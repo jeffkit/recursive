@@ -189,8 +189,21 @@ applies.
   errors `缺少 --goal 或 --goal-file`. (The run-id reuses the run *dir* for
   outputs; it does not restore the goal text.)
 - **Transient gate red that the agent is already fixing** (e.g. e2e
-  `SESSION_EXISTS`) → **do nothing**. The resume-fix loop handles it. Only
-  step in if `MAX_FIX_ROUNDS` is exhausted and it goes `failed-preserved`.
+  `SESSION_EXISTS`, or `gate.e2e` timing out because the docker build alone ate
+  the whole timeout budget) → **do nothing**. The resume-fix loop handles it:
+  `gate.e2e.fix-1` / `.fix-2` in the `done` list is the agent re-running the
+  gate (image now cached → fast). Only step in if `MAX_FIX_ROUNDS` (=3) is
+  exhausted and it goes `failed-preserved`. **`gate.e2e.fix-1` is normal** for
+  any goal touching `src/` — expect it, don't panic, don't intervene.
+- **`verdict: failed-preserved` but the work looks correct** → the watchdog
+  may have mis-killed the agent during a synchronous finishing move (writing
+  the journal, running a final `cargo test`) that produced zero transcript
+  growth and had no descendant processes. The agent's complete, self-verified
+  edit is NOT lost: it sits in `refs/preserve/<run-id>` + a
+  `preserve: <reason>` commit in the worktree. See step 6's rescue procedure.
+  Known mis-fire trigger: the `no-growth-hung` watchdog (g353, g349 lesson).
+  (A winddown-recognition fix landed in the watchdog, but verify the run's
+  failure log before assuming rescue is needed.)
 - **Missing prerequisite the agent can't install** → fix it (start Docker,
   install a CLI), then resume.
 - **Decision only a human can make** → stop polling, ask the user crisply,
@@ -208,19 +221,53 @@ When `status: completed`:
 - Read `$RR/.flowcast/runs/<run-id>/report.md` for `verdict`. If `committed`,
   confirm it actually landed:
   `git -C "$RR" merge-base --is-ancestor <commit> main && echo ON_MAIN`.
+- **If `failed-preserved`**: read `report.md`'s `detail` + `watchdog-failure.log`
+  + `preserved.diff` + the `refs/preserve/<run-id>` commit. The verdict means a
+  gate/review loop exhausted OR the watchdog mis-killed; it does NOT mean the
+  code is wrong. Decide:
+  - **Watchdog mis-fire, code looks correct** (the common rescue): the agent's
+    complete, self-verified edit is in the preserve commit. `cherry-pick` it
+    onto main, then **independently run the three gates yourself**
+    (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+    --all-features -- -D warnings`, `cargo test --workspace`). If green, amend
+    the cherry-picked commit's message (it'll have the placeholder
+    `preserve: <reason>` message) to a proper `feat/fix(...): Goal NNN — …`
+    message and keep it. If red, `git reset --hard ORIG_HEAD` and report.
+    Commands:
+    ```bash
+    PRESERVE_COMMIT=$(git -C "$RR" log --format=%H refs/preserve/<run-id> -1)
+    git -C "$RR" cherry-pick "$PRESERVE_COMMIT"
+    # re-run gates; if green:
+    git -C "$RR" commit --amend -m "feat(...): Goal NNN — <one line>…"
+    ```
+  - **Genuinely broken gate/review after MAX_FIX_ROUNDS**: leave it preserved,
+    read the failure context, write a follow-up goal. Do NOT cherry-pick code
+    that failed its own gates.
 - Verify the product independently: run the relevant test subset yourself
   (e.g. `cargo test --manifest-path "$RR/Cargo.toml" -p recursive-tui`), don't
-  just trust the green gate.
-- Clean up: `git -C "$RR" worktree remove .worktrees/<run-id> --force`
-  (the flow usually does this, but confirm), `tmux kill-session` for any
-  leftover, remove `/tmp` scratch files.
+  just trust the green gate. **Specifically confirm the goal's headline test
+  exists and passes by name** — `cargo test <name-substring>`. A green
+  workspace doesn't prove the agent added the test the goal required.
+- Clean up: `git -C "$RR" worktree remove .worktrees/<run-id> --force` (the
+  flow usually does this for `committed`; for `failed-preserved` the worktree
+  is at `.worktrees/preserve/<run-id>` and you must remove it yourself),
+  `tmux kill-session` for any leftover, remove `/tmp` scratch files.
 - If you left any diagnostic commits on main, `git revert` them (don't reset —
   the goal commit sits on top; revert keeps history honest).
 
 ## Discipline (the lessons, condensed)
 
 1. **Never pre-compile before launch.** Contention on `target/` produces
-   phantom `preflight.build` failures. The flow builds for you.
+   phantom `preflight.build` failures. The flow builds for you. **If you see
+   `error: invalid character ' ' in package name: ' recursive-cli'`** (note the
+   leading space), the cause is NOT a corrupted target/ lock — it's a bug in
+   `.dev/flows/self-improve.flow.js` itself: an argv element like
+   `'-p recursive-cli'` written as ONE string (space inside the quotes) instead
+   of two `'-p', 'recursive-cli'`. cargo then parses the `-p` value as
+   ` recursive-cli` (leading space) → invalid-char. Diagnose by wrapping cargo
+   with a `/tmp` shell script that logs `argv`, OR check the flow source:
+   `grep -n "'-p [^']*'" .dev/flows/self-improve.flow.js` (a `-p X` with the
+   space INSIDE the quotes is the bug). The fix is a one-char comma insertion.
 2. **Liveness before "healthy".** A crashed flow emits nothing; checking only
    `state.json == running` will have you narrate progress over a corpse.
 3. **Capture run-id + tmux + log path at launch.** Re-derive the log path on
@@ -235,6 +282,67 @@ When `status: completed`:
    headline test after landing.
 8. **All git in the sub-repo.** This is a recursive change; the monorepo root
    only owns `mona.yaml` + docs.
+9. **`gate.e2e` is the cost center.** Any goal touching `src/` or
+   `crates/*/src/` pays 25-40 min of docker build (colima compiles the whole
+   recursive + AWS SDK inside the image). An e2e-gate diff-scope short-circuit
+   skips it for docs/tests/`.dev/`-only changes (verified: a tests-only goal's
+   `gate.e2e` ran in 435ms vs ~25min). So: **if you have a choice, batch the
+   pure-test/docs goals** — they skip e2e and finish in minutes. When
+   monitoring an e2e-bearing goal, arm 4-5 min sleeps, not 90s — the docker
+   build is genuinely busy (colima CPU 40%+), not stuck.
+10. **`failed-preserved` ≠ broken.** The watchdog (`no-growth-hung`) can
+    mis-kill an agent that's writing its journal or running a final `cargo
+    test` — synchronous moves with zero transcript growth and no child
+    processes. The complete, self-verified edit survives in
+    `refs/preserve/<run-id>` + a `preserve: <reason>` commit. Rescue it by
+    cherry-pick + independent gate re-run (see step 6). Don't re-run the goal
+    from scratch — that burns another 25 min and may hit the same watchdog.
+11. **e2e first-red is normal; `gate.e2e.fix-1` is the agent self-healing.**
+    e2e often times out on the first run because the docker build eats the
+    whole gate timeout; on `fix-1` the image is cached and it passes. Seeing
+    `gate.e2e.fix-1` in the done list is GOOD news, not a problem. Only
+    intervene if it goes `.fix-2`, `.fix-3`, then `failed-preserved`.
+12. **The dirty-tree guard has TWO layers.** `launch-flow.sh` checks
+    `git status --porcelain`, AND flowcast's own `withSelfModGuard`
+    (`node_modules/flowcast/self-mod-guard.js`, NOT in our repo) re-checks at
+    `preflight.baseline`. Loosening launch-flow.sh alone is useless — the
+    inner guard still rejects. **Keep the tree clean before every launch:**
+    commit ALL goal drafts, even untracked ones. There's no shortcut.
+13. **Background-poll to terminal, don't babysit.** Arm ONE
+    `run_in_background: true` poll loop per goal that sleeps + checks
+    `state.json` until `verdict` appears or the node process dies, then
+    notifies you. You spend one tool call to arm it and get woken at the end —
+    far cheaper than 10+ foreground sleep-probe cycles. Template:
+    `for i in $(seq 1 30); do sleep 90; pgrep -f self-improve.flow.js || break;
+    <read verdict>; <break if terminal>; done` with `run_in_background`.
+14. **Verify the headline test by NAME, not just "test suite green".** After
+    landing, run `cargo test <goal-name-substring>` (e.g.
+    `cargo test cancelled_mid_stream`) and confirm the specific tests the goal
+    required exist and pass. A green workspace can hide a missing test.
+15. **Goal-writing: be unambiguous and prescriptive.** The agent only has the
+    goal text. A good goal has: **Design principle check** (state it does NOT
+    violate invariant #1), **Why** (root cause with file:line), **Scope** (do
+    EXACTLY this — numbered steps with code snippets), **Files NOT to touch**
+    (explicit allowlist of what's out of scope), **Acceptance** (exact gate
+    commands + grep-verifiable checks), **Notes for the agent** (traps:
+    invariants, API signatures to verify, ordering constraints). Mirror a
+    recent same-flavour goal's format. Ambiguity costs fix-rounds.
+16. **Sequence goals by leverage, and mix scopes.** Order: real bugs >
+    invariant/gate holes > test gaps > cleanup. **Deliberately mix src/ and
+    tests-only goals** in a batch — the tests-only ones skip e2e (fast,
+    ~15min) and let you keep momentum while an e2e-heavy goal churns.
+17. **When in doubt about a fix's scope, prefer /tmp reproducers.** Before
+    patching `.dev/flows/*.js` or `.dev/scripts/*.sh` to diagnose, write a
+    standalone reproducer (`node -e`, a bash wrapper that logs argv, a small
+    `.rs` file). It keeps main clean and often pinpoints the bug faster than
+    reading the full script. (Real run: a cargo wrapper in `/tmp/cargo-diag/`
+    captured the `argv: ['-p recursive-cli']` single-element bug in one shot.)
+18. **Push only when the user asks.** Self-improve commits land on the local
+    `recursive` sub-repo's main. Do NOT `git push` unless explicitly told —
+    "land" and "publish" are different actions. Confirm the remote state first
+    (`git fetch; git status -sb`) and note any pre-receive-hook quirks (an old
+    issue doc in `.dev/issues/` may be stale; a clean push in 2026-08
+    succeeded despite the doc claiming otherwise).
 
 ## Quick reference
 
@@ -259,6 +367,29 @@ tmux ls | grep recursive-flow; pgrep -fl self-improve.flow.js
 # verify landing
 git -C "$RR" merge-base --is-ancestor <COMMIT> main && echo ON_MAIN
 cargo test --manifest-path "$RR/Cargo.toml" -p recursive-tui   # or the relevant crate
+
+# background-poll to terminal (arm with run_in_background: true; get notified at verdict)
+RID=selfimprove-XXXXXXXXX
+for i in $(seq 1 32); do
+  sleep 90
+  pgrep -f self-improve.flow.js >/dev/null 2>&1 || { echo "node gone"; break; }
+  read st v step <<< $(python3 -c "import json;d=json.load(open('$RR/.flowcast/runs/$RID/state.json'));print(d.get('status'),d.get('verdict') or '-',d.get('currentStep') or '-')")
+  [ "$st" = completed ] || [ "$v" != - ] && { echo "TERMINAL: $st $v $step"; break; }
+  echo "tick $i: $step"
+done
+
+# rescue a failed-preserved run whose work is correct (watchdog mis-fire case)
+PRESERVE_COMMIT=$(git -C "$RR" log --format=%H refs/preserve/<RID> -1)
+git -C "$RR" cherry-pick "$PRESERVE_COMMIT"
+# then independently re-run the 3 gates; if green, amend the message:
+git -C "$RR" commit --amend -m "feat(...): Goal NNN — <one line>"
+# if red: git -C "$RR" reset --hard ORIG_HEAD
+
+# verify the goal's headline test BY NAME (not just "test suite green")
+cargo test --manifest-path "$RR/Cargo.toml" <name-substring>   # e.g. cancelled_mid_stream
+
+# diagnose a phantom preflight.build error (invalid char in package name)
+grep -n "'-p [^']*'" "$RR/.dev/flows/self-improve.flow.js"   # a -p X with space INSIDE quotes = bug
 
 # list historical runs
 node "$RR/.dev/flows/self-improve.flow.js" --list
