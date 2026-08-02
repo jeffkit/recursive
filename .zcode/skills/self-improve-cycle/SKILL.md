@@ -20,7 +20,8 @@ iterate (concurrent if independent) → verify each → distill lessons → repo
 ```
 
 **Load `self-improve-supervise` first** — this skill assumes you know its SOP
-(polling, verdict semantics, rescue procedures, the 18 discipline lessons).
+(event-driven watcher with `run_in_background: true`, verdict semantics,
+rescue procedures, the 18 discipline lessons).
 
 ## When to use
 

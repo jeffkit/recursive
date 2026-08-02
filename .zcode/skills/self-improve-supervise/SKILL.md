@@ -1,7 +1,7 @@
 ---
 type: Skill
 name: self-improve-supervise
-description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Polling-driven (ZCode has no event-driven loop — unlike recursive's own loop-supervise/recursive-loop skills, which assume run_background/watch_file/schedule_wakeup)."
+description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Event-driven: arm a Bash watcher with run_in_background: true; the kernel wakes you with a <task-notification> when the flow reaches verdict or dies. Foreground sleep+probe is only a forensic fallback for between-tick steering. (This contrasts with recursive's *own* loop-supervise / recursive-loop skills, which target recursive's kernel and use its run_background/watch_file/schedule_wakeup/stop_loop/tool_search toolset.)"
 mode: trigger
 triggers: self-improve, self improve, 自改, 跑一个goal, 跑一个 goal, 带跑, supervisor, 督战
 ---
@@ -16,13 +16,21 @@ self-improve goal end-to-end: write a goal file, launch
 problems the flow/agent can't self-heal. The product of the run is a code
 change in the `recursive` sub-repo.
 
-> **This is the ZCode/polling version.** Recursive ships its own
+> **ZCode IS event-driven.** Arm a single `Bash` call with
+> `run_in_background: true` that polls `state.json` until the flow reaches
+> `verdict` or the node process dies; the kernel wakes you with a
+> `<task-notification>` when the watcher exits. That's the default — one
+> tool call to arm, one to handle the verdict. Foreground `sleep` + probe
+> is a **forensic fallback** for cases where you need to steer between
+> ticks (e.g. read a mid-run diff to decide whether to intervene before
+> the next state change).
+>
+> This skill is the **ZCode** version. Recursive ships its own
 > `loop-supervise` / `recursive-loop` skills for recursive's *own* agent
-> kernel — but those assume event-driven tools (`run_background` returning a
-> job_id that auto-wakes you, `watch_file`, `schedule_wakeup`, `stop_loop`,
-> `tool_search`). **ZCode has none of those.** You monitor by
-> `sleep` + reading `state.json` / log files. This skill is built around
-> that reality, plus the hard-won lessons from real supervised runs.
+> kernel — those target a different toolset (`run_background` returning a
+> job_id, `watch_file`, `schedule_wakeup`, `stop_loop`, `tool_search`).
+> Don't conflate the two: when this skill says "watcher", it means a
+> backgrounded `Bash` invocation, not a recursive-kernel primitive.
 
 ## What you're supervising (mental model — read once)
 
@@ -58,15 +66,20 @@ green, it stops. `MAX_FIX_ROUNDS` defaults to **3**.
 | Need | Tool | Notes |
 |---|---|---|
 | Launch the flow | `Bash` (foreground, the launcher returns fast) | `launch-flow.sh` backgrounds into tmux and returns within ~15s |
-| Wait between checks | `Bash` with `sleep N` | your only "heartbeat". No `schedule_wakeup`. |
+| Wait + watch to verdict | `Bash` with `run_in_background: true` (arm a polling watcher) | **DEFAULT.** The watcher polls `state.json` and exits on terminal event; ZCode wakes you with `<task-notification>`. This IS the heartbeat. |
 | Read progress | `Read` / `Bash` (`cat`/`python3 -m json.tool`) on `state.json`, `run.log.jsonl`, the log file | pick paths from `run-id`, don't hardcode |
 | Inspect the agent's work mid-run | `Bash` `git -C <worktree> diff` | read-only on the worktree is safe |
 | Kill a stuck/hung flow | `Bash` `tmux kill-session -t <name>` | `tmux ls` to find the name |
-| Background a long watch | `Bash` `run_in_background: true` | optional; a single `sleep` block is usually simpler |
+| Foreground sleep+probe (forensic only) | `Bash` with `sleep N` | use only when you need to steer between ticks (e.g. read a mid-run diff and decide before next state change). One tool call per tick. |
 
-You do **not** have: `run_background` (job_id), `check_background`,
-`watch_file`, `schedule_wakeup`, `stop_loop`, `tool_search`. Do not write
-SOP text that calls for them.
+**What you have for event-driven wake:** `Bash` with
+`run_in_background: true` — the watcher exits, ZCode delivers a
+`<task-notification>` with `status: completed` (or `failed`) + exit code +
+stdout path. **What ZCode does not have:** a cron-style mid-run scheduler
+(`CronCreate` exists but is for periodic triggers, not for waking you
+mid-run). Don't write SOP text that calls for `watch_file`,
+`schedule_wakeup`, `stop_loop`, `tool_search`, or `run_background` returning
+a job-id — those are **recursive's kernel** primitives, not ZCode's.
 
 ## SOP
 
@@ -146,16 +159,25 @@ The launcher prints three things you must **capture into your todo/notes**:
 `launch-flow.sh` auto-attaches a cross-provider reviewer (deepseek ↔
 deepseek-pro) unless you pass `--reviewer-provider`/`--no-review`.
 
-### 4. Monitor — polling loop (your only mechanism)
+### 4. Monitor — arm a background watcher (event-driven)
 
-There is no event wake. You alternate: `sleep` a while, then probe. Arm each
-"tick" as a single `Bash` call that sleeps **then** reads state, so you spend
-one tool call per tick, not two.
+**Default path:** one `Bash` call with `run_in_background: true` that
+sleeps + probes `state.json` in a loop, exits when the flow reaches a
+terminal state (`status: completed`, `verdict: ...`) or when the node
+process dies. The kernel wakes you with a `<task-notification>` at exit —
+you spend one tool call to arm it and one to handle the verdict. The
+template lives in the Quick reference (`# Background-poll to terminal`).
 
-**Tick cadence:** preflight is fast (~30–90s) → sleep 60–90s. `run.recursive`
-is the long phase (10–25 min for a real change) → sleep 150–240s. Gate phase
-is bursty → sleep 60–120s. Lean longer when stable; shorter after a state
-change.
+**Foreground `sleep` + probe is the forensic fallback.** Reach for it
+when you need to *steer between ticks* (e.g. the watcher noticed a state
+change you want to inspect before the next tick: read the agent's diff,
+decide whether to intervene). Each tick is one `Bash` call that sleeps
+**then** reads state.
+
+**Tick cadence (for either path):** preflight is fast (~30–90s) → sleep
+60–90s. `run.recursive` is the long phase (10–25 min for a real change)
+→ sleep 150–240s. Gate phase is bursty → sleep 60–120s. Lean longer when
+stable; shorter after a state change.
 
 **Per tick, read in this order (one python one-liner over `state.json`):**
 ```bash
@@ -206,8 +228,8 @@ applies.
   failure log before assuming rescue is needed.)
 - **Missing prerequisite the agent can't install** → fix it (start Docker,
   install a CLI), then resume.
-- **Decision only a human can make** → stop polling, ask the user crisply,
-  don't arm another sleep.
+- **Decision only a human can make** → stop the watcher, ask the user
+  crisply, don't arm another background poll.
 - **Diagnosing a flow-script bug** (rare): `withSelfModGuard` refuses a dirty
   `.dev/`, so you must commit any diagnostic patch first, then `git revert`
   it after. Prefer a standalone reproducer script in `/tmp` (CJS `node -e` or
