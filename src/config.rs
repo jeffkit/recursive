@@ -659,6 +659,31 @@ Set via --provider, RECURSIVE_PROVIDER_TYPE, or by using
                 self.provider_type
             ));
         }
+        // Goal-365: reject set-but-unknown web search providers at config
+        // time. A typo like `RECURSIVE_WEB_SEARCH_PROVIDER=braev` previously
+        // slipped through here and silently degraded the WebSearch tool to the
+        // zero-config DDG scrape, ignoring the paid API key the user
+        // configured. `None` (unset) stays valid — DDG/Bing zero-config
+        // scraping is intentional and documented. The valid set lives in
+        // `web_search::Provider::from_str`, so providers added there are
+        // accepted here automatically. When the `web_search` feature is off
+        // the provider is never consulted, so validation is skipped.
+        #[cfg(feature = "web_search")]
+        if let Some(p) = &self.web_search_provider {
+            if crate::tools::web_search::Provider::from_str(p).is_none() {
+                return Err(format!(
+                    "\
+Error: Unknown web search provider '{}'.
+
+Supported providers: brave, tavily, serper, bocha, bing
+Set via RECURSIVE_WEB_SEARCH_PROVIDER, or the `[search]` section of
+~/.recursive/config.toml. DDG/Bing zero-config scraping runs only when
+the provider is unset.
+",
+                    p
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -2155,6 +2180,65 @@ api_key = "sk-from-file"
         assert!(
             config.validate_for_agent().is_ok(),
             "anthropic provider must be valid"
+        );
+    }
+
+    // ── Goal-365: web_search_provider validation ──────────────────────────
+    //
+    // These tests exercise the `#[cfg(feature = "web_search")]` block in
+    // validate_for_agent, so they only exist where the validation exists.
+    // Without the feature the WebSearch tool is never registered and the
+    // provider value is inert, so there is nothing to reject.
+    #[cfg(feature = "web_search")]
+    #[test]
+    fn validate_rejects_unknown_web_search_provider() {
+        // A typo like "braev" (for "brave") must be rejected at config time
+        // instead of silently degrading the tool to the zero-config DDG
+        // scrape while ignoring the paid API key.
+        let config = Config {
+            web_search_provider: Some("braev".into()),
+            ..valid_config()
+        };
+        let err = config.validate_for_agent().unwrap_err();
+        assert!(
+            err.contains("braev"),
+            "error must name the bad provider value; got: {err}"
+        );
+        for valid in ["brave", "tavily", "serper", "bocha", "bing"] {
+            assert!(
+                err.contains(valid),
+                "error must list valid provider '{valid}'; got: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "web_search")]
+    #[test]
+    fn validate_accepts_known_web_search_provider() {
+        // A real provider name (one from Provider::from_str) passes.
+        let config = Config {
+            web_search_provider: Some("brave".into()),
+            ..valid_config()
+        };
+        assert!(
+            config.validate_for_agent().is_ok(),
+            "known web search provider must be accepted"
+        );
+    }
+
+    #[cfg(feature = "web_search")]
+    #[test]
+    fn validate_accepts_unset_web_search_provider() {
+        // None (unset) stays valid — DDG/Bing zero-config scraping is the
+        // documented behaviour when no provider is configured. This pins that
+        // validation only fires when a value IS set.
+        let config = Config {
+            web_search_provider: None,
+            ..valid_config()
+        };
+        assert!(
+            config.validate_for_agent().is_ok(),
+            "unset web search provider must be accepted (DDG fallback is intentional)"
         );
     }
 

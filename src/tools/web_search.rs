@@ -42,7 +42,7 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 
 /// Supported search providers.
 #[derive(Debug, Clone, PartialEq)]
-enum Provider {
+pub(crate) enum Provider {
     Brave,
     Tavily,
     Serper,
@@ -51,7 +51,12 @@ enum Provider {
 }
 
 impl Provider {
-    fn from_str(s: &str) -> Option<Self> {
+    /// Case-insensitive name lookup for a known provider.
+    /// `pub(crate)` so `config.rs` can validate `web_search_provider` at
+    /// config time without duplicating the valid set (the crate-internal
+    /// visibility keeps clippy's `should_implement_trait` from suggesting a
+    /// `FromStr` impl — this is a lookup, not a fallible parse).
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "brave" => Some(Self::Brave),
             "tavily" => Some(Self::Tavily),
