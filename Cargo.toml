@@ -42,9 +42,6 @@ weixin = ["dep:wechatbot", "dep:qrcode"]
 coordinator-mode = []
 cloud-runtime = ["dep:redis", "dep:deadpool-redis", "dep:aws-sdk-s3", "dep:aws-config", "dep:bollard"]
 e2b-sandbox = []
-aws-sdk-s3 = ["dep:aws-sdk-s3"]
-aws-config = ["dep:aws-config"]
-bollard = ["dep:bollard"]
 # Semantic vector memory: OpenAI embedding API call.
 openai-embedding = []
 # Full vector memory: SQLite-backed ANN store (pure rusqlite, no C extensions required).

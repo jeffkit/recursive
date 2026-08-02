@@ -1,8 +1,8 @@
 # Recursive ROADMAP v4 — From Product to Ecosystem
 
 > **Replaces**: ROADMAP v3 (v0.5 release, Phases 10-13 complete)
-> **Status**: Draft — pending user review
-> **Version baseline**: v0.5.0
+> **Status**: Active (drives 0.7 → 0.8+ work; Phase 20 essentially complete per the 2026-07-31 audit)
+> **Version baseline**: v0.8.1
 
 ## Context
 
@@ -109,11 +109,11 @@ Make Recursive accessible to a wider audience.
 
 | ID | Feature | Effort | Status |
 |----|---------|--------|--------|
-| 19.1 | TypeScript/Node.js SDK | M | ✅ feat/phase19-sdk-ecosystem (pending merge) |
-| 19.2 | CLI installer (curl \| sh) | S | ✅ install.sh in feat/phase19-sdk-ecosystem |
-| 19.3 | Homebrew formula | S | ✅ docs/homebrew/recursive.rb in feat/phase19-sdk-ecosystem |
+| 19.1 | TypeScript/Node.js SDK | M | ✅ `sdk/typescript/` on main |
+| 19.2 | CLI installer (curl \| sh) | S | ✅ `install.sh` on main |
+| 19.3 | Homebrew formula | S | ✅ `docs/homebrew/recursive.rb` on main |
 | 19.4 | VS Code extension (agent in sidebar) | L | 🔴 |
-| 19.5 | Documentation site (mdbook or similar) | M | 🔴 |
+| 19.5 | Documentation site | M | ✅ `website/` (recursive-docs, en/zh) on main |
 
 **Total**: ~3 batches
 

@@ -45,9 +45,9 @@ Embedding just the kernel (no HTTP / TUI / cloud) is supported via
 ## At a glance
 
 Wire up an OpenAI-compatible LLM, register some tools, and drive the
-agent loop. This is the v0.7 surface — the legacy `Agent` type from
-v0.5 was split into `AgentKernel` (stateless) and `AgentRuntime`
-(stateful wrapper) during Goal 219.
+agent loop. This surface has been stable since v0.7 (the legacy `Agent`
+type from v0.5 was split into `AgentKernel` (stateless) and `AgentRuntime`
+(stateful wrapper) during Goal 219); it is the API shipped in v0.8.1.
 
 ```rust
 use recursive::llm::OpenAiProvider;
