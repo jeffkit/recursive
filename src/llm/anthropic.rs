@@ -1421,6 +1421,76 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[tokio::test]
+    async fn parse_sse_stream_returns_error_on_malformed_chunk() {
+        // A garbled/truncated `data:` payload from a flaky proxy must
+        // surface as a diagnosable `Error::Llm` whose message contains
+        // "SSE parse error" (from `process_sse_line`'s per-event
+        // `serde_json::from_str(...).map_err(...)`), NOT a silent panic or
+        // an infinite hang. The malformed event comes FIRST so the parser
+        // errors out before the terminal `message_stop` event.
+        //
+        // The `event:` line is load-bearing: a bare malformed `data:` line
+        // with no preceding event name would fall into the "unhandled SSE
+        // event" debug branch and be silently ignored — the test pins that
+        // a malformed payload for a REAL event type is a hard error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {not valid json
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
+        // Timeout guards against a parser bug that loops on malformed input
+        // — the test should fail on timeout, not hang the suite.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.stream(&[Message::user("hi".to_string())], &[], None, None),
+        )
+        .await
+        .expect("SSE parser must not hang on malformed input");
+
+        let err = match result {
+            Ok(_) => panic!("expected Err on malformed SSE chunk, got Ok"),
+            Err(e) => e,
+        };
+        match err {
+            Error::Llm { provider, message } => {
+                assert!(
+                    message.contains("SSE parse error"),
+                    "error message should be diagnosable, got: {message}"
+                );
+                assert!(
+                    provider.contains("claude-3-sonnet"),
+                    "error should carry the provider/model name, got: {provider}"
+                );
+            }
+            other => panic!("expected Error::Llm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_e2_stream_thinking_deltas_populate_reasoning() {
         // A streaming response with thinking_delta events must accumulate
         // into reasoning_content while text_delta stays in content.

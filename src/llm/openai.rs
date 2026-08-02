@@ -1827,6 +1827,75 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
+    async fn parse_sse_stream_returns_error_on_malformed_chunk() {
+        // A flaky proxy can truncate/garbble a chunk mid-stream. The parser
+        // must surface that as a diagnosable `Error::Llm` whose message
+        // contains "SSE parse error" (from `process_sse_line`'s
+        // `serde_json::from_str(...).map_err(...)`), NOT a silent panic or
+        // an infinite hang. The malformed `data:` line comes FIRST so the
+        // error fires before any valid chunk is processed; a subsequent
+        // valid `[DONE]` proves the parser stops at the bad line rather
+        // than skipping it and completing the stream.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+data: {not valid json
+
+data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-malformed-model")
+                .unwrap();
+        // Timeout guards against a parser bug that loops on malformed input
+        // — the test should fail on timeout, not hang the suite.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.stream(&[Message::user("hi")], &[], None, None),
+        )
+        .await
+        .expect("SSE parser must not hang on malformed input");
+
+        let err = match result {
+            Ok(_) => panic!("expected Err on malformed SSE chunk, got Ok"),
+            Err(e) => e,
+        };
+        match err {
+            Error::Llm { provider, message } => {
+                assert!(
+                    message.contains("SSE parse error"),
+                    "error message should be diagnosable, got: {message}"
+                );
+                assert!(
+                    provider.contains("test-malformed-model"),
+                    "error should carry the provider/model name, got: {provider}"
+                );
+            }
+            other => panic!("expected Error::Llm, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn stream_fallback_delegates_to_complete() {
         // MockProvider doesn't override stream, so it falls back to complete.
         // Verify the fallback path works by using a MockProvider.

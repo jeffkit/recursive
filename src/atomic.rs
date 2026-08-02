@@ -125,6 +125,55 @@ mod tests {
     }
 
     #[test]
+    fn test_atomic_write_ignores_stale_tmp_orphan() {
+        // A crash *between* `write_all` and `rename` leaves a `.tmp-*`
+        // orphan on disk that matches the TEMP_SEQ naming pattern
+        // (`.tmp-{name}-{pid}-{seq}`). The data-integrity contract
+        // (module doc): a reader observing `path` sees either the old
+        // content or the full new content — never a half-written file —
+        // and a previous crash's leftover must NOT corrupt the next write.
+        //
+        // PINNED ACTUAL BEHAVIOUR: `atomic_write` never scans the parent
+        // directory for pre-existing temp files; it only writes its own
+        // fresh `.tmp-{name}-{pid}-{seq}` and renames it. So the stale
+        // orphan is IGNORED (still present, content untouched), not
+        // cleaned up. This test asserts the no-corruption guarantee; it
+        // does NOT promise orphan reaping (that would be a separate
+        // `cleanup_tmp_orphans` helper goal).
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("target.txt");
+        atomic_write(&p, b"v1").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"v1");
+
+        // Simulate a crashed writer's leftover: a temp file matching the
+        // `.tmp-{name}-{pid}-{seq}` pattern but from a DIFFERENT pid/seq
+        // than the live process would generate, so it can't collide with
+        // the temp name the next `atomic_write` picks.
+        let stale = dir.path().join(format!(
+            ".tmp-target.txt-{}-{}",
+            std::process::id() + 1, // pid of the crashed writer ≠ this process
+            999_999,                // seq far beyond TEMP_SEQ's small counter
+        ));
+        std::fs::write(&stale, b"half-written garbage from a crashed process").unwrap();
+
+        // The next write must succeed and leave a well-formed target.
+        atomic_write(&p, b"v2").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"v2", "target must not be torn");
+
+        // The stale orphan is harmless: ignored, not renamed over the
+        // target, and its content untouched.
+        assert!(
+            stale.exists(),
+            "stale orphan is ignored (not reaped) by atomic_write"
+        );
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"half-written garbage from a crashed process",
+            "stale orphan content must be untouched"
+        );
+    }
+
+    #[test]
     fn test_atomic_write_empty_bytes() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("empty.txt");
