@@ -106,24 +106,24 @@ tmux session. This saves wall-clock time when you have several goals.
    signature, a public API, an error enum variant). If goal A adds an
    `Error::Foo` variant and goal B matches on `Error` exhaustively, they
    conflict even if files differ — run sequentially.
-2. **e2e gate contention**: the e2e gate uses a **fixed container name
-   `recursive-e2e` + port 8080** (`e2e/e2e.yaml:20-22`). Two concurrent e2e
-   gates **will collide** on container name + port. So:
-   - At most **one concurrent goal** may be a `src/`-touching goal (which
-     triggers e2e). The rest must be e2e-skipping (tests/docs only).
-   - OR run all goals sequentially if more than one touches `src/`.
+2. **e2e gate isolation**: argusai (v0.14.3+, [issue #9](https://github.com/jeffkit/argusai/issues/9))
+   now namespaces container names (`<namespace>-recursive-e2e` + `--network-alias`
+   preserving in-network DNS) and uses random host ports (`ports: ["0:8080"]`).
+   **Multiple concurrent e2e gates no longer collide.** So `src/` goals CAN run
+   concurrently — the only remaining constraint is independence (rule 1) + LLM
+   rate limits (rule 3).
 3. **LLM rate limits**: each goal's agent + reviewer makes many LLM calls.
    2-3 concurrent goals is usually fine; >3 may hit rate limits.
 4. **Monitor each independently**: one background-poll per concurrent goal.
    A crash in one doesn't affect the other (separate tmux sessions).
 
 **Recommended concurrency pattern** (safe default):
-- Launch **1 `src/` goal** (triggers e2e, ~15-20min) **+ 1-2 tests/docs goals**
-  (e2e skipped, ~5-10min) concurrently. The tests/docs goals finish fast while
-  the src/ goal's docker build runs. Max 2-3 concurrent.
+- **2-3 independent goals** concurrently — regardless of whether they're
+  `src/` or tests/docs (e2e isolation now handles concurrent docker builds).
+  Each gets its own worktree + tmux session + argusai namespace.
 - When the batch finishes, launch the next batch.
-
-**Do NOT** run >1 `src/` goal concurrently (e2e container collision).
+- The binding constraint is now LLM rate limits + goal independence, NOT
+  e2e container collision.
 
 #### Per-goal workflow (same as self-improve-supervise)
 
@@ -220,17 +220,16 @@ sub-agent prompt should demand file:line evidence + fix direction.
 ```
 Have N independent goals?
 │
-├─ Do any two touch the same file? → SEQUENTIAL (all of them)
+├─ Do any two touch the same file? → SEQUENTIAL (those two)
 │
 ├─ Do any two change a shared contract (trait/enum/public API)?
 │   → SEQUENTIAL (even if files differ)
 │
-├─ How many touch src/ (trigger e2e gate)?
-│   ├─ 0  → all concurrent-safe (but mind LLM rate limits, cap at 3)
-│   ├─ 1  → that one solo, OR + 1-2 tests/docs goals alongside
-│   └─ 2+ → SEQUENTIAL (e2e container name + port 8080 collision)
-│
-└─ Otherwise → concurrent OK (cap at 2-3, monitor each independently)
+└─ Otherwise → CONCURRENT OK
+    (e2e isolation since argusai #9: container names namespaced + random
+     host ports — multiple src/ goals can run in parallel without
+     container/port collision. Cap at 2-3 concurrent, mind LLM rate
+     limits. Monitor each independently with its own background-poll.)
 ```
 
 ---

@@ -19,7 +19,13 @@ service:
   container:
     name: recursive-e2e
     ports:
-      - "8080:8080"
+      # Host port 0 = Docker assigns a free random host port (argusai 0.14.3+
+      # reads it back via getHostPort). This lets multiple worktrees run e2e
+      # concurrently without host-port collision. The smoke suite doesn't need
+      # host access at all (tests run via `docker exec` inside the container +
+      # talk to aimock via Docker network DNS), so the random port is never
+      # consumed — it's purely to avoid the collision.
+      - "0:8080"
     environment:
       RECURSIVE_API_BASE: http://aimock:4010/v1
       RECURSIVE_API_KEY: mock-key
