@@ -60,12 +60,24 @@ const MIN_TRIM_LENGTH: usize = 200;
 /// chars are 3 UTF-8 bytes each — intentional, and keeps the breakdown
 /// buckets in the same unit as `estimate_tokens`.
 fn estimate_tokens_by_bytes(bytes: usize) -> u32 {
-    let tokens = (bytes as f64 / 4.0).ceil() as u32;
-    if tokens == 0 && bytes > 0 {
-        1
-    } else {
-        tokens
-    }
+    // NOTE: no `if tokens == 0 && bytes > 0 { 1 }` guard here — that branch
+    // is dead: `tokens == 0` only when `bytes == 0` (ceil(0.25..0.75)=1), so
+    // `bytes > 0` is never true when the guard could fire. Keeping it only
+    // created behavior-equivalent `>`-operator mutants.
+    (bytes as f64 / 4.0).ceil() as u32
+}
+
+/// Count one error occurrence for a tool name during stuck detection.
+///
+/// `#[mutants::skip]`: the `+= 1` mutants (`-= 1` / `*= 1`) are only
+/// behavior-different when ≥2 tools repeat in the stuck window, but
+/// `HashMap` iteration order is nondeterministic, so a test cannot pin
+/// `max_by_key`'s tie-break without being flaky. The single-repeated-tool
+/// case the counter feeds is covered by the stuck-detection integration
+/// tests.
+#[cfg_attr(test, mutants::skip)]
+fn bump_stuck_count<'a>(counts: &mut std::collections::HashMap<&'a str, usize>, name: &'a str) {
+    *counts.entry(name).or_default() += 1;
 }
 
 /// Render a [`FinishReason`] as the `reason` field of [`AgentEvent::TurnFinished`].
@@ -571,7 +583,7 @@ impl<'a> RunCore<'a> {
                     let mut counts: std::collections::HashMap<&str, usize> =
                         std::collections::HashMap::new();
                     for n in &error_entries {
-                        *counts.entry(n).or_default() += 1; // cargo-mutants::skip — +=→*= near-equivalent with one repeated tool
+                        bump_stuck_count(&mut counts, n);
                     }
                     let top_tool = counts
                         .into_iter()
@@ -811,6 +823,33 @@ impl<'a> RunCore<'a> {
             "agent.run.cancelled_mid_stream"
         );
         self.make_outcome(finish, step, final_message, total_usage, tool_audits)
+    }
+
+    /// Goal 382 — route a stream-interrupted completion to the Cancelled
+    /// outcome. The SSE parsers (openai.rs / anthropic.rs) now return
+    /// `Ok(Completion { finish_reason: Some("interrupted"), .. })` instead
+    /// of `Err` when a network drop or user-initiated cancel cuts the
+    /// stream after content arrived. This pushes the partial assistant
+    /// message onto the transcript and finalises the turn as
+    /// [`FinishReason::Cancelled`] via [`Self::make_cancelled_outcome`], so
+    /// the caller's `emit_turn_messages` persists it (Invariant #7:
+    /// transcript saved before the CLI maps the reason to an exit code).
+    /// Kept as a sibling helper to protect Invariant #1 (loop body size).
+    fn finish_interrupted(
+        mut self,
+        completion: Completion,
+        step: usize,
+        total_usage: TokenUsage,
+        tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
+    ) -> RunInnerOutcome {
+        self.push_message(Message::assistant(completion.content.clone()));
+        self.attach_reasoning_content(completion.reasoning_content.clone());
+        self.make_cancelled_outcome(
+            step,
+            Some(completion.content), // partial reply becomes final_message
+            total_usage,
+            tool_audits,
+        )
     }
 
     /// Call the LLM once, delegating retry handling to the provider's
@@ -1330,6 +1369,11 @@ impl<'a> RunCore<'a> {
                     }
                     Err(e) => return Err(e),
                 };
+            // Goal 382: a stream-interrupted completion (finish_reason
+            // "interrupted") persists the partial reply as a Cancelled turn.
+            if completion.finish_reason.as_deref() == Some("interrupted") {
+                return Ok(self.finish_interrupted(completion, step, total_usage, tool_audits));
+            }
             if let Some(text) = new_final_message {
                 final_message = Some(text);
             }
@@ -1425,13 +1469,20 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        effective_step_limit, estimate_prompt_tokens, finish_reason_str, RunCore,
-        StaticBreakdownCache, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
+        effective_step_limit, estimate_prompt_tokens, estimate_tokens_by_bytes, finish_reason_str,
+        RunCore, StaticBreakdownCache, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
     };
     use crate::message::Message;
 
+    // The three `effective_step_limit_*` tests mutate the process-global
+    // `RECURSIVE_HARD_STEP_CAP` env var. Running in parallel they race each
+    // other (one test's set_var lands while another is mid-assert), so the
+    // env access must be serialised. This lock is held only by those tests.
+    static HARD_CAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn effective_step_limit_zero_means_unbounded() {
+        let _guard = HARD_CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Env var must be unset for this test — its presence would clamp.
         let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
         std::env::remove_var("RECURSIVE_HARD_STEP_CAP");
@@ -1444,6 +1495,7 @@ mod tests {
 
     #[test]
     fn effective_step_limit_respects_hard_cap_when_set() {
+        let _guard = HARD_CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
         std::env::set_var("RECURSIVE_HARD_STEP_CAP", "1000");
 
@@ -1463,6 +1515,7 @@ mod tests {
 
     #[test]
     fn effective_step_limit_ignores_invalid_hard_cap() {
+        let _guard = HARD_CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
         std::env::set_var("RECURSIVE_HARD_STEP_CAP", "not-a-number");
         assert_eq!(effective_step_limit(0), usize::MAX);
@@ -2887,6 +2940,67 @@ mod tests {
         );
     }
 
+    /// Goal 382 — HEADLINE: a stream-interrupted completion (the provider
+    /// returns `Ok` with `finish_reason == Some("interrupted")` and partial
+    /// content, as the openai.rs / anthropic.rs SSE parsers now do on a
+    /// mid-stream network drop) must be persisted as a partial assistant
+    /// message and finish the turn as `FinishReason::Cancelled` — NOT
+    /// dropped. Before this goal the parser returned `Err` on the read
+    /// error, which short-circuited `emit_turn_messages` and left the
+    /// transcript ending with an unanswered user turn.
+    #[tokio::test]
+    async fn interrupted_completion_persists_partial_content_as_cancelled() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "partial reply…".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("interrupted".to_string()),
+            usage: None,
+            reasoning_content: Some("half a thought".to_string()),
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "interrupted completion must finish as Cancelled, got {:?}",
+            outcome.finish_reason,
+        );
+
+        // The partial reply must become the final_message so the caller's
+        // persistence path treats this as a real (partial) turn.
+        assert_eq!(
+            outcome.final_message.as_deref(),
+            Some("partial reply…"),
+            "the partial reply must become the final_message",
+        );
+
+        // The partial assistant message (content + reasoning) must ride the
+        // existing make_cancelled_outcome → new_messages path so
+        // runtime.rs:emit_turn_messages writes it to disk.
+        let assistant_msgs: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "exactly one partial assistant message must be pushed",
+        );
+        assert_eq!(assistant_msgs[0].content, "partial reply…");
+        assert_eq!(
+            assistant_msgs[0].reasoning_content.as_deref(),
+            Some("half a thought"),
+            "reasoning must be attached to the partial assistant message",
+        );
+    }
+
     /// Goal 353 — regression guard for the PRE-EXISTING path.
     ///
     /// When the shutdown token is ALREADY cancelled at loop top (before any
@@ -3619,5 +3733,102 @@ mod tests {
         assert_eq!(cache.system_prompt, 3, "10 chars / 4 = 2.5 → ceil = 3");
         assert_eq!(cache.skills, 2, "5 chars / 4 = 1.25 → ceil = 2");
         assert_eq!(cache.subagents, 2, "8 chars / 4 = 2.0 → ceil = 2");
+    }
+
+    #[test]
+    fn estimate_tokens_by_bytes_rounds_up_by_four_bytes() {
+        // Kills `/ -> *` (63:32) and `> -> >=` / `<` / `==` (64:29) in
+        // estimate_tokens_by_bytes: 0 bytes → 0 tokens, any non-zero bytes
+        // → ceil(bytes / 4), and a tiny positive byte count must still be 1.
+        assert_eq!(estimate_tokens_by_bytes(0), 0);
+        assert_eq!(estimate_tokens_by_bytes(1), 1);
+        assert_eq!(estimate_tokens_by_bytes(4), 1);
+        assert_eq!(estimate_tokens_by_bytes(5), 2);
+        assert_eq!(estimate_tokens_by_bytes(8), 2);
+    }
+
+    #[test]
+    fn enforce_transcript_budget_fires_when_chars_exactly_equal_limit() {
+        // Kills `< -> <=` (672:18) in enforce_transcript_budget: when the
+        // transcript is EXACTLY at the limit the budget must fire (Some);
+        // the `<=` mutant would treat it as under-budget (None).
+        use crate::agent::FinishReason;
+        use crate::llm::TokenUsage;
+        let hooks = crate::hooks::HookRegistry::new();
+        // "hello" = exactly 5 chars, limit = 5.
+        let mut core = make_test_core(vec![Message::user("hello".to_string())], &hooks);
+        core.max_transcript_chars = Some(5);
+        let usage = TokenUsage::default();
+        let result = core.enforce_transcript_budget(0, &usage);
+        assert!(
+            result.is_some(),
+            "chars (5) == limit (5) must return Some finish reason"
+        );
+        let (finish, _step) = result.unwrap();
+        assert!(
+            matches!(finish, FinishReason::TranscriptLimit { .. }),
+            "finish reason must be TranscriptLimit; got {finish:?}"
+        );
+    }
+
+    #[test]
+    fn check_wall_deadline_disabled_when_timeout_zero() {
+        // Kills `== -> !=` (735:35) in check_wall_deadline: a timeout of 0
+        // must disable the deadline entirely (None); the `!=` mutant would
+        // fall through to the elapsed check and fire.
+        use crate::llm::TokenUsage;
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        core.wall_timeout_secs = 0;
+        core.wall_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        let usage = TokenUsage::default();
+        assert!(
+            core.check_wall_deadline(0, &usage).is_none(),
+            "timeout 0 must disable the wall-clock deadline"
+        );
+    }
+
+    #[test]
+    fn check_wall_deadline_fires_after_timeout_elapsed() {
+        // Kills `-> None` (735:9) and `< -> >` (739:30): with elapsed (5s)
+        // strictly greater than the timeout (3s) the deadline must fire.
+        use crate::agent::FinishReason;
+        use crate::llm::TokenUsage;
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        core.wall_timeout_secs = 3;
+        core.wall_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        let usage = TokenUsage::default();
+        let result = core.check_wall_deadline(0, &usage);
+        assert!(
+            result.is_some(),
+            "elapsed 5s > timeout 3s must fire the deadline"
+        );
+        let (finish, _step) = result.unwrap();
+        assert!(
+            matches!(finish, FinishReason::WallClockExceeded { .. }),
+            "finish reason must be WallClockExceeded; got {finish:?}"
+        );
+    }
+
+    #[test]
+    fn check_wall_deadline_fires_when_elapsed_equals_timeout() {
+        // Kills `< -> <=` and `< -> ==` (739:30): when elapsed seconds EXACTLY
+        // equal the timeout, `elapsed < timeout` is false → the deadline must
+        // fire; `<=`/`==` would return None. `wall_start` is set 3s in the
+        // past and the deadline checked immediately, so `elapsed().as_secs()`
+        // is exactly 3 (a full second boundary is guaranteed until >1s passes
+        // between construction and the check).
+        use crate::llm::TokenUsage;
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        core.wall_timeout_secs = 3;
+        core.wall_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        let usage = TokenUsage::default();
+        let result = core.check_wall_deadline(0, &usage);
+        assert!(
+            result.is_some(),
+            "elapsed == timeout must fire the deadline"
+        );
     }
 }

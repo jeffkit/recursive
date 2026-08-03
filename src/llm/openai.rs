@@ -655,6 +655,33 @@ impl OpenAiProvider {
                 tokio::select! {
                     biased;
                     _ = ct.cancelled() => {
+                        // Goal 382: a user-initiated cancel mid-stream should
+                        // still persist whatever content already arrived, so
+                        // the next "继续" turn doesn't see a gap where the
+                        // reply was. If anything accumulated, return it as a
+                        // partial Completion (finish_reason "interrupted"
+                        // sentinel); run_inner routes it to
+                        // FinishReason::Cancelled. With nothing accumulated
+                        // there is nothing to save — keep the original
+                        // Err(Error::Cancelled) so run_inner's Cancelled arm
+                        // handles it.
+                        let have_partial = !content.is_empty()
+                            || !reasoning_content.is_empty()
+                            || !tool_call_builders.is_empty();
+                        if have_partial {
+                            tracing::warn!(
+                                target: "recursive::llm",
+                                content_len = content.len(),
+                                "SSE stream cancelled; returning partial completion"
+                            );
+                            return Ok(Self::build_completion(
+                                content,
+                                reasoning_content,
+                                HashMap::new(), // drop half-received tool calls
+                                Some("interrupted".to_string()),
+                                usage.take(),
+                            ));
+                        }
                         // reqwest::Response 在函数返回时被 drop，HTTP 连接关闭
                         return Err(Error::Cancelled);
                     }
@@ -665,7 +692,34 @@ impl OpenAiProvider {
             };
             let chunk = match chunk_result {
                 Some(Ok(c)) => c,
-                Some(Err(e)) => return Err(self.make_err(format!("SSE stream read error: {e}"))),
+                Some(Err(e)) => {
+                    // Goal 382: a network drop mid-stream currently discards
+                    // everything accumulated in `content` /
+                    // `reasoning_content` / `tool_call_builders`. If any
+                    // content arrived, return it as a partial Completion so
+                    // the caller persists it (the "interrupted" sentinel
+                    // routes to FinishReason::Cancelled). A drop before the
+                    // first token has nothing to save — keep the Err.
+                    let have_partial = !content.is_empty()
+                        || !reasoning_content.is_empty()
+                        || !tool_call_builders.is_empty();
+                    if have_partial {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            error = %e,
+                            content_len = content.len(),
+                            "SSE stream interrupted; returning partial completion"
+                        );
+                        return Ok(Self::build_completion(
+                            content,
+                            reasoning_content,
+                            HashMap::new(), // drop half-received tool calls
+                            Some("interrupted".to_string()),
+                            usage.take(),
+                        ));
+                    }
+                    return Err(self.make_err(format!("SSE stream read error: {e}")));
+                }
                 None => break,
             };
             // Prepend any leftover bytes from the previous chunk.
@@ -705,12 +759,7 @@ impl OpenAiProvider {
         }
         // Flush any remaining bytes (shouldn't happen with a well-formed stream,
         // but handle gracefully to avoid silent truncation).
-        if !incomplete.is_empty() {
-            tracing::warn!(
-                bytes = incomplete.len(),
-                "SSE stream ended with incomplete UTF-8 sequence; discarding tail bytes"
-            );
-        }
+        Self::warn_incomplete_utf8_tail(&incomplete);
         // Flush any trailing line without a terminating newline.
         if !line_buf.is_empty() {
             Self::process_sse_line(
@@ -725,6 +774,27 @@ impl OpenAiProvider {
             )?;
         }
 
+        // Normal end of stream: assemble the Completion from the accumulated
+        // state (shared with the Goal-382 partial-return paths above).
+        Ok(Self::build_completion(
+            content,
+            reasoning_content,
+            tool_call_builders,
+            finish_reason,
+            usage,
+        ))
+    }
+
+    /// Assemble a [`Completion`] from accumulated SSE state. Shared by the
+    /// normal end-of-stream path and the Goal-382 partial-return paths
+    /// (stream read error / user-initiated cancel mid-stream).
+    fn build_completion(
+        content: String,
+        reasoning_content: String,
+        mut tool_call_builders: HashMap<usize, (String, String, String)>,
+        finish_reason: Option<String>,
+        usage: Option<TokenUsage>,
+    ) -> Completion {
         // Convert accumulated builders into ToolCall objects, sorted by index.
         let mut sorted_indices: Vec<usize> = tool_call_builders.keys().copied().collect();
         sorted_indices.sort_unstable();
@@ -748,7 +818,7 @@ impl OpenAiProvider {
             })
             .collect();
 
-        Ok(Completion {
+        Completion {
             content,
             tool_calls,
             finish_reason,
@@ -758,7 +828,23 @@ impl OpenAiProvider {
             } else {
                 Some(reasoning_content)
             },
-        })
+        }
+    }
+
+    /// Log (and discard) a trailing incomplete UTF-8 sequence at end of stream.
+    ///
+    /// `#[mutants::skip]`: this helper only emits a warning, so mutating the
+    /// `!is_empty` check is behavior-equivalent and untestable without
+    /// asserting on log output.
+    #[cfg_attr(test, mutants::skip)]
+    fn warn_incomplete_utf8_tail(incomplete: &[u8]) {
+        if !incomplete.is_empty() {
+            tracing::warn!(
+                target: "recursive::llm",
+                bytes = incomplete.len(),
+                "SSE stream ended with incomplete UTF-8 sequence; discarding tail bytes"
+            );
+        }
     }
 
     // provider is needed to produce accurate error messages when the OpenAI adapter
@@ -1896,6 +1982,59 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn parse_sse_stream_returns_partial_on_mid_stream_error() {
+        // Goal 382: a network drop mid-stream must NOT discard the content
+        // that already arrived — it must be returned as a partial Completion
+        // with finish_reason "interrupted" so run_inner persists it via the
+        // Cancelled path. Serve one valid SSE chunk, then close the
+        // connection early with a Content-Length LARGER than the body: the
+        // client's next bytes_stream().next() sees a truncated-body read
+        // error (exactly the `Some(Err(e))` arm this goal touches).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                9999,
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            // Normal FIN close: the truncated body (9999 declared vs body.len()
+            // sent) makes the client's next read error, deterministically.
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-stream-model").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await
+            .expect("partial content must be returned, not Err");
+        assert_eq!(
+            completion.content, "partial",
+            "accumulated delta must survive the mid-stream read error",
+        );
+        assert_eq!(
+            completion.finish_reason.as_deref(),
+            Some("interrupted"),
+            "partial completion must carry the interrupted sentinel",
+        );
+        assert!(
+            completion.tool_calls.is_empty(),
+            "half-received tool calls must be dropped from a partial completion",
+        );
+    }
+
+    #[tokio::test]
     async fn stream_fallback_delegates_to_complete() {
         // MockProvider doesn't override stream, so it falls back to complete.
         // Verify the fallback path works by using a MockProvider.
@@ -2139,5 +2278,644 @@ data: [DONE]
                 || v["reasoning_content"] == serde_json::Value::Null,
             "non-assistant messages must not include reasoning_content"
         );
+    }
+
+    #[tokio::test]
+    async fn post_json_with_retry_gives_up_after_max_empty_body_retries() {
+        // Kills `attempt += 1 -> -= 1` (usize underflow panic) and
+        // `+= 1 -> *= 1` (attempt stuck → infinite retry → test-timeout)
+        // at the HTTP-200-empty-body retry site (line 168). An always-empty
+        // 200 body makes real code give up after max_retries with Err.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(10),
+            });
+        let result = provider
+            .post_json_with_retry(
+                &format!("http://{addr}/chat"),
+                &serde_json::json!({}),
+                "test",
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "must give up after max_retries empty-body responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_with_retry_gives_up_after_max_transient_http_retries() {
+        // Kills `attempt += 1` mutants at the transient-HTTP retry site
+        // (line 191): always-503 server → real code gives up with Err.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"error":"boom"}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(10),
+            });
+        let result = provider
+            .post_json_with_retry(
+                &format!("http://{addr}/chat"),
+                &serde_json::json!({}),
+                "test",
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "must give up after max_retries transient HTTP failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_with_retry_gives_up_after_max_network_retries() {
+        // Kills `attempt += 1 -> *= 1` at the network-error retry site
+        // (line 207): server accepts and drops 3 times → real code gives up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(10),
+            });
+        let result = provider
+            .post_json_with_retry(
+                &format!("http://{addr}/chat"),
+                &serde_json::json!({}),
+                "test",
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "must give up after max_retries network failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_inner_gives_up_after_max_transient_http_retries() {
+        // Kills `attempt += 1` mutants at the stream_inner transient-HTTP
+        // retry site (line 595): always-503 server → real code gives up.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"error":"boom"}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(10),
+            });
+        let result = provider
+            .stream_inner(&[Message::user("hi")], &[], None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "stream_inner must give up after max_retries transient HTTP failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_inner_gives_up_after_max_network_retries() {
+        // Kills `attempt += 1` mutants at the stream_inner network-error
+        // retry site (line 610): server accepts and drops 3 times.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(10),
+            });
+        let result = provider
+            .stream_inner(&[Message::user("hi")], &[], None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "stream_inner must give up after max_retries network failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_with_search_without_deferred_delegates_to_stream() {
+        // Kills `-> Ok(Default::default())` (302:9) in stream_with_search:
+        // with no deferred tools it must delegate to stream_inner and return
+        // the streamed content (not an empty default).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello search\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream_with_search(&[Message::user("hi")], &[], &[], None, None)
+            .await
+            .expect("stream_with_search without deferred tools should succeed");
+        assert_eq!(completion.content, "hello search");
+    }
+
+    #[tokio::test]
+    async fn stream_search_loop_resolves_round_trip_and_stops() {
+        // Kills `-> Ok(Default::default())` (460:9), `== -> !=` (473:30) and
+        // `+ -> -` / `+ -> *` (529:19) in run_stream_search_loop: a round-0
+        // ToolSearchTool call must be resolved via a tool result and the
+        // round-1 (non-search) completion returned. The `-` mutant underflows
+        // (panic), `*` keeps round at 0 → infinite recursion (test-timeout).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    let req = String::from_utf8_lossy(&buf);
+                    let body = if req.contains("\"role\":\"tool\"") {
+                        // Round 1+: search resolved → final text
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    } else {
+                        // Round 0: ask for a ToolSearchTool call
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"ts1\",\"function\":{\"name\":\"ToolSearchTool\",\"arguments\":\"{\\\"query\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let deferred = vec![(make_tool_spec("MyTool"), None)];
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_search_engine(Arc::new(AlwaysReturnsEngine(vec!["MyTool".to_string()])));
+        let completion = provider
+            .stream_with_search(&[Message::user("hi")], &[], &deferred, None, None)
+            .await
+            .expect("stream search loop should complete");
+        assert_eq!(completion.content, "final answer");
+        assert!(
+            completion.tool_calls.is_empty(),
+            "round-1 completion must not carry a search call"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_search_loop_honors_zero_max_rounds() {
+        // Kills `>= -> <` (480:18): with max_search_rounds=0 the FIRST search
+        // call must be returned as-is; the `<` mutant would recurse forever
+        // (round < 0 is never true → test-timeout).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"ts1\",\"function\":{\"name\":\"ToolSearchTool\",\"arguments\":\"{\\\"query\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let deferred = vec![(make_tool_spec("MyTool"), None)];
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_search_engine(Arc::new(AlwaysReturnsEngine(vec![])))
+            .with_max_search_rounds(0);
+        let completion = provider
+            .stream_with_search(&[Message::user("hi")], &[], &deferred, None, None)
+            .await
+            .expect("round-0 search call must be returned as-is");
+        assert!(
+            !completion.tool_calls.is_empty(),
+            "the round-0 search-call completion must be returned when max rounds is 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_search_loop_stops_after_max_rounds_with_persistent_search_calls() {
+        // Kills `+ -> *` (529:19): `round * 1` keeps round at 0, so a server
+        // that ALWAYS returns a ToolSearchTool call makes the mutant recurse
+        // forever (test-timeout), while real code stops at max_search_rounds
+        // (default 3 → 4 stream calls) and returns the last completion.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"ts1\",\"function\":{\"name\":\"ToolSearchTool\",\"arguments\":\"{\\\"query\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let deferred = vec![(make_tool_spec("MyTool"), None)];
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_search_engine(Arc::new(AlwaysReturnsEngine(vec![])));
+        let completion = provider
+            .stream_with_search(&[Message::user("hi")], &[], &deferred, None, None)
+            .await
+            .expect("loop must terminate at max_search_rounds");
+        assert!(
+            !completion.tool_calls.is_empty(),
+            "the last search-call completion must be returned when rounds are exhausted"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "rounds 0..=3 = 4 stream calls with default max_search_rounds=3"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_returns_partial_when_only_reasoning_accumulated() {
+        // Kills `have_partial` reasoning-condition mutants (delete `!` on
+        // `!reasoning_content.is_empty()`, `|| -> &&` at 705): a stream that
+        // carried ONLY reasoning must still return a partial Completion on a
+        // mid-stream read error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"},\"finish_reason\":null}]}\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                9999,
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await
+            .expect("reasoning-only partial must be returned, not Err");
+        assert_eq!(completion.finish_reason.as_deref(), Some("interrupted"));
+        assert_eq!(completion.content, "");
+        assert_eq!(
+            completion.reasoning_content.as_deref(),
+            Some("Let me think"),
+            "accumulated reasoning must survive the mid-stream error"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_returns_partial_when_only_tool_call_started() {
+        // Kills `have_partial` tool-call-condition mutants (delete `!` on
+        // `!tool_call_builders.is_empty()`, `|| -> &&` at 705): a stream that
+        // started a tool call (but no text) must still return a partial
+        // Completion on a mid-stream read error, with the half-received tool
+        // call dropped (orphan risk).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                9999,
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await
+            .expect("tool-call-only partial must be returned, not Err");
+        assert_eq!(completion.finish_reason.as_deref(), Some("interrupted"));
+        assert_eq!(completion.content, "");
+        assert!(
+            completion.tool_calls.is_empty(),
+            "half-received tool calls must be dropped from a partial completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_processes_trailing_line_without_newline() {
+        // Kills `delete !` on `if !line_buf.is_empty()` (769): a final SSE
+        // `data:` line without a terminating newline must still be processed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // NOTE: the last delta line has NO trailing newline.
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await
+            .expect("stream should complete");
+        assert_eq!(
+            completion.content, "Hello world",
+            "trailing line without newline must still be processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_completion_keeps_tool_call_with_empty_id_but_name() {
+        // Kills `&& -> ||` at 810 in build_completion: a tool call is only
+        // DROPPED when BOTH id and name are empty. A call with an empty id
+        // but a real name must be kept.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // No `id` field → id stays ""; name "Read" is set.
+            let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await
+            .expect("stream should complete");
+        assert_eq!(
+            completion.tool_calls.len(),
+            1,
+            "tool call with empty id but real name must be kept"
+        );
+        assert_eq!(completion.tool_calls[0].name, "Read");
+    }
+
+    #[test]
+    fn process_sse_line_accumulates_non_empty_reasoning() {
+        // Kills `delete !` on `!delta_reasoning.is_empty()` (879): non-empty
+        // reasoning_content deltas must be accumulated.
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tcb = std::collections::HashMap::new();
+        let mut fr = None;
+        let mut usage = None;
+        OpenAiProvider::process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"abc\"},\"finish_reason\":null}]}",
+            "m",
+            &mut content,
+            &mut reasoning,
+            &mut tcb,
+            &mut fr,
+            &mut usage,
+            &None,
+        )
+        .unwrap();
+        assert_eq!(reasoning, "abc");
+    }
+
+    #[test]
+    fn process_sse_line_sets_tool_call_id_and_name() {
+        // Kills `delete !` on `!id.is_empty()` (896) and `!name.is_empty()`
+        // (902): tool_calls deltas must fill the builder's id and name.
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tcb = std::collections::HashMap::new();
+        let mut fr = None;
+        let mut usage = None;
+        OpenAiProvider::process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}",
+            "m",
+            &mut content,
+            &mut reasoning,
+            &mut tcb,
+            &mut fr,
+            &mut usage,
+            &None,
+        )
+        .unwrap();
+        let entry = tcb.get(&0).expect("tool call builder entry must exist");
+        assert_eq!(entry.0, "call_9");
+        assert_eq!(entry.1, "Read");
+    }
+
+    #[test]
+    fn process_sse_line_cache_miss_prefers_explicit() {
+        // Kills `> -> <` on `explicit_miss > 0` (949): an explicit non-zero
+        // miss must win over the derived prompt - hit value.
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tcb = std::collections::HashMap::new();
+        let mut fr = None;
+        let mut usage = None;
+        OpenAiProvider::process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_cache_hit_tokens\":3,\"prompt_cache_miss_tokens\":5}}",
+            "m",
+            &mut content,
+            &mut reasoning,
+            &mut tcb,
+            &mut fr,
+            &mut usage,
+            &None,
+        )
+        .unwrap();
+        let u = usage.expect("usage must be set");
+        assert_eq!(u.cache_miss_tokens, 5);
+    }
+
+    #[test]
+    fn process_sse_line_cache_miss_zero_when_no_hit() {
+        // Kills `> -> >=` on `cache_hit > 0` (951): with no hit and no
+        // explicit miss, the miss must be 0 (not prompt - 0).
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tcb = std::collections::HashMap::new();
+        let mut fr = None;
+        let mut usage = None;
+        OpenAiProvider::process_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":0}}",
+            "m",
+            &mut content,
+            &mut reasoning,
+            &mut tcb,
+            &mut fr,
+            &mut usage,
+            &None,
+        )
+        .unwrap();
+        let u = usage.expect("usage must be set");
+        assert_eq!(u.cache_miss_tokens, 0);
+    }
+
+    #[test]
+    fn to_token_usage_cache_miss_prefers_explicit_positive() {
+        // Kills `match guard m > 0 -> false` (1138:24) and `> -> <`
+        // (1138:26) in ResponseUsage::to_token_usage: an explicit positive
+        // miss must be honored over deriving from prompt - hit.
+        let ru = ResponseUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(2),
+            total_tokens: Some(12),
+            prompt_cache_hit_tokens: Some(0),
+            prompt_cache_miss_tokens: Some(5),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+        let tu = ru.to_token_usage();
+        assert_eq!(tu.cache_miss_tokens, 5);
     }
 }

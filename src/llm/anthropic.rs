@@ -344,6 +344,30 @@ impl AnthropicProvider {
                 tokio::select! {
                     biased;
                     _ = ct.cancelled() => {
+                        // Goal 382: a user-initiated cancel mid-stream should
+                        // still persist whatever content already arrived. If
+                        // anything accumulated, return it as a partial
+                        // Completion (finish_reason "interrupted" sentinel);
+                        // run_inner routes it to FinishReason::Cancelled.
+                        // With nothing accumulated there is nothing to save —
+                        // keep the original Err(Error::Cancelled) so
+                        // run_inner's Cancelled arm handles it.
+                        let have_partial = !acc.content.is_empty()
+                            || !acc.reasoning_content.is_empty()
+                            || !acc.tool_calls.is_empty();
+                        if have_partial {
+                            tracing::warn!(
+                                target: "recursive::llm",
+                                content_len = acc.content.len(),
+                                "SSE stream cancelled; returning partial completion"
+                            );
+                            // Drop half-received tool calls (orphan risk).
+                            acc.tool_calls.clear();
+                            return Ok(Self::build_completion(
+                                acc,
+                                Some("interrupted".to_string()),
+                            ));
+                        }
                         return Err(Error::Cancelled);
                     }
                     next = byte_stream.next() => next,
@@ -353,7 +377,29 @@ impl AnthropicProvider {
             };
             let bytes = match chunk_result {
                 Some(Ok(c)) => c,
-                Some(Err(e)) => return Err(self.make_err(format!("SSE stream read error: {e}"))),
+                Some(Err(e)) => {
+                    // Goal 382: a network drop mid-stream currently discards
+                    // everything accumulated in `acc`. If any content
+                    // arrived, return it as a partial Completion so the
+                    // caller persists it (the "interrupted" sentinel routes
+                    // to FinishReason::Cancelled). A drop before the first
+                    // token has nothing to save — keep the Err.
+                    let have_partial = !acc.content.is_empty()
+                        || !acc.reasoning_content.is_empty()
+                        || !acc.tool_calls.is_empty();
+                    if have_partial {
+                        tracing::warn!(
+                            target: "recursive::llm",
+                            error = %e,
+                            content_len = acc.content.len(),
+                            "SSE stream interrupted; returning partial completion"
+                        );
+                        // Drop half-received tool calls (orphan risk).
+                        acc.tool_calls.clear();
+                        return Ok(Self::build_completion(acc, Some("interrupted".to_string())));
+                    }
+                    return Err(self.make_err(format!("SSE stream read error: {e}")));
+                }
                 None => break,
             };
             let combined: Vec<u8> = if incomplete.is_empty() {
@@ -379,6 +425,24 @@ impl AnthropicProvider {
                 }
             }
         }
+        Self::warn_incomplete_utf8_tail(&incomplete);
+        if !line_buf.is_empty() {
+            self.process_sse_line(&line_buf, &mut acc, &stream_tx)?;
+        }
+
+        // Normal end of stream: assemble the Completion from the accumulated
+        // state (shared with the Goal-382 partial-return paths above).
+        let finish_reason = std::mem::take(&mut acc.finish_reason);
+        Ok(Self::build_completion(acc, finish_reason))
+    }
+
+    /// Log (and discard) a trailing incomplete UTF-8 sequence at end of stream.
+    ///
+    /// `#[mutants::skip]`: this helper only emits a warning, so mutating the
+    /// `!is_empty` check is behavior-equivalent and untestable without
+    /// asserting on log output.
+    #[cfg_attr(test, mutants::skip)]
+    fn warn_incomplete_utf8_tail(incomplete: &[u8]) {
         if !incomplete.is_empty() {
             tracing::warn!(
                 target: "recursive::llm",
@@ -386,10 +450,14 @@ impl AnthropicProvider {
                 "SSE stream ended with incomplete UTF-8 sequence; discarding tail bytes"
             );
         }
-        if !line_buf.is_empty() {
-            self.process_sse_line(&line_buf, &mut acc, &stream_tx)?;
-        }
+    }
 
+    /// Assemble a [`Completion`] from the accumulated SSE state. Shared by
+    /// the normal end-of-stream path and the Goal-382 partial-return paths
+    /// (stream read error / user-initiated cancel mid-stream). The
+    /// provider-level `finish_reason` is mapped to the OpenAI-compatible
+    /// naming used across the runtime.
+    fn build_completion(acc: SseAccum, finish_reason: Option<String>) -> Completion {
         // Build final TokenUsage from accumulated fields
         let usage = if acc.input_tokens.is_some() || acc.output_tokens.is_some() {
             let prompt = acc.input_tokens.unwrap_or(0);
@@ -433,10 +501,10 @@ impl AnthropicProvider {
             })
             .collect();
 
-        Ok(Completion {
+        Completion {
             content: acc.content,
             tool_calls: final_tool_calls,
-            finish_reason: acc.finish_reason.map(|r| match r.as_str() {
+            finish_reason: finish_reason.map(|r| match r.as_str() {
                 "end_turn" => "stop".to_string(),
                 "max_tokens" => "length".to_string(),
                 "tool_use" => "tool_calls".to_string(),
@@ -448,7 +516,7 @@ impl AnthropicProvider {
             } else {
                 Some(acc.reasoning_content)
             },
-        })
+        }
     }
 
     /// Process a single SSE line, mutating `acc` and forwarding any text /
@@ -591,12 +659,10 @@ impl AnthropicProvider {
                         .map(|v| v as u32);
                 }
             }
-            "message_stop" => {
-                // End of stream - nothing to extract
-            }
-            "ping" => {
-                // Anthropic sends periodic pings to keep the connection alive
-            }
+            // `message_stop` and `ping` are no-op frames (end-of-stream marker
+            // and keep-alive respectively); they intentionally fall through to
+            // the `_` arm. Keeping them as explicit empty arms would create
+            // dead "delete match arm" mutants with no behavioral difference.
             _ => {
                 tracing::debug!(target: "recursive::llm", event = %event_type, data = %data, "unhandled SSE event");
             }
@@ -1491,6 +1557,66 @@ data: {\"type\":\"message_stop\"}
     }
 
     #[tokio::test]
+    async fn parse_sse_stream_returns_partial_on_mid_stream_error() {
+        // Goal 382: mirror of the openai.rs test — a network drop mid-stream
+        // must NOT discard the text already accumulated in SseAccum. Serve a
+        // couple of text deltas, then close the connection early with a
+        // Content-Length LARGER than the body so the client's next
+        // bytes_stream().next() sees a truncated-body read error (the
+        // `Some(Err(e))` arm this goal touches).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Hello\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" partial\"}}
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                9999,
+                body,
+            ).unwrap();
+            stream.flush().unwrap();
+            // Normal FIN close: the truncated body (9999 declared vs body.len()
+            // sent) makes the client's next read error, deterministically.
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
+            .await
+            .expect("partial content must be returned, not Err");
+        assert_eq!(
+            completion.content, "Hello partial",
+            "accumulated deltas must survive the mid-stream read error",
+        );
+        assert_eq!(
+            completion.finish_reason.as_deref(),
+            Some("interrupted"),
+            "partial completion must carry the interrupted sentinel",
+        );
+        assert!(
+            completion.tool_calls.is_empty(),
+            "half-received tool calls must be dropped from a partial completion",
+        );
+    }
+
+    #[tokio::test]
     async fn test_e2_stream_thinking_deltas_populate_reasoning() {
         // A streaming response with thinking_delta events must accumulate
         // into reasoning_content while text_delta stays in content.
@@ -1984,5 +2110,393 @@ data: {\"type\":\"message_stop\"}
             acc.reasoning_content, "step 1",
             "empty thinking must not change reasoning"
         );
+    }
+
+    #[test]
+    fn supports_deferred_tools_default_false_and_env_override() {
+        // Kills `-> true` (177:9) and `== -> !=` (178:58) in
+        // supports_deferred_tools: with a non-official base URL and no env
+        // override the answer must be false; RECURSIVE_DEFERRED_TOOLS=1/true
+        // must flip it to true.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let provider = AnthropicProvider::new("http://third-party:9999", "sk-noop", "m").unwrap();
+        let orig = std::env::var("RECURSIVE_DEFERRED_TOOLS").ok();
+        std::env::remove_var("RECURSIVE_DEFERRED_TOOLS");
+        assert!(
+            !provider.supports_deferred_tools(),
+            "non-official base URL + env unset must be false"
+        );
+        std::env::set_var("RECURSIVE_DEFERRED_TOOLS", "1");
+        assert!(
+            provider.supports_deferred_tools(),
+            "env '1' must override to true"
+        );
+        std::env::set_var("RECURSIVE_DEFERRED_TOOLS", "true");
+        assert!(
+            provider.supports_deferred_tools(),
+            "env 'true' must override to true"
+        );
+        match orig {
+            Some(v) => std::env::set_var("RECURSIVE_DEFERRED_TOOLS", v),
+            None => std::env::remove_var("RECURSIVE_DEFERRED_TOOLS"),
+        }
+    }
+
+    #[test]
+    fn serialize_messages_keeps_user_message_after_tool_result() {
+        // Kills `!= -> ==` at 852:57 in serialize_messages_anthropic: the
+        // inner tool-result collection loop must BREAK on a following plain
+        // user message; the `==` mutant would consume that user message
+        // without serializing it (it has no tool_call_id to emit).
+        let msgs = vec![
+            Message::tool_result("call_1".to_string(), "done".to_string()),
+            Message::user("next question".to_string()),
+        ];
+        let wire = serialize_messages_anthropic(&msgs);
+        assert_eq!(
+            wire.len(),
+            2,
+            "tool result AND following user message must both be serialized; got {wire:?}"
+        );
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[1]["role"], "user");
+        assert_eq!(wire[1]["content"], "next question");
+    }
+
+    #[tokio::test]
+    async fn post_with_retry_gives_up_after_max_transient_http_retries() {
+        // Kills `attempt += 1 -> -= 1` (usize underflow panic on the first
+        // retry) and `+= 1 -> *= 1` (attempt stuck at 0 → the loop retries
+        // forever and hits the mutants test-timeout) at the transient-HTTP
+        // retry site (line 140). A server that ALWAYS answers 503 makes the
+        // real code give up after max_retries (backoff_for returns None).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"error":"boom"}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        provider.retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(10),
+        };
+        let result = provider
+            .post_with_retry(&format!("http://{addr}/v1/messages"), &json!({}))
+            .await;
+        assert!(
+            result.is_err(),
+            "must give up after max_retries transient HTTP failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_with_retry_gives_up_after_max_network_retries() {
+        // Kills `attempt += 1` mutants at the network-error retry site
+        // (line 155): server accepts then immediately drops the connection
+        // 3 times → real code gives up with Err; `-=` panics on the first
+        // retry and `*=` loops forever (test-timeout = caught).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        provider.retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(10),
+        };
+        let result = provider
+            .post_with_retry(&format!("http://{addr}/v1/messages"), &json!({}))
+            .await;
+        assert!(
+            result.is_err(),
+            "must give up after max_retries network failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_inner_gives_up_after_max_transient_http_retries() {
+        // Kills `attempt += 1` mutants at the stream_inner transient-HTTP
+        // retry site (line 281): always-503 server → real code gives up
+        // with Err after max_retries.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"error":"boom"}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        provider.retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(10),
+        };
+        let result = provider
+            .stream_inner(&[Message::user("hi".to_string())], &[], None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "stream_inner must give up after max_retries transient HTTP failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_inner_gives_up_after_max_network_retries() {
+        // Kills `attempt += 1` mutants at the stream_inner network-error
+        // retry site (line 297): server accepts and drops 3 times.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        provider.retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(10),
+        };
+        let result = provider
+            .stream_inner(&[Message::user("hi".to_string())], &[], None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "stream_inner must give up after max_retries network failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_returns_partial_when_only_reasoning_accumulated() {
+        // Kills the `have_partial` reasoning-condition mutants (delete `!` on
+        // `!acc.reasoning_content.is_empty()`, `|| -> &&` at line 389) AND the
+        // deleted `content_block_start "thinking"` arm (line 598): a stream
+        // that carried ONLY a thinking block must still return a partial
+        // Completion on a mid-stream read error (content empty, reasoning
+        // non-empty).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"Let me reason\"}}
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                9999,
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
+            .await
+            .expect("reasoning-only partial must be returned, not Err");
+        assert_eq!(completion.finish_reason.as_deref(), Some("interrupted"));
+        assert_eq!(completion.content, "", "no text content was streamed");
+        assert_eq!(
+            completion.reasoning_content.as_deref(),
+            Some("Let me reason"),
+            "accumulated thinking must survive the mid-stream error"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_returns_partial_when_only_tool_call_started() {
+        // Kills the `have_partial` tool-call-condition mutants (delete `!` on
+        // `!acc.tool_calls.is_empty()`, `|| -> &&` at line 389): a stream that
+        // started a tool_use block (but no text) must still return a partial
+        // Completion on a mid-stream read error, with the half-received tool
+        // call dropped (orphan risk).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Read\",\"input\":{}}}
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                9999,
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
+            .await
+            .expect("tool-call-only partial must be returned, not Err");
+        assert_eq!(completion.finish_reason.as_deref(), Some("interrupted"));
+        assert_eq!(completion.content, "", "no text content was streamed");
+        assert!(
+            completion.tool_calls.is_empty(),
+            "half-received tool calls must be dropped from a partial completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_processes_trailing_line_without_newline() {
+        // Kills `delete !` on `if !line_buf.is_empty()` (line 435): a final
+        // SSE `data:` line without a terminating newline must still be
+        // processed at end of stream.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // NOTE: the last delta line has NO trailing newline.
+            let body = "\
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Hello\"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
+            .await
+            .expect("stream should complete");
+        assert_eq!(
+            completion.content, "Hello world",
+            "trailing line without newline must still be processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_completion_usage_from_input_tokens_only() {
+        // Kills `|| -> &&` at line 452 in build_completion: usage must be
+        // assembled when ONLY input_tokens arrived (message_start) and
+        // output_tokens was never reported (no message_delta). The `&&`
+        // mutant would drop the usage entirely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}
+";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
+        let completion = provider
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
+            .await
+            .expect("stream should complete");
+        let usage = completion
+            .usage
+            .expect("usage must be present when input_tokens was reported");
+        assert_eq!(usage.prompt_tokens, 7);
+    }
+
+    #[test]
+    fn process_sse_line_thinking_block_start_populates_reasoning() {
+        // Kills `delete match arm "thinking"` (line 598): a content_block_start
+        // of type "thinking" carrying an initial thinking chunk must land in
+        // `acc.reasoning_content`.
+        let provider = AnthropicProvider::new("http://localhost:0", "sk-noop", "m").unwrap();
+        let mut acc = SseAccum::default();
+        provider
+            .process_sse_line("event: content_block_start", &mut acc, &None)
+            .unwrap();
+        let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"initial thought"}}"#;
+        provider.process_sse_line(line, &mut acc, &None).unwrap();
+        assert_eq!(acc.reasoning_content, "initial thought");
     }
 }
