@@ -14,7 +14,7 @@
 //! Reference: <https://a2a-protocol.org/v1.0.0/specification/>
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, LOCATION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -172,6 +172,15 @@ impl A2aCallTool {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            // Do not follow redirects. `validate_url` (url_guard) checks only
+            // the *initial* URL, so reqwest's default policy (follow up to 10
+            // redirects) would let a public A2A server 302-redirect a request
+            // to a private/internal host after the guard passed — an SSRF
+            // bypass (same fix as web_fetch.rs, Goal 372). Under
+            // `Policy::none()` a 3xx comes back as a normal response and each
+            // call site rejects it explicitly instead of issuing a second
+            // request.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
     }
 }
@@ -318,6 +327,12 @@ impl Tool for A2aCallTool {
         })?;
 
         let status = resp.status();
+        // With `Policy::none()` a 3xx is a normal response, not an error —
+        // reject it explicitly. Following `Location` would bypass the SSRF
+        // URL guard (the redirect target is not validated).
+        if status.is_redirection() {
+            return Err(redirect_error("a2a_call", &resp, status));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Ok(format!("ERROR: HTTP {status} from {send_url}: {body}"));
@@ -346,9 +361,31 @@ impl Tool for A2aCallTool {
                     text
                 });
             }
-            SendMessageResponse::HasTask { mut task } => {
+            SendMessageResponse::HasTask { task } => {
                 // ── Async mode: return task ID + background poll script ──────
                 if use_async {
+                    // Security: the server controls `task.id`, and it gets
+                    // embedded into a shell one-liner the model hands to
+                    // `run_background`. Only `[A-Za-z0-9._-]` ids are safe to
+                    // interpolate; anything else (quotes, `;`, backtick, `$()`,
+                    // whitespace) falls back to synchronous polling instead of
+                    // building an injectable script.
+                    if !is_safe_task_id(&task.id) {
+                        let unsafe_id = task.id.clone();
+                        let result = poll_task_to_completion(
+                            &client,
+                            base,
+                            task,
+                            authorization,
+                            timeout_secs,
+                        )
+                        .await?;
+                        return Ok(format!(
+                            "WARNING: A2A server returned unsafe task.id {unsafe_id:?}; \
+async_mode ignored, polling synchronously\n{result}"
+                        ));
+                    }
+
                     let task_id = &task.id;
                     let state = task.status.state.as_str();
                     // Build a shell one-liner the agent can pass to run_background.
@@ -373,75 +410,132 @@ When the background job completes, a new turn will start automatically with the 
                     ));
                 }
 
-                // ── Step 3: poll until terminal state ─────────────────────
-                let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-                let task_url = format!("{base}/tasks/{}", task.id);
-
-                while !task.status.state.is_terminal() {
-                    if Instant::now() >= deadline {
-                        return Ok(format!(
-                            "ERROR: task {} timed out after {}s (last state: {})",
-                            task.id,
-                            timeout_secs,
-                            task.status.state.as_str()
-                        ));
-                    }
-
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-
-                    let mut poll_req = client.get(&task_url);
-                    if let Some(auth) = authorization {
-                        poll_req = poll_req.header(AUTHORIZATION, auth);
-                    }
-
-                    let poll_resp = poll_req.send().await.map_err(|e| Error::Tool {
-                        name: "a2a_call".into(),
-                        call_id: None,
-                        message: format!("network error polling {task_url}: {e}"),
-                    })?;
-
-                    let poll_status = poll_resp.status();
-                    if !poll_status.is_success() {
-                        let err_body = poll_resp.text().await.unwrap_or_default();
-                        return Ok(format!(
-                            "ERROR: HTTP {poll_status} polling {task_url}: {err_body}"
-                        ));
-                    }
-
-                    let poll_body = poll_resp.text().await.map_err(|e| Error::Tool {
-                        name: "a2a_call".into(),
-                        call_id: None,
-                        message: format!("failed to read poll response: {e}"),
-                    })?;
-
-                    let updated: Task =
-                        serde_json::from_str(&poll_body).map_err(|e| Error::Tool {
-                            name: "a2a_call".into(),
-                            call_id: None,
-                            message: format!("invalid task poll response: {e}\nbody: {poll_body}"),
-                        })?;
-
-                    task = updated;
-                }
-
-                // ── Step 4: extract result ─────────────────────────────────
-                match task.status.state {
-                    TaskState::Completed => {
-                        let text = artifacts_to_text(&task.artifacts);
-                        Ok(if text.is_empty() {
-                            "(task completed with no artifact text)".to_string()
-                        } else {
-                            text
-                        })
-                    }
-                    other => Ok(format!(
-                        "ERROR: task {} ended with state {}",
-                        task.id,
-                        other.as_str()
-                    )),
-                }
+                // ── Step 3 (sync): poll until terminal state ──────────────
+                poll_task_to_completion(&client, base, task, authorization, timeout_secs).await
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redirect + async task.id hardening (Goal 378)
+// ---------------------------------------------------------------------------
+
+/// Build the error surfaced when an A2A server answers with a redirect.
+///
+/// With `Policy::none()` a 3xx arrives as a normal response, not an error, so
+/// it must be rejected explicitly: following `Location` could bypass the SSRF
+/// URL guard by pointing the next request at a private/internal host (Goal 372).
+/// The redirect is never followed.
+fn redirect_error(name: &str, resp: &reqwest::Response, status: reqwest::StatusCode) -> Error {
+    let location = resp
+        .headers()
+        .get(LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>");
+    Error::Tool {
+        name: name.into(),
+        call_id: None,
+        message: format!(
+            "A2A server returned redirect ({}) to {location}",
+            status.as_u16()
+        ),
+    }
+}
+
+/// Whitelist for A2A `task.id` values that may be embedded into the async-mode
+/// shell one-liner.
+///
+/// The id is server-controlled, so only `[A-Za-z0-9._-]` is allowed — any
+/// shell metacharacter (`'`, `;`, backtick, `$()`, whitespace) is rejected and
+/// the caller falls back to synchronous polling instead of building an
+/// injectable script.
+fn is_safe_task_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// Poll `task` via `GET {base}/tasks/{id}` until it reaches a terminal state
+/// and return the plain result string.
+///
+/// Shared by the synchronous path and by the `async_mode` fallback when the
+/// server returns a `task.id` that is not safe to embed in the background poll
+/// script.
+async fn poll_task_to_completion(
+    client: &reqwest::Client,
+    base: &str,
+    mut task: Task,
+    authorization: Option<&str>,
+    timeout_secs: u64,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let task_url = format!("{base}/tasks/{}", task.id);
+
+    while !task.status.state.is_terminal() {
+        if Instant::now() >= deadline {
+            return Ok(format!(
+                "ERROR: task {} timed out after {}s (last state: {})",
+                task.id,
+                timeout_secs,
+                task.status.state.as_str()
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut poll_req = client.get(&task_url);
+        if let Some(auth) = authorization {
+            poll_req = poll_req.header(AUTHORIZATION, auth);
+        }
+
+        let poll_resp = poll_req.send().await.map_err(|e| Error::Tool {
+            name: "a2a_call".into(),
+            call_id: None,
+            message: format!("network error polling {task_url}: {e}"),
+        })?;
+
+        let poll_status = poll_resp.status();
+        if poll_status.is_redirection() {
+            return Err(redirect_error("a2a_call", &poll_resp, poll_status));
+        }
+        if !poll_status.is_success() {
+            let err_body = poll_resp.text().await.unwrap_or_default();
+            return Ok(format!(
+                "ERROR: HTTP {poll_status} polling {task_url}: {err_body}"
+            ));
+        }
+
+        let poll_body = poll_resp.text().await.map_err(|e| Error::Tool {
+            name: "a2a_call".into(),
+            call_id: None,
+            message: format!("failed to read poll response: {e}"),
+        })?;
+
+        let updated: Task = serde_json::from_str(&poll_body).map_err(|e| Error::Tool {
+            name: "a2a_call".into(),
+            call_id: None,
+            message: format!("invalid task poll response: {e}\nbody: {poll_body}"),
+        })?;
+
+        task = updated;
+    }
+
+    match task.status.state {
+        TaskState::Completed => {
+            let text = artifacts_to_text(&task.artifacts);
+            Ok(if text.is_empty() {
+                "(task completed with no artifact text)".to_string()
+            } else {
+                text
+            })
+        }
+        other => Ok(format!(
+            "ERROR: task {} ended with state {}",
+            task.id,
+            other.as_str()
+        )),
     }
 }
 
@@ -547,6 +641,12 @@ async fn execute_streaming(
     })?;
 
     let status = resp.status();
+    // With `Policy::none()` a 3xx is a normal response, not an error —
+    // reject it explicitly. Following `Location` would bypass the SSRF URL
+    // guard (the redirect target is not validated).
+    if status.is_redirection() {
+        return Err(redirect_error("a2a_call", &resp, status));
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Ok(format!("ERROR: HTTP {status} from {stream_url}: {body}"));
@@ -848,6 +948,12 @@ impl Tool for A2aCardTool {
         })?;
 
         let status = resp.status();
+        // With `Policy::none()` a 3xx is a normal response, not an error —
+        // reject it explicitly. Following `Location` would bypass the SSRF URL
+        // guard (the redirect target is not validated).
+        if status.is_redirection() {
+            return Err(redirect_error("a2a_card", &resp, status));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Ok(format!("ERROR: HTTP {status} from {card_url}: {body}"));
@@ -1001,6 +1107,12 @@ impl Tool for A2aTaskCheckTool {
         })?;
 
         let status = resp.status();
+        // With `Policy::none()` a 3xx is a normal response, not an error —
+        // reject it explicitly. Following `Location` would bypass the SSRF URL
+        // guard (the redirect target is not validated).
+        if status.is_redirection() {
+            return Err(redirect_error("a2a_task_check", &resp, status));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Ok(format!("ERROR: HTTP {status} from {task_url}: {body}"));
@@ -1044,6 +1156,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Spawn a one-shot mock HTTP server on an ephemeral port.
@@ -1543,5 +1656,128 @@ mod tests {
                 other => panic!("expected BadToolArgs for {bad_url}, got {other:?}"),
             }
         }
+    }
+
+    // ── Goal 378: redirects disabled + async task.id sanitization ─────────
+
+    /// A 302 (any 3xx) must be surfaced as an explicit redirect error and the
+    /// `Location` target must never be fetched — following it would bypass the
+    /// SSRF URL guard (same fix as web_fetch.rs, Goal 372).
+    #[tokio::test]
+    async fn redirect_response_is_rejected_without_following() {
+        // Target server: if the client followed the Location header, this
+        // accept fires and the hit counter increments.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_target = hits.clone();
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = target_listener.accept() {
+                hits_target.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        // Redirecting server: answers the initial POST with a 302 to target.
+        let body = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/tasks/evil\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let raw_resp: &'static str = Box::leak(body.into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aCallTool::new_unchecked();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "prompt": "hello"
+            }))
+            .await;
+
+        // The 3xx must be surfaced explicitly, mentioning status + Location.
+        match result {
+            Err(Error::Tool { message, .. }) => {
+                assert!(message.contains("redirect"), "got: {message}");
+                assert!(message.contains("302"), "got: {message}");
+                assert!(message.contains(&target_addr.to_string()), "got: {message}");
+            }
+            other => panic!("expected redirect Tool error, got: {other:?}"),
+        }
+
+        // …and the Location target must never have been fetched.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "redirect Location target was fetched — SSRF bypass"
+        );
+    }
+
+    /// A server-controlled `task.id` containing shell metacharacters must
+    /// never be embedded into the async-mode poll script; the call falls back
+    /// to synchronous polling with a warning instead.
+    #[tokio::test]
+    async fn async_mode_unsafe_task_id_falls_back_to_sync() {
+        let submitted_resp = make_json_response(
+            r#"{"task":{"id":"\"; rm -rf /; echo \"","status":{"state":"TASK_STATE_SUBMITTED"},"artifacts":[]}}"#,
+        );
+        let completed_resp = make_json_response(
+            r#"{"id":"x","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"parts":[{"text":"sync result"}]}]}}"#,
+        );
+        let submitted_resp: &'static str = Box::leak(submitted_resp.into_boxed_str());
+        let completed_resp: &'static str = Box::leak(completed_resp.into_boxed_str());
+        let addr = spawn_sequential_mock_server(vec![submitted_resp, completed_resp]);
+
+        let tool = A2aCallTool::new_unchecked();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "prompt": "do it",
+                "async_mode": true,
+                "timeout_secs": 10
+            }))
+            .await;
+
+        match result {
+            Ok(out) => {
+                assert!(out.contains("WARNING"), "got: {out}");
+                assert!(out.contains("unsafe task.id"), "got: {out}");
+                // No background poll script may be built for an unsafe id.
+                assert!(!out.contains("curl"), "got: {out}");
+            }
+            // reqwest may refuse to even build the poll URL for an id with
+            // quotes — that is also an acceptable "no injection" outcome.
+            Err(Error::Tool { message, .. }) => {
+                assert!(!message.contains("curl"), "got: {message}");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A well-formed task id (`t-123_abc.xyz`) still produces the async poll
+    /// script exactly as before.
+    #[tokio::test]
+    async fn async_mode_safe_task_id_produces_poll_script() {
+        let body = r#"{"task":{"id":"t-123_abc.xyz","status":{"state":"TASK_STATE_SUBMITTED"},"artifacts":[]}}"#;
+        let raw_resp = Box::leak(make_json_response(body).into_boxed_str());
+        let addr = spawn_mock_server(raw_resp);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let tool = A2aCallTool::new_unchecked();
+        let result = tool
+            .execute(json!({
+                "url": format!("http://{addr}"),
+                "prompt": "do something slow",
+                "async_mode": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.contains("TASK_ID: t-123_abc.xyz"), "got: {result}");
+        assert!(result.contains("curl"), "got: {result}");
+        assert!(result.contains("tasks/t-123_abc.xyz"), "got: {result}");
     }
 }
