@@ -24,28 +24,55 @@ use crate::app::{App, InputMode};
 /// internally). The +2 below accounts for the box's borders.
 pub const MAX_VISIBLE_ROWS: u16 = 6;
 
+/// Columns reserved on the left/right of the input box: the `Block`
+/// borders (1 + 1).
+const BORDER_WIDTH: u16 = 2;
+/// Columns reserved on the first content row: the mode indicator plus a
+/// separating space (e.g. `❯ `).
+const PREFIX_WIDTH: u16 = 2;
+
 /// Total height the chat layout should reserve for the input + footer
 /// stack, given the current buffer.
-pub fn total_height(app: &App) -> u16 {
-    // Estimate based on logical lines - the actual rendering will wrap as needed
-    let logical_lines = app.prompt.buffer.lines().count().max(1);
-    let trailing = if app.prompt.buffer.ends_with('\n') {
-        1
-    } else {
-        0
-    };
-    let estimated_lines = (logical_lines + trailing) as u16;
-    estimated_lines.clamp(1, MAX_VISIBLE_ROWS) + 2 /* borders */ + 1 /* footer */
+///
+/// `area_width` is the width of the rectangle the chat layout will hand
+/// to [`render`] — the input box spans the full terminal width. We fold
+/// every logical line with [`wrap_line_by_width`] so a pasted long
+/// paragraph (no `'\n'`) expands the box just like many short lines
+/// would; counting only logical lines (the old estimator) left a long
+/// paste stuck at one row and clipped it on render.
+pub fn total_height(app: &App, area_width: u16) -> u16 {
+    let avail = available_text_width_from(area_width);
+    let buf = &app.prompt.buffer;
+
+    // `split('\n')` already turns a trailing newline into a trailing
+    // empty segment, so we don't need the old `ends_with('\n')` +1
+    // correction — the segment count is the visual row count.
+    let mut visual_lines: u16 = 0;
+    for line in buf.split('\n') {
+        visual_lines = visual_lines.saturating_add(wrap_line_by_width(line, avail).len() as u16);
+    }
+    // An empty buffer still yields one segment, so this `.max(1)` is a
+    // belt-and-braces guard for the saturating-add path above.
+    let visual_lines = visual_lines.max(1);
+
+    visual_lines
+        .clamp(1, MAX_VISIBLE_ROWS)
+        .saturating_add(BORDER_WIDTH)
+        .saturating_add(1 /* footer */)
 }
 
-/// Calculate the available width for text content in the input box.
-///
-/// Subtracts the box borders (2 columns) and the prefix width (indicator + space)
-/// from the total input area width.
+/// Calculate the available width for text content in the input box from
+/// a rendered [`Rect`] (used by [`render`]).
 fn available_text_width(area: Rect) -> usize {
-    let border_width = 2; // left and right borders
-    let prefix_width = 2; // indicator + space (e.g., "❯ ")
-    area.width.saturating_sub(border_width + prefix_width) as usize
+    available_text_width_from(area.width)
+}
+
+/// Same width math as [`available_text_width`] but starting from a bare
+/// column count, so [`total_height`] can estimate before any `Rect`
+/// exists — the chat layout calls it to size the very `Rect` it will
+/// later pass to [`render`].
+fn available_text_width_from(area_width: u16) -> usize {
+    area_width.saturating_sub(BORDER_WIDTH.saturating_add(PREFIX_WIDTH)) as usize
 }
 
 /// Wrap a single line of text to fit within the available width.
@@ -204,20 +231,44 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         all_lines
     };
 
-    let input = Paragraph::new(lines).block(
+    // Compute cursor visual position with wrapped lines considered,
+    // BEFORE rendering, so we can derive the vertical scroll offset that
+    // keeps the cursor's wrapped row inside the visible content window.
+    // The input box has 1-cell border and a 2-cell prefix ("X "),
+    // so the first column of editable content is `area.x + 1 + 2`.
+    let (col, cursor_row) = cursor_visual_position_wrapped(buffer, cursor_byte, avail_width);
+
+    // Visible content rows inside the box (height minus the two border
+    // rows). Capped at MAX_VISIBLE_ROWS by the layout, but compute from
+    // the actual area so a squeezed terminal still behaves.
+    let visible_rows = input_area.height.saturating_sub(BORDER_WIDTH).max(1);
+    // Scroll so the cursor row stays within the window. We follow the
+    // cursor the way an editor does: only scroll when the cursor would
+    // fall outside `[scroll_y, scroll_y + visible_rows)`. This is what
+    // lets the user paste a long paragraph and then keep typing at the
+    // end — without it, `Paragraph` is top-anchored and clips every row
+    // past `visible_rows`, hiding the cursor's real edit position.
+    let scroll_y = cursor_row
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(cursor_row);
+
+    let input = Paragraph::new(lines).scroll((scroll_y, 0)).block(
         Block::default()
             .borders(Borders::ALL)
             .title(input_box_title(mode)),
     );
     frame.render_widget(input, input_area);
 
-    // Compute cursor visual position with wrapped lines considered.
-    // The input box has 1-cell border and a 2-cell prefix ("X "),
-    // so the first column of editable content is `area.x + 1 + 2`.
-    let (col, row) = cursor_visual_position_wrapped(buffer, cursor_byte, avail_width);
-    let cursor_x = input_area.x.saturating_add(1).saturating_add(2 + col);
-    let cursor_y = input_area.y.saturating_add(1).saturating_add(row);
-    // Clamp inside the input frame.
+    // Translate the cursor's wrapped row back to screen coordinates by
+    // subtracting the scroll offset, then clamp inside the input frame.
+    let cursor_x = input_area
+        .x
+        .saturating_add(1)
+        .saturating_add(PREFIX_WIDTH + col);
+    let cursor_y = input_area
+        .y
+        .saturating_add(1)
+        .saturating_add(cursor_row.saturating_sub(scroll_y));
     let max_x = input_area.x + input_area.width.saturating_sub(2);
     let max_y = input_area.y + input_area.height.saturating_sub(2);
     let cx = cursor_x.min(max_x);
@@ -488,13 +539,47 @@ mod tests {
         let mut app = App::new();
         app.screen = AppScreen::Chat;
         app.prompt.buffer = "a".into();
-        let h1 = total_height(&app);
+        let h1 = total_height(&app, 80);
         app.prompt.buffer = "a\nb\nc\nd\ne\nf\ng".into();
-        let h_max = total_height(&app);
+        let h_max = total_height(&app, 80);
         assert!(h_max > h1);
         // The input box itself is capped at MAX_VISIBLE_ROWS rows of
         // editable area, plus 2 for borders, plus 1 for the footer.
         assert!(h_max <= MAX_VISIBLE_ROWS + 2 + 1);
+    }
+
+    /// A long single-line paste (no `'\n'`) MUST expand the box the same
+    /// way many short lines do. This is the regression for the original
+    /// bug: `total_height` used to count only logical lines, so a long
+    /// paste was estimated at one row and got clipped on render.
+    #[test]
+    fn total_height_grows_with_wrapped_long_line() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+
+        // Wide terminal → short buffer fits on one visual row.
+        app.prompt.buffer = "a".into();
+        let h_short = total_height(&app, 80);
+
+        // Same logical-line count (1) but content that wraps to many
+        // visual rows at width 10. avail = 10 - 4 = 6 cols; "abcdef" is
+        // one row, "abcdefghijkl" → 2 rows, "abcdefghijklmn" → 3 rows.
+        app.prompt.buffer = "abcdefghijklmn".into(); // 14 chars → 3 rows @ 6 cols
+        let h_long = total_height(&app, 10);
+
+        // Same number of logical lines, but the wrapped estimate must be
+        // taller than the single-row estimate.
+        assert!(
+            h_long > h_short,
+            "a long wrapped line should grow the box past one row: h_long={h_long} h_short={h_short}"
+        );
+        // 3 visual rows + 2 border + 1 footer.
+        assert_eq!(h_long, 3 + 2 + 1);
+
+        // Push well past MAX_VISIBLE_ROWS: height must cap, not overflow.
+        app.prompt.buffer = "a".repeat(200);
+        let h_cap = total_height(&app, 10);
+        assert_eq!(h_cap, MAX_VISIBLE_ROWS + 2 + 1);
     }
 
     #[test]
@@ -597,6 +682,50 @@ mod tests {
         assert!(
             text.contains("! a"),
             "expected `! a` prefix on the first content row; got {text:?}"
+        );
+    }
+
+    /// When the buffer wraps to more rows than the box can show AND the
+    /// cursor is at the end (the paste-then-keep-typing case), the
+    /// renderer must scroll so the cursor's row is visible. Without the
+    /// scroll, `Paragraph` is top-anchored and the tail of a long paste
+    /// is clipped off-screen — the original bug.
+    #[test]
+    fn render_scrolls_to_keep_cursor_visible_when_buffer_overflows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+
+        // Build a long single-line buffer that wraps to MANY rows at the
+        // narrow width we render with. End it with a unique sentinel so
+        // we can assert its presence on screen. 30 'A's + "Z" = 31 chars.
+        // At avail width 4 → 8 wrapped rows (4 chars per row). The box
+        // (area height 6 → 4 content rows after borders) can't show all
+        // 8 at once, so the tail "Z" is only visible if we scroll to it.
+        app.prompt.buffer = format!("{}Z", "A".repeat(30));
+        app.prompt.cursor = app.prompt.buffer.len(); // cursor at the end
+
+        // area width 8 → avail = 8 - 4 = 4 cols. area height 6 → input
+        // box height 5 (6 - 1 footer) → visible content rows = 3.
+        let backend = TestBackend::new(8, 6);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|fr| render(fr, fr.area(), &app))
+            .expect("draw infallible");
+        let buf = term.backend().buffer();
+
+        // The whole screen — the sentinel must be somewhere visible.
+        let mut all = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                all.push_str(buf.cell((x, y)).expect("cell").symbol());
+            }
+            all.push('\n');
+        }
+        assert!(
+            all.contains('Z'),
+            "cursor's tail row should be scrolled into view; got screen:\n{all}"
         );
     }
 

@@ -36,7 +36,7 @@ fn todo_panel_height(app: &App) -> u16 {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let input_total = input::total_height(app);
+    let input_total = input::total_height(app, frame.area().width);
     let todo_height = todo_panel_height(app);
     // Fix-E: show a 1-row approval banner when a plan is awaiting the
     // user's decision. The banner replaces the floating modal and keeps
