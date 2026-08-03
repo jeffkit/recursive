@@ -1,9 +1,39 @@
 # Issue — `agent-mutants` gate runs FULL 4918 mutants + timeout escapes as orphan process
 
-**状态**: 待解决（supervisor 修复，非 goal——lesson 21：脚手架归 supervisor）
+**状态**: ✅ 已修复（commit `efacc40`，2026-08-03，supervisor 直接提交）
 **发现时间**: 2026-08-03（Goal 376 run selfimprove-1785690279657）
 **影响**: 本应 diff-scope 的 `agent-mutants` gate 跑了全量 4918 mutants，40min timeout
 后 cargo-mutants 逃逸成孤儿进程继续跑，flow 的 runGate await 卡死直到人工 kill
+
+---
+
+## 根因（两处，均已修复）
+
+### Bug 1 — `set -- "${ARGS[@]:-}"` bash 3.2 空数组陷阱（agent/cli-mutants.sh）
+
+`set -- "${ARGS[@]:-}"` 在 ARGS 为空数组时，`:-` 默认值语法把**空展开**替换成
+**一个空字符串参数** → `$#=1, $1=""` → 后续 `elif [[ $# -gt 0 ]]` 分支被触发
+（本意是走 default auto-detect 分支）→ `for f in ""` → `--file ""`（空 glob）→
+cargo-mutants 变异**整个 crate**。tui-mutants.sh 用的是 `set -- ${ARGS[@]:0}`
+（安全形式），agent/cli 两个脚本没对齐。
+
+修复：两处改为 `set -- ${ARGS[@]:0}`（bash 3.2 实测：空数组 → `$#=0`，走 auto-detect）。
+
+### Bug 2 — flowcast spawnCapture 等 `close` 而非 `exit`（flow 层卡死）
+
+`spawnCapture` 的 Promise 等子进程 `close` 事件（**所有 stdio 流关闭**），不是
+`exit`（进程退出）。gate 超时触发时，它只 SIGTERM/SIGKILL **直接子进程**（`sh -c`
+的 sh）；孙进程（cargo-mutants → cargo test）逃逸成孤儿并**继续持有 stdout/stderr
+管道** → `close` 永不触发 → runGate 的 await 永不 resolve → **flow 卡死**
+（state 停在 `gate.<name>`，进程/tmux 都活着，看起来健康实则无进展）。
+Goal 376 实测：gate timeout 配置 40min，error 事件在 86min 后才落盘（supervisor
+手动 kill 孤儿 cargo-mutants 触发管道关闭才 resolve）。
+
+修复：flow 层加 `runGateWithWatchdog`——gate 自身 timeout 后 +15s，按命令特征
+（cargo-mutants / cargo mutants / *-mutants.sh）做 pgrep **基线对比**（不杀并发
+worktree 的兄弟 gate），对本次新增的 pid 递归 kill 整棵进程树 → 管道关闭 →
+spawnCapture `close` 触发 → runGate 正常抛 GateError(timeout) → flow 继续走
+resume-fix / preserve。单测模拟：孙进程逃逸 → kill → `CLOSE_FIRED` ✓。
 
 ---
 
