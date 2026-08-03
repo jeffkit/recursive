@@ -113,16 +113,25 @@ run_mutants() {
   #   3 = some mutations timed out, none missed → tests detected the mutation (infinite loop
   #       / non-termination) but just slowly; this is acceptable → treat as success (exit 0)
   # Any other non-zero code (e.g. 1 = baseline test failure) is preserved as-is.
-  local rc=0
+  # NOTE: observed (2026-08-03, cargo-mutants 27.1.0) that exit 3 can accompany a report
+  # containing MISSED lines — blanket-passing rc=3 would false-green them. Check the text.
+  local rc=0 out
+  out=$(mktemp)
   if [[ -n "$FEATURES" ]]; then
-    cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" "$@" || rc=$?
+    cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
   else
-    cargo mutants -p "$CRATE" "${mode_args[@]}" "$@" || rc=$?
+    cargo mutants -p "$CRATE" "${mode_args[@]}" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
   fi
   if [[ "$rc" -eq 3 ]]; then
-    echo "note: cargo-mutants exited 3 (timeouts only, no missed mutants) — treating as pass" >&2
-    return 0
+    if grep -q "MISSED" "$out"; then
+      echo "note: cargo-mutants exited 3 but the report contains MISSED mutants — treating as FAILURE" >&2
+      rc=2
+    else
+      echo "note: cargo-mutants exited 3 (timeouts only, no missed mutants) — treating as pass" >&2
+      rc=0
+    fi
   fi
+  rm -f "$out"
   return "$rc"
 }
 

@@ -1168,6 +1168,18 @@ mod tests {
         assert!(A2aCallTool::new().is_deferred());
     }
 
+    /// `a2a_card` is also deferred (network tool) — same pin as above.
+    #[test]
+    fn a2a_card_tool_is_deferred() {
+        assert!(A2aCardTool::new().is_deferred());
+    }
+
+    /// `a2a_task_check` is also deferred (network tool) — same pin as above.
+    #[test]
+    fn a2a_task_check_tool_is_deferred() {
+        assert!(A2aTaskCheckTool::new().is_deferred());
+    }
+
     /// Spawn a one-shot mock HTTP server on an ephemeral port.
     /// `response_body` is the raw HTTP response (including headers) the server sends.
     fn spawn_mock_server(response_body: &'static str) -> std::net::SocketAddr {
@@ -1397,6 +1409,10 @@ mod tests {
         let summary = card.summary();
         assert!(summary.contains("Agent: Weather Bot"), "{summary}");
         assert!(summary.contains("Streaming: supported"), "{summary}");
+        assert!(
+            summary.contains("Description: Provides forecasts."),
+            "{summary}"
+        );
         assert!(
             summary.contains("Push notifications: not supported"),
             "{summary}"
