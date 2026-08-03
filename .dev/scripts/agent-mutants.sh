@@ -16,8 +16,14 @@
 #   agent-mutants.sh --list-files            # list source files cargo-mutants sees
 #
 # Exit code is non-zero if any mutant survives, so this can gate a commit.
-# --jobs N>1 uses copy mode (real source untouched).
-# --jobs 1 (default) uses --in-place, guarded against contamination (see below).
+# --jobs N>1 uses copy mode (real source untouched). --jobs 1 (explicit)
+# uses --in-place, guarded against contamination (see below).
+#
+# Default is parallel copy mode (--jobs = CPU count): the real source is
+# never mutated (no clobber risk, uncommitted changes are safe) and the
+# wall-clock time drops from ~60s/mutant to ~60s/batch. Before this default
+# (2026-08-03) single-threaded --in-place runs took ~65-75min for ~69 mutants
+# and blew the 40min gate timeout on every attempt.
 #
 # Prereq: `cargo install cargo-mutants` (global). The CI / self-improve
 # environment is expected to have it on PATH.
@@ -31,7 +37,11 @@ CRATE="recursive-agent"
 # weixin is excluded here (UI-only, no agent-kernel logic under test).
 FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,coordinator-mode"
 
-JOBS=1
+# Default: parallel copy mode. --jobs N runs N cargo build/test jobs
+# concurrently; JOBS>1 drops --in-place (parallel in-place mutation would
+# race on the same source file) and uses cargo-mutants' copy mode instead —
+# the real source is never mutated, so assert_clean below is a no-op.
+JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
@@ -97,6 +107,12 @@ cleanup_mutants() {
 trap cleanup_mutants EXIT
 
 assert_clean() {
+  if [[ "$JOBS" -gt 1 ]]; then
+    # copy mode: the real source is never mutated, so uncommitted changes
+    # are safe — skip the refusal entirely (flow runs gates BEFORE commit,
+    # so the agent's changes are uncommitted on the first attempt).
+    return 0
+  fi
   local dirty=()
   for f in "$@"; do
     if [[ -f "$f" ]] && ! git diff --quiet -- "$f" 2>/dev/null; then

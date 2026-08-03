@@ -1159,6 +1159,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// `a2a_call` must run in deferred (async) mode — pin `is_deferred` so a
+    /// mutant flipping it to false (making a2a_call synchronous) is caught.
+    /// (2026-08-03: cargo-mutants reported this mutant MISSED — the async-mode
+    /// behaviour was unpinned. Goal 378 follow-up.)
+    #[test]
+    fn a2a_call_tool_is_deferred() {
+        assert!(A2aCallTool::new().is_deferred());
+    }
+
     /// Spawn a one-shot mock HTTP server on an ephemeral port.
     /// `response_body` is the raw HTTP response (including headers) the server sends.
     fn spawn_mock_server(response_body: &'static str) -> std::net::SocketAddr {

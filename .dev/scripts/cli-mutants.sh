@@ -20,7 +20,10 @@ set -euo pipefail
 CRATE="recursive-cli"
 # No special features beyond defaults for this crate.
 FEATURES=""
-JOBS=1
+# Default: parallel copy mode (--jobs = CPU count) — real source never
+# mutated, uncommitted changes safe, and total time ~time/cores vs
+# ~60s/mutant single-threaded (2026-08-03 gate-timeout incident).
+JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
@@ -79,6 +82,10 @@ cleanup_mutants() {
 trap cleanup_mutants EXIT
 
 assert_clean() {
+  if [[ "$JOBS" -gt 1 ]]; then
+    # copy mode: real source never mutated — uncommitted changes are safe.
+    return 0
+  fi
   local dirty=()
   for f in "$@"; do
     if [[ -f "$f" ]] && ! git diff --quiet -- "$f" 2>/dev/null; then

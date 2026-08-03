@@ -778,6 +778,26 @@ async function main() {
   // ── 殭尸进程清理：杀掉本 repo 下挂起的旧 recursive 进程 ─────────
   killStaleRecursiveProcs(repo, runId)
 
+  // ── 磁盘守卫：可用空间不足时拒绝启动 ─────────────────────────
+  // 2026-08-03 事故：三个 run 并发、每个 worktree target 膨胀 ~20G（主 repo 44G + 3 worktree），
+  // 磁盘临时耗尽 → cargo-mutants --in-place 写变异源码时 ENOSPC（os error 28）→ 验证全部失败。
+  // 阈值默认 20G（≥2 个 worktree 的最坏 target 增长），可用空间不足直接 fail-fast。
+  // opt-out / 调阈值：RECURSIVE_MIN_FREE_DISK_GIB=<n>。
+  await cp.step('preflight.disk', () => {
+    const minGiB = Number(process.env.RECURSIVE_MIN_FREE_DISK_GIB ?? 20)
+    const out = execFileSync('df', ['-k', repo], { encoding: 'utf8' })
+    const availKiB = Number(out.trim().split('\n').pop().split(/\s+/)[3])
+    const availGiB = availKiB / 1024 / 1024
+    if (!Number.isFinite(availGiB) || availGiB < minGiB) {
+      throw new Error(
+        `free disk ${Number.isFinite(availGiB) ? availGiB.toFixed(1) : '?'}Gi < ${minGiB}Gi threshold — refusing to start run ` +
+        `(worktree target dirs grow ~20G each; ENOSPC previously killed cargo-mutants verification). ` +
+        `Free space first (e.g. remove stale .worktrees/*/target) or set RECURSIVE_MIN_FREE_DISK_GIB.`,
+      )
+    }
+    console.log(`  [preflight.disk] ${availGiB.toFixed(1)}Gi free (min ${minGiB}Gi) ✓`)
+  })
+
   // ── 预检：捕获 baseline（持久化，续跑复用同一 baseline）──────────
   const baseline = await cp.step('preflight.baseline', () =>
     captureBaseline(repo, { requireClean: true }),

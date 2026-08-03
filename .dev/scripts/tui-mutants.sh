@@ -40,7 +40,10 @@ FEATURES="recursive/test-utils,weixin"
 # on the same source file) and use cargo-mutants' copy mode instead —
 # the real source is never mutated, so the contamination guard below is
 # a harmless no-op in that case.
-JOBS=1
+# Default is parallel copy mode (--jobs = CPU count); --jobs 1 is the
+# explicit single-threaded --in-place mode (2026-08-03: single-threaded
+# runs blew the gate timeout; copy mode also tolerates uncommitted changes).
+JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
@@ -114,6 +117,10 @@ cleanup_mutants() {
 trap cleanup_mutants EXIT
 
 assert_clean() {
+  if [[ "$JOBS" -gt 1 ]]; then
+    # copy mode: real source never mutated — uncommitted changes are safe.
+    return 0
+  fi
   # Refuse to mutate files with uncommitted changes — restore would clobber them.
   local dirty=()
   for f in "$@"; do
