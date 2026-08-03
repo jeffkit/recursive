@@ -56,7 +56,7 @@ Returns a compact one-line-per-skill list injected at Layer 0 position 9:
 
 ```
 rust-patch-discipline: Surgical-edit guide for Rust files using V4A apply_patch
-recursive-loop: Loop orchestrator for the Recursive self-improvement workflow
+loop-supervise: Monitor+intervene playbook for long-running commands and the self-improve flow
 ```
 
 This gives the agent a menu of available skills without loading their full content.
@@ -77,7 +77,8 @@ are large.
 | Skill | Mode | Description |
 |-------|------|-------------|
 | `rust-patch-discipline` | manual | V4A apply_patch guide |
-| `recursive-loop` | manual | Self-improve loop orchestrator |
+| `loop-supervise` | trigger | Monitor+intervene playbook (long-running commands, self-improve flow) |
+| `self-improve-cycle` | trigger | Orchestrate a full review→goal→iterate cycle (parallel explore, concurrency, distill) |
 | `gitnexus-guide` | manual | GitNexus tools reference |
 | `gitnexus-impact-analysis` | manual | Blast-radius analysis |
 | `gitnexus-debugging` | manual | Bug tracing with GitNexus |

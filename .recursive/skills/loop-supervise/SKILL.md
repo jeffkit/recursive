@@ -1,7 +1,7 @@
 ---
 type: Skill
 name: loop-supervise
-description: "Monitor+intervene playbook for the event-driven /loop. Use when the user wants to run a long-running command and watch it, intervening only when it needs a decision or fix it can't make itself. Generic pattern first; includes a dedicated section for Recursive's own self-improve flow (.dev/flows/self-improve.flow.js) with the flow-specific launch args, event schema, and intervention rules (the recursive-loop skill is referenced where it exists, but this skill is self-contained for the flow too)."
+description: "Monitor+intervene playbook for the event-driven /loop. Use when the user wants to run a long-running command and watch it, intervening only when it needs a decision or fix it can't make itself. Generic pattern first; includes a dedicated section for Recursive's own self-improve flow (.dev/flows/self-improve.flow.js) with the flow-specific launch args, event schema, verdict handling, and intervention rules — self-contained, no other skill required."
 mode: trigger
 triggers: supervise, monitor, watch, 盯, 盯着, 盯住, 长跑, loop, 跑着, 看着
 ---
@@ -18,9 +18,9 @@ command itself comes from the user's natural-language prompt.
 This is the generic pattern. It also carries a **dedicated section below**
 ("Recursive self-improve flow — flow-specific rules") for Recursive's own
 self-improve flow (`.dev/flows/self-improve.flow.js`): the launch args, event
-schema, and the flow-specific traps that the generic SOP doesn't cover. If
-the `recursive-loop` skill exists in this checkout it has the same info in
-more depth; either is fine to follow.
+schema, verdict handling, and the flow-specific traps that the generic SOP
+doesn't cover. The flow section is self-contained — follow it when supervising
+a self-improve goal; no separate skill is needed.
 
 ## Tools (use them; if one isn't in your eager tool list, `tool_search` for it by name)
 
@@ -118,17 +118,43 @@ The generic SOP above covers launch → watch → intervene → stop. When the
 supervised command is **Recursive's own self-improve flow**
 (`.dev/scripts/launch-flow.sh` → `.dev/flows/self-improve.flow.js`), these
 extra rules apply. They are distilled from real supervised runs; the generic
-SOP alone will steer you into at least four avoidable traps.
+SOP alone will steer you into a dozen avoidable traps.
 
 The flow runs inside a **tmux session**, is **resumable by `--run-id`**, and
 writes everything under `<repo>/.flowcast/runs/<run-id>/` (`state.json`,
 `run.log.jsonl`, `report.md`, `system-prompt.md`, `transcript.json`).
-Verdicts: `committed` (green + review passed → on `main`) ·
-`failed-preserved` (gate/review loop exhausted → worktree +
-`refs/preserve/<run-id>` kept, **not** rolled back) · `skip-commit` ·
-`panic-preserved`.
 
-**Flow-specific traps (do not learn these the hard way):**
+### Step chain (so you know what phase you're in)
+
+```
+preflight.* (baseline capture, build, baseline-tests, worktree, provider ping, gate-prereqs)
+  → run.recursive   (the agent edits code in an isolated git worktree — the LONG phase, 10–25 min)
+  → gate.test/clippy/fmt/e2e + tui/agent/cli presence & mutants + flow-watchdog
+  → review          (cross-provider self-review)
+  → commit.prep / commit.land  (lands on main via fast-forward)
+  → verdict
+```
+
+Verdicts: `committed` (all green + review passed → on `main`) ·
+`failed-preserved` (gate/review loop exhausted OR watchdog killed the agent →
+worktree + `refs/preserve/<run-id>` kept, **not** rolled back) · `skip-commit`
+(no edits / `--no-commit` / reviewer unavailable) · `panic-preserved`.
+
+### Tick cadence by phase
+
+Preflight is fast (~30–90s) → heartbeat 60–90s. `run.recursive` is the long
+phase (10–25 min for a real change) → heartbeat 150–240s. Gate phase is
+bursty → heartbeat 60–120s. Lean longer when stable, shorter after a state
+change. At launch, **capture run-id + tmux session name + log path** — you'll
+need all three, and the log path changes on every relaunch (trap 2 below).
+
+Read progress in one shot from `state.json`:
+
+```bash
+python3 -c "import json;d=json.load(open('<repo>/.flowcast/runs/<run-id>/state.json'));print(d['status'],d.get('currentStep'),d.get('verdict','-'),d.get('failedStep','-'));print([s['key'] for s in d['steps'] if s['status']=='done'])"
+```
+
+### Flow-specific traps (do not learn these the hard way)
 
 1. **Never pre-compile before launch.** The flow's `preflight.build` step
    builds `recursive-cli` itself. If you run `cargo build --release` in
@@ -149,7 +175,13 @@ Verdicts: `committed` (green + review passed → on `main`) ·
    outputs; it does **not** restore the goal text. Always pass both:
    `launch-flow.sh --run-id <id> --goal-file .dev/goals/NN-*.md --provider ...`
 
-4. **Diagnose without polluting `main`.** The flow refuses a dirty `.dev/`
+4. **The dirty-tree guard has TWO layers.** `launch-flow.sh` checks
+   `git status --porcelain`, AND flowcast's own `withSelfModGuard` re-checks
+   at `preflight.baseline`. Loosening the launcher alone is useless.
+   **Commit every goal draft (even untracked) before launching** — there is
+   no shortcut.
+
+5. **Diagnose without polluting `main`.** The flow refuses a dirty `.dev/`
    (`withSelfModGuard`), so any patch to `.dev/flows/*.js` must be committed
    before it can run — and forgotten `wip(diag)` commits then sit on `main`
    ahead of the real goal commit (observed: two throwaway diagnostic commits
@@ -158,7 +190,104 @@ Verdicts: `committed` (green + review passed → on `main`) ·
    the flow, commit → run → `git revert` (never `reset`; the goal commit sits
    on top and revert keeps history honest).
 
-These four are flow-specific; the two cross-cutting rules — **probe liveness
-before declaring healthy** (SOP step 5) and **don't intervene on a gate the
-worker is already fixing** (Discipline, `onFail: resume-fix`) — are already
-covered above and apply to the flow too.
+### Gate semantics (know the `onFail` policy before judging a red)
+
+- **`onFail: resume-fix` means the worker is already fixing it.** A red gate
+  is fed back into the agent's transcript as more work — the agent re-invokes
+  the very gate script you see "failing". Watch the `gate.<name>.fix-N`
+  counter in the done list. Gate run count = 1 (flow's first) + N fix rounds;
+  `MAX_FIX_ROUNDS` defaults to **3**. Step in only when the counter is
+  exhausted (→ `failed-preserved`) or the failure is environmental (a missing
+  service the agent structurally can't install).
+- **`gate.e2e.fix-1` is NORMAL for any goal touching `src/`** — expect it,
+  don't panic, don't intervene. The first e2e run often times out because the
+  docker build eats the whole gate timeout; on fix-1 the image is cached and
+  it passes. Only worry at `.fix-2`/`.fix-3` → `failed-preserved`.
+- **e2e is the cost center.** Any goal touching `src/` or `crates/*/src/`
+  pays a docker build (the e2e image compiles recursive + AWS SDK). The
+  cargo-chef 3-stage `e2e/Dockerfile` caches the 588-dep cooker layer, so a
+  src/ change is ~1 min once the cache is warm; tests/docs/`.dev/`-only goals
+  **skip e2e entirely** (diff-scope short-circuit, ~400ms). **Batch
+  pure-test/docs goals** — they finish in minutes while an e2e-heavy goal
+  churns. Never re-add `COPY src` to the planner stage; it invalidates the
+  cooker cache and reverts every worktree build to ~12 min.
+- **A gate that completes in ~100ms is NOT passing — it's broken.** Every
+  mutants gate was silently false-green for a period: `gates.json` invoked
+  bash-only scripts via `sh` (abort at parse time), and a `trap` re-emitted
+  `$?` captured inside the trap (0), masking the abort as passed. If any gate
+  shows suspiciously fast completion (<1s for something that compiles), grep
+  its `result.output` in `run.log.jsonl` for `syntax error` / `command not
+  found` / `unexpected token`. A real cargo-mutants run takes minutes.
+
+### Verdict handling & rescue
+
+- **`committed`** → confirm it actually landed:
+  `git -C <repo> merge-base --is-ancestor <commit> main && echo ON_MAIN`.
+  Then **verify the product yourself** — a green workspace doesn't prove the
+  agent added the test the goal required. Run the goal's headline test BY
+  NAME (`cargo test <name-substring>`) and re-run the relevant test subset
+  rather than trusting the gates.
+- **`failed-preserved` ≠ broken code.** This verdict means a gate/review loop
+  exhausted OR the `no-growth-hung` watchdog mis-killed the agent during a
+  synchronous finishing move (writing the journal, a final `cargo test`) that
+  produced zero transcript growth. The agent's complete, self-verified edit
+  survives in `refs/preserve/<run-id>` + a `preserve: <reason>` commit in the
+  worktree. Decide:
+  - **Watchdog mis-fire, code looks correct** (the common rescue): read the
+    failure log to confirm, then cherry-pick the preserve commit. **Scan for
+    cargo-mutants contamination first** — `grep -rln "changed by
+    cargo-mutants" src/ crates/` and `git checkout --` every hit; an
+    interrupted `--in-place` run leaves `||`→`&&`-style mutations that
+    survive cherry-pick (two real incidents). Then independently run the
+    three gates (`fmt --check`, `clippy -D warnings`, `test`). Green → amend
+    the message to `feat/fix(...): Goal NNN — …`; red → `git reset --hard
+    ORIG_HEAD` and report. Do NOT re-run the goal from scratch — it burns
+    another 25 min and may hit the same watchdog.
+  - **Genuinely broken after MAX_FIX_ROUNDS**: leave it preserved, read the
+    failure context, write a follow-up goal. Do NOT cherry-pick code that
+    failed its own gates.
+- **`skip-commit`** → read `report.md` detail (no edits / `--no-commit` /
+  reviewer unavailable). If the reviewer was unavailable the changes are kept
+  uncommitted — report to the user for manual review.
+- **`panic-preserved`** → the agent process panicked; the scene is kept for
+  diagnosis. Do not roll back; read the transcript and report.
+- Clean up after: `git -C <repo> worktree remove .worktrees/<run-id> --force`
+  (flow usually does this for `committed`; `failed-preserved` leaves it at
+  `.worktrees/preserve/<run-id>` — remove it yourself), `tmux kill-session`
+  for leftovers, delete `/tmp` scratch files, `git revert` any diagnostic
+  commits you left on main.
+
+### Supervisor discipline (goal-writing & stance)
+
+- **Goals change the AGENT's source, not the scaffolding.** A self-improve
+  goal may only edit `src/`, `crates/*/src/`, `Cargo.toml`, `tests/`, `e2e/`.
+  `.dev/scripts/*.sh`, `.dev/flows/*.js`, `.flowcast/gates.json`, and the
+  skill files are supervisor infrastructure — "the examinee rewriting the
+  exam". If a cycle finds a scaffolding bug, fix it with a direct commit, not
+  a goal.
+- **Write goals to be unambiguous and prescriptive** — the agent only has the
+  goal text. Each goal: **Why** (root cause with file:line), **Scope** (do
+  exactly this — numbered steps with code), **Files NOT to touch**, **Tests**
+  (name the headline regression test), **Acceptance** (exact gate commands),
+  **Notes for the agent** (invariant #1 trap, API signatures, ordering). A
+  design-principle check that the change does NOT branch
+  `run_core.rs::run_inner` is the #1 way goals survive review. Mirror a
+  recent same-flavour goal's format.
+- **Sequence goals by leverage, mix scopes**: real bugs > invariant/gate
+  holes > test gaps > cleanup. Deliberately mix src/ and tests-only goals in
+  a batch — tests-only skip e2e and keep momentum while an e2e-heavy goal
+  churns.
+- **Stop an agent that over-spends its budget self-checking.** If
+  `run.recursive` runs >2× longer than similar goals AND the log shows the
+  agent polling a long background job (`cargo mutants`, `cargo test --all`,
+  a big build) instead of editing, it has finished writing and is
+  over-verifying (zero transcript growth → watchdog-bait). Read the worktree
+  diff; if the changes look complete, stop the flow (`tmux kill-session` +
+  `pkill`), rescue the worktree, and verify yourself — the gate phase exists
+  to run the expensive checks. (Incident: goal 373, rescued as `82d7ccb`.)
+- **Don't push unless the user asks.** Self-improve commits land on the local
+  repo's `main`; "land" and "publish" are different actions.
+- **All git targets the recursive repo, never the surrounding monorepo.**
+  When supervising from a monorepo root, resolve the recursive root first
+  (`[ -f .dev/flows/self-improve.flow.js ] && RR=. || RR=recursive`) and run
+  every git/launch command from there.

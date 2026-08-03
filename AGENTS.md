@@ -190,9 +190,15 @@ Hard-won rules:
 
 ## Skills available
 
-- `/recursive-loop` — act as loop orchestrator: read roadmap, pick goals, launch
-  the Flowcast self-improve flow, handle results. Use when the user wants
-  Recursive to self-improve rather than you directly editing code.
+- `/loop-supervise` — supervisor playbook for long-running commands and
+  Recursive's own self-improve flow: launch `launch-flow.sh`, monitor to
+  verdict, intervene only when the flow can't self-heal. Use when the user
+  wants Recursive to self-improve rather than you directly editing code.
+- `/self-improve-cycle` — orchestrate a full self-improve cycle: parallel
+  Explore sub-agents review the codebase → generate goals → iterate them
+  through the flow (sequential or concurrent) → distill lessons into skills →
+  report. Use for periodic quality sweeps ("找问题跑自迭代"). Depends on
+  `loop-supervise` for per-goal supervision.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

@@ -1,7 +1,7 @@
 ---
 type: Skill
 name: self-improve-supervise
-description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Event-driven: arm a Bash watcher with run_in_background: true; the kernel wakes you with a <task-notification> when the flow reaches verdict or dies. Foreground sleep+probe is only a forensic fallback for between-tick steering. (This contrasts with recursive's *own* loop-supervise / recursive-loop skills, which target recursive's kernel and use its run_background/watch_file/schedule_wakeup/stop_loop/tool_search toolset.)"
+description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Event-driven: arm a Bash watcher with run_in_background: true; the kernel wakes you with a <task-notification> when the flow reaches verdict or dies. Foreground sleep+probe is only a forensic fallback for between-tick steering. (This contrasts with recursive's *own* loop-supervise skill, which targets recursive's kernel and uses its run_background/watch_file/schedule_wakeup/stop_loop toolset.)"
 mode: trigger
 triggers: self-improve, self improve, 自改, 跑一个goal, 跑一个 goal, 带跑, supervisor, 督战
 ---
@@ -26,10 +26,10 @@ change in the `recursive` sub-repo.
 > the next state change).
 >
 > This skill is the **ZCode** version. Recursive ships its own
-> `loop-supervise` / `recursive-loop` skills for recursive's *own* agent
-> kernel — those target a different toolset (`run_background` returning a
-> job_id, `watch_file`, `schedule_wakeup`, `stop_loop`, `tool_search`).
-> Don't conflate the two: when this skill says "watcher", it means a
+> `loop-supervise` skill for recursive's *own* agent kernel — that targets a
+> different toolset (`run_background` returning a job_id, `watch_file`,
+> `schedule_wakeup`, `stop_loop`). Don't conflate the two: when this skill
+> says "watcher", it means a
 > backgrounded `Bash` invocation, not a recursive-kernel primitive.
 
 ## What you're supervising (mental model — read once)
