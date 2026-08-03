@@ -568,7 +568,7 @@ pub fn register_subagent_if_enabled(
     let task_registry = Arc::new(TaskRegistry::new());
     let worker_registry = WorkerRegistry::new();
     let worker_table: crate::tools::agent::WorkerTable =
-        Arc::new(RwLock::new(std::collections::HashMap::new()));
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let agent = AgentTool::new(
         &config.workspace,

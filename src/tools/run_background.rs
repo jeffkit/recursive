@@ -54,6 +54,16 @@ pub enum JobState {
     TimedOut,
 }
 
+impl JobState {
+    /// True if the job will never change state again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut
+        )
+    }
+}
+
 /// A single background job.
 pub struct Job {
     pub state: JobState,
@@ -145,10 +155,7 @@ impl BackgroundJobManager {
 
     /// Update a job's state.
     fn update(&mut self, id: &str, state: JobState) {
-        let is_terminal = matches!(
-            state,
-            JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut
-        );
+        let is_terminal = state.is_terminal();
         if let Some(job) = self.jobs.get_mut(id) {
             job.state = state;
         }
@@ -245,6 +252,13 @@ impl BackgroundJobManager {
     /// Returns `Some((job_id, output_string))` where `output_string` includes
     /// the exit code and captured stdout/stderr. Completed jobs are removed
     /// from the tracked set.
+    ///
+    /// If a terminal job remains after this removal, the completion notify is
+    /// re-armed. `update()` uses `notify_one()`, which stores a single permit:
+    /// when ≥2 jobs reach a terminal state before a waiter polls, the second
+    /// `notify_one()` is a no-op, so a waiter that consumes the one permit
+    /// would never wake for the remaining job. Re-arming here guarantees every
+    /// completed job has a scheduled wake until it is drained (goal-379).
     pub fn take_completed(&mut self) -> Option<(String, String)> {
         let id = self.jobs.iter().find_map(|(id, job)| match &job.state {
             JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut => {
@@ -267,6 +281,9 @@ impl BackgroundJobManager {
             JobState::TimedOut => "timed out".to_string(),
             JobState::Running => unreachable!(), // filtered above
         };
+        if self.jobs.values().any(|j| j.state.is_terminal()) {
+            self.completed_notify.notify_one();
+        }
         Some((id, output))
     }
 }
@@ -930,6 +947,67 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_ok(), "notify should fire for Failed");
+    }
+
+    #[tokio::test]
+    async fn two_completed_jobs_each_get_a_wake() {
+        // goal-379: `update()` uses notify_one(), which stores a SINGLE
+        // permit. When two jobs reach a terminal state before any waiter
+        // polls, the two notify_one() calls coalesce into one wake. The
+        // drainer consumes that wake, takes ONE job, and — without a re-arm —
+        // the second job would be orphaned forever (the loop idles even
+        // though a background job is finished). take_completed() must re-arm
+        // the notify while terminal jobs remain, so each completed job gets
+        // its own wake.
+        let mut manager = BackgroundJobManager::new();
+        let id_a = manager.insert(Job {
+            state: JobState::Running,
+            created_at: Instant::now(),
+        });
+        let id_b = manager.insert(Job {
+            state: JobState::Running,
+            created_at: Instant::now(),
+        });
+        manager.update(
+            &id_a,
+            JobState::Completed {
+                stdout: "a".into(),
+                stderr: "".into(),
+                exit_code: 0,
+            },
+        );
+        manager.update(
+            &id_b,
+            JobState::Completed {
+                stdout: "b".into(),
+                stderr: "".into(),
+                exit_code: 0,
+            },
+        );
+
+        let notify = manager.completed_notify();
+
+        // First wake consumes the single coalesced permit.
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("first completed job must produce a wake");
+
+        // Drain one job; the other is still terminal, so take_completed must
+        // re-arm the notify for it.
+        let (first_id, first_output) = manager.take_completed().expect("first completed job");
+        assert!(first_output.contains("exit code: 0"));
+
+        // Second wake must fire for the remaining job (would time out on the
+        // pre-fix code, where the coalesced permit was already consumed).
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("second completed job must also produce a wake");
+        let (second_id, second_output) = manager.take_completed().expect("second completed job");
+        assert!(second_output.contains("exit code: 0"));
+        assert_ne!(first_id, second_id, "each job must be drained exactly once");
+
+        // Queue fully drained; nothing left to take.
+        assert!(manager.take_completed().is_none());
     }
 
     #[tokio::test]

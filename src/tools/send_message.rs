@@ -207,7 +207,7 @@ impl Tool for SendMessageTool {
             // pushing the message onto the worker's continuation channel.
             // The worker runtime is retained across turns, so this continues
             // the same conversation (transcript preserved).
-            let workers = self.workers.read().await;
+            let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             for handle in workers.values() {
                 if handle.task_id == task_id {
                     match handle.tx.send(message.clone()) {
@@ -233,22 +233,26 @@ impl Tool for SendMessageTool {
         if let Some(worker_id) = arguments.get("worker_id").and_then(|v| v.as_str()) {
             // Background worker continuation: push to the mpsc channel so the
             // long-lived worker runs this as a new turn on the same runtime.
-            let workers = self.workers.read().await;
-            if let Some(handle) = workers.get(worker_id) {
-                match handle.tx.send(message.clone()) {
-                    Ok(()) => {
-                        return Ok(format!(
-                            "Message delivered to worker '{worker_id}'; worker will run it as a new turn."
-                        ));
-                    }
-                    Err(_) => {
-                        return Ok(format!(
-                            "Message queued for worker '{worker_id}', but it has exited and cannot continue."
-                        ));
+            // The std MutexGuard is !Send, so it is scoped to drop before the
+            // awaits below (goal-379 switched the table to a sync Mutex so a
+            // Drop guard can deregister on the abort path).
+            {
+                let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(handle) = workers.get(worker_id) {
+                    match handle.tx.send(message.clone()) {
+                        Ok(()) => {
+                            return Ok(format!(
+                                "Message delivered to worker '{worker_id}'; worker will run it as a new turn."
+                            ));
+                        }
+                        Err(_) => {
+                            return Ok(format!(
+                                "Message queued for worker '{worker_id}', but it has exited and cannot continue."
+                            ));
+                        }
                     }
                 }
             }
-            drop(workers);
 
             // Legacy in-memory mailbox path.
             match self.registry.get(worker_id).await {

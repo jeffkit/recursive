@@ -188,7 +188,36 @@ pub struct WorkerHandle {
 /// A process-wide table of live background workers keyed by worker_id.
 /// Shared between the `agent` tool (which inserts) and the `send_message`
 /// tool ( which looks up to continue a worker).
-pub type WorkerTable = Arc<RwLock<HashMap<String, Arc<WorkerHandle>>>>;
+///
+/// The lock is a synchronous `std::sync::Mutex` (not tokio's `RwLock`) so a
+/// `Drop` guard can remove an entry without awaiting — the `task_stop` abort
+/// path unwinds the worker task and must deregister synchronously (goal-379).
+/// Critical sections are microsecond-scale (HashMap insert/get/remove).
+pub type WorkerTable = Arc<Mutex<HashMap<String, Arc<WorkerHandle>>>>;
+
+/// RAII guard that removes a background worker's `WorkerHandle` from the
+/// `WorkerTable` when the worker task exits.
+///
+/// The worker task normally removes its own entry at the end of the loop
+/// (channel close) and on the turn-failure path; but `task_stop` aborts the
+/// task's `JoinHandle`, unwinding the task at its next await point and
+/// skipping those trailing statements. Because this guard is a local of the
+/// spawned async block, its `Drop` runs on every exit path — normal return,
+/// panic unwind, AND abort unwind — and the synchronous table lock makes the
+/// removal safe from `Drop` (goal-379).
+struct WorkerDeregisterGuard {
+    workers: WorkerTable,
+    worker_key: String,
+}
+
+impl Drop for WorkerDeregisterGuard {
+    fn drop(&mut self) {
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.worker_key);
+    }
+}
 
 /// The unified `agent` delegation tool.
 ///
@@ -231,7 +260,7 @@ impl AgentTool {
             pool: None,
             task_registry: Arc::new(TaskRegistry::new()),
             definitions: None,
-            workers: Arc::new(RwLock::new(HashMap::new())),
+            workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -501,22 +530,31 @@ impl AgentTool {
             task_id: task_id.clone(),
         });
         self.workers
-            .write()
-            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(worker_id.to_string(), handle.clone());
 
         // Spawn the long-lived worker task.
         let state_for_task = state.clone();
         // Clone the table + key so the task can deregister itself on EVERY
-        // exit path (failure return, channel-close completion). Without this
-        // the WorkerHandle — with its mpsc sender — lingers in the
-        // process-wide WorkerTable for the rest of the process: a slow memory
-        // + channel-buffer leak for long-running coordinator/HTTP/TUI
-        // processes (goal-370). A panicked task is NOT covered here (the
-        // panic unwinds past these lines); the two normal exits are.
+        // exit path. A `WorkerDeregisterGuard` is a local of the spawned
+        // async block, so its `Drop` runs on normal exit (failure return,
+        // channel-close completion), on panic unwind, AND on the `task_stop`
+        // abort path where `JoinHandle::abort()` unwinds the task past any
+        // trailing statements. Without this the WorkerHandle — with its mpsc
+        // sender — lingers in the process-wide WorkerTable for the rest of
+        // the process: a slow memory + channel-buffer leak for long-running
+        // coordinator/HTTP/TUI processes (goal-370 normal exits, goal-379
+        // abort path).
         let workers = self.workers.clone();
         let worker_key = worker_id.to_string();
         let join_handle = tokio::spawn(async move {
+            // Deregister from the WorkerTable when the task ends, no matter
+            // how it ends (see `WorkerDeregisterGuard` docs).
+            let _dereg_guard = WorkerDeregisterGuard {
+                workers: workers.clone(),
+                worker_key: worker_key.clone(),
+            };
             // Drain the channel: each message is a new turn on the same runtime.
             while let Some(msg) = rx.recv().await {
                 let mut rt = runtime.lock().await;
@@ -533,7 +571,6 @@ impl AgentTool {
                         state_for_task
                             .mark_failed(format!("worker turn failed: {e}"))
                             .await;
-                        let _ = workers.write().await.remove(&worker_key);
                         return;
                     }
                 }
@@ -542,7 +579,6 @@ impl AgentTool {
             state_for_task
                 .mark_completed("worker finished".to_string())
                 .await;
-            let _ = workers.write().await.remove(&worker_key);
         });
 
         // Attach the JoinHandle so `task_stop` can truly abort this task.
@@ -1359,7 +1395,7 @@ allowed_tools:
         let tmp = tempfile::tempdir().unwrap();
         let all_tools = full_tool_registry(tmp.path());
         let task_registry = Arc::new(TaskRegistry::new());
-        let worker_table: WorkerTable = Arc::new(RwLock::new(HashMap::new()));
+        let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
         let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
             .with_task_registry(task_registry.clone())
             .with_workers(worker_table);
@@ -1416,7 +1452,7 @@ allowed_tools:
         let all_tools = full_tool_registry(tmp.path());
         let task_registry = Arc::new(TaskRegistry::new());
         let worker_registry = WorkerRegistry::new();
-        let worker_table: WorkerTable = Arc::new(RwLock::new(HashMap::new()));
+        let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
         let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
             .with_task_registry(task_registry.clone())
             .with_registry(worker_registry.clone())
@@ -1492,7 +1528,7 @@ allowed_tools:
         let tmp = tempfile::tempdir().unwrap();
         let all_tools = full_tool_registry(tmp.path());
         let task_registry = Arc::new(TaskRegistry::new());
-        let worker_table: WorkerTable = Arc::new(RwLock::new(HashMap::new()));
+        let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
         let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
             .with_task_registry(task_registry.clone())
             .with_workers(worker_table.clone());
@@ -1518,7 +1554,10 @@ allowed_tools:
 
         // While the worker is alive its entry must be present.
         assert!(
-            worker_table.read().await.contains_key("w1"),
+            worker_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("w1"),
             "entry should exist while the worker is alive"
         );
 
@@ -1529,7 +1568,11 @@ allowed_tools:
         // was never removed.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if !worker_table.read().await.contains_key("w1") {
+            if !worker_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("w1")
+            {
                 break;
             }
             if std::time::Instant::now() > deadline {
@@ -1548,6 +1591,132 @@ allowed_tools:
         assert!(
             matches!(status, crate::tasks::TaskStatus::Failed),
             "worker task should have failed, was {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_stop_deregisters_aborted_worker_from_worker_table() {
+        // goal-379: `task_stop` aborts the worker's JoinHandle, which unwinds
+        // the task at its next await point — skipping trailing cleanup. The
+        // `WorkerDeregisterGuard` (a local of the spawned task) must remove
+        // the WorkerHandle from the WorkerTable on that abort path too, so a
+        // later `send_message` to the worker_id reports "not found" instead
+        // of finding a stale handle (memory + channel-buffer leak, goal-370
+        // class).
+        let provider = mock_provider(vec![Completion {
+            content: "first turn done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let task_registry = Arc::new(TaskRegistry::new());
+        let worker_registry = WorkerRegistry::new();
+        let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_task_registry(task_registry.clone())
+            .with_registry(worker_registry.clone())
+            .with_workers(worker_table.clone());
+
+        // Spawn the worker in the background.
+        let spawn_result = agent
+            .execute(json!({
+                "mode": "single",
+                "background": true,
+                "manifest": {
+                    "w1": { "system_prompt": "You are a helper." }
+                },
+                "prompt": "do the first thing"
+            }))
+            .await
+            .unwrap();
+        let task_id = spawn_result
+            .split("task '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("task id in spawn result")
+            .to_string();
+
+        // Let the first turn finish so the worker is alive and parked on
+        // rx.recv(), then confirm its table entry is present.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            worker_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("w1"),
+            "entry should exist while the worker is alive"
+        );
+
+        // Stop the task: `TaskRegistry::stop` → `TaskState::stop` aborts the
+        // JoinHandle, unwinding the worker task (same path TaskStopTool uses,
+        // without needing the coordinator-mode feature gate).
+        let stopped = task_registry.stop(&TaskId(task_id.clone())).await;
+        assert!(stopped, "task_stop must find a live handle to abort");
+
+        // The abort unwind must run the WorkerDeregisterGuard: wait (bounded)
+        // for the entry to disappear. On the old code this loop would time
+        // out because abort skipped the trailing remove statements.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !worker_table
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("w1")
+            {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("worker table entry for 'w1' was not removed after task_stop aborted the worker");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The task itself stays registered (so task_get can report Stopped),
+        // but its worker handle is gone.
+        let task = task_registry
+            .get(&TaskId(task_id.clone()))
+            .await
+            .expect("task still registered");
+        assert_eq!(task.status().await, crate::tasks::TaskStatus::Stopped);
+
+        // A follow-up send_message by worker_id must report "not found"
+        // rather than silently buffering into a dead continuation channel.
+        let send_tool = SendMessageTool::new(
+            worker_registry.clone(),
+            task_registry.clone(),
+            worker_table.clone(),
+        );
+        let send_result = send_tool
+            .execute(json!({
+                "worker_id": "w1",
+                "message": "are you there?"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            send_result.contains("not found"),
+            "send_message to a stopped worker must report not found, got: {send_result}"
+        );
+        assert!(
+            !send_result.contains("new turn"),
+            "send_message must not claim it will drive a new turn on a stopped worker: {send_result}"
+        );
+
+        // The task_id addressing mode still resolves the (stopped) task, but
+        // must NOT find a live continuation handle.
+        let send_result = send_tool
+            .execute(json!({
+                "task_id": task_id,
+                "message": "anyone home?"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !send_result.contains("will run it as a new turn"),
+            "stopped worker must not claim a new turn, got: {send_result}"
         );
     }
 }

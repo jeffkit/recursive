@@ -1342,6 +1342,13 @@ impl AgentRuntime {
         let mut outcomes = Vec::new();
         let mut next_goal = initial_goal.into();
 
+        // Completed background jobs drained in one wake but not yet serviced
+        // as their own turn. Kept here (not just in the manager) so a
+        // multi-job completion — where the manager's `notify_one()` permits
+        // coalesce into a single wake — cannot orphan a job (goal-379).
+        let mut pending_jobs: std::collections::VecDeque<(String, String)> =
+            std::collections::VecDeque::new();
+
         loop {
             let outcome = self.run(&next_goal).await?;
             outcomes.push(outcome);
@@ -1357,12 +1364,20 @@ impl AgentRuntime {
             // Priority 2: background job completed
             // Use .lock().await instead of try_lock() so a completed job is
             // never silently skipped when the lock is momentarily contended.
+            // Drain EVERY currently-completed job (via `take_completed`) in
+            // one wake into `pending_jobs`, then service one per turn —
+            // identical to the old single-job path (one
+            // `Background job 'X' completed:` turn per job), but with no job
+            // left behind when ≥2 jobs finish while a turn is in flight.
             if let Some(mgr) = bg_manager {
                 let mut mgr = mgr.lock().await;
-                if let Some((id, output)) = mgr.take_completed() {
-                    next_goal = format!("Background job '{}' completed:\n{}", id, output);
-                    continue;
+                while let Some((id, output)) = mgr.take_completed() {
+                    pending_jobs.push_back((id, output));
                 }
+            }
+            if let Some((id, output)) = pending_jobs.pop_front() {
+                next_goal = format!("Background job '{}' completed:\n{}", id, output);
+                continue;
             }
 
             // Nothing to do → loop ends
