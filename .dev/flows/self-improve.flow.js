@@ -372,6 +372,11 @@ const GATE_FIX_HINTS = {
   ].join('\n'),
 }
 
+// gate 孙进程命令特征（cargo-mutants 及其 cargo 子进程）。必须在 await main()
+// 之前声明（同 GATE_FIX_HINTS 的 TDZ 规矩）：commitPending / runQualityGates 等
+// 顶层函数在模块求值期间就可能被调用，访问未初始化的 const 会 ReferenceError。
+const GATE_WATCHDOG_PATTERNS = ['cargo-mutants', 'cargo mutants', 'agent-mutants.sh', 'cli-mutants.sh', 'tui-mutants.sh']
+
 // Batch-run constraint prepended to every system prompt:
 // plan mode tools block indefinitely when no interactive channel is present.
 const HEADLESS_CONSTRAINT = `# Headless batch-run constraints
@@ -524,7 +529,7 @@ async function commitPending() {
     for (const g of gates) {
       // commit-pending 不喂回 agent：任何门红灯直接抛错，改动保留待人处理
       await cp.step(`commit-pending.gate.${g.name}`, () =>
-        runGate({ ...g, onFail: 'rollback' }, { resumeFix: null }),
+        runGateWithWatchdog({ ...g, onFail: 'rollback' }, { worktreeDir: repo }),
       )
     }
   } catch (err) {
@@ -646,7 +651,7 @@ async function landPreserve(preserveRunId) {
     const projectGates = await loadGates({ repo })
     const gates = mergeGates(builtin, projectGates).map(g => normalizeGate(g, wtDir))
     for (const g of gates) {
-      await cp.step(`land.gate.${g.name}`, () => runGate(g, { resumeFix: null }))
+      await cp.step(`land.gate.${g.name}`, () => runGateWithWatchdog(g, { worktreeDir: wtDir }))
     }
     // 全绿 → 落地 preserve 的完整改动树到 main。
     // 关键：不能 `cherry-pick <sha>`——sha 是 preserve 链顶最后一个 commit，当
@@ -1195,6 +1200,87 @@ function normalizeGate(g, cwd) {
   return { cwd, ...g, onFail }
 }
 
+// ── gate 进程树 watchdog（g376 教训：spawnCapture 等 close 而非 exit）──
+//
+// flowcast 的 spawnCapture 在 gate 超时时只 SIGTERM/SIGKILL **直接子进程**
+// （`sh -c cmd` 的 sh）。若 cmd 再拉起孙进程（如 agent-mutants.sh →
+// cargo-mutants → cargo test），孙进程逃逸成孤儿并继续持有 stdout/stderr
+// 管道 → spawnCapture 等 `close`（stdio 全关）永不触发 → runGate 的 await
+// 永不 resolve → flow 卡死（状态停在 `gate.<name>`，看起来活着但无进展）。
+// 实测：Goal 376 gate.agent-mutants 配置 timeout 40min，error 在 86min 后
+// 才落盘（supervisor 手动 kill 孤儿 cargo-mutants 才触发 close）。
+//
+// 这里在 runGate 外包一层 watchdog：gate 自身 timeout 之后再等 15s（留给
+// flowcast 的 SIGTERM→SIGKILL 清场），若仍未返回，按 cmd 特征杀 **本次**
+// gate 启动的进程树（含孙进程），让管道关闭 → spawnCapture close 触发 →
+// runGate 正常抛 GateError(timeout)，flow 继续走 resume-fix / preserve。
+function runGateWithWatchdog(gate, { worktreeDir }) {
+  const timeoutMs = gate.timeout ?? 600_000
+  // gate 启动前已存在的相关进程（基线）——不杀并发 worktree 的兄弟 gate。
+  const baseline = new Set()
+  for (const pid of pgrepAll(GATE_WATCHDOG_PATTERNS)) baseline.add(pid)
+
+  let killerTimer
+  const watchdog = new Promise((_, reject) => {
+    killerTimer = setTimeout(() => {
+      const spawned = pgrepAll(GATE_WATCHDOG_PATTERNS).filter(pid => !baseline.has(pid))
+      for (const pid of spawned) killProcessTree(pid)
+      const err = new Error(
+        `quality gate '${gate.name}': watchdog timeout after ${timeoutMs}ms ` +
+        `(spawnCapture 只杀直接子进程，孙进程逃逸持管道；已强杀 ${spawned.length} 个进程树)`,
+      )
+      err.gate = gate.name
+      err.timeout = true
+      reject(err)
+    }, timeoutMs + 15_000)
+  })
+  try {
+    return Promise.race([runGate(gate, { resumeFix: null }), watchdog])
+  } finally {
+    clearTimeout(killerTimer)
+  }
+}
+
+/** pgrep -f 收集匹配进程的 pid 列表（pgrep 缺失/无匹配时返回 []）。 */
+function pgrepAll(patterns) {
+  const pids = []
+  for (const pat of patterns) {
+    try {
+      const r = spawnSync('pgrep', ['-f', pat], { encoding: 'utf8' })
+      if (r.status === 0) {
+        for (const line of r.stdout.split('\n')) {
+          const pid = Number(line.trim())
+          if (Number.isInteger(pid) && pid > 0) pids.push(pid)
+        }
+      }
+    } catch { /* pgrep missing */ }
+  }
+  return pids
+}
+
+/** 递归 SIGKILL pid 及其全部后代（BFS 收集，从叶子杀起）。 */
+function killProcessTree(rootPid) {
+  const all = [rootPid]
+  const seen = new Set([rootPid])
+  for (let i = 0; i < all.length; i++) {
+    try {
+      const r = spawnSync('pgrep', ['-P', String(all[i])], { encoding: 'utf8' })
+      if (r.status === 0) {
+        for (const line of r.stdout.split('\n')) {
+          const pid = Number(line.trim())
+          if (Number.isInteger(pid) && pid > 0 && !seen.has(pid)) {
+            seen.add(pid)
+            all.push(pid)
+          }
+        }
+      }
+    } catch { /* child gone */ }
+  }
+  for (let i = all.length - 1; i >= 0; i--) {
+    try { process.kill(all[i], 'SIGKILL') } catch { /* already gone */ }
+  }
+}
+
 /**
  * 跑每个门，红灯就走 resume-fix 循环：喂最新 stderr → agent 修 → 重跑门，最多 MAX_FIX_ROUNDS 轮。
  * 旧实现靠 flowcast runGate 内置的「1 轮 resume-fix」——1 轮修不过就抛错回滚，丢全部成果。
@@ -1218,7 +1304,7 @@ async function runQualityGates({ sysPromptFile, transcriptOut, env, worktreeDir,
     for (let attempt = 0; attempt <= MAX_FIX_ROUNDS; attempt++) {
       try {
         await cp.step(attempt === 0 ? `gate.${g.name}` : `gate.${g.name}.fix-${attempt}`, () =>
-          runGate(g, { resumeFix: null }),
+          runGateWithWatchdog(g, { worktreeDir }),
         )
         break // 本门绿 → 下一道门
       } catch (err) {
@@ -1271,7 +1357,7 @@ async function runRegate(worktreeDir) {
   const projectGates = await loadGates({ repo })
   const gates = mergeGates(builtin, projectGates).map(g => normalizeGate(g, worktreeDir))
   for (const g of gates) {
-    await cp.step(`regate.${g.name}`, () => runGate(g, { resumeFix: null }))
+    await cp.step(`regate.${g.name}`, () => runGateWithWatchdog(g, { worktreeDir }))
   }
 }
 

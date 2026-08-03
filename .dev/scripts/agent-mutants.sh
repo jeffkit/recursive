@@ -56,7 +56,12 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-set -- "${ARGS[@]:-}"
+# bash 3.2 (macOS default) turns "${ARGS[@]:-}" into ONE empty-string arg when
+# the array is empty (the :- default kicks in on the empty expansion) → $#=1,
+# $1="" → the `[[ $# -gt 0 ]]` branch fires with an empty file → `--file ""`
+# (empty glob) → cargo-mutants mutates the WHOLE crate. ${ARGS[@]:0} is the
+# safe form across versions (same pattern as tui-mutants.sh).
+set -- ${ARGS[@]:0}
 
 # Resolve the worktree root (this script lives in <root>/.dev/scripts/).
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
