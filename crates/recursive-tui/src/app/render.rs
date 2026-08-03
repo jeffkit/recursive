@@ -24,74 +24,119 @@ use super::{DiffHunk, DiffLine, DiffLineKind, ToolResultData, TranscriptBlock};
 ///   message fills the result. Persisted results carry no success flag, so
 ///   they are shown as succeeded.
 pub fn blocks_from_messages(messages: &[recursive::message::Message]) -> Vec<TranscriptBlock> {
-    use recursive::message::Role;
-
     let mut blocks: Vec<TranscriptBlock> = Vec::new();
     for msg in messages {
-        match msg.role {
-            Role::System => {}
-            Role::User => {
-                if !msg.content.trim().is_empty() {
-                    blocks.push(TranscriptBlock::User {
-                        text: msg.content.clone(),
-                    });
-                }
+        push_blocks_for_message(&mut blocks, msg);
+    }
+    blocks
+}
+
+/// Rebuild the visible transcript blocks from a loaded session's **full**
+/// history (messages + compact-boundary markers), as produced by
+/// [`recursive::session::SessionReader::load_full_history`].
+///
+/// Like [`blocks_from_messages`], but each
+/// [`LoadedEntry::CompactBoundary`] is rendered as a
+/// [`TranscriptBlock::Compacted`] marker (`⊕ Conversation compacted: …`)
+/// sitting in-line between the messages it folds, so the user can see
+/// the whole conversation including where compactions happened.
+pub fn blocks_from_loaded_history(
+    entries: &[recursive::session::LoadedEntry],
+) -> Vec<TranscriptBlock> {
+    let mut blocks: Vec<TranscriptBlock> = Vec::new();
+    for entry in entries {
+        match entry {
+            recursive::session::LoadedEntry::Message(msg) => {
+                // Convert the persisted TranscriptEntry to a runtime
+                // Message so push_blocks_for_message can match on Role.
+                // The persistence-only fields (id/uuid/timestamp/usage)
+                // aren't needed for display.
+                let msg = recursive::session::entry_to_message(msg.as_ref().clone());
+                push_blocks_for_message(&mut blocks, &msg);
             }
-            Role::Assistant => {
-                if let Some(reasoning) = &msg.reasoning_content {
-                    if !reasoning.trim().is_empty() {
-                        blocks.push(TranscriptBlock::Reasoning {
-                            text: reasoning.clone(),
-                            streaming: false,
-                            duration_ms: None,
-                            // Goal-352: resumed reasoning has no live timing
-                            started: None,
-                        });
-                    }
-                }
-                if !msg.content.trim().is_empty() {
-                    blocks.push(TranscriptBlock::Assistant {
-                        text: msg.content.clone(),
-                        streaming: false,
-                        latency_ms: None,
-                    });
-                }
-                for tc in &msg.tool_calls {
-                    blocks.push(TranscriptBlock::ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        args_preview: preview_args(&tc.arguments.to_string()),
-                        result: None,
-                    });
-                }
-            }
-            Role::Tool => {
-                let id = msg.tool_call_id.clone().unwrap_or_default();
-                let matched = blocks.iter_mut().rev().find(|b| {
-                    matches!(b, TranscriptBlock::ToolCall { id: cid, result: None, .. } if cid == &id)
+            recursive::session::LoadedEntry::CompactBoundary { removed, .. } => {
+                // Compaction folds `removed` older messages into a single
+                // summary message (the next Message entry). Rendered with
+                // kept = 1 to match the live-compaction display.
+                blocks.push(TranscriptBlock::Compacted {
+                    removed: *removed,
+                    kept: 1,
                 });
-                if let Some(TranscriptBlock::ToolCall { result, .. }) = matched {
-                    *result = Some(ToolResultData {
-                        success: true,
-                        output: msg.content.clone(),
-                        expanded: false,
-                    });
-                } else {
-                    blocks.push(TranscriptBlock::ToolCall {
-                        id,
-                        name: String::new(),
-                        args_preview: String::new(),
-                        result: Some(ToolResultData {
-                            success: true,
-                            output: msg.content.clone(),
-                            expanded: false,
-                        }),
-                    });
-                }
             }
         }
     }
     blocks
+}
+
+/// Append the transcript blocks for a single message onto `blocks`.
+///
+/// Extracted from `blocks_from_messages` so both the messages-only and
+/// full-history (messages + compact markers) paths share one rendering
+/// of each role.
+fn push_blocks_for_message(blocks: &mut Vec<TranscriptBlock>, msg: &recursive::message::Message) {
+    use recursive::message::Role;
+    match msg.role {
+        Role::System => {}
+        Role::User => {
+            if !msg.content.trim().is_empty() {
+                blocks.push(TranscriptBlock::User {
+                    text: msg.content.clone(),
+                });
+            }
+        }
+        Role::Assistant => {
+            if let Some(reasoning) = &msg.reasoning_content {
+                if !reasoning.trim().is_empty() {
+                    blocks.push(TranscriptBlock::Reasoning {
+                        text: reasoning.clone(),
+                        streaming: false,
+                        duration_ms: None,
+                        // Goal-352: resumed reasoning has no live timing
+                        started: None,
+                    });
+                }
+            }
+            if !msg.content.trim().is_empty() {
+                blocks.push(TranscriptBlock::Assistant {
+                    text: msg.content.clone(),
+                    streaming: false,
+                    latency_ms: None,
+                });
+            }
+            for tc in &msg.tool_calls {
+                blocks.push(TranscriptBlock::ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    args_preview: preview_args(&tc.arguments.to_string()),
+                    result: None,
+                });
+            }
+        }
+        Role::Tool => {
+            let id = msg.tool_call_id.clone().unwrap_or_default();
+            let matched = blocks.iter_mut().rev().find(|b| {
+                matches!(b, TranscriptBlock::ToolCall { id: cid, result: None, .. } if cid == &id)
+            });
+            if let Some(TranscriptBlock::ToolCall { result, .. }) = matched {
+                *result = Some(ToolResultData {
+                    success: true,
+                    output: msg.content.clone(),
+                    expanded: false,
+                });
+            } else {
+                blocks.push(TranscriptBlock::ToolCall {
+                    id,
+                    name: String::new(),
+                    args_preview: String::new(),
+                    result: Some(ToolResultData {
+                        success: true,
+                        output: msg.content.clone(),
+                        expanded: false,
+                    }),
+                });
+            }
+        }
+    }
 }
 
 // ── Argument preview ─────────────────────────────────────────────────
@@ -310,6 +355,94 @@ mod tests {
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    // Goal: TUI resume shows the full history; each compact_boundary
+    // becomes a TranscriptBlock::Compacted marker inline.
+    fn loaded_msg(role: &str, content: &str) -> recursive::session::LoadedEntry {
+        use recursive::session::TranscriptEntry;
+        recursive::session::LoadedEntry::Message(Box::new(TranscriptEntry {
+            uuid: String::new(),
+            parent_uuid: None,
+            source_tool_assistant_uuid: None,
+            id: format!("id-{role}"),
+            parent_id: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            usage: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            audit: None,
+        }))
+    }
+
+    #[test]
+    fn blocks_from_loaded_history_renders_compact_boundary_inline() {
+        let entries = vec![
+            loaded_msg("user", "old turn 1"),
+            loaded_msg("assistant", "old reply 1"),
+            // Boundary: 2 messages folded into a summary.
+            recursive::session::LoadedEntry::CompactBoundary {
+                turn: Some(2),
+                removed: 2,
+            },
+            loaded_msg("system", "summary of old turns"),
+            loaded_msg("user", "new turn"),
+            loaded_msg("assistant", "new reply"),
+        ];
+
+        let blocks = blocks_from_loaded_history(&entries);
+
+        // System message is skipped (as in blocks_from_messages), so:
+        // user, assistant, Compacted, [system skipped], user, assistant.
+        assert!(matches!(&blocks[0], TranscriptBlock::User { text } if text == "old turn 1"));
+        assert!(
+            matches!(&blocks[1], TranscriptBlock::Assistant { text, .. } if text == "old reply 1")
+        );
+        match &blocks[2] {
+            TranscriptBlock::Compacted { removed, kept } => {
+                assert_eq!(*removed, 2);
+                assert_eq!(*kept, 1, "folded into 1 summary");
+            }
+            other => panic!("expected Compacted, got {other:?}"),
+        }
+        assert!(matches!(&blocks[3], TranscriptBlock::User { text } if text == "new turn"));
+        assert!(
+            matches!(&blocks[4], TranscriptBlock::Assistant { text, .. } if text == "new reply")
+        );
+    }
+
+    #[test]
+    fn blocks_from_loaded_history_multiple_boundaries() {
+        // A session that compacted twice — both markers must render.
+        let entries = vec![
+            loaded_msg("user", "a"),
+            recursive::session::LoadedEntry::CompactBoundary {
+                turn: Some(1),
+                removed: 1,
+            },
+            loaded_msg("system", "summary 1"),
+            loaded_msg("user", "b"),
+            recursive::session::LoadedEntry::CompactBoundary {
+                turn: Some(2),
+                removed: 1,
+            },
+            loaded_msg("system", "summary 2"),
+            loaded_msg("user", "c"),
+        ];
+
+        let blocks = blocks_from_loaded_history(&entries);
+        let compacted: Vec<_> = blocks
+            .iter()
+            .filter(|b| matches!(b, TranscriptBlock::Compacted { .. }))
+            .collect();
+        assert_eq!(
+            compacted.len(),
+            2,
+            "both compaction markers must be rendered"
+        );
     }
 
     #[test]

@@ -1169,28 +1169,50 @@ async fn worker_loop(
                         tracing::warn!("backend: runtime not available in ResumeSession");
                         continue;
                     };
-                    match recursive::session::SessionReader::load_messages(&session_dir) {
-                        Ok(messages) => {
-                            let turn_count = messages.len();
-                            let blocks = crate::app::render::blocks_from_messages(&messages);
-                            rt.set_transcript(messages);
-                            let session_id = session_dir
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let _ = event_tx.send(UiEvent::SessionResumed {
-                                session_id,
-                                turn_count,
-                                blocks,
-                            });
-                        }
+                    // Two distinct loads:
+                    //  - model seed: `load_messages` drops everything
+                    //    before the last compact_boundary so the runtime
+                    //    transcript matches the post-compaction context
+                    //    the model should see.
+                    //  - UI display: `load_full_history` keeps every
+                    //    message and surfaces each compaction as a
+                    //    `LoadedEntry::CompactBoundary` marker, so the
+                    //    user sees the whole conversation (not just the
+                    //    post-compaction tail). The compact markers render
+                    //    inline as `⊕ Conversation compacted: …`.
+                    let seed = match recursive::session::SessionReader::load_messages(&session_dir)
+                    {
+                        Ok(m) => m,
                         Err(e) => {
                             let _ = event_tx.send(UiEvent::Error {
                                 message: format!("Failed to load session: {e}"),
                             });
+                            continue;
                         }
-                    }
+                    };
+                    let loaded =
+                        match recursive::session::SessionReader::load_full_history(&session_dir) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                let _ = event_tx.send(UiEvent::Error {
+                                    message: format!("Failed to load session history: {e}"),
+                                });
+                                continue;
+                            }
+                        };
+                    let turn_count = loaded.len();
+                    let blocks = crate::app::render::blocks_from_loaded_history(&loaded);
+                    rt.set_transcript(seed);
+                    let session_id = session_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let _ = event_tx.send(UiEvent::SessionResumed {
+                        session_id,
+                        turn_count,
+                        blocks,
+                    });
                 }
             }
 

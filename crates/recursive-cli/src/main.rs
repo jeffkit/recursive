@@ -1012,7 +1012,7 @@ async fn main() -> anyhow::Result<()> {
                     // New JSONL session format (directory with transcript.jsonl + .meta.json)
                     let meta = recursive::session::SessionReader::load_meta(&path)
                         .with_context(|| format!("reading session meta: {}", path.display()))?;
-                    let entries = recursive::session::SessionReader::load_transcript(&path)
+                    let entries = recursive::session::SessionReader::load_full_history(&path)
                         .with_context(|| {
                             format!("reading session transcript: {}", path.display())
                         })?;
@@ -1032,18 +1032,31 @@ async fn main() -> anyhow::Result<()> {
                     println!();
                     println!("Transcript ({} entries):", entries.len());
                     for (i, entry) in entries.iter().enumerate() {
-                        let preview: String = entry.content.chars().take(200).collect();
-                        let truncated = if entry.content.len() > 200 { "…" } else { "" };
-                        println!("  [{:>3}] {:>9}: {}{}", i, entry.role, preview, truncated);
-                        if !entry.tool_calls.is_empty() {
-                            for tc in &entry.tool_calls {
-                                println!("         tool_call: {} ({})", tc.name, tc.id);
+                        use recursive::session::LoadedEntry;
+                        match entry {
+                            LoadedEntry::Message(msg) => {
+                                let preview: String = msg.content.chars().take(200).collect();
+                                let truncated = if msg.content.len() > 200 { "…" } else { "" };
+                                println!("  [{:>3}] {:>9}: {}{}", i, msg.role, preview, truncated);
+                                if !msg.tool_calls.is_empty() {
+                                    for tc in &msg.tool_calls {
+                                        println!("         tool_call: {} ({})", tc.name, tc.id);
+                                    }
+                                }
+                                if let Some(ref rc) = msg.reasoning_content {
+                                    let rp: String = rc.chars().take(100).collect();
+                                    let rt = if rc.len() > 100 { "…" } else { "" };
+                                    println!("         reasoning: {}{}", rp, rt);
+                                }
                             }
-                        }
-                        if let Some(ref rc) = entry.reasoning_content {
-                            let rp: String = rc.chars().take(100).collect();
-                            let rt = if rc.len() > 100 { "…" } else { "" };
-                            println!("         reasoning: {}{}", rp, rt);
+                            LoadedEntry::CompactBoundary { turn, removed } => {
+                                let turn_str =
+                                    turn.map(|t| format!(" at turn {t}")).unwrap_or_default();
+                                println!(
+                                    "  [{:>3}]  compact: ⊕ {} messages folded into summary{}",
+                                    i, removed, turn_str
+                                );
+                            }
                         }
                     }
                     Ok(())

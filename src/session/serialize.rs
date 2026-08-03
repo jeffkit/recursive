@@ -57,6 +57,32 @@ pub(crate) struct CompactBoundaryEntry {
     pub(crate) timestamp: String,
 }
 
+/// One entry of the **full** on-disk history, as exposed to UI / export
+/// paths via [`super::reader::SessionReader::load_full_history`].
+///
+/// Unlike [`super::reader::SessionReader::load_messages`] (which discards
+/// everything before the last `compact_boundary` for the model seed),
+/// `load_full_history` keeps every line so the user can see the whole
+/// conversation. Each cross-turn compaction shows up here as a
+/// [`CompactBoundary`](Self::CompactBoundary) marker that the TUI renders
+/// as a single `⊕ Conversation compacted: …` line.
+///
+/// The message variant carries the full [`TranscriptEntry`] (with
+/// `id` / `uuid` / `timestamp` / `usage` / `audit`), not the trimmed
+/// [`crate::message::Message`], so `session export` preserves every
+/// persisted field.
+///
+/// The message is boxed to keep the enum small (a `TranscriptEntry` is
+/// ~400 bytes vs 16 for the boundary marker; clippy::large-enum-variant).
+#[derive(Debug, Clone)]
+pub enum LoadedEntry {
+    /// A regular conversational message (full persisted shape).
+    Message(Box<TranscriptEntry>),
+    /// A cross-turn compaction boundary. `removed` is how many older
+    /// messages were folded into the summary that follows this marker.
+    CompactBoundary { turn: Option<u32>, removed: usize },
+}
+
 /// Convert a persisted [`TranscriptEntry`] into a runtime [`Message`].
 ///
 /// Drops persistence-only fields (`id`, `parent_id`, `timestamp`,

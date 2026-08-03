@@ -57,6 +57,7 @@ pub(crate) mod skills_injector;
 pub mod storage;
 pub mod system_prompt;
 pub mod tasks;
+#[cfg(feature = "coordinator-mode")]
 pub(crate) mod team;
 pub mod tool_set_provider;
 pub mod tools;

@@ -32,7 +32,7 @@ use crate::message::Message;
 pub use lifecycle::{truncate_transcript_to_turn, SessionLock, SessionLockBusy, TruncateStats};
 pub use orphan::OrphanToolCall;
 pub use reader::SessionReader;
-pub use serialize::{entry_to_message, TranscriptEntry};
+pub use serialize::{entry_to_message, LoadedEntry, TranscriptEntry};
 pub use writer::{SessionPersistenceSink, SessionWriter};
 
 /// Current schema version for session files.
@@ -587,16 +587,60 @@ pub struct ExportedTranscript {
     /// — the same enum is used in both structs to keep the
     /// wire shape consistent for external SDK consumers.
     pub status: SessionStatus,
+    /// Every persisted message in on-disk order, including those that
+    /// were folded into a compaction summary (older `messages.len()` of
+    /// these were superseded by the corresponding [`Self::compact_boundaries`]
+    /// entry at runtime). Consumers that only want the post-compaction
+    /// context should filter messages before the last boundary's index.
     pub messages: Vec<TranscriptEntry>,
+    /// Cross-turn compaction boundaries, in order. Each records how many
+    /// older messages were folded into the summary that follows it.
+    /// Empty for sessions that never compacted.
+    #[serde(default)]
+    pub compact_boundaries: Vec<ExportedCompactBoundary>,
+    /// Count of messages in `messages` (excludes boundary markers).
     pub message_count: u64,
+}
+
+/// A compaction boundary exported alongside [`ExportedTranscript::messages`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedCompactBoundary {
+    /// Index into `ExportedTranscript::messages` at the position where the
+    /// boundary sits (the summary message immediately follows).
+    pub message_index: usize,
+    pub turn: Option<u32>,
+    /// How many older messages were folded into the summary.
+    pub removed: usize,
+    pub timestamp: String,
 }
 
 impl ExportedTranscript {
     /// Build an ExportedTranscript from a session directory.
     pub fn from_session_dir(session_dir: &Path) -> std::io::Result<Self> {
         let meta = SessionReader::load_meta(session_dir)?;
-        let entries = SessionReader::load_transcript(session_dir)?;
-        let message_count = entries.len() as u64;
+        let loaded = SessionReader::load_full_history(session_dir)?;
+        let mut messages: Vec<TranscriptEntry> = Vec::new();
+        let mut compact_boundaries: Vec<ExportedCompactBoundary> = Vec::new();
+        for entry in loaded {
+            match entry {
+                LoadedEntry::Message(m) => messages.push(*m),
+                LoadedEntry::CompactBoundary { turn, removed } => {
+                    // The boundary marker sits between messages; record the
+                    // index of the message that would follow it.
+                    let timestamp = messages
+                        .last()
+                        .map(|m| m.timestamp.clone())
+                        .unwrap_or_default();
+                    compact_boundaries.push(ExportedCompactBoundary {
+                        message_index: messages.len(),
+                        turn,
+                        removed,
+                        timestamp,
+                    });
+                }
+            }
+        }
+        let message_count = messages.len() as u64;
         Ok(Self {
             version: 1,
             session_id: meta.session_id,
@@ -604,7 +648,8 @@ impl ExportedTranscript {
             goal: meta.goal,
             created_at: meta.created_at,
             status: meta.status,
-            messages: entries,
+            messages,
+            compact_boundaries,
             message_count,
         })
     }
@@ -1688,5 +1733,40 @@ mod tests {
             1,
             "default schema version must be 1"
         );
+    }
+
+    // Goal: session export must include the full history (messages folded
+    // by compaction included) plus the compaction boundaries, so consumers
+    // see the whole conversation rather than just the post-compaction tail.
+    #[test]
+    fn export_includes_full_history_and_compact_boundaries() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create(ws, "export test", "model", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        w.append(&Message::user("folded turn".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("folded reply".to_string()), None, None)
+            .unwrap();
+        // Boundary: 2 messages folded.
+        w.write_compact_boundary(1, 2, None).unwrap();
+        w.append(&Message::system("summary".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("post turn".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let exported = ExportedTranscript::from_session_dir(&session_dir).unwrap();
+        // All 4 real messages are present (compaction did not strip them).
+        assert_eq!(exported.messages.len(), 4);
+        assert_eq!(exported.message_count, 4);
+        // One boundary recorded, sitting at the index of the summary that
+        // follows it (after the 2 folded messages).
+        assert_eq!(exported.compact_boundaries.len(), 1);
+        let b = &exported.compact_boundaries[0];
+        assert_eq!(b.removed, 2);
+        assert_eq!(b.turn, Some(1));
+        assert_eq!(b.message_index, 2, "boundary precedes the summary message");
     }
 }

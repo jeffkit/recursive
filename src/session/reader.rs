@@ -6,7 +6,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use super::orphan::OrphanToolCall;
-use super::serialize::{entry_to_message, CompactBoundaryEntry, TranscriptEntry};
+use super::serialize::{entry_to_message, CompactBoundaryEntry, LoadedEntry, TranscriptEntry};
 use super::SessionMeta;
 
 /// Reader for loading sessions from JSONL files.
@@ -57,6 +57,58 @@ impl SessionReader {
         }
         // Discard pre-boundary entries (g157).
         Ok(all_entries.split_off(boundary_after))
+    }
+
+    /// Load the **full** on-disk history without discarding messages
+    /// folded away by cross-turn compaction.
+    ///
+    /// Unlike [`load_transcript`](Self::load_transcript) / [`load_messages`](Self::load_messages)
+    /// (which drop everything before the last `compact_boundary` so the
+    /// model seed matches the post-compaction context), this keeps every
+    /// line and surfaces each compaction as a
+    /// [`LoadedEntry::CompactBoundary`] marker. Use this for
+    /// **user-facing** paths — TUI session resume, `session show`,
+    /// `session export` — where the user expects to see the whole
+    /// conversation, not just the post-compaction tail.
+    ///
+    /// The model / resume-seed paths keep using `load_messages`; do not
+    /// feed `load_full_history` output into the runtime transcript.
+    pub fn load_full_history(session_dir: &Path) -> std::io::Result<Vec<LoadedEntry>> {
+        let jsonl_path = session_dir.join("transcript.jsonl");
+        let file = std::fs::File::open(&jsonl_path)?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut out: Vec<LoadedEntry> = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            // g157: detect compact_boundary system entries before trying to
+            // parse as TranscriptEntry (they have a different shape).
+            if let Ok(sys) = serde_json::from_str::<CompactBoundaryEntry>(&line) {
+                if sys.entry_type == "system" && sys.subtype == "compact_boundary" {
+                    out.push(LoadedEntry::CompactBoundary {
+                        turn: sys.turn,
+                        removed: sys.compacted_count.unwrap_or(0),
+                    });
+                    continue;
+                }
+            }
+            match serde_json::from_str::<TranscriptEntry>(&line) {
+                Ok(entry) => out.push(LoadedEntry::Message(Box::new(entry))),
+                Err(e) => {
+                    // Skip corrupt lines gracefully (mirrors load_transcript).
+                    eprintln!(
+                        "warning: skipping corrupt line in {}: {}",
+                        jsonl_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Load the transcript and build a UUID → `TranscriptEntry` index
@@ -638,5 +690,101 @@ mod tests {
         );
         assert_eq!(orphans[0].tool_call_id, "tc-orphan");
         assert_eq!(orphans[0].tool_name, "Read");
+    }
+
+    // Goal: TUI resume / session show should display the full conversation,
+    // not just the post-compaction tail. `load_full_history` keeps every
+    // message and surfaces each compact_boundary as a `CompactBoundary`
+    // marker, while `load_messages` (model seed) keeps stripping them.
+    #[test]
+    fn load_full_history_includes_pre_compact_messages_and_boundaries() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create(ws, "full history", "model", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+
+        // Pre-compact messages (these get folded at runtime, but stay on disk).
+        w.append(&Message::user("turn 1".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("reply 1".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::user("turn 2".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("reply 2".to_string()), None, None)
+            .unwrap();
+        // Boundary: folds the 4 messages above into a summary.
+        w.write_compact_boundary(3, 4, None).unwrap();
+        // Post-compact summary + a fresh exchange.
+        w.append(
+            &Message::system("summary of turn 1-2".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        w.append(&Message::user("turn 3".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("reply 3".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        // load_full_history keeps everything: 7 messages + 1 boundary marker.
+        let loaded = SessionReader::load_full_history(&session_dir).unwrap();
+        assert_eq!(loaded.len(), 8, "all messages + the boundary marker");
+
+        // The boundary sits between the folded messages and the summary.
+        let boundary_idx = loaded
+            .iter()
+            .position(
+                |e| matches!(e, LoadedEntry::CompactBoundary { removed, .. } if *removed == 4),
+            )
+            .expect("a CompactBoundary marker with removed=4");
+        assert_eq!(boundary_idx, 4, "boundary follows the 4 folded messages");
+
+        // Messages before and after the boundary are all present.
+        let pre = &loaded[..boundary_idx];
+        assert_eq!(pre.len(), 4);
+        assert!(pre.iter().all(|e| matches!(e, LoadedEntry::Message(_))));
+
+        let post = &loaded[boundary_idx + 1..];
+        assert_eq!(post.len(), 3);
+        assert!(post.iter().all(|e| matches!(e, LoadedEntry::Message(_))));
+
+        // The summary is the first message after the boundary.
+        if let LoadedEntry::Message(m) = &post[0] {
+            assert_eq!(m.role, "system");
+            assert_eq!(m.content, "summary of turn 1-2");
+        } else {
+            panic!("expected a Message after the boundary");
+        }
+
+        // Model seed path is unchanged: load_messages still strips the
+        // 4 folded messages, leaving summary + turn 3 exchange (3 msgs).
+        let seed = SessionReader::load_messages(&session_dir).unwrap();
+        assert_eq!(
+            seed.len(),
+            3,
+            "load_messages keeps only post-compaction tail"
+        );
+        assert_eq!(seed[0].content, "summary of turn 1-2");
+    }
+
+    #[test]
+    fn load_full_history_no_boundary_returns_all_messages() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create(ws, "no compact", "model", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+        w.append(&Message::user("hi".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("hello".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let loaded = SessionReader::load_full_history(&session_dir).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(
+            loaded.iter().all(|e| matches!(e, LoadedEntry::Message(_))),
+            "no CompactBoundary markers when the session never compacted"
+        );
     }
 }
