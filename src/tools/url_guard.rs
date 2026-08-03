@@ -5,17 +5,25 @@
 //! loopback targets **before any socket opens**. Consumers: `WebFetch`,
 //! `a2a_call`, `a2a_card`, `a2a_task_check`.
 //!
-//! The logic here is deliberately verbatim from the original `web_fetch.rs`
-//! implementation — do not "improve" it in place; file a separate goal if a
-//! gap is found (e.g. the hardcoded `"WebFetch"` name in error messages, or
-//! the lack of a redirect policy — both tracked separately).
+//! Host extraction and normalization were replaced in Goal 377 with the
+//! `url` crate's WHATWG parser — the same parsing reqwest applies before
+//! connecting — closing the RFC-vs-string mismatch that let userinfo /
+//! fragment / query / backslash forms and IPv4-mapped / trailing-dot
+//! literals reach private hosts while the hand-rolled splitter saw a
+//! "hostname". Remaining known issues (hardcoded `"WebFetch"` name in error
+//! messages, the lack of a redirect policy) are still tracked separately.
 
 use std::net::{IpAddr, Ipv4Addr};
+
+use url::Host;
 
 use crate::error::{Error, Result};
 
 /// Validate URL and block SSRF targets (private/loopback/link-local addresses).
 pub(crate) fn validate_url(url: &str) -> Result<String> {
+    // Cheap prefix gate keeps today's error message for non-http(s) inputs
+    // (web_fetch tests match on "http:// or https://"); `Url::parse` would
+    // otherwise report "relative URL without a base" for the same inputs.
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(Error::BadToolArgs {
             name: "WebFetch".into(),
@@ -23,44 +31,90 @@ pub(crate) fn validate_url(url: &str) -> Result<String> {
         });
     }
 
-    // Extract host from URL to check for SSRF targets.
-    let host = url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .and_then(|host_port| {
-            // Strip port if present; handle IPv6 literals [::1]:8080
-            if host_port.starts_with('[') {
-                host_port.find(']').map(|i| &host_port[1..i])
-            } else {
-                Some(host_port.split(':').next().unwrap_or(host_port))
-            }
-        })
-        .unwrap_or("");
+    let parsed = url::Url::parse(url).map_err(|e| Error::BadToolArgs {
+        name: "WebFetch".into(),
+        message: format!("invalid URL: {e}"),
+    })?;
 
-    // Block well-known SSRF hostnames regardless of capitalisation.
-    let host_lower = host.to_ascii_lowercase();
-    if host_lower == "localhost"
-        || host_lower.ends_with(".localhost")
-        || host_lower == "metadata.google.internal"
-    {
+    // Scheme check stays (belt-and-braces — the prefix gate above already
+    // guarantees http/https for anything that parses).
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
         return Err(Error::BadToolArgs {
             name: "WebFetch".into(),
-            message: format!("SSRF protection: host '{host}' is not allowed"),
+            message: "URL must start with http:// or https://".into(),
         });
     }
 
-    // If the host parses as a bare IP address, block private/loopback/link-local ranges.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(ip) {
-            return Err(reject(ip));
+    // Reject embedded credentials: userinfo is a primary obfuscation surface
+    // and web tools have no legitimate use for them.
+    if !parsed.username().is_empty() {
+        return Err(Error::BadToolArgs {
+            name: "WebFetch".into(),
+            message: "SSRF protection: userinfo in URL is not allowed".into(),
+        });
+    }
+
+    match parsed.host() {
+        Some(Host::Ipv4(v4)) => {
+            let ip = IpAddr::V4(v4);
+            if is_private_ip(ip) {
+                return Err(reject(ip));
+            }
         }
-    } else if let Some(ip) = parse_lenient_ipv4(host) {
-        // Lenient IPv4 spellings (decimal/hex/short-form) that the OS
-        // resolver accepts but `IpAddr::parse` rejects — block the same
-        // ranges so `http://2130706433/` can't reach loopback or IMDS.
-        if is_private_ip(ip) {
-            return Err(reject(ip));
+        Some(Host::Ipv6(v6)) => {
+            // IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is routed by the OS to the
+            // mapped v4 address — run the v4 private check so loopback/IMDS
+            // mapped forms (`[::ffff:127.0.0.1]`, `[::ffff:169.254.169.254]`)
+            // are blocked even though the v6 checks below would pass them.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                let ip = IpAddr::V4(v4);
+                if is_private_ip(ip) {
+                    return Err(reject(ip));
+                }
+            } else if is_private_ip(IpAddr::V6(v6)) {
+                return Err(reject(IpAddr::V6(v6)));
+            }
+        }
+        Some(Host::Domain(d)) => {
+            // Normalize: lowercase, and strip ONE trailing dot (a fully
+            // qualified host still resolves to the same address).
+            let host = d.to_ascii_lowercase();
+            let host = host.strip_suffix('.').unwrap_or(host.as_str());
+
+            // Block well-known SSRF hostnames regardless of capitalisation.
+            if host == "localhost"
+                || host.ends_with(".localhost")
+                || host == "metadata.google.internal"
+            {
+                return Err(Error::BadToolArgs {
+                    name: "WebFetch".into(),
+                    message: format!("SSRF protection: host '{host}' is not allowed"),
+                });
+            }
+
+            // If the host parses as a bare IP address, block private/loopback/
+            // link-local ranges.
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if is_private_ip(ip) {
+                    return Err(reject(ip));
+                }
+            } else if let Some(ip) = parse_lenient_ipv4(host) {
+                // Lenient IPv4 spellings (decimal/hex/short-form) that the OS
+                // resolver accepts but `IpAddr::parse` rejects — block the
+                // same ranges so `http://2130706433/` can't reach loopback or
+                // IMDS. (With the WHATWG parser most of these arrive as
+                // `Host::Ipv4`, but keep the fallback for domain-form cases.)
+                if is_private_ip(ip) {
+                    return Err(reject(ip));
+                }
+            }
+        }
+        None => {
+            return Err(Error::BadToolArgs {
+                name: "WebFetch".into(),
+                message: "SSRF protection: URL has no host".into(),
+            });
         }
     }
 
@@ -246,5 +300,74 @@ mod tests {
     fn validate_url_still_accepts_hostnames() {
         assert!(validate_url("http://example.com").is_ok());
         assert!(validate_url("http://example.com:8080/path").is_ok());
+    }
+
+    // ── Goal 377: RFC-vs-string parsing mismatch bypasses ───────────────
+
+    /// userinfo: reqwest drops `user@` and connects to 127.0.0.1; the old
+    /// hand-rolled splitter saw `user@127.0.0.1` (not an IP) and passed it.
+    #[test]
+    fn validate_url_blocks_userinfo_bypass() {
+        assert!(validate_url("http://user@127.0.0.1/").is_err());
+        // Credentials on a public host are also rejected (obfuscation surface).
+        assert!(validate_url("http://user:pass@example.com/").is_err());
+    }
+
+    /// fragment/query terminators: `#`/`?` end the host; reqwest connects to
+    /// 127.0.0.1 while the old splitter saw a single non-IP "hostname".
+    #[test]
+    fn validate_url_blocks_fragment_query_bypass() {
+        assert!(validate_url("http://127.0.0.1#@evil.com/").is_err());
+        assert!(validate_url("http://127.0.0.1?x/").is_err());
+    }
+
+    /// backslash: WHATWG treats `\` as `/` for special schemes, so reqwest
+    /// connects to 127.0.0.1 with path `@evil.com/`.
+    #[test]
+    fn validate_url_blocks_backslash_bypass() {
+        assert!(validate_url("http://127.0.0.1\\@evil.com/").is_err());
+    }
+
+    /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) routes to the v4 address; the old
+    /// v6 arm only checked loopback/ULA/link-local v6 ranges and passed.
+    #[test]
+    fn validate_url_blocks_ipv4_mapped_ipv6() {
+        assert!(validate_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(validate_url("http://[::ffff:169.254.169.254]/").is_err());
+        // Public mapped addresses stay allowed.
+        assert!(validate_url("http://[::ffff:8.8.8.8]/").is_ok());
+    }
+
+    /// Trailing-dot literals resolve to the same address; `localhost.` must
+    /// also be blocked (dot-stripped before the hostname check).
+    #[test]
+    fn validate_url_blocks_trailing_dot_literals() {
+        assert!(validate_url("http://127.0.0.1./").is_err());
+        assert!(validate_url("http://2130706433./").is_err());
+        assert!(validate_url("http://localhost./").is_err());
+    }
+
+    /// Port variant still blocked (host check independent of port).
+    #[test]
+    fn validate_url_blocks_loopback_with_port() {
+        assert!(validate_url("http://127.0.0.1:8080/path").is_err());
+    }
+
+    /// Non-SSRF URLs keep passing: public hostnames, public v6, query/fragment.
+    #[test]
+    fn validate_url_still_accepts_public_targets() {
+        assert!(validate_url("http://example.com").is_ok());
+        assert!(validate_url("http://example.com:8080/path").is_ok());
+        assert!(validate_url("http://[2001:db8::1]/path").is_ok());
+        assert!(validate_url("https://example.com/x?y=1#z").is_ok());
+        // Trailing-dot public hostname stays allowed.
+        assert!(validate_url("http://example.com./").is_ok());
+    }
+
+    /// Malformed URLs are rejected up front (the old splitter passed some).
+    #[test]
+    fn validate_url_rejects_unparseable() {
+        assert!(validate_url("http://").is_err());
+        assert!(validate_url("http://exa mple.com/").is_err());
     }
 }
