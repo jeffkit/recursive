@@ -41,7 +41,12 @@ FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,coordinat
 # concurrently; JOBS>1 drops --in-place (parallel in-place mutation would
 # race on the same source file) and uses cargo-mutants' copy mode instead —
 # the real source is never mutated, so assert_clean below is a no-op.
+# Cap at 8: cargo-mutants warns "--jobs > 8 may overload"; 14 jobs on this
+# 14-core box saturated CPU/IO and (2026-08-03) crashed the mcp_e2e baseline
+# (mock-server 2s handshake timeout) and ran ~4.8h for 83 mutants — resource
+# contention made it SLOWER than 4-8 jobs, not faster.
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+if [[ "$JOBS" -gt 8 ]]; then JOBS=8; fi
 
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2

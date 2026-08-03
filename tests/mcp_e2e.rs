@@ -27,6 +27,17 @@ use recursive::mcp::{McpClient, McpServer, McpTool, McpToolSpec};
 ///    middle ground that still cuts the timeout test from ~10s to ~2s.
 const TEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Cold-start retries for the mock binary (modes that must succeed).
+///
+/// Under heavy parallel load — e.g. cargo-mutants `--jobs N` compiling
+/// and running test binaries concurrently (2026-08-03: 14 jobs crashed the
+/// mcp_e2e baseline with "server timed out (no response within 2s)") — a
+/// single spawn+handshake can exceed TEST_READ_TIMEOUT transiently even
+/// though the server is healthy. Retrying separates that from a genuinely
+/// hung server. The `timeout` mode is the one case that must NOT retry:
+/// its whole purpose is to exercise the read-timeout path and fail fast.
+const MOCK_SPAWN_RETRIES: u32 = 3;
+
 /// Spawn the pure-Rust mock MCP server binary in the given behavior mode.
 async fn spawn_mock(mode: &str) -> Result<McpClient> {
     let server = McpServer {
@@ -36,7 +47,24 @@ async fn spawn_mock(mode: &str) -> Result<McpClient> {
         url: None,
         env: None,
     };
-    McpClient::spawn_with_timeout(&server, TEST_READ_TIMEOUT).await
+    let attempts = if mode == "timeout" {
+        1
+    } else {
+        MOCK_SPAWN_RETRIES
+    };
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match McpClient::spawn_with_timeout(&server, TEST_READ_TIMEOUT).await {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                last_err = Some(e);
+                // Back off between retries: cold start under load is
+                // transient, but give the scheduler a moment to settle.
+                tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+            }
+        }
+    }
+    Err(last_err.expect("at least one spawn attempt"))
 }
 
 // ---------------------------------------------------------------------------
