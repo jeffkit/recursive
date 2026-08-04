@@ -122,6 +122,11 @@ AIMOCK_NAME="${WORKTREE_ID}-aimock"
 cleanup() {
   local rc=$?
   docker rm -f "$AIMOCK_NAME" >/dev/null 2>&1 || true
+  # Drop the WORKTREE_ID-scoped network this run created. Leftover
+  # argusai-* networks accumulate and exhaust Docker's subnet pool
+  # ("all predefined address pools have been fully subnetted"), which
+  # breaks later Docker-mode setups. Only remove this run's network.
+  docker network rm "argusai-${WORKTREE_ID}-network" >/dev/null 2>&1 || true
   rm -rf "$WORKSPACE_DIR"
   exit "$rc"
 }

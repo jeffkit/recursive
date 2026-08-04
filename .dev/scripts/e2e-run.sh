@@ -120,6 +120,12 @@ cleanup() {
   # would linger and — worse — silently replay old fixtures instead of
   # recording on the next E2E_RECORD run. Remove it explicitly.
   docker rm -f aimock >/dev/null 2>&1 || true
+  # Also drop the WORKTREE_ID-scoped network. Leftover argusai-* networks
+  # accumulate across runs and exhaust Docker's default subnet pool
+  # ("all predefined address pools have been fully subnetted"), which
+  # silently breaks later setups. Only remove the current run's network —
+  # other worktrees' networks are left alone.
+  docker network rm "argusai-${WORKTREE_ID}-network" >/dev/null 2>&1 || true
   "$MCP2CLI" --session-stop "$SESSION" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
