@@ -139,20 +139,36 @@ Don't edit files a live worktree run is working on.
    even after the filesystem cleanup. If the first remedy isn't enough, kill the
    daemon too: `mcp2cli --session-stop argusai-$(git rev-parse --short HEAD)`
    (list live ones with `mcp2cli --session-list`), then re-run the gate.
-5. **Accumulated `argusai-wt-*-network` networks exhaust Docker's address pools.**
+5. **Accumulated `argusai-*` networks exhaust Docker's address pools.**
    `argus-clean` removes containers but leaves the empty network behind, so every
-   completed e2e gate run leaks one bridge network. After enough runs
+   completed e2e run leaks one bridge network (`argusai-<WORKTREE_ID>-network`,
+   or `argusai-host-<pid>-network` in host mode). After enough runs
    (`docker network ls --filter name=argusai` grows to ~25+), `docker network create`
    fails with `all predefined address pools have been fully subnetted` and
    `argusai-core`'s `ensureNetwork` **swallows** that error (`catch { // Network may
    already exist }`) — so `argus-setup` reports `"created": true` but the subsequent
    `docker run --network <name>` fails with `network ... not found`, and every smoke
    case fails with `File ... does not exist` (setup exec steps ran against no
-   container). This looks like a code regression but isn't. Remedy:
-   `for n in $(docker network ls --filter name=argusai --format '{{.Name}}'); do docker network rm "$n"; done`
+   container). This looks like a code regression but isn't. **Mitigation (commit `1f93b94`):**
+   `e2e-run.sh` and `e2e-run-host.sh` now `docker network rm` their own network in
+   cleanup, so normal runs no longer leak. Any **pre-fix** leaked networks need a
+   one-time manual sweep:
+   `for n in $(docker network ls --filter name=argusai --format '{{.Name}}'); do [ "$(docker network inspect "$n" --format '{{len .Containers}}')" = "0" ] && docker network rm "$n"; done`
    (only removes networks with no attached containers — safe for concurrent runs),
    remove any stale `recursive-e2e` container (`docker rm -f recursive-e2e`), then
    re-run the gate.
+6. **`e2e-run.sh --no-build` after a code change silently uses a missing image.**
+   The e2e image tag is `recursive:e2e-wt-<HEAD>`; once HEAD moves (any commit, even
+   an e2e-YAML-only one) the tag no longer matches a built image. `--no-build` skips
+   the rebuild and `docker run` falls back to pulling `recursive:e2e-wt-<new HEAD>`
+   from the registry, which fails with `pull access denied for recursive` — but
+   argus-setup swallows this as `service: failed` and the suite then fails every
+   case with `File ... does not exist` / `No such container` (no container ever
+   started). Looks like an agent/tool regression; it's a missing image. **Always
+   drop `--no-build` on the first Docker-mode run after HEAD changes** (build takes
+   ~1-2 min; subsequent runs in the same HEAD can use `--no-build`). Host-mode runs
+   (`e2e-run-host.sh`) are unaffected — they use the host `target/release/recursive`
+   binary, not the image.
 
 New failure modes should be added here, not silently worked around.
 
