@@ -104,15 +104,16 @@ const plugin: PluginModule = {
     // exactly like on the CLI path.
     try {
       const allNetworks = execSync('docker network ls --format "{{.Name}}"', { encoding: 'utf-8' }).trim().split('\n');
-      const candidateNetworks = [
-        worktreeId ? `argusai-${worktreeId}-network` : null,
-        `argusai-${projectSlug}-network`,
-        'e2e-network',
-      ].filter((n): n is string => n !== null);
-      // Prefer an already-existing candidate (any of them); otherwise create
-      // the one argus-setup will use, derived from WORKTREE_ID/project slug.
-      const targetNetwork = candidateNetworks.find((n) => allNetworks.includes(n))
-        ?? (worktreeId ? `argusai-${worktreeId}-network` : `argusai-${projectSlug}-network`);
+      // Always use the network argus-setup creates: the WORKTREE_ID-scoped
+      // network (or the project-slug network when no WORKTREE_ID). Do NOT
+      // prefer an already-existing candidate — a leftover network from an
+      // earlier run (e.g. `argusai-recursive-agent-network`) would strand
+      // aimock on a different network than the service container, making
+      // `aimock` unresolvable from inside recursive-e2e (agent LLM calls
+      // silently time out and the e2e fails with missing files).
+      const targetNetwork = worktreeId
+        ? `argusai-${worktreeId}-network`
+        : `argusai-${projectSlug}-network`;
       if (!allNetworks.includes(targetNetwork)) {
         try {
           execSync(`docker network create "${targetNetwork}"`, { stdio: 'pipe' });
