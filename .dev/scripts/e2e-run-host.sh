@@ -40,6 +40,12 @@ echo "[e2e-host] using argusai-mcp: $ARGUSAI_MCP_BIN"
 export E2E_HOST_MODE=1
 export WORKTREE_ID="host-$$"
 export E2E_AIMOCK_PORT="${E2E_AIMOCK_PORT:-4010}"
+# recursive provider env — in Docker mode these are set by e2e.yaml's
+# container.environment; in host mode we set them globally so the recursive
+# binary (invoked by YAML exec steps) inherits them via HostRuntime.
+export RECURSIVE_PROVIDER_TYPE=openai
+export RECURSIVE_RATE_LIMIT_BURST=200
+export RECURSIVE_RATE_LIMIT_RPM=6000
 # E2E_WORKSPACE_DIR: HostRuntime transparently maps /workspace → this dir
 # in exec commands, so YAML suites with container paths work on host.
 WORKSPACE_DIR=$(mktemp -d /tmp/e2e-host-ws-XXXXXX)
