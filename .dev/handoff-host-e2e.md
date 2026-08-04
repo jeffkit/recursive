@@ -5,7 +5,7 @@
 
 ## 一句话状态
 
-argusai HostRuntime 已发版 0.15.3（含 host cwd 修复）。recursive 侧 host 模式 e2e **37/41 suite 通过**（2026-08-04，`e2e-host-batch.sh` 全量跑）。剩 2 个失败**全是本机端口冲突**（9093 被 Java app 占、9097 被隐藏 listener 占），换机器/杀进程即过，suite 本身没问题。本次会话还顺手修了一批 Docker 下也潜伏的 bug（HTTP 认证、过时断言、schema 不匹配、jq 点号 key、rate-limit 测错端点、SSE curl 引号）。
+argusai HostRuntime 已发版 0.15.3（含 host cwd 修复）。recursive 侧 host 模式 e2e **39/41 suite 通过、0 失败**（2026-08-04，`e2e-host-batch.sh` 全量跑；仅 skip 2 个需真 key 的 live suite）。HTTP 测试端口已随机化（每个 suite 自分配空闲端口），本机端口占用不再影响测试。本次会话还顺手修了一批 Docker 下也潜伏的 bug（HTTP 认证、过时断言、schema 不匹配、jq 点号 key、rate-limit 测错端点、SSE curl 引号）。
 
 ## 两个仓的最新 commit
 
@@ -94,15 +94,16 @@ npm 已发版：`argusai-mcp@0.15.2`（含 argusai-core/core-storage/dashboard �
 | session-rewind slug 断言改匹配稳定尾巴 `test-rewind` | 36 | host-only（workspace 是临时目录，slug 带前缀） |
 | **HostRuntime `execInContainer` 加 `cwd: workspaceDir`** | argusai 仓 runtime.ts | host-only（镜像 Docker 的 WORKDIR；否则 agent 默认 workspace=cwd 落到 daemon 目录） |
 
-### 1. 剩余 2 个失败（已知，纯环境）
+### 1. ✅ 全部 39 个非 live suite 通过（0 失败）
 
-| suite | 原因 | 性质 |
-|-------|------|------|
-| `http-interrupt` (port 9093) | 本机一个 Java app 占着 9093 | **环境**（端口冲突，换机器/杀进程即过） |
-| `http-auth` (port 9097) | 本机一个隐藏 listener 占着 9097（lsof 看不到 PID，netstat 见 LISTEN，回 404+CORS 头，非 recursive） | **环境**（端口冲突） |
+端口随机化（commit `953359f`）后，之前 2 个端口冲突的失败也解决了：
+- 8 个 HTTP suite 不再硬编码端口（9090/9091/9093/9095/9096/9097/9099），每个 suite 在第一个 setup step 用 `socket.bind(('',0))` 自分配空闲端口，写到 `/tmp/e2e-host-port-<id>.txt`，后续每个 step（独立 sh 进程）重新读文件。
+- 顺带解决了 08b 和 18 共用 9091 的潜在冲突。
+- 清理用的 pkill 改成端口无关的 `'recursive.*http --addr'` 模式。
+- SDK heredoc（Python/TS）通过 `os.environ['PORT']` / `process.env.PORT` 读端口（单引号 heredoc 不展开 `$PORT`）。
+- 39 的 `nohup sh -c '...'` 内层引号改双引号让 `$PORT` 展开。
 
-> 两个端口冲突的验证：在空闲端口上手动复现过，`/interrupt`→200、`/health`→200 都正常，suite 本身没问题。
-> （之前的第 3 个失败 http-api SSE 已解决——是我做 auth-header 注入时把 `-H` 塞进了已加引号的 URL token，curl 当成无 URL → SSE 捕获为空。已把 header 移到引号外，http-api 现在 21/21。）
+**最终状态：`e2e-host-batch.sh` 全量 39 PASS / 0 FAIL / 2 SKIP**（skip 的是需真 key 的 `live` 和 `deferred-tool-loading`）。
 
 ### 2. argusai 0.15.3 已发版
 
