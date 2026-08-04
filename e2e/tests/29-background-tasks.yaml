@@ -35,7 +35,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 12 \
           run "Run background job 'sleep 0.5 && echo bg-ok > bg-result.txt', wait, then check its status with check_background. Write result to bg-check-result.txt."
-        SESSION_DIR=$(find /tmp/rh-bg -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/rh-bg -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-bg
           cp -r "$SESSION_DIR/." /tmp/sessions-bg/

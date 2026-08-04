@@ -42,7 +42,7 @@ setup:
         cat /tmp/acp-stderr.log
         echo "--- END ---"
 
-assert:
+cases:
   - name: "Response line 1: protocolVersion, agentInfo, agentCapabilities"
     exec:
       container: recursive-e2e
@@ -66,9 +66,12 @@ assert:
           exit 1
         fi
 
-        # S1-C2: All 8 required forward-capability keys must exist
+        # S1-C2: All 8 required forward-capability keys must exist.
+        # Use bracket notation (["..."]) so dotted keys like "fs.readTextFile"
+        # are treated as a single key, not a nested path (jq would otherwise
+        # parse agentCapabilities.fs.readTextFile as .fs → .readTextFile).
         for KEY in promptCapabilities toolCallNotifications loadSession resume fs.readTextFile fs.writeTextFile mcpCapabilities; do
-          echo "$RESP" | jq -e ".result.agentCapabilities.$KEY != null and .result.agentCapabilities.$KEY != false" \
+          echo "$RESP" | jq -e --arg k "$KEY" '.result.agentCapabilities[$k] != null and .result.agentCapabilities[$k] != false' \
             || { echo "FAIL: missing or falsy agentCapabilities.$KEY"; exit 1; }
         done
 

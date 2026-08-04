@@ -32,7 +32,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 10 \
           run "Store the fact 'The project uses Rust as its primary language' using remember tool with tags=['project','language']. Then recall using query 'primary language'. Write the recall result to facts-result.txt."
-        SESSION_DIR=$(find /tmp/recursive-home-facts -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/recursive-home-facts -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-facts
           cp -r "$SESSION_DIR/." /tmp/sessions-facts/

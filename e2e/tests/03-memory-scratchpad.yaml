@@ -25,7 +25,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 10 \
           run "Use the scratchpad_set tool to store the key 'test_color' with value 'blue'. Then use scratchpad_list to confirm it's stored. Do nothing else."
-        SESSION_DIR=$(find /tmp/recursive-home-03 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/recursive-home-03 -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-03
           cp -r "$SESSION_DIR/." /tmp/sessions-03/

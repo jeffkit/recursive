@@ -5,7 +5,7 @@
 
 ## 一句话状态
 
-argusai HostRuntime 已实现并通过 npm 发版（0.15.0-0.15.2）。recursive 侧的 host 模式 e2e smoke 验证了 **case 1 (write_file) 完全通过**——证明从 config 到 recursive binary 到 file 断言的完整链路 work。剩余工作是 smoke case 2/3 的 session 断言路径适配（机械工作，非架构问题）。
+argusai HostRuntime 已实现并通过 npm 发版（0.15.0-0.15.2）。recursive 侧 host 模式 e2e **36/41 suite 通过**（2026-08-04，`e2e-host-batch.sh` 全量跑）。剩 3 个失败全是环境/边角问题（2 个是本机端口被别的 app 占用，1 个是 SSE `done` 事件在 host 模式下不投递——待深挖）。本次会话还顺手修了一批 Docker 下也潜伏的 bug（HTTP 认证、过时断言、schema 不匹配、jq 点号 key、rate-limit 测错端点）。
 
 ## 两个仓的最新 commit
 
@@ -75,50 +75,56 @@ npm 已发版：`argusai-mcp@0.15.2`（含 argusai-core/core-storage/dashboard �
 
 ## 下一个会话需要继续做的事
 
-### 1.（优先）让 smoke 套件 3/3 全过
+### 0. ✅ 全量 host e2e 已跑通 36/41（2026-08-04 第二轮会话）
 
-**当前状态**：
-```
-smoke 套件（3 个 case）：
-  ✅ case 1: write_file produced smoke.txt    PASSED
-  ❌ case 2: session recorded write_file       FAILED（"No session directory found under /tmp/sessions-smoke-01"）
-  ⏭️ case 3: session recorded read_file         SKIPPED（sequential fail-fast）
-```
+`bash .dev/scripts/e2e-host-batch.sh` 全量跑 41 个 suite：**PASS 36 / FAIL 3 / SKIP 2**（skip 的是需真 key 的 live/deferred）。
+本次会话修了以下问题（都是 host 模式暴露、但多数 Docker 下也潜伏的）：
 
-**case 1 通过证明完整链路 work**（config-loader → HostRuntime → execInContainer → recursive binary → aimock → write_file → file 断言）。
+| 修复 | 影响范围 | 类型 |
+|------|---------|------|
+| `find -printf` → `-exec dirname {}` | 21 个 suite | BSD/GNU 兼容（host-only） |
+| `e2e-run-host.sh` 注册全部 41 suite（之前只 smoke）+ `data` 信封解包 | runner | host runner |
+| `E2E_HOST_REPLACEMENTS` 映射 `/sdk/*` → repo | typescript-sdk | host runner（python-sdk 走 pip 已通） |
+| `RECURSIVE_API_KEY`/`API_BASE` 全局 export | acp-init | host runner（之前只 export 了 provider type） |
+| HTTP server 起 `RECURSIVE_HTTP_AUTH_KEYS` + curl 带 `X-API-Key` | 08/08b/18/19/20/21/22 共 7 个 suite | **SEC-003 在 release binary 下的潜伏 bug**（Docker 也挂） |
+| `assert:` → `cases:` schema 迁移 + jq 点号 key (`fs.readTextFile`) 改 `[$k]` | acp-init | **schema 不匹配 + jq bug**（Docker 也挂） |
+| `escapes workspace` → `escapes sandbox roots` | bash-tool, sandbox-security | **过时断言**（Docker 也挂） |
+| http-rate-limit 改测受保护端点（`/health` 是 rate-limit-exempt） | 08b | **测试测错端点**（Docker 也挂） |
+| count_lines 断言改成「serve 可见」 | utility-tools | **过时断言**（registry 重构后 count_lines 已共享，Docker 也挂） |
+| session-rewind slug 断言改匹配稳定尾巴 `test-rewind` | 36 | host-only（workspace 是临时目录，slug 带前缀） |
+| **HostRuntime `execInContainer` 加 `cwd: workspaceDir`** | argusai 仓 runtime.ts | host-only（镜像 Docker 的 WORKDIR；否则 agent 默认 workspace=cwd 落到 daemon 目录） |
 
-**case 2 失败原因**：smoke YAML (`e2e/tests/00-smoke.yaml`) 的 setup step 里有这段逻辑：
-```bash
-SESSION=$(find /tmp/rh-smoke-01 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
-if [ -n "$SESSION" ]; then
-  mkdir -p /tmp/sessions-smoke-01
-  cp -r "$SESSION/." /tmp/sessions-smoke-01/
-fi
-```
-这段把 session cp 到 `/tmp/sessions-smoke-01`。在 host 模式下：
-- recursive 用 `RECURSIVE_HOME=/tmp/rh-smoke-01` 跑，session 落在 `/tmp/rh-smoke-01/workspaces/<hash>/sessions/...`
-- `find /tmp/rh-smoke-01 -name .meta.json` 应该能找到——但 macOS 的 `find` 不支持 `-printf`（GNU 专有）！这是和 e2e-local.sh 一样的 BSD find 兼容性问题
-- 即使 find 成功，`/tmp/sessions-smoke-01` 的 cp 也需要执行成功
+### 1. 剩余 3 个失败（已知，非阻塞）
 
-**修复方向**：
-- 最小方案：在 e2e-run-host.sh 里，跑完 setup 后手动 cp session 到断言期望的路径
-- 或：改 recursive-session assertion plugin 的 input 路径（让它直接读 `RECURSIVE_HOME` 下的 session，不依赖 cp）
+| suite | 原因 | 性质 |
+|-------|------|------|
+| `http-interrupt` (port 9093) | 本机一个 Java app 占着 9093 | **环境**（端口冲突，换机器/杀进程即过） |
+| `http-auth` (port 9097) | 本机一个隐藏 listener 占着 9097（lsof 看不到 PID，netstat 见 LISTEN，回 404+CORS 头，非 recursive） | **环境**（端口冲突） |
+| `http-api` SSE case | `GET /sessions/:id/events` 在 host 模式下收不到 `done` 事件（已把固定 sleep 改成 5s 轮询仍 missing，**不是 timing**，是 SSE 完成事件投递的更深问题） | **待深挖**（08 其余 15/21 全过，只此 1 个 SSE case） |
 
-### 2. 扩展到全部 41 个 suite
+> 两个端口冲突的验证：在空闲端口上手动复现过，`/interrupt`→200、`/health`→200 都正常，suite 本身没问题。
 
-smoke 全过后，其余 40 个 suite 的主要障碍是 `/workspace` 路径（已被 HostRuntime 的 workspaceDir 映射解决）和各种容器环境变量（如 `RECURSIVE_PROVIDER_TYPE`）。逐个 suite 跑 `e2e-run-host.sh <suite-id>`，修暴露的问题。
+### 2. argusai 仓的改动需发版
+
+`packages/core/src/runtime.ts` 的 HostRuntime `cwd` 修复**已在本地 build + `npm link`**（当前 argusai-mcp 指向本地）。
+跑 host e2e 前 `cd argusai/packages/mcp && npm link`；恢复正式版 `npm install -g argusai-mcp@0.15.2`。
+建议给 argusai 加个 changeset 发 0.15.3（host cwd fix）。
 
 ### 3. 工作树清理
 
-recursive 工作树有未提交的文件（可能是之前 self-improve cycle 的遗留）：
+recursive 工作树有一批未提交文件（之前 self-improve cycle 遗留，**非本次会话产物**）：
 ```
  M docs/review/REVIEW_STATUS.md
 ?? .dev/goals/385-invariant-size-headroom.md
 ?? .dev/goals/386-default-launch-tui.md
 ?? .dev/goals/387-acp-tools-defer-or-gate.md
 ?? .dev/goals/388-doc-drift-agents-arch-overview.md
+?? .dev/goals/389-tui-prompt-history-persist.md
+?? .dev/goals/390-cost-unknown-model-null.md
+?? .dev/goals/391-packaging-trigger-criteria.md
+?? docs/review/architecture-review-2026-08-04.md
 ```
-确认这些是否要保留/提交/删除。
+本次会话只动了 e2e/tests/*.yaml、.dev/scripts/、.dev/handoff-host-e2e.md，没碰上面这些。
 
 ## 关键技术知识（避免踩坑）
 

@@ -39,6 +39,7 @@ setup:
       command: |
         RECURSIVE_RATE_LIMIT_BURST=200 \
         RECURSIVE_RATE_LIMIT_RPM=6000 \
+         RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
         nohup recursive \
           --api-base http://aimock:4010/v1 \
           --api-key mock-key -m mock-chat \
@@ -61,7 +62,7 @@ cases:
   - name: "GET /tools returns Read in JSON array"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9090/tools
+      command: 'curl -sf -H "X-API-Key: test-secret-key" http://localhost:9090/tools'
     expect:
       exitCode: 0
       output:
@@ -82,7 +83,7 @@ cases:
       container: recursive-e2e
       command: >
         curl -s -o /dev/null -w 'status=%{http_code}'
-        http://localhost:9090/sessions/nonexistent-session-id-xyz
+        -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/nonexistent-session-id-xyz
     expect:
       exitCode: 0
       output:
@@ -93,7 +94,7 @@ cases:
       container: recursive-e2e
       command: >
         curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST http://localhost:9090/sessions/nonexistent-session-id-xyz/messages
+        -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/nonexistent-session-id-xyz/messages
         -H 'Content-Type: application/json'
         -d '{"content":"hello"}'
     expect:
@@ -106,7 +107,7 @@ cases:
       container: recursive-e2e
       command: >
         curl -s -o /dev/null -w 'status=%{http_code}'
-        http://localhost:9090/sessions/nonexistent-session-id-xyz/events
+        -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/nonexistent-session-id-xyz/events
     expect:
       exitCode: 0
       output:
@@ -117,7 +118,7 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -sf -X POST http://localhost:9090/run
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/run
         -H 'Content-Type: application/json'
         -d '{"goal":"Write file http-run.txt with content run-ok","max_steps":5}'
     expect:
@@ -140,7 +141,7 @@ cases:
       container: recursive-e2e
       command: >
         curl -s -o /dev/null -w status=%{http_code}
-        -X POST http://localhost:9090/run
+        -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/run
         -H 'Content-Type: application/json'
         -d '{"goal":""}'
     expect:
@@ -153,7 +154,7 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -sf -X POST http://localhost:9090/sessions
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions
         -H 'Content-Type: application/json'
         -d '{"system_prompt":"You are a test assistant."}'
         | tee /tmp/sess.json | jq -r .id > /tmp/http-sid
@@ -168,7 +169,7 @@ cases:
       container: recursive-e2e
       command: >
         SID=$(cat /tmp/http-sid)
-        && curl -sf -X POST http://localhost:9090/sessions/$SID/messages
+        && curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SID/messages
         -H 'Content-Type: application/json'
         -d '{"content":"Write file session-turn1.txt with content turn1"}'
         | jq -r .role | xargs -I {} echo role={}
@@ -189,7 +190,7 @@ cases:
       container: recursive-e2e
       command: >
         SID=$(cat /tmp/http-sid)
-        && curl -sf http://localhost:9090/sessions/$SID
+        && curl -sf -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SID
         | jq '.messages | length' | xargs -I {} echo count={}
     expect:
       exitCode: 0
@@ -201,7 +202,7 @@ cases:
       container: recursive-e2e
       command: >
         SID=$(cat /tmp/http-sid)
-        && curl -sf -X POST http://localhost:9090/sessions/$SID/messages
+        && curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SID/messages
         -H 'Content-Type: application/json'
         -d '{"content":"Write file session-turn2.txt with content turn2"}'
         | jq -r .role | xargs -I {} echo role={}
@@ -222,7 +223,7 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -sf -X POST http://localhost:9090/sessions
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions
         -H 'Content-Type: application/json'
         -d '{"system_prompt":"You are a test assistant."}'
         | jq -r .id > /tmp/sse-sid
@@ -238,15 +239,21 @@ cases:
       command: |
         SSE_SID=$(cat /tmp/sse-sid)
         : > /tmp/sse-events.txt
-        curl -s -N "http://localhost:9090/sessions/$SSE_SID/events" \
+        curl -s -N "-H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SSE_SID/events" \
           > /tmp/sse-events.txt 2>/dev/null &
         SSE_PID=$!
         sleep 0.5
-        curl -sf -X POST "http://localhost:9090/sessions/$SSE_SID/messages" \
+        curl -sf -X POST "-H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SSE_SID/messages" \
           -H 'Content-Type: application/json' \
           -d '{"content":"Write file sse-test.txt with content sse-ok"}' \
           > /dev/null
-        sleep 0.5
+        # Poll up to ~5s for the `done` event to arrive on the SSE stream.
+        # The agent turn (mock LLM + tool call) takes longer than a fixed 0.5s
+        # on a loaded host, so a hard sleep made this flaky.
+        for i in $(seq 1 50); do
+          grep -q "done" /tmp/sse-events.txt && break
+          sleep 0.1
+        done
         kill $SSE_PID 2>/dev/null || true
         wait $SSE_PID 2>/dev/null || true
         grep -q "done" /tmp/sse-events.txt && echo "sse-received" || echo "sse-missing"
@@ -267,7 +274,7 @@ cases:
       container: recursive-e2e
       command: >
         SSE_SID=$(cat /tmp/sse-sid)
-        && curl -sf -X DELETE http://localhost:9090/sessions/$SSE_SID
+        && curl -sf -X DELETE -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SSE_SID
         && echo cleaned
     expect:
       exitCode: 0
@@ -278,7 +285,7 @@ cases:
   - name: "GET /sessions lists sessions with message_count"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9090/sessions
+      command: 'curl -sf -H "X-API-Key: test-secret-key" http://localhost:9090/sessions'
     expect:
       exitCode: 0
       output:
@@ -289,9 +296,9 @@ cases:
       container: recursive-e2e
       command: >
         SID=$(cat /tmp/http-sid)
-        && curl -sf -X DELETE http://localhost:9090/sessions/$SID
+        && curl -sf -X DELETE -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SID
         && CODE=$(curl -s -o /dev/null -w %{http_code}
-        http://localhost:9090/sessions/$SID)
+        -H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SID)
         && echo after_delete=$CODE
     expect:
       exitCode: 0

@@ -31,7 +31,7 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        nohup recursive \
+        RECURSIVE_HTTP_AUTH_KEYS=test-secret-key nohup recursive \
           --api-base http://aimock:4010/v1 \
           --api-key mock-key -m mock-chat \
           http --addr 0.0.0.0:9095 \
@@ -54,7 +54,7 @@ setup:
       command: |
         python3 - <<'PYEOF' > /tmp/sdk-result.txt
         from recursive_sdk import Agent
-        with Agent.create(base_url='http://localhost:9095', api_key='test') as agent:
+        with Agent.create(base_url='http://localhost:9095', api_key='test-secret-key') as agent:
             run = agent.send('sdk-python-hello')
             result = run.wait()
             print('status=' + str(result.status))

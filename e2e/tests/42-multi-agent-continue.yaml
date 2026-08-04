@@ -42,7 +42,7 @@ setup:
         # Give any lingering background task a moment to flush before the
         # process exit tears down its runtime.
         sleep 1
-        SESSION_DIR=$(find /tmp/recursive-home-42 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/recursive-home-42 -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-42
           cp -r "$SESSION_DIR/." /tmp/sessions-42/

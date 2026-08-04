@@ -37,7 +37,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 8 \
           loop "Write file multi-loop.txt with content wakeup-done"
-        SESSION_DIR=$(find /tmp/rh-loop17 -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/rh-loop17 -name 'transcript.jsonl' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-loop17
           cp -r "$SESSION_DIR/." /tmp/sessions-loop17/

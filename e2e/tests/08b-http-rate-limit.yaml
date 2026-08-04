@@ -26,6 +26,7 @@ setup:
         rm -f /tmp/http-9091.log
         RECURSIVE_RATE_LIMIT_BURST=2 \
         RECURSIVE_RATE_LIMIT_RPM=60 \
+        RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
         nohup recursive \
           --api-base http://aimock:4010/v1 \
           --api-key mock-key -m mock-chat \
@@ -48,15 +49,15 @@ cases:
     exec:
       container: recursive-e2e
       command: |
-        # Burst=2 → first two 200, third 429.
-        # Note: the sanity case in setup already consumed 1 token.
-        # Request 1 here will be 429 if the bucket didn't refill; or
-        # status3 will be 429 after 2 fresh hits. We assert at least one
-        # 429 across three rapid hits.
+        # Burst=2 → first two 200, third 429. /health is rate-limit-exempt
+        # (it's the k8s liveness probe and lives in the public sub-router),
+        # so we hit a protected endpoint (/tools) with the auth key to
+        # actually exercise the rate-limit middleware.
         sleep 1
-        S1=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
-        S2=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
-        S3=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9091/health)
+        HDR='-H X-API-Key:test-secret-key'
+        S1=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:9091/tools)
+        S2=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:9091/tools)
+        S3=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:9091/tools)
         echo "statuses=$S1,$S2,$S3"
         echo "$S1 $S2 $S3" | grep -q 429 && echo "rate-limited-ok" || echo "expected-429-but-got-$S1-$S2-$S3"
     expect:

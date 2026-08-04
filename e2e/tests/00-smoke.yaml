@@ -34,7 +34,7 @@ setup:
             --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
             --max-steps 5 \
             run "Create a file called smoke.txt with content 'ok'"
-        SESSION=$(find /tmp/rh-smoke-01 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION=$(find /tmp/rh-smoke-01 -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION" ]; then
           mkdir -p /tmp/sessions-smoke-01
           cp -r "$SESSION/." /tmp/sessions-smoke-01/
@@ -52,7 +52,7 @@ setup:
             --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
             --max-steps 5 \
             run "Read the file input.txt and tell me what it contains"
-        SESSION=$(find /tmp/rh-smoke-02 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION=$(find /tmp/rh-smoke-02 -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION" ]; then
           mkdir -p /tmp/sessions-smoke-02
           cp -r "$SESSION/." /tmp/sessions-smoke-02/

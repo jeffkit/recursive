@@ -32,6 +32,7 @@ setup:
       container: recursive-e2e
       command: |
         RECURSIVE_RATE_LIMIT_BURST=200 RECURSIVE_RATE_LIMIT_RPM=6000 \
+        RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
           nohup recursive \
             --api-base http://aimock:4010/v1 \
             --api-key mock-key -m mock-chat \
@@ -53,7 +54,7 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        curl -sf -X POST http://localhost:9091/sessions \
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions \
           -H 'Content-Type: application/json' \
           -d '{"system_prompt":"You are a test assistant."}' \
           | jq -r .id > /tmp/goal-sid
@@ -75,7 +76,7 @@ cases:
       container: recursive-e2e
       command: |
         SID=$(cat /tmp/goal-sid)
-        curl -sf -X POST http://localhost:9091/sessions/$SID/goal \
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/$SID/goal \
           -H 'Content-Type: application/json' \
           -d '{"condition":"Write file goal-output.txt","max_turns":5}'
     expect:
@@ -92,7 +93,7 @@ cases:
       command: |
         sleep 2
         SID=$(cat /tmp/goal-sid)
-        curl -sf -X POST http://localhost:9091/sessions/$SID/goal \
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/$SID/goal \
           -H 'Content-Type: application/json' \
           -d '{"condition":"Write file goal-output.txt","max_turns":5}' \
           | jq -r .session_id
@@ -108,7 +109,7 @@ cases:
       command: |
         sleep 2
         SID=$(cat /tmp/goal-sid)
-        curl -sf http://localhost:9091/sessions/$SID
+        curl -sf -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/$SID
     expect:
       exitCode: 0
       output:
@@ -124,7 +125,7 @@ cases:
         sleep 2
         SID=$(cat /tmp/goal-sid)
         curl -s -o /dev/null -w 'status=%{http_code}' \
-          -X POST http://localhost:9091/sessions/$SID/goal \
+          -X POST -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/$SID/goal \
           -H 'Content-Type: application/json' \
           -d '{}'
     expect:
@@ -138,7 +139,7 @@ cases:
       command: |
         sleep 2
         curl -s -o /dev/null -w 'status=%{http_code}' \
-          -X POST http://localhost:9091/sessions/no-such-session/goal \
+          -X POST -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/no-such-session/goal \
           -H 'Content-Type: application/json' \
           -d '{"condition":"test"}'
     expect:
@@ -154,7 +155,7 @@ cases:
       command: |
         sleep 2
         SID=$(cat /tmp/goal-sid)
-        curl -sf -X DELETE http://localhost:9091/sessions/$SID/goal
+        curl -sf -X DELETE -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/$SID/goal
     expect:
       exitCode: 0
       output:
@@ -168,7 +169,7 @@ cases:
       command: |
         sleep 2
         curl -s -o /dev/null -w 'status=%{http_code}' \
-          -X DELETE http://localhost:9091/sessions/no-such-session/goal
+          -X DELETE -H 'X-API-Key: test-secret-key' http://localhost:9091/sessions/no-such-session/goal
     expect:
       exitCode: 0
       output:

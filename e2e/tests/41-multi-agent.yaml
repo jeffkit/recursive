@@ -32,7 +32,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 20 \
           run "delegate-marker: please delegate writing a note to a worker."
-        SESSION_DIR=$(find /tmp/recursive-home-41 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/recursive-home-41 -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-41
           cp -r "$SESSION_DIR/." /tmp/sessions-41/

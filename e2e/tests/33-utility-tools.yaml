@@ -33,7 +33,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 10 \
           run "Estimate tokens for large-file.txt using estimate_tokens, then count its lines with count_lines. Write the results to utility-result.txt."
-        SESSION_DIR=$(find /tmp/rh-utility -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/rh-utility -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-utility
           cp -r "$SESSION_DIR/." /tmp/sessions-utility/
@@ -56,10 +56,12 @@ cases:
       exists: true
       contains: "estimate-and-count-done"
 
-  # ── Scenario B: estimate_tokens is available via MCP serve ───────────────────
-  # estimate_tokens is registered in tools/registry.rs (shared with MCP serve).
-  # count_lines is agent-loop-only (registered only in cli/builder.rs), so it
-  # is not accessible via MCP serve; we document that invariant below.
+  # ── Scenario B: utility tools are available via MCP serve ────────────────────
+  # Both estimate_tokens and count_lines are registered in tools/registry.rs,
+  # which is shared by the agent loop and `recursive serve`. They are therefore
+  # reachable over MCP stdio (the earlier "count_lines is agent-loop-only"
+  # invariant no longer holds after the registry refactor that moved both tools
+  # into the shared registry).
   - name: "B: estimate_tokens via MCP serve returns a positive token count"
     exec:
       container: recursive-e2e
@@ -72,18 +74,18 @@ cases:
       output:
         contains: "tokens="
 
-  - name: "B: count_lines is NOT in MCP serve tool list (agent-loop-only tool)"
+  - name: "B: count_lines IS in the MCP serve tool list (shared registry)"
     exec:
       container: recursive-e2e
       command: |
         TOOLS=$(printf \
           '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n' \
           | recursive serve --workspace /workspace/test-utility 2>/dev/null)
-        echo "$TOOLS" | grep -q '"count_lines"' && echo "found-unexpectedly" || echo "correctly-agent-only"
+        echo "$TOOLS" | grep -q '"count_lines"' && echo "count-lines-served" || echo "count-lines-missing"
     expect:
       exitCode: 0
       output:
-        contains: "correctly-agent-only"
+        contains: "count-lines-served"
 
   # ── Scenario C: estimate_tokens handles missing file gracefully ───────────────
   - name: "C: estimate_tokens on non-existent file returns error without crash"

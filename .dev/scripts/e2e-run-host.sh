@@ -44,6 +44,8 @@ export E2E_AIMOCK_PORT="${E2E_AIMOCK_PORT:-4010}"
 # container.environment; in host mode we set them globally so the recursive
 # binary (invoked by YAML exec steps) inherits them via HostRuntime.
 export RECURSIVE_PROVIDER_TYPE=openai
+export RECURSIVE_API_KEY=mock-key
+export RECURSIVE_API_BASE=http://aimock:4010/v1
 export RECURSIVE_RATE_LIMIT_BURST=200
 export RECURSIVE_RATE_LIMIT_RPM=6000
 # E2E_WORKSPACE_DIR: HostRuntime transparently maps /workspace → this dir
@@ -58,9 +60,34 @@ export PATH="$REPO_ROOT/target/release:$PATH"
 # in exec commands, so YAML suites with http://aimock:4010 work on host.
 # No wrapper needed.
 
+# ── 容器绝对路径 → host 路径映射（SDK suites 引用 /sdk/...）──
+# E2E_HOST_REPLACEMENTS is HostRuntime's generic old=new substitution. SDK
+# suites require('/sdk/typescript/...') / install from /sdk/python — container
+# paths that don't exist on the host. Map them back to the repo checkout so
+# the SDK e2e suites (20/21) resolve without per-suite edits.
+export E2E_HOST_REPLACEMENTS="/sdk/typescript=$REPO_ROOT/sdk/typescript /sdk/python=$REPO_ROOT/sdk/python"
+
 # ── host 模式的 e2e 配置（动态生成，避免改原 e2e.yaml）──
-# 关键差异：runtime: host、无 service/build、aimock 走 localhost
+# 关键差异：runtime: host、无 service/build、aimock 走 localhost。
+# Suite 注册表从 e2e/e2e.yaml 抽取（全部 41 suite），改成绝对路径，
+# 这样 --filter <id> 能命中任意 suite，与 Docker 模式对齐。
 HOST_E2E_YAML="$WORKSPACE_DIR/e2e-host.yaml"
+MASTER_YAML="$REPO_ROOT/e2e/e2e.yaml"
+SUITES_BLOCK="$(python3 - "$MASTER_YAML" "$REPO_ROOT" <<'PY'
+import sys, yaml
+master, repo = sys.argv[1], sys.argv[2]
+doc = yaml.safe_load(open(master))
+lines = []
+for s in doc.get("tests", {}).get("suites", []):
+    name = s["name"].replace('"', '\\"')
+    sid = s["id"]
+    file = f"{repo}/e2e/tests/{s['file'].split('/')[-1]}" \
+        if "/" not in s["file"] else f"{repo}/e2e/{s['file']}"
+    lines.append(f'    - name: "{name}"\n      id: {sid}\n      file: {file}')
+print("\n".join(lines))
+PY
+)"
+
 cat > "$HOST_E2E_YAML" <<EOF
 version: "1"
 
@@ -82,9 +109,7 @@ plugins:
 
 tests:
   suites:
-    - name: "Self-Improve Smoke Gate"
-      id: smoke
-      file: $REPO_ROOT/e2e/tests/00-smoke.yaml
+$SUITES_BLOCK
 EOF
 
 # 生成 host 版本的 e2e 项目目录（让 argusai-init 找到 e2e-host.yaml）
@@ -152,6 +177,10 @@ raw = open(sys.argv[1]).read()
 i = raw.find("{")
 if i < 0: sys.exit(1)
 d = json.loads(raw[i:])
+# mcp2cli wraps the tool result as {"success": ..., "data": <tool-payload>}.
+# The actual run totals live under data.totals (or data itself if flat).
+if isinstance(d.get("data"), dict):
+    d = d["data"]
 totals = d.get("totals", d)
 total = totals.get("total", 0)
 failed = totals.get("failed", 0)

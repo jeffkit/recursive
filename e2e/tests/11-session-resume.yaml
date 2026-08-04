@@ -42,7 +42,7 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        SESSION=$(find /tmp/rh-resume -name 'transcript.jsonl' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION=$(find /tmp/rh-resume -name 'transcript.jsonl' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -z "$SESSION" ]; then
           echo "ERROR: no session found after first run"
           exit 1

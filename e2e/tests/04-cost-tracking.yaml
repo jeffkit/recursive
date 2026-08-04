@@ -24,7 +24,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 5 \
           run "Say hello. Do not use any tools."
-        SESSION_DIR=$(find /tmp/recursive-home-04 -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/recursive-home-04 -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-04
           cp -r "$SESSION_DIR/." /tmp/sessions-04/

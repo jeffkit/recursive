@@ -26,7 +26,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 10 \
           run "Create a 3-task todo list using TodoWrite (read, transform, write), then write todo-complete.txt with 'task-done', then mark all tasks completed."
-        SESSION_DIR=$(find /tmp/rh-todo -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/rh-todo -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-todo
           cp -r "$SESSION_DIR/." /tmp/sessions-todo/

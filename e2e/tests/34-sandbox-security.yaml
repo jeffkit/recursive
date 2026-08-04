@@ -10,7 +10,7 @@ description: |
     D. Bash cwd   — try to cwd= to ../../ (covered by 24-bash-tool C, repeated here
                     for completeness as a self-contained security suite)
 
-  All four must produce an error response containing "escapes workspace root"
+  All four must produce an error response containing "escapes sandbox roots"
   (the exact message from dispatch::resolve_within).
   No LLM or fixture is needed — tests invoke tools directly via MCP stdio.
 sequential: true
@@ -36,7 +36,7 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "escapes workspace"
+        contains: "escapes sandbox roots"
 
   - name: "A: read_file with absolute /etc/passwd path is rejected"
     exec:
@@ -47,7 +47,7 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "escapes workspace"
+        contains: "escapes sandbox roots"
 
   # ── B: write_file path escape ─────────────────────────────────────────────────
   - name: "B: write_file ../../escaped.txt is rejected as escaping workspace"
@@ -59,7 +59,7 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "escapes workspace"
+        contains: "escapes sandbox roots"
 
   - name: "B: escaped.txt was NOT created outside workspace (side-effect verified)"
     file:
@@ -77,7 +77,7 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "escapes workspace"
+        contains: "escapes sandbox roots"
 
   # ── D: Bash cwd escape ────────────────────────────────────────────────────────
   - name: "D: Bash cwd=../../ is rejected as escaping workspace"
@@ -89,7 +89,7 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "escapes workspace"
+        contains: "escapes sandbox roots"
 
   # ── E: safe paths still work ──────────────────────────────────────────────────
   - name: "E: read_file on safe.txt within workspace succeeds (sandbox allows legitimate access)"

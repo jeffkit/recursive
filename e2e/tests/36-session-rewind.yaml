@@ -30,7 +30,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 5 \
           run "Write rewind-probe.txt with content probe." 2>&1
-        SESSION_PATH=$(find /tmp/rh-rewind -name ".meta.json" -printf "%h\n" 2>/dev/null | head -1)
+        SESSION_PATH=$(find /tmp/rh-rewind -name ".meta.json" -exec dirname {} \; 2>/dev/null | head -1)
         echo "session_path=$SESSION_PATH" > /tmp/rw-session.txt
         echo "$SESSION_PATH"
         echo "prepared"
@@ -97,7 +97,11 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "workspace-test-rewind"
+        # The session slug is derived from the workspace path. In Docker mode
+        # the workspace is /workspace → slug "workspace-test-rewind"; in host
+        # mode /workspace is mapped to a temp dir → slug "<tmp>-test-rewind".
+        # Assert the stable tail so both modes pass.
+        contains: "test-rewind"
 
 teardown:
   - name: "Clean workspace and RECURSIVE_HOME"

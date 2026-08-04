@@ -4,7 +4,7 @@ description: |
     A. Basic command execution — agent runs `echo` and creates a file.
     B. cwd parameter — agent runs a command inside a workspace subdirectory.
     C. Sandbox cwd rejection — cwd pointing outside the workspace is rejected
-       with an error mentioning "escapes workspace root" (Invariant #3).
+       with an error mentioning "escapes sandbox roots" (Invariant #3).
     D. env parameter — extra env vars are injected and visible in the command.
 
   Scenarios A and B use the mock LLM fixture; C and D use MCP stdio
@@ -32,7 +32,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 5 \
           run "Run a Bash command to create bash-output.txt with content 'bash-ok'."
-        SESSION_DIR=$(find /tmp/rh-bash -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/rh-bash -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-bash
           cp -r "$SESSION_DIR/." /tmp/sessions-bash/
@@ -48,7 +48,7 @@ setup:
           --api-base http://aimock:4010/v1 --api-key mock-key -m mock-chat \
           --max-steps 5 \
           run "Create file bash-cwd.txt inside the subdir folder using Bash with cwd=subdir."
-        SESSION_DIR=$(find /tmp/rh-bash-cwd -name '.meta.json' -printf '%h\n' 2>/dev/null | head -1)
+        SESSION_DIR=$(find /tmp/rh-bash-cwd -name '.meta.json' -exec dirname {} \; 2>/dev/null | head -1)
         if [ -n "$SESSION_DIR" ]; then
           mkdir -p /tmp/sessions-bash-cwd
           cp -r "$SESSION_DIR/." /tmp/sessions-bash-cwd/
@@ -80,7 +80,7 @@ cases:
       contains: "cwd-ok"
 
   # ── Scenario C: sandbox cwd escape rejection (via MCP) ───────────────────────
-  - name: "C: Bash with cwd='../../' is rejected — error mentions workspace escape"
+  - name: "C: Bash with cwd='../../' is rejected — error mentions sandbox escape"
     exec:
       container: recursive-e2e
       command: >
@@ -89,7 +89,7 @@ cases:
     expect:
       exitCode: 0
       output:
-        contains: "escapes workspace"
+        contains: "escapes sandbox roots"
 
   # ── Scenario D: env parameter — injected env var visible in command ────────────
   - name: "D: Bash env parameter — MY_VAR is visible inside the command"
