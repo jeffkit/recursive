@@ -26,6 +26,7 @@ const plugin: PluginModule = {
 
   async setup() {
     const recordMode = process.env['E2E_RECORD'] === '1';
+    const hostMode = process.env['E2E_HOST_MODE'] === '1';
     // aimock's `--provider-openai` appends `/v1/chat/completions` itself, so
     // strip a trailing `/v1` from the configured base to avoid `/v1/v1/`.
     const rawBase = process.env['DEEPSEEK_API_BASE'] ?? 'https://api.deepseek.com/v1';
@@ -41,7 +42,52 @@ const plugin: PluginModule = {
     const namespace = worktreeId ?? projectSlug;
     const aimockContainerName = `${namespace}-aimock`;
 
-    // Auto-start aimock container, joining the correct Docker network.
+    // ── Host mode: start aimock with port mapping (no Docker network) ──
+    // In host mode (E2E_HOST_MODE=1), test commands run directly on the host
+    // via argusai's HostRuntime. There is no Docker network and no service
+    // container — aimock is the only container, started with -p to publish
+    // its port to localhost. RECURSIVE_API_BASE should point to
+    // http://localhost:4010/v1 (set by the e2e config or env).
+    if (hostMode) {
+      const aimockPort = process.env['E2E_AIMOCK_PORT'] ?? '4010';
+      try {
+        const running = execSync(`docker ps --filter "name=^/${aimockContainerName}$" --format "{{.Names}}"`, { encoding: 'utf-8' }).trim();
+        if (!running.includes(aimockContainerName)) {
+          const fixturesDir = path.resolve(import.meta.dirname, '../../fixtures');
+          const recordedDir = path.resolve(fixturesDir, 'recorded');
+          let aimockCmd: string;
+          if (recordMode && apiKey) {
+            execSync(`mkdir -p "${recordedDir}"`);
+            aimockCmd = `docker run -d --name ${aimockContainerName} ` +
+              `-p ${aimockPort}:4010 ` +
+              `-v "${fixturesDir}:/fixtures" ` +
+              `-e "OPENAI_API_KEY=${apiKey}" ` +
+              `ghcr.io/copilotkit/aimock ` +
+              `--record --provider-openai ${realApiBase} ` +
+              `-f /fixtures/recorded -f /fixtures -h 0.0.0.0`;
+            console.log('[recursive-agent] aimock starting in RECORD mode (host, port-mapped)');
+          } else {
+            aimockCmd = `docker run -d --name ${aimockContainerName} ` +
+              `-p ${aimockPort}:4010 ` +
+              `-v "${fixturesDir}:/fixtures" ` +
+              `ghcr.io/copilotkit/aimock -f /fixtures -h 0.0.0.0`;
+            console.log('[recursive-agent] aimock starting in REPLAY mode (host, port-mapped)');
+          }
+          execSync(aimockCmd, { stdio: 'pipe' });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          console.log(`[recursive-agent] aimock container started on localhost:${aimockPort} (${aimockContainerName})`);
+        } else {
+          console.log(`[recursive-agent] aimock already running (${aimockContainerName})`);
+        }
+      } catch (e) {
+        console.warn(`[recursive-agent] aimock auto-start failed: ${(e as Error).message}`);
+      }
+
+      console.log('[recursive-agent] Plugin loaded (HOST mode) — assertions registered');
+      return;
+    }
+
+    // ── Docker mode (original): aimock on argusai Docker network ──
     // If aimock is already running but on a different network (e.g. a stale
     // container from a previous worktree run), remove it and restart on the
     // correct network so the recursive-e2e container can reach it.
