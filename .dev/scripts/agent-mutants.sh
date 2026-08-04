@@ -88,12 +88,18 @@ cd "$ROOT"
 # source. Guard: refuse to mutate files with uncommitted changes, and on
 # ANY exit restore any file that still carries a cargo-mutants marker.
 MUTATED_FILES=()
+# Temp diff file used by the --in-diff auto-detect path; cleaned up on exit.
+DIFF_FILE=""
 
 cleanup_mutants() {
   local rc=$?
   # NOTE: `$?` here is captured as the FIRST statement so a syntax-error / unexpected
   # exit is faithfully re-emitted, not masked by the trap's own success.
   # (mutants-gate-false-green bug: sh + <(...)-syntax-error produced exit 0.)
+  # Clean up the --in-diff temp file if the auto-detect path created one.
+  if [[ -n "$DIFF_FILE" && -f "$DIFF_FILE" ]]; then
+    rm -f "$DIFF_FILE"
+  fi
   if [[ ${#MUTATED_FILES[@]} -gt 0 ]]; then
     local dirty=()
     for f in "${MUTATED_FILES[@]}"; do
@@ -209,28 +215,40 @@ elif [[ $# -gt 0 ]]; then
   exit 0
 fi
 
-# Default: auto-detect source files changed on this branch vs main
-# (plus any uncommitted edits) that belong to the main crate (src/).
-# Only mutate what the current change touches — keeps the run fast.
-CHANGED=$( {
-  git diff --name-only main...HEAD 2>/dev/null || true
-  git diff --name-only 2>/dev/null || true
-} | grep "^src/" | grep -v "^src/weixin\|^src/test_util" | sort -u || true )
+# Default: function-level scope via cargo-mutants --in-diff.
+#
+# cargo-mutants identifies the functions touched by the diff (committed
+# main...HEAD plus uncommitted edits) and mutates ONLY those functions —
+# not the whole file they live in. This shrinks a typical run dramatically:
+# e.g. a 3-file change that touches 6 functions drops from ~296 mutants
+# (whole-file scope) to ~26 (function scope), cutting wall-clock from
+# ~40min to ~3-4min (observed Goal 382). The .cargo/mutants.toml
+# exclude_re still applies on top of --in-diff automatically.
+#
+# We use a temp file instead of process substitution <(...) so the script
+# works under `sh -c` too (flowcast gates invoke via sh; <(...) is bash-only
+# and silently broke the mutants gate once before — see commit history).
+DIFF_FILE=$(mktemp)
+{
+  # Committed changes on this branch vs main, restricted to crate src/.
+  # Pathspec excludes weixin/ and test_util (no agent-kernel logic under test).
+  git diff main...HEAD -- 'src/*.rs' ':(exclude)src/weixin/*' ':(exclude)src/test_util.rs' 2>/dev/null || true
+  # Plus uncommitted edits (flow runs gates BEFORE commit, so the agent's
+  # first-attempt changes are uncommitted).
+  git diff             -- 'src/*.rs' ':(exclude)src/weixin/*' ':(exclude)src/test_util.rs' 2>/dev/null || true
+} > "$DIFF_FILE"
 
-if [[ -z "$CHANGED" ]]; then
+if [[ ! -s "$DIFF_FILE" ]]; then
   echo "No $CRATE source files changed vs main. Pass file paths or --all." >&2
+  rm -f "$DIFF_FILE"
+  DIFF_FILE=""
   exit 0
 fi
 
-echo "Auto-detected changed files under $CRATE:" >&2
-echo "$CHANGED" | sed 's/^/  /' >&2
+echo "Auto-detected changed functions under $CRATE (scope: --in-diff):" >&2
 
-FILE_ARGS=()
-while IFS= read -r line; do
-  FILE_ARGS+=(--file "$line")
-  MUTATED_FILES+=("$line")
-done <<< "$CHANGED"
-
-assert_clean "${MUTATED_FILES[@]}"
-
-run_mutants --no-shuffle "${FILE_ARGS[@]}"
+run_mutants --no-shuffle --in-diff "$DIFF_FILE"
+rc=$?
+rm -f "$DIFF_FILE"
+DIFF_FILE=""
+exit $rc

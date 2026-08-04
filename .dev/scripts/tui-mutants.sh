@@ -89,6 +89,8 @@ cd "$ROOT"
 # (2) on ANY exit, scan the mutated files for the marker and `git
 # checkout` any that still carry it.
 MUTATED_FILES=()
+# Temp diff file used by the --in-diff auto-detect path; cleaned up on exit.
+DIFF_FILE=""
 
 # Saved exit status. On a clean normal exit this is set by the last command
 # before the script ends; on a syntax error / unexpected exit, the EXIT trap
@@ -99,6 +101,10 @@ MUTATED_FILES=()
 # bug: sh-syntax-error + `exit $rc` reported exit 0.)
 cleanup_mutants() {
   local rc=$?
+  # Clean up the --in-diff temp file if the auto-detect path created one.
+  if [[ -n "$DIFF_FILE" && -f "$DIFF_FILE" ]]; then
+    rm -f "$DIFF_FILE"
+  fi
   if [[ ${#MUTATED_FILES[@]} -gt 0 ]]; then
     local dirty=()
     for f in "${MUTATED_FILES[@]}"; do
@@ -217,30 +223,33 @@ elif [[ $# -gt 0 ]]; then
   exit 0
 fi
 
-# Default: auto-detect files changed on this branch vs main (plus any
-# uncommitted edits). This is the "改某文件 → 杀该文件变异点" rule — only
-# mutate what the current change touches, keeping the run fast.
-MAP_TO_CRATE="s#^crates/$CRATE/##"
+# Default: function-level scope via cargo-mutants --in-diff.
+#
+# cargo-mutants identifies the functions touched by the diff (committed
+# main...HEAD plus uncommitted edits) and mutates ONLY those — not the
+# whole file. This mirrors agent-mutants.sh's --in-diff path and keeps
+# TUI mutation runs fast even when a large file (backend.rs, render.rs)
+# is touched in just one function.
+#
+# We use a temp file instead of process substitution <(...) so the script
+# works under `sh -c` too (flowcast gates invoke via sh; <(...) is bash-only).
+DIFF_FILE=$(mktemp)
+{
+  git diff main...HEAD -- "crates/$CRATE/src/*.rs" 2>/dev/null || true
+  git diff             -- "crates/$CRATE/src/*.rs" 2>/dev/null || true
+} > "$DIFF_FILE"
 
-CHANGED=$( {
-  git diff --name-only main...HEAD 2>/dev/null || true
-  git diff --name-only 2>/dev/null || true
-} | grep "^crates/$CRATE/src/" | sort -u || true )
-
-if [[ -z "$CHANGED" ]]; then
+if [[ ! -s "$DIFF_FILE" ]]; then
   echo "No recursive-tui source files changed vs main. Pass file paths or --all." >&2
+  rm -f "$DIFF_FILE"
+  DIFF_FILE=""
   exit 0
 fi
 
-echo "Auto-detected changed files under $CRATE:" >&2
-echo "$CHANGED" | sed 's/^/  /' >&2
+echo "Auto-detected changed functions under $CRATE (scope: --in-diff):" >&2
 
-FILE_ARGS=()
-while IFS= read -r line; do
-  FILE_ARGS+=(--file "$line")
-  MUTATED_FILES+=("$line")
-done <<< "$CHANGED"
-
-assert_clean "${MUTATED_FILES[@]}"
-
-run_mutants --no-shuffle "${FILE_ARGS[@]}"
+run_mutants --no-shuffle --in-diff "$DIFF_FILE"
+rc=$?
+rm -f "$DIFF_FILE"
+DIFF_FILE=""
+exit $rc
