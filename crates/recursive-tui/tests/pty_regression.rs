@@ -12,7 +12,11 @@
 //! from a manual SOP step into a `cargo test` that runs on every
 //! `cargo test -p recursive-tui`. Because `tui_pty_harness` now polls for
 //! screen stability instead of sleeping a fixed `--wait-ms`, the assertions
-//! are deterministic on fast machines and non-flaky on slow CI.
+//! are deterministic on fast machines and non-flaky on slow CI — and
+//! [`tour`] retries once with a long boot budget if the first snapshot is
+//! blank, so the parallel `cargo-mutants` load of the tui-mutants gate
+//! (which can starve the real binary past the fast cap before its first
+//! frame) cannot turn a slow boot into a false failure.
 //!
 //! `CARGO_BIN_EXE_recursive-tui` resolves to the binary cargo just built for
 //! this test run, so no subprocess `cargo build` / `cargo run` is needed
@@ -32,9 +36,36 @@ fn tui_bin() -> String {
     path.to_string()
 }
 
+/// Extra wall-clock budget (ms) for a retry when the first PTY snapshot is
+/// blank. The tui-mutants gate runs `cargo-mutants --jobs=<CPU count>`
+/// (copy mode, 14 jobs on a 14-core Mac), so the real `recursive-tui`
+/// binary can be CPU-starved past the fast cap before it draws its first
+/// frame — `spawn_and_snapshot` then returns a blank screen because its
+/// `wait_ms` cap fired before any output arrived. The blank screen is a
+/// boot-starvation artifact, not a rendering regression; give the binary a
+/// much longer budget on retry. 15s is a cap, not a sleep — the stability
+/// poll still returns as soon as the screen settles, so a healthy boot
+/// never pays the full 15s.
+const BOOT_RETRY_MS: u64 = 15_000;
+
 /// Run the TUI under a PTY with the given key script and return the screen
 /// text (lines joined by `\n`, trailing blanks dropped).
+///
+/// If the first snapshot is blank (the binary was still booting — see
+/// [`BOOT_RETRY_MS`]), retry once with the long budget before giving up.
+/// The assertions stay strict: the caller still requires a real splash, a
+/// blank screen is only ever *retried*, never accepted.
 fn tour(keys: &str, wait_ms: u64) -> String {
+    let fast = tour_once(keys, wait_ms);
+    if fast.trim().is_empty() {
+        tour_once(keys, BOOT_RETRY_MS)
+    } else {
+        fast
+    }
+}
+
+/// Single PTY tour attempt with the given wait cap. See [`tour`].
+fn tour_once(keys: &str, wait_ms: u64) -> String {
     let bin = tui_bin();
     let spec = RunSpec {
         prog: &bin,

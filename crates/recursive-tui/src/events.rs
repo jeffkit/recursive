@@ -284,12 +284,12 @@ pub enum UserAction {
     /// plan-first mode, `false` reverts to immediate execution.
     /// The worker echoes a `System` block confirming the new state.
     SetPlanningMode(bool),
-    /// Goal-147: signal the worker to abort the in-flight turn.
-    /// The worker flips its `cancel_flag`, and any `tokio::select!`
-    /// waiting on `wait_for_cancel` returns immediately. The runtime
-    /// is *not* cancelled mid-HTTP-request (reqwest doesn't support
-    /// that); on the next tool-call boundary the next turn will
-    /// surface as a `UiEvent::Error { message: "interrupted" }`.
+    /// Goal-147: signal the worker to cancel the in-flight turn.
+    /// Goal-383: the worker cancels the turn's `CancellationToken`; the
+    /// kernel notices it at the next step boundary / stream chunk and
+    /// finishes the turn as `FinishReason::Cancelled`, persisting whatever
+    /// partial work the turn produced. The TUI awaits the task's natural
+    /// join instead of hard-aborting it.
     Interrupt,
     /// Tear down the worker and exit the runtime.
     Shutdown,

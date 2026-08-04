@@ -17,6 +17,7 @@ use recursive::tools::{PermissionHook, SharedSandboxRoots};
 use recursive::{new_shared_sandbox_roots, AgentEvent, AgentRuntime, EventSink, SessionStatus};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::bash::{build_bash_registry, resolve_workspace_root, run_bash_command};
 #[cfg(feature = "weixin")]
@@ -35,9 +36,15 @@ enum Either<L, R> {
 pub struct Backend {
     pub action_tx: mpsc::UnboundedSender<UserAction>,
     pub event_rx: mpsc::UnboundedReceiver<UiEvent>,
-    /// Shared cancel flag: the UI flips this to `true` to interrupt an
-    /// in-flight turn; the worker's `tokio::select!` wakes and aborts.
-    pub cancel_flag: Arc<AtomicBool>,
+    /// Goal-383: the `CancellationToken` for the currently-running turn, if
+    /// any. The worker installs a fresh token into the runtime before each
+    /// turn (`AgentRuntime::set_interrupt_token`) and clears it when the
+    /// turn ends. `UserAction::Interrupt` cancels this token so the kernel
+    /// exits via `FinishReason::Cancelled` — persisting whatever partial
+    /// work the turn produced — instead of the TUI hard-aborting the task
+    /// with `JoinHandle::abort()`. Exposed so tests can assert the wiring;
+    /// the UI can also observe it to know whether a turn is interruptible.
+    pub current_interrupt_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     /// Goal-161: side-channel for runtime permission requests.
     /// Separate from `event_rx` because `PermissionRequest` carries a
     /// `oneshot::Sender<bool>` which is not `PartialEq`/`Clone`.
@@ -95,8 +102,7 @@ impl Backend {
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
         // Dummy skill-install channel: sender dropped immediately → receiver never fires.
         let (_dummy_skill_tx, skill_install_rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let current_interrupt_token = Arc::new(std::sync::Mutex::new(None));
         let permission_enabled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "weixin")]
         let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
@@ -110,8 +116,7 @@ impl Backend {
             action_rx,
             event_tx,
             perm_tx,
-            cancel_flag.clone(),
-            cancel_notify.clone(),
+            current_interrupt_token.clone(),
             permission_enabled.clone(),
             wakeup_slot.clone(),
             bg_manager.clone(),
@@ -123,7 +128,7 @@ impl Backend {
             action_tx,
             event_rx,
             perm_rx,
-            cancel_flag,
+            current_interrupt_token,
             permission_enabled,
             #[cfg(feature = "weixin")]
             weixin_tx,
@@ -143,8 +148,7 @@ impl Backend {
         let (action_tx, action_rx) = mpsc::unbounded_channel::<UserAction>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UiEvent>();
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<PermissionRequest>();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let current_interrupt_token = Arc::new(std::sync::Mutex::new(None));
         let permission_enabled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "weixin")]
         let (weixin_tx, weixin_rx) = mpsc::unbounded_channel::<WeixinBackendRequest>();
@@ -158,8 +162,7 @@ impl Backend {
             action_rx,
             event_tx,
             perm_tx,
-            cancel_flag.clone(),
-            cancel_notify.clone(),
+            current_interrupt_token.clone(),
             permission_enabled.clone(),
             wakeup_slot.clone(),
             bg_manager.clone(),
@@ -171,7 +174,7 @@ impl Backend {
             action_tx,
             event_rx,
             perm_rx,
-            cancel_flag,
+            current_interrupt_token,
             permission_enabled,
             #[cfg(feature = "weixin")]
             weixin_tx,
@@ -567,8 +570,7 @@ async fn worker_loop(
     mut action_rx: mpsc::UnboundedReceiver<UserAction>,
     event_tx: mpsc::UnboundedSender<UiEvent>,
     perm_tx: mpsc::UnboundedSender<PermissionRequest>,
-    cancel_flag: Arc<AtomicBool>,
-    cancel_notify: Arc<tokio::sync::Notify>,
+    current_interrupt_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     permission_enabled: Arc<AtomicBool>,
     wakeup_slot: recursive::tools::WakeupSlot,
     bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>>,
@@ -845,14 +847,6 @@ async fn worker_loop(
 
             UserAction::SendMessage(text) => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let pre_turn_len = {
-                        let Some(rt_ref) = rt_opt.as_ref() else {
-                            tracing::warn!("backend: runtime not initialized in SendMessage");
-                            continue;
-                        };
-                        rt_ref.transcript().len()
-                    };
-
                     // On the first user message, create a SessionWriter and wire
                     // it into the runtime's event sink via SessionPersistenceSink
                     // so every MessageAppended event is written to disk in real-time.
@@ -880,6 +874,25 @@ async fn worker_loop(
                         }
                     }
 
+                    // Goal-383: install a fresh CancellationToken for this turn,
+                    // mirroring the HTTP layer (`src/http/handlers.rs`). The
+                    // kernel polls it at each step boundary / stream chunk and
+                    // exits via `FinishReason::Cancelled`, so a user interrupt
+                    // persists the turn's partial work instead of the TUI
+                    // hard-aborting the task. Store it so the Interrupt action
+                    // (and tests) can reach it; it is cleared when the turn ends.
+                    let interrupt_token = CancellationToken::new();
+                    {
+                        let Some(rt_mut) = rt_opt.as_mut() else {
+                            tracing::warn!("backend: runtime not available for interrupt token");
+                            continue;
+                        };
+                        rt_mut.set_interrupt_token(interrupt_token.clone());
+                    }
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
+
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for SendMessage task");
                         continue;
@@ -891,8 +904,6 @@ async fn worker_loop(
                     let plan_mode_request_gate = rt.plan_mode_request_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
-                    cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_clone = cancel_flag.clone();
                     // Re-arm the UI spinner for this turn. Required so a turn
                     // drained from the type-ahead queue shows progress even
                     // though the previous turn's TurnFinished cleared it.
@@ -905,9 +916,7 @@ async fn worker_loop(
                         &mut handle,
                         &mut action_rx,
                         &event_tx,
-                        &cancel_flag,
-                        cancel_clone,
-                        cancel_notify.clone(),
+                        interrupt_token,
                         &gate,
                         &plan_mode_request_gate,
                         &mut queued_messages,
@@ -917,17 +926,22 @@ async fn worker_loop(
                         tracing::error!("backend: arc has multiple owners after SendMessage task");
                         continue;
                     };
-                    let mut recovered = recovered.into_inner();
+                    let recovered = recovered.into_inner();
                     if aborted {
-                        recovered.truncate_transcript(pre_turn_len);
-                        // The user interrupted (or is shutting down); drop any
-                        // type-ahead they queued during the aborted turn rather
-                        // than running it against their wishes.
+                        // Goal-383: keep the type-ahead drop on a user-initiated
+                        // interrupt — text queued during a doomed turn is usually
+                        // stale (product choice, not a memory-safety hack). The
+                        // transcript is deliberately NOT rolled back: the graceful
+                        // cancellation path made the kernel persist its real state
+                        // (partial messages, tool results) to disk, so truncating
+                        // memory here would re-introduce the disk/memory split.
                         queued_messages.clear();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
-                    cancel_flag.store(false, Ordering::SeqCst);
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                 } else if let RuntimeBuild::Offline { reason } = &state {
                     let _ = event_tx.send(UiEvent::Error {
                         message: reason.clone(),
@@ -947,7 +961,12 @@ async fn worker_loop(
                         continue;
                     };
                     rt_mut.confirm_plan();
-                    let pre_turn_len = rt_mut.transcript().len();
+                    // Goal-383: per-turn CancellationToken (see SendMessage).
+                    let interrupt_token = CancellationToken::new();
+                    rt_mut.set_interrupt_token(interrupt_token.clone());
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for ConfirmPlan task");
                         continue;
@@ -956,8 +975,6 @@ async fn worker_loop(
                     let plan_mode_request_gate = rt.plan_mode_request_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
-                    cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_clone = cancel_flag.clone();
                     let mut handle = tokio::task::spawn(async move {
                         let mut g = rt_clone.lock().await;
                         g.run("").await.map(|_| ())
@@ -966,9 +983,7 @@ async fn worker_loop(
                         &mut handle,
                         &mut action_rx,
                         &event_tx,
-                        &cancel_flag,
-                        cancel_clone,
-                        cancel_notify.clone(),
+                        interrupt_token,
                         &gate,
                         &plan_mode_request_gate,
                         &mut queued_messages,
@@ -978,14 +993,15 @@ async fn worker_loop(
                         tracing::error!("backend: arc has multiple owners after ConfirmPlan task");
                         continue;
                     };
-                    let mut recovered = recovered.into_inner();
+                    let recovered = recovered.into_inner();
                     if aborted {
-                        recovered.truncate_transcript(pre_turn_len);
                         queued_messages.clear();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
-                    cancel_flag.store(false, Ordering::SeqCst);
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                 }
             }
 
@@ -1075,8 +1091,20 @@ async fn worker_loop(
             }
 
             UserAction::Interrupt => {
-                cancel_flag.store(true, Ordering::SeqCst);
-                cancel_notify.notify_waiters();
+                // Goal-383: cancel the current turn's token so the kernel exits
+                // gracefully (FinishReason::Cancelled) at the next step boundary
+                // / stream chunk — persisting partial work — instead of the TUI
+                // hard-aborting the task. Between turns there is no token
+                // installed (a fresh one is created per turn), so an idle
+                // interrupt is a no-op — the old `cancel_flag` was wiped by the
+                // next turn-start reset anyway, so behaviour is unchanged.
+                let token = current_interrupt_token
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(token) = token {
+                    token.cancel();
+                }
             }
 
             // Goal-168: start a condition-based autonomous loop.
@@ -1093,13 +1121,18 @@ async fn worker_loop(
                     continue;
                 }
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let pre_turn_len = {
-                        let Some(rt_ref) = rt_opt.as_ref() else {
-                            tracing::warn!("backend: runtime not initialized in SetGoal");
+                    // Goal-383: per-turn CancellationToken (see SendMessage).
+                    let interrupt_token = CancellationToken::new();
+                    {
+                        let Some(rt_mut) = rt_opt.as_mut() else {
+                            tracing::warn!("backend: runtime not available for interrupt token");
                             continue;
                         };
-                        rt_ref.transcript().len()
-                    };
+                        rt_mut.set_interrupt_token(interrupt_token.clone());
+                    }
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for SetGoal task");
                         continue;
@@ -1108,8 +1141,6 @@ async fn worker_loop(
                     let plan_mode_request_gate = rt.plan_mode_request_gate();
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
-                    cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_clone = cancel_flag.clone();
                     let prompt = format!(
                         "Start working towards the following goal: {condition}\n\nContinue until the goal is achieved."
                     );
@@ -1123,9 +1154,7 @@ async fn worker_loop(
                         &mut handle,
                         &mut action_rx,
                         &event_tx,
-                        &cancel_flag,
-                        cancel_clone,
-                        cancel_notify.clone(),
+                        interrupt_token,
                         &gate,
                         &plan_mode_request_gate,
                         &mut queued_messages,
@@ -1136,14 +1165,15 @@ async fn worker_loop(
                         tracing::error!("backend: arc has multiple owners after SetGoal task");
                         continue;
                     };
-                    let mut recovered = recovered.into_inner();
+                    let recovered = recovered.into_inner();
                     if aborted {
-                        recovered.truncate_transcript(pre_turn_len);
                         queued_messages.clear();
                     }
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
-                    cancel_flag.store(false, Ordering::SeqCst);
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                 } else if let RuntimeBuild::Offline { reason } = &state {
                     let _ = event_tx.send(UiEvent::Error {
                         message: reason.clone(),
@@ -1271,43 +1301,91 @@ async fn worker_loop(
             // Goal-169: run an already-expanded skill prompt.
             UserAction::RunSkillPrompt { prompt } => {
                 if let RuntimeBuild::Ready(rt_opt) = &mut state {
-                    let pre_turn_len = {
-                        let Some(rt_ref) = rt_opt.as_ref() else {
-                            tracing::warn!("backend: runtime not initialized in RunSkillPrompt");
+                    // Goal-383: per-turn CancellationToken (see SendMessage).
+                    let interrupt_token = CancellationToken::new();
+                    {
+                        let Some(rt_mut) = rt_opt.as_mut() else {
+                            tracing::warn!("backend: runtime not available for interrupt token");
                             continue;
                         };
-                        rt_ref.transcript().len()
-                    };
+                        rt_mut.set_interrupt_token(interrupt_token.clone());
+                    }
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for RunSkillPrompt task");
                         continue;
                     };
                     let rt_shared = Arc::new(tokio::sync::Mutex::new(rt));
                     let rt_clone = rt_shared.clone();
-                    cancel_flag.store(false, Ordering::SeqCst);
-                    let cancel_clone = cancel_flag.clone();
                     let mut handle = tokio::task::spawn(async move {
                         let mut g = rt_clone.lock().await;
                         g.run(prompt).await.map(|_| ())
                     });
-                    let aborted = tokio::select! {
-                        res = &mut handle => {
-                            if let Err(e) = res
-                                .map_err(|e| recursive::Error::Internal {
-                                    context: "tui::task_join".to_string(),
-                                    message: e.to_string(),
-                                })
-                                .and_then(|r| r)
-                            {
-                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                    // Goal-383: the select outcome is intentionally unused —
+                    // graceful cancel persists partial work via the kernel's
+                    // Cancelled path, so there is no abort-side truncation to
+                    // branch on (unlike the pre-383 abort behaviour).
+                    let _ = loop {
+                        tokio::select! {
+                            biased;
+                            res = &mut handle => {
+                                if let Err(e) = res
+                                    .map_err(|e| recursive::Error::Internal {
+                                        context: "tui::task_join".to_string(),
+                                        message: e.to_string(),
+                                    })
+                                    .and_then(|r| r)
+                                {
+                                    let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                                }
+                                break false;
                             }
-                            false
-                        },
-                        _ = wait_for_cancel(cancel_clone, cancel_notify.clone()) => {
-                            handle.abort();
-                            let _ = handle.await;
-                            let _ = event_tx.send(UiEvent::Interrupted);
-                            true
+                            // Goal-383: graceful cancel — signal the kernel's
+                            // CancellationToken and await the natural (non-aborted)
+                            // join, so partial work is persisted via
+                            // FinishReason::Cancelled instead of being discarded.
+                            _ = interrupt_token.cancelled() => {
+                                match handle.await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                                    }
+                                    Err(e) => tracing::warn!("turn task panicked after cancel: {e}"),
+                                }
+                                let _ = event_tx.send(UiEvent::Interrupted);
+                                break true;
+                            }
+                            // Goal-383: keep the worker responsive to interrupt /
+                            // shutdown while a skill run is in-flight. The old
+                            // select had no action arm, so Ctrl+C during a skill
+                            // run was merely queued and ignored.
+                            maybe_action = action_rx.recv() => {
+                                match maybe_action {
+                                    Some(UserAction::Interrupt) => interrupt_token.cancel(),
+                                    Some(UserAction::Shutdown) => {
+                                        interrupt_token.cancel();
+                                        match handle.await {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(e)) => {
+                                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                                            }
+                                            Err(e) => tracing::warn!("turn task panicked after cancel: {e}"),
+                                        }
+                                        let _ = event_tx.send(UiEvent::Interrupted);
+                                        break true;
+                                    }
+                                    Some(UserAction::SendMessage(text)) => {
+                                        queued_messages.push_back(text);
+                                    }
+                                    // Plan-gate actions are not forwarded here
+                                    // (matches the pre-existing behaviour of this
+                                    // arm); discard them while the skill runs.
+                                    Some(_) => {}
+                                    None => break false,
+                                }
+                            }
                         }
                     };
                     let Ok(recovered) = Arc::try_unwrap(rt_shared) else {
@@ -1316,13 +1394,12 @@ async fn worker_loop(
                         );
                         continue;
                     };
-                    let mut recovered = recovered.into_inner();
-                    if aborted {
-                        recovered.truncate_transcript(pre_turn_len);
-                    }
+                    let recovered = recovered.into_inner();
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
-                    cancel_flag.store(false, Ordering::SeqCst);
+                    *current_interrupt_token
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
                 } else if let RuntimeBuild::Offline { reason } = &state {
                     let _ = event_tx.send(UiEvent::Error {
                         message: reason.clone(),
@@ -1334,37 +1411,27 @@ async fn worker_loop(
     }
 }
 
-/// Wait until the cancel flag is set. Uses a `Notify` wakeup for near-zero
-/// latency instead of a 100ms busy-poll sleep.
-pub async fn wait_for_cancel(flag: Arc<AtomicBool>, notify: Arc<tokio::sync::Notify>) {
-    loop {
-        if flag.load(Ordering::SeqCst) {
-            return;
-        }
-        notify.notified().await;
-    }
-}
-
 /// Drive a spawned agent turn to completion while remaining responsive to
 /// plan-approval and interrupt actions from the UI.
 ///
-/// Returns `true` if the turn was aborted (cancel flag set or Shutdown received),
-/// `false` if the task completed normally.
+/// Returns `true` if the turn was interrupted (token cancelled / Shutdown
+/// received), `false` if the task completed normally.
 ///
 /// While a turn runs, `action_rx` is polled concurrently so that
 /// `UserAction::ConfirmPlan` / `UserAction::RejectPlan` can signal the
 /// `PlanApprovalGate` directly — unblocking `exit_plan_mode` without
-/// requiring a new turn. `UserAction::Interrupt` sets the cancel flag.
-/// Any other actions received during the turn are silently discarded
-/// (they cannot be acted on without the runtime, which is inside the task).
+/// requiring a new turn. `UserAction::Interrupt` cancels the turn's
+/// `CancellationToken`; the kernel notices it at the next step boundary /
+/// stream chunk and exits via `FinishReason::Cancelled` (persisting partial
+/// work), after which we await the natural (non-aborted) join. Any other
+/// actions received during the turn are silently discarded (they cannot be
+/// acted on without the runtime, which is inside the task).
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_select_loop(
     handle: &mut tokio::task::JoinHandle<Result<(), recursive::Error>>,
     action_rx: &mut tokio::sync::mpsc::UnboundedReceiver<UserAction>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<UiEvent>,
-    cancel_flag: &Arc<AtomicBool>,
-    cancel_clone: Arc<AtomicBool>,
-    cancel_notify: Arc<tokio::sync::Notify>,
+    interrupt_token: CancellationToken,
     gate: &Arc<recursive::tools::plan_mode::PlanApprovalGate>,
     plan_mode_request_gate: &Arc<recursive::tools::plan_mode::PlanModeRequestGate>,
     queued: &mut std::collections::VecDeque<String>,
@@ -1384,9 +1451,20 @@ async fn run_turn_select_loop(
                 }
                 return false;
             }
-            _ = wait_for_cancel(cancel_clone.clone(), cancel_notify.clone()) => {
-                handle.abort();
-                let _ = handle.await;
+            // Goal-383: graceful cancel. The token is cancelled by the
+            // `UserAction::Interrupt` arm below (or by the outer loop between
+            // turns). We do NOT abort the task: the kernel notices the token at
+            // the next step boundary / stream chunk and exits via
+            // `Error::Cancelled` → `make_cancelled_outcome`, persisting whatever
+            // the turn produced. We then await the natural (non-aborted) join.
+            _ = interrupt_token.cancelled() => {
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                    }
+                    Err(e) => tracing::warn!("turn task panicked after cancel: {e}"),
+                }
                 let _ = event_tx.send(UiEvent::Interrupted);
                 return true;
             }
@@ -1403,12 +1481,23 @@ async fn run_turn_select_loop(
                         plan_mode_request_gate.reject(&reason);
                     }
                     Some(UserAction::Interrupt) => {
-                        cancel_flag.store(true, Ordering::SeqCst);
-                        cancel_notify.notify_waiters();
+                        interrupt_token.cancel();
                     }
+                    // Goal-383: Shutdown also cancels gracefully (no abort), so
+                    // partial work is persisted instead of discarded. The select
+                    // loop returns `true` and the caller's `if aborted` cleanup
+                    // runs; the worker loop itself does not exit here (the
+                    // Shutdown action was consumed by this loop).
                     Some(UserAction::Shutdown) => {
-                        handle.abort();
-                        let _ = handle.await;
+                        interrupt_token.cancel();
+                        match handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                let _ = event_tx.send(UiEvent::Error { message: e.to_string() });
+                            }
+                            Err(e) => tracing::warn!("turn task panicked after cancel: {e}"),
+                        }
+                        let _ = event_tx.send(UiEvent::Interrupted);
                         return true;
                     }
                     // A message submitted while the turn is running is buffered
@@ -1617,89 +1706,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_with_cancel_flag_true_returns_quickly() {
-        let flag = Arc::new(AtomicBool::new(true));
-        let notify = Arc::new(tokio::sync::Notify::new());
+    async fn cancelled_token_future_completes_immediately() {
+        // Goal-383: the select-loop cancel arm waits on
+        // `CancellationToken::cancelled()`. A token cancelled before the
+        // wait must complete the future right away (replaces the old
+        // `wait_for_cancel` flag-poll test).
+        let token = CancellationToken::new();
+        token.cancel();
         let started = std::time::Instant::now();
-        let timed = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            wait_for_cancel(flag.clone(), notify.clone()),
-        )
-        .await;
+        let timed =
+            tokio::time::timeout(std::time::Duration::from_millis(500), token.cancelled()).await;
         let elapsed = started.elapsed();
-        assert!(timed.is_ok(), "wait_for_cancel didn't return in time");
+        assert!(timed.is_ok(), "cancelled() didn't return in time");
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "wait_for_cancel was too slow: {elapsed:?}"
+            "cancelled() was too slow: {elapsed:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn interrupt_action_sets_cancel_flag() {
-        let prev_recursive = std::env::var("RECURSIVE_API_KEY").ok();
-        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("RECURSIVE_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
-
-        let backend = Backend::spawn();
-        assert!(!backend.cancel_flag.load(Ordering::SeqCst));
-        backend.action_tx.send(UserAction::Interrupt).unwrap();
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
-            if backend.cancel_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            backend.cancel_flag.load(Ordering::SeqCst),
-            "Interrupt should set cancel_flag"
-        );
-        let _ = backend.action_tx.send(UserAction::Shutdown);
-
-        if let Some(v) = prev_recursive {
-            std::env::set_var("RECURSIVE_API_KEY", v);
-        }
-        if let Some(v) = prev_openai {
-            std::env::set_var("OPENAI_API_KEY", v);
-        }
-    }
-
-    // ── Goal-170: real cancel-during-turn aborts the in-flight task,
-    //    truncates the transcript, and emits UiEvent::Interrupted. The
-    //    earlier `interrupt_action_sets_cancel_flag` only checks the flag
-    //    flips; this one drives the full worker_loop path with a Ready
-    //    runtime whose tool hangs, so the abort actually has something to
-    //    cancel — covering the backend layer the in-process harness can't
-    //    reach (it doesn't spin up a backend).
-    use recursive::llm::{Completion, MockProvider, ToolCall};
-    use recursive::tools::{Tool, ToolRegistry};
-    use recursive::AgentRuntime;
-    use serde_json::{json, Value};
-
-    /// A tool that never returns — `std::future::pending` parks forever so
-    /// the turn task stays in-flight until the worker aborts it.
-    struct HangTool;
-
-    #[async_trait::async_trait]
-    impl Tool for HangTool {
-        fn spec(&self) -> recursive::llm::ToolSpec {
-            recursive::llm::ToolSpec {
-                name: "hang".into(),
-                description: "test tool that never returns".into(),
-                parameters: json!({"type":"object","properties":{}}),
-            }
-        }
-        async fn execute(&self, _args: Value) -> recursive::error::Result<String> {
-            std::future::pending::<()>().await;
-            Ok("never".into())
-        }
     }
 
     #[tokio::test]
     #[cfg_attr(target_os = "windows", ignore)]
-    async fn interrupt_aborts_running_turn_and_emits_interrupted() {
+    async fn interrupt_action_cancels_turn_token() {
+        // Goal-383 wiring test (replaces the old flag-only test): a fresh
+        // CancellationToken is installed before a turn starts (asserted via
+        // `current_interrupt_token`), and `UserAction::Interrupt` cancels it
+        // so the kernel can exit gracefully. The hang tool keeps the turn
+        // in-flight so the token stays observable while we check it.
+        use recursive::llm::{Completion, MockProvider, ToolCall};
+        use recursive::tools::{Tool, ToolRegistry};
+        use recursive::AgentRuntime;
+        use serde_json::{json, Value};
+
+        /// A tool that never returns — `std::future::pending` parks forever
+        /// so the turn task stays in-flight until the worker's select loop
+        /// cancels the token (and would then await the natural join).
+        struct HangTool;
+
+        #[async_trait::async_trait]
+        impl Tool for HangTool {
+            fn spec(&self) -> recursive::llm::ToolSpec {
+                recursive::llm::ToolSpec {
+                    name: "hang".into(),
+                    description: "test tool that never returns".into(),
+                    parameters: json!({"type":"object","properties":{}}),
+                }
+            }
+            async fn execute(&self, _args: Value) -> recursive::error::Result<String> {
+                std::future::pending::<()>().await;
+                Ok("never".into())
+            }
+        }
+
         let notify = Arc::new(tokio::sync::Notify::new());
         let llm = Arc::new(
             MockProvider::new(vec![Completion {
@@ -1722,7 +1779,13 @@ mod tests {
             .build()
             .expect("runtime builds");
 
-        let mut backend = Backend::spawn_with_runtime(rt);
+        let backend = Backend::spawn_with_runtime(rt);
+        // Between turns there is no token installed.
+        assert!(
+            backend.current_interrupt_token.lock().unwrap().is_none(),
+            "no token should be installed before a turn starts"
+        );
+
         backend
             .action_tx
             .send(UserAction::SendMessage("hi".into()))
@@ -1730,16 +1793,150 @@ mod tests {
 
         // Wait until the mock completion has returned — at that point the
         // agent is dispatching the hang tool and the turn is genuinely
-        // in-flight, so an Interrupt won't be cleared by the turn-start
-        // `cancel_flag.store(false)` reset (line ~504/814 in worker_loop).
-        // `notify.notified()` is single-use but re-entrant: if the mock
-        // already fired, the first await returns immediately.
+        // in-flight. `notify.notified()` is single-use but re-entrant: if the
+        // mock already fired, the first await returns immediately.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), notify.notified()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // The per-turn token must be wired into the runtime before the turn
+        // runs (Goal-383: mirrors `set_interrupt_token` in the HTTP layer).
+        let token_before = backend.current_interrupt_token.lock().unwrap().clone();
+        assert!(
+            token_before.is_some(),
+            "SendMessage should install a current interrupt token"
+        );
+        assert!(
+            !token_before.as_ref().unwrap().is_cancelled(),
+            "a freshly installed token must not be pre-cancelled"
+        );
+
+        backend.action_tx.send(UserAction::Interrupt).unwrap();
+
+        // Interrupt must cancel the token (the kernel-side signal that lets
+        // the turn finish as FinishReason::Cancelled and persist partial work).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut cancelled = false;
+        while tokio::time::Instant::now() < deadline {
+            let tok = backend.current_interrupt_token.lock().unwrap().clone();
+            if tok.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
+                cancelled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            cancelled,
+            "Interrupt should cancel the current turn's token"
+        );
+        // The worker is now awaiting the hang tool's natural join; it will
+        // not process further actions. Drop the backend (detaches the worker)
+        // rather than waiting on it.
+        drop(backend);
+    }
+
+    // ── Goal-383: real cancel-during-turn cancels the kernel's token,
+    //    awaits the natural join, emits UiEvent::Interrupted, and does NOT
+    //    roll the transcript back (partial work persists). The old Goal-170
+    //    test asserted an abort + truncate; graceful cancel changes both.
+    use recursive::llm::{Completion, MockProvider, ToolCall};
+    use recursive::tools::{Tool, ToolRegistry};
+    use recursive::AgentRuntime;
+    use serde_json::{json, Value};
+
+    /// A tool that completes after a short delay — long enough to interrupt
+    /// mid-tool, short enough that the graceful cancel path (the kernel
+    /// notices the token at the NEXT step boundary, after the tool returns)
+    /// can finish the turn promptly. Contrast with the `HangTool` above,
+    /// which never returns: graceful cancel cannot interrupt a tool that
+    /// never yields — exactly like the HTTP layer, where a hung tool also
+    /// stalls until it returns.
+    struct SlowTool {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SlowTool {
+        fn spec(&self) -> recursive::llm::ToolSpec {
+            recursive::llm::ToolSpec {
+                name: "slow".into(),
+                description: "test tool that returns after a delay".into(),
+                parameters: json!({"type":"object","properties":{}}),
+            }
+        }
+        async fn execute(&self, _args: Value) -> recursive::error::Result<String> {
+            tokio::time::sleep(self.delay).await;
+            Ok("done".into())
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    async fn interrupt_cancels_running_turn_and_emits_interrupted() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let llm = Arc::new(
+            MockProvider::new(vec![
+                Completion {
+                    content: "calling slow".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "slow".into(),
+                        arguments: json!({}),
+                    }],
+                    finish_reason: Some("tool_calls".into()),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                Completion {
+                    content: "second turn done".into(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ])
+            .with_on_complete(notify.clone()),
+        );
+        let tools = ToolRegistry::local().register(Arc::new(SlowTool {
+            delay: std::time::Duration::from_millis(300),
+        }));
+        let rt = AgentRuntime::builder()
+            .llm(llm.clone())
+            .tools(tools)
+            .build()
+            .expect("runtime builds");
+
+        let mut backend = Backend::spawn_with_runtime(rt);
+        backend
+            .action_tx
+            .send(UserAction::SendMessage("hi".into()))
+            .unwrap();
+
+        // Wait until the mock completion has returned — at that point the
+        // agent is dispatching the slow tool and the turn is genuinely
+        // in-flight. `notify.notified()` is single-use but re-entrant: if the
+        // mock already fired, the first await returns immediately.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), notify.notified()).await;
         // Give the worker a beat to enter the tool dispatch path.
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
+        // Goal-383 wiring check: the per-turn token is installed before the
+        // turn and is fresh (not pre-cancelled).
+        let token_before = backend.current_interrupt_token.lock().unwrap().clone();
+        assert!(
+            token_before.is_some(),
+            "SendMessage should install a current interrupt token"
+        );
+        assert!(
+            !token_before.as_ref().unwrap().is_cancelled(),
+            "a freshly installed token must not be pre-cancelled"
+        );
+
         backend.action_tx.send(UserAction::Interrupt).unwrap();
 
+        // The graceful path must eventually emit UiEvent::Interrupted — the
+        // slow tool returns, the kernel sees the token at the next step
+        // boundary, finishes as Cancelled, and the select loop awaits the
+        // natural join before signalling the UI.
         let mut got_interrupted = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline {
@@ -1758,11 +1955,59 @@ mod tests {
                 Err(_) => continue,
             }
         }
-        let _ = backend.action_tx.send(UserAction::Shutdown);
         assert!(
             got_interrupted,
-            "Interrupt should abort the running turn and emit UiEvent::Interrupted"
+            "Interrupt should cancel the running turn and emit UiEvent::Interrupted"
         );
+
+        // After the turn, the token slot is cleared again (fresh token next turn).
+        let clear_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut cleared = false;
+        while tokio::time::Instant::now() < clear_deadline {
+            if backend.current_interrupt_token.lock().unwrap().is_none() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(cleared, "turn token should be cleared after the turn ends");
+
+        // Goal-383 core regression: the interrupted turn's partial content
+        // must NOT be truncated from the runtime transcript. Send a second
+        // message and assert the provider's second request still contains the
+        // first turn's assistant message + tool call. Under the old
+        // abort + truncate_transcript(pre_turn_len) path, that content was
+        // rolled back and this assertion would fail.
+        backend
+            .action_tx
+            .send(UserAction::SendMessage("again".into()))
+            .unwrap();
+        let second_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < second_deadline {
+            if llm.calls().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let calls = llm.calls();
+        assert!(
+            calls.len() >= 2,
+            "expected a second LLM call after the interrupted turn, got {}",
+            calls.len()
+        );
+        let second = &calls[1];
+        let text = second
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            text.contains("calling slow"),
+            "second-turn request must still contain the interrupted turn's \
+             partial assistant content (transcript must not be truncated); got: {text}"
+        );
+
+        let _ = backend.action_tx.send(UserAction::Shutdown);
     }
 
     // ── Goal-323: Loop arbiter tests ──────────────────────────────────
@@ -2723,54 +2968,90 @@ mod tests {
         );
     }
 
-    // ── Pre-existing: wait_for_cancel semantics ───────────────────────
+    // ── Goal-383: token-based cancel semantics (replaces wait_for_cancel) ──
 
     #[tokio::test]
-    async fn wait_for_cancel_returns_immediately_when_flag_already_set() {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            wait_for_cancel(flag, notify),
-        )
-        .await
-        .expect("should return immediately when flag is set");
+    async fn cancelled_future_completes_when_token_precancelled() {
+        let token = CancellationToken::new();
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(100), token.cancelled())
+            .await
+            .expect("should return immediately when the token is already cancelled");
     }
 
     #[tokio::test]
-    async fn wait_for_cancel_blocks_until_flag_set_and_notified() {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let flag_clone = flag.clone();
-        let notify_clone = notify.clone();
+    async fn cancelled_future_completes_when_token_cancelled() {
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            notify_clone.notify_one();
+            token_clone.cancel();
         });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            wait_for_cancel(flag, notify),
-        )
-        .await
-        .expect("timed out waiting for cancel");
+        tokio::time::timeout(std::time::Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("timed out waiting for cancel");
     }
 
     #[tokio::test]
-    async fn wait_for_cancel_must_block_when_flag_false_and_no_notify() {
-        // If wait_for_cancel is replaced with `()` it returns immediately and
-        // this timeout succeeds — failing the assertion. The real impl blocks.
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            wait_for_cancel(flag, notify),
-        )
-        .await;
+    async fn cancelled_future_must_block_when_token_not_cancelled() {
+        // If the select-loop cancel arm were replaced with `()` the select
+        // would always take the cancel arm immediately — the real future
+        // blocks until the token is cancelled.
+        let token = CancellationToken::new();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), token.cancelled()).await;
         assert!(
             result.is_err(),
-            "wait_for_cancel must block while flag is false and no notify fires"
+            "cancelled() must block while the token is not cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_path_awaits_handle_instead_of_aborting() {
+        // Goal-383 regression: when the token fires, `run_turn_select_loop`
+        // must await the task's NATURAL join — the task runs to completion
+        // (or panics), it is not dropped mid-flight by `JoinHandle::abort()`.
+        // A task that sets a flag just before finishing proves it was awaited.
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel::<UserAction>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let gate = Arc::new(recursive::tools::plan_mode::PlanApprovalGate::new());
+        let plan_mode_request_gate =
+            Arc::new(recursive::tools::plan_mode::PlanModeRequestGate::new());
+        let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let mut handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            finished_clone.store(true, Ordering::SeqCst);
+            Ok::<(), recursive::Error>(())
+        });
+        // Pre-cancel the token: the biased select checks the handle future
+        // (pending on the 50ms sleep) first, then the cancelled() future,
+        // which is ready → the cancel arm wins.
+        let token = CancellationToken::new();
+        token.cancel();
+        let aborted = run_turn_select_loop(
+            &mut handle,
+            &mut action_rx,
+            &event_tx,
+            token,
+            &gate,
+            &plan_mode_request_gate,
+            &mut queued,
+        )
+        .await;
+        assert!(aborted, "a cancelled token must mark the turn interrupted");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "cancel path must await the handle (task ran to completion), not abort it"
+        );
+        // The cancel path emits UiEvent::Interrupted to the UI.
+        let ev = event_rx.recv().await;
+        assert!(
+            matches!(ev, Some(UiEvent::Interrupted)),
+            "cancel path should emit UiEvent::Interrupted, got {ev:?}"
+        );
+        drop(action_tx);
     }
 
     // ── Pre-existing: mcp_server_transport classification ─────────────

@@ -3701,6 +3701,7 @@ dependencies = [
  "syntect",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tui-pty-harness",
  "unicode-width 0.2.0",
