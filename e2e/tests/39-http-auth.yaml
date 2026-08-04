@@ -16,7 +16,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9097' 2>/dev/null || true
+        # Allocate a free port for this suite (host-mode port randomization).
+        PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+        echo "$PORT" > /tmp/e2e-host-port-39.txt
+        echo "suite-port=$PORT"
+        export PORT=$(cat /tmp/e2e-host-port-39.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         sleep 0.5
         echo cleaned
 
@@ -24,14 +29,15 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        nohup sh -c 'RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
+        export PORT=$(cat /tmp/e2e-host-port-39.txt)
+        nohup sh -c "RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
           recursive \
             --api-base http://aimock:4010/v1 \
             --api-key mock-key -m mock-chat \
-            http --addr 0.0.0.0:9097' \
-          > /tmp/http-9097.log 2>&1 &
+            http --addr 0.0.0.0:$PORT" \
+          > /tmp/http-$PORT.log 2>&1 &
         for i in $(seq 1 20); do
-          curl -sf http://localhost:9097/health > /dev/null 2>&1 && echo "server-ready" && break
+          curl -sf http://localhost:$PORT/health > /dev/null 2>&1 && echo "server-ready" && break
           sleep 0.5
         done
 
@@ -41,8 +47,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        http://localhost:9097/health
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:$PORT/health
     expect:
       exitCode: 0
       output:
@@ -52,8 +58,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        http://localhost:9097/metrics
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:$PORT/metrics
     expect:
       exitCode: 0
       output:
@@ -64,8 +70,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        http://localhost:9097/sessions
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
+        http://localhost:$PORT/sessions
     expect:
       exitCode: 0
       output:
@@ -75,8 +81,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST http://localhost:9097/sessions
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:$PORT/sessions
         -H 'Content-Type: application/json'
         -d '{}'
     expect:
@@ -88,8 +94,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST http://localhost:9097/run
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST http://localhost:$PORT/run
         -H 'Content-Type: application/json'
         -d '{"goal":"test"}'
     expect:
@@ -102,9 +108,9 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
         -H 'X-API-Key: wrong-key'
-        http://localhost:9097/sessions
+        http://localhost:$PORT/sessions
     expect:
       exitCode: 0
       output:
@@ -115,9 +121,9 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
+        export PORT=$(cat /tmp/e2e-host-port-39.txt); curl -s -o /dev/null -w 'status=%{http_code}'
         -H 'X-API-Key: test-secret-key'
-        http://localhost:9097/sessions
+        http://localhost:$PORT/sessions
     expect:
       exitCode: 0
       output:
@@ -127,9 +133,10 @@ cases:
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-39.txt)
         OUT=$(curl -sf \
           -H 'X-API-Key: test-secret-key' \
-          -X POST http://localhost:9097/sessions \
+          -X POST http://localhost:$PORT/sessions \
           -H 'Content-Type: application/json' \
           -d '{"system_prompt":"auth test"}')
         echo "$OUT" | grep -q '"id"' && echo "has-id" || echo "no-id"
@@ -144,6 +151,7 @@ teardown:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9097' 2>/dev/null || true
-        rm -f /tmp/http-9097.log
+        export PORT=$(cat /tmp/e2e-host-port-39.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
+        rm -f /tmp/http-$PORT.log
         echo stopped

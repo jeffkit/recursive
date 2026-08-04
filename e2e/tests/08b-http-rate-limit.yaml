@@ -15,7 +15,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null || true
+        # Allocate a free port for this suite (host-mode port randomization).
+        PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+        echo "$PORT" > /tmp/e2e-host-port-08b.txt
+        echo "suite-port=$PORT"
+        export PORT=$(cat /tmp/e2e-host-port-08b.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         sleep 1
         echo cleaned
 
@@ -23,22 +28,23 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        rm -f /tmp/http-9091.log
+        export PORT=$(cat /tmp/e2e-host-port-08b.txt)
+        rm -f /tmp/http-$PORT.log
         RECURSIVE_RATE_LIMIT_BURST=2 \
         RECURSIVE_RATE_LIMIT_RPM=60 \
         RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
         nohup recursive \
           --api-base http://aimock:4010/v1 \
           --api-key mock-key -m mock-chat \
-          http --addr 0.0.0.0:9091 \
-          > /tmp/http-9091.log 2>&1 &
+          http --addr 0.0.0.0:$PORT \
+          > /tmp/http-$PORT.log 2>&1 &
         sleep 2
         echo started
 
   - name: "Sanity: server is responding before rate-limit test"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9091/health
+      command: export PORT=$(cat /tmp/e2e-host-port-08b.txt); curl -sf http://localhost:$PORT/health
     expect:
       exitCode: 0
       output:
@@ -49,15 +55,16 @@ cases:
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-08b.txt)
         # Burst=2 → first two 200, third 429. /health is rate-limit-exempt
         # (it's the k8s liveness probe and lives in the public sub-router),
         # so we hit a protected endpoint (/tools) with the auth key to
         # actually exercise the rate-limit middleware.
         sleep 1
         HDR='-H X-API-Key:test-secret-key'
-        S1=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:9091/tools)
-        S2=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:9091/tools)
-        S3=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:9091/tools)
+        S1=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:$PORT/tools)
+        S2=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:$PORT/tools)
+        S3=$(curl -s -o /dev/null -w '%{http_code}' $HDR http://localhost:$PORT/tools)
         echo "statuses=$S1,$S2,$S3"
         echo "$S1 $S2 $S3" | grep -q 429 && echo "rate-limited-ok" || echo "expected-429-but-got-$S1-$S2-$S3"
     expect:
@@ -71,6 +78,7 @@ teardown:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9091' 2>/dev/null || true
-        rm -f /tmp/http-9091.log
+        export PORT=$(cat /tmp/e2e-host-port-08b.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
+        rm -f /tmp/http-$PORT.log
         echo stopped

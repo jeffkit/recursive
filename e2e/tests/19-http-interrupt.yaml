@@ -15,7 +15,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9093' 2>/dev/null || true
+        # Allocate a free port for this suite (host-mode port randomization).
+        PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+        echo "$PORT" > /tmp/e2e-host-port-19.txt
+        echo "suite-port=$PORT"
+        export PORT=$(cat /tmp/e2e-host-port-19.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         sleep 1
         echo cleaned
 
@@ -23,16 +28,17 @@ setup:
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -f /tmp/intr-sid /tmp/intr-http.log && echo reset
+      command: export PORT=$(cat /tmp/e2e-host-port-19.txt); rm -f /tmp/intr-sid /tmp/intr-http.log && echo reset
 
   - name: "Start HTTP server on port 9093"
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-19.txt)
         RECURSIVE_HTTP_AUTH_KEYS=test-secret-key nohup recursive \
           --api-base http://aimock:4010/v1 \
           --api-key mock-key -m mock-chat \
-          http --addr 0.0.0.0:9093 \
+          http --addr 0.0.0.0:$PORT \
           > /tmp/intr-http.log 2>&1 &
         sleep 2
         echo started
@@ -40,7 +46,7 @@ setup:
   - name: "Sanity: GET /health returns ok"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9093/health
+      command: export PORT=$(cat /tmp/e2e-host-port-19.txt); curl -sf http://localhost:$PORT/health
     expect:
       exitCode: 0
       output:
@@ -50,7 +56,7 @@ setup:
     exec:
       container: recursive-e2e
       command: >
-        curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9093/sessions
+        export PORT=$(cat /tmp/e2e-host-port-19.txt); curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions
         -H 'Content-Type: application/json'
         -d '{"system_prompt":"You are a test assistant."}'
         | jq -r .id > /tmp/intr-sid
@@ -65,9 +71,9 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        SID=$(cat /tmp/intr-sid)
+        export PORT=$(cat /tmp/e2e-host-port-19.txt); SID=$(cat /tmp/intr-sid)
         && curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST -H 'X-API-Key: test-secret-key' http://localhost:9093/sessions/$SID/interrupt
+        -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SID/interrupt
         -H 'Content-Type: application/json'
     expect:
       exitCode: 0
@@ -78,8 +84,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        SID=$(cat /tmp/intr-sid)
-        && curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9093/sessions/$SID/interrupt
+        export PORT=$(cat /tmp/e2e-host-port-19.txt); SID=$(cat /tmp/intr-sid)
+        && curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SID/interrupt
         -H 'Content-Type: application/json'
     expect:
       exitCode: 0
@@ -90,8 +96,8 @@ cases:
     exec:
       container: recursive-e2e
       command: >
-        curl -s -o /dev/null -w 'status=%{http_code}'
-        -X POST -H 'X-API-Key: test-secret-key' http://localhost:9093/sessions/no-such-session-xyz/interrupt
+        export PORT=$(cat /tmp/e2e-host-port-19.txt); curl -s -o /dev/null -w 'status=%{http_code}'
+        -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/no-such-session-xyz/interrupt
         -H 'Content-Type: application/json'
     expect:
       exitCode: 0
@@ -104,6 +110,7 @@ teardown:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9093' 2>/dev/null || true
+        export PORT=$(cat /tmp/e2e-host-port-19.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         rm -f /tmp/intr-sid /tmp/intr-http.log
         echo stopped

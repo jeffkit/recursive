@@ -17,7 +17,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9099' 2>/dev/null || true
+        # Allocate a free port for this suite (host-mode port randomization).
+        PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+        echo "$PORT" > /tmp/e2e-host-port-22.txt
+        echo "suite-port=$PORT"
+        export PORT=$(cat /tmp/e2e-host-port-22.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         sleep 1
         echo cleaned
 
@@ -25,18 +30,19 @@ setup:
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -f /tmp/compact-result.txt /tmp/compact-http.log && echo reset
+      command: export PORT=$(cat /tmp/e2e-host-port-22.txt); rm -f /tmp/compact-result.txt /tmp/compact-http.log && echo reset
 
   - name: "Start HTTP server on port 9099 with low compaction threshold"
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-22.txt)
         RECURSIVE_COMPACT_THRESHOLD=100 RECURSIVE_RATE_LIMIT_BURST=200 RECURSIVE_RATE_LIMIT_RPM=6000 \
          RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
           nohup recursive \
             --api-base http://aimock:4010/v1 \
             --api-key mock-key -m mock-chat \
-            http --addr 0.0.0.0:9099 \
+            http --addr 0.0.0.0:$PORT \
             > /tmp/compact-http.log 2>&1 &
         sleep 2
         echo started
@@ -44,7 +50,7 @@ setup:
   - name: "Sanity: GET /health returns ok"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9099/health
+      command: export PORT=$(cat /tmp/e2e-host-port-22.txt); curl -sf http://localhost:$PORT/health
     expect:
       exitCode: 0
       output:
@@ -54,21 +60,22 @@ setup:
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-22.txt)
         # Create session
-        SESSION=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9099/sessions \
+        SESSION=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions \
           -H 'Content-Type: application/json' \
           -d '{"system_prompt":"You are a test assistant."}' \
           | jq -r '.id')
         echo "session=$SESSION"
 
         # Turn 1: long response to exceed 100-char threshold
-        RESP1=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9099/sessions/$SESSION/messages \
+        RESP1=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SESSION/messages \
           -H 'Content-Type: application/json' \
           -d '{"content":"compaction-turn-1"}')
         echo "turn1_role=$(echo $RESP1 | jq -r '.role')"
 
         # Turn 2: after compaction — must still work
-        RESP2=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:9099/sessions/$SESSION/messages \
+        RESP2=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SESSION/messages \
           -H 'Content-Type: application/json' \
           -d '{"content":"compaction-turn-2"}')
         echo "turn2_role=$(echo $RESP2 | jq -r '.role')"
@@ -104,6 +111,7 @@ teardown:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9099' 2>/dev/null || true
+        export PORT=$(cat /tmp/e2e-host-port-22.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         rm -f /tmp/compact-result.txt /tmp/compact-http.log
         echo stopped

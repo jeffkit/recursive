@@ -17,7 +17,12 @@ setup:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9095' 2>/dev/null || true
+        # Allocate a free port for this suite (host-mode port randomization).
+        PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)")
+        echo "$PORT" > /tmp/e2e-host-port-20.txt
+        echo "suite-port=$PORT"
+        export PORT=$(cat /tmp/e2e-host-port-20.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         sleep 1
         echo cleaned
 
@@ -25,16 +30,17 @@ setup:
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: rm -f /tmp/sdk-result.txt /tmp/sdk-http.log && echo reset
+      command: export PORT=$(cat /tmp/e2e-host-port-20.txt); rm -f /tmp/sdk-result.txt /tmp/sdk-http.log && echo reset
 
   - name: "Start HTTP server on port 9095"
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-20.txt)
         RECURSIVE_HTTP_AUTH_KEYS=test-secret-key nohup recursive \
           --api-base http://aimock:4010/v1 \
           --api-key mock-key -m mock-chat \
-          http --addr 0.0.0.0:9095 \
+          http --addr 0.0.0.0:$PORT \
           > /tmp/sdk-http.log 2>&1 &
         sleep 2
         echo started
@@ -42,7 +48,7 @@ setup:
   - name: "Sanity: GET /health returns ok"
     exec:
       container: recursive-e2e
-      command: curl -sf http://localhost:9095/health
+      command: export PORT=$(cat /tmp/e2e-host-port-20.txt); curl -sf http://localhost:$PORT/health
     expect:
       exitCode: 0
       output:
@@ -52,9 +58,11 @@ setup:
     exec:
       container: recursive-e2e
       command: |
+        export PORT=$(cat /tmp/e2e-host-port-20.txt)
         python3 - <<'PYEOF' > /tmp/sdk-result.txt
         from recursive_sdk import Agent
-        with Agent.create(base_url='http://localhost:9095', api_key='test-secret-key') as agent:
+        import os
+        with Agent.create(base_url='http://localhost:' + os.environ['PORT'], api_key='test-secret-key') as agent:
             run = agent.send('sdk-python-hello')
             result = run.wait()
             print('status=' + str(result.status))
@@ -105,6 +113,7 @@ teardown:
     exec:
       container: recursive-e2e
       command: |
-        pkill -f 'http --addr 0.0.0.0:9095' 2>/dev/null || true
+        export PORT=$(cat /tmp/e2e-host-port-20.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
         rm -f /tmp/sdk-result.txt /tmp/sdk-http.log
         echo stopped
