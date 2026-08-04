@@ -25,19 +25,29 @@ use crate::app::App;
 use crate::ui::{command_menu, input, modal, spinner, status, transcript};
 use recursive::tools::todo::TodoStatus;
 
-/// Height of the todo panel (border + one row per item, capped at 6 items).
-fn todo_panel_height(app: &App) -> u16 {
+/// Height of the todo panel (border + one row per item).
+///
+/// Goal-384: the panel grows with the list up to ~1/3 of the screen so
+/// the windowing logic has room to show context around the in-progress
+/// task, but never shrinks below the old 6-item default for short lists.
+/// `screen_height` is the full terminal height (`frame.area().height`),
+/// used only to derive the cap.
+fn todo_panel_height(app: &App, screen_height: u16) -> u16 {
     if app.current_todos.is_empty() {
-        0
-    } else {
-        // 2 for the border + 1 per item (capped so it doesn't take over)
-        (app.current_todos.len().min(6) as u16) + 2
+        return 0;
     }
+    // Cap at ~1/3 of the screen so the transcript keeps the majority of
+    // vertical space. `max(3)` guards a tiny terminal; `.max(6)` keeps
+    // the old default for lists that fit.
+    let by_items = app.current_todos.len() as u16;
+    let max_by_screen = screen_height.saturating_sub(8).max(3) / 3;
+    let cap = max_by_screen.max(6);
+    by_items.min(cap) + 2 // +2 for the border
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let input_total = input::total_height(app, frame.area().width);
-    let todo_height = todo_panel_height(app);
+    let todo_height = todo_panel_height(app, frame.area().height);
     // Fix-E: show a 1-row approval banner when a plan is awaiting the
     // user's decision. The banner replaces the floating modal and keeps
     // the full transcript visible.
@@ -287,10 +297,48 @@ fn render_empty_state(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
-/// Render the compact task-list panel.
+/// Compute the visible window `[start, end)` over a todo list of `total`
+/// items, given the (optional) index of the in-progress item and the
+/// number of content rows available inside the panel (`area.height - 2`
+/// for the border).
 ///
-/// Shows up to 6 items with ✓/◉/○/✗ status icons. Items beyond the first
-/// 6 are silently truncated (the agent should keep lists short).
+/// Goal-384: guarantees the in-progress item stays visible when the list
+/// is longer than the panel — the single most common "where did the agent
+/// go?" confusion in long sessions. The in-progress item is centred in
+/// the window (clamped to the list bounds) so the user sees context above
+/// and below it. When there is no in-progress item, the window pins to
+/// the tail (most recent activity), mirroring how the transcript
+/// scrolls to the bottom.
+///
+/// Returns `(0, 0)` for an empty list or a zero-height panel.
+fn todo_window(total: usize, anchor: Option<usize>, content_rows: usize) -> (usize, usize) {
+    if total == 0 || content_rows == 0 {
+        return (0, 0);
+    }
+    if total <= content_rows {
+        return (0, total);
+    }
+    let start = match anchor {
+        // Centre the anchor, then clamp so the window never overshoots
+        // the start or end of the list.
+        Some(idx) => {
+            let ideal_start = idx.saturating_sub(content_rows / 2);
+            ideal_start.min(total.saturating_sub(content_rows))
+        }
+        // No anchor → show the tail (most recent activity).
+        None => total.saturating_sub(content_rows),
+    };
+    (start, (start + content_rows).min(total))
+}
+
+/// Render the task-list panel.
+///
+/// Goal-384: instead of truncating to the first 6 items, the panel
+/// windows around the in-progress item so it is always visible. The
+/// visible slice IS the window (no `Paragraph::scroll` needed — the
+/// `Paragraph` starts at item `start`), and the title shows how many
+/// items are scrolled off the top/bottom when the list is longer than
+/// the panel.
 fn render_todo_panel(frame: &mut Frame, area: Rect, app: &App) {
     let completed = app
         .current_todos
@@ -298,12 +346,29 @@ fn render_todo_panel(frame: &mut Frame, area: Rect, app: &App) {
         .filter(|t| t.status == TodoStatus::Completed)
         .count();
     let total = app.current_todos.len();
-    let title = format!(" Tasks ({completed}/{total} done) ");
 
-    let items: Vec<Line> = app
+    // Content rows available inside the bordered panel (area.height - 2
+    // for top + bottom border). The in-progress item is the row that
+    // MUST stay visible; `todo_write` enforces at most one, so
+    // `.position(...)` yields a single deterministic index (or None).
+    let content_rows = area.height.saturating_sub(2) as usize;
+    let anchor = app
         .current_todos
         .iter()
-        .take(6)
+        .position(|t| t.status == TodoStatus::InProgress);
+    let (start, end) = todo_window(total, anchor, content_rows);
+    let hidden_top = start;
+    let hidden_bottom = total.saturating_sub(end);
+
+    let mut title = format!(" Tasks ({completed}/{total} done) ");
+    if hidden_top > 0 || hidden_bottom > 0 {
+        // Truncation indicator: `↑2` = 2 items scrolled off the top,
+        // `↓3` = 3 off the bottom.
+        title.push_str(&format!("↑{hidden_top} ↓{hidden_bottom} "));
+    }
+
+    let items: Vec<Line> = app.current_todos[start..end]
+        .iter()
         .map(|item| {
             let (icon, style) = match item.status {
                 TodoStatus::Completed => ("✓", Style::default().fg(Color::Green)),
@@ -479,24 +544,40 @@ mod debt_tests {
 
     #[test]
     fn todo_panel_height_zero_when_empty() {
+        // kills todo_panel_height -> 0 (29:5) via the empty-list branch.
         let app = App::new();
-        assert_eq!(todo_panel_height(&app), 0);
+        assert_eq!(todo_panel_height(&app, 24), 0);
     }
 
     #[test]
-    fn todo_panel_height_grows_with_items_and_caps_at_six() {
-        // kills todo_panel_height -> 0 (30:5).
+    fn todo_panel_height_grows_with_items_up_to_screen_cap() {
+        // Goal-384: the cap is now screen-relative (~1/3 of the screen,
+        // never below the old 6-item default) instead of hardcoded at 6.
+        // Tall screen (40 rows): 9 items fit (9+2=11 rows) because the
+        // screen cap is 10. Short screen (24 rows): the cap is 6, so 9
+        // items render only 6+2=8 rows. Together these pin the
+        // `min(cap)` clamp and the `saturating_sub(8) / 3` screen cap.
         let mut app = App::new();
+
+        // 1 item + 2 border, regardless of screen height.
         app.current_todos = vec![todo("a", TodoStatus::Pending, None)];
-        assert_eq!(todo_panel_height(&app), 3); // 1 item + 2 border
+        assert_eq!(todo_panel_height(&app, 40), 3);
+
+        // 6 items + 2 border on both screens (fits under every cap).
         app.current_todos = (0..6)
             .map(|i| todo(&format!("t{i}"), TodoStatus::Pending, None))
             .collect();
-        assert_eq!(todo_panel_height(&app), 8); // 6 + 2
-        app.current_todos = (0..7)
+        assert_eq!(todo_panel_height(&app, 40), 8);
+        assert_eq!(todo_panel_height(&app, 24), 8);
+
+        // Tall screen: 9 items grow past the old 6-item cap → 11 rows.
+        app.current_todos = (0..9)
             .map(|i| todo(&format!("t{i}"), TodoStatus::Pending, None))
             .collect();
-        assert_eq!(todo_panel_height(&app), 8); // capped 6 + 2
+        assert_eq!(todo_panel_height(&app, 40), 11);
+
+        // Short screen: the 1/3-screen cap (6) kicks in → 8 rows.
+        assert_eq!(todo_panel_height(&app, 24), 8);
     }
 
     #[test]
@@ -623,6 +704,103 @@ mod debt_tests {
         assert!(
             all_text(&buf).contains("DoThing"),
             "Pending item should show content 'DoThing'"
+        );
+    }
+
+    #[test]
+    fn todo_window_centers_anchor() {
+        // Goal-384 headline logic: the pure window helper must keep the
+        // in-progress item visible when the list overflows the panel.
+        // 9 items, 4 content rows, anchor at index 7 → window [5, 9),
+        // which contains index 7 (the old hardcoded first-6 slice
+        // showed [0, 6)).
+        assert_eq!(todo_window(9, Some(7), 4), (5, 9));
+
+        // Anchor at the very start → window pinned to the top.
+        assert_eq!(todo_window(9, Some(0), 4), (0, 4));
+
+        // Anchor at the last index → window pinned to the bottom.
+        assert_eq!(todo_window(9, Some(8), 4), (5, 9));
+
+        // List fits entirely → no scroll, full list shown.
+        assert_eq!(todo_window(3, Some(2), 4), (0, 3));
+
+        // No in-progress item → pin to the tail (most recent activity).
+        assert_eq!(todo_window(9, None, 4), (5, 9));
+
+        // Degenerate inputs → empty window, no panic.
+        assert_eq!(todo_window(0, None, 4), (0, 0));
+        assert_eq!(todo_window(9, Some(7), 0), (0, 0));
+    }
+
+    #[test]
+    fn render_todo_panel_shows_in_progress_when_beyond_viewport() {
+        // Goal-384 headline render test: with 9 todos on a 24-row screen
+        // the panel shows only 6 content rows, so the old hardcoded
+        // first-6 render would truncate the in-progress item at index 7
+        // off-screen. The windowed render must centre on it and paint its
+        // active_form label, plus show the truncation indicator.
+        let mut app = App::new();
+        app.turn.running = true;
+        app.current_todos = (0..9)
+            .map(|i| {
+                if i == 7 {
+                    todo("task7", TodoStatus::InProgress, Some("DoingTask7"))
+                } else {
+                    todo(&format!("task{i}"), TodoStatus::Pending, None)
+                }
+            })
+            .collect();
+        let buf = draw(&mut app, 80, 24);
+        let text = all_text(&buf);
+        assert!(
+            text.contains("DoingTask7"),
+            "in-progress item (index 7) must be visible; got:\n{text}"
+        );
+        // The list is longer than the panel (9 > 6 content rows) → the
+        // truncation indicator reports 3 items scrolled off the top and
+        // none off the bottom.
+        assert!(
+            text.contains("↑3 ↓0"),
+            "expected truncation indicator '↑3 ↓0'; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_todo_panel_hides_indicator_when_everything_fits() {
+        // When the whole list fits in the panel nothing is hidden, so the
+        // title must NOT carry the truncation indicator. Kills the
+        // `>` -> `>=` mutants on `hidden_top > 0 || hidden_bottom > 0`
+        // (364:19 and 364:40): with `>=`, `hidden_bottom == 0` makes the
+        // second condition always true and the title would read "↑0 ↓0".
+        let mut app = App::new();
+        app.turn.running = true;
+        app.current_todos = (0..3)
+            .map(|i| {
+                if i == 1 {
+                    todo("mid", TodoStatus::InProgress, Some("DoingMid"))
+                } else {
+                    todo(&format!("t{i}"), TodoStatus::Pending, None)
+                }
+            })
+            .collect();
+        let buf = draw(&mut app, 80, 24);
+        let text = all_text(&buf);
+        // Sanity: the in-progress item is visible (list fits → full list
+        // shown, no truncation).
+        assert!(
+            text.contains("DoingMid"),
+            "in-progress item must be visible; got:\n{text}"
+        );
+        // The title row must not show ↑N/↓M — the list fits entirely.
+        let y = row_y_containing(&buf, " Tasks ").expect("todo panel title row");
+        let mut title_row = String::new();
+        for x in 0..buf.area.width {
+            title_row.push_str(buf.cell((x, y)).expect("cell").symbol());
+        }
+        assert!(
+            !title_row.contains('↑') && !title_row.contains('↓'),
+            "no truncation indicator expected when everything fits; got: {title_row:?}"
         );
     }
 
