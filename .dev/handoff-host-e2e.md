@@ -5,7 +5,7 @@
 
 ## 一句话状态
 
-argusai HostRuntime 已实现并通过 npm 发版（0.15.0-0.15.2）。recursive 侧 host 模式 e2e **36/41 suite 通过**（2026-08-04，`e2e-host-batch.sh` 全量跑）。剩 3 个失败全是环境/边角问题（2 个是本机端口被别的 app 占用，1 个是 SSE `done` 事件在 host 模式下不投递——待深挖）。本次会话还顺手修了一批 Docker 下也潜伏的 bug（HTTP 认证、过时断言、schema 不匹配、jq 点号 key、rate-limit 测错端点）。
+argusai HostRuntime 已发版 0.15.3（含 host cwd 修复）。recursive 侧 host 模式 e2e **37/41 suite 通过**（2026-08-04，`e2e-host-batch.sh` 全量跑）。剩 2 个失败**全是本机端口冲突**（9093 被 Java app 占、9097 被隐藏 listener 占），换机器/杀进程即过，suite 本身没问题。本次会话还顺手修了一批 Docker 下也潜伏的 bug（HTTP 认证、过时断言、schema 不匹配、jq 点号 key、rate-limit 测错端点、SSE curl 引号）。
 
 ## 两个仓的最新 commit
 
@@ -94,21 +94,19 @@ npm 已发版：`argusai-mcp@0.15.2`（含 argusai-core/core-storage/dashboard �
 | session-rewind slug 断言改匹配稳定尾巴 `test-rewind` | 36 | host-only（workspace 是临时目录，slug 带前缀） |
 | **HostRuntime `execInContainer` 加 `cwd: workspaceDir`** | argusai 仓 runtime.ts | host-only（镜像 Docker 的 WORKDIR；否则 agent 默认 workspace=cwd 落到 daemon 目录） |
 
-### 1. 剩余 3 个失败（已知，非阻塞）
+### 1. 剩余 2 个失败（已知，纯环境）
 
 | suite | 原因 | 性质 |
 |-------|------|------|
 | `http-interrupt` (port 9093) | 本机一个 Java app 占着 9093 | **环境**（端口冲突，换机器/杀进程即过） |
 | `http-auth` (port 9097) | 本机一个隐藏 listener 占着 9097（lsof 看不到 PID，netstat 见 LISTEN，回 404+CORS 头，非 recursive） | **环境**（端口冲突） |
-| `http-api` SSE case | `GET /sessions/:id/events` 在 host 模式下收不到 `done` 事件（已把固定 sleep 改成 5s 轮询仍 missing，**不是 timing**，是 SSE 完成事件投递的更深问题） | **待深挖**（08 其余 15/21 全过，只此 1 个 SSE case） |
 
 > 两个端口冲突的验证：在空闲端口上手动复现过，`/interrupt`→200、`/health`→200 都正常，suite 本身没问题。
+> （之前的第 3 个失败 http-api SSE 已解决——是我做 auth-header 注入时把 `-H` 塞进了已加引号的 URL token，curl 当成无 URL → SSE 捕获为空。已把 header 移到引号外，http-api 现在 21/21。）
 
-### 2. argusai 仓的改动需发版
+### 2. argusai 0.15.3 已发版
 
-`packages/core/src/runtime.ts` 的 HostRuntime `cwd` 修复**已在本地 build + `npm link`**（当前 argusai-mcp 指向本地）。
-跑 host e2e 前 `cd argusai/packages/mcp && npm link`；恢复正式版 `npm install -g argusai-mcp@0.15.2`。
-建议给 argusai 加个 changeset 发 0.15.3（host cwd fix）。
+`packages/core/src/runtime.ts` 的 HostRuntime `cwd` 修复（镜像 Docker WORKDIR，让 host 进程在 workspaceDir 下跑）+ 对不存在目录的 guard，已随 **argusai-mcp@0.15.3** 发到 npm（CI 跑 1m31s 全绿）。本地已 `npm install -g argusai-mcp@0.15.3`（不再是 npm link）。
 
 ### 3. 工作树清理
 
