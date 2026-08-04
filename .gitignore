@@ -78,3 +78,5 @@ scripts/apply_goal_261.py
 # cargo-mutants output
 mutants.out/
 mutants.out.old/
+.gate-*-output.log
+.gate-*-rerun.log
