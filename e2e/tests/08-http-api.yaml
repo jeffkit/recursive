@@ -239,11 +239,11 @@ cases:
       command: |
         SSE_SID=$(cat /tmp/sse-sid)
         : > /tmp/sse-events.txt
-        curl -s -N "-H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SSE_SID/events" \
+        curl -s -N -H 'X-API-Key: test-secret-key' "http://localhost:9090/sessions/$SSE_SID/events" \
           > /tmp/sse-events.txt 2>/dev/null &
         SSE_PID=$!
         sleep 0.5
-        curl -sf -X POST "-H 'X-API-Key: test-secret-key' http://localhost:9090/sessions/$SSE_SID/messages" \
+        curl -sf -X POST -H 'X-API-Key: test-secret-key' "http://localhost:9090/sessions/$SSE_SID/messages" \
           -H 'Content-Type: application/json' \
           -d '{"content":"Write file sse-test.txt with content sse-ok"}' \
           > /dev/null
