@@ -12,8 +12,8 @@
 **Docker 模式修复**（argusai 0.15.4 已发版 + recursive 插件 fix）：
 1. **yaml-engine 容器名解析**：0.15.x 起容器带 namespace 前缀（`wt-XXX-recursive-e2e`），但 exec/file/process/port/插件步骤仍用 YAML 原始名（`recursive-e2e`）→ `No such container`。已把 session 解析的 containerName 优先级提高（4 处步骤 + 插件步骤 container 覆盖）
 2. **插件 aimock network**：插件原来"优先选已存在的候选 network"，残留的 `argusai-recursive-agent-network` 会让 aimock 连错网络 → recursive-e2e 容器里 `aimock` 不可解析 → agent LLM 静默超时。改为始终用 WORKTREE_ID network
-3. **Docker 子网池耗尽**（环境问题）：host 模式测试每次创建 `argusai-host-XXX-network` 从不清理，29 个残留把 Docker 默认 31 个子网池耗尽 → 新 network 创建失败。**需定期清理**：`docker network ls | grep argusai | xargs docker network rm`（仅未被容器使用的）
-4. **HEAD 变更后镜像缺失**（开发流程）：e2e 镜像 tag 是 `recursive:e2e-wt-<HEAD>`，改代码后必须跑 `e2e-run.sh <suite>`（不带 --no-build）重新构建
+3. **Docker 子网池泄漏**：host/Docker 测试每次创建 `argusai-<WORKTREE_ID>-network` 从不清理，积累到 29 个时耗尽 Docker 默认 31 个子网池 → 新 network 创建失败。**已在 `e2e-run.sh` / `e2e-run-host.sh` 的 cleanup 里自动删除本 run 的 network**（验证：跑完 0 残留）。注意：**修复前的旧残留需要手动清一次**：`docker network ls | grep argusai | while read n; do [ "$(docker network inspect "$n" --format '{{len .Containers}}')" = "0" ] && docker network rm "$n"; done`
+4. **HEAD 变更后镜像缺失**：e2e 镜像 tag 是 `recursive:e2e-wt-<HEAD>`，改代码后镜像就没了。**改完代码后第一次跑 Docker e2e 别用 `--no-build`**（会静默 fallback 到不存在的镜像 → setup 失败，表现为 "File ... does not exist" 而不是明确的镜像错误）。用 `e2e-run.sh <suite>`（不带 --no-build）让它重新构建。
 
 HTTP 测试端口已随机化（每个 suite 自分配空闲端口），本机端口占用不再影响测试。
 
@@ -115,9 +115,12 @@ npm 已发版：`argusai-mcp@0.15.2`（含 argusai-core/core-storage/dashboard �
 
 **最终状态：`e2e-host-batch.sh` 全量 39 PASS / 0 FAIL / 2 SKIP**（skip 的是需真 key 的 `live` 和 `deferred-tool-loading`）。
 
-### 2. argusai 0.15.3 已发版
+### 2. argusai 0.15.4 已发版
 
-`packages/core/src/runtime.ts` 的 HostRuntime `cwd` 修复（镜像 Docker WORKDIR，让 host 进程在 workspaceDir 下跑）+ 对不存在目录的 guard，已随 **argusai-mcp@0.15.3** 发到 npm（CI 跑 1m31s 全绿）。本地已 `npm install -g argusai-mcp@0.15.3`（不再是 npm link）。
+- **0.15.3**：HostRuntime `cwd` 修复（镜像 Docker WORKDIR，让 host 进程在 workspaceDir 下跑）+ 对不存在目录的 guard
+- **0.15.4**：yaml-engine 容器名解析修复（exec/file/process/port/插件步骤用 session 解析后的 namespace 前缀容器名，而非 YAML 原始名）—— 这是 Docker 模式 e2e 全挂的根因
+
+都已发 npm（CI 跑 1m31s 全绿，1028 测试过）。本地已 `npm install -g argusai-mcp@0.15.4`。recursive 插件 fix（aimock network）在 commit `c355c29`。
 
 ### 3. 工作树清理
 
@@ -134,6 +137,30 @@ recursive 工作树有一批未提交文件（之前 self-improve cycle 遗留�
 ?? docs/review/architecture-review-2026-08-04.md
 ```
 本次会话只动了 e2e/tests/*.yaml、.dev/scripts/、.dev/handoff-host-e2e.md，没碰上面这些。
+
+### 4. ⚠️ 运维注意事项（这次踩的坑，避免重蹈）
+
+跑 e2e 时注意这两点，否则会得到**误导性的失败**（看起来像代码 bug，其实是环境/流程问题）：
+
+**a. 改代码后第一次跑 Docker e2e 别用 `--no-build`**
+
+e2e 镜像 tag 是 `recursive:e2e-wt-<HEAD>`，改代码（即使只改 e2e YAML）后 git HEAD 变了，旧镜像 tag 就不匹配了。`--no-build` 会静默 fallback 到**不存在的镜像**，docker run 报 `pull access denied`（被 argus-setup 吞成 `service: failed`），最终表现为 **case 断言 "File ... does not exist"**（因为容器根本没起）。看起来像 agent 没写文件，其实是镜像缺失。
+
+→ 用 `bash .dev/scripts/e2e-run.sh <suite>`（不带 `--no-build`）让它重新构建镜像（cargo build + Docker build，约 1-2 分钟）。后续同一个 HEAD 的 run 才能安全用 `--no-build`。
+
+**b. Docker 子网池耗尽**
+
+每次 host/Docker e2e 跑会创建一个 `argusai-<WORKTREE_ID>-network`。**修复前**（commit `1f93b94` 之前）这些 network 从不清理，积累到 ~29 个时耗尽 Docker 默认的 31 个子网池 → 新 network 创建失败 → setup 全挂（报 `all predefined address pools have been fully subnetted`）。
+
+→ 已在 `e2e-run.sh` / `e2e-run-host.sh` 的 cleanup 里**自动删本 run 的 network**（验证跑完 0 残留）。但 **`1f93b94` 之前的旧残留需要手动清一次**：
+
+```bash
+docker network ls --format '{{.Name}}' | grep argusai | while read n; do
+  [ "$(docker network inspect "$n" --format '{{len .Containers}}')" = "0" ] && docker network rm "$n"
+done
+```
+
+只删未被容器使用的，安全。
 
 ## 关键技术知识（避免踩坑）
 
