@@ -101,6 +101,19 @@ if [[ "${RECURSIVE_E2E_GATE_FORCE:-0}" != "1" ]]; then
   fi
 fi
 
+# ---- 本地 smoke 快路径（旁路 argusai，秒级）──────────────────────────────
+# 默认先跑本地 smoke（直接在 host 上跑 recursive binary + 本地 aimock 容器，
+# 不构建 Docker 镜像、不走 argusai 编排）。过了就秒级绿灯，省 10-40min。
+# 本地红 → fallback 到下方 Docker 全量 e2e 拿完整诊断。
+# RECURSIVE_E2E_DOCKER=1 跳过本地，直接走 Docker（release 前全量验证用）。
+if [[ "${RECURSIVE_E2E_DOCKER:-0}" != "1" ]]; then
+  if bash "$REPO_ROOT/.dev/scripts/e2e-local.sh"; then
+    echo "[e2e-gate] local smoke PASS — skipping Docker full e2e (set RECURSIVE_E2E_DOCKER=1 to force)"
+    exit 0
+  fi
+  echo "[e2e-gate] local smoke FAIL — falling through to Docker e2e for full diagnostics" >&2
+fi
+
 # ---- 构建 e2e 插件（首次或 src 变动后）-------------------------------------
 if [[ -f "e2e/plugins/package.json" ]] && [[ ! -f "e2e/plugins/dist/index.js" || \
     "e2e/plugins/src" -nt "e2e/plugins/dist/index.js" ]]; then
