@@ -1,7 +1,7 @@
 # Recursive 架构 Review 修复状态总览
 
-**Date**: 2026-08-02
-**Maintainer**: 本文档是 `00-summary.md`、`architecture-review-2026-06-10.md`、`architecture-review-2026-06-15.md` 三轮 review 的**事后落地凭证**。
+**Date**: 2026-08-04
+**Maintainer**: 本文档是 `00-summary.md`、`architecture-review-2026-06-10.md`、`architecture-review-2026-06-15.md` 三轮 review 的**事后落地凭证**；战略增量见 2026-08-04 审查。
 **目的**: 让后续读者只看一份文件就能知道"当年那些 P0/P1/P2/P3，后来怎么样了"，避免被 review 文字中的 ☐ 误判为"现在还没修"。
 
 ---
@@ -13,6 +13,7 @@
 | 2026-06-06 初版 | `00-summary.md` + `01-core-engine.md` ~ `06-interfaces.md` |
 | 2026-06-10 增量 | `architecture-review-2026-06-10.md` |
 | 2026-06-15 第三次 | `architecture-review-2026-06-15.md` |
+| **2026-08-04 战略审查** | **`architecture-review-2026-08-04.md`**（意图 / 行数预算 / 默认入口 / keep·freeze；goals 385–391） |
 
 ## 落地凭证（handoff 链 + commit）
 
