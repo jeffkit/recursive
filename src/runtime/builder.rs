@@ -350,6 +350,7 @@ impl AgentRuntimeBuilder {
             skill_reinjector: self.skill_reinjector,
             plan_todo_reinjector,
             last_compact_turn: None,
+            permission_hook: None,
         })
     }
 }

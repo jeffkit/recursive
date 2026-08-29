@@ -1422,32 +1422,39 @@ pub(super) async fn agui_run(
         )
     })?;
 
-    // Derive the user goal: prefer the last user message, else fall back
-    // to the first context item value.
-    let goal = input
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.content.clone())
-        .or_else(|| input.context.first().map(|c| c.value.clone()))
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: "RunAgentInput must contain at least one user \
-                            message or a non-empty context item"
-                        .into(),
-                }),
-            )
-        })?;
-
     // ── Resume handling ──────────────────────────────────────────────────
     // If `input.resume` is present and non-empty, process the interrupt
     // resolutions before building the runtime.
     let resume_items: Vec<ag::Resume> = input.resume.unwrap_or_default();
+
+    // Derive the user goal: prefer the last user message, else fall back
+    // to the first context item value. Resume turns must NOT re-append the
+    // original user message (the seeded transcript already contains it plus
+    // the injected tool result; a duplicate makes the model re-issue the
+    // same tool call), so a neutral continuation directive is used instead.
+    let goal = if resume_items.is_empty() {
+        input
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.clone())
+            .or_else(|| input.context.first().map(|c| c.value.clone()))
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        status: "error".into(),
+                        error: "RunAgentInput must contain at least one user \
+                                message or a non-empty context item"
+                            .into(),
+                    }),
+                )
+            })?
+    } else {
+        "[frontend tool result received] 客户端工具结果已注入对话，请基于该结果继续回答用户最初的问题。".to_string()
+    };
     let mut seed_transcript: Option<Vec<crate::message::Message>> = None;
 
     if !resume_items.is_empty() {
@@ -1510,9 +1517,11 @@ pub(super) async fn agui_run(
             }
         }
 
-        // Load the transcript from the session.
-        let loaded_messages =
-            crate::session::SessionReader::load_messages(&session_dir).map_err(|e| {
+        // Load the transcript from the session. The AG-UI run persists one
+        // `Message` JSON per line (see the write side in the driver task).
+        let transcript_path = session_dir.join("transcript.jsonl");
+        let loaded_messages: Vec<crate::message::Message> = std::fs::read_to_string(&transcript_path)
+            .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -1520,7 +1529,11 @@ pub(super) async fn agui_run(
                         error: format!("failed to load session transcript: {e}"),
                     }),
                 )
-            })?;
+            })?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
 
         // Build an index of resume items by interrupt_id.
         let resume_by_id: std::collections::HashMap<&str, &ag::Resume> = resume_items
@@ -1641,9 +1654,39 @@ pub(super) async fn agui_run(
             })
         });
 
+    // ── AG-UI client tools: register stubs + install deny hook ────────
+    let agui_tools = input.tools.clone();
+    let client_tool_names: std::collections::HashSet<String> =
+        agui_tools.iter().map(|t| t.name.clone()).collect();
+
     let mut tool_registry = state.tool_registry.clone();
-    if let Some(ref hook) = interrupt_hook {
-        tool_registry.set_permission_hook(hook.clone());
+    for t in &agui_tools {
+        tool_registry = tool_registry.register(Arc::new(ClientToolStub {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters: t.parameters.clone(),
+        }));
+    }
+
+    // Client tools take the permission-hook slot; `interrupt_before` is a
+    // test-only facility and is ignored when client tools are present.
+    let client_hook: Option<Arc<ClientToolHook>> = if client_tool_names.is_empty() {
+        None
+    } else {
+        Some(Arc::new(ClientToolHook {
+            names: client_tool_names,
+            denied: std::sync::Mutex::new(None),
+        }))
+    };
+    if let Some(ref client_hook_ref) = client_hook {
+        let hook: Arc<ClientToolHook> = client_hook_ref.clone();
+        tool_registry.set_permission_hook(hook);
+    }
+    if client_hook.is_none() {
+        if let Some(ref test_hook_ref) = interrupt_hook {
+            let hook: Arc<TestInterruptHook> = test_hook_ref.clone();
+            tool_registry.set_permission_hook(hook);
+        }
     }
 
     let mut runtime_builder = AgentRuntimeBuilder::new()
@@ -1667,6 +1710,14 @@ pub(super) async fn agui_run(
             }),
         )
     })?;
+
+    // Route the permission hook into the runtime's TurnContext: client
+    // tools must be denied at dispatch so they surface as interrupts.
+    if let Some(ref hook) = client_hook {
+        runtime.set_permission_hook(hook.clone());
+    } else if let Some(ref hook) = interrupt_hook {
+        runtime.set_permission_hook(hook.clone());
+    }
 
     // Wire per-turn workspace checkpoints. The AG-UI thread is the
     // natural session boundary, so we use a sanitised version of the
@@ -1734,11 +1785,37 @@ pub(super) async fn agui_run(
     let drv_thread = thread_id.clone();
     let drv_run = run_id.clone();
     let drv_interrupt_hook = interrupt_hook.clone();
+    let drv_client_hook = client_hook.clone();
+    let drv_client_tools = agui_tools.clone();
     let drv_workspace = state.config.workspace.clone();
 
     let driver_handle = tokio::spawn(async move {
-        // Scan transcript after run for test interrupt markers.
-        let was_interrupted = drv_interrupt_hook
+        let outcome = runtime.run(&goal).await;
+
+        // Locate the interrupted tool call after the run:
+        // - test hook: transcript contains the fixed deny marker
+        // - client tools: transcript contains CLIENT_TOOL_DENY_PREFIX
+        // Both markers land in the Tool-role message that the registry
+        // writes for a denied call, and carry the real tool_call_id.
+        let find_denied_tool_call =
+            |transcript: &[crate::message::Message], marker: &str| {
+                transcript
+                    .iter()
+                    .rev()
+                    .find(|msg| {
+                        msg.role == crate::message::Role::Tool
+                            && msg.content.contains(marker)
+                    })
+                    .and_then(|msg| msg.tool_call_id.clone())
+            };
+
+        let client_denied: Option<(String, String)> = drv_client_hook
+            .as_ref()
+            .and_then(|h| {
+                let guard = h.denied.lock().unwrap_or_else(|e| e.into_inner());
+                guard.clone()
+            });
+        let test_was_interrupted = drv_interrupt_hook
             .as_ref()
             .and_then(|hook| {
                 hook.interrupted_tool_name
@@ -1747,8 +1824,6 @@ pub(super) async fn agui_run(
                     .clone()
             })
             .is_some();
-
-        let outcome = runtime.run(&goal).await;
         // Replace the sink so the converter task's recv() sees a closed
         // channel and exits cleanly.
         runtime.set_event_sink(Arc::new(NullSink));
@@ -1767,9 +1842,40 @@ pub(super) async fn agui_run(
             Err(_) => record_run_failed(&metrics),
         }
 
-        // If the test interrupt hook was triggered, find the denied tool
-        // call in the transcript to extract the tool_call_id.
-        let interrupt_details: Option<(String, String)> = if was_interrupted {
+        // Persist the transcript so a later `resume` (client-tool result
+        // round-trip) can load and seed it. Format: one Message JSON per
+        // line — the resume loader reads the same shape.
+        if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
+            let _ = std::fs::create_dir_all(&session_dir);
+            let mut lines = String::new();
+            for m in runtime.transcript() {
+                if let Ok(v) = serde_json::to_string(m) {
+                    lines.push_str(&v);
+                    lines.push('\n');
+                }
+            }
+            let path = session_dir.join("transcript.jsonl");
+            if let Err(e) = std::fs::write(&path, lines) {
+                tracing::warn!("agui: transcript persist failed: {e}");
+            }
+        }
+
+        // Interrupt details for whichever mechanism fired. `parameters`
+        // carries the client tool's input schema so the frontend knows how
+        // to execute it; `args` echoes the model's arguments.
+        let interrupt_details: Option<AguiInterruptDetail> = if let Some((name, args)) =
+            client_denied
+        {
+            let transcript = runtime.transcript();
+            find_denied_tool_call(&transcript, CLIENT_TOOL_DENY_PREFIX).map(|tc_id| {
+                let parameters = drv_client_tools
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.parameters.clone())
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                AguiInterruptDetail::Client { tool_call_id: tc_id, tool_name: name, parameters, args: serde_json::Value::String(args) }
+            })
+        } else if test_was_interrupted {
             let transcript = runtime.transcript();
             let denied_tool_name = drv_interrupt_hook.as_ref().and_then(|h| {
                 h.interrupted_tool_name
@@ -1777,18 +1883,12 @@ pub(super) async fn agui_run(
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
             });
-            transcript
-                .iter()
-                .rev()
-                .find(|msg| {
-                    msg.role == crate::message::Role::Tool
-                        && msg.content.contains("test interrupt trigger")
-                })
-                .and_then(|msg| {
-                    msg.tool_call_id
-                        .clone()
-                        .map(|tc_id| (tc_id, denied_tool_name.unwrap_or_else(|| "unknown".into())))
-                })
+            find_denied_tool_call(&transcript, "test interrupt trigger").map(|tc_id| {
+                AguiInterruptDetail::Test {
+                    tool_call_id: tc_id,
+                    tool_name: denied_tool_name.unwrap_or_else(|| "unknown".into()),
+                }
+            })
         } else {
             None
         };
@@ -1809,17 +1909,38 @@ pub(super) async fn agui_run(
             }));
         }
 
-        // Emit RunFinished — with Interrupt outcome if a test trigger fired.
-        if let Some((tc_id, tc_name)) = interrupt_details {
+        // Emit RunFinished — with Interrupt outcome if a test trigger or a
+        // client-tool call fired.
+        if let Some(detail) = interrupt_details {
+            let (tc_id, _tc_name, response_schema, metadata, message) = match detail {
+                AguiInterruptDetail::Test { tool_call_id, tool_name } => (
+                    tool_call_id,
+                    tool_name.clone(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { "approved": { "type": "boolean" } }
+                    }),
+                    serde_json::json!({ "testTrigger": true, "toolName": tool_name }),
+                    format!("Test interrupt: tool '{tool_name}' needs user input to proceed"),
+                ),
+                AguiInterruptDetail::Client { tool_call_id, tool_name, parameters, args } => (
+                    tool_call_id,
+                    tool_name.clone(),
+                    parameters,
+                    serde_json::json!({ "frontendTool": true, "toolName": tool_name, "args": args }),
+                    format!("Frontend tool '{tool_name}' needs client execution to proceed"),
+                ),
+            };
+            let tool_call_id = tc_id.clone();
+            let interrupt_message = message.clone();
+
             // Build the interrupt and persist it.
             let interrupt_id = uuid::Uuid::new_v4().to_string();
             let open_interrupt = OpenInterrupt {
                 interrupt_id: interrupt_id.clone(),
-                tool_call_id: tc_id.clone(),
+                tool_call_id: tool_call_id.clone(),
                 reason: "tool_call".into(),
-                message: Some(format!(
-                    "Test interrupt: tool '{tc_name}' needs user input to proceed"
-                )),
+                message: Some(interrupt_message.clone()),
                 created_at: crate::session::chrono_lite_now(),
             };
 
@@ -1855,21 +1976,11 @@ pub(super) async fn agui_run(
                     interrupts: vec![ag::Interrupt {
                         id: interrupt_id,
                         reason: "tool_call".into(),
-                        message: Some(format!(
-                            "Test interrupt: tool '{tc_name}' needs user input to proceed"
-                        )),
-                        tool_call_id: Some(tc_id),
-                        response_schema: Some(serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "approved": {"type": "boolean"}
-                            }
-                        })),
+                        message: Some(interrupt_message),
+                        tool_call_id: Some(tool_call_id),
+                        response_schema: Some(response_schema),
                         expires_at: None,
-                        metadata: Some(serde_json::json!({
-                            "testTrigger": true,
-                            "toolName": tc_name,
-                        })),
+                        metadata: Some(metadata),
                     }],
                 }),
                 result: None,
@@ -1961,6 +2072,13 @@ fn agui_session_dir(workspace: &std::path::Path, thread_id: &str) -> Option<std:
         .map(|d| d.join(format!("agui-{session_id}")))
 }
 
+/// Which interrupt mechanism fired during an AG-UI run.
+#[derive(Debug, Clone)]
+enum AguiInterruptDetail {
+    Test { tool_call_id: String, tool_name: String },
+    Client { tool_call_id: String, tool_name: String, parameters: serde_json::Value, args: serde_json::Value },
+}
+
 /// One open interrupt persisted in the session metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OpenInterrupt {
@@ -2009,6 +2127,71 @@ struct TestInterruptHook {
     interrupted_tool_name: std::sync::Mutex<Option<String>>,
     /// Set to the arguments of the first tool that was denied.
     interrupted_arguments: std::sync::Mutex<Option<serde_json::Value>>,
+}
+
+// ── AG-UI client tools bridge ────────────────────────────────────────
+// `RunAgentInput.tools` are frontend-owned functions (CopilotKit
+// useCopilotAction etc.). We register server-side stubs so the model can
+// call them, and a permission hook that denies the call before dispatch —
+// the deny produces an interrupt whose payload is the tool result the
+// frontend sends back via `input.resume` (docs/copilot-agent-plan.md M2-1).
+
+pub(crate) const CLIENT_TOOL_DENY_PREFIX: &str = "[frontend tool]";
+
+struct ClientToolStub {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for ClientToolStub {
+    fn spec(&self) -> crate::llm::chat::ToolSpec {
+        crate::llm::chat::ToolSpec {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            parameters: self.parameters.clone(),
+        }
+    }
+    async fn execute(&self, _arguments: serde_json::Value) -> crate::error::Result<String> {
+        // Defensive fallback: ClientToolHook denies client tools before
+        // dispatch, so execute() should never run.
+        Ok(format!(
+            "{} {} not executed server-side",
+            CLIENT_TOOL_DENY_PREFIX, self.name
+        ))
+    }
+}
+
+struct ClientToolHook {
+    names: std::collections::HashSet<String>,
+    /// First denied call: (tool_name, args_json). The tool_call_id is not
+    /// known at check() time; the driver locates it by scanning the
+    /// transcript for the deny-reason marker.
+    denied: std::sync::Mutex<Option<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::PermissionHook for ClientToolHook {
+    async fn check(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> crate::agent::PermissionDecision {
+        if !self.names.contains(name) {
+            return crate::agent::PermissionDecision::Allow;
+        }
+        {
+            let mut slot = self.denied.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some((name.to_string(), args.to_string()));
+            }
+        }
+        crate::agent::PermissionDecision::Deny(format!(
+            "{} {} awaiting client execution",
+            CLIENT_TOOL_DENY_PREFIX, name
+        ))
+    }
 }
 
 #[async_trait::async_trait]

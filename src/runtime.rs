@@ -133,6 +133,10 @@ pub struct AgentRuntime {
     transcript: Arc<Vec<Message>>,
     /// Event sink for streaming events (Arc for sharing with forwarder task).
     event_sink: Arc<dyn EventSink>,
+    /// Goal M2-1: permission hook that flows into TurnContext so client
+    /// tools (AG-UI bridge) get denied before dispatch and surface as
+    /// interrupts to the frontend.
+    permission_hook: Option<Arc<dyn crate::tools::PermissionHook>>,
     /// Whether to request streaming responses from the LLM.
     streaming: bool,
     /// Optional compactor for cross-turn transcript summarization.
@@ -652,7 +656,7 @@ impl AgentRuntime {
             tool_specs: self.kernel.tools().specs(),
             step_events_tx: Some(event_tx.clone()),
             streaming: self.streaming,
-            permission_hook: None,
+            permission_hook: self.permission_hook.clone(),
             exploring_plan_mode: self.plan_approval_gate.exploring_plan_mode.clone(),
             permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
@@ -926,6 +930,7 @@ impl AgentRuntime {
     /// underlying tool registry so every tool invocation passes through
     /// the async permission gate before execution.
     pub fn set_permission_hook(&mut self, hook: Arc<dyn crate::tools::PermissionHook>) {
+        self.permission_hook = Some(hook.clone());
         self.kernel.tools_mut().set_permission_hook(hook);
     }
 
