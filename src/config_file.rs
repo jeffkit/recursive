@@ -413,13 +413,14 @@ fn smart_value(s: &str) -> toml::Value {
 pub fn load_layered_permissions(workspace: &Path) -> LayeredPermissionsConfig {
     let mut config = LayeredPermissionsConfig::default();
 
-    // User layer (lowest priority)
-    if let Some(home) = std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-    {
-        let path = home.join(".recursive").join("config.toml");
+    // User layer (lowest priority). Resolve the home dir via the same
+    // RECURSIVE_HOME-aware helper used elsewhere in this module, so the path
+    // is consistent with `config_file_path()` and correct on Windows (where
+    // HOME is rarely set; dirs::home_dir reads USERPROFILE).
+    let user_config = std::env::var_os("RECURSIVE_HOME")
+        .map(|custom| PathBuf::from(custom).join(".recursive").join("config.toml"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".recursive").join("config.toml")));
+    if let Some(path) = user_config {
         if let Some(layer) = load_permission_layer(&path, RuleSource::User) {
             config.layers.push(layer);
         }
@@ -720,18 +721,14 @@ interactive = ["delete_file"]
         )
         .unwrap();
 
-        // Override home dir for the test
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        // Override home dir for the test. RECURSIVE_HOME is the cross-platform
+        // override honoured by load_layered_permissions; setting HOME directly
+        // does not work on Windows (dirs::home_dir reads USERPROFILE, not HOME).
+        // PinnedRecursiveHome holds the env lock so parallel tests are not
+        // polluted while the pin is in effect.
+        let _pin = crate::test_util::PinnedRecursiveHome::new(&home);
 
         let config = load_layered_permissions(&project);
-
-        // Restore home
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
 
         // Should have 3 layers: User, Project, Session
         assert_eq!(config.layers.len(), 3);
