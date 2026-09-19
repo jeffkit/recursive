@@ -55,7 +55,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -3664,7 +3663,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
- "futures-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -3686,17 +3684,14 @@ dependencies = [
 name = "recursive-tui"
 version = "0.8.1"
 dependencies = [
- "anyhow",
  "arboard",
  "async-trait",
  "crossterm",
  "dirs",
- "futures-util",
  "mutants",
  "pulldown-cmark",
  "ratatui",
  "recursive-agent",
- "serde",
  "serde_json",
  "syntect",
  "tempfile",

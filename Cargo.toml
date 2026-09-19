@@ -137,6 +137,13 @@ mockito = "1.7.2"
 # don't count them as missed. Zero production-binary impact.
 mutants = "0.0.3"
 
+# cargo-machete allowlist: these are feature-gated optional dependencies
+# (cli/http features) consumed via `dep:` references in the [features] table
+# and by downstream workspace crates. cargo-machete's text scan can't see
+# feature-gated usage, so it false-positives them as unused.
+[package.metadata.cargo-machete]
+ignored = ["anyhow", "clap", "tower-http"]
+
 [profile.dev]
 opt-level = 0
 debug = 1
