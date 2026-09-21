@@ -1872,6 +1872,12 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(target_os = "windows", ignore)]
     async fn interrupt_cancels_running_turn_and_emits_interrupted() {
+        // The backend's turns create a real SessionWriter for the cwd
+        // workspace; pin RECURSIVE_HOME (holds env_lock) so those land in a
+        // private root instead of the user's real sessions dir, serialised
+        // against other env-mutating tests.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         let notify = Arc::new(tokio::sync::Notify::new());
         let llm = Arc::new(
             MockProvider::new(vec![

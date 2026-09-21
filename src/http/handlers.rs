@@ -1520,20 +1520,21 @@ pub(super) async fn agui_run(
         // Load the transcript from the session. The AG-UI run persists one
         // `Message` JSON per line (see the write side in the driver task).
         let transcript_path = session_dir.join("transcript.jsonl");
-        let loaded_messages: Vec<crate::message::Message> = std::fs::read_to_string(&transcript_path)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        status: "error".into(),
-                        error: format!("failed to load session transcript: {e}"),
-                    }),
-                )
-            })?
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+        let loaded_messages: Vec<crate::message::Message> =
+            std::fs::read_to_string(&transcript_path)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            status: "error".into(),
+                            error: format!("failed to load session transcript: {e}"),
+                        }),
+                    )
+                })?
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
 
         // Build an index of resume items by interrupt_id.
         let resume_by_id: std::collections::HashMap<&str, &ag::Resume> = resume_items
@@ -1797,24 +1798,18 @@ pub(super) async fn agui_run(
         // - client tools: transcript contains CLIENT_TOOL_DENY_PREFIX
         // Both markers land in the Tool-role message that the registry
         // writes for a denied call, and carry the real tool_call_id.
-        let find_denied_tool_call =
-            |transcript: &[crate::message::Message], marker: &str| {
-                transcript
-                    .iter()
-                    .rev()
-                    .find(|msg| {
-                        msg.role == crate::message::Role::Tool
-                            && msg.content.contains(marker)
-                    })
-                    .and_then(|msg| msg.tool_call_id.clone())
-            };
+        let find_denied_tool_call = |transcript: &[crate::message::Message], marker: &str| {
+            transcript
+                .iter()
+                .rev()
+                .find(|msg| msg.role == crate::message::Role::Tool && msg.content.contains(marker))
+                .and_then(|msg| msg.tool_call_id.clone())
+        };
 
-        let client_denied: Option<(String, String)> = drv_client_hook
-            .as_ref()
-            .and_then(|h| {
-                let guard = h.denied.lock().unwrap_or_else(|e| e.into_inner());
-                guard.clone()
-            });
+        let client_denied: Option<(String, String)> = drv_client_hook.as_ref().and_then(|h| {
+            let guard = h.denied.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        });
         let test_was_interrupted = drv_interrupt_hook
             .as_ref()
             .and_then(|hook| {
@@ -1863,35 +1858,39 @@ pub(super) async fn agui_run(
         // Interrupt details for whichever mechanism fired. `parameters`
         // carries the client tool's input schema so the frontend knows how
         // to execute it; `args` echoes the model's arguments.
-        let interrupt_details: Option<AguiInterruptDetail> = if let Some((name, args)) =
-            client_denied
-        {
-            let transcript = runtime.transcript();
-            find_denied_tool_call(&transcript, CLIENT_TOOL_DENY_PREFIX).map(|tc_id| {
-                let parameters = drv_client_tools
-                    .iter()
-                    .find(|t| t.name == name)
-                    .map(|t| t.parameters.clone())
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                AguiInterruptDetail::Client { tool_call_id: tc_id, tool_name: name, parameters, args: serde_json::Value::String(args) }
-            })
-        } else if test_was_interrupted {
-            let transcript = runtime.transcript();
-            let denied_tool_name = drv_interrupt_hook.as_ref().and_then(|h| {
-                h.interrupted_tool_name
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-            });
-            find_denied_tool_call(&transcript, "test interrupt trigger").map(|tc_id| {
-                AguiInterruptDetail::Test {
-                    tool_call_id: tc_id,
-                    tool_name: denied_tool_name.unwrap_or_else(|| "unknown".into()),
-                }
-            })
-        } else {
-            None
-        };
+        let interrupt_details: Option<AguiInterruptDetail> =
+            if let Some((name, args)) = client_denied {
+                let transcript = runtime.transcript();
+                find_denied_tool_call(transcript, CLIENT_TOOL_DENY_PREFIX).map(|tc_id| {
+                    let parameters = drv_client_tools
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.parameters.clone())
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                    AguiInterruptDetail::Client {
+                        tool_call_id: tc_id,
+                        tool_name: name,
+                        parameters,
+                        args: serde_json::Value::String(args),
+                    }
+                })
+            } else if test_was_interrupted {
+                let transcript = runtime.transcript();
+                let denied_tool_name = drv_interrupt_hook.as_ref().and_then(|h| {
+                    h.interrupted_tool_name
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                });
+                find_denied_tool_call(transcript, "test interrupt trigger").map(|tc_id| {
+                    AguiInterruptDetail::Test {
+                        tool_call_id: tc_id,
+                        tool_name: denied_tool_name.unwrap_or_else(|| "unknown".into()),
+                    }
+                })
+            } else {
+                None
+            };
 
         // Wait for the converter task to translate the last AgentEvent
         // before we emit anything else, so checkpoint_post and
@@ -1913,7 +1912,10 @@ pub(super) async fn agui_run(
         // client-tool call fired.
         if let Some(detail) = interrupt_details {
             let (tc_id, _tc_name, response_schema, metadata, message) = match detail {
-                AguiInterruptDetail::Test { tool_call_id, tool_name } => (
+                AguiInterruptDetail::Test {
+                    tool_call_id,
+                    tool_name,
+                } => (
                     tool_call_id,
                     tool_name.clone(),
                     serde_json::json!({
@@ -1923,7 +1925,12 @@ pub(super) async fn agui_run(
                     serde_json::json!({ "testTrigger": true, "toolName": tool_name }),
                     format!("Test interrupt: tool '{tool_name}' needs user input to proceed"),
                 ),
-                AguiInterruptDetail::Client { tool_call_id, tool_name, parameters, args } => (
+                AguiInterruptDetail::Client {
+                    tool_call_id,
+                    tool_name,
+                    parameters,
+                    args,
+                } => (
                     tool_call_id,
                     tool_name.clone(),
                     parameters,
@@ -2075,8 +2082,16 @@ fn agui_session_dir(workspace: &std::path::Path, thread_id: &str) -> Option<std:
 /// Which interrupt mechanism fired during an AG-UI run.
 #[derive(Debug, Clone)]
 enum AguiInterruptDetail {
-    Test { tool_call_id: String, tool_name: String },
-    Client { tool_call_id: String, tool_name: String, parameters: serde_json::Value, args: serde_json::Value },
+    Test {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    Client {
+        tool_call_id: String,
+        tool_name: String,
+        parameters: serde_json::Value,
+        args: serde_json::Value,
+    },
 }
 
 /// One open interrupt persisted in the session metadata.

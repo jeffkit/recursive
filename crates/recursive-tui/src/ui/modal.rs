@@ -1829,6 +1829,12 @@ mod tests {
         let ws_a = tempfile::tempdir().expect("tempdir a");
         let ws_b = tempfile::tempdir().expect("tempdir b");
         let sessions = tempfile::tempdir().expect("sessions tempdir");
+        // The listing shares one flat root, so hold env_lock across the whole
+        // override + write + read span (repo-wide env-mutation policy) and
+        // filter out any stray session a non-lock-holding test still manages
+        // to write in the same window (observed: the backend interrupt test's
+        // cwd session) — otherwise the count assert below sees 3 entries.
+        let _guard = recursive::test_util::env_lock();
         let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
         std::env::set_var("RECURSIVE_SESSIONS_DIR", sessions.path());
         // Two distinct workspaces => distinct session ids even within the
@@ -1842,6 +1848,25 @@ mod tests {
             Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
             None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
         }
+        let ws_a_name = ws_a
+            .path()
+            .file_name()
+            .expect("tempdir has file name")
+            .to_string_lossy()
+            .into_owned();
+        let ws_b_name = ws_b
+            .path()
+            .file_name()
+            .expect("tempdir has file name")
+            .to_string_lossy()
+            .into_owned();
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|e| {
+                let dir = e.session_dir.to_string_lossy();
+                dir.contains(&ws_a_name) || dir.contains(&ws_b_name)
+            })
+            .collect();
         assert_eq!(entries.len(), 2, "should find both sessions: {:?}", entries);
         let long = entries
             .iter()
