@@ -3693,7 +3693,6 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "recursive-agent",
- "serde",
  "serde_json",
  "syntect",
  "tempfile",
