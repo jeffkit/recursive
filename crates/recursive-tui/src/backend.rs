@@ -1727,6 +1727,10 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(target_os = "windows", ignore)]
     async fn interrupt_action_cancels_turn_token() {
+        // The turn writes a real SessionWriter for the cwd workspace; pin it
+        // to a private home (also holds env_lock) instead of the user's data.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         // Goal-383 wiring test (replaces the old flag-only test): a fresh
         // CancellationToken is installed before a turn starts (asserted via
         // `current_interrupt_token`), and `UserAction::Interrupt` cancels it
@@ -2033,6 +2037,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_loop_emits_loop_started_and_runs_turn() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         let llm = Arc::new(MockProvider::new(vec![Completion {
             content: "working".into(),
             tool_calls: vec![],
@@ -2079,6 +2085,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_loop_emits_loop_stopped() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         let llm = Arc::new(MockProvider::new(vec![Completion {
             content: "ok".into(),
             tool_calls: vec![],
@@ -2143,6 +2151,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_goal_rejected_during_loop() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         let llm = Arc::new(MockProvider::new(vec![Completion {
             content: "ok".into(),
             tool_calls: vec![],
@@ -2213,6 +2223,8 @@ mod tests {
 
     #[tokio::test]
     async fn loop_trigger_runs_turn() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         let llm = Arc::new(MockProvider::new(vec![
             Completion {
                 content: "first".into(),
@@ -2731,6 +2743,8 @@ mod tests {
 
     #[tokio::test]
     async fn loop_arbiter_user_message_preempts_pending_wakeup() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
         // Regression: when a wakeup is scheduled with a long delay, a user
         // message arriving during that delay must be serviced immediately
         // (queued for the next turn) — not blocked behind the wakeup timer.

@@ -53,8 +53,6 @@
 - Flowcast 0.6 executor migration; fail-fast quality-gate preflight;
   `/loop` supervise shipped as a loadable skill with agent-controlled stop.
 
-Note: the `v0.8.1` git tag is pending — this section only prepares main.
-
 ## 0.8.0
 
 192 commits since 0.7.0. Highlights:
