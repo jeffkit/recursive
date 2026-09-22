@@ -1,6 +1,6 @@
 [package]
 name = "agui-tui"
-version = "0.1.0"
+version = "0.8.1"
 edition = "2021"
 description = "Generic terminal UI for any AG-UI–compatible agent."
 license = "MIT"
@@ -15,8 +15,8 @@ name = "agui-tui"
 path = "src/main.rs"
 
 [dependencies]
-agui-protocol = { path = "../agui-protocol" }
-agui-client = { path = "../agui-client" }
+agui-protocol = { version = "0.8.1", path = "../agui-protocol" }
+agui-client = { version = "0.8.1", path = "../agui-client" }
 ratatui = "0.29"
 crossterm = "0.28"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

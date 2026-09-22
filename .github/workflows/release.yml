@@ -205,16 +205,18 @@ jobs:
             --draft=false
 
   # ── 4. Publish to crates.io ────────────────────────────────────────────────
+  # Whole publishable workspace in dependency order (agui-* → recursive-agent
+  # → tui/cli): `cargo publish` verifies each crate against REGISTRY versions
+  # of its internal deps, so dependencies must land first and the index needs
+  # a moment to propagate before dependents resolve them (hence the retry).
+  # Failures are loud: a red crates.io job must not be silently swallowed —
+  # it sat broken from 0.7.0 through 0.8.1 under continue-on-error while the
+  # channel stalled at 0.6.0. "already exists" stays benign for re-tagged
+  # reruns.
   publish-crate:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
-    # Best-effort: a re-tagged release (e.g. fixing a broken build step
-    # after the first attempt) would re-run this job and hit "already
-    # exists" on crates.io, which is benign — the GitHub Release and
-    # binaries are the canonical distribution. Don't fail the whole
-    # release run over an already-published crate.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -230,41 +232,72 @@ jobs:
             target
           key: ubuntu-latest-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Publish
+      - name: Publish workspace crates (dependency order)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p recursive-agent
+        run: |
+          set -uo pipefail
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::Secret CRATES_IO_TOKEN is not set — crates.io publish skipped."
+            exit 0
+          fi
+          for pkg in agui-protocol agui-client agui-tui recursive-agent recursive-tui recursive-cli; do
+            echo "==> Publishing $pkg"
+            ok=""
+            for attempt in 1 2 3 4 5 6 7 8; do
+              out=$(cargo publish -p "$pkg" 2>&1) && { ok=yes; break; }
+              if echo "$out" | grep -q "already exists"; then
+                echo "$pkg already published — skipping."
+                ok=yes; break
+              fi
+              # The freshly published dependency may not be visible in the
+              # sparse index yet; wait and retry that specific case.
+              if echo "$out" | grep -qE "no matching version|failed to select a version"; then
+                echo "attempt $attempt: index has not caught up yet; retrying in 20s"
+                echo "$out" | tail -3
+                sleep 20
+                continue
+              fi
+              break
+            done
+            if [ -z "$ok" ]; then
+              echo "$out"
+              echo "::error::cargo publish failed for $pkg"
+              exit 1
+            fi
+          done
+          echo "All workspace crates published."
 
   # ── 5. Bump the Homebrew tap ────────────────────────────────────────────────
   # Pushes a "recursive: bump to X.Y.Z" commit to jeffkit/homebrew-tap so the
   # brew channel ships with the release instead of silently lagging behind
-  # (0.8.0 and 0.8.1 both had to be bumped by hand). Needs a fine-grained PAT
-  # with Contents:read/write on jeffkit/homebrew-tap stored as the
-  # HOMEBREW_TAP_TOKEN secret — without it the job warns and skips, so the
-  # release itself never goes red.
+  # (0.8.0 and 0.8.1 both had to be bumped by hand). Auth is a write deploy
+  # key on jeffkit/homebrew-tap stored as the HOMEBREW_TAP_DEPLOY_KEY secret
+  # (repo-scoped, revocable from the tap's Settings → Deploy keys) — without
+  # it the job warns and skips, so the release itself never goes red.
   bump-homebrew:
     name: Bump homebrew tap
     needs: release
     runs-on: ubuntu-latest
     env:
-      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAP_KEY_SET: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
     steps:
-      - name: Skip (HOMEBREW_TAP_TOKEN not configured)
-        if: env.TAP_TOKEN == ''
+      - name: Skip (HOMEBREW_TAP_DEPLOY_KEY not configured)
+        if: env.TAP_KEY_SET == 'false'
         run: |
-          echo "::warning::Secret HOMEBREW_TAP_TOKEN is not set — jeffkit/homebrew-tap was NOT bumped."
-          echo "::warning::Create a fine-grained PAT with Contents read/write on jeffkit/homebrew-tap, add it as the HOMEBREW_TAP_TOKEN secret of this repo, then re-run this job."
+          echo "::warning::Secret HOMEBREW_TAP_DEPLOY_KEY is not set — jeffkit/homebrew-tap was NOT bumped."
+          echo "::warning::Add a write deploy key of jeffkit/homebrew-tap as this repo's HOMEBREW_TAP_DEPLOY_KEY secret, then re-run this job."
 
       - name: Checkout tap
-        if: env.TAP_TOKEN != ''
+        if: env.TAP_KEY_SET == 'true'
         uses: actions/checkout@v4
         with:
           repository: jeffkit/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
 
       - name: Bump Formula/recursive.rb to ${{ github.ref_name }}
-        if: env.TAP_TOKEN != ''
+        if: env.TAP_KEY_SET == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

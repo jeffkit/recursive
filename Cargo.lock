@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "agui-client"
-version = "0.1.0"
+version = "0.8.1"
 dependencies = [
  "agui-protocol",
  "futures-util",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "agui-protocol"
-version = "0.1.0"
+version = "0.8.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agui-tui"
-version = "0.1.0"
+version = "0.8.1"
 dependencies = [
  "agui-client",
  "agui-protocol",
