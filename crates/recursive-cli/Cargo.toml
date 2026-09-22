@@ -1,6 +1,6 @@
 [package]
 name = "recursive-cli"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 rust-version = "1.75"
 description = "Command-line interface for the Recursive agent"
@@ -11,7 +11,7 @@ name = "recursive"
 path = "src/main.rs"
 
 [dependencies]
-recursive = { package = "recursive-agent", version = "0.8.1", path = "../..", default-features = false, features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
+recursive = { package = "recursive-agent", version = "0.8.2", path = "../..", default-features = false, features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 anyhow = "1"

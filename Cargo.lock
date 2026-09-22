@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "agui-client"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "agui-protocol",
  "futures-util",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "agui-protocol"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agui-tui"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "agui-client",
  "agui-protocol",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-agent"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "agent-client-protocol-schema",
  "agui-client",
@@ -3659,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-cli"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3683,7 +3683,7 @@ dependencies = [
 
 [[package]]
 name = "recursive-tui"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "arboard",
  "async-trait",

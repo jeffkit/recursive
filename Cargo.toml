@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "recursive-agent"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 authors = ["Jeff Kit"]
 description = "A Rust coding-agent platform: kernel, tools, multi-agent orchestration, HTTP API, MCP, and TUI"
@@ -99,7 +99,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 jsonwebtoken = { version = "9", optional = true }
 tempfile = { version = "3", optional = true }
 agent-client-protocol-schema = "1.4"
-agui-protocol = { version = "0.8.1", path = "crates/agui-protocol", optional = true }
+agui-protocol = { version = "0.8.2", path = "crates/agui-protocol", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 deadpool-redis = { version = "0.18", optional = true }
 uuid = { version = "1", features = ["v4", "v7"] }
@@ -129,7 +129,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 jsonwebtoken = "9"
 agui-client = { path = "crates/agui-client" }
-agui-protocol = { version = "0.8.1", path = "crates/agui-protocol" }
+agui-protocol = { version = "0.8.2", path = "crates/agui-protocol" }
 url = "2"
 mockito = "1.7.2"
 # Inert attribute crate recognized by cargo-mutants. Used to tag

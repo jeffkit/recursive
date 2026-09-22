@@ -1,6 +1,6 @@
 [package]
 name = "recursive-tui"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 rust-version = "1.75"
 description = "Interactive terminal UI for the Recursive agent"
@@ -11,7 +11,7 @@ name = "recursive-tui"
 path = "src/main.rs"
 
 [dependencies]
-recursive = { package = "recursive-agent", version = "0.8.1", path = "../..", default-features = false, features = ["mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
+recursive = { package = "recursive-agent", version = "0.8.2", path = "../..", default-features = false, features = ["mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
@@ -46,7 +46,7 @@ mutants = "0.0.3"
 # test suite so `cargo test -p recursive-tui` is self-contained — no
 # `--features recursive/test-utils` CLI flag needed. Required by the
 # in-process harness workflow (see src/harness.rs).
-recursive = { package = "recursive-agent", version = "0.8.1", path = "../..", features = ["test-utils"] }
+recursive = { package = "recursive-agent", version = "0.8.2", path = "../..", features = ["test-utils"] }
 # PTY integration-layer harness. Used by tests/pty_regression.rs to run the
 # real `recursive-tui` binary under a PTY and assert on the rendered screen —
 # the layer the in-process harness can't reach (raw mode, alternate screen,

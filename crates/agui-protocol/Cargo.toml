@@ -1,6 +1,6 @@
 [package]
 name = "agui-protocol"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 description = "AG-UI protocol types, serde definitions, and SSE parser. Transport-independent."
 license = "MIT"

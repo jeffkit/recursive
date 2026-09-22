@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.2
+
+Release-infra hardening release; no product code changes.
+
+### Release channels
+- **crates.io publish chain repaired**: the channel had silently stalled at
+  0.6.0 — `cargo publish -p recursive-agent` verified against stale registry
+  copies of its workspace siblings and the failure was swallowed by
+  `continue-on-error`. All publishable crates now version-lockstep (agui-*,
+  recursive-agent, recursive-tui, recursive-cli), internal deps carry version
+  reqs, and the release job publishes the whole workspace in dependency order
+  with index-propagation retries. Failures are loud now.
+- **Homebrew tap automated**: `release.yml` bumps `jeffkit/homebrew-tap`
+  after every release (deploy-key auth, idempotent). The tap had lagged at
+  0.7.0 through two releases.
+- Docker image build unchanged; GitHub Releases unchanged.
+
+### Maintenance (0.8.1 post-release fixes, shipped here)
+- Gate repairs: `cargo fmt` + 2 clippy `needless_borrow` in
+  `src/http/handlers.rs`; h2 0.4.14→0.4.19 (RUSTSEC-2026-0258) and
+  rustls 0.23.40→0.23.45 (RUSTSEC-2026-0285) upgraded; unused `serde`
+  dependency dropped from recursive-tui.
+- Test isolation: the TUI session-listing test holds `env_lock` and filters
+  foreign sessions; all six session-writing backend tests pin
+  `PinnedRecursiveHome` so test runs no longer write sessions into the real
+  user data dir.
+
 ## 0.8.1
 
 172 commits since 0.8.0. Highlights:
