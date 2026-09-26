@@ -657,6 +657,24 @@ impl AnthropicProvider {
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .map(|v| v as u32);
+                    // 官方 Anthropic 把输入侧 usage 全放在 `message_start`，
+                    // `message_delta.usage` 只有 `output_tokens`。但部分
+                    // Anthropic 兼容面（实测 GLM：message_start 报
+                    // input_tokens=0，真实输入在 message_delta）在 delta 帧
+                    // 补报输入侧数字——出现即覆盖 message_start 的初值；
+                    // 缺键时保持官方语义不变。
+                    if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+                        acc.input_tokens = Some(v as u32);
+                    }
+                    if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                        acc.cache_read = Some(v as u32);
+                    }
+                    if let Some(v) = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                    {
+                        acc.cache_creation = Some(v as u32);
+                    }
                 }
             }
             // `message_stop` and `ping` are no-op frames (end-of-stream marker
@@ -2498,5 +2516,77 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
         let line = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"initial thought"}}"#;
         provider.process_sse_line(line, &mut acc, &None).unwrap();
         assert_eq!(acc.reasoning_content, "initial thought");
+    }
+
+    #[test]
+    fn message_delta_usage_overrides_message_start_input() {
+        // Anthropic 兼容面实测（GLM）：message_start 报 input_tokens=0，真实
+        // 输入在 message_delta.usage 里。delta 帧出现输入侧键时必须覆盖
+        // message_start 的初值；官方 Anthropic 的 delta 帧无这些键，不受影响。
+        let provider = AnthropicProvider::new("http://localhost:0", "sk-noop", "m").unwrap();
+        let mut acc = SseAccum::default();
+        provider
+            .process_sse_line("event: message_start", &mut acc, &None)
+            .unwrap();
+        provider
+            .process_sse_line(
+                r#"data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"GLM-5.2","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+                &mut acc,
+                &None,
+            )
+            .unwrap();
+        provider
+            .process_sse_line("event: message_delta", &mut acc, &None)
+            .unwrap();
+        provider
+            .process_sse_line(
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":17,"output_tokens":3,"cache_read_input_tokens":7680,"cache_creation_input_tokens":36}}"#,
+                &mut acc,
+                &None,
+            )
+            .unwrap();
+        let completion =
+            AnthropicProvider::build_completion(acc, Some("end_turn".to_string()));
+        let usage = completion.usage.expect("delta 帧报了 usage，必须存在");
+        assert_eq!(usage.prompt_tokens, 17);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.cache_hit_tokens, 7680);
+        // miss = fresh input + cache creation（见 TokenUsage 归一化文档）
+        assert_eq!(usage.cache_miss_tokens, 17 + 36);
+        assert_eq!(usage.total_tokens, 20);
+    }
+
+    #[test]
+    fn message_delta_without_input_keys_keeps_official_semantics() {
+        // 官方 Anthropic：message_delta.usage 只有 output_tokens——message_start
+        // 的输入侧数字必须原样保留（回归守卫）。
+        let provider = AnthropicProvider::new("http://localhost:0", "sk-noop", "m").unwrap();
+        let mut acc = SseAccum::default();
+        provider
+            .process_sse_line("event: message_start", &mut acc, &None)
+            .unwrap();
+        provider
+            .process_sse_line(
+                r#"data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-3","usage":{"input_tokens":50,"output_tokens":0,"cache_read_input_tokens":100}}}"#,
+                &mut acc,
+                &None,
+            )
+            .unwrap();
+        provider
+            .process_sse_line("event: message_delta", &mut acc, &None)
+            .unwrap();
+        provider
+            .process_sse_line(
+                r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}"#,
+                &mut acc,
+                &None,
+            )
+            .unwrap();
+        let completion =
+            AnthropicProvider::build_completion(acc, Some("end_turn".to_string()));
+        let usage = completion.usage.expect("message_start 报了 usage");
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.cache_hit_tokens, 100);
     }
 }

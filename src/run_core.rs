@@ -413,7 +413,15 @@ impl<'a> RunCore<'a> {
         self.total_llm_latency_ms = self.total_llm_latency_ms.saturating_add(llm_ms);
         self.emit(AgentEvent::Latency { step, llm_ms });
 
-        if let Some(u) = completion.usage {
+        if let Some(mut u) = completion.usage {
+            // 兼容面缺陷兜底：部分 Anthropic 兼容 provider（实测 GLM 流式 +
+            // tools 请求）completion_tokens 有值但 input 侧全 0 且流里没有
+            // message_delta 帧可补——输入用量真拿不到时用字节数估算填充，
+            // 保证下游用量统计/成本核算的 input 侧不为 0。
+            if u.prompt_tokens == 0 && u.completion_tokens > 0 {
+                u.prompt_tokens = estimate_prompt_tokens(&self.messages);
+                u.total_tokens = u.total_tokens.max(u.prompt_tokens + u.completion_tokens);
+            }
             *total_usage = total_usage.accumulate(u);
             self.last_prompt_tokens = u.prompt_tokens;
             self.emit(AgentEvent::Usage {
