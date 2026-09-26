@@ -2545,8 +2545,7 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
                 &None,
             )
             .unwrap();
-        let completion =
-            AnthropicProvider::build_completion(acc, Some("end_turn".to_string()));
+        let completion = AnthropicProvider::build_completion(acc, Some("end_turn".to_string()));
         let usage = completion.usage.expect("delta 帧报了 usage，必须存在");
         assert_eq!(usage.prompt_tokens, 17);
         assert_eq!(usage.completion_tokens, 3);
@@ -2582,8 +2581,7 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
                 &None,
             )
             .unwrap();
-        let completion =
-            AnthropicProvider::build_completion(acc, Some("end_turn".to_string()));
+        let completion = AnthropicProvider::build_completion(acc, Some("end_turn".to_string()));
         let usage = completion.usage.expect("message_start 报了 usage");
         assert_eq!(usage.prompt_tokens, 50);
         assert_eq!(usage.completion_tokens, 7);
