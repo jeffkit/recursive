@@ -1043,7 +1043,17 @@ fn serialize_message(m: &Message) -> Value {
     };
     let mut obj = serde_json::Map::new();
     obj.insert("role".into(), Value::String(role.into()));
-    obj.insert("content".into(), Value::String(m.content.clone()));
+    // OpenAI declares `content` nullable when an assistant message carries
+    // `tool_calls`, and its own API tolerates `content: ""`. Strict
+    // translation layers do not: a gateway that forwards to the Anthropic
+    // Messages API (Bedrock-backed `claude-*` in particular) materialises the
+    // empty string as `{"type":"text","text":""}` and rejects the whole
+    // request with HTTP 400 "text content blocks must be non-empty" — which
+    // breaks every turn after the first tool call. Omit the key in that case
+    // (`null` also works; omission is what OpenAI's own spec documents).
+    if !m.content.is_empty() || m.tool_calls.is_empty() {
+        obj.insert("content".into(), Value::String(m.content.clone()));
+    }
     if let Some(id) = &m.tool_call_id {
         obj.insert("tool_call_id".into(), Value::String(id.clone()));
     }
@@ -2229,6 +2239,61 @@ data: [DONE]
     }
 
     // ── serialize_message targeted tests ──────────────────────────────────────
+
+    #[test]
+    fn serialize_message_assistant_with_tool_calls_omits_empty_content() {
+        // Regression for #16: `content: ""` next to `tool_calls` is rejected
+        // with HTTP 400 "text content blocks must be non-empty" by gateways
+        // that translate the OpenAI wire format into the Anthropic Messages
+        // API, which breaks every turn after the first tool call.
+        let msg = Message::assistant_with_tool_calls(
+            String::new(),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "Write".into(),
+                arguments: serde_json::json!({"path":"c.txt","contents":"hello"}),
+            }],
+        );
+        let v = serialize_message(&msg);
+        assert_eq!(v["role"].as_str(), Some("assistant"));
+        assert!(
+            v.get("content").is_none(),
+            "empty content must be omitted when tool_calls are present; got {v}"
+        );
+        assert_eq!(v["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn serialize_message_assistant_with_tool_calls_keeps_non_empty_content() {
+        // The omission above must be content-gated: an assistant message that
+        // both talks and calls a tool still ships its text.
+        let msg = Message::assistant_with_tool_calls(
+            "let me write that file".to_string(),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "Write".into(),
+                arguments: serde_json::json!({"path":"c.txt","contents":"hello"}),
+            }],
+        );
+        let v = serialize_message(&msg);
+        assert_eq!(v["content"].as_str(), Some("let me write that file"));
+    }
+
+    #[test]
+    fn serialize_message_keeps_empty_content_without_tool_calls() {
+        // Non-tool-call messages must keep the plain string shape — omitting
+        // `content` there would be a different (worse) wire change.
+        let msg = Message {
+            role: Role::User,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            reasoning_content: None,
+            is_compaction_summary: false,
+        };
+        let v = serialize_message(&msg);
+        assert_eq!(v["content"].as_str(), Some(""));
+    }
 
     #[test]
     fn serialize_message_system_role() {
