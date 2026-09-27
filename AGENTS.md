@@ -203,6 +203,16 @@ Hard-won rules:
   use `http://127.0.0.1:PORT` not `localhost` (Node 18 IPv6 issue).
 - **`recursive loop` produces no `transcript.jsonl`** — use `file:` assertions only.
 - **`argusAI save:` can't capture exec stdout** — pass state via temp files.
+- **`argus-run --filter` matches the suite `id` in e2e.yaml, not the file name**:
+  `08-http-api` → `SUITE_NOT_FOUND`; the ids are `http-api` / `goal-loop` /
+  `http-interrupt` (filter keys on `suiteId`). e2e-run.sh swallows the raw
+  error into `status=None totals={}` — reproduce by walking the mcp2cli
+  lifecycle by hand to see argus-run's raw JSON.
+- **buildkit metadata resolution vs DNS pollution**: if `docker build` dies on
+  `failed to resolve source metadata ... auth.docker.io/token i/o timeout`
+  while `docker pull` works, pull the base images (`rust:1.88-slim`,
+  `debian:bookworm-slim`, `docker/dockerfile:1.4`) into the local store first,
+  then build `recursive:e2e-wt-<HEAD>` directly.
 
 ## Skills available
 
