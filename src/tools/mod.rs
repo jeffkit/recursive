@@ -148,7 +148,10 @@ pub use team_create::TeamCreateTool;
 pub use team_delete::TeamDeleteTool;
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use tool_search::{DeferredCatalog, ToolSearchTool, TOOL_SEARCH_TOOL_NAME};
-pub use transport::{DirEntry, ExecResult, LocalTransport, ReadResult, ToolTransport};
+pub use transport::{
+    DirEntry, EnvironmentCapabilities, ExecResult, LocalTransport, ReadResult, ToolTransport,
+    TransportFailure,
+};
 #[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
 #[cfg(feature = "web_search")]

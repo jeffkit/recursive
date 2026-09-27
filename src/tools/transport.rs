@@ -11,6 +11,32 @@
 //! the installed OpenSSH client.
 //!
 //! Host format: `user@host` or `user@host:port`.
+//!
+//! # Semantic contract (Goal 400 — normative for Goals 401–404)
+//!
+//! Every `ToolTransport` implementation MUST honour the following contract.
+//! Tools may rely on it without knowing which tier (local / SSH / container /
+//! microVM) they are talking to.
+//!
+//! 1. **写后立即可读 / write-then-read**: after `write_file` returns `Ok`,
+//!    an immediately following `read_file` on the same path MUST observe the
+//!    new contents. Push/pull-style remote transports for which this does not
+//!    hold MUST say so in their `capabilities()` / docs, and the tool layer
+//!    must then insert an explicit barrier.
+//! 2. **路径语义 / path semantics**: the trait receives **environment-internal
+//!    absolute paths** — i.e. paths as the model sees them inside the
+//!    environment (`capabilities().path_root` is the prefix that maps them
+//!    back to whatever backing store the transport uses). For
+//!    [`LocalTransport`] `path_root` is the **empty path**, which means
+//!    "environment paths == host paths as resolved by the caller"
+//!    (`tools::resolve_within_any` output is passed through unchanged).
+//!    Sandbox containment is ALWAYS checked by the caller (invariant #3)
+//!    *before* a path reaches the transport; the transport never re-checks.
+//! 3. **`persistent: false` 的含义**: when `capabilities().persistent` is
+//!    `false`, each `exec_shell` may run in a fresh process/filesystem. Tools
+//!    must not rely on cross-call state (cwd, env vars, temp files); any
+//!    state that must survive between calls has to be re-established per
+//!    call.
 
 use async_trait::async_trait;
 use std::path::Path;
@@ -33,21 +59,100 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// How a transport-level failure should be classified (Goal 400).
+///
+/// This is the vocabulary callers use to decide between "retry / change
+/// strategy / report to the model". The agent must never see an
+/// infrastructure outage as a code bug to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    /// Transient fault: VM timeout, network hiccup, throttling. The caller
+    /// may retry; the agent should not change its code.
+    Retryable,
+    /// Environment problem: missing tool in the image, missing path,
+    /// insufficient permissions. The agent must change strategy or report
+    /// back to the user.
+    Environment,
+    /// The command itself failed (non-zero exit etc.). This is normal
+    /// feedback for the model.
+    Tool,
+}
+
+/// Capabilities of an execution environment, as reported by
+/// [`ToolTransport::capabilities`] (Goal 400).
+///
+/// Tools consult this instead of hard-coding assumptions about where I/O
+/// runs, so the same tool code works across local / SSH / container /
+/// microVM tiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentCapabilities {
+    /// Whether the sandbox has outbound network access.
+    pub network: bool,
+    /// Whether filesystem and processes persist across `exec_shell` calls.
+    pub persistent: bool,
+    /// The model-visible root of the environment (local = workspace,
+    /// container = `/workspace` etc.). An **empty** `PathBuf` means
+    /// "environment paths are the caller-resolved host paths" (local tier).
+    pub path_root: PathBuf,
+    /// The identity commands run as (`None` = unknown / not applicable).
+    pub user: Option<String>,
+    /// Tools detected inside the environment (`cargo` / `node` / `rg` /
+    /// `git` …). Empty = not probed.
+    pub toolchain: Vec<String>,
+    /// Whether the environment supports snapshot / clone (container / VM
+    /// tiers).
+    pub snapshot: bool,
+}
+
+impl EnvironmentCapabilities {
+    /// The semantics of [`LocalTransport`]: full network, persistent
+    /// filesystem, caller-resolved host paths (empty `path_root`), no
+    /// snapshot support, toolchain not probed.
+    pub fn local() -> Self {
+        Self {
+            network: true,
+            persistent: true,
+            path_root: PathBuf::new(),
+            user: None,
+            toolchain: Vec::new(),
+            snapshot: false,
+        }
+    }
+}
+
 /// Result of running a shell command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// Transport-level classification of the invocation, when the transport
+    /// itself failed (timeout, missing tool, …). `None` = the command ran
+    /// and produced `exit_code` (the normal case for [`LocalTransport`]).
+    /// Consumers (Goals 401–403) use this to annotate tool errors instead of
+    /// guessing from stderr text.
+    pub failure: Option<TransportFailure>,
 }
 
 /// Abstract transport for filesystem and shell operations.
 ///
-/// Tools that need I/O (`ReadFile`, `WriteFile`, `ListDir`, `RunShell`)
-/// call methods on this trait instead of using `tokio::fs` / `tokio::process`
-/// directly. This makes them testable without touching the real filesystem.
+/// Tools that need I/O (`ReadFile`, `WriteFile`, `ListDir`, `RunShell`,
+/// `Glob`, `Grep`, …) call methods on this trait instead of using
+/// `tokio::fs` / `tokio::process` directly. This makes them testable without
+/// touching the real filesystem and lets the same tool code run against a
+/// local workspace, an SSH host, or a container (Goals 400–403).
+///
+/// See the module-level **Semantic contract** section: it is normative for
+/// every implementation.
 #[async_trait]
 pub trait ToolTransport: Send + Sync + std::fmt::Debug {
+    /// Capabilities of this environment. The default returns the
+    /// [`LocalTransport`] semantics so existing implementations and test
+    /// doubles keep working until they opt in to a more precise answer.
+    fn capabilities(&self) -> EnvironmentCapabilities {
+        EnvironmentCapabilities::local()
+    }
+
     /// Read the full contents of a file at `path`.
     async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>>;
 
@@ -254,6 +359,7 @@ impl SshTransport {
             exit_code: code,
             stdout: out,
             stderr: err,
+            failure: None,
         })
     }
 
@@ -427,6 +533,7 @@ impl ToolTransport for SshTransport {
             exit_code: code,
             stdout: out,
             stderr: err,
+            failure: None,
         })
     }
 }
@@ -518,6 +625,7 @@ impl ToolTransport for LocalTransport {
             exit_code: code,
             stdout: out,
             stderr: err,
+            failure: None,
         })
     }
 }
@@ -715,6 +823,139 @@ mod tests {
         t.create_dir_all(&path).await.unwrap();
         assert!(path.exists());
         assert!(path.is_dir());
+    }
+
+    // --- Goal 400: capabilities + failure classification ---
+
+    /// A transport that only implements the required methods (no
+    /// `capabilities` / `walk` overrides), used to pin the default trait
+    /// implementations.
+    #[derive(Debug)]
+    struct BareTransport(LocalTransport);
+
+    #[async_trait]
+    impl ToolTransport for BareTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.0.read_file(path).await
+        }
+        async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.0.write_file(path, contents).await
+        }
+        async fn list_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>> {
+            self.0.list_dir(path).await
+        }
+        async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            self.0.create_dir_all(path).await
+        }
+        async fn exec_shell(
+            &self,
+            command: &str,
+            cwd: &Path,
+            env: &[(String, String)],
+            timeout: Duration,
+            max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            self.0
+                .exec_shell(command, cwd, env, timeout, max_output_bytes)
+                .await
+        }
+    }
+
+    #[test]
+    fn local_transport_capabilities_match_local_semantics() {
+        let caps = LocalTransport.capabilities();
+        assert!(caps.network, "local tier has outbound network");
+        assert!(caps.persistent, "local tier persists across execs");
+        assert!(
+            caps.path_root.as_os_str().is_empty(),
+            "empty path_root = caller-resolved host paths (path semantics contract)"
+        );
+        assert_eq!(caps.user, None);
+        assert!(caps.toolchain.is_empty(), "toolchain not probed locally");
+        assert!(!caps.snapshot, "local tier cannot snapshot");
+        assert_eq!(caps, EnvironmentCapabilities::local());
+    }
+
+    #[test]
+    fn capabilities_default_is_local_semantics() {
+        // Test doubles that don't opt in keep working (Goal 400 requirement).
+        let caps = BareTransport(LocalTransport).capabilities();
+        assert_eq!(caps, EnvironmentCapabilities::local());
+    }
+
+    #[test]
+    fn exec_result_default_has_no_failure() {
+        let r = ExecResult::default();
+        assert_eq!(r.exit_code, None);
+        assert_eq!(r.failure, None);
+    }
+
+    #[test]
+    fn transport_failure_variants_are_distinguishable() {
+        // The classification must be transferable and comparable (Goal 400:
+        // consumers in 401–403 branch on the value).
+        let retryable = ExecResult {
+            failure: Some(TransportFailure::Retryable),
+            ..ExecResult::default()
+        };
+        let environment = ExecResult {
+            failure: Some(TransportFailure::Environment),
+            ..ExecResult::default()
+        };
+        let tool = ExecResult {
+            failure: Some(TransportFailure::Tool),
+            ..ExecResult::default()
+        };
+        assert_ne!(retryable.failure, environment.failure);
+        assert_ne!(environment.failure, tool.failure);
+        assert_ne!(retryable.failure, tool.failure);
+        assert_eq!(retryable.failure, Some(TransportFailure::Retryable));
+    }
+
+    /// A mock transport that always reports a retryable failure from
+    /// `exec_shell` — pins that the classification travels through the trait
+    /// to the caller.
+    #[derive(Debug)]
+    struct FlakyTransport;
+
+    #[async_trait]
+    impl ToolTransport for FlakyTransport {
+        async fn read_file(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn list_dir(&self, _path: &Path) -> std::io::Result<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            Ok(ExecResult {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "vm timed out".into(),
+                failure: Some(TransportFailure::Retryable),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_transport_surfaces_failure_classification() {
+        let r = FlakyTransport
+            .exec_shell("true", Path::new("/"), &[], Duration::from_secs(1), 1024)
+            .await
+            .unwrap();
+        assert_eq!(r.failure, Some(TransportFailure::Retryable));
     }
 
     // --- SSH transport tests (no actual SSH required) ---
