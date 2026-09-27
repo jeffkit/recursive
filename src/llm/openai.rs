@@ -1043,7 +1043,17 @@ fn serialize_message(m: &Message) -> Value {
     };
     let mut obj = serde_json::Map::new();
     obj.insert("role".into(), Value::String(role.into()));
-    obj.insert("content".into(), Value::String(m.content.clone()));
+    // A tool-call assistant message with no text must not go out as
+    // `content: ""`: OpenAI's own API tolerates it, but strict
+    // OpenAI→Anthropic translation gateways materialise the empty string as
+    // an empty text block and reject it with 400 "text content blocks must
+    // be non-empty". `content: null` is the canonical OpenAI wire shape for
+    // a tool-call-only assistant message, so emit that instead. (issue #16)
+    if m.role == Role::Assistant && m.content.is_empty() && !m.tool_calls.is_empty() {
+        obj.insert("content".into(), Value::Null);
+    } else {
+        obj.insert("content".into(), Value::String(m.content.clone()));
+    }
     if let Some(id) = &m.tool_call_id {
         obj.insert("tool_call_id".into(), Value::String(id.clone()));
     }
@@ -2278,6 +2288,53 @@ data: [DONE]
                 || v["reasoning_content"] == serde_json::Value::Null,
             "non-assistant messages must not include reasoning_content"
         );
+    }
+
+    #[test]
+    fn serialize_message_assistant_tool_calls_empty_content_is_null() {
+        // issue #16: a tool-call assistant message with empty content must
+        // go out as `content: null`, not `content: ""` — strict
+        // OpenAI→Anthropic translation gateways reject the empty string with
+        // 400 "text content blocks must be non-empty".
+        let msg = Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "abc".into(),
+                name: "Write".into(),
+                arguments: serde_json::json!({"path":"a","contents":"b"}),
+            }],
+        );
+        let v = serialize_message(&msg);
+        assert!(
+            v["content"].is_null(),
+            "tool-call assistant with empty content must serialise content as null, got {:?}",
+            v["content"]
+        );
+    }
+
+    #[test]
+    fn serialize_message_assistant_tool_calls_keeps_nonempty_content() {
+        // assistant text + tool calls together keeps the text — only the
+        // empty-content path switches to null
+        let msg = Message::assistant_with_tool_calls(
+            "writing the file now",
+            vec![ToolCall {
+                id: "abc".into(),
+                name: "Write".into(),
+                arguments: serde_json::json!({"path":"a","contents":"b"}),
+            }],
+        );
+        let v = serialize_message(&msg);
+        assert_eq!(v["content"].as_str(), Some("writing the file now"));
+    }
+
+    #[test]
+    fn serialize_message_tool_result_empty_content_keeps_string() {
+        // the null path is scoped to assistant + tool_calls; tool results
+        // keep the plain string form
+        let msg = Message::tool_result("tc-abc".to_string(), "".to_string());
+        let v = serialize_message(&msg);
+        assert_eq!(v["content"].as_str(), Some(""));
     }
 
     #[tokio::test]
