@@ -78,6 +78,35 @@ pub fn build_provider_for_model(
             message: format!("unknown provider preset '{preset_id}'"),
         }
     })?;
+    let config = config_for_preset_model(&preset, model)?;
+    let api_key = effective_api_key(config.api_key.as_deref())
+        .map(|k| k.to_string())
+        .ok_or_else(|| recursive::error::Error::Config {
+            message: format!(
+                "no API key for preset '{}' — set ${} (or RECURSIVE_API_KEY) and retry",
+                preset.id, preset.key_env,
+            ),
+        })?;
+    build_provider(&config, api_key)
+}
+
+/// Prepare a `Config` aimed at `(preset, model)` for a `/model` hot-swap.
+///
+/// Folds the preset's protocol / endpoint / model into the process config and
+/// then **re-derives `max_tokens`** for that model. The re-derivation is the
+/// point: `Config::from_env` derived `max_tokens` from whatever model was
+/// active at startup, so without it the swapped-in provider is built with the
+/// *previous* model's output cap — switching to a model with a lower ceiling
+/// then 400s on the first request, the same defect the CLI `--model` flag had
+/// (issue #17). `config.preset` is set first because that is where
+/// `resolve_max_tokens` looks the model's `ModelSpec.max_tokens` up.
+///
+/// Extracted from [`build_provider_for_model`] so the resulting config is
+/// observable to tests — the built `ChatProvider` does not expose its cap.
+fn config_for_preset_model(
+    preset: &recursive::providers::ProviderPreset,
+    model: &str,
+) -> recursive::error::Result<Config> {
     let mut config =
         recursive::config::Config::from_env().map_err(|e| recursive::error::Error::Config {
             message: format!("failed to load configuration: {e}"),
@@ -94,6 +123,12 @@ pub fn build_provider_for_model(
     config.provider_type = provider_type;
     config.api_base = api_base;
     config.model = model.to_string();
+    config.preset = Some(preset.id.clone());
+    config
+        .resolve_max_tokens()
+        .map_err(|e| recursive::error::Error::Config {
+            message: format!("failed to resolve max_tokens: {e}"),
+        })?;
     // Prefer the preset's own key_env when present; fall back to the current
     // config's key so cross-preset switches with a shared key just work.
     if !preset.key_env.is_empty() {
@@ -103,15 +138,7 @@ pub fn build_provider_for_model(
             }
         }
     }
-    let api_key = effective_api_key(config.api_key.as_deref())
-        .map(|k| k.to_string())
-        .ok_or_else(|| recursive::error::Error::Config {
-            message: format!(
-                "no API key for preset '{}' — set ${} (or RECURSIVE_API_KEY) and retry",
-                preset.id, preset.key_env,
-            ),
-        })?;
-    build_provider(&config, api_key)
+    Ok(config)
 }
 
 /// Whether a preset's own API key is resolvable *without* the global
@@ -840,6 +867,77 @@ type = "openai"
                 None => std::env::remove_var(self.name),
             }
         }
+    }
+
+    /// Issue #17, TUI half: the `/model` picker hot-swaps the provider, so it
+    /// must re-derive `max_tokens` for the model it is swapping *to*. Before
+    /// the fix, `config_for_preset_model` kept the startup model's cap, and
+    /// switching to a lower-ceiling model 400'd on the next turn.
+    ///
+    /// `config_for_preset_model` is asserted directly rather than
+    /// `build_provider_for_model`, because a `ChatProvider` does not expose
+    /// its `max_tokens` — the config is the observable seam.
+    #[test]
+    fn model_hot_swap_rederives_max_tokens() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
+        let _g1 = EnvGuard::remove("RECURSIVE_MAX_TOKENS");
+        let _g2 = EnvGuard::remove("RECURSIVE_API_KEY");
+
+        let providers_d = home.path().join("providers.d");
+        std::fs::create_dir_all(&providers_d).expect("mkdir providers.d");
+        std::fs::write(
+            providers_d.join("two-cap.toml"),
+            r#"[[providers]]
+id = "two-cap"
+name = "Two Cap"
+provider_type = "openai"
+api_base = "https://example.invalid/v1"
+default_model = "big-cap"
+mainland_accessible = false
+key_env = "TWO_CAP_API_KEY"
+key_url = ""
+
+[[providers.models]]
+name = "big-cap"
+context_window = 1000000
+max_tokens = 384000
+
+[[providers.models]]
+name = "small-cap"
+context_window = 200000
+max_tokens = 128000
+"#,
+        )
+        .expect("write two-cap preset");
+        let cfg_dir = home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir .recursive");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[provider]\npreset = \"two-cap\"\nmodel = \"big-cap\"\n",
+        )
+        .expect("write config");
+
+        let preset = recursive::providers::find_preset_effective("two-cap")
+            .expect("two-cap preset resolves from providers.d");
+
+        // Startup model's cap, as `Config::from_env` would derive it.
+        let startup = config_for_preset_model(&preset, "big-cap").expect("startup config");
+        assert_eq!(startup.max_tokens, 384_000);
+
+        // The picker swaps to a model with a lower output ceiling.
+        let swapped = config_for_preset_model(&preset, "small-cap").expect("swapped config");
+        assert_eq!(
+            swapped.max_tokens, 128_000,
+            "hot-swap must re-derive max_tokens from the new model's preset \
+             entry, not carry the previous model's cap (issue #17)"
+        );
+        assert_eq!(swapped.model, "small-cap");
+        assert_eq!(
+            swapped.preset.as_deref(),
+            Some("two-cap"),
+            "the swapped config must record the preset that served the model"
+        );
     }
 
     #[test]

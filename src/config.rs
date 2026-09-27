@@ -211,6 +211,44 @@ impl Config {
             .unwrap_or_else(|| crate::llm::context_window_tokens_for_model_effective(model))
     }
 
+    /// Re-derive [`Config::max_tokens`] from the *currently effective*
+    /// `(preset, model)`.
+    ///
+    /// [`Config::from_env`] derives `max_tokens` from the model it sees at
+    /// load time. Callers that change the model afterwards — the CLI
+    /// `--model` flag, the TUI `/model` picker — must call this, or the two
+    /// fields disagree: the request is sent with the *previous* model's
+    /// output cap, and switching to a model with a lower ceiling fails the
+    /// first request with HTTP 400 (`max_tokens: 384000 > 128000, ...`),
+    /// naming `max_tokens` rather than the flag that actually caused it.
+    ///
+    /// Tiers, re-derived the same way `from_env` derives them:
+    ///   1. `RECURSIVE_MAX_TOKENS` env var. An explicit value must survive
+    ///      every model override, so it still wins here (and is still
+    ///      validated, not silently ignored).
+    ///   2. the active preset's `ModelSpec.max_tokens` for the new model,
+    ///      re-resolved from the **effective** catalog via `self.preset`, so
+    ///      `providers.d/` overrides and the remote cache apply.
+    ///   3. the config file's `agent.max_tokens`, else the crate default.
+    ///
+    /// `self.preset` must already name the preset that will serve the new
+    /// model — callers that switch providers set it before calling.
+    pub fn resolve_max_tokens(&mut self) -> Result<()> {
+        let file_max_tokens = crate::config_file::FileConfig::load()
+            .map_err(|e| Error::Config {
+                message: format!("config file: {e}"),
+            })?
+            .unwrap_or_default()
+            .agent
+            .and_then(|a| a.max_tokens);
+        let preset = self.preset.as_deref().and_then(find_preset_effective);
+        self.max_tokens = parse_env(
+            "RECURSIVE_MAX_TOKENS",
+            derive_max_tokens(preset.as_ref(), &self.model, file_max_tokens),
+        )?;
+        Ok(())
+    }
+
     /// Load from environment, with config file (~/.recursive/config.toml) as fallback.
     ///
     /// Precedence (highest first), applied to `api_base` / `api_key` / `model` /
@@ -369,21 +407,22 @@ impl Config {
         // 2) Else the active provider preset's ModelSpec.max_tokens for the
         //    configured model, falling back to the config file's agent.max_tokens.
         // 3) Else the crate default (DEFAULT_MAX_TOKENS = 64K).
+        //
+        // This derivation is a pure function of `(preset, model, file)`; the
+        // same logic is re-run by `Config::resolve_max_tokens` whenever a
+        // caller changes the model after load (CLI `--model`, TUI `/model`).
         let max_tokens = parse_env(
             "RECURSIVE_MAX_TOKENS",
             // Env absent → fall back to the active model's spec in the
             // resolved preset, then to the file-level agent.max_tokens, then
-            // to the crate default (DEFAULT_MAX_TOKENS = 64K).
-            preset
-                .as_ref()
-                .and_then(|p| {
-                    p.models
-                        .iter()
-                        .find(|m| m.name == model)
-                        .and_then(|m| m.max_tokens)
-                })
-                .or_else(|| file_agent.and_then(|a| a.max_tokens))
-                .unwrap_or(crate::llm::DEFAULT_MAX_TOKENS),
+            // to the crate default (DEFAULT_MAX_TOKENS = 64K). Shared with
+            // `Config::resolve_max_tokens`, which re-runs it after a caller
+            // swaps the model post-load (CLI `--model`, TUI `/model`).
+            derive_max_tokens(
+                preset.as_ref(),
+                &model,
+                file_agent.and_then(|a| a.max_tokens),
+            ),
         )?;
 
         let temperature = parse_env(
@@ -686,6 +725,31 @@ the provider is unset.
         }
         Ok(())
     }
+}
+
+/// The two lower tiers of `max_tokens` resolution (preset model spec → config
+/// file `agent.max_tokens` → crate default), shared by [`Config::from_env`]
+/// and [`Config::resolve_max_tokens`].
+///
+/// Factored out so a post-load model swap re-derives *exactly* the value a
+/// fresh load with that model would have derived — the invariant whose
+/// absence caused `--model` to send the previous model's output cap.
+/// `RECURSIVE_MAX_TOKENS` is the tier above these and stays with the caller,
+/// so this remains a pure function of `(preset, model, file fallback)`.
+fn derive_max_tokens(
+    preset: Option<&ProviderPreset>,
+    model: &str,
+    file_max_tokens: Option<u32>,
+) -> u32 {
+    preset
+        .and_then(|p| {
+            p.models
+                .iter()
+                .find(|m| m.name == model)
+                .and_then(|m| m.max_tokens)
+        })
+        .or(file_max_tokens)
+        .unwrap_or(crate::llm::DEFAULT_MAX_TOKENS)
 }
 
 /// Parse an env var into `T`, returning `default` when the var is absent.
@@ -1072,6 +1136,257 @@ mod tests {
         assert_eq!(config.max_tokens, 131_072);
         unsafe {
             std::env::remove_var("RECURSIVE_MAX_TOKENS");
+        }
+    }
+
+    /// Clear the model env overrides (`RECURSIVE_MODEL` / `OPENAI_MODEL`)
+    /// for the guard's lifetime, restoring on drop. These tests derive
+    /// `max_tokens` from the **config-file** model, and env outranks the
+    /// file — several older tests in this module set `RECURSIVE_MODEL`
+    /// ("test-model") without restoring it, so every test here must pin
+    /// the var itself rather than trust suite ordering.
+    struct ClearModelEnv {
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ClearModelEnv {
+        /// Caller must hold [`crate::test_util::env_lock`].
+        fn new() -> Self {
+            let prev = ["RECURSIVE_MODEL", "OPENAI_MODEL"]
+                .into_iter()
+                .map(|name| {
+                    let v = std::env::var_os(name);
+                    // SAFETY: caller holds the env lock.
+                    unsafe { std::env::remove_var(name) };
+                    (name, v)
+                })
+                .collect();
+            Self { prev }
+        }
+    }
+
+    impl Drop for ClearModelEnv {
+        fn drop(&mut self) {
+            for (name, v) in &self.prev {
+                // SAFETY: caller holds the env lock for the guard's lifetime.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fixture for the `resolve_max_tokens` tests: a `providers.d/` preset
+    /// whose two models carry deliberately different output caps, mirroring
+    /// the gateway in issue #17 (`deepseek-flash` = 384000 vs
+    /// `claude-sonnet-5` = 128000).
+    ///
+    /// Written by hand rather than added to the bundled `providers.toml`:
+    /// these caps exist to pin the derivation, not to ship in the catalog.
+    fn write_two_cap_preset_dir(root: &std::path::Path) {
+        let providers_d = root.join("providers.d");
+        std::fs::create_dir_all(&providers_d).expect("mkdir providers.d");
+        std::fs::write(
+            providers_d.join("two-cap.toml"),
+            r#"[[providers]]
+id = "two-cap"
+name = "Two Cap"
+provider_type = "openai"
+api_base = "https://example.invalid/v1"
+default_model = "big-cap"
+mainland_accessible = false
+key_env = "TWO_CAP_API_KEY"
+key_url = ""
+
+[[providers.models]]
+name = "big-cap"
+context_window = 1000000
+max_tokens = 384000
+
+[[providers.models]]
+name = "small-cap"
+context_window = 200000
+max_tokens = 128000
+"#,
+        )
+        .expect("write two-cap preset");
+    }
+
+    /// Issue #17: `--model` overwrites `config.model` *after* `from_env` has
+    /// already derived `max_tokens` from the old model, so the first request
+    /// goes out with the old model's output cap and 400s when the new model's
+    /// ceiling is lower. `resolve_max_tokens` must make the two agree.
+    ///
+    /// This pins the whole CLI shape: load config (preset + model from the
+    /// file), apply the `--model` override, re-derive.
+    #[test]
+    fn resolve_max_tokens_rederives_after_model_override() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let _model_env = ClearModelEnv::new();
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+        write_two_cap_preset_dir(tmp.path());
+        std::fs::write(
+            &config_path,
+            r#"[provider]
+preset = "two-cap"
+model = "big-cap"
+"#,
+        )
+        .expect("write config");
+        let orig = std::env::var("RECURSIVE_MAX_TOKENS").ok();
+        unsafe {
+            std::env::remove_var("RECURSIVE_MAX_TOKENS");
+        }
+
+        // Startup: max_tokens is big-cap's 384000, which is correct — the
+        // bug is only that it survives a model swap.
+        let mut config = Config::from_env().expect("from_env");
+        assert_eq!(config.model, "big-cap");
+        assert_eq!(config.max_tokens, 384_000, "baseline: file model's cap");
+
+        // `recursive --model small-cap run ...` — main.rs sets the same field.
+        config.model = "small-cap".to_string();
+        config.resolve_max_tokens().expect("resolve");
+
+        assert_eq!(
+            config.max_tokens, 128_000,
+            "the override must re-derive max_tokens from the NEW model's \
+             preset entry (was {}, the previous model's cap — issue #17)",
+            config.max_tokens
+        );
+
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RECURSIVE_MAX_TOKENS", v),
+                None => std::env::remove_var("RECURSIVE_MAX_TOKENS"),
+            }
+        }
+    }
+
+    /// The other half of the acceptance criteria: an explicit
+    /// `RECURSIVE_MAX_TOKENS` outranks both the file model and any `--model`
+    /// override, so re-deriving must not clobber it.
+    #[test]
+    fn resolve_max_tokens_lets_explicit_env_win_over_model_override() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let _model_env = ClearModelEnv::new();
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+        write_two_cap_preset_dir(tmp.path());
+        std::fs::write(
+            &config_path,
+            r#"[provider]
+preset = "two-cap"
+"#,
+        )
+        .expect("write config");
+        let orig = std::env::var("RECURSIVE_MAX_TOKENS").ok();
+        unsafe {
+            std::env::set_var("RECURSIVE_MAX_TOKENS", "4096");
+        }
+
+        let mut config = Config::from_env().expect("from_env");
+        assert_eq!(config.max_tokens, 4_096, "env outranks the preset tier");
+
+        config.model = "small-cap".to_string();
+        config.resolve_max_tokens().expect("resolve");
+        assert_eq!(
+            config.max_tokens, 4_096,
+            "an explicit RECURSIVE_MAX_TOKENS must survive a --model override"
+        );
+
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RECURSIVE_MAX_TOKENS", v),
+                None => std::env::remove_var("RECURSIVE_MAX_TOKENS"),
+            }
+        }
+    }
+
+    /// When the new model has no entry in the active preset (a custom model
+    /// name, or `--model` naming a model from a different vendor), the
+    /// re-derivation must fall back to the config file's `agent.max_tokens`
+    /// rather than keeping the previous model's preset cap.
+    #[test]
+    fn resolve_max_tokens_falls_back_to_file_tier_for_unknown_model() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let _model_env = ClearModelEnv::new();
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+        write_two_cap_preset_dir(tmp.path());
+        std::fs::write(
+            &config_path,
+            r#"[provider]
+preset = "two-cap"
+model = "big-cap"
+
+[agent]
+max_tokens = 20000
+"#,
+        )
+        .expect("write config");
+        let orig = std::env::var("RECURSIVE_MAX_TOKENS").ok();
+        unsafe {
+            std::env::remove_var("RECURSIVE_MAX_TOKENS");
+        }
+
+        let mut config = Config::from_env().expect("from_env");
+        assert_eq!(config.max_tokens, 384_000, "known model → preset tier");
+
+        config.model = "not-in-any-preset".to_string();
+        config.resolve_max_tokens().expect("resolve");
+        assert_eq!(
+            config.max_tokens, 20_000,
+            "unknown model → file `agent.max_tokens`, not the stale preset cap"
+        );
+
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RECURSIVE_MAX_TOKENS", v),
+                None => std::env::remove_var("RECURSIVE_MAX_TOKENS"),
+            }
+        }
+    }
+
+    /// A model swap with no preset active (`provider.preset` unset) must not
+    /// panic and must land on the crate default — the same tier `from_env`
+    /// would have picked for that model.
+    #[test]
+    fn resolve_max_tokens_without_preset_is_default() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        let _model_env = ClearModelEnv::new();
+        let orig = std::env::var("RECURSIVE_MAX_TOKENS").ok();
+        unsafe {
+            std::env::remove_var("RECURSIVE_MAX_TOKENS");
+        }
+
+        let mut config = Config::from_env().expect("from_env");
+        assert!(config.preset.is_none(), "no config file → no preset");
+        config.model = "some-other-model".to_string();
+        config.resolve_max_tokens().expect("resolve");
+        assert_eq!(config.max_tokens, crate::llm::DEFAULT_MAX_TOKENS);
+
+        // SAFETY: env lock still held; restore previous state.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RECURSIVE_MAX_TOKENS", v),
+                None => std::env::remove_var("RECURSIVE_MAX_TOKENS"),
+            }
         }
     }
 

@@ -544,6 +544,17 @@ async fn main() -> anyhow::Result<()> {
     if let Some(p) = cli.provider {
         config.provider_type = p;
     }
+    // --model (and --provider) override the identity `Config::from_env` had
+    // already used to derive `max_tokens`. Re-derive it now that every
+    // non-env source has been folded in, so the two can't disagree: without
+    // this, `recursive --model <model-with-lower-cap> run ...` sends the
+    // previous model's output cap and the first request fails with HTTP 400
+    // (`max_tokens: 384000 > 128000, ...`). An explicit RECURSIVE_MAX_TOKENS
+    // still wins, since `resolve_max_tokens` re-applies the same tiers
+    // `from_env` does.
+    config
+        .resolve_max_tokens()
+        .context("resolving max_tokens")?;
     if cli.headless {
         config.headless = true;
     }
