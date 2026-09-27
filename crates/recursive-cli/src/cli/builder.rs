@@ -36,6 +36,9 @@ pub(crate) async fn build_tools(
     read_state: Option<Arc<Mutex<ReadFileState>>>,
 ) -> (ToolRegistry, Arc<Mutex<ReadFileState>>) {
     let root = &config.workspace;
+    // One shared transport instance for the registry AND the fs tools
+    // (Goal 401): swap this single Arc to a container transport and the
+    // whole toolset follows. Never construct a second transport for tools.
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let read_state = read_state.unwrap_or_else(|| Arc::new(Mutex::new(ReadFileState::new())));
@@ -60,14 +63,15 @@ pub(crate) async fn build_tools(
     // Shared mutable sandbox roots so control `register_repo_root` can expand
     // the sandbox mid-run (Claude Code parity).
     let session_roots = recursive::new_shared_sandbox_roots();
-    let mut registry = ToolRegistry::new(transport)
+    let mut registry = ToolRegistry::new(transport.clone())
         .with_read_file_state(read_state.clone())
         .register_with_aliases(
             Arc::new(
                 ReadFile::new(root)
                     .with_extra_roots(extra_roots.clone())
                     .with_session_roots(session_roots.clone())
-                    .with_read_state(read_state.clone()),
+                    .with_read_state(read_state.clone())
+                    .with_transport(transport.clone()),
             ),
             &["read_file"],
         )
@@ -76,7 +80,8 @@ pub(crate) async fn build_tools(
                 WriteFile::new(root)
                     .with_extra_roots(extra_roots.clone())
                     .with_session_roots(session_roots.clone())
-                    .with_read_state(read_state.clone()),
+                    .with_read_state(read_state.clone())
+                    .with_transport(transport.clone()),
             ),
             &["write_file"],
         )
@@ -84,7 +89,8 @@ pub(crate) async fn build_tools(
             EditTool::new(root)
                 .with_extra_roots(extra_roots.clone())
                 .with_session_roots(session_roots.clone())
-                .with_read_state(read_state.clone()),
+                .with_read_state(read_state.clone())
+                .with_transport(transport.clone()),
         ))
         .register_with_aliases(
             Arc::new(

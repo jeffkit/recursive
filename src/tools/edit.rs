@@ -26,11 +26,14 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::transport::ToolTransport;
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
-use crate::tools::fs::{get_file_mtime, ReadFileState};
+use crate::tools::fs::{
+    get_file_mtime, read_via_transport_or_empty, transport_io_error, ReadFileState,
+};
 
 /// Maximum on-disk size of a file the Edit tool will touch, in bytes. Prevents
 /// OOM from reading multi-GB files into memory. Aligned with fake-cc's
@@ -46,6 +49,12 @@ pub struct EditTool {
     /// never read, or only partially read, are rejected with a clear error.
     /// `None` (default) disables the guard for backward compatibility.
     pub read_state: Option<Arc<Mutex<ReadFileState>>>,
+    /// I/O backend (Goal 401). Production wiring MUST inject the registry's
+    /// shared transport instance via [`EditTool::with_transport`] so an
+    /// environment binding chosen at the registry applies to this tool too.
+    /// The `LocalTransport` default in [`EditTool::new`] exists only for
+    /// standalone/test construction.
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl EditTool {
@@ -55,11 +64,19 @@ impl EditTool {
             extra_roots: Vec::new(),
             session_roots: None,
             read_state: None,
+            transport: Arc::new(super::transport::LocalTransport),
         }
     }
 
     pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
         self.read_state = Some(slot);
+        self
+    }
+
+    /// Inject the I/O backend. In production this must be the registry's
+    /// transport Arc (one shared instance per registry).
+    pub fn with_transport(mut self, transport: Arc<dyn ToolTransport>) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -503,9 +520,8 @@ useful if you want to rename a variable for instance."
 
             // Async content-fallback staleness check (lock is not held).
             if let Some((_disk_mtime, cached_content)) = staleness_check {
-                let disk_content = tokio::fs::read_to_string(&abs_path)
-                    .await
-                    .unwrap_or_default();
+                let disk_content =
+                    read_via_transport_or_empty(self.transport.as_ref(), &abs_path).await;
                 if disk_content != cached_content {
                     return Err(Error::Tool {
                         name: "Edit".into(),
@@ -523,6 +539,13 @@ useful if you want to rename a variable for instance."
         // ── File-size guard ─────────────────────────────────────────────
         // Refuse to edit files larger than MAX_EDIT_FILE_SIZE to avoid OOM.
         // A missing file (new-file create path) is exempt — no metadata yet.
+        //
+        // Host-side `tokio::fs::metadata` on purpose (Goal 401 residual): the
+        // frozen transport trait has no stat/metadata method, so the size
+        // guard cannot go through the environment yet. On remote tiers this
+        // degrades to "guard silently skips" (a missing host path takes the
+        // NotFound exemption) — it can never wrongly reject. See journal
+        // follow-up candidates.
         match tokio::fs::metadata(&abs_path).await {
             Ok(meta) => {
                 let size = meta.len();
@@ -553,20 +576,22 @@ useful if you want to rename a variable for instance."
         // ── Empty old_string: create new file or overwrite empty file ───
         if old_string.is_empty() {
             if let Some(parent) = abs_path.parent() {
-                tokio::fs::create_dir_all(parent)
+                self.transport
+                    .create_dir_all(parent)
                     .await
                     .map_err(|e| Error::Tool {
                         name: "Edit".into(),
                         call_id: None,
-                        message: format!("mkdir {}: {e}", parent.display()),
+                        message: transport_io_error(parent, &e),
                     })?;
             }
-            tokio::fs::write(&abs_path, new_string)
+            self.transport
+                .write_file(&abs_path, new_string.as_bytes())
                 .await
                 .map_err(|e| Error::Tool {
                     name: "Edit".into(),
                     call_id: None,
-                    message: format!("{}: {e}", abs_path.display()),
+                    message: transport_io_error(&abs_path, &e),
                 })?;
             return Ok(format!(
                 "Created `{}` ({} bytes)",
@@ -576,13 +601,23 @@ useful if you want to rename a variable for instance."
         }
 
         // ── Read file ───────────────────────────────────────────────────
-        let content = tokio::fs::read_to_string(&abs_path)
+        let content_bytes = self
+            .transport
+            .read_file(&abs_path)
             .await
             .map_err(|e| Error::Tool {
                 name: "Edit".into(),
                 call_id: None,
-                message: format!("{}: {e}", abs_path.display()),
+                message: transport_io_error(&abs_path, &e),
             })?;
+        // The previous `tokio::fs::read_to_string` failed on invalid UTF-8
+        // with `InvalidData("stream did not contain valid UTF-8")`; keep that
+        // message shape now that bytes arrive via the transport.
+        let content = String::from_utf8(content_bytes).map_err(|_| Error::Tool {
+            name: "Edit".into(),
+            call_id: None,
+            message: format!("{}: stream did not contain valid UTF-8", abs_path.display()),
+        })?;
 
         // ── Guard: identical strings do nothing ─────────────────────────
         if old_string == new_string {
@@ -677,12 +712,13 @@ the instance.\nString: {old_string}"
             }
         }
 
-        tokio::fs::write(&abs_path, &updated)
+        self.transport
+            .write_file(&abs_path, updated.as_bytes())
             .await
             .map_err(|e| Error::Tool {
                 name: "Edit".into(),
                 call_id: None,
-                message: format!("{}: {e}", abs_path.display()),
+                message: transport_io_error(&abs_path, &e),
             })?;
 
         // ── Post-edit cache update ───────────────────────────────────
@@ -1828,6 +1864,184 @@ mod tests {
         assert!(
             msg.contains("not found"),
             "expected 'not found' rejection from old_string match, got: {msg}"
+        );
+    }
+
+    // ── Goal 401: Edit routes I/O through the injected transport ─────────
+
+    use crate::tools::transport::{DirEntry, ExecResult};
+    use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory transport: proves Edit reads and writes the injected
+    /// backend and never the host filesystem. (Mirror of the fs.rs test
+    /// double — test-only code stays in each file's `mod tests`.)
+    #[derive(Debug, Default)]
+    struct MemTransport {
+        files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
+        read_calls: AtomicUsize,
+        write_calls: AtomicUsize,
+        fail_kind: Mutex<Option<ErrorKind>>,
+    }
+
+    impl MemTransport {
+        fn put(&self, path: &Path, contents: &[u8]) {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), contents.to_vec());
+        }
+        fn get(&self, path: &Path) -> Option<Vec<u8>> {
+            self.files.lock().unwrap().get(path).cloned()
+        }
+    }
+
+    #[async_trait]
+    impl ToolTransport for MemTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(kind) = *self.fail_kind.lock().unwrap() {
+                return Err(std::io::Error::new(kind, "injected transport failure"));
+            }
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "mem: not found"))
+        }
+
+        async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), contents.to_vec());
+            Ok(())
+        }
+
+        async fn list_dir(&self, _path: &Path) -> std::io::Result<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "mem transport: fs tools never exec",
+            ))
+        }
+    }
+
+    /// Both halves of an edit — reading current content and writing the
+    /// replacement — must go through the injected transport, leaving the
+    /// host filesystem untouched.
+    #[tokio::test]
+    async fn edit_uses_transport_for_read_and_write() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let virt = tmp.path().join("virt.txt");
+        mem.put(&virt, b"alpha\nbeta\n");
+        let tool = EditTool::new(tmp.path()).with_transport(mem.clone() as Arc<dyn ToolTransport>);
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "virt.txt",
+                "old_string": "beta",
+                "new_string": "BETA"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("updated successfully"), "got: {result}");
+        assert_eq!(mem.get(&virt).as_deref(), Some(&b"alpha\nBETA\n"[..]));
+        assert_eq!(mem.read_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mem.write_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !virt.exists(),
+            "host file must not exist — Edit went through the transport, not tokio::fs"
+        );
+    }
+
+    /// The empty-old_string create path (mkdir + write) must also go through
+    /// the transport.
+    #[tokio::test]
+    async fn edit_empty_old_string_creates_file_via_transport() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let virt = tmp.path().join("created.txt");
+        let tool = EditTool::new(tmp.path()).with_transport(mem.clone() as Arc<dyn ToolTransport>);
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "created.txt",
+                "old_string": "",
+                "new_string": "fresh"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("Created"), "got: {result}");
+        assert_eq!(mem.get(&virt).as_deref(), Some(&b"fresh"[..]));
+        assert!(
+            !virt.exists(),
+            "host file must not exist — create went through the transport"
+        );
+    }
+
+    /// A transient transport failure on the read side must carry the
+    /// `retryable:` marker (Goal 401 annotation contract).
+    #[tokio::test]
+    async fn edit_transport_retryable_error_marked() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        *mem.fail_kind.lock().unwrap() = Some(ErrorKind::TimedOut);
+        let tool = EditTool::new(tmp.path()).with_transport(mem as Arc<dyn ToolTransport>);
+        let err = tool
+            .execute(serde_json::json!({
+                "file_path": "f.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("retryable: "),
+            "TimedOut transport failure must carry the retryable marker, got: {msg}"
+        );
+    }
+
+    /// Invalid UTF-8 coming back from a transport must produce the same
+    /// message shape the previous `read_to_string` produced (InvalidData /
+    /// "stream did not contain valid UTF-8"), not a panic.
+    #[tokio::test]
+    async fn edit_transport_invalid_utf8_message_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let virt = tmp.path().join("bin.txt");
+        mem.put(&virt, &[0xFF, 0xFE, 0x00]);
+        let tool = EditTool::new(tmp.path()).with_transport(mem as Arc<dyn ToolTransport>);
+        let err = tool
+            .execute(serde_json::json!({
+                "file_path": "bin.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stream did not contain valid UTF-8"),
+            "expected the UTF-8 message shape of read_to_string, got: {msg}"
         );
     }
 }
