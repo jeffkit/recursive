@@ -83,22 +83,22 @@ impl Tool for EstimateTokens {
             description:
                 "Estimate the number of tokens in a piece of text or a file. Useful for budgeting transcript space."
                     .into(),
+            // No top-level anyOf/oneOf/allOf: Anthropic's Messages API rejects
+            // them in input_schema with HTTP 400 (issue #15). The exactly-one
+            // constraint lives in the property descriptions; execute() enforces
+            // it at runtime regardless.
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "Literal text to estimate tokens for"
+                        "description": "Literal text to estimate tokens for. Provide exactly one of 'text' or 'path', not both"
                     },
                     "path": {
                         "type": "string",
-                        "description": "Path to a file (workspace-relative) to estimate tokens for"
+                        "description": "Path to a file (workspace-relative) to estimate tokens for. Provide exactly one of 'text' or 'path', not both"
                     }
-                },
-                "anyOf": [
-                    {"required": ["text"]},
-                    {"required": ["path"]}
-                ]
+                }
             }),
         }
     }
@@ -259,6 +259,30 @@ mod tests {
             tool.is_deferred(),
             "EstimateTokens must be deferred (low-frequency tool)"
         );
+    }
+
+    #[test]
+    fn spec_has_no_top_level_combinator() {
+        // issue #15: Anthropic's Messages API rejects oneOf/allOf/anyOf at the
+        // top level of input_schema with HTTP 400 on the FIRST request.
+        use crate::tools::Tool;
+        let spec = EstimateTokens::new("/tmp").spec();
+        for key in ["oneOf", "allOf", "anyOf"] {
+            assert!(
+                spec.parameters.get(key).is_none(),
+                "estimate_tokens spec must not carry top-level `{key}`"
+            );
+        }
+        // the exactly-one constraint survives in the property descriptions
+        for prop in ["text", "path"] {
+            let desc = spec.parameters["properties"][prop]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                desc.contains("exactly one"),
+                "description of `{prop}` must state the exactly-one constraint"
+            );
+        }
     }
 
     #[test]

@@ -989,6 +989,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn standard_tool_schemas_have_no_top_level_combinators() {
+        // issue #15: Anthropic's Messages API rejects oneOf/allOf/anyOf at the
+        // top level of input_schema with HTTP 400 — on the FIRST request, so a
+        // single bad tool spec takes down every Anthropic-protocol run. This
+        // guards the canonical tool set every entry point ships.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = build_standard_tools(tmp.path(), &[], 30);
+        for spec in registry.specs() {
+            for key in ["oneOf", "allOf", "anyOf"] {
+                assert!(
+                    spec.parameters.get(key).is_none(),
+                    "tool `{}` has top-level `{}` in its schema — Anthropic rejects it with HTTP 400",
+                    spec.name,
+                    key
+                );
+            }
+        }
+    }
+
     // ── DeferredTool mock for deferred-partition tests ───────────────────────
 
     struct DeferredTool {

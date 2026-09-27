@@ -797,7 +797,7 @@ fn build_request(
                 serde_json::json!({
                     "name": t.name,
                     "description": t.description,
-                    "input_schema": t.parameters,
+                    "input_schema": sanitize_input_schema(&t.parameters),
                 })
             })
             .collect();
@@ -805,6 +805,38 @@ fn build_request(
     }
 
     req
+}
+
+/// Anthropic's Messages API rejects `oneOf` / `allOf` / `anyOf` at the top
+/// level of a tool's `input_schema` with HTTP 400 (issue #15). Built-in tools
+/// avoid them, but MCP tools ship third-party schemas we don't control, so
+/// strip any top-level combinator before putting a schema on the wire.
+///
+/// When stripping leaves the schema without `properties`, hoist the union of
+/// the branches' `properties` (ignoring their `required`, which would flip
+/// "either" into "all") so the model still sees the argument names and types.
+/// Nested combinators are legal and left untouched.
+fn sanitize_input_schema(schema: &Value) -> Value {
+    let Value::Object(map) = schema else {
+        return schema.clone();
+    };
+    let mut out = map.clone();
+    let mut hoisted = serde_json::Map::new();
+    for key in ["oneOf", "allOf", "anyOf"] {
+        if let Some(Value::Array(branches)) = out.remove(key) {
+            for branch in &branches {
+                if let Some(props) = branch.get("properties").and_then(Value::as_object) {
+                    for (k, v) in props {
+                        hoisted.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+        }
+    }
+    if !hoisted.is_empty() && !out.contains_key("properties") {
+        out.insert("properties".into(), Value::Object(hoisted));
+    }
+    Value::Object(out)
 }
 
 fn serialize_message(m: &Message) -> Value {
@@ -1932,7 +1964,7 @@ data: {\"type\":\"message_stop\"}
     // The following tests verify these two responsibilities.
 
     #[test]
-    fn build_request_serializes_passed_specs_verbatim() {
+    fn build_request_serializes_passed_specs() {
         let specs = vec![
             ToolSpec {
                 name: "ToolSearchTool".to_string(),
@@ -1954,6 +1986,96 @@ data: {\"type\":\"message_stop\"}
         for t in tools {
             assert!(t["input_schema"].is_object());
         }
+    }
+
+    #[test]
+    fn sanitize_strips_top_level_combinators() {
+        // issue #15: any shape of top-level combinator must not reach the wire.
+        for key in ["oneOf", "allOf", "anyOf"] {
+            let mut schema = json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}}
+            });
+            schema[key] = json!([{"required": ["text"]}]);
+            let out = sanitize_input_schema(&schema);
+            assert!(out.get(key).is_none(), "top-level {key} must be stripped");
+            // untouched keys survive
+            assert_eq!(out["type"], "object");
+            assert!(out["properties"]["text"].is_object());
+        }
+    }
+
+    #[test]
+    fn sanitize_hoists_properties_when_schema_is_only_a_combinator() {
+        // Common MCP shape: the whole schema is a combinator. Stripping alone
+        // would leave the model without any argument hints.
+        let schema = json!({
+            "anyOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"type": "object", "properties": {"b": {"type": "number"}}, "required": ["b"]}
+            ]
+        });
+        let out = sanitize_input_schema(&schema);
+        assert!(out.get("anyOf").is_none());
+        assert_eq!(out["properties"]["a"]["type"], "string");
+        assert_eq!(out["properties"]["b"]["type"], "number");
+        // required must NOT be hoisted: "either" would flip into "all"
+        assert!(out.get("required").is_none());
+    }
+
+    #[test]
+    fn sanitize_keeps_existing_properties_over_branch_ones() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"keep": {"type": "string"}},
+            "oneOf": [
+                {"type": "object", "properties": {"drop": {"type": "string"}}}
+            ]
+        });
+        let out = sanitize_input_schema(&schema);
+        assert!(out["properties"]["keep"].is_object());
+        assert!(out["properties"].get("drop").is_none());
+    }
+
+    #[test]
+    fn sanitize_leaves_nested_combinators_alone() {
+        // Anthropic only rejects combinators at the TOP level of input_schema.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "choice": {"anyOf": [{"type": "string"}, {"type": "number"}]}
+            }
+        });
+        let out = sanitize_input_schema(&schema);
+        assert!(out["properties"]["choice"]["anyOf"].is_array());
+    }
+
+    #[test]
+    fn sanitize_passthrough_non_object() {
+        assert_eq!(sanitize_input_schema(&json!(null)), json!(null));
+        assert_eq!(
+            sanitize_input_schema(&json!("not-a-schema")),
+            json!("not-a-schema")
+        );
+    }
+
+    #[test]
+    fn build_request_sanitizes_tool_schemas() {
+        // End-to-end over the wire-building path: a tool carrying the exact
+        // shape from issue #15 must come out combinator-free.
+        let specs = vec![ToolSpec {
+            name: "estimate_tokens".to_string(),
+            description: "estimate".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "anyOf": [{"required": ["text"]}]
+            }),
+        }];
+        let body = build_request("claude-3", 0.2, 4096, None, &[Message::user("hi")], &specs);
+        let tool = &body["tools"][0];
+        assert!(tool["input_schema"].get("anyOf").is_none());
+        assert!(tool["input_schema"]["properties"]["text"].is_object());
     }
 
     #[test]
