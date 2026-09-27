@@ -310,11 +310,17 @@ pub(super) async fn create_session(
         .max_steps(max_steps)
         // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
         .wall_timeout_secs(state.config.wall_timeout_secs)
+        // Goal 396: the host layer persists this session's transcript via
+        // the same backend when the session is deleted, evicted, or the
+        // server shuts down — not per turn.
+        .storage(state.storage.clone())
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
-    // Register the session ID so all turns emit tracing spans with session_id
-    // and transcript is auto-saved to the storage backend after each turn.
+    // Register the session ID so all turns emit tracing spans with
+    // session_id. The transcript is NOT saved per turn; it is persisted
+    // once on teardown (DELETE / idle eviction / graceful shutdown) via
+    // `AppState.storage` — see `evict_idle_sessions` / `flush_all_sessions`.
     runtime.set_session_id(&id);
 
     // Extract the gate before moving runtime into the Mutex so HTTP handlers
@@ -502,6 +508,10 @@ pub(super) async fn delete_session(
         // runtime is dropped. Idempotent on repeated calls.
         let mut rt = runtime.lock().await;
         rt.close(None).await;
+        // Goal 396: snapshot the transcript before releasing the runtime
+        // Mutex, but persist it only after the session is out of the map —
+        // the save is I/O and must not run under either lock.
+        let transcript = rt.transcript().to_vec();
         drop(rt);
         state.sessions.write().await.remove(&id);
         state
@@ -510,6 +520,9 @@ pub(super) async fn delete_session(
             .fetch_sub(1, Ordering::Relaxed);
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
+        if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
+            tracing::warn!(session_id = %id, error = %e, "failed to persist deleted session transcript");
+        }
         tracing::info!(session_id = %id, "session deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -622,6 +635,9 @@ pub(super) async fn fork_session(
         .max_steps(state.config.max_steps)
         // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
         .wall_timeout_secs(state.config.wall_timeout_secs)
+        // Goal 396: same persistence backend as every other session — a
+        // fork is a first-class session and must survive teardown too.
+        .storage(state.storage.clone())
         .build()
         .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
@@ -2475,6 +2491,9 @@ mod tests {
             admission,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
 
         let body = serde_json::json!({
@@ -2548,6 +2567,9 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -2626,6 +2648,9 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
         (state, runtime_arc)
     }
@@ -2751,6 +2776,9 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -2798,6 +2826,9 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         };
 
         let auth = crate::http::auth::AuthConfig::default();

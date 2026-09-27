@@ -45,6 +45,7 @@ use tokio::sync::{broadcast, RwLock};
 use crate::config::Config;
 use crate::llm::ChatProvider;
 use crate::runtime::AgentRuntime;
+use crate::storage::StorageBackend;
 use crate::tools::plan_mode::PlanApprovalGate;
 use crate::tools::ToolRegistry;
 
@@ -355,6 +356,14 @@ pub struct AppState {
     /// Discovered skills for skill_index injection into the system prompt.
     /// Empty if no skills found. Goal-312.
     pub skills: Vec<crate::skills::Skill>,
+    /// Goal 396: shared transcript persistence backend. Chosen once at HTTP
+    /// startup (CLI default: `LocalStorageBackend` under the per-workspace
+    /// user dir) and injected into every session runtime via
+    /// `AgentRuntimeBuilder::storage`. The host layer calls
+    /// `save_transcript` on session teardown only — DELETE, idle eviction,
+    /// and graceful shutdown — never per turn (that would be an O(N²)
+    /// full-transcript rewrite on the hot path).
+    pub storage: Arc<dyn StorageBackend>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -1082,10 +1091,12 @@ pub fn build_openapi_spec() -> serde_json::Value {
 
 /// Spawn a background task that periodically evicts idle sessions.
 ///
-/// Every `check_interval` seconds, the reaper scans all sessions and removes
-/// those whose `last_active` is older than `session_ttl_secs`. The reaper
-/// calls `runtime.close()` on each evicted session so the transcript is
-/// saved to the storage backend before the session is dropped.
+/// Every `check_interval` seconds, the reaper runs one
+/// [`evict_idle_sessions`] sweep: sessions idle beyond `session_ttl_secs`
+/// are removed, their runtime is closed, and — Goal 396 — their transcript
+/// is persisted via `AppState.storage` **after the sessions lock is
+/// released** (the save is a full-overwrite file write and must not run
+/// under the host lock).
 pub fn spawn_session_reaper(
     state: Arc<AppState>,
     check_interval: std::time::Duration,
@@ -1093,52 +1104,130 @@ pub fn spawn_session_reaper(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(check_interval).await;
-            let ttl = std::time::Duration::from_secs(state.session_ttl_secs);
-            let mut to_evict: Vec<String> = Vec::new();
-            // Phase 1: collect eviction candidates under a read lock.
-            {
-                let sessions = state.sessions.read().await;
-                for (id, session) in sessions.iter() {
-                    let last_ms = session.last_active_ms.load(Ordering::Relaxed);
-                    let elapsed = std::time::Duration::from_millis(now_session_ms() - last_ms);
-                    if elapsed >= ttl {
-                        to_evict.push(id.clone());
-                    }
-                }
-            }
             // Prune idle rate-limit buckets (goal-290). Runs every
             // reaper tick so the bucket map doesn't grow unboundedly.
             state.rate_limiter.prune().await;
-            if to_evict.is_empty() {
-                continue;
-            }
-            // Phase 2: evict under a write lock, calling close() on each.
-            {
-                let mut sessions = state.sessions.write().await;
-                for id in &to_evict {
-                    if let Some(session) = sessions.remove(id) {
-                        // Try to close the runtime (best-effort — the lock
-                        // may be held by an in-flight turn).
-                        if let Ok(mut rt) = session.runtime.try_lock() {
-                            rt.close(None).await;
-                        }
-                        state
-                            .metrics
-                            .sessions_active
-                            .fetch_sub(1, Ordering::Relaxed);
-                        tracing::info!("reaper: evicted idle session {id}");
-                    }
-                }
-            }
-            // Prune stale event_channels for evicted sessions.
-            {
-                let mut channels = state.event_channels.write().await;
-                for id in &to_evict {
-                    channels.remove(id);
-                }
-            }
+            evict_idle_sessions(&state).await;
         }
     })
+}
+
+/// One host-layer eviction sweep (Goal 396 extraction point).
+///
+/// Phase 1 collects idle session ids under a read lock; Phase 2 removes
+/// them under a write lock; Phase 3 — **outside every lock** — closes each
+/// runtime and persists its transcript via the storage backend. A session
+/// whose runtime is mid-turn (per-session `try_lock` fails) is dropped
+/// without persistence, same as before this goal; the turn's own teardown
+/// path is responsible for that case.
+///
+/// Returns the ids that were evicted. Kept as a free function over
+/// `&AppState` so Goal 395's `SessionHost` extraction can move it (with its
+/// tests) verbatim.
+pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
+    let ttl = std::time::Duration::from_secs(state.session_ttl_secs);
+    let mut to_evict: Vec<String> = Vec::new();
+    // Phase 1: collect eviction candidates under a read lock.
+    {
+        let sessions = state.sessions.read().await;
+        for (id, session) in sessions.iter() {
+            let last_ms = session.last_active_ms.load(Ordering::Relaxed);
+            let elapsed = std::time::Duration::from_millis(now_session_ms() - last_ms);
+            if elapsed >= ttl {
+                to_evict.push(id.clone());
+            }
+        }
+    }
+    if to_evict.is_empty() {
+        return to_evict;
+    }
+    // Phase 2: evict under a write lock — remove only, no I/O here.
+    let evicted: Vec<SessionState> = {
+        let mut sessions = state.sessions.write().await;
+        to_evict
+            .iter()
+            .filter_map(|id| sessions.remove(id))
+            .collect()
+    };
+    // Phase 3 (outside every lock): close each runtime and persist its
+    // transcript. try_lock stays best-effort — the lock may be held by an
+    // in-flight turn.
+    for session in evicted {
+        if let Ok(mut rt) = session.runtime.try_lock() {
+            rt.close(None).await;
+            let transcript = rt.transcript().to_vec();
+            drop(rt);
+            if let Err(e) = state
+                .storage
+                .save_transcript(&session.id, &transcript)
+                .await
+            {
+                tracing::warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "reaper: failed to persist session transcript"
+                );
+            }
+        } else {
+            tracing::warn!(
+                session_id = %session.id,
+                "reaper: evicted busy session without transcript persistence"
+            );
+        }
+        state
+            .metrics
+            .sessions_active
+            .fetch_sub(1, Ordering::Relaxed);
+        tracing::info!("reaper: evicted idle session {}", session.id);
+    }
+    // Prune stale event_channels for evicted sessions.
+    {
+        let mut channels = state.event_channels.write().await;
+        for id in &to_evict {
+            channels.remove(id);
+        }
+    }
+    to_evict
+}
+
+/// Goal 396: persist every live session's transcript — the graceful
+/// shutdown path (`recursive http` calls this after the axum server stops).
+///
+/// Drains the session map under one write lock, then closes and saves each
+/// runtime outside the lock. Sessions whose runtime is still mid-turn are
+/// skipped (logged); a backend error on one session never stops the others.
+/// Returns the number of transcripts persisted.
+pub async fn flush_all_sessions(state: &AppState) -> usize {
+    let drained: Vec<SessionState> = {
+        let mut sessions = state.sessions.write().await;
+        sessions.drain().map(|(_, v)| v).collect()
+    };
+    let mut persisted = 0;
+    for session in drained {
+        if let Ok(mut rt) = session.runtime.try_lock() {
+            rt.close(None).await;
+            let transcript = rt.transcript().to_vec();
+            drop(rt);
+            match state
+                .storage
+                .save_transcript(&session.id, &transcript)
+                .await
+            {
+                Ok(()) => persisted += 1,
+                Err(e) => tracing::warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "shutdown: failed to persist session transcript"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                session_id = %session.id,
+                "shutdown: session still busy, transcript not persisted"
+            );
+        }
+    }
+    persisted
 }
 
 // =====================================================================
@@ -1263,5 +1352,312 @@ mod budget_tests {
         // Restore so unrelated tests observe a clean environment.
         std::env::remove_var("RECURSIVE_HTTP_MAX_STEPS");
         std::env::remove_var("RECURSIVE_HTTP_WALL_TIMEOUT_SECS");
+    }
+}
+
+// =====================================================================
+// Goal 396 — host-layer transcript persistence. Pins the three
+// teardown-path contracts: idle eviction persists each session's own
+// transcript (no cross-session bleed), the save runs OUTSIDE the
+// sessions write lock (probed from inside the backend), and the
+// graceful-shutdown flush persists and drains every live session.
+// =====================================================================
+#[cfg(test)]
+mod goal_396_persistence_tests {
+    use super::*;
+    use crate::llm::{Completion, MockProvider};
+    use crate::message::{Message, Role};
+    use crate::runtime::AgentRuntimeBuilder;
+    use crate::storage::StorageBackend;
+    use std::path::PathBuf;
+
+    type SessionsMap = HashMap<String, SessionState>;
+
+    /// One recorded save: (session_id, message count, lock-was-free flag).
+    type SaveRecord = (String, usize, Option<bool>);
+
+    /// Fake backend that records saves and optionally probes the host's
+    /// sessions-map write lock at save time — before any await — so a
+    /// host that persisted under the lock fails the test.
+    struct RecordingStorage {
+        saves: std::sync::Mutex<Vec<SaveRecord>>,
+        probe_sessions: Option<Arc<RwLock<SessionsMap>>>,
+    }
+
+    impl RecordingStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                saves: std::sync::Mutex::new(Vec::new()),
+                probe_sessions: None,
+            })
+        }
+
+        fn with_probe(sessions: Arc<RwLock<SessionsMap>>) -> Arc<Self> {
+            Arc::new(Self {
+                saves: std::sync::Mutex::new(Vec::new()),
+                probe_sessions: Some(sessions),
+            })
+        }
+
+        fn saves(&self) -> Vec<SaveRecord> {
+            self.saves.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for RecordingStorage {
+        async fn load_transcript(&self, _session_id: &str) -> crate::error::Result<Vec<Message>> {
+            Ok(vec![])
+        }
+
+        async fn save_transcript(
+            &self,
+            session_id: &str,
+            messages: &[Message],
+        ) -> crate::error::Result<()> {
+            let lock_was_free = self.probe_sessions.as_ref().map(|m| m.try_write().is_ok());
+            self.saves.lock().unwrap().push((
+                session_id.to_string(),
+                messages.len(),
+                lock_was_free,
+            ));
+            Ok(())
+        }
+
+        async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_config() -> crate::config::Config {
+        crate::config::Config {
+            workspace: PathBuf::from("."),
+            api_base: String::new(),
+            api_key: None,
+            model: String::new(),
+            provider_type: "openai".into(),
+            preset: None,
+            max_steps: 32,
+            max_tokens: 65536,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 2,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 8,
+            shell_timeout_secs: 300,
+            headless: false,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+            wall_timeout_secs: 0,
+        }
+    }
+
+    /// A session whose transcript is `n` user/assistant exchanges plus a
+    /// trailing system prompt, so two sessions have distinguishable saves.
+    fn test_session(id: &str, exchanges: usize) -> SessionState {
+        let provider: Arc<dyn ChatProvider> = Arc::new(MockProvider::new(vec![Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let mut runtime = AgentRuntimeBuilder::new()
+            .llm(provider)
+            .system_prompt(format!("system-for-{id}"))
+            .build()
+            .expect("runtime build must succeed");
+        let mut transcript = Vec::new();
+        for i in 0..exchanges {
+            transcript.push(Message {
+                role: Role::User,
+                content: format!("{id}-user-{i}"),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            });
+            transcript.push(Message {
+                role: Role::Assistant,
+                content: format!("{id}-assistant-{i}"),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            });
+        }
+        runtime.set_transcript(transcript);
+
+        SessionState {
+            id: id.to_string(),
+            created_at: "2026-09-27T00:00:00Z".to_string(),
+            title: None,
+            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
+            prompt_tokens: Arc::new(AtomicU64::new(0)),
+            completion_tokens: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    async fn test_state(
+        storage: Arc<dyn StorageBackend>,
+        sessions: Arc<RwLock<SessionsMap>>,
+    ) -> AppState {
+        AppState {
+            tools: vec![],
+            tool_registry: crate::tools::ToolRegistry::local(),
+            config: test_config(),
+            provider: Arc::new(MockProvider::new(vec![])),
+            sessions,
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
+            admission: Arc::new(AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                Arc::new(AtomicU64::new(0)),
+            )),
+            rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage,
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_persists_each_sessions_transcript_outside_the_lock() {
+        let sessions: Arc<RwLock<SessionsMap>> = Arc::new(RwLock::new(HashMap::new()));
+        let storage = RecordingStorage::with_probe(sessions.clone());
+        let state = test_state(storage.clone(), sessions.clone()).await;
+
+        state
+            .sessions
+            .write()
+            .await
+            .insert("s-a".into(), test_session("s-a", 2));
+        state
+            .sessions
+            .write()
+            .await
+            .insert("s-b".into(), test_session("s-b", 1));
+
+        let evicted = evict_idle_sessions(&state).await;
+        let mut ids = evicted.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["s-a", "s-b"], "both idle sessions must evict");
+
+        let mut saves = storage.saves();
+        saves.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(saves.len(), 2, "exactly one save per evicted session");
+        // Per-session isolation: each save carries that session's exchange
+        // count (2 user+assistant pairs for s-a, 1 for s-b), never a mix.
+        assert_eq!(saves[0].0, "s-a");
+        assert_eq!(saves[0].1, 4, "s-a transcript must hold its own 4 messages");
+        assert_eq!(saves[1].0, "s-b");
+        assert_eq!(saves[1].1, 2, "s-b transcript must hold its own 2 messages");
+        // Lock-scope rule: every save observed the sessions map writable.
+        for (id, _, lock_was_free) in &saves {
+            assert_eq!(
+                *lock_was_free,
+                Some(true),
+                "save for {id} must run outside the sessions write lock"
+            );
+        }
+        assert!(
+            state.sessions.read().await.is_empty(),
+            "evicted sessions must be gone from the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_skips_persistence_for_busy_session() {
+        let sessions: Arc<RwLock<SessionsMap>> = Arc::new(RwLock::new(HashMap::new()));
+        let storage = RecordingStorage::new();
+        let state = test_state(storage.clone(), sessions.clone()).await;
+
+        state
+            .sessions
+            .write()
+            .await
+            .insert("busy".into(), test_session("busy", 1));
+        // Hold the runtime lock — an in-flight turn. Clone the Arc so the
+        // sessions read guard drops before the sweep (else the sweep's
+        // write lock would deadlock against this test's read lock).
+        let rt_arc = state
+            .sessions
+            .read()
+            .await
+            .get("busy")
+            .unwrap()
+            .runtime
+            .clone();
+        let _guard = rt_arc.lock().await;
+
+        let evicted = evict_idle_sessions(&state).await;
+        assert_eq!(evicted, vec!["busy"], "busy session is still evicted");
+        assert!(
+            storage.saves().is_empty(),
+            "no transcript must be persisted while the runtime lock is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_all_persists_and_drains_every_session() {
+        let sessions: Arc<RwLock<SessionsMap>> = Arc::new(RwLock::new(HashMap::new()));
+        let storage = RecordingStorage::with_probe(sessions.clone());
+        let state = test_state(storage.clone(), sessions.clone()).await;
+
+        state
+            .sessions
+            .write()
+            .await
+            .insert("f-1".into(), test_session("f-1", 1));
+        state
+            .sessions
+            .write()
+            .await
+            .insert("f-2".into(), test_session("f-2", 3));
+
+        let persisted = flush_all_sessions(&state).await;
+        assert_eq!(persisted, 2, "both live sessions must be persisted");
+
+        let mut saves = storage.saves();
+        saves.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(saves[0].0, "f-1");
+        assert_eq!(saves[0].1, 2);
+        assert_eq!(saves[1].0, "f-2");
+        assert_eq!(saves[1].1, 6);
+        assert!(
+            saves.iter().all(|(_, _, free)| *free == Some(true)),
+            "shutdown flush saves must also run outside the sessions lock"
+        );
+        assert!(
+            state.sessions.read().await.is_empty(),
+            "flush must drain the session map"
+        );
     }
 }
