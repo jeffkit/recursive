@@ -662,7 +662,10 @@ impl AgentRuntime {
             mailbox: None,
             turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
             prompt_segments: self.prompt_segments.clone(),
-            wall_timeout_secs: 0,
+            // Goal 399: seed the per-turn context from the kernel-level
+            // budget (set via `AgentRuntimeBuilder::wall_timeout_secs`).
+            // `AgentKernel::run` resolves the effective value; 0 = unlimited.
+            wall_timeout_secs: self.kernel.wall_timeout_secs,
         };
 
         let turn_outcome = self.kernel.run(ctx).await?;

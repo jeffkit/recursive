@@ -163,6 +163,10 @@ pub(super) async fn run_agent(
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (env-overridable
+        // via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into state.config at
+        // server startup). Exceeding it finishes with WallClockExceeded.
+        .wall_timeout_secs(state.config.wall_timeout_secs)
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
@@ -284,6 +288,8 @@ pub(super) async fn create_session(
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
+        .wall_timeout_secs(state.config.wall_timeout_secs)
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
@@ -594,6 +600,8 @@ pub(super) async fn fork_session(
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(state.config.max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
+        .wall_timeout_secs(state.config.wall_timeout_secs)
         .build()
         .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
@@ -1695,7 +1703,9 @@ pub(super) async fn agui_run(
         .tools(tool_registry)
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
-        .max_steps(state.config.max_steps);
+        .max_steps(state.config.max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
+        .wall_timeout_secs(state.config.wall_timeout_secs);
 
     // Seed the transcript if we're resuming.
     if let Some(seed) = seed_transcript {

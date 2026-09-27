@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::llm::MockProvider;
 
@@ -410,4 +409,138 @@ fn turn_outcome_default_values() {
     assert_eq!(outcome.usage, TokenUsage::default());
     assert_eq!(outcome.llm_latency_ms, 0);
     assert_eq!(outcome.steps, 0);
+}
+
+// -- Goal 399: wall_timeout_secs wiring --------------------------------------
+
+/// Provider that stalls before its first N responses (delegates to a
+/// scripted `MockProvider` afterwards). Lets tests drive the wall-clock
+/// deadline deterministically without real time budgets beyond ~2s.
+struct SlowFirstCallProvider {
+    inner: MockProvider,
+    delay: std::time::Duration,
+    remaining_slow_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::llm::ChatProvider for SlowFirstCallProvider {
+    async fn complete(
+        &self,
+        messages: &[crate::message::Message],
+        tools: &[crate::llm::ToolSpec],
+    ) -> crate::error::Result<crate::llm::Completion> {
+        use std::sync::atomic::Ordering;
+        if self.remaining_slow_calls.fetch_sub(1, Ordering::SeqCst) > 0 {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.complete(messages, tools).await
+    }
+}
+
+/// Trivial registered tool so a scripted completion can request a second
+/// step (the wall deadline is checked at the top of each step).
+struct NoopTool;
+
+#[async_trait::async_trait]
+impl crate::tools::Tool for NoopTool {
+    fn spec(&self) -> crate::llm::ToolSpec {
+        crate::llm::ToolSpec {
+            name: "noop".into(),
+            description: "does nothing".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+        Ok("ok".into())
+    }
+}
+
+fn slow_provider(
+    script: Vec<crate::llm::Completion>,
+    slow_calls: usize,
+) -> Arc<SlowFirstCallProvider> {
+    Arc::new(SlowFirstCallProvider {
+        inner: MockProvider::new(script),
+        delay: std::time::Duration::from_secs(2),
+        remaining_slow_calls: std::sync::atomic::AtomicUsize::new(slow_calls),
+    })
+}
+
+fn two_tool_call_script() -> Vec<crate::llm::Completion> {
+    let tool_call = |id: &str| crate::llm::ToolCall {
+        id: id.into(),
+        name: "noop".into(),
+        arguments: serde_json::json!({}),
+    };
+    vec![
+        crate::llm::Completion {
+            content: "step".into(),
+            tool_calls: vec![tool_call("c1")],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        crate::llm::Completion {
+            content: "again".into(),
+            tool_calls: vec![tool_call("c2")],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ]
+}
+
+/// Goal 399: the kernel-level budget is the DEFAULT for turns whose context
+/// leaves `wall_timeout_secs` at 0 — the exact shape the runtime wrapper
+/// produces after `AgentRuntimeBuilder::wall_timeout_secs`.
+#[tokio::test]
+async fn kernel_wall_budget_fires_when_ctx_leaves_it_zero() {
+    let kernel = AgentKernel::builder()
+        .llm(slow_provider(two_tool_call_script(), 1) as Arc<dyn ChatProvider>)
+        .tools(ToolRegistry::local().register(Arc::new(NoopTool)))
+        .max_steps(10)
+        .wall_timeout_secs(1)
+        .build()
+        .expect("build");
+
+    let ctx = make_minimal_ctx(vec![Message::user("go".to_string())]);
+    assert_eq!(ctx.wall_timeout_secs, 0, "precondition: ctx unset");
+    let outcome = kernel.run(ctx).await.expect("wall finish is Ok data");
+    assert!(matches!(
+        outcome.finish_reason,
+        crate::agent::FinishReason::WallClockExceeded { secs: 1 }
+    ));
+}
+
+/// Goal 399: an explicit per-turn `ctx.wall_timeout_secs` wins over the
+/// kernel-level default (1s ctx budget fires even though kernel allows 60s).
+#[tokio::test]
+async fn kernel_ctx_budget_overrides_kernel_default() {
+    let kernel = AgentKernel::builder()
+        .llm(slow_provider(two_tool_call_script(), 1) as Arc<dyn ChatProvider>)
+        .tools(ToolRegistry::local().register(Arc::new(NoopTool)))
+        .max_steps(10)
+        .wall_timeout_secs(60)
+        .build()
+        .expect("build");
+
+    let mut ctx = make_minimal_ctx(vec![Message::user("go".to_string())]);
+    ctx.wall_timeout_secs = 1;
+    let outcome = kernel.run(ctx).await.expect("wall finish is Ok data");
+    assert!(matches!(
+        outcome.finish_reason,
+        crate::agent::FinishReason::WallClockExceeded { secs: 1 }
+    ));
+}
+
+/// Goal 399: builder default is 0 (unlimited) — the legacy contract.
+#[test]
+fn kernel_builder_wall_timeout_default_is_zero() {
+    let builder = AgentKernelBuilder::default();
+    assert_eq!(builder.wall_timeout_secs, 0);
+    let kernel = builder
+        .llm(Arc::new(MockProvider::new(vec![])) as Arc<dyn ChatProvider>)
+        .build()
+        .expect("build");
+    assert_eq!(kernel.wall_timeout_secs, 0);
 }

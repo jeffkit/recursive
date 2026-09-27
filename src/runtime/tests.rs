@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::hooks::HookRegistry;
 use crate::llm::{Completion, MockProvider};
@@ -2224,4 +2223,27 @@ async fn cross_turn_compaction_reinjects_plan_and_todos() {
         plan_idx < todo_idx,
         "plan attachment must come before todo attachment"
     );
+}
+
+// ── Goal 399: wall_timeout_secs forwarding ─────────────────────────────────
+
+#[test]
+fn runtime_builder_forwards_wall_timeout_to_kernel() {
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .tools(ToolRegistry::local())
+        .wall_timeout_secs(7)
+        .build()
+        .expect("runtime build");
+    assert_eq!(runtime.kernel.wall_timeout_secs, 7);
+}
+
+#[test]
+fn runtime_builder_wall_timeout_defaults_to_zero() {
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .tools(ToolRegistry::local())
+        .build()
+        .expect("runtime build");
+    assert_eq!(runtime.kernel.wall_timeout_secs, 0);
 }

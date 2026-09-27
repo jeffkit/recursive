@@ -114,6 +114,32 @@ pub fn now_session_ms() -> u64 {
     session_epoch().elapsed().as_millis() as u64
 }
 
+/// Goal 399: safe default execution budgets for sessions created over HTTP.
+///
+/// Returns `(max_steps, wall_timeout_secs)` as plain numbers so callers can
+/// apply them through the normal `AgentRuntimeBuilder` setters. Precedence:
+/// explicit env override → safe default; an explicit `0` disables the
+/// respective limit (compatibility escape hatch back to unbounded runs).
+///
+/// - `RECURSIVE_HTTP_MAX_STEPS` (default 100) — caps LLM steps per run.
+/// - `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` (default 1800) — wall-clock budget
+///   per turn; exceeding it finishes with `FinishReason::WallClockExceeded`
+///   (data, not an error — invariant #7).
+///
+/// These defaults apply only to HTTP-created sessions; CLI/TUI assembly is
+/// unaffected (they keep `Config::wall_timeout_secs` / `Config::max_steps`).
+pub fn http_session_budget_from_env() -> (usize, u64) {
+    fn parse_env_or(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+    let max_steps = parse_env_or("RECURSIVE_HTTP_MAX_STEPS", 100) as usize;
+    let wall_timeout_secs = parse_env_or("RECURSIVE_HTTP_WALL_TIMEOUT_SECS", 1800);
+    (max_steps, wall_timeout_secs)
+}
+
 /// Serialized session info for list/detail endpoints.
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct SessionInfo {
@@ -1186,5 +1212,47 @@ mod goal_272_route_level_auth_bypass {
             protected_end.contains("rate_limit_middleware"),
             "protected sub-router must include rate_limit_middleware layer"
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::http_session_budget_from_env;
+
+    /// Goal 399: safe defaults, explicit env overrides, the explicit-0
+    /// escape hatch, and garbage-value leniency. Kept as ONE test because
+    /// both env vars are process globals: parallel assertions on the same
+    /// pair would race (same pattern as the `effective_step_limit_*` env
+    /// tests in run_core.rs).
+    #[test]
+    fn http_session_budget_defaults_env_overrides_and_zero_escape() {
+        // 1) Defaults with both vars unset.
+        std::env::remove_var("RECURSIVE_HTTP_MAX_STEPS");
+        std::env::remove_var("RECURSIVE_HTTP_WALL_TIMEOUT_SECS");
+        assert_eq!(
+            http_session_budget_from_env(),
+            (100, 1800),
+            "defaults must be max_steps=100, wall=1800s"
+        );
+
+        // 2) Explicit overrides are honoured.
+        std::env::set_var("RECURSIVE_HTTP_MAX_STEPS", "42");
+        std::env::set_var("RECURSIVE_HTTP_WALL_TIMEOUT_SECS", "77");
+        assert_eq!(http_session_budget_from_env(), (42, 77));
+
+        // 3) Explicit 0 restores unbounded execution (compat switch).
+        std::env::set_var("RECURSIVE_HTTP_MAX_STEPS", "0");
+        std::env::set_var("RECURSIVE_HTTP_WALL_TIMEOUT_SECS", "0");
+        assert_eq!(http_session_budget_from_env(), (0, 0));
+
+        // 4) Unparseable/empty values fall back to the safe defaults instead
+        //    of failing startup (mirrors `rate_limiter_from_env` leniency).
+        std::env::set_var("RECURSIVE_HTTP_MAX_STEPS", "not-a-number");
+        std::env::set_var("RECURSIVE_HTTP_WALL_TIMEOUT_SECS", "");
+        assert_eq!(http_session_budget_from_env(), (100, 1800));
+
+        // Restore so unrelated tests observe a clean environment.
+        std::env::remove_var("RECURSIVE_HTTP_MAX_STEPS");
+        std::env::remove_var("RECURSIVE_HTTP_WALL_TIMEOUT_SECS");
     }
 }

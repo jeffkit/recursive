@@ -461,6 +461,9 @@ pub(crate) async fn build_runtime(
         .system_prompt(&assembled.full)
         .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
+        // Goal 399: `RECURSIVE_WALL_TIMEOUT_SECS` now reaches the agent loop —
+        // previously parsed into Config but never consumed anywhere.
+        .wall_timeout_secs(config.wall_timeout_secs)
         .streaming(stream)
         .stuck_window(config.stuck_window)
         .stuck_error_rate(config.stuck_error_rate)

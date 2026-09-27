@@ -308,15 +308,22 @@ pub struct AgentPool {
     provider: Arc<dyn ChatProvider>,
     memory: SharedMemory,
     bus: MessageBus,
+    /// Goal 399: wall-clock budget (seconds) inherited from the parent
+    /// session's `Config`. Sub-agents previously ran with `0` (unlimited),
+    /// so a wide manifest could pin admission permits indefinitely; they now
+    /// inherit the parent's budget so the pool can never outlive the session
+    /// that spawned it. 0 = parent was unlimited → sub-agents stay unlimited.
+    wall_timeout_secs: u64,
 }
 
 impl AgentPool {
-    pub fn new(provider: Arc<dyn ChatProvider>, _config: Config) -> Self {
+    pub fn new(provider: Arc<dyn ChatProvider>, config: Config) -> Self {
         Self {
             roles: HashMap::new(),
             provider,
             memory: SharedMemory::new(),
             bus: MessageBus::new(),
+            wall_timeout_secs: config.wall_timeout_secs,
         }
     }
 
@@ -371,6 +378,7 @@ impl AgentPool {
         let kernel = AgentKernel::builder()
             .llm(self.provider.clone())
             .max_steps(role.max_steps)
+            .wall_timeout_secs(self.wall_timeout_secs)
             .build()?;
 
         let ctx = TurnContext {
@@ -387,7 +395,9 @@ impl AgentPool {
             mailbox: None,
             turn: 0,
             prompt_segments: None,
-            wall_timeout_secs: 0,
+            // Goal 399: sub-agents inherit the parent session's wall-clock
+            // budget (never unlimited while the parent is bounded).
+            wall_timeout_secs: self.wall_timeout_secs,
         };
 
         kernel.run(ctx).await
@@ -657,7 +667,7 @@ mod tests {
     use crate::llm::{Completion, MockProvider};
     use std::path::PathBuf;
 
-    fn test_config() -> Config {
+    pub(super) fn test_config() -> Config {
         Config {
             workspace: PathBuf::from("."),
             api_base: String::new(),
@@ -1284,6 +1294,149 @@ mod tests {
             result.names(),
             initial_names,
             "disabled subagent must not register any additional tools"
+        );
+    }
+}
+
+// ── Goal 399: sub-agents inherit the parent session's wall-clock budget ────
+
+#[cfg(test)]
+mod wall_budget_tests {
+    use super::*;
+    use crate::llm::{Completion, MockProvider, ToolCall};
+
+    /// Provider that stalls before its first N responses, then delegates to
+    /// a scripted `MockProvider`. Deterministically drives the wall-clock
+    /// deadline past a 1s budget without long real sleeps.
+    struct SlowFirstCallProvider {
+        inner: MockProvider,
+        delay: std::time::Duration,
+        remaining_slow_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for SlowFirstCallProvider {
+        async fn complete(
+            &self,
+            messages: &[Message],
+            tools: &[crate::llm::ToolSpec],
+        ) -> crate::error::Result<Completion> {
+            use std::sync::atomic::Ordering;
+            if self.remaining_slow_calls.fetch_sub(1, Ordering::SeqCst) > 0 {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.complete(messages, tools).await
+        }
+    }
+
+    fn slow_provider(script: Vec<Completion>, slow_calls: usize) -> Arc<dyn ChatProvider> {
+        Arc::new(SlowFirstCallProvider {
+            inner: MockProvider::new(script),
+            delay: std::time::Duration::from_secs(2),
+            remaining_slow_calls: std::sync::atomic::AtomicUsize::new(slow_calls),
+        })
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            // Deliberately unregistered: the dispatch error must NOT end the
+            // turn — the loop continues to the next step boundary, where the
+            // wall check fires.
+            name: "definitely_not_registered".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn pool_with_budget(budget: u64, script: Vec<Completion>, slow_calls: usize) -> AgentPool {
+        // Reuse the shared fixture from the sibling `tests` module.
+        let mut config = super::tests::test_config();
+        config.wall_timeout_secs = budget;
+        let pool = AgentPool::new(slow_provider(script, slow_calls), config);
+        assert_eq!(
+            pool.wall_timeout_secs, budget,
+            "pool must inherit the parent budget"
+        );
+        pool
+    }
+
+    fn add_harness_role(pool: &mut AgentPool) {
+        pool.add_role(AgentRole {
+            name: "harness".into(),
+            system_prompt: "test".into(),
+            max_steps: 10,
+            allowed_tools: vec![],
+        });
+    }
+
+    /// Goal 399: a sub-agent under a 1s parent budget that stalls 2s
+    /// mid-turn finishes with `WallClockExceeded { secs: 1 }` — sub-agents
+    /// are never unbounded while the parent is bounded.
+    #[tokio::test]
+    async fn run_with_role_inherits_parent_wall_timeout() {
+        let script = vec![
+            Completion {
+                content: "stalling".into(),
+                tool_calls: vec![tool_call("c1")],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "again".into(),
+                tool_calls: vec![tool_call("c2")],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ];
+        let mut pool = pool_with_budget(1, script, 1);
+        add_harness_role(&mut pool);
+
+        let outcome = pool
+            .run_with_role("harness", "go")
+            .await
+            .expect("wall finish is Ok data, not an error");
+        assert!(
+            matches!(
+                outcome.finish_reason,
+                crate::agent::FinishReason::WallClockExceeded { secs: 1 }
+            ),
+            "sub-agent must inherit the 1s parent budget; got {:?}",
+            outcome.finish_reason
+        );
+    }
+
+    /// Goal 399: budget 0 (parent unlimited) keeps the legacy behaviour —
+    /// the same stalled script runs to normal completion.
+    #[tokio::test]
+    async fn run_with_role_zero_budget_stays_unlimited() {
+        let script = vec![
+            Completion {
+                content: "stalling".into(),
+                tool_calls: vec![tool_call("c1")],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ];
+        let mut pool = pool_with_budget(0, script, 1);
+        add_harness_role(&mut pool);
+
+        let outcome = pool
+            .run_with_role("harness", "go")
+            .await
+            .expect("unlimited budget must complete normally");
+        assert_eq!(
+            outcome.finish_reason,
+            crate::agent::FinishReason::NoMoreToolCalls
         );
     }
 }

@@ -159,7 +159,7 @@ which mode it's in; the runtime decides how to chain turns.
 
 | Owned by | State | Lifetime |
 |---|---|---|
-| `AgentKernel` | `llm`, `tools`, `compactor`, `hooks`, `storage`, `session_store`, `max_steps`, `max_transcript_chars`, `stuck_window` config | Process / runtime |
+| `AgentKernel` | `llm`, `tools`, `compactor`, `hooks`, `storage`, `session_store`, `max_steps`, `max_transcript_chars`, `stuck_window`, `wall_timeout_secs` config | Process / runtime |
 | `AgentRuntime` | `transcript`, `event_sink`, `streaming`, `compactor`, `message_queue`, `deferred_turn_finished`, `goal_eval_transcript_tail` | One session |
 | `AgentRuntime::checkpoints: CheckpointState` | `session_id`, `turn_index`, `shadow`, `writer`, `touched_files`, `log_path` | One session, only after `enable_checkpoints` |
 | `AgentRuntime` Arc-shared | `todo_list`, `plan_approval_gate`, `plan_mode_request_gate`, `goal_state` | One session, but `Arc`-cloned out so tools / handlers can mutate without `&mut self` |

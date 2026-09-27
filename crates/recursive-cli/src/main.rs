@@ -737,6 +737,16 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
+            // Goal 399: HTTP sessions get safe execution budgets by default
+            // (`RECURSIVE_HTTP_MAX_STEPS`=100, `RECURSIVE_HTTP_WALL_TIMEOUT_SECS`=1800;
+            // an explicit 0 restores unbounded). Applied to the server's config
+            // copy so every runtime built from `AppState` — and the sub-agent
+            // pool registered below — inherits the same budget.
+            let (http_max_steps, http_wall_timeout_secs) =
+                recursive::http::http_session_budget_from_env();
+            let mut config = config;
+            config.max_steps = http_max_steps;
+            config.wall_timeout_secs = http_wall_timeout_secs;
             let (tools, _) = cli::builder::build_tools(&config, None).await;
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
@@ -1974,6 +1984,8 @@ async fn run_loop(
         .system_prompt(&assembled.full)
         .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
+        // Goal 399: `RECURSIVE_WALL_TIMEOUT_SECS` now reaches the agent loop.
+        .wall_timeout_secs(config.wall_timeout_secs)
         .streaming(stream)
         .shutdown_token(shutdown.clone());
     if let Some(n) = max_transcript_chars {

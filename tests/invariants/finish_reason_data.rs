@@ -18,6 +18,8 @@
 //   the self-improve flow's auto-resume)
 
 use recursive::agent::FinishReason;
+use recursive::llm::{Completion, MockProvider, ToolCall};
+use std::sync::Arc;
 
 // ── Serde round-trip ───────────────────────────────────────────────────────
 
@@ -45,6 +47,7 @@ fn finish_reason_serde_roundtrip() {
         },
         FinishReason::Cancelled,
         FinishReason::PermissionDenialLimit,
+        FinishReason::WallClockExceeded { secs: 1 },
     ];
 
     for reason in &variants {
@@ -94,6 +97,10 @@ fn finish_reason_display_is_stable() {
     assert_eq!(
         FinishReason::PermissionDenialLimit.to_string(),
         "permission_denial_limit"
+    );
+    assert_eq!(
+        FinishReason::WallClockExceeded { secs: 1 }.to_string(),
+        "wall_clock_exceeded:1"
     );
 }
 
@@ -179,4 +186,177 @@ fn finish_reason_deserializes_known_formats() {
     let reason: FinishReason =
         serde_json::from_str(json).expect("must deserialize permission_denial_limit");
     assert_eq!(reason, FinishReason::PermissionDenialLimit);
+}
+
+// ── Goal 399: WallClockExceeded stays data through the full runtime ────────
+
+/// A provider that stalls before its first `complete()` response, then
+/// delegates to a scripted [`MockProvider`]. Models a hung/slow LLM call so
+/// the wall-clock deadline (Goal 345, wired through in Goal 399) fires
+/// mid-loop on the next step boundary.
+struct SlowFirstCallProvider {
+    inner: MockProvider,
+    delay: std::time::Duration,
+    remaining_slow_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl recursive::llm::ChatProvider for SlowFirstCallProvider {
+    async fn complete(
+        &self,
+        messages: &[recursive::message::Message],
+        tools: &[recursive::llm::ToolSpec],
+    ) -> recursive::error::Result<recursive::llm::Completion> {
+        use std::sync::atomic::Ordering;
+        if self.remaining_slow_calls.fetch_sub(1, Ordering::SeqCst) > 0 {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.complete(messages, tools).await
+    }
+}
+
+/// A trivial tool so the scripted loop can request a second step (the wall
+/// deadline is checked at the top of each step — a turn that ends on step 0
+/// can never observe it).
+struct NoopTool;
+
+#[async_trait::async_trait]
+impl recursive::tools::Tool for NoopTool {
+    fn spec(&self) -> recursive::llm::ToolSpec {
+        recursive::llm::ToolSpec {
+            name: "noop".into(),
+            description: "does nothing".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn execute(&self, _args: serde_json::Value) -> recursive::error::Result<String> {
+        Ok("ok".into())
+    }
+}
+
+/// Core Goal 399 assertion (invariant #7): with `wall_timeout_secs` wired
+/// through the runtime builder, a turn that outlives its wall-clock budget
+/// returns `Ok(RuntimeOutcome { finish_reason: WallClockExceeded { .. } })` —
+/// NOT `Err` — and the transcript survives for persistence / auto-resume.
+#[tokio::test]
+async fn wall_clock_exceeded_is_data_not_error_and_transcript_is_kept() {
+    use recursive::runtime::AgentRuntime;
+    use recursive::tools::ToolRegistry;
+
+    // Script: call 1 returns (after a 2s stall) a tool call so the loop
+    // continues; call 2 returns immediately with another tool call. The
+    // top-of-step wall check at step 1 then sees elapsed ≥ 2s > 1s budget.
+    let tool_call = |id: &str| ToolCall {
+        id: id.into(),
+        name: "noop".into(),
+        arguments: serde_json::json!({}),
+    };
+    let script = vec![
+        Completion {
+            content: "stalling".into(),
+            tool_calls: vec![tool_call("c1")],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "again".into(),
+            tool_calls: vec![tool_call("c2")],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+    let provider = SlowFirstCallProvider {
+        inner: MockProvider::new(script),
+        delay: std::time::Duration::from_secs(2),
+        remaining_slow_calls: std::sync::atomic::AtomicUsize::new(1),
+    };
+
+    let tools = ToolRegistry::local().register(Arc::new(NoopTool));
+    let mut runtime = AgentRuntime::builder()
+        .llm(Arc::new(provider))
+        .tools(tools)
+        .system_prompt("test agent")
+        .max_steps(10)
+        .wall_timeout_secs(1)
+        .build()
+        .expect("runtime builds");
+
+    let result = runtime.run("stall then loop").await;
+
+    // The budget must terminate the turn as DATA, not as an error.
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(e) => panic!("invariant #7 violation: wall-clock timeout became an error: {e}"),
+    };
+    assert_eq!(
+        outcome.finish_reason,
+        FinishReason::WallClockExceeded { secs: 1 },
+        "expected WallClockExceeded, got {:?}",
+        outcome.finish_reason
+    );
+
+    // Transcript must survive so persistence / auto-resume still work.
+    assert!(
+        !runtime.transcript().is_empty(),
+        "transcript must survive a wall-clock timeout"
+    );
+}
+
+/// Goal 399: `wall_timeout_secs(0)` preserves today's behaviour exactly —
+/// the same stalled-provider script that trips a 1s budget runs to normal
+/// completion when the budget is 0 (unlimited).
+#[tokio::test]
+async fn wall_timeout_zero_keeps_legacy_unlimited_behaviour() {
+    use recursive::runtime::AgentRuntime;
+    use recursive::tools::ToolRegistry;
+
+    // Same shape as the firing script, but the second call ends the turn
+    // cleanly; with 0 = unlimited the wall check never interferes.
+    let tool_call = ToolCall {
+        id: "c1".into(),
+        name: "noop".into(),
+        arguments: serde_json::json!({}),
+    };
+    let script = vec![
+        Completion {
+            content: "stalling".into(),
+            tool_calls: vec![tool_call],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+    let provider = SlowFirstCallProvider {
+        inner: MockProvider::new(script),
+        delay: std::time::Duration::from_secs(2),
+        remaining_slow_calls: std::sync::atomic::AtomicUsize::new(1),
+    };
+
+    let mut runtime = AgentRuntime::builder()
+        .llm(Arc::new(provider))
+        .tools(ToolRegistry::local().register(Arc::new(NoopTool)))
+        .system_prompt("test agent")
+        .max_steps(10)
+        .wall_timeout_secs(0)
+        .build()
+        .expect("runtime builds");
+
+    let outcome = runtime
+        .run("stall but unlimited")
+        .await
+        .expect("0 budget must keep legacy unlimited behaviour (no wall finish)");
+    assert_eq!(
+        outcome.finish_reason,
+        FinishReason::NoMoreToolCalls,
+        "0 budget must never produce WallClockExceeded"
+    );
 }

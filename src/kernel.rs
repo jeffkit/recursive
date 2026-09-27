@@ -196,6 +196,10 @@ pub struct AgentKernel {
     pub(crate) stuck_error_rate: f64,
     /// Goal-318: Globs-mode skills passed to `SkillInjector` each run.
     pub(crate) globs_skills: Vec<crate::skills::Skill>,
+    /// Goal 399: session wall-clock budget in seconds. Serves as the default
+    /// for [`TurnContext::wall_timeout_secs`] when the caller leaves it at 0.
+    /// 0 = unlimited (legacy behaviour, unchanged).
+    pub(crate) wall_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -297,6 +301,16 @@ impl AgentKernel {
     pub async fn run(&self, ctx: TurnContext) -> crate::error::Result<TurnOutcome> {
         let input_len = ctx.messages.len();
 
+        // Goal 399: resolve the effective wall-clock budget. An explicit
+        // per-turn `ctx.wall_timeout_secs` wins when non-zero; otherwise the
+        // kernel-level budget (set via `AgentKernelBuilder::wall_timeout_secs`)
+        // applies. 0 on both = unlimited (legacy behaviour).
+        let wall_timeout_secs = if ctx.wall_timeout_secs > 0 {
+            ctx.wall_timeout_secs
+        } else {
+            self.wall_timeout_secs
+        };
+
         let core = {
             use crate::run_core::{RunCore, StaticBreakdownCache};
             // Goal-328: size the static breakdown cache from the provided
@@ -334,8 +348,8 @@ impl AgentKernel {
                 static_breakdown,
                 last_prompt_tokens: 0,
                 consecutive_compact_failures: 0,
-                wall_timeout_secs: ctx.wall_timeout_secs,
-                wall_start: if ctx.wall_timeout_secs > 0 {
+                wall_timeout_secs,
+                wall_start: if wall_timeout_secs > 0 {
                     Some(std::time::Instant::now())
                 } else {
                     None
@@ -414,6 +428,8 @@ pub struct AgentKernelBuilder {
     stuck_error_rate: Option<f64>,
     /// Goal-318: Globs-mode skills.
     globs_skills: Vec<crate::skills::Skill>,
+    /// Goal 399: session wall-clock budget in seconds (default 0 = unlimited).
+    wall_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -459,6 +475,16 @@ impl AgentKernelBuilder {
     /// Set the maximum number of LLM calls per turn.
     pub fn max_steps(mut self, n: usize) -> Self {
         self.max_steps = Some(n);
+        self
+    }
+
+    /// Goal 399: set the session wall-clock budget in seconds (default 0 =
+    /// unlimited, preserving the existing contract). When > 0, a turn that
+    /// runs longer finishes with
+    /// [`FinishReason::WallClockExceeded`](crate::agent::FinishReason::WallClockExceeded)
+    /// — data, not an error (invariant #7).
+    pub fn wall_timeout_secs(mut self, secs: u64) -> Self {
+        self.wall_timeout_secs = secs;
         self
     }
 
@@ -567,6 +593,7 @@ impl AgentKernelBuilder {
             stuck_window: self.stuck_window.unwrap_or(10),
             stuck_error_rate: self.stuck_error_rate.unwrap_or(0.8),
             globs_skills: self.globs_skills,
+            wall_timeout_secs: self.wall_timeout_secs,
         })
     }
 
