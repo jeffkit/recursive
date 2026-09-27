@@ -420,6 +420,11 @@ The terminal UI is in `crates/recursive-tui/`. For an experience-level
 comparison against fake-cc (Claude Code-style baseline), see
 [docs/tui-fake-cc-gap.md](docs/tui-fake-cc-gap.md).
 
+## Docs
+
+- [LLM gateway compatibility](docs/llm-gateway-compat.md) — known traps with
+  new-api/one-api/Bedrock (#15/#16/#17).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

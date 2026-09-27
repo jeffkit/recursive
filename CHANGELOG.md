@@ -20,6 +20,9 @@
   TOML/JSON parsing) on every render frame — `App` caches
   `(model_name, pricing)` per model (`pricing_for_model`,
   `pricing_lookup_count()`), the render path reads the cache only (issue #41).
+- Documentation: new `docs/llm-gateway-compat.md` collecting the implicit
+  wire-protocol constraints behind issues #15/#16/#17 (new-api/one-api and
+  Bedrock gateway traps), linked from the README Docs section.
 
 ## 0.8.2
 
