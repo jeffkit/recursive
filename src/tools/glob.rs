@@ -1,6 +1,7 @@
 //! `Glob` tool: find files matching a glob pattern inside the workspace.
 //!
-//! Uses `walkdir` (already in Cargo.toml) to walk the directory tree and
+//! Directory traversal goes through the [`ToolTransport`] (Goal 402) — the
+//! tool asks the execution environment for the candidate file list, then
 //! matches entries using a simple built-in glob matcher that supports
 //! `*` (any characters within a single path component), `**` (any number
 //! of path components), and `?` (exactly one character).
@@ -10,8 +11,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use walkdir::WalkDir;
+use std::sync::Arc;
 
+use super::transport::{retryable_prefix, ToolTransport, WalkOptions};
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
@@ -94,6 +96,10 @@ pub struct GlobTool {
     pub root: PathBuf,
     pub extra_roots: Vec<(PathBuf, AccessTier)>,
     pub session_roots: Option<SharedSandboxRoots>,
+    /// Execution environment this tool traverses. Defaults to
+    /// `LocalTransport`; builders inject the registry's transport so the
+    /// tool follows the session's environment binding (Goal 402).
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl GlobTool {
@@ -102,7 +108,14 @@ impl GlobTool {
             root: root.into(),
             extra_roots: Vec::new(),
             session_roots: None,
+            transport: Arc::new(super::transport::LocalTransport),
         }
+    }
+
+    /// Traverse the workspace through a specific execution environment.
+    pub fn with_transport(mut self, transport: Arc<dyn ToolTransport>) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Append additional allowed sandbox roots. See
@@ -219,12 +232,27 @@ impl Tool for GlobTool {
 
         let mut matches: Vec<String> = Vec::new();
 
-        for entry in WalkDir::new(&scope)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let rel = self.relativise(entry.path());
+        // One walk round-trip through the execution environment (Goal 402).
+        // Default WalkOptions: unbounded depth, no symlink following, and the
+        // shared ignore set (.git / target / node_modules).
+        let entries = self
+            .transport
+            .walk(&scope, &WalkOptions::default())
+            .await
+            .map_err(|e| Error::Tool {
+                name: "Glob".into(),
+                call_id: None,
+                message: format!("{}walk {}: {e}", retryable_prefix(&e), scope.display()),
+            })?;
+
+        for entry in entries {
+            if !entry.is_file {
+                continue;
+            }
+            // Reconstruct the absolute (environment) path so `relativise`
+            // sees the same shape the old in-tool walkdir produced.
+            let abs = scope.join(&entry.path);
+            let rel = self.relativise(&abs);
 
             if glob_matches(pattern, &rel) {
                 matches.push(rel);
@@ -486,5 +514,200 @@ mod tests {
             .unwrap();
         assert!(out.contains("a.rs"), "sub/a.rs must appear in results");
         assert!(!out.contains("b.txt"), "b.txt must be filtered by pattern");
+    }
+
+    // ── Goal 402: Glob goes through the transport ────────────────────────────
+
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::Arc as StdArc;
+
+    /// In-memory "environment": files exist only inside the transport, keyed
+    /// by absolute environment paths.
+    #[derive(Debug, Default)]
+    struct MemoryTransport {
+        files: BTreeMap<PathBuf, Vec<u8>>,
+    }
+
+    impl MemoryTransport {
+        fn with_file(mut self, path: &Path, contents: &[u8]) -> Self {
+            self.files.insert(path.to_path_buf(), contents.to_vec());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl super::super::transport::ToolTransport for MemoryTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "not found"))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn walk(
+            &self,
+            root: &Path,
+            _opts: &super::super::transport::WalkOptions,
+        ) -> std::io::Result<Vec<super::super::transport::WalkEntry>> {
+            Ok(self
+                .files
+                .keys()
+                .filter(|p| p.starts_with(root) && *p != root)
+                .map(|p| super::super::transport::WalkEntry {
+                    path: p.strip_prefix(root).unwrap().to_path_buf(),
+                    is_file: true,
+                    size: 0,
+                })
+                .collect())
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<super::super::transport::ExecResult> {
+            Err(std::io::Error::other("unsupported"))
+        }
+    }
+
+    /// A transport whose walk fails with a transient (timeout) error.
+    #[derive(Debug, Default)]
+    struct TimedOutWalkTransport;
+
+    #[async_trait]
+    impl super::super::transport::ToolTransport for TimedOutWalkTransport {
+        async fn read_file(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn walk(
+            &self,
+            _root: &Path,
+            _opts: &super::super::transport::WalkOptions,
+        ) -> std::io::Result<Vec<super::super::transport::WalkEntry>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "environment unreachable",
+            ))
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<super::super::transport::ExecResult> {
+            Err(std::io::Error::other("unsupported"))
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_traverses_through_transport_not_host_fs() {
+        // Host workspace stays EMPTY — the tree lives only in the transport.
+        let host = TempDir::new().unwrap();
+        let transport = MemoryTransport::default()
+            .with_file(&host.path().join("src/a.rs"), b"fn a() {}\n")
+            .with_file(&host.path().join("src/b.txt"), b"not rust\n");
+        let tool = GlobTool::new(host.path()).with_transport(StdArc::new(transport));
+
+        let out = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
+        assert_eq!(out, "src/a.rs");
+        assert!(
+            !host.path().join("src").exists(),
+            "traversal must go through the transport — host fs must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_walk_failure_annotates_retryable() {
+        let host = TempDir::new().unwrap();
+        let tool = GlobTool::new(host.path()).with_transport(StdArc::new(TimedOutWalkTransport));
+        let err = tool
+            .execute(json!({"pattern": "**/*.rs"}))
+            .await
+            .unwrap_err();
+        let msg = match err {
+            Error::Tool { message, .. } => message,
+            other => panic!("expected Tool error, got {other:?}"),
+        };
+        assert!(
+            msg.starts_with("retryable: "),
+            "timeout-classified walk failure must be marked retryable, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_ignores_default_dirs_via_local_transport() {
+        let tmp = TempDir::new().unwrap();
+        create_files(&tmp, &["src/a.rs", "target/art.rs", ".git/x.rs"]);
+        let tool = GlobTool::new(tmp.path());
+        let out = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
+        assert!(out.contains("src/a.rs"));
+        assert!(
+            !out.contains("target") && !out.contains(".git"),
+            ".git / target / node_modules must be ignored (got: {out})"
+        );
+    }
+
+    /// Format-consistency pin (Goal 402): on a fixture tree with NO ignored
+    /// dirs, the transport-backed traversal must produce byte-identical
+    /// output to the pre-transport inline walkdir implementation.
+    #[tokio::test]
+    async fn glob_output_identical_to_legacy_walkdir_on_plain_tree() {
+        let tmp = TempDir::new().unwrap();
+        create_files(
+            &tmp,
+            &["src/a.rs", "src/tools/mod.rs", "b.txt", "tests/c.rs"],
+        );
+
+        let tool = GlobTool::new(tmp.path());
+        let new_out = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
+
+        // Legacy reference: the exact pre-Goal-402 execute() body.
+        let pattern = "**/*.rs";
+        let mut legacy: Vec<String> = Vec::new();
+        for entry in walkdir::WalkDir::new(tmp.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let rel = tool.relativise(entry.path());
+            if glob_matches(pattern, &rel) {
+                legacy.push(rel);
+                if legacy.len() >= MAX_RESULTS {
+                    break;
+                }
+            }
+        }
+        legacy.sort();
+        let legacy_out = legacy.join("\n");
+
+        assert_eq!(new_out, legacy_out);
     }
 }

@@ -96,7 +96,8 @@ pub(crate) async fn build_tools(
             Arc::new(
                 GlobTool::new(root)
                     .with_extra_roots(extra_roots.clone())
-                    .with_session_roots(session_roots.clone()),
+                    .with_session_roots(session_roots.clone())
+                    .with_transport(transport.clone()),
             ),
             &["list_dir", "glob"],
         )
@@ -106,7 +107,8 @@ pub(crate) async fn build_tools(
         .register(Arc::new(
             SearchFiles::new(root)
                 .with_extra_roots(extra_roots.clone())
-                .with_session_roots(session_roots.clone()),
+                .with_session_roots(session_roots.clone())
+                .with_transport(transport.clone()),
         ))
         .register(Arc::new(WebFetch::new()))
         .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
@@ -128,7 +130,8 @@ pub(crate) async fn build_tools(
     registry = registry.register(Arc::new(
         CountLines::new(root)
             .with_extra_roots(extra_roots)
-            .with_session_roots(session_roots.clone()),
+            .with_session_roots(session_roots.clone())
+            .with_transport(transport),
     ));
     registry = registry.with_session_roots(session_roots);
     registry = registry

@@ -150,7 +150,7 @@ pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use tool_search::{DeferredCatalog, ToolSearchTool, TOOL_SEARCH_TOOL_NAME};
 pub use transport::{
     DirEntry, EnvironmentCapabilities, ExecResult, LocalTransport, ReadResult, ToolTransport,
-    TransportFailure,
+    TransportFailure, WalkEntry, WalkOptions,
 };
 #[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;

@@ -1,11 +1,16 @@
 //! `count_lines` tool: returns the number of lines in a text file.
 //!
 //! All paths are sandboxed to a workspace root, same as `ReadFile`.
+//! File contents are read through the [`ToolTransport`] (Goal 402), so the
+//! tool counts lines inside whatever execution environment the registry is
+//! bound to — not on the host.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use super::transport::{retryable_prefix, ToolTransport};
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -19,6 +24,10 @@ pub struct CountLines {
     pub root: PathBuf,
     pub extra_roots: Vec<(PathBuf, AccessTier)>,
     pub session_roots: Option<SharedSandboxRoots>,
+    /// Execution environment this tool reads through. Defaults to
+    /// `LocalTransport`; builders inject the registry's transport so the
+    /// tool follows the session's environment binding (Goal 402).
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl CountLines {
@@ -27,7 +36,14 @@ impl CountLines {
             root: root.into(),
             extra_roots: Vec::new(),
             session_roots: None,
+            transport: Arc::new(super::transport::LocalTransport),
         }
+    }
+
+    /// Run file reads through a specific execution environment.
+    pub fn with_transport(mut self, transport: Arc<dyn ToolTransport>) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Append additional allowed sandbox roots. See
@@ -96,13 +112,20 @@ impl Tool for CountLines {
             message: "missing `path`".into(),
         })?;
         let abs = resolve_within_any(&self.all_roots(), path, false)?;
-        let content = tokio::fs::read_to_string(&abs)
+        let bytes = self
+            .transport
+            .read_file(&abs)
             .await
             .map_err(|e| Error::Tool {
                 name: "count_lines".into(),
                 call_id: None,
-                message: format!("{}: {e}", abs.display()),
+                message: format!("{}{}: {e}", retryable_prefix(&e), abs.display()),
             })?;
+        let content = String::from_utf8(bytes).map_err(|e| Error::Tool {
+            name: "count_lines".into(),
+            call_id: None,
+            message: format!("{}: {e}", abs.display()),
+        })?;
         let count = content.lines().count();
         Ok(count.to_string())
     }
@@ -176,6 +199,124 @@ mod tests {
         assert!(
             matches!(res, Err(Error::Tool { .. })),
             "nonexistent file must return Tool error"
+        );
+    }
+
+    // ── Goal 402: count_lines goes through the transport ─────────────────────
+
+    /// In-memory transport: the file only exists inside the "environment".
+    #[derive(Debug, Default)]
+    struct MemoryTransport {
+        files: std::collections::HashMap<PathBuf, Vec<u8>>,
+    }
+
+    impl MemoryTransport {
+        fn with_file(mut self, path: &Path, contents: &[u8]) -> Self {
+            self.files.insert(path.to_path_buf(), contents.to_vec());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl super::super::transport::ToolTransport for MemoryTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "not found"))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<super::super::transport::ExecResult> {
+            Err(std::io::Error::other("unsupported"))
+        }
+    }
+
+    /// A transport whose reads fail with a transient (timeout) error.
+    #[derive(Debug)]
+    struct TimedOutTransport;
+
+    #[async_trait]
+    impl super::super::transport::ToolTransport for TimedOutTransport {
+        async fn read_file(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "environment unreachable",
+            ))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<super::super::transport::ExecResult> {
+            Err(std::io::Error::other("unsupported"))
+        }
+    }
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn count_lines_reads_through_transport_not_host_fs() {
+        // The host tmp dir stays EMPTY — the file lives only in the transport.
+        let host = TempDir::new().unwrap();
+        let tool = CountLines::new(host.path()).with_transport(Arc::new(
+            MemoryTransport::default()
+                .with_file(&host.path().join("test.txt"), b"line1\nline2\nline3\n"),
+        ));
+
+        let out = tool.execute(json!({"path": "test.txt"})).await.unwrap();
+        assert_eq!(out, "3");
+        assert!(
+            !host.path().join("test.txt").exists(),
+            "file must be read via transport — host fs must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_lines_retryable_transport_failure_is_annotated() {
+        let host = TempDir::new().unwrap();
+        let tool = CountLines::new(host.path()).with_transport(Arc::new(TimedOutTransport));
+        let err = tool.execute(json!({"path": "test.txt"})).await.unwrap_err();
+        let msg = match err {
+            Error::Tool { message, .. } => message,
+            other => panic!("expected Tool error, got {other:?}"),
+        };
+        assert!(
+            msg.starts_with("retryable: "),
+            "timeout-classified transport failure must be marked retryable, got: {msg}"
         );
     }
 }
