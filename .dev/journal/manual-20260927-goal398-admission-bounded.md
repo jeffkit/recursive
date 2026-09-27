@@ -93,23 +93,21 @@ retry-after: 1          ← 整数秒
 - `cargo test --workspace` ✅（38 suite，0 failed）
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` ✅
 - `cargo fmt --all` ✅
-- e2e 回归（08-http-api / 08b-http-rate-limit / 19-http-interrupt）：**未能在本机执行——
-  环境阻塞，非本变更问题**。过程记录：
+- e2e 回归 ✅ **三套件全绿**（suiteId，`--filter` 按 e2e.yaml 的 `id` 匹配，非文件名）：
+  `http-api` 21/21、`http-rate-limit` 1/1、`http-interrupt` 3/3，`status=passed` exit 0。
+  过程记录（两条环境坑，均已固化修复）：
   1. 首跑 `argus-init` 失败（exit 5）＝新 worktree 未构建 `e2e/plugins/dist`，
      `cd e2e/plugins && npm install && npm run build` 后 init 通过。
   2. `argus-build` 连续两次在同一层失败（17s 处）：
      `RUN pip3 install --break-system-packages /sdk/python` →
      `ERROR: Could not find a version that satisfies the requirement setuptools>=61.0 (from versions: none)`。
-  3. 定性探针：`docker run --rm python:3.11-slim pip download setuptools` 同样报
+     定性探针：`docker run --rm python:3.11-slim pip download setuptools` 同样报
      `from versions: none`——**Docker VM 当前完全无法访问 PyPI**（同期 deb.debian.org
-     的 apt 下载也退化到 Ign 重试）。约 30 分钟前另一个 worktree（937828b，Goal 399 分支）
-     曾成功构建同一镜像，说明是本机容器网络在近期退化，与本次 diff 无关。
-  4. 替代路径 `e2e-run-host.sh` 按脚本自述目前只覆盖 smoke suite，08/08b/19 不适用。
-  - 补偿验证：`tests/http.rs` 全量 HTTP 集成测试（98 例）+ 本 goal 新增集成用例 +
-    上述真实二进制手工饱和实测，覆盖三个套件回归的核心面（/run、/messages、限流层
-    未动、/agui 语义未动）。环境恢复后可直接补跑：
-    `sh .dev/scripts/e2e-run.sh 08-http-api && sh .dev/scripts/e2e-run.sh 08b-http-rate-limit && sh .dev/scripts/e2e-run.sh 19-http-interrupt`
-    （08 的镜像构建已到最后一层，只差 pip 步骤）。
+     的 apt 下载也退化）。约 30 分钟前另一 worktree（937828b）曾成功构建同一镜像，
+     属本机容器网络近期退化，与本次 diff 无关。
+  3. **修复（本分支附带提交）**：`e2e/Dockerfile` apt 增装 `python3-setuptools`，
+     pip 行改 `--no-build-isolation`（用 apt 的 setuptools，构建期不再访问 PyPI）。
+     镜像构建恢复成功后，三套件以 `--no-build` 跑完。镜像构建从此对 PyPI 故障免疫。
 
 ## Notes
 
