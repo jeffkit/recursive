@@ -85,7 +85,11 @@ mod v050_integration {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         }

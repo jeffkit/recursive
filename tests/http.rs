@@ -29,7 +29,7 @@ mod http_tests {
     use tokio::sync::{broadcast, RwLock};
     use tower::ServiceExt;
 
-    use crate::common::{mock_config, sample_state, sample_state_with_provider};
+    use crate::common::{mock_config, sample_state, sample_state_with_provider, SET_INSECURE_OK};
 
     #[tokio::test]
     async fn health_returns_ok() {
@@ -106,7 +106,11 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -156,7 +160,11 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         };
@@ -435,7 +443,11 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         };
@@ -505,7 +517,11 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         };
@@ -582,7 +598,11 @@ mod http_tests {
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         };
@@ -758,6 +778,143 @@ mod http_tests {
 
         assert_eq!(resp["role"], "assistant");
         assert_eq!(resp["content"], "Hello! How can I help?");
+    }
+
+    /// Goal 398: with the run pool saturated, `POST /sessions/:id/messages`
+    /// must wait the admission window and then fail fast with `503` +
+    /// an integer `Retry-After` in the standard ApiError body shape —
+    /// and succeed end-to-end once a permit is released.
+    #[tokio::test]
+    async fn messages_returns_503_with_retry_after_when_admission_saturated() {
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let metrics = Arc::new(Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            config: mock_config(),
+            tool_registry: ToolRegistry::local(),
+            provider,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::clone(&metrics),
+            slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
+            // 1 slot, 150ms admission window: saturated ⇒ ~150ms then 503.
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                1,
+                std::time::Duration::from_millis(150),
+                Arc::clone(&metrics.runs_waiting),
+            )),
+            rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
+        };
+
+        // Create a session.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            201,
+            "session creation failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = created["id"].as_str().unwrap().to_string();
+
+        // Saturate the single run slot directly through the gate.
+        let hold = state.admission.acquire_run().await.unwrap();
+        assert!(state.admission.try_acquire_run().is_err());
+
+        // The message request now queues, times out, and gets a 503.
+        let app = build_router(state.clone());
+        let start = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/messages", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({"content": "Hi"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), 503);
+        // It waited for the admission window (not a fast-fail on another path).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(140),
+            "should wait ~150ms before 503, got {elapsed:?}"
+        );
+        // Retry-After must be parseable integer seconds (no floats/ranges).
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .expect("503 must carry Retry-After")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let secs: u32 = retry_after
+            .parse()
+            .expect("Retry-After must be integer seconds");
+        assert!(secs >= 1, "Retry-After must be >= 1, got {secs}");
+        // Body follows the standard ApiError envelope.
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            err["error"].is_string(),
+            "body must be ApiError shape: {err}"
+        );
+        // The timed-out waiter released its queue slot.
+        assert_eq!(
+            metrics
+                .runs_waiting
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // Release the permit; the same request now succeeds end-to-end.
+        drop(hold);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/messages", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({"content": "Hi"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
     }
 
     #[tokio::test]
@@ -3761,7 +3918,11 @@ mod http_tests {
                 },
             ]),
             session_ttl_secs: 0,
-            run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
         };

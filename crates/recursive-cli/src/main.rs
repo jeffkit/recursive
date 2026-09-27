@@ -800,12 +800,19 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3600);
             let max_concurrent = config.max_concurrent_runs;
-            let run_semaphore =
-                std::sync::Arc::new(tokio::sync::Semaphore::new(if max_concurrent == 0 {
-                    tokio::sync::Semaphore::MAX_PERMITS
-                } else {
-                    max_concurrent.max(1)
-                }));
+            // Goal 398: bounded admission. Default 30s; `0` restores the
+            // legacy wait-forever behaviour. Parsed like `session_ttl_secs`
+            // (env-only knob on AppState, not Config).
+            let admission_timeout_secs: u64 = std::env::var("RECURSIVE_ADMISSION_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            let metrics = std::sync::Arc::new(recursive::http::Metrics::default());
+            let admission = std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                max_concurrent,
+                Duration::from_secs(admission_timeout_secs),
+                std::sync::Arc::clone(&metrics.runs_waiting),
+            ));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -817,10 +824,10 @@ async fn main() -> anyhow::Result<()> {
                 event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
-                metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
+                metrics,
                 slash_commands: std::sync::Arc::new(slash_commands),
                 session_ttl_secs,
-                run_semaphore,
+                admission,
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
             };
@@ -838,6 +845,12 @@ async fn main() -> anyhow::Result<()> {
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
+            // Goal 398: operators should be able to read the effective
+            // admission policy without guessing env defaults.
+            eprintln!(
+                "admission: max_concurrent_runs={max_concurrent} (0 = unlimited), \
+                 admission_timeout={admission_timeout_secs}s (0 = wait indefinitely)"
+            );
             // Warn if auth is effectively disabled
             let auth_enabled = std::env::var("RECURSIVE_API_KEY").is_ok()
                 || std::env::var("RECURSIVE_JWT_SECRET").is_ok();

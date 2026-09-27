@@ -5,10 +5,12 @@
 //! endpoint that executes the agent with a given goal, session management
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
+mod admission;
 mod auth;
 mod handlers;
 mod rate_limit;
 
+pub use admission::{AcquireError, AdmissionGate, RunPermit};
 pub use auth::{AuthConfig, JwtConfig};
 pub use handlers::map_agent_event;
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
@@ -63,6 +65,10 @@ pub struct Metrics {
     pub sessions_active: AtomicU64,
     /// Number of requests rejected by rate limiting (counter).
     pub rate_limits_rejected: AtomicU64,
+    /// Requests currently waiting for a run permit (gauge). `Arc`-shared so
+    /// the admission gate (Goal 398) can bump it with RAII guards; read via
+    /// `AdmissionGate::runs_waiting` or here for the `/metrics` exposition.
+    pub runs_waiting: Arc<AtomicU64>,
 }
 
 // ── Session types ──────────────────────────────────────────────────────────
@@ -335,11 +341,14 @@ pub struct AppState {
     /// Pre-built at startup for cheap `GET /slash-commands` responses.
     pub slash_commands: Arc<Vec<SlashCommandInfo>>,
     pub session_ttl_secs: u64,
-    /// Semaphore limiting concurrent agent runs. Acquired in `run_agent` and
-    /// `send_session_message` before creating an `AgentRuntime`. When the
-    /// configured `max_concurrent_runs` is 0 (unlimited), this is initialised
-    /// with `Semaphore::MAX_PERMITS`.
-    pub run_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Admission gate limiting concurrent agent runs (Goal 398). Wraps the
+    /// run semaphore with a bounded wait (`RECURSIVE_ADMISSION_TIMEOUT_SECS`,
+    /// default 30s) so queued requests fail fast with `503` + `Retry-After`
+    /// instead of hanging forever. `try_acquire_run` keeps the `/agui`
+    /// never-wait contract. When the configured `max_concurrent_runs` is 0
+    /// (unlimited), the inner semaphore is initialised with
+    /// `Semaphore::MAX_PERMITS`.
+    pub admission: Arc<AdmissionGate>,
     /// Shared rate limiter for all API requests. Stored on `AppState` so the
     /// session reaper can prune idle token buckets.
     pub rate_limiter: RateLimiter,

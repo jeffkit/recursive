@@ -311,6 +311,8 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | Env | Default | Purpose |
 |-----|---------|---------|
 | `RECURSIVE_HTTP_ADDR` | `0.0.0.0:3000` | Bind address |
+| `RECURSIVE_MAX_CONCURRENT_RUNS` | `8` | Max concurrent agent runs (`0` = unlimited) |
+| `RECURSIVE_ADMISSION_TIMEOUT_SECS` | `30` | Max seconds a request may wait for a run slot before `503` + `Retry-After`; `0` = wait indefinitely (legacy) |
 | `RECURSIVE_HTTP_AUTH_KEYS` | _(required for prod)_ | Comma-separated `X-API-Key` allowlist |
 | `RECURSIVE_HTTP_AUTH_JWT_SECRET` | _(none)_ | HMAC secret for JWT bearer-token auth |
 | `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` | _(none)_ | Optional `aud` claim for JWT validation |
