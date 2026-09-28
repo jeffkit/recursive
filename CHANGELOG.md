@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Fixed publishable-crate version drift (#44): recursive-tui and the agui-*
+  crates had lagged at 0.8.2 while recursive-agent/cli shipped 0.8.3. All six
+  publishable crates are now aligned at 0.8.3, internal path-dependency version
+  reqs are pinned exactly (`=0.8.3`), and a new `tests/lockstep.rs` plus
+  `.dev/scripts/check-lockstep.sh` (supports a `vX.Y.Z` tag argument) enforce
+  lockstep so drift fails loudly. `release.yml` wiring of the script is a
+  follow-up.
+
 ## 0.8.2
 
 Release-infra hardening release; no product code changes.
