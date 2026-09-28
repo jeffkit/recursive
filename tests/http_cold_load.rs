@@ -320,4 +320,44 @@ mod cold_load_tests {
         assert_eq!(list["total"], 1);
         assert_eq!(list["sessions"][0]["id"], "cold-list-1");
     }
+
+    /// Goal 396/397 集成语义：DELETE 是用户主动清除，必须把存储快照一并清空——
+    /// 否则冷加载会把已删除的会话"复活"（GET → 200）。依据 v050 生命周期契约
+    /// （DELETE 之后 GET 必须 404）：驱逐/停机保留快照供重启恢复，DELETE 不保留。
+    #[tokio::test]
+    async fn delete_purges_snapshot_so_cold_load_cannot_resurrect() {
+        let (_dir, backend) = fresh_storage();
+        seed(
+            &backend,
+            "purge-1",
+            vec![msg(Role::User, "hi"), msg(Role::Assistant, "yo")],
+        )
+        .await;
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let app = build_router(sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![])),
+            backend.clone(),
+        ));
+
+        // 首次 GET 冷加载进内存表。
+        let (status, _) = send(&app, "GET", "/sessions/purge-1", None).await;
+        assert_eq!(status, 200);
+
+        let (status, _) = send(&app, "DELETE", "/sessions/purge-1", None).await;
+        assert_eq!(status, 204);
+
+        let stored = backend.load_transcript("purge-1").await.unwrap();
+        assert!(
+            stored.is_empty(),
+            "delete must purge the stored snapshot; got {stored:?}"
+        );
+
+        let (status, _) = send(&app, "GET", "/sessions/purge-1", None).await;
+        assert_eq!(
+            status, 404,
+            "a deleted session must not be resurrected by cold load"
+        );
+    }
 }

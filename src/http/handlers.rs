@@ -545,10 +545,11 @@ pub(super) async fn delete_session(
         // runtime is dropped. Idempotent on repeated calls.
         let mut rt = runtime.lock().await;
         rt.close(None).await;
-        // Goal 396: snapshot the transcript before releasing the runtime
-        // Mutex, but persist it only after the session is out of the map —
-        // the save is I/O and must not run under either lock.
-        let transcript = rt.transcript().to_vec();
+        // Goal 396/397 集成语义：DELETE 是用户主动清除，**不能**被冷加载复活
+        // （397 会把任何"非空 transcript"的会话从存储恢复回来），所以这里把快照
+        // 清空，而不是像驱逐/优雅停机那样落盘——冷加载把空 transcript 当 404。
+        // 依据：v050 生命周期契约测试（DELETE → GET 必须 404）+ HTTP DELETE 语义；
+        // 驱逐与停机路径仍然保留完整 transcript 供重启恢复。
         drop(rt);
         state.host.sessions().write().await.remove(&id);
         state
@@ -557,8 +558,12 @@ pub(super) async fn delete_session(
             .fetch_sub(1, Ordering::Relaxed);
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
-        if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
-            tracing::warn!(session_id = %id, error = %e, "failed to persist deleted session transcript");
+        if let Err(e) = state.storage.save_transcript(&id, &[]).await {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "failed to purge deleted session transcript"
+            );
         }
         tracing::info!(session_id = %id, "session deleted");
         Ok(StatusCode::NO_CONTENT)
