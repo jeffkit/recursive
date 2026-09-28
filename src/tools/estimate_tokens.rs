@@ -7,11 +7,13 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::llm::{estimate_tokens as llm_estimate_tokens, ToolSpec};
-use crate::tools::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use crate::tools::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 
+#[derive(Clone)]
 pub struct EstimateTokens {
     workspace: PathBuf,
     extra_roots: Vec<(PathBuf, AccessTier)>,
@@ -73,6 +75,15 @@ impl EstimateTokens {
 
 #[async_trait]
 impl Tool for EstimateTokens {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `GlobTool`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn is_deferred(&self) -> bool {
         true
     }

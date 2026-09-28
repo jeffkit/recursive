@@ -26,6 +26,28 @@ use super::policy_sandbox;
 /// [`ToolRegistry::split_eager_deferred`].
 pub type SpecWithHint = (ToolSpec, Option<String>);
 
+/// Goal 394: freshly allocated, session-scoped state slots handed to
+/// [`Tool::fork_box`] by [`ToolRegistry::fork_session`].
+///
+/// One instance exists per fork. Stateful tools rewire themselves to SHARE
+/// these slots with their siblings *inside* the fork — keeping cross-tool
+/// chains intact (e.g. `Read` records → `Edit` enforces) — while sharing
+/// nothing with the parent registry or sibling forks (session isolation).
+pub struct SessionToolState {
+    /// Fresh read-before-edit guard slot. `Some` iff the source registry had
+    /// one; holds a *copy* of the parent's records at fork time (fork
+    /// semantics: the child inherits what was already read; reads made after
+    /// the fork stay invisible across registries).
+    pub(crate) read_state: Option<Arc<Mutex<ReadFileState>>>,
+    /// Fresh, EMPTY background-job manager. Running jobs belong to the
+    /// session that spawned them and are deliberately not inherited.
+    pub(crate) bg_manager: Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>,
+    /// Fresh sandbox-roots slot seeded from the parent's current roots, so
+    /// roots granted before the fork keep working while post-fork expansions
+    /// (TUI `/add-dir`) stay session-local.
+    pub(crate) session_roots: Option<super::dispatch::SharedSandboxRoots>,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
@@ -72,6 +94,31 @@ pub trait Tool: Send + Sync {
     fn is_readonly_for_args(&self, _arguments: &Value) -> bool {
         self.is_readonly()
     }
+
+    /// Goal 394: dyn-compatible session-fork hook used by
+    /// [`ToolRegistry::fork_session`].
+    ///
+    /// Tools holding session-scoped mutable state override this to return a
+    /// clone of themselves rewired to the fresh slots in `state`:
+    ///
+    /// - `ReadFile` / `WriteFile` / `EditTool` — the shared
+    ///   `Arc<Mutex<ReadFileState>>` guard slot (injected at construction,
+    ///   so replacing only the registry field would leave the tools holding
+    ///   the parent's `Arc`);
+    /// - `RunBackground` / `CheckBackground` / `WatchFile` / `StopLoop` —
+    ///   the shared background-job manager;
+    /// - the structured fs tools — the runtime-mutable sandbox-roots slot.
+    ///
+    /// The default `None` means "session-stateless": every field the tool
+    /// holds is immutable configuration (workspace root, transport,
+    /// permissions, policy, …), so `fork_session` keeps sharing the original
+    /// `Arc` — semantically identical to a clone, allocation-free.
+    ///
+    /// When adding session state to a tool, override this method or the
+    /// state will silently stay shared across `fork_session()` boundaries.
+    fn fork_box(&self, _state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        None
+    }
 }
 
 /// Goal-161: runtime permission hook. Implement this trait to intercept
@@ -101,7 +148,11 @@ impl PermissionHook for PermissionHookDisabled {
     }
 }
 
-/// NOTE: Clone shares Arc state with all tools. Use fork() for isolation.
+/// NOTE: `Clone` shares every `Arc` with the source registry — including the
+/// read-before-edit guard, the touched-files collector, and the
+/// runtime-mutable sandbox-roots slot. Use [`ToolRegistry::fork_session`]
+/// (Goal 394) when per-session isolation is required; [`ToolRegistry::fork`]
+/// is a legacy alias for `clone()`.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -207,18 +258,111 @@ impl ToolRegistry {
         }
     }
 
-    /// Create an isolated copy of this registry.
+    /// Create a session-isolated copy of this registry (Goal 394).
     ///
-    /// Unlike `clone()`, `fork()` calls `tool.fork()` on each registered
-    /// tool so that tools with internal state (e.g. scratchpad, memory)
-    /// get independent copies rather than shared `Arc` references.
+    /// [`Clone`] — and the legacy [`fork`](Self::fork) — share every `Arc`
+    /// with the source registry. `fork_session()` instead REBUILDS the
+    /// session-scoped mutable state and keeps only genuinely external or
+    /// process-level resources shared.
     ///
-    /// Tools that do not implement `fork()` (stateless tools) are simply
-    /// cloned as usual.
+    /// Rebuilt (fresh per fork):
     ///
-    /// For now, this is equivalent to `clone()` — a full fork requires
-    /// per-tool fork support. This method exists as a named extension
-    /// point so call sites can opt in to isolation semantics explicitly.
+    /// - `read_file_state` — the read-before-edit guard. A fresh slot holding
+    ///   a *copy* of the parent's records at fork time (fork semantics: the
+    ///   child inherits what was already read; reads after the fork are
+    ///   invisible across registries). `ReadFile` / `WriteFile` / `EditTool`
+    ///   are re-constructed against the new slot via [`Tool::fork_box`] —
+    ///   replacing only the registry field would leave the tools holding the
+    ///   parent's `Arc`.
+    /// - `touched` — the touched-files collector starts empty, so
+    ///   checkpoint / audit attribution belongs to the fork, not the parent.
+    /// - `bg_manager` — background jobs are not inherited; the fork starts
+    ///   with an empty manager (`RunBackground` / `CheckBackground` /
+    ///   `WatchFile` / `StopLoop` are rewired to it).
+    /// - `session_roots` — a fresh slot seeded from the parent's current
+    ///   roots; `/add-dir`-style expansions after the fork stay
+    ///   session-local.
+    ///
+    /// Shared on purpose — process-level or external resources; sharing is
+    /// what makes a fork cheap and is NOT a bug:
+    ///
+    /// - `transport` — the execution-environment binding (Goal 401/402);
+    ///   immutable configuration, one instance per registry by design.
+    /// - `permissions` / `permission_mode` / `permission_hook` / `policy` /
+    ///   `auto_classifier` / `headless` / `hook_runner` — permission
+    ///   configuration is a property of the process, not of a session.
+    /// - MCP client(s) and the elicitation handler — MCP servers are
+    ///   external resources, deliberately shared per server (they are
+    ///   startup-time connections; a fork must not reconnect).
+    /// - `aliases` — a static name → name mapping.
+    /// - workspace-level stores inside tools (scratchpad / memory / facts /
+    ///   todo list) — those belong to the WORKSPACE, not the session (see
+    ///   `.dev/goals/394-per-session-tool-state-isolation.md`).
+    pub fn fork_session(&self) -> Self {
+        // ONE fresh read-state slot per fork; every stateful tool in the
+        // fork is rewired to it, so the cross-tool guard chain survives
+        // inside the fork while becoming invisible across forks.
+        let fork_read_state = self.read_file_state.as_ref().map(|slot| {
+            Arc::new(Mutex::new(
+                slot.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            ))
+        });
+        let fork_roots = self.session_roots.as_ref().map(|slot| {
+            let seeded = slot.read().map(|roots| roots.clone()).unwrap_or_default();
+            Arc::new(std::sync::RwLock::new(seeded))
+        });
+        let state = SessionToolState {
+            read_state: fork_read_state.clone(),
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                super::run_background::BackgroundJobManager::new(),
+            )),
+            session_roots: fork_roots.clone(),
+        };
+        let tools: BTreeMap<String, Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .map(|(name, tool)| {
+                // Session-stateless tools (fork_box → None) keep sharing the
+                // original Arc: every field they hold is immutable config.
+                (
+                    name.clone(),
+                    tool.fork_box(&state).unwrap_or_else(|| tool.clone()),
+                )
+            })
+            .collect();
+        Self {
+            tools,
+            aliases: self.aliases.clone(),
+            transport: self.transport.clone(),
+            permissions: self.permissions.clone(),
+            permission_mode: self.permission_mode.clone(),
+            // Touched-files attribution starts over for the new session.
+            touched: self
+                .touched
+                .as_ref()
+                .map(|_| Arc::new(Mutex::new(TouchedFiles::new()))),
+            read_file_state: fork_read_state,
+            session_roots: fork_roots,
+            #[cfg(feature = "mcp")]
+            elicitation: self.elicitation.clone(),
+            permission_hook: self.permission_hook.clone(),
+            policy: self.policy.clone(),
+            headless: self.headless,
+            hook_runner: self.hook_runner.clone(),
+            auto_classifier: self.auto_classifier.clone(),
+        }
+    }
+
+    /// Legacy fork entry point — a plain [`Clone`], kept for existing call
+    /// sites.
+    ///
+    /// Historical versions of this doc claimed fork "isolates" tools; that
+    /// was never true. `Clone` shares every `Arc` — the read-before-edit
+    /// guard, the touched-files collector, the sandbox-roots slot — so two
+    /// registries derived this way observe each other's state, and the
+    /// `Tool` trait has no per-tool `fork()` method. Use
+    /// [`fork_session`](Self::fork_session) (Goal 394) when per-session
+    /// isolation is required (HTTP session hosts, sub-agents).
     pub fn fork(&self) -> Self {
         self.clone()
     }
@@ -988,6 +1132,347 @@ mod tests {
         let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "ForkMe" }));
         let forked = reg.fork();
         assert!(forked.find_by_name("ForkMe").is_some());
+    }
+
+    #[test]
+    fn legacy_fork_still_shares_state() {
+        // fork() is documented as a plain clone (Goal 394): it must keep
+        // sharing the guard slot, not silently grow isolation semantics.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let reg = build_standard_tools(tmp.path(), &[], 30);
+        let legacy = reg.fork();
+        assert!(
+            Arc::ptr_eq(
+                reg.read_file_state().as_ref().expect("parent slot"),
+                &legacy.read_file_state().expect("legacy slot"),
+            ),
+            "fork() is a clone: it must keep sharing the read-state slot"
+        );
+    }
+
+    // --- fork_session (Goal 394): per-session tool state isolation ---
+
+    #[test]
+    fn fork_session_allocates_fresh_state_slots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let reg = build_standard_tools(tmp.path(), &[], 30);
+        let a = reg.fork_session();
+        let b = reg.fork_session();
+
+        let parent = reg.read_file_state().expect("parent slot");
+        let sa = a.read_file_state().expect("fork A slot");
+        let sb = b.read_file_state().expect("fork B slot");
+        assert!(
+            !Arc::ptr_eq(&parent, &sa),
+            "fork A must not alias the parent guard"
+        );
+        assert!(
+            !Arc::ptr_eq(&parent, &sb),
+            "fork B must not alias the parent guard"
+        );
+        assert!(!Arc::ptr_eq(&sa, &sb), "forks must not share a guard slot");
+    }
+
+    #[tokio::test]
+    async fn fork_session_isolates_read_guard_between_forks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("note.txt");
+        std::fs::write(&file, "note body\n").expect("fixture");
+        let reg = build_standard_tools(tmp.path(), &[], 30);
+        let a = reg.fork_session();
+        let b = reg.fork_session();
+
+        // Fork A reads the file — recorded in A's guard slot only.
+        a.invoke("Read", serde_json::json!({"path": "note.txt"}))
+            .await
+            .expect("read via fork A");
+
+        let a_slot = a.read_file_state().expect("fork A slot");
+        assert!(
+            a_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&file)
+                .is_some(),
+            "fork A must record its own read"
+        );
+        let b_slot = b.read_file_state().expect("fork B slot");
+        assert!(
+            b_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&file)
+                .is_none(),
+            "fork B must not observe fork A's reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_read_guard_is_enforced_within_and_isolated_across() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("target.txt");
+        std::fs::write(&file, "hello\n").expect("fixture");
+        let reg = build_standard_tools(tmp.path(), &[], 30);
+        let a = reg.fork_session();
+        let b = reg.fork_session();
+
+        // A reads → A may edit (the guard chain survives inside the fork).
+        a.invoke("Read", serde_json::json!({"path": "target.txt"}))
+            .await
+            .expect("A reads");
+        let a_edit = a
+            .invoke(
+                "Edit",
+                serde_json::json!({
+                    "file_path": "target.txt",
+                    "old_string": "hello",
+                    "new_string": "hi"
+                }),
+            )
+            .await;
+        assert!(a_edit.is_ok(), "A edited after reading: {a_edit:?}");
+
+        // B never read the file in its own registry → the guard must deny
+        // the edit even though A did read (per-session isolation).
+        std::fs::write(&file, "hello\n").expect("reset fixture");
+        let b_edit = b
+            .invoke(
+                "Edit",
+                serde_json::json!({
+                    "file_path": "target.txt",
+                    "old_string": "hello",
+                    "new_string": "bonjour"
+                }),
+            )
+            .await;
+        assert!(b_edit.is_err(), "B must not inherit A's read: {b_edit:?}");
+
+        // After B reads on its own, the guard allows the edit — isolation
+        // must not have disabled the guard.
+        b.invoke("Read", serde_json::json!({"path": "target.txt"}))
+            .await
+            .expect("B reads");
+        let b_edit2 = b
+            .invoke(
+                "Edit",
+                serde_json::json!({
+                    "file_path": "target.txt",
+                    "old_string": "hello",
+                    "new_string": "bonjour"
+                }),
+            )
+            .await;
+        assert!(b_edit2.is_ok(), "B edited after its own read: {b_edit2:?}");
+    }
+
+    #[tokio::test]
+    async fn clone_shares_read_state_but_fork_session_snapshots_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let reg = build_standard_tools(tmp.path(), &[], 30);
+        let file = tmp.path().join("shared.txt");
+        std::fs::write(&file, "x\n").expect("fixture");
+        let later = tmp.path().join("later.txt");
+        std::fs::write(&later, "later\n").expect("fixture");
+
+        reg.invoke("Read", serde_json::json!({"path": "shared.txt"}))
+            .await
+            .expect("parent reads");
+
+        // clone() aliases the slot → the clone sees the parent's read…
+        let cloned = reg.clone();
+        let c_slot = cloned.read_file_state().expect("clone slot");
+        assert!(
+            Arc::ptr_eq(
+                reg.read_file_state().as_ref().expect("parent slot"),
+                &c_slot
+            ),
+            "clone must share the guard slot (legacy semantics)"
+        );
+
+        // …while fork_session() copies it at fork time (the child inherits
+        // what the parent already read) into a FRESH Arc: reads made after
+        // the fork stay invisible to the fork.
+        let forked = reg.fork_session();
+        let f_slot = forked.read_file_state().expect("fork slot");
+        assert!(
+            !Arc::ptr_eq(
+                reg.read_file_state().as_ref().expect("parent slot"),
+                &f_slot
+            ),
+            "fork_session must allocate a fresh guard slot"
+        );
+        assert!(
+            f_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&file)
+                .is_some(),
+            "fork inherits the parent's pre-fork reads"
+        );
+        reg.invoke("Read", serde_json::json!({"path": "later.txt"}))
+            .await
+            .expect("parent reads again");
+        assert!(
+            f_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&later)
+                .is_none(),
+            "parent's post-fork reads must not appear in the fork"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_isolates_touched_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let reg = build_standard_tools(tmp.path(), &[], 30)
+            .with_touched_files(Arc::new(std::sync::Mutex::new(TouchedFiles::new())));
+        let a = reg.fork_session();
+        let b = reg.fork_session();
+
+        let _ = a
+            .invoke_with_audit(
+                "Write",
+                serde_json::json!({"path": "out.txt", "contents": "hi\n"}),
+            )
+            .await;
+
+        let touched_of = |r: &ToolRegistry| {
+            r.touched_files()
+                .map(|s| s.lock().unwrap_or_else(|p| p.into_inner()).paths_sorted())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            touched_of(&a),
+            vec!["out.txt".to_string()],
+            "fork A records its own write"
+        );
+        assert!(
+            touched_of(&b).is_empty(),
+            "fork B must not see A's touched files"
+        );
+        assert!(
+            touched_of(&reg).is_empty(),
+            "parent must not see the fork's touched files"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_isolates_background_jobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let reg = build_standard_tools(tmp.path(), &[], 30);
+        let a = reg.fork_session();
+        let b = reg.fork_session();
+
+        let spawned = a
+            .invoke(
+                "run_background",
+                serde_json::json!({"command": "sleep 0.5"}),
+            )
+            .await
+            .expect("spawn via fork A");
+        let job_id = serde_json::from_str::<serde_json::Value>(&spawned)
+            .expect("run_background returns JSON")["job_id"]
+            .as_str()
+            .expect("job_id")
+            .to_string();
+
+        // Fork A's manager knows the job…
+        let seen_a = a
+            .invoke("check_background", serde_json::json!({"job_id": job_id}))
+            .await
+            .expect("check via fork A");
+        assert!(
+            !seen_a.contains("\"unknown\""),
+            "fork A must see its own job: {seen_a}"
+        );
+        // …fork B's fresh manager does not.
+        let seen_b = b
+            .invoke("check_background", serde_json::json!({"job_id": job_id}))
+            .await
+            .expect("check via fork B");
+        assert!(
+            seen_b.contains("\"unknown\""),
+            "fork B must not see fork A's background job: {seen_b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_isolates_sandbox_root_expansions() {
+        use super::super::dispatch::{new_shared_sandbox_roots, AccessTier};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let extra = tempfile::tempdir().expect("extra tempdir");
+        let slot = new_shared_sandbox_roots();
+        // Mirror the CLI builder wiring: the factory hands the slot to the
+        // tools; with_session_roots ALSO recovers it on the registry itself
+        // so fork_session can seed fresh slots from it.
+        let reg = build_standard_tools_with_roots(
+            tmp.path(),
+            &[],
+            Some(slot.clone()),
+            &[],
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_session_roots(slot.clone());
+        let early_fork = reg.fork_session(); // forked BEFORE the expansion
+
+        let secret = extra.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("fixture");
+
+        // Expand the PARENT's roots after forking…
+        slot.write()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((extra.path().to_path_buf(), AccessTier::ReadOnly));
+
+        // …the parent can read the out-of-workspace file…
+        let parent_read = reg
+            .invoke(
+                "Read",
+                serde_json::json!({"path": secret.to_string_lossy()}),
+            )
+            .await;
+        assert!(
+            parent_read.is_ok(),
+            "parent sees its own expansion: {parent_read:?}"
+        );
+
+        // …but the pre-expansion fork must not (fresh slot seeded at fork).
+        let fork_read = early_fork
+            .invoke(
+                "Read",
+                serde_json::json!({"path": secret.to_string_lossy()}),
+            )
+            .await;
+        assert!(
+            fork_read.is_err(),
+            "fork must not inherit post-fork expansions: {fork_read:?}"
+        );
+
+        // A fork taken AFTER the expansion is seeded with it (fork
+        // semantics: the child inherits grants made before it was forked).
+        let late_fork = reg.fork_session();
+        let late_read = late_fork
+            .invoke(
+                "Read",
+                serde_json::json!({"path": secret.to_string_lossy()}),
+            )
+            .await;
+        assert!(
+            late_read.is_ok(),
+            "late fork inherits pre-fork grants: {late_read:?}"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &reg.session_roots().expect("parent slot"),
+                &late_fork.session_roots().expect("late fork slot"),
+            ),
+            "session_roots must be re-allocated per fork"
+        );
     }
 
     // --- build_standard_tools produces a non-empty registry ---

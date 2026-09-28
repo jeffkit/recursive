@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::transport::ToolTransport;
-use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -268,6 +268,22 @@ impl ReadFile {
 
 #[async_trait]
 impl Tool for ReadFile {
+    /// Goal 394: session-level fork — rewire the guard slot and the
+    /// sandbox-roots slot to the fork's fresh instances. Immutable config
+    /// (roots baked at build time, limits, transport) is carried over. A
+    /// slot is only rewired when the fork actually carries a fresh instance;
+    /// otherwise the original is kept shared (never silently detached).
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.read_state, &state.read_state) {
+            forked.read_state = Some(fresh.clone());
+        }
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Read".into(),
@@ -497,6 +513,18 @@ impl WriteFile {
 
 #[async_trait]
 impl Tool for WriteFile {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `ReadFile`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.read_state, &state.read_state) {
+            forked.read_state = Some(fresh.clone());
+        }
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Write".into(),

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::transport::{retryable_prefix, ToolTransport};
-use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -85,6 +85,15 @@ impl CountLines {
 
 #[async_trait]
 impl Tool for CountLines {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `GlobTool`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "count_lines".into(),

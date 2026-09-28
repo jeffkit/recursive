@@ -583,7 +583,10 @@ pub fn register_subagent_if_enabled(
     let agent = AgentTool::new(
         &config.workspace,
         provider,
-        tools.fork(),
+        // Goal 394: sub-agents get session-isolated tool state (read guard,
+        // touched files, background jobs, sandbox roots) instead of sharing
+        // the coordinator's.
+        tools.fork_session(),
         config.subagent_max_depth,
         0,
         None,

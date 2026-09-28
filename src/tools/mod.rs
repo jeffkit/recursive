@@ -69,8 +69,8 @@ pub mod web_search;
 // ── Re-exports from registry ────────────────────────────────────────────────
 
 pub use registry::{
-    build_standard_tools, build_standard_tools_with_roots, PermissionHook, SpecWithHint, Tool,
-    ToolRegistry,
+    build_standard_tools, build_standard_tools_with_roots, PermissionHook, SessionToolState,
+    SpecWithHint, Tool, ToolRegistry,
 };
 
 // ── Re-exports from audit ───────────────────────────────────────────────────

@@ -22,11 +22,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::run_background::{BackgroundJobManager, LoopControl};
-use super::Tool;
+use super::{SessionToolState, Tool};
 use crate::error::Result;
 use crate::llm::ToolSpec;
 
 /// The `stop_loop` tool: agent-initiated loop shutdown.
+#[derive(Clone)]
 pub struct StopLoop {
     manager: Arc<Mutex<BackgroundJobManager>>,
     _root: PathBuf,
@@ -43,6 +44,13 @@ impl StopLoop {
 
 #[async_trait]
 impl Tool for StopLoop {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `RunBackground`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        forked.manager = state.bg_manager.clone();
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "stop_loop".into(),
