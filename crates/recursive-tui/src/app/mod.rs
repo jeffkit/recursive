@@ -212,6 +212,19 @@ pub struct App {
     /// `prompt.mode` is `InputMode::CommandInteract` and the panel owns
     /// key events.
     pub active_command_panel: Option<CommandPanelState>,
+
+    // ── Pricing cache (issue #41) ─────────────────────────────────────
+    /// Issue-41: `(model_name, pricing)` cache so the status-bar render
+    /// path (`ui::status::build_line`) resolves the provider catalog
+    /// (disk IO + TOML/JSON parsing in `providers::all_presets_effective`)
+    /// at most once per model instead of once per frame. Interior
+    /// mutability because `build_line` only holds `&App`.
+    pub(super) pricing_cache:
+        std::cell::RefCell<Option<(String, Option<recursive::llm::ModelPricing>)>>,
+    /// Issue-41: count of catalog resolutions performed by
+    /// [`App::pricing_for_model`]; exposed via
+    /// `pricing_lookup_count()` for the red-line regression tests.
+    pub(super) pricing_lookups: std::cell::Cell<u64>,
 }
 
 /// Goal-323: UI-level mirror of event-driven loop state.

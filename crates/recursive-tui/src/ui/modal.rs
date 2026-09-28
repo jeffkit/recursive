@@ -188,7 +188,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let body = match modal {
         Modal::Help => render_help_body(&app.commands),
-        Modal::CostDetail => render_cost_body(&app.usage, &app.model_name),
+        Modal::CostDetail => render_cost_body(app),
         Modal::ModelInfo => render_model_body(&app.model_name),
         Modal::ToolList { entries } => render_tool_body(entries),
         Modal::Journal { entries, selected } => render_journal_body(entries, *selected),
@@ -309,8 +309,9 @@ fn render_help_body(registry: &CommandRegistry) -> Vec<Line<'static>> {
     out
 }
 
-fn render_cost_body(usage: &UsageStats, model: &str) -> Vec<Line<'static>> {
-    let pricing = recursive::llm::pricing_for(model);
+fn render_cost_body(app: &crate::app::App) -> Vec<Line<'static>> {
+    let (usage, model) = (&app.usage, app.model_name.as_str());
+    let pricing = app.pricing_for_model(model);
     let cost_in = pricing.map(|p| (usage.total_input as f64) * p.input_per_million / 1_000_000.0);
     let cost_out =
         pricing.map(|p| (usage.total_output as f64) * p.output_per_million / 1_000_000.0);

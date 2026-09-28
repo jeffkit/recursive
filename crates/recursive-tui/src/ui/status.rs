@@ -94,13 +94,15 @@ pub fn build_line(app: &App) -> Line<'static> {
         ),
         Style::default().fg(Color::White).bg(Color::DarkGray),
     ));
-    if let Some(cost) = crate::app::estimate_cost(
-        &app.model_name,
-        app.usage.total_input,
-        app.usage.total_output,
-        app.usage.total_cache_hit,
-        app.usage.total_cache_miss,
-    ) {
+    if let Some(cost) = app.pricing_for_model(&app.model_name).and_then(|p| {
+        crate::cost::estimate_cost_with_pricing(
+            &p,
+            app.usage.total_input,
+            app.usage.total_output,
+            app.usage.total_cache_hit,
+            app.usage.total_cache_miss,
+        )
+    }) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("${cost:.4}"),

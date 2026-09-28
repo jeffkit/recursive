@@ -16,6 +16,10 @@
   `.dev/scripts/check-lockstep.sh` (supports a `vX.Y.Z` tag argument) enforce
   lockstep so drift fails loudly. `release.yml` wiring of the script is a
   follow-up.
+- TUI: status-bar pricing no longer re-reads the provider catalog (disk IO +
+  TOML/JSON parsing) on every render frame — `App` caches
+  `(model_name, pricing)` per model (`pricing_for_model`,
+  `pricing_lookup_count()`), the render path reads the cache only (issue #41).
 
 ## 0.8.2
 

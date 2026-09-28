@@ -266,6 +266,19 @@ pub fn estimate_cost(
     cache_miss: u64,
 ) -> Option<f64> {
     let pricing = recursive::llm::pricing_for(model)?;
+    estimate_cost_with_pricing(&pricing, total_input, total_output, cache_hit, cache_miss)
+}
+
+/// Cost body of [`estimate_cost`] for an already-resolved pricing entry,
+/// so hot paths (status bar) can reuse an `App`-level pricing cache
+/// instead of re-reading the provider catalog every frame.
+pub fn estimate_cost_with_pricing(
+    pricing: &recursive::llm::ModelPricing,
+    total_input: u64,
+    total_output: u64,
+    cache_hit: u64,
+    cache_miss: u64,
+) -> Option<f64> {
     let usage = recursive::llm::TokenUsage {
         prompt_tokens: saturating_u32(total_input),
         completion_tokens: saturating_u32(total_output),

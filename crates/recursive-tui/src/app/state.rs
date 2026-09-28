@@ -79,7 +79,41 @@ impl App {
             theme: &crate::ui::theme::DARK,
             modal_scroll: 0,
             active_command_panel: None,
+            pricing_cache: std::cell::RefCell::new(None),
+            pricing_lookups: std::cell::Cell::new(0),
         }
+    }
+
+    // ── Pricing cache (issue #41) ─────────────────────────────────────
+
+    /// Issue-41: resolve [`ModelPricing`](recursive::llm::ModelPricing)
+    /// for `model` through the `App`-level cache. The provider catalog
+    /// (`providers::all_presets_effective` — disk IO + TOML/JSON parsing)
+    /// is consulted at most once per distinct model name; the render hot
+    /// path (`ui::status::build_line`) reads this instead of calling
+    /// `pricing_for` directly, so an idle TUI repaints without per-frame
+    /// filesystem IO.
+    pub fn pricing_for_model(&self, model: &str) -> Option<recursive::llm::ModelPricing> {
+        if let Some((cached_model, cached)) = self.pricing_cache.borrow().as_ref() {
+            if cached_model == model {
+                return *cached;
+            }
+        }
+        let resolved = recursive::llm::pricing_for(model);
+        *self.pricing_cache.borrow_mut() = Some((model.to_string(), resolved));
+        self.pricing_lookups.set(self.pricing_lookups.get() + 1);
+        resolved
+    }
+
+    /// Issue-41: reset the pricing-resolution counter (test helper).
+    pub fn reset_pricing_lookup_count(&self) {
+        self.pricing_lookups.set(0);
+    }
+
+    /// Issue-41: number of provider-catalog resolutions performed by
+    /// [`App::pricing_for_model`] since the last reset.
+    pub fn pricing_lookup_count(&self) -> u64 {
+        self.pricing_lookups.get()
     }
 
     /// Goal-322: lazy-reload skill commands from disk when the user presses
