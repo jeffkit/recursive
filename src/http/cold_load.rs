@@ -57,6 +57,18 @@ use std::time::SystemTime;
 /// Returns 404 when the storage has no restorable transcript for `id`
 /// (missing, or empty after normalization) — identical to the pre-restart
 /// semantics for unknown ids.
+/// Storage key for the "this session was deleted" tombstone.
+///
+/// Goal 396 keeps the transcript snapshot when a session ends (DELETE included —
+/// the CLI session-directory semantics), while Goal 397 restores any session
+/// with a non-empty snapshot. Without a marker those two combine into "DELETE
+/// then GET resurrects the session", which breaks the v050 lifecycle contract
+/// (DELETE → GET must be 404). The tombstone lives in the storage backends'
+/// generic key/value space so it works for every backend (local / S3).
+pub(super) fn deleted_marker_key(id: &str) -> String {
+    format!("session-deleted/{id}")
+}
+
 pub(super) async fn get_or_load_session(
     state: &Arc<AppState>,
     id: &str,
@@ -71,7 +83,16 @@ pub(super) async fn get_or_load_session(
         }
     }
 
-    // Phase 2: IO outside any lock.
+    // Phase 2: IO outside any lock. A deleted session stays deleted: DELETE keeps
+    // the snapshot (Goal 396) but leaves a tombstone, and cold load honours it.
+    let tombstone = state
+        .storage
+        .load_memory(&deleted_marker_key(id))
+        .await
+        .map_err(|e| ApiError::internal(format!("load tombstone for session {id}: {e}")))?;
+    if tombstone.is_some() {
+        return Err(ApiError::not_found("session not found"));
+    }
     let stored = state
         .storage
         .load_transcript(id)

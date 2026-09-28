@@ -321,11 +321,11 @@ mod cold_load_tests {
         assert_eq!(list["sessions"][0]["id"], "cold-list-1");
     }
 
-    /// Goal 396/397 集成语义：DELETE 是用户主动清除，必须把存储快照一并清空——
-    /// 否则冷加载会把已删除的会话"复活"（GET → 200）。依据 v050 生命周期契约
-    /// （DELETE 之后 GET 必须 404）：驱逐/停机保留快照供重启恢复，DELETE 不保留。
+    /// Goal 396/397 集成语义：DELETE 保留快照（396：会话结束即落盘）**但**写
+    /// tombstone，冷加载不得复活已删除会话——否则 DELETE → GET 会 200，违反 v050
+    /// 生命周期契约（DELETE 之后必须 404）。驱逐/停机不写 tombstone，仍可恢复。
     #[tokio::test]
-    async fn delete_purges_snapshot_so_cold_load_cannot_resurrect() {
+    async fn delete_marks_tombstone_so_cold_load_cannot_resurrect() {
         let (_dir, backend) = fresh_storage();
         seed(
             &backend,
@@ -348,10 +348,11 @@ mod cold_load_tests {
         let (status, _) = send(&app, "DELETE", "/sessions/purge-1", None).await;
         assert_eq!(status, 204);
 
+        // 396 语义：会话结束（含 DELETE）仍要落盘快照——CLI 的 sessions 目录语义。
         let stored = backend.load_transcript("purge-1").await.unwrap();
         assert!(
-            stored.is_empty(),
-            "delete must purge the stored snapshot; got {stored:?}"
+            !stored.is_empty(),
+            "delete must still persist the transcript snapshot (Goal 396)"
         );
 
         let (status, _) = send(&app, "GET", "/sessions/purge-1", None).await;
