@@ -162,13 +162,13 @@ impl CostTracker {
         };
 
         if let Some(obj) = meta.as_object_mut() {
-            obj.insert(
-                "cost_usd".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from_f64(self.cost_usd().unwrap_or(0.0))
-                        .unwrap_or(serde_json::Number::from(0u64)),
-                ),
-            );
+            let cost_value = match self.cost_usd() {
+                Some(c) => serde_json::Number::from_f64(c)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            };
+            obj.insert("cost_usd".to_string(), cost_value);
             obj.insert(
                 "total_tokens".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(
@@ -717,5 +717,30 @@ mod tests {
         let after = std::fs::read_to_string(dir.path().join(".meta.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert!(v.is_array(), "non-object meta must not be overwritten");
+    }
+
+    #[test]
+    fn test_meta_cost_usd_null_for_unknown_model() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".meta.json"), r#"{"session_id": "s1"}"#).unwrap();
+        let mut tracker = CostTracker::new(dir.path().to_path_buf(), "no-such-model-v42", "openai");
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            ..Default::default()
+        };
+        tracker.record_usage(usage, 100);
+        tracker.finish().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(".meta.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v["cost_usd"].is_null(),
+            ".meta.json cost_usd must be null for unpriced model, got: {}",
+            v["cost_usd"]
+        );
     }
 }

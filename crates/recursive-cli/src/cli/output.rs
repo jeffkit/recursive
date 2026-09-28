@@ -220,10 +220,17 @@ pub(crate) fn finalize_cost_tracker(
             if let Err(e) = t.finish() {
                 eprintln!("cost: failed to write cost.json: {e}");
             } else {
-                eprintln!("cost: ${:.4} ({})", t.cost_usd().unwrap_or(0.0), model);
+                eprintln!("{}", format_cost_line(t.cost_usd(), model));
             }
         }
         Err(e) => eprintln!("cost: failed to lock cost tracker: {e}"),
+    }
+}
+
+pub(crate) fn format_cost_line(cost: Option<f64>, model: &str) -> String {
+    match cost {
+        Some(c) => format!("cost: ${c:.4} ({model})"),
+        None => format!("cost: unknown (no pricing for {model})"),
     }
 }
 
@@ -458,6 +465,23 @@ mod tests {
             finish_to_session_status(&FinishReason::Cancelled),
             SessionStatus::Interrupted
         );
+    }
+
+    #[test]
+    fn format_cost_line_priced_model_shows_amount() {
+        let line = format_cost_line(Some(0.00028), "deepseek-chat");
+        assert_eq!(line, "cost: $0.0003 (deepseek-chat)");
+    }
+
+    #[test]
+    fn format_cost_line_unknown_model_shows_unknown() {
+        let line = format_cost_line(None, "no-such-model");
+        assert!(line.contains("unknown"), "line: {line}");
+        assert!(
+            !line.contains("$0.0000"),
+            "must not fake a zero cost: {line}"
+        );
+        assert_eq!(line, "cost: unknown (no pricing for no-such-model)");
     }
 
     #[test]

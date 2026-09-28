@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed unknown-model cost reporting (#42): an unpriced model no longer fakes
+  `$0.0000` — `.meta.json` writes `cost_usd: null` instead of `0.0`, and the
+  CLI cost line prints `cost: unknown (no pricing for <model>)`.
+
 - Fixed publishable-crate version drift (#44): recursive-tui and the agui-*
   crates had lagged at 0.8.2 while recursive-agent/cli shipped 0.8.3. All six
   publishable crates are now aligned at 0.8.3, internal path-dependency version
