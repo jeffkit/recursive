@@ -100,7 +100,7 @@ impl<S> SessionHost<S> {
 - 锁范围：`spawn_session_reaper` 不再在 `sessions.write()` 的 guard 作用域内 `await`
   外部工作（`close()` 必须在 guard drop 之后）；由上面那条「驱逐不阻塞读」的测试
   + journal 里的代码片段共同证明（不靠单一 grep 断言）。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 08-http-api` 与 `19-http-interrupt` 通过。
+- e2e 回归：`sh .dev/scripts/e2e-run.sh http-api` 与 `http-interrupt` 通过。
 - Journal: `.dev/journal/manual-20260927-goal395-session-host.md`，记录搬迁清单与锁范围前后的
   实测（可贴测试耗时）。
 

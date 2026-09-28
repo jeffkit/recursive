@@ -93,7 +93,7 @@ async fn walk(
 - 新测试按名可跑：`cargo test --lib walk`、`cargo test --lib grep`（journal 记录确切名）。
 - Grep: `rg "WalkDir|std::fs::read_to_string" src/tools/glob.rs src/tools/search.rs` 的命中
   只剩在 `LocalTransport` 的 walk 实现或测试里（工具本体不再直接遍历宿主）。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 15-search-files`、`25-glob-tool` 通过
+- e2e 回归：`sh .dev/scripts/e2e-run.sh search-files`、`glob-tool` 通过
   （这两个套件直接断言检索工具行为；**fixture 不能改**，改了就等于掩盖回归）。
 - Journal: `.dev/journal/manual-20260927-goal402-search-tools-through-environment.md`。
 

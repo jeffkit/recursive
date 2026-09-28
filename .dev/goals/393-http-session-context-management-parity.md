@@ -107,7 +107,7 @@ HTTP 侧则完全没有：`create_session`（`src/http/handlers.rs:281-288`）�
   `cargo fmt --all` 全绿。
 - Grep: `rg "compactor" src/http/` 现在有命中（≥ 3 类：helper 调用、测试、注释）。
 - Grep: `rg "apply_context_management" src/ crates/ | wc -l` ≥ 5（定义 + CLI + HTTP 三处 + 测试）。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 08-http-api` 与 `22-compaction` 通过
+- e2e 回归：`sh .dev/scripts/e2e-run.sh http-api` 与 `compaction` 通过
   （replay 模式，无需 API key；**首次在 HEAD 变化后运行不要加 `--no-build`**）。
 - Journal: `.dev/journal/manual-20260927-goal393-context-parity.md`，记录 CLI/HTTP 装配前后对比。
 

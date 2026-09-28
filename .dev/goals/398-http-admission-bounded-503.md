@@ -77,8 +77,8 @@
 - 新测试按名可跑：`cargo test --lib admission` 与 `cargo test --test http` 新用例。
 - 手工实测（journal 贴输出）：`RECURSIVE_MAX_CONCURRENT_RUNS=1` +
   两个并发请求 → 第二个在 30 s（或配置值）后返回 `503` 并带 `Retry-After`。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 08-http-api`、`08b-http-rate-limit`、
-  `19-http-interrupt` 通过。
+- e2e 回归：`sh .dev/scripts/e2e-run.sh http-api`、`http-rate-limit`、
+  `http-interrupt` 通过。
 - Journal: `.dev/journal/manual-20260927-goal398-admission-bounded.md`。
 
 ## Notes for the agent (traps)

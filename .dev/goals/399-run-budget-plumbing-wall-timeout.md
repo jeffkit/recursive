@@ -88,7 +88,7 @@ setter，而 `src/kernel.rs` 是 998/1000 行、`src/runtime.rs` 是 3692/3700 �
 - Grep: `rg "wall_timeout_secs" src/runtime.rs src/multi.rs` 不再出现硬编码 `: 0`
   （应为字段读取）。
 - Grep: `rg "RECURSIVE_WALL_TIMEOUT_SECS" src/ crates/ README.md` 出现解析点 + 消费点 + 文档。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 08-http-api`、`18-goal-loop`、`19-http-interrupt` 通过
+- e2e 回归：`sh .dev/scripts/e2e-run.sh http-api`、`goal-loop`、`http-interrupt` 通过
   （HTTP 默认加了步数上限，长 goal 用例必须仍然通过——若某个用例需要更长预算，
   在该 e2e 里显式设置 env 并在 journal 说明，**不要**为了过测试把默认值调大）。
 - Journal: `.dev/journal/manual-20260927-goal399-run-budget-plumbing.md`，记录四个 guard 的

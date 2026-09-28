@@ -97,8 +97,8 @@
 
 - `cargo test --workspace`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、
   `cargo fmt --all` 全绿。
-- 默认档 prompt 不变：快照测试绿 + `sh .dev/scripts/e2e-run.sh 00-smoke` 与
-  `01-basic-tools` 通过（replay，无需 key）。
+- 默认档 prompt 不变：快照测试绿 + `sh .dev/scripts/e2e-run.sh smoke` 与
+  `basic` 通过（replay，无需 key）。
 - 新测试按名可跑：`cargo test --lib environment_binding`（journal 记录确切名）。
 - Grep: `rg "destroy\(\)" src/session_host.rs src/tools/container_transport.rs` 有命中
   （创建/销毁成对）。

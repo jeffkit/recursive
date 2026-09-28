@@ -105,7 +105,7 @@ pub fn session_store(mut self, store: Arc<dyn crate::storage::SessionStore>) -> 
   不再只有 storage 实现与测试。
 - 手工实测（journal 贴命令与结果）：`recursive http` 建会话 → 发一轮 → 等 TTL 驱逐/优雅
   关停 → 在 `$RECURSIVE_HOME` 下找到并可解析 transcript 文件。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 08-http-api`、`11-session-resume` 通过
+- e2e 回归：`sh .dev/scripts/e2e-run.sh http-api`、`resume` 通过
   （注意 `RECURSIVE_SESSIONS_DIR` 是硬覆盖，会话断言按 `.dev/AGENTS.md` 的隔离规则写）。
 - Journal: `.dev/journal/manual-20260927-goal396-http-persistence.md`。
 

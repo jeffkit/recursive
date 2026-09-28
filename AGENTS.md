@@ -193,6 +193,10 @@ Hard-won rules:
 - **Port registry**: every HTTP suite picks a unique port (9090=08-http-api,
   9091=08b-rate-limit, 9092=18-goal-loop, 9093=19-interrupt, 9096=21-ts-sdk,
   9097=39-auth, 9099=22-compaction). Shared ports → 401/ECONNREFUSED ghosts.
+  Labels here are FILE-name prefixes — the `<suite-id>` arg to `e2e-run.sh` is
+  the `id:` field in `e2e/e2e.yaml` (e.g. 08-http-api → `http-api`,
+  11-session-resume → `resume`); wrong ids don't error, they surface as the
+  swallowed `status=None totals={}`. See the `argus-run --filter` rule below.
 - **Session isolation**: `RECURSIVE_SESSIONS_DIR` is a hard override ignoring
   `RECURSIVE_HOME`. For `recursive-session:` assertions, `unset RECURSIVE_SESSIONS_DIR`,
   use a unique `RECURSIVE_HOME`, then `find` the transcript and copy to a predictable
