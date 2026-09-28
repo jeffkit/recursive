@@ -687,11 +687,12 @@ pub fn build_standard_tools_with_roots(
     });
     let todo_list = Arc::new(std::sync::RwLock::new(Vec::<super::todo::TodoItem>::new()));
     let read_state = Arc::new(Mutex::new(ReadFileState::new()));
-    // Goal 401: the fs tools (Read / Write / Edit) must share the registry's
-    // single transport instance, so an environment binding chosen here
-    // follows the tools automatically (container tier, Goal 403). Do NOT let
-    // tools construct their own LocalTransport — that would silently pin
-    // them to the host and undo the sandbox.
+    // Goal 401/402: every I/O tool (Read / Write / Edit / Glob / Grep /
+    // count_lines) must share the registry's single transport instance, so an
+    // environment binding chosen here follows the tools automatically
+    // (container tier, Goal 403). Do NOT let tools construct their own
+    // LocalTransport — that would silently pin them to the host and undo the
+    // sandbox.
     let base = ToolRegistry::local();
     let shared_transport = base.transport().clone();
     let mut registry = base
@@ -724,12 +725,14 @@ pub fn build_standard_tools_with_roots(
         .register(Arc::new(
             super::search::SearchFiles::new(workspace)
                 .with_extra_roots(extra_roots.iter().cloned())
-                .with_session_roots_opt(session_roots.clone()),
+                .with_session_roots_opt(session_roots.clone())
+                .with_transport(shared_transport.clone()),
         ))
         .register(Arc::new(
             super::glob::GlobTool::new(workspace)
                 .with_extra_roots(extra_roots.iter().cloned())
-                .with_session_roots_opt(session_roots.clone()),
+                .with_session_roots_opt(session_roots.clone())
+                .with_transport(shared_transport.clone()),
         ))
         .register(Arc::new(super::run_background::RunBackground::new(
             workspace,
