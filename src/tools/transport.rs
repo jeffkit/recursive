@@ -732,6 +732,11 @@ impl ToolTransport for LocalTransport {
         cmd.current_dir(cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Defence in depth against orphan processes on timeout: Tokio's
+        // `Child` defaults to `kill_on_drop = false`, so a bare `return Err`
+        // in the timeout branch would leave the shell and any of its
+        // descendants running after the error is surfaced.
+        cmd.kill_on_drop(true);
 
         for (key, val) in env {
             cmd.env(key, val);
@@ -754,6 +759,11 @@ impl ToolTransport for LocalTransport {
         let status = match tokio::time::timeout(timeout, wait).await {
             Ok(s) => s?,
             Err(_) => {
+                // Best-effort SIGKILL of the timed-out process before the
+                // error return; `kill_on_drop(true)` set at spawn is the
+                // safety net for any other early-exit path.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("command timed out after {:?}", timeout),

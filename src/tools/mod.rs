@@ -11,7 +11,13 @@ pub mod agent_defs;
 pub mod audit;
 pub mod checkpoint;
 pub mod client_fs;
+#[cfg(feature = "cloud-runtime")]
+pub mod container_provider;
 pub mod count_lines;
+#[cfg(feature = "cloud-runtime")]
+pub use container_provider::ContainerToolSetProvider;
+#[cfg(feature = "cloud-runtime")]
+pub mod container_transport;
 pub mod dispatch;
 #[cfg(feature = "cloud-runtime")]
 pub mod docker_provider;
@@ -69,8 +75,9 @@ pub mod web_search;
 // ── Re-exports from registry ────────────────────────────────────────────────
 
 pub use registry::{
-    build_standard_tools, build_standard_tools_with_roots, PermissionHook, SessionToolState,
-    SpecWithHint, Tool, ToolRegistry,
+    build_standard_tools, build_standard_tools_with_roots, build_standard_tools_with_transport,
+    build_standard_tools_with_transport_opt, PermissionHook, SessionToolState, SpecWithHint, Tool,
+    ToolRegistry,
 };
 
 // ── Re-exports from audit ───────────────────────────────────────────────────

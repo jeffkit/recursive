@@ -27,6 +27,31 @@ pub enum SandboxMode {
     MicroVm,
 }
 
+impl SandboxMode {
+    /// Parse a sandbox tier name (values of `RECURSIVE_SANDBOX`).
+    pub fn parse_name(name: &str) -> Result<Self, String> {
+        match name {
+            "none" => Ok(SandboxMode::None),
+            "policy" => Ok(SandboxMode::Policy),
+            "container" => Ok(SandboxMode::Container),
+            "microvm" => Ok(SandboxMode::MicroVm),
+            other => Err(format!(
+                "unknown sandbox tier `{other}` (expected none|policy|container|microvm)"
+            )),
+        }
+    }
+
+    /// Resolve the sandbox tier from `RECURSIVE_SANDBOX`. `Ok(None)` when
+    /// the env is unset or empty (the local default — no sandbox change).
+    pub fn from_env() -> Result<Option<Self>, String> {
+        match std::env::var("RECURSIVE_SANDBOX") {
+            Ok(v) if v.is_empty() => Ok(None),
+            Ok(v) => SandboxMode::parse_name(&v).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
 /// Provides the [`ToolRegistry`] for a given runtime mode.
 ///
 /// The local implementation returns the standard registry with direct execution.
@@ -201,6 +226,68 @@ mod tests {
             SandboxMode::None,
             "SandboxMode default must be None"
         );
+    }
+
+    /// `from_env` reads the process-global env, so all its cases run in ONE
+    /// test fn (same pattern as the HTTP budget env tests) to stay race-free.
+    #[test]
+    fn sandbox_mode_from_env_unset_tiers_and_rejects_garbage() {
+        // Unset → local default (None = no sandbox change).
+        std::env::remove_var("RECURSIVE_SANDBOX");
+        assert_eq!(
+            SandboxMode::from_env(),
+            Ok(None),
+            "unset RECURSIVE_SANDBOX must resolve to the local default"
+        );
+        // Empty string is treated as unset (no sandbox change).
+        std::env::set_var("RECURSIVE_SANDBOX", "");
+        assert_eq!(SandboxMode::from_env(), Ok(None));
+        // Each tier name parses.
+        for (name, want) in [
+            ("none", SandboxMode::None),
+            ("policy", SandboxMode::Policy),
+            ("container", SandboxMode::Container),
+            ("microvm", SandboxMode::MicroVm),
+        ] {
+            std::env::set_var("RECURSIVE_SANDBOX", name);
+            assert_eq!(
+                SandboxMode::from_env(),
+                Ok(Some(want)),
+                "RECURSIVE_SANDBOX={name} must parse"
+            );
+        }
+        // Garbage is a hard error — the CLI surfaces it with exit(2); it
+        // must NEVER be silently coerced into local execution.
+        std::env::set_var("RECURSIVE_SANDBOX", "Container");
+        let err = SandboxMode::from_env();
+        assert!(
+            err.is_err(),
+            "tier names are case-sensitive; garbage must Err, got {err:?}"
+        );
+        std::env::remove_var("RECURSIVE_SANDBOX");
+    }
+
+    #[test]
+    fn parse_name_accepts_all_tiers() {
+        assert_eq!(SandboxMode::parse_name("none").unwrap(), SandboxMode::None);
+        assert_eq!(
+            SandboxMode::parse_name("policy").unwrap(),
+            SandboxMode::Policy
+        );
+        assert_eq!(
+            SandboxMode::parse_name("container").unwrap(),
+            SandboxMode::Container
+        );
+        assert_eq!(
+            SandboxMode::parse_name("microvm").unwrap(),
+            SandboxMode::MicroVm
+        );
+    }
+
+    #[test]
+    fn parse_name_rejects_unknown() {
+        assert!(SandboxMode::parse_name("containerd").is_err());
+        assert!(SandboxMode::parse_name("").is_err());
     }
 
     #[test]

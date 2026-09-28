@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- feat(sandbox): ContainerEnvironment 容器档执行环境与选择入口 (#30)：`RECURSIVE_SANDBOX=container`
+  或 `--sandbox container` 时，所有 I/O 工具（Read/Write/Edit/Glob/Grep/Bash 等）通过
+  `ContainerTransport` 在沙箱容器内执行，HTTP 服务为每会话构建独立容器 registry；非
+  `cloud-runtime` 构建下 container/microvm 档显式 exit(2) 拒绝降级，宿主执行工具
+  （run_background 等）在容器档不再注册，消除"容器跑命令、宿主执行"绕过。
 - Fixed unknown-model cost reporting (#42): an unpriced model no longer fakes
   `$0.0000` — `.meta.json` writes `cost_usd: null` instead of `0.0`, and the
   CLI cost line prints `cost: unknown (no pricing for <model>)`.

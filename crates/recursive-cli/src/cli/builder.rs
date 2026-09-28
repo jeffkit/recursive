@@ -36,6 +36,63 @@ pub(crate) async fn build_tools(
     read_state: Option<Arc<Mutex<ReadFileState>>>,
 ) -> (ToolRegistry, Arc<Mutex<ReadFileState>>) {
     let root = &config.workspace;
+    // Goal 403: container sandbox tier via RECURSIVE_SANDBOX=container.
+    // The default (env unset) path below stays byte-identical; other tier
+    // values are validated but handled by their own providers/goals.
+    let sandbox = recursive::SandboxMode::from_env().unwrap_or_else(|e| {
+        eprintln!("recursive: RECURSIVE_SANDBOX: {e}");
+        std::process::exit(2);
+    });
+    match sandbox {
+        Some(recursive::SandboxMode::Container) => {
+            #[cfg(feature = "cloud-runtime")]
+            {
+                let skills = discover_loaded_skills(config);
+                let provider = recursive::tools::ContainerToolSetProvider::new(
+                    root.clone(),
+                    config.shell_timeout_secs,
+                    skills,
+                );
+                let registry = recursive::ToolSetProvider::build_registry(&provider);
+                let read_state = registry
+                    .read_file_state()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(ReadFileState::new())));
+                return (registry, read_state);
+            }
+            #[cfg(not(feature = "cloud-runtime"))]
+            {
+                eprintln!(
+                    "recursive: RECURSIVE_SANDBOX=container requires a build with the \
+                     `cloud-runtime` feature; refusing to fall back to local execution"
+                );
+                std::process::exit(2);
+            }
+        }
+        // Issue §3: policy tier gets the L1 policy attached via its
+        // provider (previously the value was parsed and silently ignored).
+        Some(recursive::SandboxMode::Policy) => {
+            let skills = discover_loaded_skills(config);
+            let provider = recursive::PolicyToolSetProvider::restrictive(
+                root.clone(),
+                config.shell_timeout_secs,
+                skills,
+            );
+            let registry = recursive::ToolSetProvider::build_registry(&provider);
+            let read_state = registry
+                .read_file_state()
+                .unwrap_or_else(|| Arc::new(Mutex::new(ReadFileState::new())));
+            return (registry, read_state);
+        }
+        Some(recursive::SandboxMode::MicroVm) => {
+            eprintln!(
+                "recursive: RECURSIVE_SANDBOX=microvm requires the E2B provider \
+                 (RECURSIVE_E2B_*), which is not wired to this entry point yet; \
+                 refusing to fall back to local execution"
+            );
+            std::process::exit(2);
+        }
+        Some(recursive::SandboxMode::None) | None => {}
+    }
     // One shared transport instance for the registry AND the fs tools
     // (Goal 401): swap this single Arc to a container transport and the
     // whole toolset follows. Never construct a second transport for tools.
@@ -569,6 +626,55 @@ mod tests {
     ///      `read_file_state()` points at the SAME arc (so the reinjector sees
     ///      what Read just recorded);
     ///   2. passing `Some(custom)` reuses that exact arc (no hidden copy).
+    ///
+    /// Goal 403 / issue §5: the sandbox tier selection entry point is pinned
+    /// at the source level — `build_tools` dispatches on
+    /// `SandboxMode::from_env()` and every non-local tier refuses to
+    /// degrade (exit(2)) rather than silently running on the host. A
+    /// runtime test of the container arm needs a Docker daemon, so the
+    /// dispatch + refusal contract is asserted against the builder source.
+    #[test]
+    fn build_tools_dispatches_on_sandbox_mode_without_silent_fallback() {
+        let src = include_str!("builder.rs");
+        // Dispatch happens on SandboxMode::from_env().
+        assert!(
+            src.contains("SandboxMode::from_env()"),
+            "build_tools must select the tier via SandboxMode::from_env()"
+        );
+        // Every non-local tier arm must exit(2) on failure instead of
+        // falling through to the local registry below the match.
+        let container_arm = src
+            .split("Some(recursive::SandboxMode::Container) => {")
+            .nth(1)
+            .and_then(|r| r.split("Some(recursive::SandboxMode::Policy)").next())
+            .expect("Container arm");
+        assert!(
+            container_arm.contains("ContainerToolSetProvider"),
+            "container tier must dispatch to ContainerToolSetProvider"
+        );
+        let microvm_arm = src
+            .split("Some(recursive::SandboxMode::MicroVm) => {")
+            .nth(1)
+            .and_then(|r| r.split("Some(recursive::SandboxMode::None)").next())
+            .expect("MicroVm arm");
+        assert!(
+            microvm_arm.contains("std::process::exit(2)"),
+            "microvm tier must refuse (exit 2), not degrade"
+        );
+        // The container tier without the cloud-runtime feature must also
+        // exit(2) — that is the "no silent downgrade" contract for the
+        // default binary.
+        let no_feature = src
+            .split("#[cfg(not(feature = \"cloud-runtime\"))]")
+            .nth(1)
+            .and_then(|r| r.split("Some(recursive::SandboxMode::Policy)").next())
+            .expect("non-cloud-runtime container arm");
+        assert!(
+            no_feature.contains("std::process::exit(2)"),
+            "container tier on a non-cloud-runtime build must exit(2)"
+        );
+    }
+
     #[tokio::test]
     async fn build_tools_returns_shared_read_state_when_none() {
         let cfg = test_config();

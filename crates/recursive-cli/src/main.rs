@@ -218,6 +218,15 @@ struct Cli {
     /// Tool names are matched case-insensitively.
     #[arg(long = "allow-tools", env = "RECURSIVE_ALLOW_TOOLS")]
     allow_tools: Option<String>,
+
+    /// Sandbox tier: none | policy | container | microvm (issue §3).
+    /// Equivalent to RECURSIVE_SANDBOX; the flag wins when both are given.
+    #[arg(
+        long = "sandbox",
+        env = "RECURSIVE_SANDBOX",
+        value_parser = ["none", "policy", "container", "microvm"]
+    )]
+    sandbox: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -502,6 +511,17 @@ enum McpCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // --sandbox flag (issue §3): wins over RECURSIVE_SANDBOX when given, by
+    // exporting it before any tool-set construction reads the env.
+    if let Some(tier) = &cli.sandbox {
+        // clap's value_parser already restricted the vocabulary; still
+        // validate via SandboxMode so the error text stays canonical.
+        if let Err(e) = recursive::SandboxMode::parse_name(tier) {
+            eprintln!("recursive: --sandbox: {e}");
+            std::process::exit(2);
+        }
+        std::env::set_var("RECURSIVE_SANDBOX", tier);
+    }
     // Resolve log level early (before Config::from_env) so init_logging sees
     // --debug / --verbose before any config-file processing happens.
     let early_log = if cli.verbose {
@@ -2962,6 +2982,75 @@ mod tests {
         let args = vec!["recursive", "--hook-timing", "run", "test goal"];
         let cli = Cli::parse_from(args);
         assert!(cli.hook_timing);
+    }
+
+    // ── Goal 403 / issue §5: the --sandbox flag entry point ─────────────
+
+    #[test]
+    fn sandbox_flag_parses_all_tiers_env_and_garbage() {
+        // clap reads the process env, so every env-dependent case lives in
+        // ONE fn (parallel sibling tests would race on the global).
+        let saved = std::env::var("RECURSIVE_SANDBOX").ok();
+        std::env::remove_var("RECURSIVE_SANDBOX");
+
+        // Default: unset → local default tier.
+        let cli = Cli::parse_from(vec!["recursive", "run", "g"]);
+        assert!(
+            cli.sandbox.is_none(),
+            "--sandbox must default to unset (local default tier)"
+        );
+        // Every tier name parses via the flag.
+        for tier in ["none", "policy", "container", "microvm"] {
+            let cli = Cli::parse_from(vec!["recursive", "--sandbox", tier, "run", "g"]);
+            assert_eq!(cli.sandbox.as_deref(), Some(tier));
+        }
+        // Env fallback populates the flag…
+        std::env::set_var("RECURSIVE_SANDBOX", "policy");
+        let cli = Cli::parse_from(vec!["recursive", "run", "g"]);
+        assert_eq!(
+            cli.sandbox.as_deref(),
+            Some("policy"),
+            "RECURSIVE_SANDBOX env must populate --sandbox"
+        );
+        // …and the explicit flag wins over the env value.
+        let cli = Cli::parse_from(vec!["recursive", "--sandbox", "container", "run", "g"]);
+        assert_eq!(
+            cli.sandbox.as_deref(),
+            Some("container"),
+            "the explicit flag must win over the env value"
+        );
+        std::env::remove_var("RECURSIVE_SANDBOX");
+        // Unknown tier names are rejected by clap's value_parser (exit 2).
+        assert!(
+            Cli::try_parse_from(vec!["recursive", "--sandbox", "bogus", "run", "g"]).is_err(),
+            "bogus tier must fail parsing"
+        );
+
+        if let Some(v) = saved {
+            std::env::set_var("RECURSIVE_SANDBOX", v);
+        }
+    }
+
+    #[test]
+    fn sandbox_flag_invalid_name_would_exit_two() {
+        // main() routes --sandbox values through SandboxMode::parse_name
+        // before set_var so the canonical error text is used; clap's
+        // value_parser already restricts the vocabulary, so this pins the
+        // double-validation source contract (no silent acceptance).
+        let src = include_str!("main.rs");
+        let block = src
+            .split("if let Some(tier) = &cli.sandbox {")
+            .nth(1)
+            .and_then(|r| r.split("let early_log").next())
+            .expect("--sandbox handling block must exist in main()");
+        assert!(
+            block.contains("SandboxMode::parse_name"),
+            "--sandbox must be validated via SandboxMode::parse_name"
+        );
+        assert!(
+            block.contains("std::process::exit(2)"),
+            "invalid --sandbox must exit(2), never degrade to local execution"
+        );
     }
 
     #[test]

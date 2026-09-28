@@ -608,6 +608,19 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
+    /// Builder-style conditional registration: registers every tool produced
+    /// by `make` only when `cond` is true. Lets factory code express
+    /// "these tools are host-only" inline in the registration chain.
+    fn register_when(mut self, cond: bool, make: impl FnOnce() -> Vec<Arc<dyn Tool>>) -> Self {
+        if cond {
+            for tool in make() {
+                let name = tool.spec().name;
+                self.tools.insert(name, tool);
+            }
+        }
+        self
+    }
+
     /// Find a registered tool by its primary name or any alias.
     ///
     /// This is the preferred lookup path. `invoke` delegates to this so that
@@ -643,6 +656,18 @@ impl ToolRegistry {
             }
         }
         (eager, deferred)
+    }
+
+    /// Remove tools by primary name (case-sensitive). Aliases pointing at
+    /// removed tools are dropped too. Used to disable host-executing tools
+    /// in sandbox tiers where they would bypass the environment binding
+    /// (e.g. `run_background` in the container tier, Goal 403).
+    pub fn remove_tools(&mut self, names: &[&str]) {
+        let drop_set: std::collections::HashSet<&str> = names.iter().copied().collect();
+        self.tools
+            .retain(|name, _| !drop_set.contains(name.as_str()));
+        self.aliases
+            .retain(|_, primary| self.tools.contains_key(primary));
     }
 
     /// Restrict the registry to only the named tools, removing all others.
@@ -829,32 +854,118 @@ pub fn build_standard_tools_with_roots(
             super::run_background::BackgroundJobManager::new(),
         ))
     });
-    let todo_list = Arc::new(std::sync::RwLock::new(Vec::<super::todo::TodoItem>::new()));
-    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
     // Goal 401/402: every I/O tool (Read / Write / Edit / Glob / Grep /
     // count_lines) must share the registry's single transport instance, so an
     // environment binding chosen here follows the tools automatically
     // (container tier, Goal 403). Do NOT let tools construct their own
     // LocalTransport — that would silently pin them to the host and undo the
     // sandbox.
-    let base = ToolRegistry::local();
-    let shared_transport = base.transport().clone();
-    let mut registry = base
+    build_standard_tools_with_transport(
+        Arc::new(super::transport::LocalTransport),
+        workspace,
+        extra_roots,
+        session_roots,
+        skills,
+        shell_timeout_secs,
+        web_search_provider,
+        web_search_api_key,
+        web_search_jina_key,
+        Some(bg_manager),
+    )
+}
+
+/// Same as [`build_standard_tools_with_roots`] but every I/O tool is bound
+/// to the given shared transport (Goal 403 container tier: pass the
+/// [`super::container_transport::ContainerTransport`] `Arc` here instead of
+/// swapping it post-hoc — tools hold their own `Arc` clones, so a registry
+/// built with `LocalTransport` can never be re-bound after the fact).
+#[allow(clippy::too_many_arguments)]
+pub fn build_standard_tools_with_transport(
+    transport: Arc<dyn super::transport::ToolTransport>,
+    workspace: &std::path::Path,
+    extra_roots: &[(std::path::PathBuf, super::dispatch::AccessTier)],
+    session_roots: Option<super::dispatch::SharedSandboxRoots>,
+    skills: &[crate::skills::Skill],
+    shell_timeout_secs: u64,
+    web_search_provider: Option<String>,
+    web_search_api_key: Option<String>,
+    web_search_jina_key: Option<String>,
+    bg_manager: Option<Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>>,
+) -> ToolRegistry {
+    build_standard_tools_with_transport_opt(
+        transport,
+        workspace,
+        extra_roots,
+        session_roots,
+        skills,
+        shell_timeout_secs,
+        web_search_provider,
+        web_search_api_key,
+        web_search_jina_key,
+        bg_manager,
+        false,
+    )
+}
+
+/// Extended form of [`build_standard_tools_with_transport`] with
+/// `disable_host_exec`: when `true`, the host-process-executing tools
+/// (`run_background` / `check_background` / `watch_file` / `stop_loop`) are
+/// removed from the registry. They spawn commands via the HOST
+/// `/bin/sh` regardless of the shared transport, so keeping them would let
+/// the model bypass the container sandbox (issue #30: "container runs the
+/// commands, host executes them" split). Isolating them inside the
+/// container is future work; until then the container tier honestly drops
+/// them instead of silently exposing host execution.
+#[allow(clippy::too_many_arguments)]
+pub fn build_standard_tools_with_transport_opt(
+    transport: Arc<dyn super::transport::ToolTransport>,
+    workspace: &std::path::Path,
+    extra_roots: &[(std::path::PathBuf, super::dispatch::AccessTier)],
+    session_roots: Option<super::dispatch::SharedSandboxRoots>,
+    skills: &[crate::skills::Skill],
+    shell_timeout_secs: u64,
+    web_search_provider: Option<String>,
+    web_search_api_key: Option<String>,
+    web_search_jina_key: Option<String>,
+    bg_manager: Option<Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>>,
+    disable_host_exec: bool,
+) -> ToolRegistry {
+    let bg_manager = bg_manager.unwrap_or_else(|| {
+        Arc::new(tokio::sync::Mutex::new(
+            super::run_background::BackgroundJobManager::new(),
+        ))
+    });
+    let todo_list = Arc::new(std::sync::RwLock::new(Vec::<super::todo::TodoItem>::new()));
+    let read_state = Arc::new(Mutex::new(ReadFileState::new()));
+    // Goal 401/402: every I/O tool (Read / Write / Edit / Glob / Grep /
+    // count_lines / Bash) must share the registry's single transport
+    // instance, so an environment binding chosen here follows the tools
+    // automatically (container tier, Goal 403). Do NOT let tools construct
+    // their own LocalTransport — that would silently pin them to the host
+    // and undo the sandbox.
+    let shared_transport = transport;
+    let mut registry = ToolRegistry::new(shared_transport.clone())
         .with_read_file_state(read_state.clone())
-        .register(Arc::new(
-            super::fs::ReadFile::new(workspace)
-                .with_extra_roots(extra_roots.iter().cloned())
-                .with_session_roots_opt(session_roots.clone())
-                .with_read_state(read_state.clone())
-                .with_transport(shared_transport.clone()),
-        ))
-        .register(Arc::new(
-            super::fs::WriteFile::new(workspace)
-                .with_extra_roots(extra_roots.iter().cloned())
-                .with_session_roots_opt(session_roots.clone())
-                .with_read_state(read_state.clone())
-                .with_transport(shared_transport.clone()),
-        ))
+        .register_with_aliases(
+            Arc::new(
+                super::fs::ReadFile::new(workspace)
+                    .with_extra_roots(extra_roots.iter().cloned())
+                    .with_session_roots_opt(session_roots.clone())
+                    .with_read_state(read_state.clone())
+                    .with_transport(shared_transport.clone()),
+            ),
+            &["read_file"],
+        )
+        .register_with_aliases(
+            Arc::new(
+                super::fs::WriteFile::new(workspace)
+                    .with_extra_roots(extra_roots.iter().cloned())
+                    .with_session_roots_opt(session_roots.clone())
+                    .with_read_state(read_state.clone())
+                    .with_transport(shared_transport.clone()),
+            ),
+            &["write_file"],
+        )
         .register(Arc::new(
             super::edit::EditTool::new(workspace)
                 .with_extra_roots(extra_roots.iter().cloned())
@@ -864,7 +975,8 @@ pub fn build_standard_tools_with_roots(
         ))
         .register(Arc::new(
             super::shell::RunShell::new(workspace)
-                .with_timeout(std::time::Duration::from_secs(shell_timeout_secs)),
+                .with_timeout(std::time::Duration::from_secs(shell_timeout_secs))
+                .with_transport(shared_transport.clone()),
         ))
         .register(Arc::new(
             super::search::SearchFiles::new(workspace)
@@ -872,26 +984,24 @@ pub fn build_standard_tools_with_roots(
                 .with_session_roots_opt(session_roots.clone())
                 .with_transport(shared_transport.clone()),
         ))
-        .register(Arc::new(
-            super::glob::GlobTool::new(workspace)
-                .with_extra_roots(extra_roots.iter().cloned())
-                .with_session_roots_opt(session_roots.clone())
-                .with_transport(shared_transport.clone()),
-        ))
-        .register(Arc::new(super::run_background::RunBackground::new(
-            workspace,
-            bg_manager.clone(),
-        )))
-        .register(Arc::new(super::run_background::CheckBackground::new(
-            bg_manager.clone(),
-        )))
-        .register(Arc::new(super::watch_file::WatchFile::new(
-            workspace,
-            bg_manager.clone(),
-        )))
-        .register(Arc::new(super::stop_loop::StopLoop::new(
-            workspace, bg_manager,
-        )))
+        .register_with_aliases(
+            Arc::new(
+                super::glob::GlobTool::new(workspace)
+                    .with_extra_roots(extra_roots.iter().cloned())
+                    .with_session_roots_opt(session_roots.clone())
+                    .with_transport(shared_transport.clone()),
+            ),
+            &["list_dir", "glob"],
+        )
+        .register_with_aliases(
+            Arc::new(
+                super::count_lines::CountLines::new(workspace)
+                    .with_extra_roots(extra_roots.iter().cloned())
+                    .with_session_roots_opt(session_roots.clone())
+                    .with_transport(shared_transport.clone()),
+            ),
+            &["count_lines"],
+        )
         .register(Arc::new(
             super::estimate_tokens::EstimateTokens::new(workspace)
                 .with_extra_roots(extra_roots.iter().cloned())
@@ -917,7 +1027,31 @@ pub fn build_standard_tools_with_roots(
         )))
         .register(Arc::new(super::a2a::A2aCallTool::new()))
         .register(Arc::new(super::a2a::A2aCardTool::new()))
-        .register(Arc::new(super::a2a::A2aTaskCheckTool::new()));
+        .register(Arc::new(super::a2a::A2aTaskCheckTool::new()))
+        // Host-process-executing tools (`/bin/sh` on the host, host fs
+        // polling): only registered when the transport actually IS the
+        // host. In container-bound registries (disable_host_exec) they
+        // would be a sandbox bypass — see the doc on
+        // `build_standard_tools_with_transport_opt`.
+        .register_when(!disable_host_exec, || {
+            vec![
+                Arc::new(super::run_background::RunBackground::new(
+                    workspace,
+                    bg_manager.clone(),
+                )) as Arc<dyn Tool>,
+                Arc::new(super::run_background::CheckBackground::new(
+                    bg_manager.clone(),
+                )),
+                Arc::new(super::watch_file::WatchFile::new(
+                    workspace,
+                    bg_manager.clone(),
+                )),
+                Arc::new(super::stop_loop::StopLoop::new(
+                    workspace,
+                    bg_manager.clone(),
+                )),
+            ]
+        });
 
     // Goal-201: plan mode tools are channel capabilities (TUI / HTTP only).
     // They are registered exclusively by AgentRuntimeBuilder::build() which
@@ -961,6 +1095,9 @@ pub fn build_standard_tools_with_roots(
             .with_session_roots_opt(session_roots.clone()),
     ));
 
+    if let Some(roots) = session_roots {
+        registry = registry.with_session_roots(roots);
+    }
     registry
 }
 

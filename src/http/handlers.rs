@@ -205,7 +205,7 @@ pub(super) async fn run_agent(
     );
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
-    let mut tool_registry = state.tool_registry.clone();
+    let mut tool_registry = state.session_tool_registry();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
         tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
@@ -327,7 +327,7 @@ pub(super) async fn create_session(
         .max_steps
         .map(|n| n as usize)
         .unwrap_or(state.config.max_steps);
-    let mut tool_registry = state.tool_registry.clone();
+    let mut tool_registry = state.session_tool_registry();
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
         tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
@@ -687,7 +687,7 @@ pub(super) async fn fork_session(
 
     let mut runtime = build_session_runtime(
         &state,
-        state.tool_registry.clone(),
+        state.session_tool_registry(),
         system_prompt,
         prompt_segments,
         state.config.max_steps,
@@ -1763,7 +1763,7 @@ pub(super) async fn agui_run(
     let client_tool_names: std::collections::HashSet<String> =
         agui_tools.iter().map(|t| t.name.clone()).collect();
 
-    let mut tool_registry = state.tool_registry.clone();
+    let mut tool_registry = state.session_tool_registry();
     for t in &agui_tools {
         tool_registry = tool_registry.register(Arc::new(ClientToolStub {
             name: t.name.clone(),

@@ -381,6 +381,56 @@ pub struct ToolInfo {
     pub parameters: serde_json::Value,
 }
 
+/// Goal 403 (issue §3): construct the container environment **per session**.
+///
+/// In the container sandbox tier every session (and one-shot `/run` / `/agui`
+/// run) gets its OWN `ContainerToolSetProvider` registry — i.e. its own
+/// sandbox container — instead of sharing the registry built once at server
+/// startup. Every other tier (none / policy) keeps sharing the process-wide
+/// startup registry via a plain clone.
+///
+/// Process-level configuration on the startup registry (permissions,
+/// headless, hook runner) is carried over so the per-session rebuild does
+/// not silently drop it.
+fn rebind_per_session_registry(
+    base: &ToolRegistry,
+    #[allow(unused_variables)] config: &Config,
+    #[allow(unused_variables)] skills: &[crate::skills::Skill],
+) -> ToolRegistry {
+    #[cfg(feature = "cloud-runtime")]
+    {
+        if matches!(
+            crate::SandboxMode::from_env(),
+            Ok(Some(crate::SandboxMode::Container))
+        ) {
+            let provider = crate::tools::ContainerToolSetProvider::new(
+                config.workspace.clone(),
+                config.shell_timeout_secs,
+                skills.to_vec(),
+            );
+            let mut reg = crate::ToolSetProvider::build_registry(&provider);
+            if let Some(sp) = base.shared_permissions() {
+                reg = reg.with_shared_permissions(sp);
+            }
+            return reg
+                .with_headless(base.headless)
+                .with_hook_runner(base.hook_runner.clone());
+        }
+    }
+    base.clone()
+}
+
+impl AppState {
+    /// The tool registry a NEW session / run should be built with.
+    ///
+    /// Container tier: a fresh registry with its own container (issue §3 —
+    /// one container per session, not one per process). Other tiers: a
+    /// handle-clone of the shared startup registry (previous behaviour).
+    pub fn session_tool_registry(&self) -> ToolRegistry {
+        rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills)
+    }
+}
+
 /// Request body for `POST /run`.
 #[derive(serde::Deserialize, Debug)]
 pub struct RunRequest {
@@ -1658,6 +1708,86 @@ mod goal_396_persistence_tests {
         assert!(
             state.host.sessions().read().await.is_empty(),
             "flush must drain the session map"
+        );
+    }
+}
+
+// =====================================================================
+// Goal 403 (issue §3 / E2): the HTTP entry must honor
+// RECURSIVE_SANDBOX=container the same way the CLI does. Verified at
+// the source level in two parts:
+//   1. the `recursive http` entry builds its startup registry through
+//      `cli::builder::build_tools` (which dispatches on SandboxMode), and
+//   2. every per-session build point substitutes a FRESH
+//      ContainerToolSetProvider registry (one container per session) via
+//      `AppState::session_tool_registry` — the registry built at startup
+//      must NOT be shared into sessions in the container tier.
+// Wiring a live container into unit tests is out of scope here; the
+// builder dispatch itself is covered by the container provider tests and
+// the gated integration tests (tests/sandbox_container.rs).
+// =====================================================================
+#[cfg(test)]
+mod goal_403_http_sandbox_entry {
+    #[test]
+    fn http_entry_builds_tools_via_shared_builder_not_local_registry() {
+        let src = include_str!("../../crates/recursive-cli/src/main.rs");
+        let http_block = src
+            .split("Cmd::Http { addr } => {")
+            .nth(1)
+            .expect("HTTP entry block must exist");
+        assert!(
+            http_block.contains("cli::builder::build_tools"),
+            "HTTP entry must build its tool registry through cli::builder::build_tools \
+             (which dispatches RECURSIVE_SANDBOX=container to ContainerToolSetProvider), \
+             not a local-only registry"
+        );
+    }
+
+    #[test]
+    fn builder_dispatches_container_tier_to_container_provider() {
+        // The builder's Container arm must construct a
+        // ContainerToolSetProvider and build the registry through the
+        // ToolSetProvider — that is what makes the source-level assertion
+        // above non-vacuous.
+        let src = include_str!("../../crates/recursive-cli/src/cli/builder.rs");
+        let container_arm = src
+            .split("Some(recursive::SandboxMode::Container) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("Some(recursive::SandboxMode::Policy)").next())
+            .expect("builder must have a Container match arm");
+        assert!(
+            container_arm.contains("ContainerToolSetProvider"),
+            "builder Container arm must dispatch to ContainerToolSetProvider"
+        );
+        assert!(
+            container_arm.contains("build_registry"),
+            "builder Container arm must build the registry via the provider"
+        );
+        // No silent fallback: the non-cloud-runtime build must refuse.
+        let no_feature = src
+            .split("#[cfg(not(feature = \"cloud-runtime\"))]")
+            .nth(1)
+            .and_then(|rest| rest.split("Some(recursive::SandboxMode::Policy)").next())
+            .expect("non-cloud-runtime container arm must exist");
+        assert!(
+            no_feature.contains("std::process::exit(2)"),
+            "container tier without cloud-runtime must exit(2), not degrade to local"
+        );
+    }
+
+    #[test]
+    fn sessions_rebind_their_own_registry_in_container_tier() {
+        let src = include_str!("handlers.rs");
+        assert!(
+            !src.contains("state.tool_registry.clone()"),
+            "per-session build points must go through \
+             AppState::session_tool_registry(), never clone the shared \
+             startup registry directly (container tier = one container \
+             per session, issue §3)"
+        );
+        assert!(
+            src.contains("state.session_tool_registry()"),
+            "per-session runtimes must be built from session_tool_registry()"
         );
     }
 }

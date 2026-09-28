@@ -6,10 +6,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use super::resolve_within;
 use super::Tool;
@@ -27,6 +24,11 @@ pub struct RunShell {
     pub root: PathBuf,
     pub timeout: Duration,
     pub max_output_bytes: usize,
+    /// Goal 403: I/O backend for command execution. Defaults to
+    /// [`super::transport::LocalTransport`] (byte-identical to the
+    /// pre-transport behaviour); a container transport routes commands
+    /// into the sandbox environment instead of the host shell.
+    pub transport: std::sync::Arc<dyn super::transport::ToolTransport>,
 }
 
 impl RunShell {
@@ -35,11 +37,23 @@ impl RunShell {
             root: root.into(),
             timeout: Duration::from_secs(300),
             max_output_bytes: 128 * 1024,
+            transport: std::sync::Arc::new(super::transport::LocalTransport),
         }
     }
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
+        self
+    }
+
+    /// Bind the shell to a transport (Goal 403 container tier). The
+    /// transport receives host-resolved paths (`root` + optional `cwd`);
+    /// container transports map them into the environment.
+    pub fn with_transport(
+        mut self,
+        transport: std::sync::Arc<dyn super::transport::ToolTransport>,
+    ) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -111,47 +125,21 @@ impl Tool for RunShell {
             self.root.clone()
         };
 
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(command);
-        cmd.current_dir(&cwd);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        // Defence in depth against orphan processes on timeout: Tokio's
-        // `Child` defaults to `kill_on_drop = false`, so a bare `return Err`
-        // in the timeout branch would leave the shell and any of its
-        // descendants running. The timeout branch also calls `start_kill`
-        // explicitly so the intent is visible at the call site, but
-        // `kill_on_drop(true)` covers the case where a future refactor
-        // adds another early return (panic, `?` propagation, etc.).
-        cmd.kill_on_drop(true);
-
-        // Apply optional env overrides
+        // Goal 403: delegate execution to the transport. With the default
+        // `LocalTransport` this is byte-identical to the previous direct
+        // `tokio::process` path (the local `exec_shell` implementation
+        // preserves the kill-on-timeout / kill-on-drop semantics); a
+        // container transport routes the command into the sandbox.
+        let mut env_pairs: Vec<(String, String)> = Vec::new();
         if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
             for (key, val) in env_map {
                 let val_str = val.as_str().ok_or_else(|| Error::BadToolArgs {
                     name: "Bash".to_string(),
                     message: format!("env value for `{key}` must be a string, got {:?}", val),
                 })?;
-                cmd.env(key, val_str);
+                env_pairs.push((key.clone(), val_str.to_string()));
             }
         }
-
-        let mut child = cmd.spawn().map_err(|e| Error::Tool {
-            name: "Bash".into(),
-            call_id: None,
-            message: format!("spawn failed: {e}"),
-        })?;
-
-        let mut stdout = child.stdout.take().ok_or_else(|| Error::Tool {
-            name: "Bash".into(),
-            call_id: None,
-            message: "stdout was not piped".into(),
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| Error::Tool {
-            name: "Bash".into(),
-            call_id: None,
-            message: "stderr was not piped".into(),
-        })?;
 
         // LLM may ask for a larger per-stream cap when it knows it needs
         // the full output (e.g. a long `cargo build` diagnostic). Clamp
@@ -162,74 +150,55 @@ impl Tool for RunShell {
             Some(n) => (n as usize).min(MAX_OUTPUT_BYTES_HARD_CAP),
             None => self.max_output_bytes,
         };
-        let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
-        let stderr_task = tokio::spawn(async move { read_capped(&mut stderr, max).await });
 
-        let wait = child.wait();
-        let status = match tokio::time::timeout(self.timeout, wait).await {
-            Ok(s) => s.map_err(|e| Error::Tool {
+        let result = self
+            .transport
+            .exec_shell(command, &cwd, &env_pairs, self.timeout, max)
+            .await
+            .map_err(|e| Error::Tool {
                 name: "Bash".into(),
                 call_id: None,
-                message: format!("wait failed: {e}"),
-            })?,
-            Err(_) => {
-                // Best-effort SIGKILL of the timed-out process group.
-                // `kill_on_drop(true)` set at spawn is the safety net,
-                // but explicit kill here ensures the OS reaps the child
-                // promptly rather than waiting for the Drop to fire when
-                // the error path returns. `start_kill` is non-blocking
-                // and tolerant of the child having already exited.
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                // Drain the reader tasks before returning. They block on
-                // the stdout/stderr pipes until the kill closes them;
-                // awaiting them here prevents their JoinHandles from
-                // detaching with output still buffered. Order matters:
-                // kill (and reap) BEFORE awaiting the readers, or the
-                // pipes never close and the drain deadlocks.
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                return Err(Error::Tool {
-                    name: "Bash".into(),
-                    call_id: None,
-                    message: format!("command timed out after {:?}", self.timeout),
-                });
-            }
-        };
+                message: super::fs::transport_io_error(&cwd, &e),
+            })?;
 
-        let out = stdout_task.await.unwrap_or_default();
-        let err = stderr_task.await.unwrap_or_default();
-        let code = status
-            .code()
+        // Goal 400/403: the transport's structural classification is the
+        // single source of truth for WHY the exec ended. Environment
+        // failures (container OOM/killed) must not be reported as a plain
+        // tool error the model would try to "fix" in its command; surface
+        // the classification explicitly instead (contract pinned by
+        // `mock_transport_surfaces_failure_classification`).
+        if let Some(failure) = result.failure {
+            return Err(Error::Tool {
+                name: "Bash".into(),
+                call_id: None,
+                message: match failure {
+                    super::transport::TransportFailure::Environment => format!(
+                        "environment failure (sandbox container died or was killed; \
+                         not a command bug): cwd={}",
+                        cwd.display()
+                    ),
+                    super::transport::TransportFailure::Retryable => format!(
+                        "retryable: transient sandbox transport failure: cwd={}",
+                        cwd.display()
+                    ),
+                    super::transport::TransportFailure::Tool => format!(
+                        "sandbox transport rejected the invocation: cwd={}",
+                        cwd.display()
+                    ),
+                },
+            });
+        }
+
+        let code = result
+            .exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
 
         Ok(format!(
-            "exit: {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+            "exit: {code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            result.stdout, result.stderr
         ))
     }
-}
-
-async fn read_capped<R: AsyncReadExt + Unpin>(reader: &mut R, max: usize) -> String {
-    let mut buf = Vec::with_capacity(8 * 1024);
-    let mut tmp = [0u8; 8 * 1024];
-    loop {
-        match reader.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len() + n > max {
-                    let take = max.saturating_sub(buf.len());
-                    buf.extend_from_slice(&tmp[..take]);
-                    buf.extend_from_slice(b"\n... [output truncated]");
-                    let _ = tokio::io::copy(reader, &mut tokio::io::sink()).await;
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]

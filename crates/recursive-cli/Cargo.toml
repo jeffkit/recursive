@@ -41,6 +41,7 @@ default = ["web_search", "http"]
 # move the corresponding entry out of the `[dependencies]` `features` list.
 web_search = ["recursive/web_search"]
 http = ["recursive/http"]
+cloud-runtime = ["recursive/cloud-runtime"]
 weixin = ["recursive/weixin"]
 otel = [
   "dep:opentelemetry",
