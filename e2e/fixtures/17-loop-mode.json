@@ -1,5 +1,5 @@
 {
-  "_comment": "Fixtures for 17-loop-mode.yaml — schedule_wakeup multi-turn loop. Turn 1 ONLY schedules a wakeup and ends; the wakeup turn (turn 2) writes the output file and ends. Three authoring rules that bite here: (1) arg names must match the schedule_wakeup tool spec — delay_secs/reason/prompt, NOT the legacy seconds/message. A mismatch silently defaults delay_secs to the tool's unwrap_or(60), making the suite sleep 60s. (2) userMessage keys off the LATEST user message, so the wakeup turn (whose latest user msg is the schedule_wakeup prompt, not the goal) needs its own substring ('Continue') absent from the goal. (3) the loop shares the transcript across turns, so turn 2's first call already has hasToolResult=true from turn 1's schedule_wakeup result.",
+  "_comment": "Fixtures for 17-loop-mode.yaml — schedule_wakeup multi-turn loop. Turn 1 ONLY schedules a wakeup and ends; the wakeup turn (turn 2) writes the output file and ends. Three authoring rules that bite here: (1) arg names must match the schedule_wakeup tool spec — delay_secs/reason/prompt, NOT the legacy seconds/message. A mismatch silently defaults delay_secs to the tool's unwrap_or(60), making the suite sleep 60s. (2) userMessage keys off the LATEST user message, so the wakeup turn (whose latest user msg is the schedule_wakeup prompt, not the goal) needs its own substring ('Continue') absent from the goal. (3) the loop shares the transcript across turns, but aimock's hasToolResult is scoped to the CURRENT turn (messages after the latest user msg): turn 2's first call is preceded by the wakeup user msg, so turn 1's schedule_wakeup result does NOT make it true — only turn 2's own write_file result does (call 3).",
   "fixtures": [
     {
       "_comment": "Turn 1, LLM call 0: agent schedules an immediate wakeup (goal is latest user msg, no tool result yet)",
@@ -25,8 +25,8 @@
       }
     },
     {
-      "_comment": "Turn 2 (wakeup), LLM call 2: latest user msg is the wakeup prompt ('Continue…'), transcript already has turn 1's tool result, so hasToolResult=true",
-      "match": { "userMessage": "Continue", "turnIndex": 2, "hasToolResult": true },
+      "_comment": "Turn 2 (wakeup), LLM call 2: latest user msg is the wakeup prompt ('Continue…'); the current turn (messages after that user msg) has no tool result yet, so hasToolResult=false even though turn 1's schedule_wakeup result is earlier in the transcript. (Same aimock current-turn rule that broke 11-session-resume — see fixtures/README.md.)",
+      "match": { "userMessage": "Continue", "turnIndex": 2, "hasToolResult": false },
       "response": {
         "toolCalls": [
           {
