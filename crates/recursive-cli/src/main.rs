@@ -1245,7 +1245,7 @@ async fn main() -> anyhow::Result<()> {
                         preset.key_env.clone()
                     };
                     println!(
-                        "preset resolves to: type={}, model={}, key_env={key_env}",
+                        "preset resolves to: type={}, default_model={}, key_env={key_env}",
                         preset.provider_type, preset.default_model
                     );
                 }
