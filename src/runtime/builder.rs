@@ -159,6 +159,15 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Goal 399: set the session wall-clock budget in seconds, forwarded to
+    /// the kernel builder (optional, default 0 = unlimited, same contract as
+    /// `max_steps`). When > 0, a turn that exceeds the budget finishes with
+    /// `FinishReason::WallClockExceeded` — data, not an error (invariant #7).
+    pub fn wall_timeout_secs(mut self, secs: u64) -> Self {
+        self.kernel_builder = self.kernel_builder.wall_timeout_secs(secs);
+        self
+    }
+
     /// Set a transcript character limit (optional, default unlimited).
     pub fn max_transcript_chars(mut self, n: usize) -> Self {
         self.kernel_builder = self.kernel_builder.max_transcript_chars(n);

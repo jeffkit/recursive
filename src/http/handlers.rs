@@ -21,16 +21,41 @@ use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
 
 use super::{
-    build_openapi_spec, ApiError, AppState, CreateSessionRequest, CreateSessionResponse,
-    ErrorResponse, ListSessionsQuery, RunRequest, RunResponse, SessionDetailResponse, SessionInfo,
-    SessionMessageRequest, SessionMessageResponse, SessionState, SetGoalRequest, SlashCommandInfo,
-    SseContentBlock, SseEvent, ToolInfo, UsageInfo,
+    build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, CreateSessionRequest,
+    CreateSessionResponse, ErrorResponse, ListSessionsQuery, RunRequest, RunResponse,
+    SessionDetailResponse, SessionInfo, SessionMessageRequest, SessionMessageResponse,
+    SessionState, SetGoalRequest, SlashCommandInfo, SseContentBlock, SseEvent, ToolInfo, UsageInfo,
 };
 
 // Constant body — no branching worth scoring.
 #[cfg_attr(test, mutants::skip)]
 pub(super) async fn health() -> &'static str {
     "ok"
+}
+
+/// Map an admission failure to the standardized API error (Goal 398).
+///
+/// `Timeout` → `503 Service Unavailable` with a `Retry-After` hint; a closed
+/// semaphore keeps the historical "too many concurrent runs" 503. The
+/// `Retry-After` value is a **rough drain estimate**
+/// (`ceil(runs_waiting / max_concurrent)`, see
+/// [`AdmissionGate::estimate_retry_after_secs`]) — deliberately conservative
+/// and always a plain integer so any HTTP client can parse it.
+fn admission_error(err: AcquireError, gate: &AdmissionGate) -> ApiError {
+    match err {
+        AcquireError::Timeout { waited } => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "server at capacity: no run slot after waiting {}s, try again later",
+                waited.as_secs()
+            ),
+        )
+        .with_retry_after(gate.estimate_retry_after_secs()),
+        AcquireError::Closed => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many concurrent runs, try again later",
+        ),
+    }
 }
 
 /// Update metrics after a successful agent run.
@@ -114,18 +139,13 @@ pub(super) async fn run_agent(
         return Err(ApiError::bad_request("missing or empty 'goal' field"));
     }
 
-    // Acquire a semaphore permit to limit concurrent runs.
+    // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
+    // now fails fast with 503 + Retry-After instead of hanging the request.
     let _permit = state
-        .run_semaphore
-        .clone()
-        .acquire_owned()
+        .admission
+        .acquire_run()
         .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "too many concurrent runs, try again later",
-            )
-        })?;
+        .map_err(|e| admission_error(e, &state.admission))?;
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
     let system_prompt = match body.system_prompt {
         Some(s) => s,
@@ -163,6 +183,10 @@ pub(super) async fn run_agent(
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (env-overridable
+        // via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into state.config at
+        // server startup). Exceeding it finishes with WallClockExceeded.
+        .wall_timeout_secs(state.config.wall_timeout_secs)
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
@@ -284,6 +308,8 @@ pub(super) async fn create_session(
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
+        .wall_timeout_secs(state.config.wall_timeout_secs)
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
@@ -594,6 +620,8 @@ pub(super) async fn fork_session(
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(state.config.max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
+        .wall_timeout_secs(state.config.wall_timeout_secs)
         .build()
         .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
@@ -891,18 +919,13 @@ pub(super) async fn send_session_message(
 
     // Lock the runtime for this turn (serializes concurrent requests per session).
 
-    // Acquire a semaphore permit to limit concurrent runs.
+    // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
+    // now fails fast with 503 + Retry-After instead of hanging the request.
     let _permit = state
-        .run_semaphore
-        .clone()
-        .acquire_owned()
+        .admission
+        .acquire_run()
         .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "too many concurrent runs, try again later",
-            )
-        })?;
+        .map_err(|e| admission_error(e, &state.admission))?;
     let mut runtime = runtime_arc.lock().await;
 
     // Goal-170: install a fresh cancellation token so `POST .../interrupt`
@@ -1611,25 +1634,20 @@ pub(super) async fn agui_run(
     }
 
     // Acquire a semaphore permit to limit concurrent runs.
-    // Goal-H J2: use `try_acquire_owned` so a saturated semaphore
-    // returns immediately with a 503 (rather than awaiting
-    // indefinitely via `acquire_owned().await`, which would hang
-    // every /agui request when the pool is full). The previous
-    // behaviour was documented in the g268 lead-completion
-    // journal entry but the fix was deferred. Closing it here.
-    let _permit = state
-        .run_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: "too many concurrent runs, try again later".into(),
-                }),
-            )
-        })?;
+    // Goal-H J2: /agui stays on the never-wait contract (`try_acquire_run`),
+    // so a saturated semaphore returns immediately with a 503 (rather than
+    // awaiting indefinitely, which would hang every /agui request when the
+    // pool is full). Goal 398 routes it through the same admission gate as
+    // the REST endpoints; only the waiting policy differs (none).
+    let _permit = state.admission.try_acquire_run().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: "too many concurrent runs, try again later".into(),
+            }),
+        )
+    })?;
 
     // Common system-prompt assembly: project context + skill index +
     // coordinator/sub_agent note (when enabled).
@@ -1695,7 +1713,9 @@ pub(super) async fn agui_run(
         .tools(tool_registry)
         .system_prompt(system_prompt)
         .prompt_segments(prompt_segments)
-        .max_steps(state.config.max_steps);
+        .max_steps(state.config.max_steps)
+        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
+        .wall_timeout_secs(state.config.wall_timeout_secs);
 
     // Seed the transcript if we're resuming.
     if let Some(seed) = seed_transcript {
@@ -2259,6 +2279,8 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let agent_steps_total = metrics.agent_steps_total.load(Ordering::Relaxed);
     let sessions_active = metrics.sessions_active.load(Ordering::Relaxed);
     let rate_limits_rejected = metrics.rate_limits_rejected.load(Ordering::Relaxed);
+    // Goal 398: queue visibility for the bounded admission gate.
+    let runs_waiting = metrics.runs_waiting.load(Ordering::Relaxed);
 
     format!(
         "# HELP recursive_requests_total Total HTTP requests\n\
@@ -2288,6 +2310,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_sessions_active Currently active sessions\n\
          # TYPE recursive_sessions_active gauge\n\
          recursive_sessions_active {sessions_active}\n\
+         # HELP recursive_runs_waiting Requests waiting for a run permit\n\
+         # TYPE recursive_runs_waiting gauge\n\
+         recursive_runs_waiting {runs_waiting}\n\
          # HELP recursive_rate_limits_rejected_total Total requests rejected by rate limiting\n\
          # TYPE recursive_rate_limits_rejected_total counter\n\
          recursive_rate_limits_rejected_total {rate_limits_rejected}\n"
@@ -2428,9 +2453,14 @@ mod tests {
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         let config = crate::config::Config::from_env().unwrap();
 
-        // 0-permit semaphore: every `try_acquire_owned` call
+        // 0-permit admission gate: every `try_acquire_run` call
         // returns `TryAcquireError::NoPermits` immediately.
-        let sem = Arc::new(Semaphore::new(0));
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let admission = Arc::new(crate::http::AdmissionGate::from_semaphore(
+            Arc::new(Semaphore::new(0)),
+            Duration::ZERO,
+            Arc::clone(&metrics.runs_waiting),
+        ));
 
         let state = Arc::new(crate::http::AppState {
             tools: vec![],
@@ -2439,10 +2469,10 @@ mod tests {
             provider: Arc::new(MockProvider::new(vec![])),
             sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            metrics: Arc::new(crate::http::Metrics::default()),
+            metrics,
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
-            run_semaphore: sem,
+            admission,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2474,7 +2504,6 @@ mod tests {
         use crate::tools::ToolRegistry;
         use axum::response::IntoResponse;
         use std::sync::Arc;
-        use tokio::sync::Semaphore;
 
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
@@ -2512,7 +2541,11 @@ mod tests {
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
-            run_semaphore: Arc::new(Semaphore::new(8)),
+            admission: Arc::new(crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2552,7 +2585,6 @@ mod tests {
     ) {
         use crate::llm::MockProvider;
         use crate::tools::ToolRegistry;
-        use tokio::sync::Semaphore;
 
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
@@ -2587,7 +2619,11 @@ mod tests {
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
-            run_semaphore: Arc::new(Semaphore::new(8)),
+            admission: Arc::new(crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2708,7 +2744,11 @@ mod tests {
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
-            run_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: Arc::new(crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2720,6 +2760,11 @@ mod tests {
         assert!(
             output.contains("recursive_rate_limits_rejected_total 42"),
             "output should contain rate_limits_rejected_total: {output}"
+        );
+        // Goal 398: queue gauge is always exposed (0 when nothing waits).
+        assert!(
+            output.contains("recursive_runs_waiting 0"),
+            "output should contain runs_waiting gauge: {output}"
         );
     }
 
@@ -2746,7 +2791,11 @@ mod tests {
             metrics: metrics.clone(),
             slash_commands: Arc::new(vec![]),
             session_ttl_secs: 3600,
-            run_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            admission: Arc::new(crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
         };

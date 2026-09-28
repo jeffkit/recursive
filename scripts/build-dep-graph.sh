@@ -74,7 +74,9 @@ while IFS= read -r goal_file; do
   [[ -z "$tag" ]] || [[ ! "$tag" =~ ^[0-9]+$ ]] && continue
 
   # Title from first heading
-  title=$(head -1 "$goal_file" | sed -E 's/^#[[:space:]]*Goal [0-9]+[[:space:]]*[—–-]*[[:space:]]*//' | xargs)
+  # Trim whitespace without xargs: titles may contain backticks/quotes
+  # (e.g. "`fork()` no longer clone()") which xargs parses as shell quoting.
+  title=$(head -1 "$goal_file" | sed -E 's/^#[[:space:]]*Goal [0-9]+[[:space:]]*[—–-]*[[:space:]]*//' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   [[ -z "$title" ]] && title="(no title)"
   _set "title" "$tag" "$title"
 

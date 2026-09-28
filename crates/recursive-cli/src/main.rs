@@ -737,6 +737,16 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
+            // Goal 399: HTTP sessions get safe execution budgets by default
+            // (`RECURSIVE_HTTP_MAX_STEPS`=100, `RECURSIVE_HTTP_WALL_TIMEOUT_SECS`=1800;
+            // an explicit 0 restores unbounded). Applied to the server's config
+            // copy so every runtime built from `AppState` — and the sub-agent
+            // pool registered below — inherits the same budget.
+            let (http_max_steps, http_wall_timeout_secs) =
+                recursive::http::http_session_budget_from_env();
+            let mut config = config;
+            config.max_steps = http_max_steps;
+            config.wall_timeout_secs = http_wall_timeout_secs;
             let (tools, _) = cli::builder::build_tools(&config, None).await;
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
@@ -790,12 +800,19 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3600);
             let max_concurrent = config.max_concurrent_runs;
-            let run_semaphore =
-                std::sync::Arc::new(tokio::sync::Semaphore::new(if max_concurrent == 0 {
-                    tokio::sync::Semaphore::MAX_PERMITS
-                } else {
-                    max_concurrent.max(1)
-                }));
+            // Goal 398: bounded admission. Default 30s; `0` restores the
+            // legacy wait-forever behaviour. Parsed like `session_ttl_secs`
+            // (env-only knob on AppState, not Config).
+            let admission_timeout_secs: u64 = std::env::var("RECURSIVE_ADMISSION_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            let metrics = std::sync::Arc::new(recursive::http::Metrics::default());
+            let admission = std::sync::Arc::new(recursive::http::AdmissionGate::new(
+                max_concurrent,
+                Duration::from_secs(admission_timeout_secs),
+                std::sync::Arc::clone(&metrics.runs_waiting),
+            ));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -807,10 +824,10 @@ async fn main() -> anyhow::Result<()> {
                 event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
-                metrics: std::sync::Arc::new(recursive::http::Metrics::default()),
+                metrics,
                 slash_commands: std::sync::Arc::new(slash_commands),
                 session_ttl_secs,
-                run_semaphore,
+                admission,
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
             };
@@ -828,6 +845,12 @@ async fn main() -> anyhow::Result<()> {
             let router = recursive::http::build_router(state);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!("Recursive HTTP API listening on {addr}");
+            // Goal 398: operators should be able to read the effective
+            // admission policy without guessing env defaults.
+            eprintln!(
+                "admission: max_concurrent_runs={max_concurrent} (0 = unlimited), \
+                 admission_timeout={admission_timeout_secs}s (0 = wait indefinitely)"
+            );
             // Warn if auth is effectively disabled
             let auth_enabled = std::env::var("RECURSIVE_API_KEY").is_ok()
                 || std::env::var("RECURSIVE_JWT_SECRET").is_ok();
@@ -1974,6 +1997,8 @@ async fn run_loop(
         .system_prompt(&assembled.full)
         .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
+        // Goal 399: `RECURSIVE_WALL_TIMEOUT_SECS` now reaches the agent loop.
+        .wall_timeout_secs(config.wall_timeout_secs)
         .streaming(stream)
         .shutdown_token(shutdown.clone());
     if let Some(n) = max_transcript_chars {

@@ -36,6 +36,9 @@ pub(crate) async fn build_tools(
     read_state: Option<Arc<Mutex<ReadFileState>>>,
 ) -> (ToolRegistry, Arc<Mutex<ReadFileState>>) {
     let root = &config.workspace;
+    // One shared transport instance for the registry AND the fs tools
+    // (Goal 401): swap this single Arc to a container transport and the
+    // whole toolset follows. Never construct a second transport for tools.
     let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
     let bg_manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
     let read_state = read_state.unwrap_or_else(|| Arc::new(Mutex::new(ReadFileState::new())));
@@ -60,14 +63,15 @@ pub(crate) async fn build_tools(
     // Shared mutable sandbox roots so control `register_repo_root` can expand
     // the sandbox mid-run (Claude Code parity).
     let session_roots = recursive::new_shared_sandbox_roots();
-    let mut registry = ToolRegistry::new(transport)
+    let mut registry = ToolRegistry::new(transport.clone())
         .with_read_file_state(read_state.clone())
         .register_with_aliases(
             Arc::new(
                 ReadFile::new(root)
                     .with_extra_roots(extra_roots.clone())
                     .with_session_roots(session_roots.clone())
-                    .with_read_state(read_state.clone()),
+                    .with_read_state(read_state.clone())
+                    .with_transport(transport.clone()),
             ),
             &["read_file"],
         )
@@ -76,7 +80,8 @@ pub(crate) async fn build_tools(
                 WriteFile::new(root)
                     .with_extra_roots(extra_roots.clone())
                     .with_session_roots(session_roots.clone())
-                    .with_read_state(read_state.clone()),
+                    .with_read_state(read_state.clone())
+                    .with_transport(transport.clone()),
             ),
             &["write_file"],
         )
@@ -84,13 +89,15 @@ pub(crate) async fn build_tools(
             EditTool::new(root)
                 .with_extra_roots(extra_roots.clone())
                 .with_session_roots(session_roots.clone())
-                .with_read_state(read_state.clone()),
+                .with_read_state(read_state.clone())
+                .with_transport(transport.clone()),
         ))
         .register_with_aliases(
             Arc::new(
                 GlobTool::new(root)
                     .with_extra_roots(extra_roots.clone())
-                    .with_session_roots(session_roots.clone()),
+                    .with_session_roots(session_roots.clone())
+                    .with_transport(transport.clone()),
             ),
             &["list_dir", "glob"],
         )
@@ -100,7 +107,8 @@ pub(crate) async fn build_tools(
         .register(Arc::new(
             SearchFiles::new(root)
                 .with_extra_roots(extra_roots.clone())
-                .with_session_roots(session_roots.clone()),
+                .with_session_roots(session_roots.clone())
+                .with_transport(transport.clone()),
         ))
         .register(Arc::new(WebFetch::new()))
         .register(Arc::new(RunBackground::new(root, bg_manager.clone())))
@@ -122,7 +130,8 @@ pub(crate) async fn build_tools(
     registry = registry.register(Arc::new(
         CountLines::new(root)
             .with_extra_roots(extra_roots)
-            .with_session_roots(session_roots.clone()),
+            .with_session_roots(session_roots.clone())
+            .with_transport(transport),
     ));
     registry = registry.with_session_roots(session_roots);
     registry = registry
@@ -461,6 +470,9 @@ pub(crate) async fn build_runtime(
         .system_prompt(&assembled.full)
         .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
+        // Goal 399: `RECURSIVE_WALL_TIMEOUT_SECS` now reaches the agent loop —
+        // previously parsed into Config but never consumed anywhere.
+        .wall_timeout_secs(config.wall_timeout_secs)
         .streaming(stream)
         .stuck_window(config.stuck_window)
         .stuck_error_rate(config.stuck_error_rate)

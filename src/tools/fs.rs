@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::transport::ToolTransport;
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
@@ -113,6 +114,65 @@ pub(crate) fn get_file_mtime(path: &Path) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Transport error classification (Goal 401)
+// ---------------------------------------------------------------------------
+
+/// Classify a transport I/O error as retryable — the fs-level stand-in for
+/// Goal 400's `TransportFailure::Retryable`.
+///
+/// The frozen `ToolTransport` fs methods report failures as `std::io::Error`
+/// (`ExecResult.failure` only covers `exec_shell`), so this maps the
+/// transient kinds (VM/network hiccups, timeouts, interrupted calls) onto
+/// that vocabulary. Non-transient kinds (`NotFound`, `PermissionDenied`, …)
+/// stay unclassified — those are for the model to fix, not the
+/// infrastructure.
+pub(crate) fn is_retryable_transport_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    matches!(
+        e.kind(),
+        K::TimedOut
+            | K::WouldBlock
+            | K::Interrupted
+            | K::ConnectionRefused
+            | K::ConnectionReset
+            | K::ConnectionAborted
+            | K::BrokenPipe
+            | K::NotConnected
+            | K::UnexpectedEof
+    )
+}
+
+/// Format a transport I/O failure for a tool error message. Retryable
+/// failures get an explicit `retryable: ` prefix so the model can tell an
+/// infrastructure blip apart from a code problem. Goal 401 annotates only —
+/// auto-retry belongs to the transport implementation or the layer above.
+pub(crate) fn transport_io_error(path: &Path, e: &std::io::Error) -> String {
+    if is_retryable_transport_error(e) {
+        format!(
+            "retryable: {}: {e} (transient transport failure — retrying may succeed)",
+            path.display()
+        )
+    } else {
+        format!("{}: {e}", path.display())
+    }
+}
+
+/// Read current file content through the transport for staleness
+/// content-fallback checks, mirroring the previous
+/// `tokio::fs::read_to_string(..).await.unwrap_or_default()` semantics:
+/// any I/O or UTF-8 failure yields an empty string (which then differs from
+/// the cached content and rejects the pending write/edit).
+pub(crate) async fn read_via_transport_or_empty(
+    transport: &dyn ToolTransport,
+    path: &Path,
+) -> String {
+    match transport.read_file(path).await {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ReadFile
 // ---------------------------------------------------------------------------
 
@@ -132,6 +192,13 @@ pub struct ReadFile {
     /// Optional shared state slot. When `Some`, every successful read is
     /// recorded so `EditTool` can enforce the partial-read guard.
     pub read_state: Option<Arc<Mutex<ReadFileState>>>,
+    /// I/O backend (Goal 401). Production wiring MUST inject the registry's
+    /// shared transport instance via [`ReadFile::with_transport`] so an
+    /// environment binding (local / SSH / container) chosen at the registry
+    /// automatically applies to this tool. The `LocalTransport` default in
+    /// [`ReadFile::new`] exists only for standalone/test construction — never
+    /// let a production build silently fall back to it.
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl ReadFile {
@@ -142,11 +209,19 @@ impl ReadFile {
             session_roots: None,
             max_bytes: 256 * 1024,
             read_state: None,
+            transport: Arc::new(super::transport::LocalTransport),
         }
     }
 
     pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
         self.read_state = Some(slot);
+        self
+    }
+
+    /// Inject the I/O backend. In production this must be the registry's
+    /// transport Arc (one shared instance per registry — see the field doc).
+    pub fn with_transport(mut self, transport: Arc<dyn ToolTransport>) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -225,11 +300,15 @@ impl Tool for ReadFile {
             message: "missing `path`".into(),
         })?;
         let abs = resolve_within_any(&self.all_roots(), path, false)?;
-        let bytes = tokio::fs::read(&abs).await.map_err(|e| Error::Tool {
-            name: "Read".into(),
-            call_id: None,
-            message: format!("{}: {e}", abs.display()),
-        })?;
+        let bytes = self
+            .transport
+            .read_file(&abs)
+            .await
+            .map_err(|e| Error::Tool {
+                name: "Read".into(),
+                call_id: None,
+                message: transport_io_error(&abs, &e),
+            })?;
         if bytes.len() > self.max_bytes {
             return Err(Error::Tool {
                 name: "Read".into(),
@@ -351,6 +430,9 @@ pub struct WriteFile {
     /// requires a prior full `Read` and checks staleness (file not modified
     /// since last read). New files (non-existent) are exempt.
     pub read_state: Option<Arc<Mutex<ReadFileState>>>,
+    /// I/O backend (Goal 401). See [`ReadFile::transport`] for the
+    /// shared-instance requirement.
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl WriteFile {
@@ -360,11 +442,19 @@ impl WriteFile {
             extra_roots: Vec::new(),
             session_roots: None,
             read_state: None,
+            transport: Arc::new(super::transport::LocalTransport),
         }
     }
 
     pub fn with_read_state(mut self, slot: Arc<Mutex<ReadFileState>>) -> Self {
         self.read_state = Some(slot);
+        self
+    }
+
+    /// Inject the I/O backend. In production this must be the registry's
+    /// transport Arc (one shared instance per registry).
+    pub fn with_transport(mut self, transport: Arc<dyn ToolTransport>) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -453,6 +543,12 @@ impl Tool for WriteFile {
         //
         // The lock is acquired briefly to extract the record, then dropped
         // before any `.await` to keep the future `Send`.
+        //
+        // Host-side `Path::exists` probe on purpose (Goal 401 residual): the
+        // frozen transport trait has no `exists`/stat method, and the
+        // pre-read guard's mtime semantics (`ReadFileState`) are
+        // host-probed by design this goal. On remote tiers the probe answers
+        // for the host view only — see journal follow-up candidates.
         let file_exists = abs.exists();
         if file_exists {
             if let Some(slot) = &self.read_state {
@@ -504,7 +600,8 @@ impl Tool for WriteFile {
 
                 // Async content-fallback staleness check (lock is not held).
                 if let Some((_disk_mtime, cached_content)) = staleness_check {
-                    let disk_content = tokio::fs::read_to_string(&abs).await.unwrap_or_default();
+                    let disk_content =
+                        read_via_transport_or_empty(self.transport.as_ref(), &abs).await;
                     if disk_content != cached_content {
                         return Err(Error::Tool {
                             name: "Write".into(),
@@ -521,12 +618,13 @@ impl Tool for WriteFile {
         }
 
         if let Some(parent) = abs.parent() {
-            tokio::fs::create_dir_all(parent)
+            self.transport
+                .create_dir_all(parent)
                 .await
                 .map_err(|e| Error::Tool {
                     name: "Write".into(),
                     call_id: None,
-                    message: format!("mkdir {}: {e}", parent.display()),
+                    message: transport_io_error(parent, &e),
                 })?;
         }
 
@@ -550,7 +648,7 @@ impl Tool for WriteFile {
                     let disk_mtime = get_file_mtime(&abs);
                     if disk_mtime > cached_ts {
                         let disk_content =
-                            tokio::fs::read_to_string(&abs).await.unwrap_or_default();
+                            read_via_transport_or_empty(self.transport.as_ref(), &abs).await;
                         if disk_content != cached_content {
                             return Err(Error::Tool {
                                 name: "Write".into(),
@@ -566,12 +664,13 @@ impl Tool for WriteFile {
             }
         }
 
-        tokio::fs::write(&abs, contents)
+        self.transport
+            .write_file(&abs, contents.as_bytes())
             .await
             .map_err(|e| Error::Tool {
                 name: "Write".into(),
                 call_id: None,
-                message: format!("{}: {e}", abs.display()),
+                message: transport_io_error(&abs, &e),
             })?;
 
         // ── Post-write cache update ──────────────────────────────────
@@ -1165,5 +1264,221 @@ line3
             .execute(json!({"path": "e.txt", "contents": "new"}))
             .await
             .expect("unchanged content with bumped mtime must be allowed");
+    }
+
+    // ── Goal 401: Read / Write route I/O through the injected transport ──
+
+    use crate::tools::transport::{DirEntry, ExecResult};
+    use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory transport: proves the tools hit the injected backend and
+    /// never the host filesystem.
+    #[derive(Debug, Default)]
+    struct MemTransport {
+        files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
+        read_calls: AtomicUsize,
+        write_calls: AtomicUsize,
+        /// When set, every `read_file` fails with this kind (retryable tests).
+        fail_kind: Mutex<Option<ErrorKind>>,
+    }
+
+    impl MemTransport {
+        fn put(&self, path: &Path, contents: &[u8]) {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), contents.to_vec());
+        }
+        fn get(&self, path: &Path) -> Option<Vec<u8>> {
+            self.files.lock().unwrap().get(path).cloned()
+        }
+    }
+
+    #[async_trait]
+    impl ToolTransport for MemTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(kind) = *self.fail_kind.lock().unwrap() {
+                return Err(std::io::Error::new(kind, "injected transport failure"));
+            }
+            self.files
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "mem: not found"))
+        }
+
+        async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.write_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(kind) = *self.fail_kind.lock().unwrap() {
+                return Err(std::io::Error::new(kind, "injected transport failure"));
+            }
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), contents.to_vec());
+            Ok(())
+        }
+
+        async fn list_dir(&self, _path: &Path) -> std::io::Result<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "mem transport: fs tools never exec",
+            ))
+        }
+    }
+
+    /// Read must fetch bytes from the injected transport: the content comes
+    /// back even though the path exists ONLY in the in-memory backend, and
+    /// no host file was created.
+    #[tokio::test]
+    async fn read_file_uses_transport() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let virt = tmp.path().join("virtual.txt");
+        mem.put(&virt, b"from-transport");
+        let r = ReadFile::new(tmp.path()).with_transport(mem as Arc<dyn ToolTransport>);
+        let got = r.execute(json!({"path": "virtual.txt"})).await.unwrap();
+        assert_eq!(got, "from-transport");
+        assert!(
+            !virt.exists(),
+            "host file must not exist — Read went through the transport, not tokio::fs"
+        );
+    }
+
+    /// Write must land in the injected transport, not on the host disk.
+    #[tokio::test]
+    async fn write_file_uses_transport() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let w = WriteFile::new(tmp.path()).with_transport(mem.clone() as Arc<dyn ToolTransport>);
+        w.execute(json!({"path": "out.txt", "contents": "payload"}))
+            .await
+            .unwrap();
+        let virt = tmp.path().join("out.txt");
+        assert_eq!(mem.get(&virt).as_deref(), Some(&b"payload"[..]));
+        assert_eq!(
+            mem.write_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one transport write call"
+        );
+        assert!(
+            !virt.exists(),
+            "host file must not exist — Write went through the transport, not tokio::fs"
+        );
+    }
+
+    /// The production wiring shape: the tool's transport Arc IS the
+    /// registry's transport Arc (one shared instance — never a per-tool
+    /// LocalTransport), and the dispatch path reaches it.
+    #[tokio::test]
+    async fn read_via_registry_hits_registry_shared_transport() {
+        use crate::tools::ToolRegistry;
+        let tmp = TempDir::new().unwrap();
+        let concrete = Arc::new(MemTransport::default());
+        let shared: Arc<dyn ToolTransport> = concrete.clone();
+        let virt = tmp.path().join("wired.txt");
+        concrete.put(&virt, b"wired-content");
+        let registry = ToolRegistry::new(shared.clone())
+            .register(Arc::new(ReadFile::new(tmp.path()).with_transport(shared)));
+        let got = registry
+            .invoke("Read", json!({"path": "wired.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(got, "wired-content");
+    }
+
+    /// Path validation (invariant #3) fires BEFORE any transport call: a
+    /// sandbox escape is rejected with zero transport invocations.
+    #[tokio::test]
+    async fn sandbox_escape_rejected_before_transport() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let r = ReadFile::new(tmp.path()).with_transport(mem.clone() as Arc<dyn ToolTransport>);
+        let err = r
+            .execute(json!({"path": "../../etc/passwd"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadToolArgs { .. }),
+            "escape must be rejected at path resolution: {err:?}"
+        );
+        assert_eq!(
+            mem.read_calls.load(Ordering::SeqCst),
+            0,
+            "rejected paths must never reach the transport"
+        );
+    }
+
+    /// A transient transport failure (TimedOut) must be annotated with the
+    /// `retryable:` marker so the model does not mistake infrastructure
+    /// trouble for a code bug (Goal 401: annotate only, no auto-retry).
+    #[tokio::test]
+    async fn read_file_transport_retryable_error_marked() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        *mem.fail_kind.lock().unwrap() = Some(ErrorKind::TimedOut);
+        let r = ReadFile::new(tmp.path()).with_transport(mem as Arc<dyn ToolTransport>);
+        let err = r.execute(json!({"path": "f.txt"})).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("retryable: "),
+            "TimedOut transport failure must carry the retryable marker, got: {msg}"
+        );
+        assert!(
+            msg.contains("transient transport failure"),
+            "message must say the failure is transient, got: {msg}"
+        );
+    }
+
+    /// A permanent failure (NotFound) must NOT be annotated retryable — the
+    /// model should fix the path, not retry.
+    #[tokio::test]
+    async fn read_file_transport_non_retryable_error_not_marked() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        let r = ReadFile::new(tmp.path()).with_transport(mem as Arc<dyn ToolTransport>);
+        let err = r.execute(json!({"path": "missing.txt"})).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("retryable"),
+            "NotFound must not carry the retryable marker, got: {msg}"
+        );
+    }
+
+    /// Same annotation contract on the write path.
+    #[tokio::test]
+    async fn write_file_transport_retryable_error_marked() {
+        let tmp = TempDir::new().unwrap();
+        let mem = Arc::new(MemTransport::default());
+        *mem.fail_kind.lock().unwrap() = Some(ErrorKind::ConnectionReset);
+        let w = WriteFile::new(tmp.path()).with_transport(mem as Arc<dyn ToolTransport>);
+        let err = w
+            .execute(json!({"path": "f.txt", "contents": "x"}))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("retryable: "),
+            "ConnectionReset transport failure must carry the retryable marker, got: {msg}"
+        );
     }
 }

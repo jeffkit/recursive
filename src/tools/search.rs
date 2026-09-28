@@ -1,11 +1,16 @@
 //! `search_files`: substring/regex search across workspace files.
+//!
+//! Candidate discovery and file reads go through the [`ToolTransport`]
+//! (Goal 402), so Grep searches inside whatever execution environment the
+//! registry is bound to — not on the host.
 
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use walkdir::WalkDir;
+use std::sync::Arc;
 
+use super::transport::{retryable_prefix, ToolTransport, WalkOptions};
 use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -24,6 +29,10 @@ pub struct SearchFiles {
     pub extra_roots: Vec<(PathBuf, AccessTier)>,
     pub session_roots: Option<SharedSandboxRoots>,
     pub max_results: usize,
+    /// Execution environment this tool searches in. Defaults to
+    /// `LocalTransport`; builders inject the registry's transport so the
+    /// tool follows the session's environment binding (Goal 402).
+    pub transport: Arc<dyn ToolTransport>,
 }
 
 impl SearchFiles {
@@ -33,7 +42,14 @@ impl SearchFiles {
             extra_roots: Vec::new(),
             session_roots: None,
             max_results: DEFAULT_MAX_RESULTS,
+            transport: Arc::new(super::transport::LocalTransport),
         }
+    }
+
+    /// Search inside a specific execution environment.
+    pub fn with_transport(mut self, transport: Arc<dyn ToolTransport>) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Append additional allowed sandbox roots. See
@@ -156,13 +172,25 @@ impl Tool for SearchFiles {
             .unwrap_or(self.max_results);
 
         let mut hits: Vec<String> = Vec::new();
-        'outer: for entry in WalkDir::new(&scope)
-            .follow_links(false) // explicit: default, documents symlink-loop safety
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
+        // One walk round-trip through the execution environment (Goal 402).
+        // Default WalkOptions: unbounded depth, no symlink following, and the
+        // shared ignore set (.git / target / node_modules).
+        let entries = self
+            .transport
+            .walk(&scope, &WalkOptions::default())
+            .await
+            .map_err(|e| Error::Tool {
+                name: "Grep".into(),
+                call_id: None,
+                message: format!("{}walk {}: {e}", retryable_prefix(&e), scope.display()),
+            })?;
+        'outer: for entry in entries {
+            if !entry.is_file {
+                continue;
+            }
+            // Reconstruct the absolute (environment) path so `relativise`
+            // sees the same shape the old in-tool walkdir produced.
+            let path = scope.join(&entry.path);
             // Skip obvious binaries / large files by name. Cheap heuristic.
             if path
                 .extension()
@@ -180,16 +208,19 @@ impl Tool for SearchFiles {
             // Skip files that would OOM if read wholesale. Source files are well
             // under 1 MiB; anything larger is a log/data/artifact that grep
             // shouldn't slurp. Silent skip, matching the binary-extension skip.
-            let Ok(meta) = std::fs::metadata(path) else {
-                continue;
-            };
-            if meta.len() > MAX_GREP_FILE_BYTES {
+            // (WalkEntry::size comes from the transport's traversal; the
+            // depth-limited default walk reports 0 = unknown, which never
+            // trips this skip.)
+            if entry.size > MAX_GREP_FILE_BYTES {
                 continue;
             }
-            let Ok(contents) = std::fs::read_to_string(path) else {
+            let Ok(bytes) = self.transport.read_file(&path).await else {
                 continue;
             };
-            let rel = self.relativise(path);
+            let Ok(contents) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let rel = self.relativise(&path);
             for (line_no, line) in contents.lines().enumerate() {
                 let is_match = match &re_opt {
                     Some(re) => re.is_match(line),
@@ -466,5 +497,248 @@ Todo",
             .await
             .unwrap();
         assert!(out.contains("transcript.jsonl:1:"));
+    }
+
+    // ── Goal 402: Grep goes through the transport ────────────────────────────
+
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    /// In-memory "environment": files exist only inside the transport, keyed
+    /// by absolute environment paths.
+    #[derive(Debug, Default)]
+    struct MemoryTransport {
+        files: BTreeMap<PathBuf, Vec<u8>>,
+    }
+
+    impl MemoryTransport {
+        fn with_file(mut self, path: &Path, contents: &[u8]) -> Self {
+            self.files.insert(path.to_path_buf(), contents.to_vec());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl super::super::transport::ToolTransport for MemoryTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "not found"))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn walk(
+            &self,
+            root: &Path,
+            _opts: &super::super::transport::WalkOptions,
+        ) -> std::io::Result<Vec<super::super::transport::WalkEntry>> {
+            Ok(self
+                .files
+                .iter()
+                .filter(|(p, _)| p.starts_with(root) && *p != root)
+                .map(|(p, contents)| super::super::transport::WalkEntry {
+                    path: p.strip_prefix(root).unwrap().to_path_buf(),
+                    is_file: true,
+                    size: contents.len() as u64,
+                })
+                .collect())
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<super::super::transport::ExecResult> {
+            Err(std::io::Error::other("unsupported"))
+        }
+    }
+
+    /// A transport whose walk fails with a transient (timeout) error.
+    #[derive(Debug, Default)]
+    struct TimedOutWalkTransport;
+
+    #[async_trait]
+    impl super::super::transport::ToolTransport for TimedOutWalkTransport {
+        async fn read_file(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+            Err(std::io::Error::other("unsupported"))
+        }
+        async fn walk(
+            &self,
+            _root: &Path,
+            _opts: &super::super::transport::WalkOptions,
+        ) -> std::io::Result<Vec<super::super::transport::WalkEntry>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "environment unreachable",
+            ))
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<super::super::transport::ExecResult> {
+            Err(std::io::Error::other("unsupported"))
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_searches_through_transport_not_host_fs() {
+        // Host workspace stays EMPTY — the tree lives only in the transport.
+        let host = TempDir::new().unwrap();
+        let transport = MemoryTransport::default()
+            .with_file(&host.path().join("a.txt"), b"foo\nbar\nbaz")
+            .with_file(&host.path().join("b.txt"), b"bar quux");
+        let tool = SearchFiles::new(host.path()).with_transport(Arc::new(transport));
+
+        let out = tool.execute(json!({"pattern": "bar"})).await.unwrap();
+        assert!(out.contains("a.txt:2: bar"));
+        assert!(out.contains("b.txt:1: bar quux"));
+        assert!(
+            !host.path().join("a.txt").exists(),
+            "search must go through the transport — host fs must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_walk_failure_annotates_retryable() {
+        let host = TempDir::new().unwrap();
+        let tool = SearchFiles::new(host.path()).with_transport(Arc::new(TimedOutWalkTransport));
+        let err = tool.execute(json!({"pattern": "bar"})).await.unwrap_err();
+        let msg = match err {
+            Error::Tool { message, .. } => message,
+            other => panic!("expected Tool error, got {other:?}"),
+        };
+        assert!(
+            msg.starts_with("retryable: "),
+            "timeout-classified walk failure must be marked retryable, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_ignores_default_dirs_via_local_transport() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "needle here\n").unwrap();
+        std::fs::write(tmp.path().join("target/gen.rs"), "needle in build\n").unwrap();
+        std::fs::write(tmp.path().join(".git/hooks.sample"), "needle in git\n").unwrap();
+
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "needle"}))
+            .await
+            .unwrap();
+        assert!(out.contains("src/a.rs:1: needle here"));
+        assert!(
+            !out.contains("target") && !out.contains(".git"),
+            ".git / target / node_modules must be ignored on both paths (got: {out})"
+        );
+    }
+
+    /// Format-consistency pin (Goal 402): on a fixture tree with NO ignored
+    /// dirs, the transport-backed Grep must produce byte-identical output to
+    /// the pre-transport inline walkdir implementation (file visit order,
+    /// path separators, line numbers, truncation ellipsis).
+    #[tokio::test]
+    async fn grep_output_identical_to_legacy_walkdir_on_plain_tree() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.rs"), "fn hit() {}\ncall hit()\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "hit at top\nnope\n").unwrap();
+        std::fs::write(
+            tmp.path().join("long.txt"),
+            format!("{}\nhit\n", "x".repeat(300)),
+        )
+        .unwrap();
+
+        let tool = SearchFiles::new(tmp.path());
+        let new_out = tool.execute(json!({"pattern": "hit"})).await.unwrap();
+
+        // Legacy reference: the exact pre-Goal-402 execute() body.
+        let pattern = "hit";
+        let mut legacy_hits: Vec<String> = Vec::new();
+        'legacy: for entry in walkdir::WalkDir::new(tmp.path())
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    matches!(
+                        e,
+                        "png" | "jpg" | "jpeg" | "gif" | "pdf" | "zip" | "gz" | "tar" | "bin"
+                    )
+                })
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            if meta.len() > MAX_GREP_FILE_BYTES {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let rel = tool.relativise(path);
+            for (line_no, line) in contents.lines().enumerate() {
+                if line.contains(pattern) {
+                    let truncated = if line.len() > DEFAULT_MAX_LINE_LEN {
+                        let mut end = DEFAULT_MAX_LINE_LEN;
+                        while !line.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}…", &line[..end])
+                    } else {
+                        line.to_string()
+                    };
+                    legacy_hits.push(format!("{}:{}: {}", rel.display(), line_no + 1, truncated));
+                    if legacy_hits.len() >= tool.max_results {
+                        break 'legacy;
+                    }
+                }
+            }
+        }
+        let legacy_out = if legacy_hits.is_empty() {
+            format!("no matches for `{pattern}`")
+        } else {
+            legacy_hits.join("\n")
+        };
+
+        assert_eq!(new_out, legacy_out);
     }
 }

@@ -47,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     python3 \
     python3-pip \
+    python3-setuptools \
     nodejs \
     curl \
     jq \
@@ -54,9 +55,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/recursive /usr/local/bin/recursive
 
-# Install Python SDK (for 20-python-sdk e2e test)
+# Install Python SDK (for 20-python-sdk e2e test).
+# --no-build-isolation: build with the apt-installed setuptools instead of
+# downloading build deps from PyPI at image-build time (keeps the build
+# offline-safe; a PyPI outage must not block e2e).
 COPY sdk/python /sdk/python
-RUN pip3 install --break-system-packages /sdk/python
+RUN pip3 install --break-system-packages --no-build-isolation /sdk/python
 
 # Copy TypeScript SDK dist (pre-built; no npm install needed — zero runtime deps)
 COPY sdk/typescript/dist /sdk/typescript/dist

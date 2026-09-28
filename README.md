@@ -169,6 +169,7 @@ Anything OpenAI-compatible works. Override via env vars (or CLI flags):
 | `RECURSIVE_API_KEY` | _(required)_ | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Loop budget (0 = unlimited; set to N to cap at N steps) |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds (0 = unlimited). Effective as of Goal 399 — previously parsed but never consumed |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_WORKSPACE` | cwd | Root all fs/shell tools are sandboxed to |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a system prompt to load |
@@ -299,6 +300,8 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_PROVIDER_TYPE` | `openai` | Protocol: `openai` or `anthropic` |
 | `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Max tool-call loop iterations per run (0 = unlimited) |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds; expiry finishes with `wall_clock_exceeded` (`0` = unlimited). Effective as of Goal 399 — previously parsed but never consumed |
+| `RECURSIVE_HARD_STEP_CAP` | _(unset)_ | Process-level step ceiling. When set (>0), the effective step limit is `min(max_steps, cap)` — an operator ceiling that clamps even `max_steps=0` sessions |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a custom system-prompt file |
 | `RECURSIVE_WORKSPACE` | cwd | Filesystem sandbox root |
@@ -308,10 +311,14 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | Env | Default | Purpose |
 |-----|---------|---------|
 | `RECURSIVE_HTTP_ADDR` | `0.0.0.0:3000` | Bind address |
+| `RECURSIVE_MAX_CONCURRENT_RUNS` | `8` | Max concurrent agent runs (`0` = unlimited) |
+| `RECURSIVE_ADMISSION_TIMEOUT_SECS` | `30` | Max seconds a request may wait for a run slot before `503` + `Retry-After`; `0` = wait indefinitely (legacy) |
 | `RECURSIVE_HTTP_AUTH_KEYS` | _(required for prod)_ | Comma-separated `X-API-Key` allowlist |
 | `RECURSIVE_HTTP_AUTH_JWT_SECRET` | _(none)_ | HMAC secret for JWT bearer-token auth |
 | `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` | _(none)_ | Optional `aud` claim for JWT validation |
 | `RECURSIVE_HTTP_AUTH_INSECURE_OK` | _(none)_ | Set to `1` to bypass auth (local dev ONLY) |
+| `RECURSIVE_HTTP_MAX_STEPS` | `100` | Safe default step budget for HTTP-created sessions (request `max_steps` still wins; `0` = unlimited) |
+| `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` | `1800` | Safe default wall-clock budget per turn for HTTP-created sessions; expiry finishes with `wall_clock_exceeded` (`0` = unlimited) |
 
 #### Cloud storage — Redis (session hot-state)
 

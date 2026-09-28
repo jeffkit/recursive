@@ -84,7 +84,7 @@ This document is the *how-is-it-wired* companion.
 | `tokio::sync::Mutex<AgentRuntime>` | `http/handlers.rs`, `tui/backend.rs` | **The whole `AgentRuntime`**, held for the duration of a single `run()` / `enqueue()` / accessor call. Serial agent execution per session. |
 | `std::sync::Arc<tokio::sync::RwLock<HashMap<String, SessionState>>>` | `http/mod.rs::AppState.sessions` | HTTP's session map — many readers (`GET /sessions/:id`, `fork`) vs. rare writers (`POST /sessions`, reaper). |
 | `std::sync::RwLock<HashMap<String, broadcast::Sender<SseEvent>>>` | `http/mod.rs::AppState.event_channels` | SSE fan-out channels per session. Readers spawn sender halves; writers create on session-start, drop on session-end. |
-| `tokio::sync::Semaphore` | `http/mod.rs::AppState.run_semaphore` | Caps concurrent agent runs across the whole server. Acquired in `run_agent` / `send_session_message` before constructing `AgentRuntime`. `MAX_PERMITS` when `max_concurrent_runs = 0` (unlimited). |
+| `AdmissionGate` (wraps `tokio::sync::Semaphore`) | `http/admission.rs`, on `http/mod.rs::AppState.admission` | Caps concurrent agent runs across the whole server. `acquire_run` (used by `run_agent` / `send_session_message`) waits at most `RECURSIVE_ADMISSION_TIMEOUT_SECS` (default 30s; `0` = wait forever) before failing with `503` + `Retry-After`; `try_acquire_run` (`/agui`) never waits. `MAX_PERMITS` when `max_concurrent_runs = 0` (unlimited). |
 | `Arc<RwLock<Vec<TodoItem>>>` | `runtime.rs::AgentRuntime.todo_list` | The agent's task list. Held by `TodoWriteTool` and read back by `AgentRuntime::current_todos`. Shared via `Arc` so the tool can mutate without going through the runtime mutex. |
 | `Arc<RwLock<Option<GoalState>>>` | `runtime.rs::AgentRuntime.goal_state` | Active goal. `set_goal`/`clear_goal` take write; `current_goal`/`run_goal_loop` take read. Shared via `Arc` so HTTP's `force_clear_goal_when_runtime_busy` can clear without the runtime mutex. |
 | `Arc<PlanApprovalGate>` / `Arc<PlanModeRequestGate>` | `runtime.rs::AgentRuntime.plan_approval_gate` / `plan_mode_request_gate` | Plan-mode 2.0 gates. Internal `Notify`-based primitives; the `Arc` lets HTTP and TUI clone a handle and call `approve`/`reject` without holding the runtime mutex. |
@@ -114,7 +114,8 @@ own `Arc<RwLock<>>` and expose accessor methods on `AgentRuntime`. If no
 When a code path takes multiple locks, do it in this order to avoid
 deadlock:
 
-1. **HTTP layer**: `AppState.run_semaphore` (acquired in handler) →
+1. **HTTP layer**: `AppState.admission` run permit (acquired in handler,
+   bounded wait) →
    `AppState.sessions.write()` (when creating/destroying session) →
    `AppState.event_channels.write()` (when churning channels) →
    per-session `tokio::Mutex<AgentRuntime>` (when driving a turn).
@@ -159,7 +160,7 @@ which mode it's in; the runtime decides how to chain turns.
 
 | Owned by | State | Lifetime |
 |---|---|---|
-| `AgentKernel` | `llm`, `tools`, `compactor`, `hooks`, `storage`, `session_store`, `max_steps`, `max_transcript_chars`, `stuck_window` config | Process / runtime |
+| `AgentKernel` | `llm`, `tools`, `compactor`, `hooks`, `storage`, `session_store`, `max_steps`, `max_transcript_chars`, `stuck_window`, `wall_timeout_secs` config | Process / runtime |
 | `AgentRuntime` | `transcript`, `event_sink`, `streaming`, `compactor`, `message_queue`, `deferred_turn_finished`, `goal_eval_transcript_tail` | One session |
 | `AgentRuntime::checkpoints: CheckpointState` | `session_id`, `turn_index`, `shadow`, `writer`, `touched_files`, `log_path` | One session, only after `enable_checkpoints` |
 | `AgentRuntime` Arc-shared | `todo_list`, `plan_approval_gate`, `plan_mode_request_gate`, `goal_state` | One session, but `Arc`-cloned out so tools / handlers can mutate without `&mut self` |
