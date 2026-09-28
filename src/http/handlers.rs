@@ -2365,6 +2365,29 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let rate_limits_rejected = metrics.rate_limits_rejected.load(Ordering::Relaxed);
     // Goal 398: queue visibility for the bounded admission gate.
     let runs_waiting = metrics.runs_waiting.load(Ordering::Relaxed);
+    // Goal 392: runs currently holding a permit (RAII via RunPermit Drop).
+    let runs_in_flight = metrics.runs_in_flight.load(Ordering::Relaxed);
+    // Goal 392: aggregate transcript size across live sessions. Estimated
+    // on demand by summing each message's `content` character count — a
+    // UTF-8 byte total would need an O(n) encode walk per scrape anyway.
+    // Sessions whose runtime mutex is contended (mid-turn) are skipped
+    // rather than blocking the scrape or reporting a partial lie; the
+    // skipped-session count is reported alongside so a stale-looking
+    // total is explainable.
+    let mut transcript_chars: u64 = 0;
+    let mut transcript_bytes_skipped: u64 = 0;
+    for session in state.host.sessions().read().await.values() {
+        match session.runtime.try_lock() {
+            Ok(rt) => {
+                transcript_chars += rt
+                    .transcript()
+                    .iter()
+                    .map(|m| m.content.chars().count() as u64)
+                    .sum::<u64>();
+            }
+            Err(_) => transcript_bytes_skipped += 1,
+        }
+    }
 
     format!(
         "# HELP recursive_requests_total Total HTTP requests\n\
@@ -2397,6 +2420,15 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_runs_waiting Requests waiting for a run permit\n\
          # TYPE recursive_runs_waiting gauge\n\
          recursive_runs_waiting {runs_waiting}\n\
+         # HELP recursive_runs_in_flight Runs currently holding a run permit\n\
+         # TYPE recursive_runs_in_flight gauge\n\
+         recursive_runs_in_flight {runs_in_flight}\n\
+         # HELP recursive_transcript_bytes_total Estimated transcript size across live sessions (character count; busy sessions skipped)\n\
+         # TYPE recursive_transcript_bytes_total gauge\n\
+         recursive_transcript_bytes_total {transcript_chars}\n\
+         # HELP recursive_transcript_bytes_skipped Live sessions skipped when sampling transcript size (runtime busy)\n\
+         # TYPE recursive_transcript_bytes_skipped gauge\n\
+         recursive_transcript_bytes_skipped {transcript_bytes_skipped}\n\
          # HELP recursive_rate_limits_rejected_total Total requests rejected by rate limiting\n\
          # TYPE recursive_rate_limits_rejected_total counter\n\
          recursive_rate_limits_rejected_total {rate_limits_rejected}\n"
@@ -2432,7 +2464,12 @@ mod tests {
             provider: Arc::new(crate::llm::MockProvider::new(vec![])),
             host: Arc::new(crate::session_host::SessionHost::new(
                 Duration::from_secs(0),
-                crate::http::AdmissionGate::new(1, Duration::ZERO, Arc::new(AtomicU64::new(0))),
+                crate::http::AdmissionGate::new(
+                    1,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
             )),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
@@ -2605,6 +2642,7 @@ mod tests {
                 Arc::new(Semaphore::new(0)),
                 Duration::ZERO,
                 Arc::clone(&metrics.runs_waiting),
+                Arc::clone(&metrics.runs_in_flight),
             ),
         ));
 
@@ -2684,6 +2722,7 @@ mod tests {
             crate::http::AdmissionGate::new(
                 8,
                 Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
         ));
@@ -2769,6 +2808,7 @@ mod tests {
             crate::http::AdmissionGate::new(
                 8,
                 Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
         ));
@@ -2911,6 +2951,7 @@ mod tests {
                     8,
                     Duration::ZERO,
                     Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
@@ -2933,6 +2974,58 @@ mod tests {
         assert!(
             output.contains("recursive_runs_waiting 0"),
             "output should contain runs_waiting gauge: {output}"
+        );
+    }
+
+    /// Goal-392: the two new gauges are always exposed.
+    #[tokio::test]
+    async fn metrics_handler_includes_gauges() {
+        use crate::http::Metrics;
+        use crate::tools::ToolRegistry;
+        use std::sync::atomic::AtomicU64;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Metrics {
+            runs_in_flight: Arc::new(AtomicU64::new(7)),
+            ..Metrics::default()
+        };
+        let state = Arc::new(AppState {
+            metrics: Arc::new(metrics),
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+        });
+        let output = metrics_handler(State(state)).await;
+        assert!(
+            output.contains("recursive_runs_in_flight 7"),
+            "output should contain runs_in_flight: {output}"
+        );
+        assert!(
+            output.contains("recursive_transcript_bytes_total 0"),
+            "output should contain transcript_bytes_total (empty host): {output}"
+        );
+        assert!(
+            output.contains("recursive_transcript_bytes_skipped 0"),
+            "output should contain transcript_bytes_skipped (empty host): {output}"
         );
     }
 
@@ -2962,6 +3055,7 @@ mod tests {
                 crate::http::AdmissionGate::new(
                     8,
                     Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),

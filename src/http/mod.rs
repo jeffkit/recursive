@@ -74,6 +74,11 @@ pub struct Metrics {
     /// the admission gate (Goal 398) can bump it with RAII guards; read via
     /// `AdmissionGate::runs_waiting` or here for the `/metrics` exposition.
     pub runs_waiting: Arc<AtomicU64>,
+    /// Runs currently holding an admission permit (gauge, Goal 392).
+    /// `Arc`-shared with the admission gate; decremented by `RunPermit`'s
+    /// `Drop` so every acquire site (including `?` early returns) is
+    /// covered by RAII.
+    pub runs_in_flight: Arc<AtomicU64>,
 }
 
 // ── Session types ──────────────────────────────────────────────────────────
@@ -1570,7 +1575,12 @@ mod goal_396_persistence_tests {
     fn test_host(ttl_secs: u64) -> Arc<SessionHost<SessionState>> {
         Arc::new(SessionHost::new(
             std::time::Duration::from_secs(ttl_secs),
-            AdmissionGate::new(8, std::time::Duration::ZERO, Arc::new(AtomicU64::new(0))),
+            AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
         ))
     }
 

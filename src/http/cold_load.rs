@@ -377,6 +377,7 @@ mod tests {
                     8,
                     std::time::Duration::ZERO,
                     Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
                 ),
             )),
             event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),

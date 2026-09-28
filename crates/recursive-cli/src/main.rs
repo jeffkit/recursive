@@ -834,6 +834,7 @@ async fn main() -> anyhow::Result<()> {
                     max_concurrent,
                     Duration::from_secs(admission_timeout_secs),
                     std::sync::Arc::clone(&metrics.runs_waiting),
+                    std::sync::Arc::clone(&metrics.runs_in_flight),
                 ),
             ));
             // Goal 396: session transcript persistence. Default backend is

@@ -231,6 +231,7 @@ pub fn sample_state() -> AppState {
                 8,
                 std::time::Duration::ZERO,
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
@@ -256,6 +257,7 @@ pub fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
             recursive::http::AdmissionGate::new(
                 8,
                 std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
         )),
@@ -293,6 +295,7 @@ pub fn sample_state_with_storage(
             recursive::http::AdmissionGate::new(
                 8,
                 std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
         )),

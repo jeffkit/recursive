@@ -75,6 +75,16 @@ pub enum AcquireError {
 #[derive(Debug)]
 pub struct RunPermit {
     _permit: OwnedSemaphorePermit,
+    /// Goal 392: in-flight gauge decremented when this permit drops.
+    in_flight: Option<Arc<AtomicU64>>,
+}
+
+impl Drop for RunPermit {
+    fn drop(&mut self) {
+        if let Some(c) = self.in_flight.take() {
+            c.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Gate in front of the run semaphore: bounded waiting + waiting gauge.
@@ -93,6 +103,9 @@ pub struct AdmissionGate {
     /// Gauge of requests currently waiting for a permit (Goal 392 field,
     /// shared with the front-end's `Metrics`).
     runs_waiting: Arc<AtomicU64>,
+    /// Gauge of runs currently holding a permit (Goal 392), decremented
+    /// by [`RunPermit`]'s `Drop`.
+    runs_in_flight: Arc<AtomicU64>,
 }
 
 /// RAII guard for the `runs_waiting` gauge: +1 on enter, −1 on drop
@@ -126,6 +139,7 @@ impl AdmissionGate {
         max_concurrent_runs: usize,
         admission_timeout: Duration,
         runs_waiting: Arc<AtomicU64>,
+        runs_in_flight: Arc<AtomicU64>,
     ) -> Self {
         let permits = if max_concurrent_runs == 0 {
             Semaphore::MAX_PERMITS
@@ -137,6 +151,7 @@ impl AdmissionGate {
             max_concurrent_runs,
             admission_timeout,
             runs_waiting,
+            runs_in_flight,
         }
     }
 
@@ -148,12 +163,14 @@ impl AdmissionGate {
         semaphore: Arc<Semaphore>,
         admission_timeout: Duration,
         runs_waiting: Arc<AtomicU64>,
+        runs_in_flight: Arc<AtomicU64>,
     ) -> Self {
         Self {
             semaphore,
             max_concurrent_runs: 1,
             admission_timeout,
             runs_waiting,
+            runs_in_flight,
         }
     }
 
@@ -179,23 +196,38 @@ impl AdmissionGate {
                 }
             }
         };
-        permit.map(|p| RunPermit { _permit: p }).map_err(|_| {
+        match permit {
+            Ok(p) => {
+                self.runs_in_flight.fetch_add(1, Ordering::Relaxed);
+                Ok(RunPermit {
+                    _permit: p,
+                    in_flight: Some(Arc::clone(&self.runs_in_flight)),
+                })
+            }
             // Semaphore closed while waiting: no permits will ever come.
-            AcquireError::Closed
-        })
+            Err(_) => Err(AcquireError::Closed),
+        }
     }
 
     /// Acquire a run permit without waiting (the `/agui` fast-503 contract).
     pub fn try_acquire_run(&self) -> Result<RunPermit, TryAcquireError> {
-        self.semaphore
-            .clone()
-            .try_acquire_owned()
-            .map(|p| RunPermit { _permit: p })
+        self.semaphore.clone().try_acquire_owned().map(|p| {
+            self.runs_in_flight.fetch_add(1, Ordering::Relaxed);
+            RunPermit {
+                _permit: p,
+                in_flight: Some(Arc::clone(&self.runs_in_flight)),
+            }
+        })
     }
 
     /// Requests currently waiting for a permit.
     pub fn runs_waiting(&self) -> u64 {
         self.runs_waiting.load(Ordering::Relaxed)
+    }
+
+    /// Runs currently holding a permit (Goal 392 gauge).
+    pub fn runs_in_flight(&self) -> u64 {
+        self.runs_in_flight.load(Ordering::Relaxed)
     }
 
     /// Rough `Retry-After` estimate in whole seconds for a just-timed-out
@@ -395,8 +427,12 @@ mod tests {
     /// A 0-permit gate is the natural always-saturated fixture.
     fn saturated_gate(timeout: Duration) -> (Arc<AdmissionGate>, Arc<AtomicU64>) {
         let c = counter();
-        let gate =
-            AdmissionGate::from_semaphore(Arc::new(Semaphore::new(0)), timeout, Arc::clone(&c));
+        let gate = AdmissionGate::from_semaphore(
+            Arc::new(Semaphore::new(0)),
+            timeout,
+            Arc::clone(&c),
+            counter(),
+        );
         (Arc::new(gate), c)
     }
 
@@ -429,7 +465,12 @@ mod tests {
         // Timeout 0 == legacy unbounded wait: the permit arrives whenever
         // the holder releases, however long that takes.
         let c = counter();
-        let gate = Arc::new(AdmissionGate::new(1, Duration::ZERO, Arc::clone(&c)));
+        let gate = Arc::new(AdmissionGate::new(
+            1,
+            Duration::ZERO,
+            Arc::clone(&c),
+            counter(),
+        ));
         let hold = gate.acquire_run().await.expect("first acquire saturates");
 
         let releaser = tokio::spawn(async move {
@@ -454,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_run_success_leaves_runs_waiting_at_zero() {
         let c = counter();
-        let gate = AdmissionGate::new(2, Duration::from_secs(5), Arc::clone(&c));
+        let gate = AdmissionGate::new(2, Duration::from_secs(5), Arc::clone(&c), counter());
 
         let p1 = gate.acquire_run().await.unwrap();
         assert_eq!(
@@ -469,7 +510,12 @@ mod tests {
     #[tokio::test]
     async fn runs_waiting_counts_while_blocked() {
         let c = counter();
-        let gate = Arc::new(AdmissionGate::new(1, Duration::ZERO, Arc::clone(&c)));
+        let gate = Arc::new(AdmissionGate::new(
+            1,
+            Duration::ZERO,
+            Arc::clone(&c),
+            counter(),
+        ));
         let hold = gate.acquire_run().await.expect("saturate the pool");
 
         let waiter = {
@@ -487,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_acquire_run_never_blocks() {
-        let gate = AdmissionGate::new(1, Duration::from_secs(5), counter());
+        let gate = AdmissionGate::new(1, Duration::from_secs(5), counter(), counter());
         let permit = gate.try_acquire_run().expect("pool has room");
         assert!(gate.try_acquire_run().is_err(), "pool saturated");
         drop(permit);
@@ -499,7 +545,7 @@ mod tests {
     /// pool must still hand out exactly its configured capacity.
     #[tokio::test]
     async fn timeout_does_not_leak_permits() {
-        let gate = AdmissionGate::new(1, Duration::from_millis(30), counter());
+        let gate = AdmissionGate::new(1, Duration::from_millis(30), counter(), counter());
         let hold = gate.acquire_run().await.expect("initial permit");
 
         for _ in 0..3 {
@@ -530,6 +576,7 @@ mod tests {
             Arc::new(Semaphore::new(1)),
             Duration::from_secs(5),
             counter(),
+            counter(),
         );
         gate.semaphore.close();
         assert_eq!(gate.acquire_run().await.unwrap_err(), AcquireError::Closed);
@@ -539,7 +586,7 @@ mod tests {
     #[test]
     fn estimate_retry_after_scales_with_queue_depth() {
         let c = counter();
-        let gate = AdmissionGate::new(2, Duration::from_secs(30), Arc::clone(&c));
+        let gate = AdmissionGate::new(2, Duration::from_secs(30), Arc::clone(&c), counter());
         // No queue yet: minimum back-off of 1s.
         assert_eq!(gate.estimate_retry_after_secs(), 1);
         // 5 waiting, 2 slots → ceil(5/2) = 3 waves.
@@ -552,8 +599,46 @@ mod tests {
 
     #[test]
     fn estimate_retry_after_unlimited_pool_floors_at_one() {
-        let gate = AdmissionGate::new(0, Duration::from_secs(30), counter());
+        let gate = AdmissionGate::new(0, Duration::from_secs(30), counter(), counter());
         assert_eq!(gate.estimate_retry_after_secs(), 1);
+    }
+
+    /// Goal 392: the in-flight gauge is RAII-driven — a permit holds a slot,
+    /// dropping it releases, and failed acquisitions (timeout, try-fail)
+    /// never bump it.
+    #[tokio::test]
+    async fn runs_in_flight_raii_guard_covers_early_return() {
+        let waiting = counter();
+        let in_flight = counter();
+        // 0-permit gate: every acquisition fails.
+        let gate = AdmissionGate::from_semaphore(
+            Arc::new(Semaphore::new(0)),
+            Duration::from_millis(30),
+            Arc::clone(&waiting),
+            Arc::clone(&in_flight),
+        );
+
+        // Failed acquire (timeout) leaves the gauge untouched.
+        assert!(matches!(
+            gate.acquire_run().await,
+            Err(AcquireError::Timeout { .. })
+        ));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+
+        // Failed try_acquire likewise.
+        assert!(gate.try_acquire_run().is_err());
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+
+        // Success path: held while the permit lives, released on Drop.
+        let gate_ok =
+            AdmissionGate::new(2, Duration::from_secs(5), waiting, Arc::clone(&in_flight));
+        let p1 = gate_ok.acquire_run().await.unwrap();
+        let p2 = gate_ok.try_acquire_run().unwrap();
+        assert_eq!(in_flight.load(Ordering::Relaxed), 2);
+        drop(p1);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 1);
+        drop(p2);
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
     }
 
     // ── SessionHost ────────────────────────────────────────────────────────
@@ -598,7 +683,7 @@ mod tests {
     fn host(ttl: Duration) -> SessionHost<FakeSession> {
         SessionHost::new(
             ttl,
-            AdmissionGate::new(2, Duration::from_secs(5), counter()),
+            AdmissionGate::new(2, Duration::from_secs(5), counter(), counter()),
         )
     }
 

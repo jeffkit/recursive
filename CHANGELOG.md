@@ -25,6 +25,13 @@
   TOML/JSON parsing) on every render frame — `App` caches
   `(model_name, pricing)` per model (`pricing_for_model`,
   `pricing_lookup_count()`), the render path reads the cache only (issue #41).
+- HTTP `/metrics` gains density & queue gauges (#19): `recursive_runs_in_flight`
+  (runs currently holding an admission permit, RAII-tracked via `RunPermit`'s
+  `Drop` so failed acquisitions never count) and
+  `recursive_transcript_bytes_total` (estimated transcript size across live
+  sessions; busy sessions skipped and reported by
+  `recursive_transcript_bytes_skipped`). `AdmissionGate` now takes the
+  in-flight counter in both constructors.
 - Documentation: new `docs/llm-gateway-compat.md` collecting the implicit
   wire-protocol constraints behind issues #15/#16/#17 (new-api/one-api and
   Bedrock gateway traps), linked from the README Docs section.

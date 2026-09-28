@@ -125,6 +125,7 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
                 8,
                 std::time::Duration::ZERO,
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ),
         )),
         rate_limiter: RateLimiter::new(10, 1.0),

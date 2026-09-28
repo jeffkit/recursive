@@ -112,6 +112,7 @@ mod http_tests {
                     8,
                     std::time::Duration::ZERO,
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
@@ -169,6 +170,7 @@ mod http_tests {
                 recursive::http::AdmissionGate::new(
                     8,
                     std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
@@ -457,6 +459,7 @@ mod http_tests {
                     8,
                     std::time::Duration::ZERO,
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
@@ -534,6 +537,7 @@ mod http_tests {
                 recursive::http::AdmissionGate::new(
                     8,
                     std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
@@ -619,6 +623,7 @@ mod http_tests {
                 recursive::http::AdmissionGate::new(
                     8,
                     std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
@@ -833,6 +838,7 @@ mod http_tests {
                     1,
                     std::time::Duration::from_millis(150),
                     Arc::clone(&metrics.runs_waiting),
+                    Arc::clone(&metrics.runs_in_flight),
                 ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
@@ -1193,6 +1199,7 @@ mod http_tests {
                 recursive::http::AdmissionGate::new(
                     8,
                     std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
@@ -2622,6 +2629,9 @@ mod http_tests {
             "recursive_tokens_prompt_total",
             "recursive_tokens_completion_total",
             "recursive_agent_steps_total",
+            "recursive_runs_waiting",
+            "recursive_runs_in_flight",
+            "recursive_transcript_bytes_total",
         ] {
             assert!(text.contains(name), "missing metric: {name}");
         }
@@ -4223,6 +4233,7 @@ mod http_tests {
                 recursive::http::AdmissionGate::new(
                     8,
                     std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 ),
             )),
