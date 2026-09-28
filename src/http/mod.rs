@@ -5,12 +5,15 @@
 //! endpoint that executes the agent with a given goal, session management
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
-mod admission;
 mod auth;
 mod handlers;
 mod rate_limit;
 
-pub use admission::{AcquireError, AdmissionGate, RunPermit};
+// Goal 395: the admission gate moved to the transport-agnostic
+// `session_host` module; re-exported here so front-end call sites and
+// external `recursive::http::AdmissionGate` paths keep working.
+pub use crate::session_host::SessionHost;
+pub use crate::session_host::{AcquireError, AdmissionGate, RunPermit};
 pub use auth::{AuthConfig, JwtConfig};
 pub use handlers::map_agent_event;
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
@@ -332,23 +335,16 @@ pub struct AppState {
     pub tool_registry: ToolRegistry,
     pub config: Config,
     pub provider: Arc<dyn ChatProvider>,
-    /// Session state keyed by session ID.
-    pub sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+    /// Goal 395: transport-agnostic session host — owns the session
+    /// registry, the run-admission gate (Goal 398) and the session TTL.
+    /// Session SSE channels stay here: they are an HTTP transport concept.
+    pub host: Arc<SessionHost<SessionState>>,
     /// Per-session SSE broadcast channels.
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseEvent>>>>,
     pub metrics: Arc<Metrics>,
     /// Goal-169: registered slash commands (built-in + skill-backed).
     /// Pre-built at startup for cheap `GET /slash-commands` responses.
     pub slash_commands: Arc<Vec<SlashCommandInfo>>,
-    pub session_ttl_secs: u64,
-    /// Admission gate limiting concurrent agent runs (Goal 398). Wraps the
-    /// run semaphore with a bounded wait (`RECURSIVE_ADMISSION_TIMEOUT_SECS`,
-    /// default 30s) so queued requests fail fast with `503` + `Retry-After`
-    /// instead of hanging forever. `try_acquire_run` keeps the `/agui`
-    /// never-wait contract. When the configured `max_concurrent_runs` is 0
-    /// (unlimited), the inner semaphore is initialised with
-    /// `Semaphore::MAX_PERMITS`.
-    pub admission: Arc<AdmissionGate>,
     /// Shared rate limiter for all API requests. Stored on `AppState` so the
     /// session reaper can prune idle token buckets.
     pub rate_limiter: RateLimiter,
@@ -1082,10 +1078,13 @@ pub fn build_openapi_spec() -> serde_json::Value {
 
 /// Spawn a background task that periodically evicts idle sessions.
 ///
-/// Every `check_interval` seconds, the reaper scans all sessions and removes
-/// those whose `last_active` is older than `session_ttl_secs`. The reaper
-/// calls `runtime.close()` on each evicted session so the transcript is
-/// saved to the storage backend before the session is dropped.
+/// Every `check_interval` seconds the reaper runs one
+/// [`SessionHost::evict_idle`] sweep (Goal 395): sessions idle beyond the
+/// configured TTL are removed under a short write lock, and their runtime is
+/// closed **outside every sessions lock** — a slow close (e.g. transcript
+/// persistence, Goal 396) can therefore never freeze the other session
+/// endpoints. Busy sessions (runtime locked by an in-flight turn) are
+/// skipped in place and picked up by a later sweep.
 pub fn spawn_session_reaper(
     state: Arc<AppState>,
     check_interval: std::time::Duration,
@@ -1093,49 +1092,44 @@ pub fn spawn_session_reaper(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(check_interval).await;
-            let ttl = std::time::Duration::from_secs(state.session_ttl_secs);
-            let mut to_evict: Vec<String> = Vec::new();
-            // Phase 1: collect eviction candidates under a read lock.
-            {
-                let sessions = state.sessions.read().await;
-                for (id, session) in sessions.iter() {
-                    let last_ms = session.last_active_ms.load(Ordering::Relaxed);
-                    let elapsed = std::time::Duration::from_millis(now_session_ms() - last_ms);
-                    if elapsed >= ttl {
-                        to_evict.push(id.clone());
-                    }
-                }
-            }
-            // Prune idle rate-limit buckets (goal-290). Runs every
-            // reaper tick so the bucket map doesn't grow unboundedly.
-            state.rate_limiter.prune().await;
-            if to_evict.is_empty() {
-                continue;
-            }
-            // Phase 2: evict under a write lock, calling close() on each.
-            {
-                let mut sessions = state.sessions.write().await;
-                for id in &to_evict {
-                    if let Some(session) = sessions.remove(id) {
-                        // Try to close the runtime (best-effort — the lock
-                        // may be held by an in-flight turn).
+            let evicted = state
+                .host
+                .evict_idle(
+                    // Idle: last activity older than the session TTL.
+                    |session, ttl| {
+                        let last_ms = session.last_active_ms.load(Ordering::Relaxed);
+                        std::time::Duration::from_millis(now_session_ms() - last_ms) >= ttl
+                    },
+                    // Busy: an in-flight turn holds the runtime — skip and
+                    // keep the session in the table for the next sweep.
+                    |session| session.runtime.try_lock().is_err(),
+                    // Best-effort close, outside every sessions lock. Close
+                    // outcomes never abort the sweep (data, not errors).
+                    |session| async move {
                         if let Ok(mut rt) = session.runtime.try_lock() {
                             rt.close(None).await;
                         }
+                    },
+                    // Bookkeeping: the gauge must track the table.
+                    |id| {
                         state
                             .metrics
                             .sessions_active
                             .fetch_sub(1, Ordering::Relaxed);
                         tracing::info!("reaper: evicted idle session {id}");
-                    }
-                }
+                    },
+                )
+                .await;
+            // Prune idle rate-limit buckets (goal-290). Runs every
+            // reaper tick so the bucket map doesn't grow unboundedly.
+            state.rate_limiter.prune().await;
+            if evicted.is_empty() {
+                continue;
             }
             // Prune stale event_channels for evicted sessions.
-            {
-                let mut channels = state.event_channels.write().await;
-                for id in &to_evict {
-                    channels.remove(id);
-                }
+            let mut channels = state.event_channels.write().await;
+            for id in &evicted {
+                channels.remove(id);
             }
         }
     })

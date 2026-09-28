@@ -142,10 +142,11 @@ pub(super) async fn run_agent(
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
     let _permit = state
-        .admission
+        .host
+        .admission()
         .acquire_run()
         .await
-        .map_err(|e| admission_error(e, &state.admission))?;
+        .map_err(|e| admission_error(e, &state.host.admission()))?;
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
     let system_prompt = match body.system_prompt {
         Some(s) => s,
@@ -334,7 +335,12 @@ pub(super) async fn create_session(
         completion_tokens: Arc::new(AtomicU64::new(0)),
     };
 
-    state.sessions.write().await.insert(id.clone(), session);
+    state
+        .host
+        .sessions()
+        .write()
+        .await
+        .insert(id.clone(), session);
     state
         .metrics
         .sessions_active
@@ -368,7 +374,8 @@ pub(super) async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ListSessionsQuery>,
 ) -> Json<SessionList> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let mut infos = Vec::with_capacity(sessions.len());
     for s in sessions.values() {
         // Read the pre-computed count without acquiring the runtime lock.
@@ -413,7 +420,8 @@ pub(super) async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionDetailResponse>, ApiError> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let session = sessions
         .get(&id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -493,7 +501,8 @@ pub(super) async fn delete_session(
     // runtime Mutex and call `close()` without holding the global write
     // lock across an await point.
     let session_runtime = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         sessions.get(&id).map(|s| s.runtime.clone())
     };
     if let Some(runtime) = session_runtime {
@@ -503,7 +512,7 @@ pub(super) async fn delete_session(
         let mut rt = runtime.lock().await;
         rt.close(None).await;
         drop(rt);
-        state.sessions.write().await.remove(&id);
+        state.host.sessions().write().await.remove(&id);
         state
             .metrics
             .sessions_active
@@ -540,7 +549,8 @@ pub(super) async fn patch_session(
     Path(id): Path<String>,
     Json(body): Json<PatchSessionRequest>,
 ) -> Result<Json<SessionInfo>, ApiError> {
-    let mut sessions = state.sessions.write().await;
+    let sessions_lock = state.host.sessions();
+    let mut sessions = sessions_lock.write().await;
     let session = sessions
         .get_mut(&id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -588,7 +598,8 @@ pub(super) async fn fork_session(
 ) -> Result<(StatusCode, Json<ForkSessionResponse>), ApiError> {
     // Snapshot the source transcript while holding the write lock.
     let transcript_snapshot = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let src = sessions
             .get(&id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -649,7 +660,12 @@ pub(super) async fn fork_session(
         completion_tokens: Arc::new(AtomicU64::new(0)),
     };
 
-    state.sessions.write().await.insert(new_id.clone(), session);
+    state
+        .host
+        .sessions()
+        .write()
+        .await
+        .insert(new_id.clone(), session);
     state
         .metrics
         .sessions_active
@@ -685,7 +701,8 @@ pub(super) async fn session_plan_confirm(
     Path(session_id): Path<String>,
     Json(body): Json<PlanConfirmRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -717,7 +734,8 @@ pub(super) async fn session_plan_reject(
     Path(session_id): Path<String>,
     Json(body): Json<PlanRejectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -747,7 +765,8 @@ pub(super) async fn session_set_goal(
     Json(body): Json<SetGoalRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -779,7 +798,8 @@ pub(super) async fn session_clear_goal(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -847,7 +867,8 @@ pub(super) async fn session_interrupt(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let token_arc = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -890,7 +911,8 @@ pub(super) async fn send_session_message(
     // Get the session's runtime, interrupt token, message counter, last_active,
     // and token usage counters.
     let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -922,10 +944,11 @@ pub(super) async fn send_session_message(
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
     let _permit = state
-        .admission
+        .host
+        .admission()
         .acquire_run()
         .await
-        .map_err(|e| admission_error(e, &state.admission))?;
+        .map_err(|e| admission_error(e, &state.host.admission()))?;
     let mut runtime = runtime_arc.lock().await;
 
     // Goal-170: install a fresh cancellation token so `POST .../interrupt`
@@ -1045,7 +1068,8 @@ pub(super) async fn session_events(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Verify session exists
     {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         if !sessions.contains_key(&id) {
             return Err(ApiError::not_found("session not found"));
         }
@@ -1639,7 +1663,7 @@ pub(super) async fn agui_run(
     // awaiting indefinitely, which would hang every /agui request when the
     // pool is full). Goal 398 routes it through the same admission gate as
     // the REST endpoints; only the waiting policy differs (none).
-    let _permit = state.admission.try_acquire_run().map_err(|_| {
+    let _permit = state.host.admission().try_acquire_run().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -2456,10 +2480,13 @@ mod tests {
         // 0-permit admission gate: every `try_acquire_run` call
         // returns `TryAcquireError::NoPermits` immediately.
         let metrics = Arc::new(crate::http::Metrics::default());
-        let admission = Arc::new(crate::http::AdmissionGate::from_semaphore(
-            Arc::new(Semaphore::new(0)),
-            Duration::ZERO,
-            Arc::clone(&metrics.runs_waiting),
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::from_semaphore(
+                Arc::new(Semaphore::new(0)),
+                Duration::ZERO,
+                Arc::clone(&metrics.runs_waiting),
+            ),
         ));
 
         let state = Arc::new(crate::http::AppState {
@@ -2467,12 +2494,10 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider: Arc::new(MockProvider::new(vec![])),
-            sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            host,
             event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             metrics,
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2531,21 +2556,24 @@ mod tests {
         };
 
         let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
         let state = Arc::new(AppState {
             tools: vec![],
             tool_registry: ToolRegistry::default(),
             config,
             provider,
-            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            )),
+            host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2577,7 +2605,7 @@ mod tests {
     }
 
     /// Helper: build a minimal AppState with one session for handler unit tests.
-    fn test_app_state_with_session(
+    async fn test_app_state_with_session(
         session_id: &str,
     ) -> (
         Arc<AppState>,
@@ -2609,21 +2637,24 @@ mod tests {
             completion_tokens: Arc::new(AtomicU64::new(0)),
         };
         let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
         let state = Arc::new(AppState {
             tools: vec![],
             tool_registry: ToolRegistry::default(),
             config,
             provider,
-            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            )),
+            host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
         });
@@ -2633,7 +2664,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_status_idle_vs_plan_pending() {
         let sid = "test-plan-status";
-        let (state, _) = test_app_state_with_session(sid);
+        let (state, _) = test_app_state_with_session(sid).await;
 
         let idle = match get_session(State(state.clone()), Path(sid.to_string())).await {
             Ok(Json(v)) => v,
@@ -2644,7 +2675,8 @@ mod tests {
 
         // Set pending plan via the gate.
         {
-            let sessions = state.sessions.read().await;
+            let sessions_lock = state.host.sessions();
+            let sessions = sessions_lock.read().await;
             let session = sessions.get(sid).unwrap();
             *session.plan_approval_gate.pending_plan.write().unwrap() = Some("do the thing".into());
         }
@@ -2659,7 +2691,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_busy_runtime_returns_empty_messages() {
         let sid = "test-busy-get";
-        let (state, runtime_arc) = test_app_state_with_session(sid);
+        let (state, runtime_arc) = test_app_state_with_session(sid).await;
         let _guard = runtime_arc.lock().await;
         let detail = match get_session(State(state), Path(sid.to_string())).await {
             Ok(Json(v)) => v,
@@ -2675,7 +2707,7 @@ mod tests {
     #[tokio::test]
     async fn patch_session_empty_title_clears() {
         let sid = "test-patch-title";
-        let (state, _) = test_app_state_with_session(sid);
+        let (state, _) = test_app_state_with_session(sid).await;
 
         let cleared = match patch_session(
             State(state.clone()),
@@ -2740,14 +2772,15 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider: Arc::new(crate::llm::MockProvider::new(vec![])),
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -2786,15 +2819,16 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider,
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: metrics.clone(),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],

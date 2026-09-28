@@ -101,15 +101,16 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -155,15 +156,16 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -438,15 +440,16 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -512,15 +515,16 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -593,15 +597,16 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -802,16 +807,16 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::clone(&metrics),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            // 1 slot, 150ms admission window: saturated ⇒ ~150ms then 503.
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                1,
-                std::time::Duration::from_millis(150),
-                Arc::clone(&metrics.runs_waiting),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    1,
+                    std::time::Duration::from_millis(150),
+                    Arc::clone(&metrics.runs_waiting),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
@@ -844,8 +849,8 @@ mod http_tests {
         let session_id = created["id"].as_str().unwrap().to_string();
 
         // Saturate the single run slot directly through the gate.
-        let hold = state.admission.acquire_run().await.unwrap();
-        assert!(state.admission.try_acquire_run().is_err());
+        let hold = state.host.admission().acquire_run().await.unwrap();
+        assert!(state.host.admission().try_acquire_run().is_err());
 
         // The message request now queues, times out, and gets a 503.
         let app = build_router(state.clone());
@@ -1816,7 +1821,8 @@ mod http_tests {
         //    To exercise the 409 we acquire the runtime Mutex first;
         //    that requires touching AppState directly.
         let runtime_arc = {
-            let sessions = state.sessions.read().await;
+            let sessions = state.host.sessions();
+            let sessions = sessions.read().await;
             sessions.get(&session_id).unwrap().runtime.clone()
         };
         let _guard = runtime_arc.lock().await;
@@ -1884,7 +1890,8 @@ mod http_tests {
 
         // Hold the runtime Mutex so clear_goal hits its 409 path.
         let runtime_arc = {
-            let sessions = state.sessions.read().await;
+            let sessions = state.host.sessions();
+            let sessions = sessions.read().await;
             sessions.get(&session_id).unwrap().runtime.clone()
         };
         let _guard = runtime_arc.lock().await;
@@ -3209,7 +3216,8 @@ mod http_tests {
             completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state
-            .sessions
+            .host
+            .sessions()
             .write()
             .await
             .insert(session_id.clone(), session);
@@ -3392,7 +3400,8 @@ mod http_tests {
         // Snapshot the gate so we can verify the edit took effect.
         let gate = {
             state
-                .sessions
+                .host
+                .sessions()
                 .read()
                 .await
                 .get(&session_id)
@@ -3898,7 +3907,6 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(vec![
@@ -3917,11 +3925,13 @@ mod http_tests {
                     argument_hint: String::new(),
                 },
             ]),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],

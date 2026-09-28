@@ -808,26 +808,25 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30);
             let metrics = std::sync::Arc::new(recursive::http::Metrics::default());
-            let admission = std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                max_concurrent,
-                Duration::from_secs(admission_timeout_secs),
-                std::sync::Arc::clone(&metrics.runs_waiting),
+            let host = std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                Duration::from_secs(session_ttl_secs),
+                recursive::http::AdmissionGate::new(
+                    max_concurrent,
+                    Duration::from_secs(admission_timeout_secs),
+                    std::sync::Arc::clone(&metrics.runs_waiting),
+                ),
             ));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
                 config: config.clone(),
                 provider,
-                sessions: std::sync::Arc::new(tokio::sync::RwLock::new(
-                    std::collections::HashMap::new(),
-                )),
+                host,
                 event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
                 metrics,
                 slash_commands: std::sync::Arc::new(slash_commands),
-                session_ttl_secs,
-                admission,
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
             };
