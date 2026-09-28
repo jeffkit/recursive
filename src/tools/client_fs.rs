@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::dispatch::{AccessTier, SharedSandboxRoots};
-use crate::tools::Tool;
+use crate::tools::{SessionToolState, Tool};
 
 // ---------------------------------------------------------------------------
 // Shared state for ACP client FS capabilities
@@ -61,6 +61,7 @@ impl AcpClientFsState {
 /// If the client returns an error or does not respond within
 /// `client_read_timeout_ms`, the tool falls back to a local filesystem
 /// read (S2-E2).
+#[derive(Clone)]
 pub struct ClientReadFile {
     /// Primary workspace root. Held for future permission-root lookups; the
     /// current read/write handlers only need the client-side buffer state.
@@ -138,6 +139,15 @@ impl ClientReadFile {
 
 #[async_trait]
 impl Tool for ClientReadFile {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `GlobTool`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "ClientReadFile".into(),
@@ -211,6 +221,7 @@ impl Tool for ClientReadFile {
 /// Sandbox escape detection is enforced: the `file_path` parameter is
 /// checked against the sandbox roots via `resolve_within` before the
 /// write is sent to the client (S2-E5).
+#[derive(Clone)]
 pub struct ClientWriteFile {
     workspace: Arc<Path>,
     /// Additional sandbox roots beyond the primary workspace.
@@ -272,6 +283,15 @@ impl ClientWriteFile {
 
 #[async_trait]
 impl Tool for ClientWriteFile {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `GlobTool`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "ClientWriteFile".into(),

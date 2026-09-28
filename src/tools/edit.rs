@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::transport::ToolTransport;
-use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -370,6 +370,20 @@ fn extract_by_char_count(
 
 #[async_trait]
 impl Tool for EditTool {
+    /// Goal 394: session-level fork — rewire the shared guard slot and the
+    /// sandbox-roots slot so the read-before-edit guard is per-session. See
+    /// [`Tool::fork_box`] on `ReadFile` for the rewire-only-when-fresh rule.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.read_state, &state.read_state) {
+            forked.read_state = Some(fresh.clone());
+        }
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Edit".into(),

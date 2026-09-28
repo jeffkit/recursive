@@ -22,7 +22,7 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use super::resolve_within;
-use super::Tool;
+use super::{SessionToolState, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -289,6 +289,7 @@ impl BackgroundJobManager {
 }
 
 /// The `run_background` tool: spawn a command and return immediately.
+#[derive(Clone)]
 pub struct RunBackground {
     root: PathBuf,
     manager: Arc<Mutex<BackgroundJobManager>>,
@@ -305,6 +306,14 @@ impl RunBackground {
 
 #[async_trait]
 impl Tool for RunBackground {
+    /// Goal 394: session-level fork — rewire the shared background-job
+    /// manager so jobs spawned in one session are invisible to another.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        forked.manager = state.bg_manager.clone();
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_background".into(),
@@ -429,6 +438,7 @@ impl Tool for RunBackground {
 }
 
 /// The `check_background` tool: poll a previously spawned background job.
+#[derive(Clone)]
 pub struct CheckBackground {
     manager: Arc<Mutex<BackgroundJobManager>>,
 }
@@ -441,6 +451,13 @@ impl CheckBackground {
 
 #[async_trait]
 impl Tool for CheckBackground {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `RunBackground`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        forked.manager = state.bg_manager.clone();
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "check_background".into(),

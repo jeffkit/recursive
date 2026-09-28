@@ -388,7 +388,10 @@ impl AgentTool {
         let mut child_agent = AgentTool::new(
             &self.workspace,
             self.provider.clone(),
-            self.all_tools.fork(),
+            // Goal 394: real session isolation — the child must not inherit
+            // (or be observed through) the parent's read-before-edit guard,
+            // touched-files, background jobs, or sandbox-root expansions.
+            self.all_tools.fork_session(),
             self.max_depth,
             child_depth,
             self.permission_hook.clone(),
@@ -648,7 +651,7 @@ impl AgentTool {
         // worker gets its own clone of the relevant fields.
         let workspace = self.workspace.clone();
         let provider = self.provider.clone();
-        let all_tools = self.all_tools.fork();
+        let all_tools = self.all_tools.fork_session();
         let max_depth = self.max_depth;
         let permission_hook = self.permission_hook.clone();
         let registry = self.registry.clone();

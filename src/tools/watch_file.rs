@@ -18,11 +18,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::run_background::BackgroundJobManager;
-use super::{resolve_within, Tool};
+use super::{resolve_within, SessionToolState, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
 /// The `watch_file` tool: register a file for event-driven wakes.
+#[derive(Clone)]
 pub struct WatchFile {
     root: PathBuf,
     manager: Arc<Mutex<BackgroundJobManager>>,
@@ -39,6 +40,13 @@ impl WatchFile {
 
 #[async_trait]
 impl Tool for WatchFile {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `RunBackground`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        forked.manager = state.bg_manager.clone();
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "watch_file".into(),
