@@ -147,7 +147,10 @@ fixture。详见 `e2e/fixtures/README.md` + aimock 官方文档
 ### 2. 用 `turnIndex` + `hasToolResult` 区分多轮
 
 - `turnIndex` = 请求里已有的 assistant 消息数（从 0 开始，**无状态推导**）。
-- `hasToolResult` = 历史里是否已有 tool result。
+- `hasToolResult` = **当前轮**（最后一条 `role:user` 之后的那些消息）里是否含
+  `role:tool` 结果——**不是**「历史里是否出现过 tool result」。末尾再追加一条
+  user 消息就会把它重置为 `false`（resume 就是这样：seeded tool result 之后又
+  追加了续跑 user 消息）→ 详见 issue #38 与 `fixtures/README.md`。
 - 隔离 transcript 的子 agent（如 `agent` 工具 spawn 的 worker），turnIndex 从 0
   重新计数——用 `userMessage`（goal 子串 vs worker prompt 子串）区分父子请求。
 

@@ -21,9 +21,17 @@ chat-completions request.
 - `match.userMessage` — **substring** matched against the **latest** `role:user`
   text message in the request body (NOT the first/original goal, NOT tool
   results). Empty/absent ⇒ matches any user message.
-- `match.hasToolResult` — `true` iff the conversation history already contains
-  at least one tool result. Use this to distinguish "first LLM call of a turn"
-  (`false`) from "follow-up call after a tool ran" (`true`).
+- `match.hasToolResult` — `true` iff the **current turn** (the messages *after*
+  the last `role:"user"` message) contains a `role:"tool"` result. It is NOT
+  "the history contains a tool result somewhere": a trailing user message
+  resets it to `false` even when earlier turns ran tools. Use it to distinguish
+  "first LLM call of a turn" (`false`) from "follow-up call after a tool ran in
+  this same turn" (`true`). If the request has no user message at all, aimock
+  falls back to scanning the whole conversation. See
+  <https://aimock.copilotkit.dev/multi-turn> (authoritative). This bites
+  resume/interrupt fixtures: `resume` appends a synthetic continuation user
+  message after the seeded tool result, so `hasToolResult` is `false` on the
+  resume request even though the transcript contains a tool result.
 - `response.toolCalls` — a list of `{ "name": "<PascalCase>", "arguments": {…} }`
   tool calls the mock model "makes". Tool names MUST be PascalCase
   (`Write`, `Read`, `Glob`) — the registry exports PascalCase, and asserting

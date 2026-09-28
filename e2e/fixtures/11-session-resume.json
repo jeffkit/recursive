@@ -13,8 +13,8 @@
       }
     },
     {
-      "_comment": "Turn 1: resume continues here — max-steps 1 was exhausted after turn 0. With session-id resume (no -p), recursive appends a synthetic 'Continue from where you left off.' user message instead of re-injecting the saved goal.",
-      "match": { "userMessage": "Continue from where you left off", "turnIndex": 1, "hasToolResult": true },
+      "_comment": "Turn 1: resume continues here — max-steps 1 was exhausted after turn 0. With session-id resume (no -p), recursive appends a synthetic 'Continue from where you left off.' user message instead of re-injecting the saved goal. aimock's hasToolResult is scoped to the CURRENT turn (messages after the last role:user); the seeded tool result sits BEFORE that appended user message, so it is false — see https://aimock.copilotkit.dev/multi-turn.",
+      "match": { "userMessage": "Continue from where you left off", "turnIndex": 1, "hasToolResult": false },
       "response": {
         "content": "Done! resume-step1.txt has been created with content step1-done."
       }
