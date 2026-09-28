@@ -20,6 +20,8 @@
 use recursive::config::Config;
 use recursive::http::{AppState, Metrics, RateLimiter, ToolInfo};
 use recursive::llm::{Completion, MockProvider};
+use recursive::message::Message;
+use recursive::storage::StorageBackend;
 use recursive::tools::ToolRegistry;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,6 +31,116 @@ use tokio::sync::RwLock;
 /// Since Goal 277, the HTTP server default-deny requires the
 /// insecure-ok debug escape hatch for no-auth integration tests.
 pub static SET_INSECURE_OK: std::sync::Once = std::sync::Once::new();
+
+// ── Goal 396: in-memory StorageBackend for HTTP fixtures ─────────────────
+
+/// One `save_transcript` call recorded by [`MemoryStorage`].
+#[derive(Clone, Debug)]
+pub struct SaveRecord {
+    pub session_id: String,
+    pub messages: Vec<Message>,
+    /// When a probe lock is attached: `true` if the probed lock was FREE at
+    /// save time (i.e. the host did NOT hold it across the save).
+    pub probe_lock_was_free: Option<bool>,
+}
+
+/// Goal 396: in-memory fake `StorageBackend`.
+///
+/// Records every save so tests can assert what the host layer persisted,
+/// and optionally probes the host's **sessions map lock** during the save
+/// to pin the lock-scope rule ("save_transcript must run outside the host
+/// sessions lock": if the host held the write lock across the save,
+/// `try_write` fails and the test fails). Round-trip via `load_transcript`
+/// also works.
+#[derive(Default)]
+pub struct MemoryStorage {
+    pub saves: std::sync::Mutex<Vec<SaveRecord>>,
+    /// Optional probe — the host sessions map itself, probed for write
+    /// access at save time.
+    pub probe_sessions: Option<Arc<RwLock<HashMap<String, recursive::http::SessionState>>>>,
+    /// Backing store for round-trip reads (session_id → jsonl lines).
+    store: std::sync::Mutex<HashMap<String, Vec<String>>>,
+}
+
+impl MemoryStorage {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn with_sessions_probe(
+        sessions: Arc<RwLock<HashMap<String, recursive::http::SessionState>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            probe_sessions: Some(sessions),
+            ..Default::default()
+        })
+    }
+
+    pub fn saves(&self) -> Vec<SaveRecord> {
+        self.saves.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for MemoryStorage {
+    async fn load_transcript(&self, session_id: &str) -> recursive::error::Result<Vec<Message>> {
+        let store = self.store.lock().unwrap();
+        let lines = store.get(session_id).cloned().unwrap_or_default();
+        drop(store);
+        lines
+            .iter()
+            .map(|l| serde_json::from_str(l))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| recursive::error::Error::Config {
+                message: format!("memory storage parse: {e}"),
+            })
+    }
+
+    async fn save_transcript(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+    ) -> recursive::error::Result<()> {
+        // Probe BEFORE any await point: if the host still held the sessions
+        // write lock here, try_write fails and the test fails.
+        let probe_lock_was_free = self
+            .probe_sessions
+            .as_ref()
+            .map(|sessions| sessions.try_write().is_ok());
+        let lines: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                serde_json::to_string(m).map_err(|e| recursive::error::Error::Config {
+                    message: format!("memory storage serialize: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.store
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), lines);
+        self.saves.lock().unwrap().push(SaveRecord {
+            session_id: session_id.to_string(),
+            messages: messages.to_vec(),
+            probe_lock_was_free,
+        });
+        Ok(())
+    }
+
+    async fn load_memory(&self, _key: &str) -> recursive::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn save_memory(&self, _key: &str, _value: &str) -> recursive::error::Result<()> {
+        Ok(())
+    }
+}
+
+/// Storage for fixtures that don't assert on persistence — keeps test
+/// transcripts out of the real filesystem entirely.
+pub fn memory_storage() -> Arc<MemoryStorage> {
+    MemoryStorage::new()
+}
 
 pub fn mock_config() -> Config {
     Config {
@@ -123,6 +235,7 @@ pub fn sample_state() -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        storage: memory_storage(),
     }
 }
 
@@ -148,5 +261,6 @@ pub fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        storage: memory_storage(),
     }
 }

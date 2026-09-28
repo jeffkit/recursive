@@ -2,8 +2,17 @@
 //!
 //! Tests that HTTP API and Multi-Agent features work together correctly.
 
+// Goal 396: reuse the shared HTTP fixtures (in-memory storage backend) so
+// AppState keeps compiling without touching the real filesystem. Declared
+// at the file root — the same `#[path]` resolution rules as tests/http.rs.
+#[cfg(feature = "http")]
+#[path = "http_common/mod.rs"]
+mod common;
+
 #[cfg(feature = "http")]
 mod v050_integration {
+    use crate::common::memory_storage;
+
     use axum::body::Body;
     use http_body_util::BodyExt;
     use recursive::http::{build_router, AppState, Metrics, RateLimiter, ToolInfo};
@@ -93,6 +102,7 @@ mod v050_integration {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: memory_storage(),
         }
     }
 

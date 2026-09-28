@@ -23,6 +23,11 @@ use recursive::tools::ToolRegistry;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+// Goal 396: reuse the shared HTTP fixtures (in-memory storage backend) so
+// AppState keeps compiling without touching the real filesystem.
+#[path = "http_common/mod.rs"]
+mod common;
+
 /// Process-wide lock for tests that mutate `RECURSIVE_HOME`.
 static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -124,6 +129,7 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        storage: common::memory_storage(),
     }
 }
 

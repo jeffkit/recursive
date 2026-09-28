@@ -85,7 +85,11 @@ fn build_session_runtime(
             // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
             // into state.config at server startup). Exceeding it finishes
             // with WallClockExceeded.
-            .wall_timeout_secs(state.config.wall_timeout_secs),
+            .wall_timeout_secs(state.config.wall_timeout_secs)
+            // Goal 396: the host layer persists this session's transcript
+            // through the same storage backend on teardown (DELETE / idle
+            // eviction / graceful shutdown) — not per turn.
+            .storage(state.storage.clone()),
         &state.config,
     )
 }
@@ -343,10 +347,10 @@ pub(super) async fn create_session(
     .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
     // Register the session ID so all turns emit tracing spans with
-    // session_id. (As of Goal 393 the HTTP layer installs no storage
-    // writer/sink — transcripts live in memory and die with the process;
-    // persistence is Goal 396's write-through path. Update this comment
-    // when that lands.)
+    // session_id. The transcript is NOT saved per turn — the host layer
+    // persists it once on teardown (DELETE / idle eviction / graceful
+    // shutdown) through the storage backend that `build_session_runtime`
+    // wires into the builder (Goal 396).
     runtime.set_session_id(&id);
 
     // Extract the gate before moving runtime into the Mutex so HTTP handlers
@@ -542,6 +546,10 @@ pub(super) async fn delete_session(
         // runtime is dropped. Idempotent on repeated calls.
         let mut rt = runtime.lock().await;
         rt.close(None).await;
+        // Goal 396: snapshot the transcript before releasing the runtime
+        // Mutex, but persist it only after the session is out of the map —
+        // the save is I/O and must not run under either lock.
+        let transcript = rt.transcript().to_vec();
         drop(rt);
         state.host.sessions().write().await.remove(&id);
         state
@@ -550,6 +558,9 @@ pub(super) async fn delete_session(
             .fetch_sub(1, Ordering::Relaxed);
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
+        if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
+            tracing::warn!(session_id = %id, error = %e, "failed to persist deleted session transcript");
+        }
         tracing::info!(session_id = %id, "session deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -2587,6 +2598,9 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
 
         let body = serde_json::json!({
@@ -2663,6 +2677,9 @@ mod tests {
             host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -2744,6 +2761,9 @@ mod tests {
             host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
         (state, runtime_arc)
     }
@@ -2871,6 +2891,9 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -2919,6 +2942,9 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir(),
+            )),
         };
 
         let auth = crate::http::auth::AuthConfig::default();

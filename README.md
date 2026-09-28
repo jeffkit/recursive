@@ -326,6 +326,9 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 #### Cloud storage — Redis (session hot-state)
 
 Requires the `cloud-runtime` feature flag (`--features cloud-runtime`).
+**Not yet wired in http mode**: if `RECURSIVE_REDIS_URL` is set, `recursive http`
+logs "recognized but not yet wired in http mode" at startup and keeps using the
+local backend (Goal 396); wiring the actual Redis/S3 backends is future work.
 
 | Env | Default | Purpose |
 |-----|---------|---------|
@@ -335,7 +338,8 @@ Requires the `cloud-runtime` feature flag (`--features cloud-runtime`).
 
 #### Cloud storage — S3 (transcript + memory)
 
-Requires the `cloud-runtime` feature flag.
+Requires the `cloud-runtime` feature flag. Same caveat as Redis: **not yet
+wired in http mode** (recognized + startup log only).
 
 | Env | Default | Purpose |
 |-----|---------|---------|
@@ -361,11 +365,11 @@ Requires the `cloud-runtime` feature flag.
 
 | Concern | Local (default) | Cloud (`cloud-runtime` feature) |
 |---------|-----------------|----------------------------------|
-| Transcript persistence | Local JSONL (`~/.recursive/...`) | S3 via `S3StorageBackend` |
-| Session hot-state | In-memory (`NoopSessionStore`) | Redis via `RedisSessionStore` |
+| Transcript persistence | Local JSONL via `LocalStorageBackend`; HTTP sessions persist on delete / idle eviction / graceful shutdown (Goal 396) — at most the turns after the last save are lost | S3 via `S3StorageBackend` (not yet wired in http mode) |
+| Session hot-state | In-memory (`NoopSessionStore`) | Redis via `RedisSessionStore` (not yet wired in http mode) |
 | Tool execution | Host shell | Docker (L2) or E2B microVM (L3) |
-| Horizontal scaling | Single process | Stateless HTTP pods + shared Redis/S3 |
-| Resume across restarts | Via `--session` flag | Automatic via `restore_from_storage()` |
+| Horizontal scaling | Single process | Stateless HTTP pods + shared Redis/S3 (blocked on the storage wiring above) |
+| Resume across restarts | Via `--session` flag (CLI/TUI sessions) | Not available yet — HTTP cold-load from storage is pending (Goal 397); there is no `restore_from_storage()` today |
 
 ## Library API
 
