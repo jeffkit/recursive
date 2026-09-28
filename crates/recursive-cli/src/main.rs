@@ -813,6 +813,15 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(admission_timeout_secs),
                 std::sync::Arc::clone(&metrics.runs_waiting),
             ));
+            // Goal 397: transcripts live under
+            // `<workspace-data>/.recursive/sessions/<id>.jsonl` (the
+            // LocalStorageBackend layout). Cold load reads this same backend
+            // to restore sessions after a restart; Goal 396 wires the write
+            // path through it.
+            let storage: std::sync::Arc<dyn recursive::storage::StorageBackend> =
+                std::sync::Arc::new(recursive::storage::LocalStorageBackend::new(
+                    recursive::user_workspace_dir(&config.workspace)?,
+                ));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -830,6 +839,7 @@ async fn main() -> anyhow::Result<()> {
                 admission,
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
+                storage,
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the

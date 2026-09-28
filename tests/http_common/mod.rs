@@ -122,6 +122,7 @@ pub fn sample_state() -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        storage: test_storage_dir(),
     }
 }
 
@@ -146,5 +147,45 @@ pub fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        storage: test_storage_dir(),
+    }
+}
+
+/// Throwaway per-process storage root for fixtures that don't care about
+/// persistence — `load_transcript` on the missing dir yields empty `Vec`s,
+/// so cold load keeps every unknown session a 404.
+fn test_storage_dir() -> Arc<dyn recursive::storage::StorageBackend> {
+    Arc::new(recursive::storage::LocalStorageBackend::new(
+        std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+    ))
+}
+
+/// Goal 397: fixture with an explicit storage backend so cold-load tests can
+/// seed transcripts the way a previous process would have written them.
+pub fn sample_state_with_storage(
+    provider: Arc<MockProvider>,
+    storage: Arc<dyn recursive::storage::StorageBackend>,
+) -> AppState {
+    SET_INSECURE_OK.call_once(|| {
+        unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+    });
+    AppState {
+        tools: vec![],
+        config: mock_config(),
+        tool_registry: ToolRegistry::local(),
+        provider,
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+        event_channels: Arc::new(RwLock::new(HashMap::new())),
+        metrics: Arc::new(Metrics::default()),
+        slash_commands: Arc::new(Vec::new()),
+        session_ttl_secs: 0,
+        admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
+            8,
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )),
+        rate_limiter: RateLimiter::new(10, 1.0),
+        skills: vec![],
+        storage,
     }
 }

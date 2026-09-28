@@ -123,6 +123,9 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+            std::env::temp_dir().join(format!("recursive-agui-test-{}", std::process::id())),
+        )),
     }
 }
 

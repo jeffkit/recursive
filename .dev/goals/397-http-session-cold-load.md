@@ -84,7 +84,7 @@ journal 说明 key 约定。
   （在 journal 里写清测试名与文件）。
 - 手工实测（journal 贴命令）：建会话 → 发 1 轮 → 重启 server → `GET /sessions/:id`
   返回原 transcript（`message_count` > 0）。
-- e2e 回归：`sh .dev/scripts/e2e-run.sh 08-http-api`、`11-session-resume` 通过。
+- e2e 回归：`sh .dev/scripts/e2e-run.sh http-api`、`resume` 通过。
 - Journal: `.dev/journal/manual-20260927-goal397-http-cold-load.md`。
 
 ## Notes for the agent (traps)

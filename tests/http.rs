@@ -113,6 +113,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         });
 
         let response = app
@@ -167,6 +170,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -450,6 +456,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -524,6 +533,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -605,6 +617,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -815,6 +830,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
 
         // Create a session.
@@ -3925,6 +3943,9 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
         let resp = app
