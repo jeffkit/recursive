@@ -1358,6 +1358,11 @@ mod tests {
     }
 
     #[tokio::test]
+    /// `run_background` spawns through a hard-coded `/bin/sh`, so the fixture
+    /// is Unix-only — on Windows the tool honestly errors out and there is no
+    /// job to check. The fork-isolation semantics under test are
+    /// platform-independent.
+    #[cfg(unix)]
     async fn fork_session_isolates_background_jobs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let reg = build_standard_tools(tmp.path(), &[], 30);

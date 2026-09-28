@@ -665,9 +665,12 @@ Todo",
             .execute(json!({"pattern": "needle"}))
             .await
             .unwrap();
-        assert!(out.contains("src/a.rs:1: needle here"));
+        // Path separators are platform-dependent (`\` on Windows) — normalise
+        // before asserting on the POSIX-looking fixture paths.
+        let norm = out.replace('\\', "/");
+        assert!(norm.contains("src/a.rs:1: needle here"));
         assert!(
-            !out.contains("target") && !out.contains(".git"),
+            !norm.contains("target") && !norm.contains(".git"),
             ".git / target / node_modules must be ignored on both paths (got: {out})"
         );
     }

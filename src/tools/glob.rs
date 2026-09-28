@@ -679,9 +679,13 @@ mod tests {
         create_files(&tmp, &["src/a.rs", "target/art.rs", ".git/x.rs"]);
         let tool = GlobTool::new(tmp.path());
         let out = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
-        assert!(out.contains("src/a.rs"));
+        // Path separators are platform-dependent (`\` on Windows); normalise
+        // before asserting on the POSIX-looking fixture paths. (CI parity:
+        // windows-latest went red on exactly this assertion.)
+        let norm = out.replace('\\', "/");
+        assert!(norm.contains("src/a.rs"));
         assert!(
-            !out.contains("target") && !out.contains(".git"),
+            !norm.contains("target") && !norm.contains(".git"),
             ".git / target / node_modules must be ignored (got: {out})"
         );
     }
