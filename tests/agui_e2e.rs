@@ -111,15 +111,16 @@ fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
         config: mock_config(workspace),
         tool_registry: ToolRegistry::local(),
         provider,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
         event_channels: Arc::new(RwLock::new(HashMap::new())),
         metrics: Arc::new(Metrics::default()),
         slash_commands: Arc::new(Vec::new()),
-        session_ttl_secs: 0,
-        admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-            8,
-            std::time::Duration::ZERO,
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+            std::time::Duration::from_secs(0),
+            recursive::http::AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
