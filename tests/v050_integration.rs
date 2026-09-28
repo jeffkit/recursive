@@ -102,7 +102,9 @@ mod v050_integration {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
-            storage: memory_storage(),
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-v050-test-{}", std::process::id())),
+            )),
         }
     }
 

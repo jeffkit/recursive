@@ -276,7 +276,7 @@ fn generate_session_id() -> String {
 }
 
 /// Format a SystemTime as a basic ISO-8601 string (without chrono).
-fn format_timestamp(t: SystemTime) -> String {
+pub(super) fn format_timestamp(t: SystemTime) -> String {
     let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs();
     // Basic formatting: seconds since epoch as a simple numeric timestamp
@@ -451,15 +451,14 @@ pub(super) async fn list_sessions(
 /// needed) so this endpoint stays responsive even while an agent turn is
 /// blocked awaiting plan approval.  Messages and todos fall back to empty
 /// vectors when the runtime is busy rather than deadlocking.
+///
+/// Goal 397: a session persisted by a previous server process is restored
+/// from the storage backend here (cold load) instead of 404-ing.
 pub(super) async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionDetailResponse>, ApiError> {
-    let sessions_lock = state.host.sessions();
-    let sessions = sessions_lock.read().await;
-    let session = sessions
-        .get(&id)
-        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let session = super::cold_load::get_or_load_session(&state, &id).await?;
 
     // Read plan status without locking the runtime Mutex so callers can poll
     // while the agent is suspended inside `exit_plan_mode`.
@@ -903,6 +902,11 @@ async fn runtime_goal_state_clear(
 /// turn. The kernel exits with `FinishReason::Cancelled` at the next step
 /// boundary.  If no turn is in progress the request is still `200 OK`
 /// (idempotent — no harm done).
+///
+/// Intentionally does NOT cold-load (Goal 397 allows read-only paths to skip
+/// it): after a restart no turn is running, so there is nothing to cancel —
+/// a restored session would only be built to discover a `None` token. An
+/// unknown id stays 404.
 pub(super) async fn session_interrupt(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -949,26 +953,23 @@ pub(super) async fn send_session_message(
         return Err(ApiError::bad_request("missing or empty 'content' field"));
     }
     tracing::debug!(session_id = %id, content_len = body.content.len(), "session message received");
-    // Get the session's runtime, interrupt token, message counter, last_active,
-    // and token usage counters.
-    let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = {
-        let sessions_lock = state.host.sessions();
-        let sessions = sessions_lock.read().await;
-        let session = sessions
-            .get(&id)
-            .ok_or_else(|| ApiError::not_found("session not found"))?;
-        // Update last_active_ms timestamp for this session.
-        session
-            .last_active_ms
-            .store(super::now_session_ms(), Ordering::Relaxed);
-        (
-            session.runtime.clone(),
-            session.interrupt_token.clone(),
-            session.non_system_message_count.clone(),
-            session.prompt_tokens.clone(),
-            session.completion_tokens.clone(),
-        )
-    };
+    // Goal 397: get the session (cold-loading it from storage when it only
+    // exists on disk), then grab its runtime, interrupt token, message
+    // counter, last_active, and token usage counters. The returned handle
+    // shares all mutable state with the table entry — no table lock held
+    // while the turn runs.
+    let session = super::cold_load::get_or_load_session(&state, &id).await?;
+    // Update last_active_ms timestamp for this session.
+    session
+        .last_active_ms
+        .store(super::now_session_ms(), Ordering::Relaxed);
+    let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = (
+        session.runtime.clone(),
+        session.interrupt_token.clone(),
+        session.non_system_message_count.clone(),
+        session.prompt_tokens.clone(),
+        session.completion_tokens.clone(),
+    );
 
     // Ensure broadcast channel exists for this session before we lock the runtime.
     let broadcast_tx = {
@@ -2599,7 +2600,8 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
-                std::env::temp_dir(),
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
         });
 
@@ -2678,7 +2680,8 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
-                std::env::temp_dir(),
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
         });
 
@@ -2762,7 +2765,8 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
-                std::env::temp_dir(),
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
         });
         (state, runtime_arc)
@@ -2892,7 +2896,8 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
-                std::env::temp_dir(),
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
         });
         let output = metrics_handler(State(state)).await;
@@ -2943,7 +2948,8 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
-                std::env::temp_dir(),
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
         };
 

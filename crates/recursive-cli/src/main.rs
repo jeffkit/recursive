@@ -833,6 +833,11 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            // Goal 397: transcripts live under
+            // `<workspace-data>/.recursive/sessions/<id>.jsonl` (the
+            // LocalStorageBackend layout). Cold load reads this same backend
+            // to restore sessions after a restart; Goal 396 wires the write
+            // path through it.
             let storage: std::sync::Arc<dyn recursive::storage::StorageBackend> =
                 std::sync::Arc::new(recursive::storage::LocalStorageBackend::new(
                     recursive::user_workspace_dir(&config.workspace)?,

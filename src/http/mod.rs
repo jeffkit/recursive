@@ -6,6 +6,7 @@
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
 mod auth;
+mod cold_load;
 mod handlers;
 mod rate_limit;
 
@@ -81,6 +82,13 @@ pub struct Metrics {
 ///
 /// The [`AgentRuntime`] owns the transcript; this struct adds HTTP-layer
 /// metadata (id, created_at) and the broadcast channel for SSE clients.
+///
+/// Clone is a handle clone: every mutable field is `Arc`-wrapped, so clones
+/// share runtime / counters / gate with the value stored in the sessions
+/// table (plain metadata fields — id / created_at / title — are copied).
+/// `http::cold_load` relies on this to hand handlers a table entry without
+/// holding the table lock.
+#[derive(Clone)]
 pub struct SessionState {
     pub id: String,
     pub created_at: String,
@@ -360,6 +368,11 @@ pub struct AppState {
     /// and graceful shutdown — never per turn (that would be an O(N²)
     /// full-transcript rewrite on the hot path).
     pub storage: Arc<dyn StorageBackend>,
+    /// Persistent storage for session transcripts (Goal 397). Read by
+    /// `cold_load::get_or_load_session` to restore sessions after a restart;
+    /// Goal 396's write path reuses the same backend. In production this is
+    /// a `LocalStorageBackend` rooted at the per-workspace data dir.
+    pub storage: Arc<dyn crate::storage::StorageBackend>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -433,6 +446,7 @@ struct ErrorBody {
 ///
 /// Use [`ApiError::with_retry_after`] to attach a `Retry-After` header
 /// (Goal-313: needed by `session_clear_goal` when the runtime is busy).
+#[derive(Debug)]
 pub(super) struct ApiError {
     status: StatusCode,
     message: String,
