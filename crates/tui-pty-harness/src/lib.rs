@@ -36,6 +36,17 @@ use anyhow::{anyhow, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::Parser as VtParser;
 
+/// Re-exported so callers assert on the exact colour model vt100 parsed —
+/// e.g. SGR 41 (red bg) arrives as `Color::Idx(1)`, matching the ratatui
+/// named colour the in-process harness would see (`harness.rs:113`
+/// semantics). Zero-conversion parity with the PTY parse layer.
+pub use vt100::Color;
+
+/// Scrollback depth kept by the vt100 parser. Non-zero so content scrolled
+/// off the visible screen stays assertable via [`Screen::history_lines`].
+/// Alternate-screen TUIs don't scroll, so they are unaffected.
+const SCROLLBACK_ROWS: u16 = 200;
+
 /// Inputs for a single PTY run. All fields are owned by the caller; the
 /// spec itself borrows for the duration of [`spawn_and_snapshot`].
 pub struct RunSpec<'a> {
@@ -50,13 +61,19 @@ pub struct RunSpec<'a> {
     pub stable_ms: u64,
     pub cwd: Option<&'a str>,
     pub envs: &'a [(String, String)],
+    /// When set, the raw PTY byte stream (exactly what the child wrote,
+    /// SGR escapes included) is teed to this path. Best-effort: write
+    /// failures are ignored, they must not kill the reader thread.
+    pub record_raw: Option<&'a std::path::Path>,
 }
 
-#[derive(Clone, Copy)]
-pub enum SnapFormat {
-    Text,
-    Numbered,
-    Json,
+/// Per-cell style snapshot: vt100's parsed attributes for one grid cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellAttrs {
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub underline: bool,
 }
 
 /// Snapshot of the PTY screen after the run.
@@ -64,6 +81,58 @@ pub struct Screen {
     pub cols: u16,
     pub rows: u16,
     pub lines: Vec<String>,
+    /// Per-row cell attributes, same indexing as `lines`.
+    pub attrs: Vec<Vec<CellAttrs>>,
+    /// Lines scrolled off the top of the visible screen (oldest first).
+    /// Empty in alternate-screen mode — TUIs don't use scrollback there.
+    pub history: Vec<String>,
+}
+
+impl Screen {
+    /// Attributes of cell `(x, y)`, or `None` when out of range.
+    pub fn cell_attrs(&self, x: u16, y: u16) -> Option<&CellAttrs> {
+        self.attrs
+            .get(usize::from(y))
+            .and_then(|row| row.get(usize::from(x)))
+    }
+
+    /// The background colour at `(x, y)`, or `None` when unset/default.
+    /// Same normalisation as the in-process harness (`harness.rs::bg`):
+    /// reset/default backgrounds read as `None`, so a highlight bar is
+    /// distinguishable from the terminal's base fill.
+    pub fn bg(&self, x: u16, y: u16) -> Option<Color> {
+        match self.cell_attrs(x, y).map(|a| a.bg) {
+            Some(Color::Default) | None => None,
+            Some(c) => Some(c),
+        }
+    }
+
+    /// `true` if any cell on row `y` carries the specific background
+    /// `color`. Same semantics as `harness.rs:113`'s `row_has_bg_color`.
+    pub fn row_has_bg_color(&self, y: u16, color: Color) -> bool {
+        (0..self.cols).any(|x| self.bg(x, y) == Some(color))
+    }
+
+    /// Row index of the first visible line containing `needle`, trimmed of
+    /// trailing whitespace — same view `lines` exposes.
+    pub fn find_row(&self, needle: &str) -> Option<u16> {
+        self.lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .map(|i| i as u16)
+    }
+
+    /// Lines scrolled off the visible screen, oldest first.
+    pub fn history_lines(&self) -> &[String] {
+        &self.history
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum SnapFormat {
+    Text,
+    Numbered,
+    Json,
 }
 
 /// Minimal shell-like splitter: splits on whitespace, honours single and
@@ -180,6 +249,7 @@ pub fn spawn_and_snapshot(spec: &RunSpec) -> Result<Screen> {
         stable_ms,
         cwd,
         envs,
+        record_raw,
     } = spec;
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -223,7 +293,11 @@ pub fn spawn_and_snapshot(spec: &RunSpec) -> Result<Screen> {
     // updates a shared "last screen change" timestamp so the main thread
     // can snapshot the moment the screen goes quiet — instead of sleeping
     // a fixed --wait-ms and hoping the TUI finished.
-    let parser = Arc::new(Mutex::new(VtParser::new(*rows, *cols, 0)));
+    let parser = Arc::new(Mutex::new(VtParser::new(
+        *rows,
+        *cols,
+        SCROLLBACK_ROWS.into(),
+    )));
     let stop = Arc::new(AtomicBool::new(false));
     // last_change is set to the run start; reader updates it whenever the
     // rendered screen text actually differs from the previous chunk.
@@ -233,11 +307,22 @@ pub fn spawn_and_snapshot(spec: &RunSpec) -> Result<Screen> {
     let last_change = Arc::new(Mutex::new(Instant::now()));
     let got_output = Arc::new(AtomicBool::new(false));
     let mut reader = pair.master.try_clone_reader()?;
-    let (parser_r, stop_r, last_change_r, got_output_r) = (
+    // Optional raw-stream tee: created (truncating) on the main thread so a
+    // failure surfaces here, then written best-effort by the reader thread —
+    // a full disk must not take down the PTY observation pipeline.
+    let raw_tee: Option<Arc<Mutex<std::fs::File>>> = match record_raw {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(f) => Some(Arc::new(Mutex::new(f))),
+            Err(e) => return Err(anyhow!("record_raw create {}: {e}", path.display())),
+        },
+        None => None,
+    };
+    let (parser_r, stop_r, last_change_r, got_output_r, tee_r) = (
         parser.clone(),
         stop.clone(),
         last_change.clone(),
         got_output.clone(),
+        raw_tee.clone(),
     );
     let reader_handle = thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -249,6 +334,11 @@ pub fn spawn_and_snapshot(spec: &RunSpec) -> Result<Screen> {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if let Some(tee) = tee_r.as_ref() {
+                        if let Ok(mut f) = tee.lock() {
+                            let _ = f.write_all(&buf[..n]);
+                        }
+                    }
                     if let Ok(mut p) = parser_r.lock() {
                         p.process(&buf[..n]);
                         // Track screen stability: compute the current text
@@ -297,24 +387,70 @@ pub fn spawn_and_snapshot(spec: &RunSpec) -> Result<Screen> {
 
     // Snapshot the screen state now, before teardown.
     let screen = {
-        let p = parser.lock().map_err(|e| anyhow!("parser lock: {e}"))?;
+        let mut p = parser.lock().map_err(|e| anyhow!("parser lock: {e}"))?;
         let scr = p.screen();
         let (r, c) = scr.size();
-        let lines: Vec<String> = (0..r)
-            .map(|row| {
-                let mut line = String::new();
-                for col in 0..c {
-                    if let Some(cell) = scr.cell(row, col) {
-                        line.push_str(&cell.contents());
-                    }
+        let mut lines: Vec<String> = Vec::with_capacity(usize::from(r));
+        let mut attrs: Vec<Vec<CellAttrs>> = Vec::with_capacity(usize::from(r));
+        for row in 0..r {
+            let mut line = String::new();
+            let mut row_attrs = Vec::with_capacity(usize::from(c));
+            for col in 0..c {
+                if let Some(cell) = scr.cell(row, col) {
+                    line.push_str(&cell.contents());
+                    row_attrs.push(CellAttrs {
+                        fg: cell.fgcolor(),
+                        bg: cell.bgcolor(),
+                        bold: cell.bold(),
+                        underline: cell.underline(),
+                    });
+                } else {
+                    row_attrs.push(CellAttrs {
+                        fg: Color::Default,
+                        bg: Color::Default,
+                        bold: false,
+                        underline: false,
+                    });
                 }
-                line.trim_end().to_string()
-            })
-            .collect();
+            }
+            lines.push(line.trim_end().to_string());
+            attrs.push(row_attrs);
+        }
+        // Scrollback: vt100 0.15 exposes history only through the grid's
+        // scrollback *offset* (a viewport over history+live rows). Reading
+        // "the oldest history line" via a large `set_scrollback(n)` is not
+        // viable: `visible_rows` subtracts the offset from the live
+        // `rows.len()` and overflows (panics) once offset > rows.len().
+        // Instead: clamp-query the total history depth, then temporarily
+        // grow the parser by that many rows — `set_size` pulls history rows
+        // back into the live grid — read the whole window in one `rows()`
+        // pass, and restore size and offset afterwards.
+        let history = {
+            p.set_scrollback(usize::MAX);
+            let len = p.screen().scrollback();
+            if len == 0 {
+                Vec::new()
+            } else {
+                let virtual_rows = r.saturating_add(u16::try_from(len).unwrap_or(u16::MAX));
+                p.set_size(virtual_rows, c);
+                p.set_scrollback(len);
+                let hist: Vec<String> = p
+                    .screen()
+                    .rows(0, c)
+                    .take(len)
+                    .map(|l| l.trim_end().to_string())
+                    .collect();
+                p.set_scrollback(0);
+                p.set_size(r, c);
+                hist
+            }
+        };
         Screen {
             cols: c,
             rows: r,
             lines,
+            attrs,
+            history,
         }
     };
 
@@ -448,6 +584,7 @@ mod tests {
             stable_ms: 80,
             cwd: None,
             envs: &[],
+            record_raw: None,
         };
         let screen = spawn_and_snapshot(&spec).expect("spawn + snapshot should succeed");
         let text = screen.lines.join("\n");
@@ -476,6 +613,7 @@ mod tests {
             stable_ms: 60,
             cwd: None,
             envs: &[],
+            record_raw: None,
         };
         let _ = spawn_and_snapshot(&spec).expect("spawn + snapshot should succeed");
         let elapsed = start.elapsed();
@@ -484,5 +622,31 @@ mod tests {
             "stability poll should return early (got {:?})",
             elapsed
         );
+    }
+
+    /// Pure-logic test (runs on all platforms, no PTY): `bg` normalises
+    /// `Color::Default` (vt100's representation of SGR reset) to `None`,
+    /// matching the in-process harness (`harness.rs::bg` maps Reset/None
+    /// to None so highlight bars are distinguishable from base fill).
+    #[test]
+    fn bg_normalises_default_to_none() {
+        let mk = |bg: Color| CellAttrs {
+            fg: Color::Default,
+            bg,
+            bold: false,
+            underline: false,
+        };
+        let screen = Screen {
+            cols: 2,
+            rows: 1,
+            lines: vec!["ab".to_string()],
+            attrs: vec![vec![mk(Color::Default), mk(Color::Idx(1))]],
+            history: vec![],
+        };
+        assert_eq!(screen.bg(0, 0), None, "Default (reset) bg must be None");
+        assert_eq!(screen.bg(1, 0), Some(Color::Idx(1)));
+        assert_eq!(screen.bg(2, 0), None, "out of range must be None");
+        assert!(screen.row_has_bg_color(0, Color::Idx(1)));
+        assert!(!screen.row_has_bg_color(0, Color::Default));
     }
 }

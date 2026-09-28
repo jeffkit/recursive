@@ -69,6 +69,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     let mut wait_ms: u64 = 1500;
     let mut stable_ms: u64 = 120;
     let mut cwd: Option<String> = None;
+    let mut record_raw: Option<String> = None;
     let mut envs: Vec<(String, String)> = Vec::new();
     let mut snap = SnapFormat::Text;
 
@@ -105,6 +106,14 @@ fn run_cmd(args: &[String]) -> Result<()> {
             "--stable-ms" => {
                 i += 1;
                 stable_ms = parse_u64(args.get(i), "--stable-ms")?;
+            }
+            "--record-raw" => {
+                i += 1;
+                record_raw = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("--record-raw needs a value"))?,
+                );
             }
             "--cwd" => {
                 i += 1;
@@ -164,6 +173,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         stable_ms,
         cwd: cwd.as_deref(),
         envs: &envs,
+        record_raw: record_raw.as_deref().map(std::path::Path::new),
     };
     let screen = tui_pty_harness::spawn_and_snapshot(&spec)?;
     print_snapshot(&screen, snap)?;

@@ -77,6 +77,7 @@ fn tour_once(keys: &str, wait_ms: u64) -> String {
         stable_ms: 150,
         cwd: None,
         envs: &[],
+        record_raw: None,
     };
     let screen = spawn_and_snapshot(&spec).expect("PTY tour should succeed");
     let mut lines = screen.lines.clone();
