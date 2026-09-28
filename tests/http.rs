@@ -30,8 +30,7 @@ mod http_tests {
     use tower::ServiceExt;
 
     use crate::common::{
-        memory_storage, mock_config, sample_state, sample_state_with_provider, MemoryStorage,
-        SET_INSECURE_OK,
+        mock_config, sample_state, sample_state_with_provider, MemoryStorage, SET_INSECURE_OK,
     };
 
     #[tokio::test]
@@ -1189,16 +1188,17 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: storage.clone(),

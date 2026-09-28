@@ -64,7 +64,8 @@ pub(super) async fn get_or_load_session(
     // Phase 1: short read lock. All mutable session state lives in Arc
     // fields, so a struct-level clone shares it with the table value.
     {
-        let sessions = state.sessions.read().await;
+        let host_sessions = state.host.sessions();
+        let sessions = host_sessions.read().await;
         if let Some(existing) = sessions.get(id) {
             return Ok(Arc::new(existing.clone()));
         }
@@ -85,7 +86,8 @@ pub(super) async fn get_or_load_session(
     let plan_approval_gate = runtime.plan_approval_gate();
 
     // Phase 4: short write lock — first insert wins a concurrent race.
-    let mut sessions = state.sessions.write().await;
+    let host_sessions = state.host.sessions();
+    let mut sessions = host_sessions.write().await;
     if let Some(existing) = sessions.get(id) {
         return Ok(Arc::new(existing.clone()));
     }
@@ -348,16 +350,17 @@ mod tests {
             tool_registry: crate::tools::ToolRegistry::default(),
             config: test_config(),
             provider: Arc::new(MockProvider::new(completions)),
-            sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                std::time::Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
             event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             metrics,
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                Arc::new(AtomicU64::new(0)),
-            )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: Arc::new(LocalStorageBackend::new(dir)),
@@ -442,7 +445,7 @@ mod tests {
         };
         assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
         // No ghost session was materialized.
-        assert_eq!(state.sessions.read().await.len(), 0);
+        assert_eq!(state.host.sessions().read().await.len(), 0);
         assert_eq!(
             state
                 .metrics
@@ -462,7 +465,7 @@ mod tests {
             .build()
             .unwrap();
         let gate = runtime.plan_approval_gate();
-        state.sessions.write().await.insert(
+        state.host.sessions().write().await.insert(
             "live-session".to_string(),
             SessionState {
                 id: "live-session".to_string(),

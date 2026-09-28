@@ -11,7 +11,6 @@ mod common;
 
 #[cfg(feature = "http")]
 mod v050_integration {
-    use crate::common::memory_storage;
 
     use axum::body::Body;
     use http_body_util::BodyExt;

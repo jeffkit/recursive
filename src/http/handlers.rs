@@ -2411,18 +2411,19 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider: Arc::new(crate::llm::MockProvider::new(vec![])),
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(0),
+                crate::http::AdmissionGate::new(1, Duration::ZERO, Arc::new(AtomicU64::new(0))),
+            )),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                1,
-                Duration::ZERO,
-                Arc::new(AtomicU64::new(0)),
-            )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
         };
 
         let builder = build_session_runtime(
