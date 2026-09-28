@@ -19,6 +19,7 @@ use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::message::Role;
 use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
+use crate::tools::ToolRegistry;
 
 use super::{
     build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, CreateSessionRequest,
@@ -56,6 +57,37 @@ fn admission_error(err: AcquireError, gate: &AdmissionGate) -> ApiError {
             "too many concurrent runs, try again later",
         ),
     }
+}
+
+/// Goal-393: the one place where HTTP session runtimes get built. Every
+/// build point (`POST /run`, `POST /sessions`, session fork, `/agui`) goes
+/// through here so the channels cannot drift apart — the compactor /
+/// microcompactor / transcript-cap assembly comes from the same
+/// frontend-neutral helper the CLI uses (`apply_context_management`).
+///
+/// Callers add what is genuinely request-specific on top of the returned
+/// builder (`seed_transcript` for `/agui` resume, then `build()`).
+fn build_session_runtime(
+    state: &AppState,
+    tool_registry: ToolRegistry,
+    system_prompt: String,
+    prompt_segments: crate::system_prompt::PromptSegments,
+    max_steps: usize,
+) -> AgentRuntimeBuilder {
+    crate::runtime::apply_context_management(
+        AgentRuntimeBuilder::new()
+            .llm(state.provider.clone())
+            .tools(tool_registry)
+            .system_prompt(system_prompt)
+            .prompt_segments(prompt_segments)
+            .max_steps(max_steps)
+            // Goal 399: safe wall-clock budget for HTTP sessions
+            // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
+            // into state.config at server startup). Exceeding it finishes
+            // with WallClockExceeded.
+            .wall_timeout_secs(state.config.wall_timeout_secs),
+        &state.config,
+    )
 }
 
 /// Update metrics after a successful agent run.
@@ -177,18 +209,15 @@ pub(super) async fn run_agent(
         });
     }
 
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (env-overridable
-        // via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into state.config at
-        // server startup). Exceeding it finishes with WallClockExceeded.
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
+    let mut runtime = build_session_runtime(
+        &state,
+        tool_registry,
+        system_prompt,
+        prompt_segments,
+        max_steps,
+    )
+    .build()
+    .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
     let outcome = runtime.run(&body.goal).await.map_err(|e| {
         record_run_failed(&state.metrics);
@@ -302,19 +331,21 @@ pub(super) async fn create_session(
         });
     }
 
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
+    let mut runtime = build_session_runtime(
+        &state,
+        tool_registry,
+        system_prompt,
+        prompt_segments,
+        max_steps,
+    )
+    .build()
+    .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
-    // Register the session ID so all turns emit tracing spans with session_id
-    // and transcript is auto-saved to the storage backend after each turn.
+    // Register the session ID so all turns emit tracing spans with
+    // session_id. (As of Goal 393 the HTTP layer installs no storage
+    // writer/sink — transcripts live in memory and die with the process;
+    // persistence is Goal 396's write-through path. Update this comment
+    // when that lands.)
     runtime.set_session_id(&id);
 
     // Extract the gate before moving runtime into the Mutex so HTTP handlers
@@ -614,16 +645,15 @@ pub(super) async fn fork_session(
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
 
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(state.tool_registry.clone())
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(state.config.max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .build()
-        .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
+    let mut runtime = build_session_runtime(
+        &state,
+        state.tool_registry.clone(),
+        system_prompt,
+        prompt_segments,
+        state.config.max_steps,
+    )
+    .build()
+    .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
     // Count non-system messages BEFORE set_transcript (which moves the
     // snapshot). The new session's `non_system_message_count` atomic and
@@ -1708,14 +1738,13 @@ pub(super) async fn agui_run(
         }
     }
 
-    let mut runtime_builder = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(state.config.max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
-        .wall_timeout_secs(state.config.wall_timeout_secs);
+    let mut runtime_builder = build_session_runtime(
+        &state,
+        tool_registry,
+        system_prompt,
+        prompt_segments,
+        state.config.max_steps,
+    );
 
     // Seed the transcript if we're resuming.
     if let Some(seed) = seed_transcript {
@@ -2324,6 +2353,64 @@ mod tests {
     use super::*;
     use crate::event::AgentEvent;
     use crate::http::SseEvent;
+
+    /// Goal-393: `build_session_runtime` must install the same context
+    /// management the CLI gets — compactor (auto threshold from the model),
+    /// microcompactor (opt-in), transcript cap (env). Asserted at the
+    /// builder level: `AgentRuntime` deliberately has no public accessors.
+    #[test]
+    fn build_session_runtime_installs_compactor_and_transcript_cap() {
+        // The env matrix itself lives in
+        // `src/runtime/context_management.rs` (single merged test — env is
+        // process-global). Here: one representative configuration.
+        let saved_threshold = std::env::var("RECURSIVE_COMPACT_THRESHOLD").ok();
+        let saved_cap = std::env::var("RECURSIVE_MAX_TRANSCRIPT_CHARS").ok();
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", "7777");
+        std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", "99999");
+
+        let config = crate::config::Config::from_env().expect("config");
+        let state = crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            session_ttl_secs: 0,
+            admission: Arc::new(crate::http::AdmissionGate::new(
+                1,
+                Duration::ZERO,
+                Arc::new(AtomicU64::new(0)),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+        };
+
+        let builder = build_session_runtime(
+            &state,
+            ToolRegistry::default(),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+        );
+        let compactor = builder.compactor_for_test().expect("compactor installed");
+        assert_eq!(compactor.threshold_chars, 7777);
+        assert_eq!(builder.max_transcript_chars_for_test(), Some(99999));
+
+        if let Some(v) = saved_threshold {
+            std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", v);
+        } else {
+            std::env::remove_var("RECURSIVE_COMPACT_THRESHOLD");
+        }
+        if let Some(v) = saved_cap {
+            std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
+        }
+    }
 
     #[test]
     fn agui_events_for_assistant_text_emits_start_content_end() {

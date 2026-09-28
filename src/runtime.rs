@@ -44,6 +44,11 @@ pub use builder::AgentRuntimeBuilder;
 mod checkpoint;
 pub(crate) use checkpoint::CheckpointState;
 
+// Goal-393: frontend-neutral context-management assembly (compactor /
+// microcompactor / transcript cap), shared by the CLI and HTTP builders.
+mod context_management;
+pub use context_management::apply_context_management;
+
 // ──────────────────────────────────────────────────────────────────────────
 // Goal-168: GoalState / GoalStatus / GoalEvaluator
 // ──────────────────────────────────────────────────────────────────────────

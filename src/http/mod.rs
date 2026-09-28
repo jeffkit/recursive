@@ -1084,8 +1084,10 @@ pub fn build_openapi_spec() -> serde_json::Value {
 ///
 /// Every `check_interval` seconds, the reaper scans all sessions and removes
 /// those whose `last_active` is older than `session_ttl_secs`. The reaper
-/// calls `runtime.close()` on each evicted session so the transcript is
-/// saved to the storage backend before the session is dropped.
+/// calls `runtime.close()` on each evicted session to run the SessionEnd
+/// lifecycle hook before the session is dropped. (As of Goal 393 the HTTP
+/// layer has no storage backend wired — transcripts are in-memory only and
+/// die with the process; Goal 396 owns the persistence write path.)
 pub fn spawn_session_reaper(
     state: Arc<AppState>,
     check_interval: std::time::Duration,
