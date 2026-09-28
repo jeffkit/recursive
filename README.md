@@ -319,6 +319,9 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_HTTP_AUTH_INSECURE_OK` | _(none)_ | Set to `1` to bypass auth (local dev ONLY) |
 | `RECURSIVE_HTTP_MAX_STEPS` | `100` | Safe default step budget for HTTP-created sessions (request `max_steps` still wins; `0` = unlimited) |
 | `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` | `1800` | Safe default wall-clock budget per turn for HTTP-created sessions; expiry finishes with `wall_clock_exceeded` (`0` = unlimited) |
+| `RECURSIVE_COMPACT_THRESHOLD` | auto (from model context window) | Cross-turn compaction char threshold (`0`/`off`/`false` = disable). Goal 393: effective for HTTP sessions too, same semantics as the CLI |
+| `RECURSIVE_MICROCOMPACT_TRIGGER` / `RECURSIVE_MICROCOMPACT_KEEP` | _(disabled)_ / `4` | Opt-in proactive tool-result pruning after N tool messages, keeping the most recent K (`0` = off). Goal 393: effective for HTTP sessions too |
+| `RECURSIVE_MAX_TRANSCRIPT_CHARS` | _(unlimited)_ | Hard transcript char cap per session (Goal 393: honored by HTTP session runtimes; the CLI also takes `--max-transcript-chars`) |
 
 #### Cloud storage — Redis (session hot-state)
 

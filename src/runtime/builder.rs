@@ -192,6 +192,28 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    // Goal-393: test-only read access so `context_management` tests can
+    // assert what a frontend assembly installed without building a runtime
+    // (`AgentRuntime` has no public accessors on purpose — keep it that way
+    // instead of growing `runtime.rs` for tests).
+    /// Inspect the compactor installed by a builder chain (tests only).
+    #[cfg(test)]
+    pub(crate) fn compactor_for_test(&self) -> Option<&Compactor> {
+        self.compactor.as_ref()
+    }
+
+    /// Inspect the microcompactor installed by a builder chain (tests only).
+    #[cfg(test)]
+    pub(crate) fn microcompactor_for_test(&self) -> Option<&crate::compact::Microcompactor> {
+        self.microcompactor.as_ref()
+    }
+
+    /// Inspect the transcript cap installed by a builder chain (tests only).
+    #[cfg(test)]
+    pub(crate) fn max_transcript_chars_for_test(&self) -> Option<usize> {
+        self.kernel_builder.max_transcript_chars_for_test()
+    }
+
     /// Enable or disable streaming of partial tokens (optional, default false).
     pub fn streaming(mut self, enabled: bool) -> Self {
         self.streaming = enabled;

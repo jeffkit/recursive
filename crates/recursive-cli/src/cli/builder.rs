@@ -468,52 +468,24 @@ pub(crate) async fn build_runtime(
         .stuck_window(config.stuck_window)
         .stuck_error_rate(config.stuck_error_rate)
         .goal_eval_transcript_tail(config.goal_eval_transcript_tail);
-    if let Some(n) = max_transcript_chars {
-        builder = builder.max_transcript_chars(n);
-    }
     if let Some(token) = shutdown_token {
         builder = builder.shutdown_token(token);
     }
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
     }
-    // Determine the compaction threshold (chars):
-    //   RECURSIVE_COMPACT_THRESHOLD=<n>  → explicit override (0 = disabled)
-    //   RECURSIVE_COMPACT_THRESHOLD unset → auto-compute from model context window
-    //   RECURSIVE_COMPACT_THRESHOLD=0    → explicitly disabled
-    let compact_threshold: Option<usize> =
-        match std::env::var("RECURSIVE_COMPACT_THRESHOLD").as_deref() {
-            Ok("0") | Ok("off") | Ok("false") => None, // explicitly disabled
-            Ok(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
-            Err(_) => {
-                // Auto-compute: mirrors fake-cc's getAutoCompactThreshold.
-                Some(recursive::llm::default_compact_threshold_chars(
-                    &config.model,
-                ))
-            }
-        };
-    if let Some(n) = compact_threshold {
-        // Also set the token-based threshold derived from the model's context
-        // window. This threshold takes priority over the char estimate when
-        // actual prompt_tokens are available from the API response, which is
-        // more reliable for CJK content where the 4-char/token assumption
-        // significantly underestimates actual token density.
-        let token_threshold = recursive::llm::default_compact_threshold_tokens(&config.model);
-        builder = builder
-            .compactor(recursive::Compactor::new(n).threshold_prompt_tokens(token_threshold));
-    }
-    // Determine the microcompactor settings (count-based proactive prune):
-    //   RECURSIVE_MICROCOMPACT_TRIGGER=<n> → explicit trigger count (0 = disabled)
-    //   RECURSIVE_MICROCOMPACT_TRIGGER unset → default 12
-    //   RECURSIVE_MICROCOMPACT_KEEP=<n>    → keep count (default 4)
-    let microcompactor = recursive::compact::micro::build_microcompactor_from_env(
-        std::env::var("RECURSIVE_MICROCOMPACT_TRIGGER")
-            .ok()
-            .as_deref(),
-        std::env::var("RECURSIVE_MICROCOMPACT_KEEP").ok().as_deref(),
-    );
-    if let Some(mc) = microcompactor {
-        builder = builder.microcompactor(mc);
+    // Goal-393: compactor / microcompactor / transcript cap assembly is
+    // shared with the HTTP frontends via the frontend-neutral helper, so the
+    // two channels cannot drift apart again. Env semantics
+    // (RECURSIVE_COMPACT_THRESHOLD / RECURSIVE_MICROCOMPACT_TRIGGER /
+    // RECURSIVE_MICROCOMPACT_KEEP / RECURSIVE_MAX_TRANSCRIPT_CHARS) are
+    // documented there.
+    builder = recursive::runtime::apply_context_management(builder, config);
+    // CLI-specific override: the --max-transcript-chars flag (and its clap
+    // env fallback) keeps flag-over-env precedence over the cap the helper
+    // just applied.
+    if let Some(n) = max_transcript_chars {
+        builder = builder.max_transcript_chars(n);
     }
     // Goal-334: file reinjector for post-compaction restoration of recently-read files.
     if let Some(r) = recursive::build_file_reinjector_from_env(read_state.clone()) {
