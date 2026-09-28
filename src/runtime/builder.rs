@@ -192,6 +192,47 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    // Goal-393: test-only read access so `context_management` tests can
+    // assert what a frontend assembly installed without building a runtime
+    // (`AgentRuntime` has no public accessors on purpose — keep it that way
+    // instead of growing `runtime.rs` for tests).
+    /// Inspect the compactor installed by a builder chain (tests only).
+    #[cfg(test)]
+    pub(crate) fn compactor_for_test(&self) -> Option<&Compactor> {
+        self.compactor.as_ref()
+    }
+
+    /// Inspect the microcompactor installed by a builder chain (tests only).
+    #[cfg(test)]
+    pub(crate) fn microcompactor_for_test(&self) -> Option<&crate::compact::Microcompactor> {
+        self.microcompactor.as_ref()
+    }
+
+    /// Inspect the transcript cap installed by a builder chain (tests only).
+    #[cfg(test)]
+    pub(crate) fn max_transcript_chars_for_test(&self) -> Option<usize> {
+        self.kernel_builder.max_transcript_chars_for_test()
+    }
+
+    /// Goal 396: inject a storage backend, forwarded to the kernel builder
+    /// (same forwarding pattern as `compactor`). The HTTP host layer shares
+    /// the same `Arc` and persists transcripts on session close/eviction —
+    /// the kernel itself does NOT save per-turn (that would be an O(N²)
+    /// full-transcript write on the hot path).
+    pub fn storage(mut self, storage: Arc<dyn crate::storage::StorageBackend>) -> Self {
+        self.kernel_builder = self.kernel_builder.with_storage(storage);
+        self
+    }
+
+    /// Goal 396: inject a session hot-state store, forwarded to the kernel
+    /// builder. The local default stays [`crate::storage::NoopSessionStore`]
+    /// (zero cost); cloud deployments inject Redis (wiring still pending —
+    /// recognized-but-unwired at HTTP startup).
+    pub fn session_store(mut self, store: Arc<dyn crate::storage::SessionStore>) -> Self {
+        self.kernel_builder = self.kernel_builder.with_session_store(store);
+        self
+    }
+
     /// Enable or disable streaming of partial tokens (optional, default false).
     pub fn streaming(mut self, enabled: bool) -> Self {
         self.streaming = enabled;
@@ -374,6 +415,31 @@ mod tests {
         Arc::new(MockProvider::new(vec![]))
     }
 
+    /// Goal 396: minimal fake backend that only records its own identity —
+    /// the assertion is Arc pointer equality after the build, not I/O.
+    #[derive(Default)]
+    struct FakeStorage;
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for FakeStorage {
+        async fn load_transcript(&self, _session_id: &str) -> crate::error::Result<Vec<Message>> {
+            Ok(vec![])
+        }
+        async fn save_transcript(
+            &self,
+            _session_id: &str,
+            _messages: &[Message],
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn build_with_minimum_config_succeeds() {
         let rt = AgentRuntimeBuilder::new()
@@ -447,5 +513,31 @@ mod tests {
         assert!(rt.skill_reinjector.is_some());
         // Goal-340: build() always wires the plan/todo reinjector.
         assert!(rt.plan_todo_reinjector.is_some());
+    }
+
+    /// Goal 396: `storage(...)` / `session_store(...)` must reach the kernel
+    /// — same Arc, not a copy or a default. Without this the host layer's
+    /// save path and the kernel's storage would silently diverge.
+    #[test]
+    fn storage_and_session_store_forward_to_kernel() {
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(FakeStorage);
+        let store: Arc<dyn crate::storage::SessionStore> =
+            Arc::new(crate::storage::NoopSessionStore);
+
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .storage(storage.clone())
+            .session_store(store.clone())
+            .build()
+            .expect("build() with storage must succeed");
+
+        assert!(
+            Arc::ptr_eq(&storage, &rt.kernel().storage),
+            "kernel.storage must be the exact Arc passed to the builder"
+        );
+        assert!(
+            Arc::ptr_eq(&store, &rt.kernel().session_store),
+            "kernel.session_store must be the exact Arc passed to the builder"
+        );
     }
 }

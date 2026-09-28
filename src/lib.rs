@@ -52,6 +52,7 @@ pub mod run_core;
 pub mod runtime;
 pub mod runtime_goal;
 pub mod session;
+pub mod session_host;
 pub mod skills;
 pub(crate) mod skills_injector;
 pub mod storage;

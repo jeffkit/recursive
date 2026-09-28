@@ -29,7 +29,9 @@ mod http_tests {
     use tokio::sync::{broadcast, RwLock};
     use tower::ServiceExt;
 
-    use crate::common::{mock_config, sample_state, sample_state_with_provider, SET_INSECURE_OK};
+    use crate::common::{
+        mock_config, sample_state, sample_state_with_provider, MemoryStorage, SET_INSECURE_OK,
+    };
 
     #[tokio::test]
     async fn health_returns_ok() {
@@ -101,18 +103,22 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         });
 
         let response = app
@@ -155,18 +161,22 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -438,18 +448,22 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -512,18 +526,22 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -593,18 +611,22 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
 
@@ -802,19 +824,22 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::clone(&metrics),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            // 1 slot, 150ms admission window: saturated ⇒ ~150ms then 503.
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                1,
-                std::time::Duration::from_millis(150),
-                Arc::clone(&metrics.runs_waiting),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    1,
+                    std::time::Duration::from_millis(150),
+                    Arc::clone(&metrics.runs_waiting),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
 
         // Create a session.
@@ -844,8 +869,8 @@ mod http_tests {
         let session_id = created["id"].as_str().unwrap().to_string();
 
         // Saturate the single run slot directly through the gate.
-        let hold = state.admission.acquire_run().await.unwrap();
-        assert!(state.admission.try_acquire_run().is_err());
+        let hold = state.host.admission().acquire_run().await.unwrap();
+        assert!(state.host.admission().try_acquire_run().is_err());
 
         // The message request now queues, times out, and gets a 503.
         let app = build_router(state.clone());
@@ -1123,6 +1148,279 @@ mod http_tests {
             !state.event_channels.read().await.contains_key(&session_id),
             "event channel entry must be removed after session deletion"
         );
+    }
+
+    /// Goal 396: DELETE must persist the session transcript through the
+    /// storage backend, and the persisted transcript must round-trip via
+    /// `load_transcript` with tool-call ↔ tool-result pairing intact
+    /// (invariant #8).
+    #[tokio::test]
+    async fn delete_session_persists_transcript_with_tool_pairing() {
+        use recursive::llm::ToolCall;
+        use recursive::message::Role;
+        use recursive::storage::StorageBackend;
+
+        let storage = MemoryStorage::new();
+        let provider = Arc::new(MockProvider::new(vec![
+            // Step 1: the model calls a tool.
+            Completion {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "unknown".into(),
+                    arguments: serde_json::json!({ "path": "x.txt" }),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            // Step 2: after the tool result, the model answers.
+            Completion {
+                content: "done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let state = AppState {
+            tools: vec![],
+            config: mock_config(),
+            tool_registry: ToolRegistry::local(),
+            provider,
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: storage.clone(),
+        };
+
+        // Create a session.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = create_resp["id"].as_str().unwrap().to_string();
+
+        // Send one turn that exercises a tool call + tool result.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/messages", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "content": "read x.txt"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Delete the session — the persistence trigger.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+
+        // Exactly one save, for THIS session.
+        let saves = storage.saves();
+        assert_eq!(saves.len(), 1, "DELETE must trigger exactly one save");
+        assert_eq!(saves[0].session_id, session_id);
+        assert_eq!(
+            saves[0].probe_lock_was_free, None,
+            "no probe attached in this test"
+        );
+
+        // The persisted transcript round-trips via load_transcript.
+        let loaded = storage.load_transcript(&session_id).await.unwrap();
+        assert!(!loaded.is_empty(), "persisted transcript must be non-empty");
+        assert_eq!(loaded, saves[0].messages, "round-trip must be lossless");
+
+        // Invariant #8: every Tool message pairs with the assistant
+        // tool_calls immediately before it.
+        let mut open_tool_call_ids: Vec<String> = Vec::new();
+        let mut saw_tool_pair = false;
+        for msg in &loaded {
+            match msg.role {
+                Role::Assistant => {
+                    open_tool_call_ids = msg.tool_calls.iter().map(|c| c.id.clone()).collect();
+                }
+                Role::Tool => {
+                    let id = msg.tool_call_id.as_deref().unwrap_or_default();
+                    assert!(
+                        open_tool_call_ids.iter().any(|c| c == id),
+                        "tool message with call id {id:?} has no matching assistant tool_call"
+                    );
+                    saw_tool_pair = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_tool_pair,
+            "the persisted transcript must contain a tool-call/tool-result pair"
+        );
+    }
+
+    /// Goal 396: two sessions deleted back-to-back must persist their OWN
+    /// transcripts — no cross-session bleed.
+    #[tokio::test]
+    async fn delete_persists_each_session_transcript_separately() {
+        // One scripted completion per session turn — the provider is shared
+        // across both sessions, so a single entry would starve the second.
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "reply one".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "reply two".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let storage = MemoryStorage::new();
+        let state = sample_state_with_provider(provider);
+        // Swap in the recording backend (fixture uses a plain one).
+        let state = AppState {
+            storage: storage.clone(),
+            ..state
+        };
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/sessions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&serde_json::json!({})).unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 201);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let session_id = create_resp["id"].as_str().unwrap().to_string();
+
+            // One turn per session with distinct content.
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/sessions/{}/messages", session_id))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&serde_json::json!({
+                                "content": session_id
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            ids.push(session_id);
+        }
+
+        // Delete both.
+        for id in &ids {
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/sessions/{}", id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 204);
+        }
+
+        let saves = storage.saves();
+        assert_eq!(saves.len(), 2, "one save per deleted session");
+        let mut saved_ids: Vec<&str> = saves.iter().map(|s| s.session_id.as_str()).collect();
+        saved_ids.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(saved_ids, expected, "saves must be keyed by session id");
+
+        // Each saved transcript contains its own session's prompt, not the
+        // other session's.
+        for (i, id) in ids.iter().enumerate() {
+            let record = saves
+                .iter()
+                .find(|s| s.session_id == *id)
+                .expect("save for this session");
+            let user_texts: Vec<&str> = record
+                .messages
+                .iter()
+                .filter(|m| m.role == recursive::message::Role::User)
+                .map(|m| m.content.as_str())
+                .collect();
+            assert!(
+                user_texts.contains(&id.as_str()),
+                "session {id} save must contain its own prompt, got {user_texts:?}"
+            );
+            let other: Vec<&String> = ids.iter().filter(|o| *o != id).collect();
+            for o in other {
+                assert!(
+                    !record.messages.iter().any(|m| m.content == *o),
+                    "session {id} save must not contain the other session's prompt {o}"
+                );
+            }
+            let _ = i;
+        }
     }
 
     #[tokio::test]
@@ -1816,7 +2114,8 @@ mod http_tests {
         //    To exercise the 409 we acquire the runtime Mutex first;
         //    that requires touching AppState directly.
         let runtime_arc = {
-            let sessions = state.sessions.read().await;
+            let sessions = state.host.sessions();
+            let sessions = sessions.read().await;
             sessions.get(&session_id).unwrap().runtime.clone()
         };
         let _guard = runtime_arc.lock().await;
@@ -1884,7 +2183,8 @@ mod http_tests {
 
         // Hold the runtime Mutex so clear_goal hits its 409 path.
         let runtime_arc = {
-            let sessions = state.sessions.read().await;
+            let sessions = state.host.sessions();
+            let sessions = sessions.read().await;
             sessions.get(&session_id).unwrap().runtime.clone()
         };
         let _guard = runtime_arc.lock().await;
@@ -3209,7 +3509,8 @@ mod http_tests {
             completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state
-            .sessions
+            .host
+            .sessions()
             .write()
             .await
             .insert(session_id.clone(), session);
@@ -3392,7 +3693,8 @@ mod http_tests {
         // Snapshot the gate so we can verify the edit took effect.
         let gate = {
             state
-                .sessions
+                .host
+                .sessions()
                 .read()
                 .await
                 .get(&session_id)
@@ -3898,7 +4200,6 @@ mod http_tests {
             config: mock_config(),
             tool_registry: ToolRegistry::local(),
             provider,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(vec![
@@ -3917,14 +4218,19 @@ mod http_tests {
                     argument_hint: String::new(),
                 },
             ]),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
+            )),
         };
         let app = build_router(state);
         let resp = app

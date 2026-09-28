@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::transport::{retryable_prefix, ToolTransport, WalkOptions};
-use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 
@@ -98,6 +98,15 @@ impl SearchFiles {
 
 #[async_trait]
 impl Tool for SearchFiles {
+    /// Goal 394: session-level fork — see [`Tool::fork_box`] on `GlobTool`.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Grep".into(),
@@ -656,9 +665,12 @@ Todo",
             .execute(json!({"pattern": "needle"}))
             .await
             .unwrap();
-        assert!(out.contains("src/a.rs:1: needle here"));
+        // Path separators are platform-dependent (`\` on Windows) — normalise
+        // before asserting on the POSIX-looking fixture paths.
+        let norm = out.replace('\\', "/");
+        assert!(norm.contains("src/a.rs:1: needle here"));
         assert!(
-            !out.contains("target") && !out.contains(".git"),
+            !norm.contains("target") && !norm.contains(".git"),
             ".git / target / node_modules must be ignored on both paths (got: {out})"
         );
     }

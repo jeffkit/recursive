@@ -19,6 +19,7 @@ use crate::event::{AgentEvent, ChannelSink, NullSink};
 use crate::message::Role;
 use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
+use crate::tools::ToolRegistry;
 
 use super::{
     build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, CreateSessionRequest,
@@ -56,6 +57,41 @@ fn admission_error(err: AcquireError, gate: &AdmissionGate) -> ApiError {
             "too many concurrent runs, try again later",
         ),
     }
+}
+
+/// Goal-393: the one place where HTTP session runtimes get built. Every
+/// build point (`POST /run`, `POST /sessions`, session fork, `/agui`) goes
+/// through here so the channels cannot drift apart — the compactor /
+/// microcompactor / transcript-cap assembly comes from the same
+/// frontend-neutral helper the CLI uses (`apply_context_management`).
+///
+/// Callers add what is genuinely request-specific on top of the returned
+/// builder (`seed_transcript` for `/agui` resume, then `build()`).
+fn build_session_runtime(
+    state: &AppState,
+    tool_registry: ToolRegistry,
+    system_prompt: String,
+    prompt_segments: crate::system_prompt::PromptSegments,
+    max_steps: usize,
+) -> AgentRuntimeBuilder {
+    crate::runtime::apply_context_management(
+        AgentRuntimeBuilder::new()
+            .llm(state.provider.clone())
+            .tools(tool_registry)
+            .system_prompt(system_prompt)
+            .prompt_segments(prompt_segments)
+            .max_steps(max_steps)
+            // Goal 399: safe wall-clock budget for HTTP sessions
+            // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
+            // into state.config at server startup). Exceeding it finishes
+            // with WallClockExceeded.
+            .wall_timeout_secs(state.config.wall_timeout_secs)
+            // Goal 396: the host layer persists this session's transcript
+            // through the same storage backend on teardown (DELETE / idle
+            // eviction / graceful shutdown) — not per turn.
+            .storage(state.storage.clone()),
+        &state.config,
+    )
 }
 
 /// Update metrics after a successful agent run.
@@ -142,10 +178,11 @@ pub(super) async fn run_agent(
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
     let _permit = state
-        .admission
+        .host
+        .admission()
         .acquire_run()
         .await
-        .map_err(|e| admission_error(e, &state.admission))?;
+        .map_err(|e| admission_error(e, &state.host.admission()))?;
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
     let system_prompt = match body.system_prompt {
         Some(s) => s,
@@ -177,18 +214,15 @@ pub(super) async fn run_agent(
         });
     }
 
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (env-overridable
-        // via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into state.config at
-        // server startup). Exceeding it finishes with WallClockExceeded.
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
+    let mut runtime = build_session_runtime(
+        &state,
+        tool_registry,
+        system_prompt,
+        prompt_segments,
+        max_steps,
+    )
+    .build()
+    .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
     let outcome = runtime.run(&body.goal).await.map_err(|e| {
         record_run_failed(&state.metrics);
@@ -242,7 +276,7 @@ fn generate_session_id() -> String {
 }
 
 /// Format a SystemTime as a basic ISO-8601 string (without chrono).
-fn format_timestamp(t: SystemTime) -> String {
+pub(super) fn format_timestamp(t: SystemTime) -> String {
     let dur = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     let secs = dur.as_secs();
     // Basic formatting: seconds since epoch as a simple numeric timestamp
@@ -302,19 +336,21 @@ pub(super) async fn create_session(
         });
     }
 
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
+    let mut runtime = build_session_runtime(
+        &state,
+        tool_registry,
+        system_prompt,
+        prompt_segments,
+        max_steps,
+    )
+    .build()
+    .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
-    // Register the session ID so all turns emit tracing spans with session_id
-    // and transcript is auto-saved to the storage backend after each turn.
+    // Register the session ID so all turns emit tracing spans with
+    // session_id. The transcript is NOT saved per turn — the host layer
+    // persists it once on teardown (DELETE / idle eviction / graceful
+    // shutdown) through the storage backend that `build_session_runtime`
+    // wires into the builder (Goal 396).
     runtime.set_session_id(&id);
 
     // Extract the gate before moving runtime into the Mutex so HTTP handlers
@@ -334,7 +370,12 @@ pub(super) async fn create_session(
         completion_tokens: Arc::new(AtomicU64::new(0)),
     };
 
-    state.sessions.write().await.insert(id.clone(), session);
+    state
+        .host
+        .sessions()
+        .write()
+        .await
+        .insert(id.clone(), session);
     state
         .metrics
         .sessions_active
@@ -368,7 +409,8 @@ pub(super) async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ListSessionsQuery>,
 ) -> Json<SessionList> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let mut infos = Vec::with_capacity(sessions.len());
     for s in sessions.values() {
         // Read the pre-computed count without acquiring the runtime lock.
@@ -409,14 +451,14 @@ pub(super) async fn list_sessions(
 /// needed) so this endpoint stays responsive even while an agent turn is
 /// blocked awaiting plan approval.  Messages and todos fall back to empty
 /// vectors when the runtime is busy rather than deadlocking.
+///
+/// Goal 397: a session persisted by a previous server process is restored
+/// from the storage backend here (cold load) instead of 404-ing.
 pub(super) async fn get_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionDetailResponse>, ApiError> {
-    let sessions = state.sessions.read().await;
-    let session = sessions
-        .get(&id)
-        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let session = super::cold_load::get_or_load_session(&state, &id).await?;
 
     // Read plan status without locking the runtime Mutex so callers can poll
     // while the agent is suspended inside `exit_plan_mode`.
@@ -493,7 +535,8 @@ pub(super) async fn delete_session(
     // runtime Mutex and call `close()` without holding the global write
     // lock across an await point.
     let session_runtime = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         sessions.get(&id).map(|s| s.runtime.clone())
     };
     if let Some(runtime) = session_runtime {
@@ -502,14 +545,40 @@ pub(super) async fn delete_session(
         // runtime is dropped. Idempotent on repeated calls.
         let mut rt = runtime.lock().await;
         rt.close(None).await;
+        // Goal 396: snapshot the transcript before releasing the runtime
+        // Mutex, but persist it only after the session is out of the map —
+        // the save is I/O and must not run under either lock. 会话结束即落盘是
+        // 396 的既定语义（DELETE / 驱逐 / 优雅停机同路）。
+        let transcript = rt.transcript().to_vec();
         drop(rt);
-        state.sessions.write().await.remove(&id);
+        state.host.sessions().write().await.remove(&id);
         state
             .metrics
             .sessions_active
             .fetch_sub(1, Ordering::Relaxed);
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
+        if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "failed to persist deleted session transcript"
+            );
+        }
+        // Goal 396/397 集成语义：快照保留，但删掉的会话**不得被冷加载复活**
+        // （否则 DELETE → GET 会 200，违反 v050 生命周期契约）。落一个 tombstone，
+        // 冷加载见它即 404；驱逐/停机不写 tombstone，仍可从存储恢复。
+        if let Err(e) = state
+            .storage
+            .save_memory(&super::cold_load::deleted_marker_key(&id), "1")
+            .await
+        {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "failed to write session tombstone"
+            );
+        }
         tracing::info!(session_id = %id, "session deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -540,7 +609,8 @@ pub(super) async fn patch_session(
     Path(id): Path<String>,
     Json(body): Json<PatchSessionRequest>,
 ) -> Result<Json<SessionInfo>, ApiError> {
-    let mut sessions = state.sessions.write().await;
+    let sessions_lock = state.host.sessions();
+    let mut sessions = sessions_lock.write().await;
     let session = sessions
         .get_mut(&id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -588,7 +658,8 @@ pub(super) async fn fork_session(
 ) -> Result<(StatusCode, Json<ForkSessionResponse>), ApiError> {
     // Snapshot the source transcript while holding the write lock.
     let transcript_snapshot = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let src = sessions
             .get(&id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -614,16 +685,15 @@ pub(super) async fn fork_session(
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
 
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(state.tool_registry.clone())
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(state.config.max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .build()
-        .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
+    let mut runtime = build_session_runtime(
+        &state,
+        state.tool_registry.clone(),
+        system_prompt,
+        prompt_segments,
+        state.config.max_steps,
+    )
+    .build()
+    .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
     // Count non-system messages BEFORE set_transcript (which moves the
     // snapshot). The new session's `non_system_message_count` atomic and
@@ -649,7 +719,12 @@ pub(super) async fn fork_session(
         completion_tokens: Arc::new(AtomicU64::new(0)),
     };
 
-    state.sessions.write().await.insert(new_id.clone(), session);
+    state
+        .host
+        .sessions()
+        .write()
+        .await
+        .insert(new_id.clone(), session);
     state
         .metrics
         .sessions_active
@@ -685,7 +760,8 @@ pub(super) async fn session_plan_confirm(
     Path(session_id): Path<String>,
     Json(body): Json<PlanConfirmRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -717,7 +793,8 @@ pub(super) async fn session_plan_reject(
     Path(session_id): Path<String>,
     Json(body): Json<PlanRejectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sessions = state.sessions.read().await;
+    let sessions_lock = state.host.sessions();
+    let sessions = sessions_lock.read().await;
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -747,7 +824,8 @@ pub(super) async fn session_set_goal(
     Json(body): Json<SetGoalRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -779,7 +857,8 @@ pub(super) async fn session_clear_goal(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -842,12 +921,18 @@ async fn runtime_goal_state_clear(
 /// turn. The kernel exits with `FinishReason::Cancelled` at the next step
 /// boundary.  If no turn is in progress the request is still `200 OK`
 /// (idempotent — no harm done).
+///
+/// Intentionally does NOT cold-load (Goal 397 allows read-only paths to skip
+/// it): after a restart no turn is running, so there is nothing to cancel —
+/// a restored session would only be built to discover a `None` token. An
+/// unknown id stays 404.
 pub(super) async fn session_interrupt(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let token_arc = {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
@@ -887,25 +972,23 @@ pub(super) async fn send_session_message(
         return Err(ApiError::bad_request("missing or empty 'content' field"));
     }
     tracing::debug!(session_id = %id, content_len = body.content.len(), "session message received");
-    // Get the session's runtime, interrupt token, message counter, last_active,
-    // and token usage counters.
-    let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = {
-        let sessions = state.sessions.read().await;
-        let session = sessions
-            .get(&id)
-            .ok_or_else(|| ApiError::not_found("session not found"))?;
-        // Update last_active_ms timestamp for this session.
-        session
-            .last_active_ms
-            .store(super::now_session_ms(), Ordering::Relaxed);
-        (
-            session.runtime.clone(),
-            session.interrupt_token.clone(),
-            session.non_system_message_count.clone(),
-            session.prompt_tokens.clone(),
-            session.completion_tokens.clone(),
-        )
-    };
+    // Goal 397: get the session (cold-loading it from storage when it only
+    // exists on disk), then grab its runtime, interrupt token, message
+    // counter, last_active, and token usage counters. The returned handle
+    // shares all mutable state with the table entry — no table lock held
+    // while the turn runs.
+    let session = super::cold_load::get_or_load_session(&state, &id).await?;
+    // Update last_active_ms timestamp for this session.
+    session
+        .last_active_ms
+        .store(super::now_session_ms(), Ordering::Relaxed);
+    let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = (
+        session.runtime.clone(),
+        session.interrupt_token.clone(),
+        session.non_system_message_count.clone(),
+        session.prompt_tokens.clone(),
+        session.completion_tokens.clone(),
+    );
 
     // Ensure broadcast channel exists for this session before we lock the runtime.
     let broadcast_tx = {
@@ -922,10 +1005,11 @@ pub(super) async fn send_session_message(
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
     let _permit = state
-        .admission
+        .host
+        .admission()
         .acquire_run()
         .await
-        .map_err(|e| admission_error(e, &state.admission))?;
+        .map_err(|e| admission_error(e, &state.host.admission()))?;
     let mut runtime = runtime_arc.lock().await;
 
     // Goal-170: install a fresh cancellation token so `POST .../interrupt`
@@ -1045,7 +1129,8 @@ pub(super) async fn session_events(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Verify session exists
     {
-        let sessions = state.sessions.read().await;
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
         if !sessions.contains_key(&id) {
             return Err(ApiError::not_found("session not found"));
         }
@@ -1639,7 +1724,7 @@ pub(super) async fn agui_run(
     // awaiting indefinitely, which would hang every /agui request when the
     // pool is full). Goal 398 routes it through the same admission gate as
     // the REST endpoints; only the waiting policy differs (none).
-    let _permit = state.admission.try_acquire_run().map_err(|_| {
+    let _permit = state.host.admission().try_acquire_run().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -1708,14 +1793,13 @@ pub(super) async fn agui_run(
         }
     }
 
-    let mut runtime_builder = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(state.config.max_steps)
-        // Goal 399: safe wall-clock budget for HTTP sessions (see run_agent).
-        .wall_timeout_secs(state.config.wall_timeout_secs);
+    let mut runtime_builder = build_session_runtime(
+        &state,
+        tool_registry,
+        system_prompt,
+        prompt_segments,
+        state.config.max_steps,
+    );
 
     // Seed the transcript if we're resuming.
     if let Some(seed) = seed_transcript {
@@ -2325,6 +2409,65 @@ mod tests {
     use crate::event::AgentEvent;
     use crate::http::SseEvent;
 
+    /// Goal-393: `build_session_runtime` must install the same context
+    /// management the CLI gets — compactor (auto threshold from the model),
+    /// microcompactor (opt-in), transcript cap (env). Asserted at the
+    /// builder level: `AgentRuntime` deliberately has no public accessors.
+    #[test]
+    fn build_session_runtime_installs_compactor_and_transcript_cap() {
+        // The env matrix itself lives in
+        // `src/runtime/context_management.rs` (single merged test — env is
+        // process-global). Here: one representative configuration.
+        let saved_threshold = std::env::var("RECURSIVE_COMPACT_THRESHOLD").ok();
+        let saved_cap = std::env::var("RECURSIVE_MAX_TRANSCRIPT_CHARS").ok();
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", "7777");
+        std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", "99999");
+
+        let config = crate::config::Config::from_env().expect("config");
+        let state = crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(0),
+                crate::http::AdmissionGate::new(1, Duration::ZERO, Arc::new(AtomicU64::new(0))),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+        };
+
+        let builder = build_session_runtime(
+            &state,
+            ToolRegistry::default(),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+        );
+        let compactor = builder.compactor_for_test().expect("compactor installed");
+        assert_eq!(compactor.threshold_chars, 7777);
+        assert_eq!(builder.max_transcript_chars_for_test(), Some(99999));
+
+        if let Some(v) = saved_threshold {
+            std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", v);
+        } else {
+            std::env::remove_var("RECURSIVE_COMPACT_THRESHOLD");
+        }
+        if let Some(v) = saved_cap {
+            std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
+        }
+    }
+
     #[test]
     fn agui_events_for_assistant_text_emits_start_content_end() {
         use agui_protocol as ag;
@@ -2456,10 +2599,13 @@ mod tests {
         // 0-permit admission gate: every `try_acquire_run` call
         // returns `TryAcquireError::NoPermits` immediately.
         let metrics = Arc::new(crate::http::Metrics::default());
-        let admission = Arc::new(crate::http::AdmissionGate::from_semaphore(
-            Arc::new(Semaphore::new(0)),
-            Duration::ZERO,
-            Arc::clone(&metrics.runs_waiting),
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::from_semaphore(
+                Arc::new(Semaphore::new(0)),
+                Duration::ZERO,
+                Arc::clone(&metrics.runs_waiting),
+            ),
         ));
 
         let state = Arc::new(crate::http::AppState {
@@ -2467,14 +2613,16 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider: Arc::new(MockProvider::new(vec![])),
-            sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            host,
             event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             metrics,
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
         });
 
         let body = serde_json::json!({
@@ -2531,23 +2679,30 @@ mod tests {
         };
 
         let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
         let state = Arc::new(AppState {
             tools: vec![],
             tool_registry: ToolRegistry::default(),
             config,
             provider,
-            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            )),
+            host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -2577,7 +2732,7 @@ mod tests {
     }
 
     /// Helper: build a minimal AppState with one session for handler unit tests.
-    fn test_app_state_with_session(
+    async fn test_app_state_with_session(
         session_id: &str,
     ) -> (
         Arc<AppState>,
@@ -2609,23 +2764,30 @@ mod tests {
             completion_tokens: Arc::new(AtomicU64::new(0)),
         };
         let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
         let state = Arc::new(AppState {
             tools: vec![],
             tool_registry: ToolRegistry::default(),
             config,
             provider,
-            sessions: Arc::new(tokio::sync::RwLock::new(sessions)),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: Arc::new(crate::http::Metrics::default()),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            )),
+            host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
         });
         (state, runtime_arc)
     }
@@ -2633,7 +2795,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_status_idle_vs_plan_pending() {
         let sid = "test-plan-status";
-        let (state, _) = test_app_state_with_session(sid);
+        let (state, _) = test_app_state_with_session(sid).await;
 
         let idle = match get_session(State(state.clone()), Path(sid.to_string())).await {
             Ok(Json(v)) => v,
@@ -2644,7 +2806,8 @@ mod tests {
 
         // Set pending plan via the gate.
         {
-            let sessions = state.sessions.read().await;
+            let sessions_lock = state.host.sessions();
+            let sessions = sessions_lock.read().await;
             let session = sessions.get(sid).unwrap();
             *session.plan_approval_gate.pending_plan.write().unwrap() = Some("do the thing".into());
         }
@@ -2659,7 +2822,7 @@ mod tests {
     #[tokio::test]
     async fn get_session_busy_runtime_returns_empty_messages() {
         let sid = "test-busy-get";
-        let (state, runtime_arc) = test_app_state_with_session(sid);
+        let (state, runtime_arc) = test_app_state_with_session(sid).await;
         let _guard = runtime_arc.lock().await;
         let detail = match get_session(State(state), Path(sid.to_string())).await {
             Ok(Json(v)) => v,
@@ -2675,7 +2838,7 @@ mod tests {
     #[tokio::test]
     async fn patch_session_empty_title_clears() {
         let sid = "test-patch-title";
-        let (state, _) = test_app_state_with_session(sid);
+        let (state, _) = test_app_state_with_session(sid).await;
 
         let cleared = match patch_session(
             State(state.clone()),
@@ -2740,17 +2903,22 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider: Arc::new(crate::llm::MockProvider::new(vec![])),
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -2786,18 +2954,23 @@ mod tests {
             tool_registry: ToolRegistry::default(),
             config,
             provider,
-            sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             metrics: metrics.clone(),
             slash_commands: Arc::new(vec![]),
-            session_ttl_secs: 3600,
-            admission: Arc::new(crate::http::AdmissionGate::new(
-                8,
-                Duration::ZERO,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
         };
 
         let auth = crate::http::auth::AuthConfig::default();

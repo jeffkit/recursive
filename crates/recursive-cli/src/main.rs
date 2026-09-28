@@ -808,33 +808,62 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30);
             let metrics = std::sync::Arc::new(recursive::http::Metrics::default());
-            let admission = std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                max_concurrent,
-                Duration::from_secs(admission_timeout_secs),
-                std::sync::Arc::clone(&metrics.runs_waiting),
+            let host = std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                Duration::from_secs(session_ttl_secs),
+                recursive::http::AdmissionGate::new(
+                    max_concurrent,
+                    Duration::from_secs(admission_timeout_secs),
+                    std::sync::Arc::clone(&metrics.runs_waiting),
+                ),
             ));
+            // Goal 396: session transcript persistence. Default backend is
+            // the local filesystem rooted at the per-workspace user dir, so
+            // HTTP transcripts land as siblings of the CLI session directory
+            // (<user_workspace_dir>/.recursive/sessions/<id>.jsonl). Redis /
+            // S3 backends are recognized but deliberately not wired yet —
+            // half-wired cloud storage is worse than none.
+            for (env_var, backend) in [
+                ("RECURSIVE_REDIS_URL", "RedisSessionStore"),
+                ("RECURSIVE_S3_BUCKET", "S3StorageBackend"),
+            ] {
+                if std::env::var_os(env_var).is_some() {
+                    eprintln!(
+                        "storage: {env_var} is set — {backend} recognized but not yet wired \
+                         in http mode; using LocalStorageBackend"
+                    );
+                }
+            }
+            // Goal 397: transcripts live under
+            // `<workspace-data>/.recursive/sessions/<id>.jsonl` (the
+            // LocalStorageBackend layout). Cold load reads this same backend
+            // to restore sessions after a restart; Goal 396 wires the write
+            // path through it.
+            let storage: std::sync::Arc<dyn recursive::storage::StorageBackend> =
+                std::sync::Arc::new(recursive::storage::LocalStorageBackend::new(
+                    recursive::user_workspace_dir(&config.workspace)?,
+                ));
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
                 config: config.clone(),
                 provider,
-                sessions: std::sync::Arc::new(tokio::sync::RwLock::new(
-                    std::collections::HashMap::new(),
-                )),
+                host,
                 event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
                 metrics,
                 slash_commands: std::sync::Arc::new(slash_commands),
-                session_ttl_secs,
-                admission,
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
+                storage,
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the
             // same Arc-wrapped inner fields, so no actual data is duplicated).
             let reaper_state = std::sync::Arc::new(state.clone());
+            // Goal 396: keep a handle on the session map for the graceful
+            // shutdown transcript flush below.
+            let flush_state = std::sync::Arc::new(state.clone());
             let reaper_handle =
                 recursive::http::spawn_session_reaper(reaper_state, Duration::from_secs(60));
             tokio::spawn(async move {
@@ -867,6 +896,12 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
             eprintln!("shutdown: HTTP server stopped gracefully");
+            // Goal 396: last write-through — persist every session still
+            // alive when the server stopped, so a clean shutdown loses
+            // nothing. (A hard kill still loses everything since the last
+            // teardown save; that is the documented semantics.)
+            let persisted = recursive::http::flush_all_sessions(&flush_state).await;
+            eprintln!("shutdown: persisted {persisted} session transcript(s)");
             Ok(())
         }
         Cmd::Init {

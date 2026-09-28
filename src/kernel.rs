@@ -494,6 +494,14 @@ impl AgentKernelBuilder {
         self
     }
 
+    /// Goal-393: test-only read access for the transcript cap — the runtime
+    /// builder forwards the cap here, and `context_management` tests assert
+    /// on the forwarded value.
+    #[cfg(test)]
+    pub(crate) fn max_transcript_chars_for_test(&self) -> Option<usize> {
+        self.max_transcript_chars
+    }
+
     /// Set the compactor for summarising old messages.
     pub fn compactor(mut self, compactor: Compactor) -> Self {
         self.compactor = Some(compactor);

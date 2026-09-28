@@ -319,10 +319,16 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_HTTP_AUTH_INSECURE_OK` | _(none)_ | Set to `1` to bypass auth (local dev ONLY) |
 | `RECURSIVE_HTTP_MAX_STEPS` | `100` | Safe default step budget for HTTP-created sessions (request `max_steps` still wins; `0` = unlimited) |
 | `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` | `1800` | Safe default wall-clock budget per turn for HTTP-created sessions; expiry finishes with `wall_clock_exceeded` (`0` = unlimited) |
+| `RECURSIVE_COMPACT_THRESHOLD` | auto (from model context window) | Cross-turn compaction char threshold (`0`/`off`/`false` = disable). Goal 393: effective for HTTP sessions too, same semantics as the CLI |
+| `RECURSIVE_MICROCOMPACT_TRIGGER` / `RECURSIVE_MICROCOMPACT_KEEP` | _(disabled)_ / `4` | Opt-in proactive tool-result pruning after N tool messages, keeping the most recent K (`0` = off). Goal 393: effective for HTTP sessions too |
+| `RECURSIVE_MAX_TRANSCRIPT_CHARS` | _(unlimited)_ | Hard transcript char cap per session (Goal 393: honored by HTTP session runtimes; the CLI also takes `--max-transcript-chars`) |
 
 #### Cloud storage — Redis (session hot-state)
 
 Requires the `cloud-runtime` feature flag (`--features cloud-runtime`).
+**Not yet wired in http mode**: if `RECURSIVE_REDIS_URL` is set, `recursive http`
+logs "recognized but not yet wired in http mode" at startup and keeps using the
+local backend (Goal 396); wiring the actual Redis/S3 backends is future work.
 
 | Env | Default | Purpose |
 |-----|---------|---------|
@@ -332,7 +338,8 @@ Requires the `cloud-runtime` feature flag (`--features cloud-runtime`).
 
 #### Cloud storage — S3 (transcript + memory)
 
-Requires the `cloud-runtime` feature flag.
+Requires the `cloud-runtime` feature flag. Same caveat as Redis: **not yet
+wired in http mode** (recognized + startup log only).
 
 | Env | Default | Purpose |
 |-----|---------|---------|
@@ -358,11 +365,11 @@ Requires the `cloud-runtime` feature flag.
 
 | Concern | Local (default) | Cloud (`cloud-runtime` feature) |
 |---------|-----------------|----------------------------------|
-| Transcript persistence | Local JSONL (`~/.recursive/...`) | S3 via `S3StorageBackend` |
-| Session hot-state | In-memory (`NoopSessionStore`) | Redis via `RedisSessionStore` |
+| Transcript persistence | Local JSONL via `LocalStorageBackend`; HTTP sessions persist on delete / idle eviction / graceful shutdown (Goal 396) — at most the turns after the last save are lost | S3 via `S3StorageBackend` (not yet wired in http mode) |
+| Session hot-state | In-memory (`NoopSessionStore`) | Redis via `RedisSessionStore` (not yet wired in http mode) |
 | Tool execution | Host shell | Docker (L2) or E2B microVM (L3) |
-| Horizontal scaling | Single process | Stateless HTTP pods + shared Redis/S3 |
-| Resume across restarts | Via `--session` flag | Automatic via `restore_from_storage()` |
+| Horizontal scaling | Single process | Stateless HTTP pods + shared Redis/S3 (blocked on the storage wiring above) |
+| Resume across restarts | Via `--session` flag (CLI/TUI sessions) | Not available yet — HTTP cold-load from storage is pending (Goal 397); there is no `restore_from_storage()` today |
 
 ## Library API
 
@@ -412,6 +419,11 @@ print(result.finish_reason)
 The terminal UI is in `crates/recursive-tui/`. For an experience-level
 comparison against fake-cc (Claude Code-style baseline), see
 [docs/tui-fake-cc-gap.md](docs/tui-fake-cc-gap.md).
+
+## Docs
+
+- [LLM gateway compatibility](docs/llm-gateway-compat.md) — known traps with
+  new-api/one-api/Bedrock (#15/#16/#17).
 
 ## License
 

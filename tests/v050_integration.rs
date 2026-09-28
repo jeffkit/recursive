@@ -2,8 +2,16 @@
 //!
 //! Tests that HTTP API and Multi-Agent features work together correctly.
 
+// Goal 396: reuse the shared HTTP fixtures (in-memory storage backend) so
+// AppState keeps compiling without touching the real filesystem. Declared
+// at the file root — the same `#[path]` resolution rules as tests/http.rs.
+#[cfg(feature = "http")]
+#[path = "http_common/mod.rs"]
+mod common;
+
 #[cfg(feature = "http")]
 mod v050_integration {
+
     use axum::body::Body;
     use http_body_util::BodyExt;
     use recursive::http::{build_router, AppState, Metrics, RateLimiter, ToolInfo};
@@ -80,18 +88,22 @@ mod v050_integration {
             config: test_config(),
             tool_registry: ToolRegistry::local(),
             provider: mock_provider(),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(Metrics::default()),
             slash_commands: Arc::new(Vec::new()),
-            session_ttl_secs: 0,
-            admission: std::sync::Arc::new(recursive::http::AdmissionGate::new(
-                8,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host: std::sync::Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-v050-test-{}", std::process::id())),
+            )),
         }
     }
 

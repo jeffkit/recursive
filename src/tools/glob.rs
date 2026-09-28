@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::transport::{retryable_prefix, ToolTransport, WalkOptions};
-use super::{resolve_within_any, AccessTier, SharedSandboxRoots, Tool};
+use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
@@ -178,6 +178,17 @@ impl GlobTool {
 
 #[async_trait]
 impl Tool for GlobTool {
+    /// Goal 394: session-level fork — rewire the sandbox-roots slot to the
+    /// fork's fresh instance so post-fork `/add-dir` expansions stay
+    /// session-local.
+    fn fork_box(&self, state: &SessionToolState) -> Option<Arc<dyn Tool>> {
+        let mut forked = self.clone();
+        if let (Some(_), Some(fresh)) = (&self.session_roots, &state.session_roots) {
+            forked.session_roots = Some(fresh.clone());
+        }
+        Some(Arc::new(forked))
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "Glob".into(),
@@ -668,9 +679,13 @@ mod tests {
         create_files(&tmp, &["src/a.rs", "target/art.rs", ".git/x.rs"]);
         let tool = GlobTool::new(tmp.path());
         let out = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
-        assert!(out.contains("src/a.rs"));
+        // Path separators are platform-dependent (`\` on Windows); normalise
+        // before asserting on the POSIX-looking fixture paths. (CI parity:
+        // windows-latest went red on exactly this assertion.)
+        let norm = out.replace('\\', "/");
+        assert!(norm.contains("src/a.rs"));
         assert!(
-            !out.contains("target") && !out.contains(".git"),
+            !norm.contains("target") && !norm.contains(".git"),
             ".git / target / node_modules must be ignored (got: {out})"
         );
     }
