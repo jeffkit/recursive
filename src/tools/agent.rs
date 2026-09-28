@@ -1056,11 +1056,13 @@ mod tests {
 
     fn full_tool_registry(workspace: &std::path::Path) -> ToolRegistry {
         let transport: Arc<dyn ToolTransport> = Arc::new(LocalTransport);
-        ToolRegistry::new(transport)
+        ToolRegistry::new(transport.clone())
             .register(Arc::new(ReadFile::new(workspace)))
-            .register(Arc::new(SearchFiles::new(workspace)))
+            .register(Arc::new(
+                SearchFiles::new(workspace).with_transport(transport.clone()),
+            ))
             .register(Arc::new(WriteFile::new(workspace)))
-            .register(Arc::new(GlobTool::new(workspace)))
+            .register(Arc::new(GlobTool::new(workspace).with_transport(transport)))
             .register(Arc::new(WebFetch::new()))
     }
 

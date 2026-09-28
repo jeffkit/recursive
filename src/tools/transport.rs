@@ -45,6 +45,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use walkdir::WalkDir;
 
 /// Result of reading a file.
 #[derive(Debug, Clone)]
@@ -134,6 +135,50 @@ pub struct ExecResult {
     pub failure: Option<TransportFailure>,
 }
 
+/// One entry produced by [`ToolTransport::walk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkEntry {
+    /// Path of the entry **relative to the walk root** (platform separators).
+    pub path: PathBuf,
+    /// `true` for regular files. Symlinks are never followed (both local and
+    /// remote walks prune them by contract), so a symlink counts as
+    /// `is_file: false`.
+    pub is_file: bool,
+    /// File size in bytes (`0` when unknown — e.g. the list_dir-based
+    /// default implementation cannot stat).
+    pub size: u64,
+}
+
+/// Options for [`ToolTransport::walk`].
+#[derive(Debug, Clone)]
+pub struct WalkOptions {
+    /// Maximum descent depth below `root` (`1` = direct children only).
+    /// [`usize::MAX`] (the default) = unlimited.
+    pub max_depth: usize,
+    /// Follow symbolic links. **Explicit by contract** — tool defaults differ
+    /// between platforms, so both the local and remote implementations must
+    /// be told rather than rely on their defaults. Default `false`
+    /// (symlink-loop safe, matches the previous in-tool `walkdir` behaviour).
+    pub follow_symlinks: bool,
+    /// Directory names pruned during the walk (at any depth). Default:
+    /// `.git`, `target`, `node_modules` — the same set Glob/Grep are
+    /// specified to ignore (Goal 402).
+    pub ignore_dirs: Vec<String>,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: usize::MAX,
+            follow_symlinks: false,
+            ignore_dirs: [".git", "target", "node_modules"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Abstract transport for filesystem and shell operations.
 ///
 /// Tools that need I/O (`ReadFile`, `WriteFile`, `ListDir`, `RunShell`,
@@ -161,6 +206,54 @@ pub trait ToolTransport: Send + Sync + std::fmt::Debug {
 
     /// List entries in a directory at `path`.
     async fn list_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>>;
+
+    /// Recursively walk `root` and return every entry below it (`root` itself
+    /// excluded; both files and directories, distinguishable via
+    /// `WalkEntry::is_file`), relative to `root`, honouring `opts` (depth,
+    /// ignored directory names). Entries are returned in an unspecified
+    /// order — callers that need order sort themselves (Glob does).
+    ///
+    /// The default implementation is a **safety fallback built on repeated
+    /// `list_dir` calls**: it is depth-limited (8 levels), reports `size: 0`,
+    /// and cannot distinguish a symlink-to-file from a regular file (reports
+    /// it as a file). Remote transports SHOULD override this with a single
+    /// round-trip (`find` / `rg --files` in the environment) — the fallback
+    /// costs O(directories) network round-trips and must not back a
+    /// production remote tier.
+    ///
+    /// Only a failure to traverse `root` itself (missing root, no permission)
+    /// returns `Err`; per-entry errors (unreadable subdirectory, vanished
+    /// file) are skipped, matching the previous in-tool `walkdir` behaviour.
+    async fn walk(&self, root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<WalkEntry>> {
+        const FALLBACK_MAX_DEPTH: usize = 8;
+        let max_depth = opts.max_depth.min(FALLBACK_MAX_DEPTH);
+        let ignored = |name: &str| opts.ignore_dirs.iter().any(|i| i == name);
+        let mut out = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            for entry in self.list_dir(&dir).await? {
+                if ignored(&entry.name) {
+                    continue;
+                }
+                let entry_depth = depth + 1;
+                if entry_depth > max_depth {
+                    continue;
+                }
+                let child = dir.join(&entry.name);
+                if entry.is_dir && entry_depth < max_depth {
+                    stack.push((child.clone(), entry_depth));
+                }
+                let rel = child.strip_prefix(root).unwrap_or(&child).to_path_buf();
+                out.push(WalkEntry {
+                    path: rel,
+                    is_file: !entry.is_dir,
+                    size: 0,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
 
     /// Create a directory and all parents.
     async fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
@@ -571,6 +664,57 @@ impl ToolTransport for LocalTransport {
         Ok(entries)
     }
 
+    /// Single-pass recursive walk via `walkdir` (same crate the tools used
+    /// before Goal 402, so traversal order and filtering semantics are
+    /// byte-identical to the pre-transport behaviour).
+    ///
+    /// Traversal only (missing root) errors return `Err`; per-entry errors
+    /// are skipped, exactly like the tools' previous
+    /// `WalkDir … filter_map(|e| e.ok())` pipeline.
+    async fn walk(&self, root: &Path, opts: &WalkOptions) -> std::io::Result<Vec<WalkEntry>> {
+        if !root.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("walk root not found: {}", root.display()),
+            ));
+        }
+        let mut out = Vec::new();
+        for entry in WalkDir::new(root)
+            // Explicit by contract (Goal 402): never rely on walkdir's
+            // default — the remote implementation must match this policy.
+            .follow_links(opts.follow_symlinks)
+            .max_depth(opts.max_depth)
+            .into_iter()
+            .filter_entry(|e| {
+                // Prune ignored dirs at any depth below the root; the root
+                // itself (depth 0) is never pruned so scoping *into* an
+                // ignored dir still works.
+                e.depth() == 0
+                    || !e
+                        .file_name()
+                        .to_str()
+                        .map(|name| opts.ignore_dirs.iter().any(|i| i == name))
+                        .unwrap_or(false)
+            })
+        {
+            let Ok(entry) = entry else { continue };
+            let is_root = entry.depth() == 0;
+            if is_root && !entry.file_type().is_file() {
+                // The root directory itself is not part of the result.
+                // (walkdir yields it at depth 0; the old in-tool pipelines
+                // filtered it out via `file_type().is_file()`.)
+                continue;
+            }
+            let path = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            out.push(WalkEntry {
+                path: path.to_path_buf(),
+                is_file: entry.file_type().is_file(),
+                size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
     async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
         tokio::fs::create_dir_all(path).await
     }
@@ -633,6 +777,32 @@ impl ToolTransport for LocalTransport {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Goal 401/402 convention for consuming transport failures from the
+/// `std::io::Result`-shaped methods (`read_file` / `write_file` / `walk`):
+/// error kinds that mark a **transient** fault (timeout, connection loss)
+/// must be surfaced to the model with a `retryable: ` prefix so it knows the
+/// failure is infrastructure, not a code bug to fix. Exec-style failures are
+/// classified structurally via [`ExecResult::failure`] instead.
+pub fn is_retryable_io_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Prefix for a tool-error message per [`is_retryable_io_error`].
+pub fn retryable_prefix(e: &std::io::Error) -> &'static str {
+    if is_retryable_io_error(e) {
+        "retryable: "
+    } else {
+        ""
+    }
+}
 
 async fn read_capped<R: AsyncReadExt + Unpin>(reader: &mut R, max: usize) -> String {
     let mut buf = Vec::with_capacity(8 * 1024);
@@ -956,6 +1126,202 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.failure, Some(TransportFailure::Retryable));
+    }
+
+    // --- Goal 402: walk ---
+
+    fn write_tree(root: &std::path::Path) {
+        for rel in [
+            "a.txt",
+            "src/b.rs",
+            "src/deep/c.rs",
+            "target/d.rs",
+            ".git/config",
+            "node_modules/pkg/e.js",
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn local_transport_walk_returns_relative_paths_with_metadata() {
+        let t = LocalTransport;
+        let tmp = TempDir::new().unwrap();
+        write_tree(tmp.path());
+
+        let entries = t.walk(tmp.path(), &WalkOptions::default()).await.unwrap();
+        let files: Vec<String> = entries
+            .iter()
+            .filter(|e| e.is_file)
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        for expected in ["a.txt", "src/b.rs", "src/deep/c.rs"] {
+            assert!(
+                files.iter().any(|f| f.ends_with(expected)),
+                "walk must find {expected} (got {files:?})"
+            );
+        }
+        // All paths are relative to the walk root.
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.path.is_absolute() && !e.path.starts_with(tmp.path())),
+            "walk entries must be root-relative"
+        );
+        // Sizes are real (walkdir metadata), not the fallback's 0.
+        let a = entries
+            .iter()
+            .find(|e| e.path.file_name().unwrap() == "a.txt")
+            .unwrap();
+        assert_eq!(a.size, 1);
+    }
+
+    #[tokio::test]
+    async fn local_transport_walk_prunes_ignored_dirs() {
+        let t = LocalTransport;
+        let tmp = TempDir::new().unwrap();
+        write_tree(tmp.path());
+
+        let entries = t.walk(tmp.path(), &WalkOptions::default()).await.unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains(".git") || n.contains("target") || n.contains("node_modules")),
+            ".git / target / node_modules must be pruned on both local and remote paths (got {names:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_transport_walk_respects_max_depth() {
+        let t = LocalTransport;
+        let tmp = TempDir::new().unwrap();
+        write_tree(tmp.path());
+
+        let opts = WalkOptions {
+            max_depth: 1,
+            ..WalkOptions::default()
+        };
+        let entries = t.walk(tmp.path(), &opts).await.unwrap();
+        let files: Vec<String> = entries
+            .iter()
+            .filter(|e| e.is_file)
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(files.iter().any(|f| f == "a.txt"), "depth-1 file present");
+        assert!(
+            !files.iter().any(|f| f.contains("b.rs")),
+            "depth-2 files excluded at max_depth 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_transport_walk_missing_root_is_error() {
+        let t = LocalTransport;
+        let err = t
+            .walk(Path::new("/nonexistent/walk/root"), &WalkOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_transport_walk_does_not_follow_symlinks_by_default() {
+        let t = LocalTransport;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real.txt"), tmp.path().join("link.txt"))
+            .unwrap();
+
+        let entries = t.walk(tmp.path(), &WalkOptions::default()).await.unwrap();
+        let link = entries
+            .iter()
+            .find(|e| e.path.file_name().unwrap() == "link.txt")
+            .expect("symlink must appear as an entry");
+        assert!(
+            !link.is_file,
+            "with follow_symlinks=false (explicit default) a symlink is not a file"
+        );
+    }
+
+    #[test]
+    fn walk_options_defaults_pin_the_contract() {
+        let opts = WalkOptions::default();
+        assert!(
+            !opts.follow_symlinks,
+            "symlink policy must be explicit and default to not following (Goal 402 trap)"
+        );
+        assert_eq!(opts.max_depth, usize::MAX, "default walk is unbounded");
+        for dir in [".git", "target", "node_modules"] {
+            assert!(
+                opts.ignore_dirs.iter().any(|i| i == dir),
+                "{dir} must be in the default ignore set"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_walk_fallback_is_depth_limited_and_sorted() {
+        let t = BareTransport(LocalTransport);
+        let tmp = TempDir::new().unwrap();
+        // Build a chain 12 levels deep; the fallback caps at 8.
+        let mut deep = tmp.path().to_path_buf();
+        for i in 0..12 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("bottom.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join("top.txt"), "x").unwrap();
+
+        let entries = t.walk(tmp.path(), &WalkOptions::default()).await.unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "top.txt"),
+            "shallow files found by fallback"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("bottom.txt")),
+            "fallback must be depth-limited (remote tiers must override walk)"
+        );
+        // Fallback reports size 0 (no stat through list_dir).
+        let top = names.iter().find(|n| n.as_str() == "top.txt").unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.path.to_string_lossy() == *top)
+            .unwrap();
+        assert_eq!(entry.size, 0);
+        // Fallback output is sorted by relative path.
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    #[tokio::test]
+    async fn default_walk_fallback_prunes_ignored_dirs() {
+        let t = BareTransport(LocalTransport);
+        let tmp = TempDir::new().unwrap();
+        write_tree(tmp.path());
+
+        let entries = t.walk(tmp.path(), &WalkOptions::default()).await.unwrap();
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| e.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains(".git") || n.contains("target") || n.contains("node_modules")),
+            "both walk implementations must share ignore semantics (got {names:?})"
+        );
+        assert!(names.iter().any(|n| n == "a.txt"));
+        assert!(names.iter().any(|n| n.ends_with("b.rs")));
     }
 
     // --- SSH transport tests (no actual SSH required) ---
