@@ -1187,9 +1187,13 @@ def main() -> None:
         print(__doc__)
         raise SystemExit(1)
     cmd = sys.argv[1]
-    # Path("") == Path(".")：空 env 会让 run 目录静默解析到 cwd（repo 根），
-    # artifact 写进主 checkout 还能骗过 is_dir 守卫——必须显式非空（2026-09-29 影子验证实证）。
-    run_dir_raw = os.environ.get("SELF_IMPROVE_RUN_DIR", "")
+    # run 目录优先取 argv（免疫沙箱 env 白名单清洗——2026-09-29 影子验证实证
+    # SystemExit('') 空串案例）；env 作为兼容回退。Path("") == Path(".")，
+    # 空 env 会让 artifact 静默写进 cwd（repo 根），必须显式校验。
+    run_dir_raw = None
+    if "--run-dir" in sys.argv:
+        run_dir_raw = sys.argv[sys.argv.index("--run-dir") + 1]
+    run_dir_raw = run_dir_raw or os.environ.get("SELF_IMPROVE_RUN_DIR", "")
     run_dir = Path(run_dir_raw) if run_dir_raw else None
     if run_dir is None or not run_dir.is_dir():
         raise SystemExit(f"SELF_IMPROVE_RUN_DIR 未设置或不存在: {run_dir_raw!r}")
