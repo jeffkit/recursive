@@ -8,6 +8,28 @@
 
 ---
 
+## 引擎：plaita（2026-09-30 起，flowcast 为回滚）
+
+自迭代循环现有两个引擎，**语义等价**（门禁/评审/preserve/落地行为一致）：
+
+| | plaita 引擎（默认推荐） | flowcast 引擎（回滚） |
+|---|---|---|
+| 启动 | .dev/scripts/launch-flow-plaita.sh | .dev/scripts/launch-flow.sh |
+| 编排 | 45 节点薄骨架 self_improve_flow.py（编译产物 self-improve.plaita.json，已发布 console v1.0.0） | self-improve.flow.js（2033 行） |
+| 逻辑 | 厚引擎 self_improve_engine.py（watchdog/门禁fix循环/评审/commit/preserve） | 同在 JS 内 |
+
+要点：
+- **改业务逻辑只动 self_improve_engine.py**（节点是薄 shim，不需重发 flow 定义）；
+  改节点图/增删节点才需要改 self_improve_flow.py 并重跑 build_self_improve_flow.py + console 发布新版本。
+- bridge（self_improve_bridge.py）按 三级降级（console → run 内缓存 → 本地 json）取定义；
+  凭据经沙箱白名单需走 SUBPROCESS_ENV_EXTRA 前缀注入（bridge 已实现 DEEPSEEK_/GLM_/MINIMAX_/RECURSIVE_/LANGFUSE_）。
+- launcher 已放宽 PLAITA_SANDBOX_TIMEOUT=90000（沙箱默认 10s 墙钟装不下 preflight.build）。
+- 运行目录/状态文件与 flowcast 版兼容（.flowcast/runs/<run-id>/，state.json 含 engine: plaita）；
+  supervisor 轮询方式不变。
+
+---
+---
+
 ## 这是什么
 
 `.dev/flows/self-improve.flow.js` 把一次自改拆成可断点的步骤链：
