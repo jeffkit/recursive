@@ -81,6 +81,8 @@ def main() -> None:
     }, ensure_ascii=False, indent=2))
 
     # ── 定义三级降级：console → stale 缓存 → 本地文件 ─────────────
+    # console 查找：GET 详情找 status=published 的版本号 → GET 该版本定义
+    # （versions/{ver} 只认具体版本号，"published" 字面量会 404）
     flow_def, flow_source = None, "local"
     cache = run_dir / "flow-cache.json"
     console_url = os.environ.get("PLAITA_CONSOLE_URL")
@@ -89,14 +91,20 @@ def main() -> None:
     if console_url and console_key:
         try:
             import urllib.request
-            req = urllib.request.Request(
-                f"{console_url.rstrip('/')}/api/flows/{flow_id}/versions/published",
-                headers={"X-Admin-API-Key": console_key})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                published = json.loads(resp.read())
-            flow_def = json.loads(published["definition"])
-            flow_source = f"console@{published.get('version')}"
-            cache.write_text(json.dumps(flow_def, ensure_ascii=False))
+
+            def _get(url):
+                req = urllib.request.Request(url, headers={"X-Admin-API-Key": console_key})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read())
+
+            detail = _get(f"{console_url.rstrip('/')}/api/flows/{flow_id}")
+            pub = [v for v in detail.get("versions", []) if v.get("status") == "published"]
+            if pub:
+                ver = sorted(pub, key=lambda v: v["version"])[-1]["version"]
+                vdata = _get(f"{console_url.rstrip('/')}/api/flows/{flow_id}/versions/{ver}")
+                flow_def = json.loads(vdata["definition"])
+                flow_source = f"console@{ver}"
+                cache.write_text(json.dumps(flow_def, ensure_ascii=False))
         except Exception as e:
             print(f"[bridge] console 拉定义失败（降级缓存/本地）: {e}", file=sys.stderr)
     if flow_def is None and cache.exists():
