@@ -312,8 +312,7 @@ impl AgentKernel {
         };
 
         let core = {
-            use crate::context_breakdown::StaticBreakdownCache;
-            use crate::run_core::RunCore;
+            use crate::run_core::{RunCore, StaticBreakdownCache};
             // Goal-328: size the static breakdown cache from the provided
             // prompt segments + the tool registry's specs. The cache is
             // read-only for the rest of the run (no field on RunCore
@@ -345,7 +344,7 @@ impl AgentKernel {
                 stuck_error_rate: self.stuck_error_rate,
                 turn: ctx.turn,
                 globs_skills: self.globs_skills.clone(),
-                prompt_segments: None, // Goal-396: preserved on TurnOutcome via TurnContext
+                prompt_segments: ctx.prompt_segments,
                 static_breakdown,
                 last_prompt_tokens: 0,
                 consecutive_compact_failures: 0,

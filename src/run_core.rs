@@ -28,7 +28,10 @@ pub(crate) const DENIAL_LIMIT_SENTINEL: &str = "ERROR_DENIAL_LIMIT:";
 use crate::compact::Compactor;
 use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
-use crate::llm::{ChatProvider, Completion, StreamChunk, StreamSender, TokenUsage, ToolCall};
+use crate::llm::{
+    estimate_tokens, ChatProvider, Completion, ContextBreakdown, StreamChunk, StreamSender,
+    TokenUsage, ToolCall, ToolSpec,
+};
 use crate::message::Message;
 
 use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
@@ -48,9 +51,21 @@ pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit bud
 const MIN_TRIM_LENGTH: usize = 200;
 
 /// Goal-328: token estimate from a pre-computed byte count.
-/// Moved to `crate::context_breakdown` (Issue #40); re-exported for tests.
-#[cfg(test)]
-use crate::context_breakdown::estimate_tokens_by_bytes;
+///
+/// Same arithmetic as [`crate::llm::estimate_tokens`] but takes a `usize`
+/// byte-count directly so the conversation bucket can avoid re-iterating
+/// the transcript just to read each message's `len()`. Matches the public
+/// helper's ceil semantics so a 5-byte transcript chunk is 2 tokens, not 1.
+/// Byte-based (like the public helper): over-counts CJK ~3× because CJK
+/// chars are 3 UTF-8 bytes each — intentional, and keeps the breakdown
+/// buckets in the same unit as `estimate_tokens`.
+fn estimate_tokens_by_bytes(bytes: usize) -> u32 {
+    // NOTE: no `if tokens == 0 && bytes > 0 { 1 }` guard here — that branch
+    // is dead: `tokens == 0` only when `bytes == 0` (ceil(0.25..0.75)=1), so
+    // `bytes > 0` is never true when the guard could fire. Keeping it only
+    // created behavior-equivalent `>`-operator mutants.
+    (bytes as f64 / 4.0).ceil() as u32
+}
 
 /// Count one error occurrence for a tool name during stuck detection.
 ///
@@ -158,19 +173,24 @@ pub(crate) struct RunCore<'a> {
     /// Goal-318: `Globs`-mode skills for path-triggered injection.
     /// Injected as system messages after tool calls match a skill's glob patterns.
     pub(crate) globs_skills: Vec<Skill>,
-    /// Goal-328: structured prompt segments from `assemble_system_prompt`.
-    /// **Deprecated holder** — the segments only size
-    /// [`Self::static_breakdown`] at construction (done in
-    /// `AgentKernel::run`); RunCore itself never reads them. Retained as an
-    /// `Option` field for struct-compat with test fixtures; always `None`
-    /// in production paths.
+    /// Goal-328: structured prompt segments from `assemble_system_prompt`,
+    /// used to size the static breakdown buckets (`system_prompt`, `rules`,
+    /// `skills`, `subagents`). `None` when the runtime was built without a
+    /// system-prompt path (tests, headless loops without prompts).
+    ///
+    /// Currently held for introspection / future hot-reload; the breakdown
+    /// computation only reads [`Self::static_breakdown`] (which was sized
+    /// at construction). The `#[allow(dead_code)]` silences the lint
+    /// without removing the field — the goal explicitly preserves the
+    /// structured segment accessor surface so callers can reason about
+    /// which buckets contribute to the prompt.
     #[allow(dead_code)]
     pub(crate) prompt_segments: Option<PromptSegments>,
     /// Goal-328: per-bucket token counts for the static prompt portions,
     /// cached once at construction so the breakdown estimator does not
     /// re-tokenise `PromptSegments` every step. The `conversation`
     /// bucket is recomputed every step from `self.messages`.
-    pub(crate) static_breakdown: crate::context_breakdown::StaticBreakdownCache,
+    pub(crate) static_breakdown: StaticBreakdownCache,
     /// Goal-330: `prompt_tokens` from the most recent LLM response, used
     /// by [`Compactor::should_compact`] intra-turn. `0` means "no reading
     /// yet" (first step, or provider never reports usage).
@@ -189,6 +209,61 @@ pub(crate) struct RunCore<'a> {
     /// Wall-clock start instant, recorded when `RunCore` is
     /// constructed. `None` when the timeout is not active.
     pub(crate) wall_start: Option<std::time::Instant>,
+}
+
+/// Goal-328: cached token counts for the static breakdown buckets.
+///
+/// Sized once at `RunCore` construction from `PromptSegments`. The
+/// `tools` and `mcp_dynamic` buckets are also cached because they only
+/// change on a `/model` hot-swap or tool-registry change — the same
+/// hook that re-creates the runtime. `conversation` and `overhead`
+/// stay dynamic (recomputed every step).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StaticBreakdownCache {
+    pub system_prompt: u32,
+    pub rules: u32,
+    pub skills: u32,
+    pub subagents: u32,
+    /// Eager tool specs that are NOT MCP / NOT deferred.
+    pub tools: u32,
+    /// MCP / deferred tool specs.
+    pub mcp_dynamic: u32,
+}
+
+impl StaticBreakdownCache {
+    /// Build a fresh cache from a `PromptSegments` + the registry's tool
+    /// specs. `registry` is consulted to partition `eager` vs
+    /// `deferred_or_mcp` (McpTool reports `is_deferred() == true`).
+    pub(crate) fn build(
+        segments: &PromptSegments,
+        specs: &[ToolSpec],
+        registry: &ToolRegistry,
+    ) -> Self {
+        let mut tools = 0u32;
+        let mut mcp_dynamic = 0u32;
+        for spec in specs {
+            // Mirror the serde-shape the provider adapter would send: a
+            // single ToolSpec serialises to a JSON object with
+            // name/description/parameters. We tokenise that JSON text
+            // so the local estimate is comparable to what the provider
+            // actually sees after wrapping.
+            let text = serde_json::to_string(spec).unwrap_or_default();
+            let n = estimate_tokens(&text);
+            if registry.is_deferred_spec(spec) {
+                mcp_dynamic = mcp_dynamic.saturating_add(n);
+            } else {
+                tools = tools.saturating_add(n);
+            }
+        }
+        Self {
+            system_prompt: estimate_tokens(&segments.system_prompt),
+            rules: estimate_tokens(&segments.rules),
+            skills: estimate_tokens(&segments.skills),
+            subagents: estimate_tokens(&segments.subagents),
+            tools,
+            mcp_dynamic,
+        }
+    }
 }
 
 impl<'a> RunCore<'a> {
@@ -211,6 +286,49 @@ impl<'a> RunCore<'a> {
             if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
                 msg.reasoning_content = reasoning;
             }
+        }
+    }
+
+    /// Goal-328: build a fresh [`ContextBreakdown`] from the cached static
+    /// buckets + a re-tokenised `conversation` (the transcript body).
+    /// `provider_total` is the `max(input_tokens, cache_hit + cache_miss)`
+    /// reading from the just-completed LLM call; it backs the `overhead`
+    /// bucket.
+    fn compute_breakdown(&self, provider_total: u32) -> ContextBreakdown {
+        // Conversation bucket: bytes/4 over the transcript body. We
+        // intentionally re-tokenise every step (rather than caching) so
+        // the bucket grows naturally with each new assistant / tool /
+        // user message appended this run.
+        let mut conversation_bytes: usize = 0;
+        for msg in self.messages.iter() {
+            conversation_bytes = conversation_bytes.saturating_add(msg.content.len());
+            if let Some(rc) = &msg.reasoning_content {
+                conversation_bytes = conversation_bytes.saturating_add(rc.len());
+            }
+        }
+        // `estimate_tokens` uses (bytes as f64 / 4.0).ceil() as u32.
+        let conversation = estimate_tokens_by_bytes(conversation_bytes);
+
+        let local_sum = self
+            .static_breakdown
+            .system_prompt
+            .saturating_add(self.static_breakdown.rules)
+            .saturating_add(self.static_breakdown.skills)
+            .saturating_add(self.static_breakdown.subagents)
+            .saturating_add(self.static_breakdown.tools)
+            .saturating_add(self.static_breakdown.mcp_dynamic)
+            .saturating_add(conversation);
+        let overhead = provider_total.saturating_sub(local_sum);
+
+        ContextBreakdown {
+            system_prompt: self.static_breakdown.system_prompt,
+            rules: self.static_breakdown.rules,
+            skills: self.static_breakdown.skills,
+            subagents: self.static_breakdown.subagents,
+            tools: self.static_breakdown.tools,
+            mcp_dynamic: self.static_breakdown.mcp_dynamic,
+            conversation,
+            overhead,
         }
     }
 
@@ -715,33 +833,6 @@ impl<'a> RunCore<'a> {
         self.make_outcome(finish, step, final_message, total_usage, tool_audits)
     }
 
-    /// Issue #40 — route a per-call wall-budget expiry (from
-    /// [`Self::complete_with_budget`]) to the [`FinishReason::WallClockExceeded`]
-    /// outcome. Same data path as the between-step `check_wall_deadline`;
-    /// kept as a sibling helper to protect Invariant #1 (loop body size).
-    fn wall_clock_finish(
-        self,
-        secs: u64,
-        step: usize,
-        final_message: Option<String>,
-        total_usage: TokenUsage,
-        tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
-    ) -> RunInnerOutcome {
-        let finish = FinishReason::WallClockExceeded { secs };
-        let finished_steps = step.saturating_sub(1);
-        self.emit(AgentEvent::TurnFinished {
-            reason: finish_reason_str(&finish),
-            steps: finished_steps,
-        });
-        self.make_outcome(
-            finish,
-            finished_steps,
-            final_message,
-            total_usage,
-            tool_audits,
-        )
-    }
-
     /// Goal 382 — route a stream-interrupted completion to the Cancelled
     /// outcome. The SSE parsers (openai.rs / anthropic.rs) now return
     /// `Ok(Completion { finish_reason: Some("interrupted"), .. })` instead
@@ -770,7 +861,8 @@ impl<'a> RunCore<'a> {
     }
 
     /// Call the LLM once, delegating retry handling to the provider's
-    /// internal `RetryPolicy` (Goal-288: exactly one retry layer).
+    /// internal `RetryPolicy`. Goal-288 removed the outer retry loop so
+    /// there is exactly one retry layer.
     ///
     /// When the registry has deferred tools, their names are injected as an
     /// `<available-deferred-tools>` user message prepended to the transcript,
@@ -779,8 +871,36 @@ impl<'a> RunCore<'a> {
     /// its results in the message history are serialized as `tool_reference`
     /// blocks by `serialize_messages_anthropic`.
     /// Inject the skill catalog as a `<system-reminder>` user turn, appended
-    /// to the **tail** of the per-request message copy. See
-    /// `inject_skill_reminder` in `crate::agent::types` for rationale.
+    /// to the **tail** of the per-request message copy.
+    ///
+    /// Why tail (not head): the catalog is volatile — it changes when skills
+    /// load/unload. Placing it at the head (right after the leading `system`
+    /// message, as an earlier draft did) busts the prefix cache for every
+    /// message that follows it on each skill change. At the tail it sits in
+    /// the most-recent turn, mirroring fake-cc's `skill_listing` attachment,
+    /// which `reorderAttachmentsForAPI` bubbles to the end of the
+    /// conversation. The static `system` field is untouched either way, so
+    /// prefix caching of the system prompt + stable history is preserved.
+    ///
+    /// Correctness: appending a `user` turn at the tail is safe on both
+    /// Anthropic and OpenAI-compatible providers. It never splits an
+    /// assistant→tool_result pair (we only append, never insert), so
+    /// AGENTS.md invariant #8 holds. The transcript (`self.messages`) is
+    /// never mutated — only the per-request copy is wrapped.
+    fn inject_skill_reminder(
+        messages: &[crate::message::Message],
+        skills: &[crate::skills::Skill],
+    ) -> Vec<crate::message::Message> {
+        if skills.is_empty() {
+            return messages.to_vec();
+        }
+        let reminder = crate::skills::skill_reminder(skills);
+        let mut out = Vec::with_capacity(messages.len() + 1);
+        out.extend(messages.iter().cloned());
+        out.push(crate::message::Message::user(reminder));
+        out
+    }
+
     async fn call_llm(
         &self,
         specs: &[crate::llm::ToolSpec],
@@ -818,9 +938,10 @@ impl<'a> RunCore<'a> {
             };
 
         // Ship the skill catalog per-turn as a tail-appended `system-reminder`
-        // (cache-friendly; see inject_skill_reminder doc).
+        // so the static `system` prompt + stable history stay cacheable. Does
+        // not mutate the transcript. See `inject_skill_reminder` for rationale.
         let injected: Vec<crate::message::Message> =
-            crate::agent::types::inject_skill_reminder(messages, &self.globs_skills);
+            Self::inject_skill_reminder(messages, &self.globs_skills);
 
         if let Some(ref tx) = stream_sender {
             let cancel_token = self.shutdown_token.clone();
@@ -828,66 +949,7 @@ impl<'a> RunCore<'a> {
                 .stream(&injected, call_specs, Some(tx.clone()), cancel_token)
                 .await
         } else {
-            self.complete_with_budget(&injected, call_specs).await
-        }
-    }
-
-    /// Issue #40: a non-streaming `complete()` call with no cancellation or
-    /// deadline used to stall the whole run — the between-step
-    /// `check_shutdown` / `check_wall_deadline` probes can never fire while
-    /// we are parked inside the await. Wrap the call in a select against the
-    /// shutdown token and the remaining wall-clock budget (when one is
-    /// configured). A wall-budget expiry surfaces as `Error::WallClockExceeded`
-    /// so the existing run_inner handling keeps Goal 399's FinishReason;
-    /// token cancellation maps to Cancelled (Goal 353).
-    async fn complete_with_budget(
-        &self,
-        injected: &[crate::message::Message],
-        call_specs: &[crate::llm::ToolSpec],
-    ) -> crate::error::Result<Completion> {
-        let elapsed = self.wall_start.map(|t| t.elapsed());
-        if self.wall_timeout_secs > 0
-            && elapsed.is_some_and(|e| e.as_secs() >= self.wall_timeout_secs)
-        {
-            return Err(crate::error::Error::WallClockExceeded {
-                secs: self.wall_timeout_secs,
-            });
-        }
-        let budget_sleep = if self.wall_timeout_secs > 0 {
-            elapsed.map(|e| {
-                tokio::time::sleep(
-                    std::time::Duration::from_secs(self.wall_timeout_secs).saturating_sub(e),
-                )
-            })
-        } else {
-            None
-        };
-        let fut = self.llm.complete(injected, call_specs);
-        let wall_err = || crate::error::Error::WallClockExceeded {
-            secs: self.wall_timeout_secs,
-        };
-        if let Some(sleep) = budget_sleep {
-            tokio::pin!(fut);
-            tokio::pin!(sleep);
-            match self.shutdown_token.clone() {
-                Some(token) => tokio::select! {
-                    r = &mut fut => r,
-                    _ = token.cancelled() => Err(crate::error::Error::Cancelled),
-                    _ = &mut sleep => Err(wall_err()),
-                },
-                None => tokio::select! {
-                    r = &mut fut => r,
-                    _ = &mut sleep => Err(wall_err()),
-                },
-            }
-        } else {
-            match self.shutdown_token.clone() {
-                Some(token) => tokio::select! {
-                    r = fut => r,
-                    _ = token.cancelled() => Err(crate::error::Error::Cancelled),
-                },
-                None => fut.await,
-            }
+            self.llm.complete(&injected, call_specs).await
         }
     }
 
@@ -1254,8 +1316,11 @@ impl<'a> RunCore<'a> {
             let _guard = step_span.enter();
 
             // ---- shutdown cancellation -------------------------------------------
-            // If a CancellationToken fired between steps, finish cleanly
-            // with FinishReason::Cancelled.
+            // Termination check, parallel to the BudgetExceeded /
+            // TranscriptLimit blocks below. If a CancellationToken was
+            // configured (via AgentRuntimeBuilder::shutdown_token / etc.)
+            // and it fired between steps, finish cleanly with
+            // FinishReason::Cancelled.
             if let Some((finish, finished_steps)) = self.check_shutdown(step, &total_usage) {
                 return Ok(self.make_outcome(
                     finish,
@@ -1267,8 +1332,14 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- wall-clock deadline (Goal 345) ---------------------------------
-            if let Some((finish, s)) = self.check_wall_deadline(step, &total_usage) {
-                return Ok(self.make_outcome(finish, s, final_message, total_usage, tool_audits));
+            if let Some((finish, finished_steps)) = self.check_wall_deadline(step, &total_usage) {
+                return Ok(self.make_outcome(
+                    finish,
+                    finished_steps,
+                    final_message,
+                    total_usage,
+                    tool_audits,
+                ));
             }
 
             // ---- mailbox drain (coordinator → worker mid-run messages) -----------
@@ -1294,20 +1365,10 @@ impl<'a> RunCore<'a> {
                 match self.dispatch_llm_step(&specs, step, &mut total_usage).await {
                     Ok(v) => v,
                     Err(crate::error::Error::Cancelled) => {
-                        // Mid-call cancellation → Cancelled, partial
-                        // transcript persisted by the caller (Invariant #7).
+                        // Mid-stream cancellation: the stream was interrupted partway
+                        // through an LLM call. Route to FinishReason::Cancelled so the
+                        // partial transcript is persisted by the caller. Invariant #7.
                         return Ok(self.make_cancelled_outcome(
-                            step,
-                            final_message,
-                            total_usage,
-                            tool_audits,
-                        ));
-                    }
-                    Err(crate::error::Error::WallClockExceeded { secs }) => {
-                        // Issue #40: per-call wall budget fired inside a
-                        // stalled non-stream `complete()`.
-                        return Ok(self.wall_clock_finish(
-                            secs,
                             step,
                             final_message,
                             total_usage,
@@ -1383,9 +1444,13 @@ impl<'a> RunCore<'a> {
 }
 
 /// Step cap for the agent loop. `0` means unlimited (no `BudgetExceeded`).
-/// See `RECURSIVE_HARD_STEP_CAP` doc in `.dev/AGENTS.md` / README. If the
-/// env var is set to a positive integer, the cap is clamped to that value;
-/// when unset or zero, `max_steps=0` still means `usize::MAX`.
+///
+/// If the `RECURSIVE_HARD_STEP_CAP` env var is set to a positive integer,
+/// the cap is clamped to that value regardless of `max_steps`. This lets
+/// operators enforce a production ceiling on `recursive loop` long-running
+/// sessions (which default to `max_steps=0` / unbounded) without changing
+/// the per-session contract. When unset or zero, behaviour is unchanged:
+/// `max_steps=0` still means `usize::MAX`.
 fn effective_step_limit(max_steps: usize) -> usize {
     let requested = if max_steps == 0 {
         usize::MAX
@@ -1398,7 +1463,9 @@ fn effective_step_limit(max_steps: usize) -> usize {
     }
 }
 
-/// Read `RECURSIVE_HARD_STEP_CAP`; `None`/unparseable/`0` = unset.
+/// Read the `RECURSIVE_HARD_STEP_CAP` env var once per call. Returns
+/// `None` when unset or unparseable. A value of `0` is treated as
+/// "unset" (matches the `max_steps=0` unlimited convention).
 fn hard_step_cap_from_env() -> Option<usize> {
     std::env::var("RECURSIVE_HARD_STEP_CAP")
         .ok()
@@ -1411,9 +1478,8 @@ mod tests {
 
     use super::{
         effective_step_limit, estimate_prompt_tokens, estimate_tokens_by_bytes, finish_reason_str,
-        RunCore, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
+        RunCore, StaticBreakdownCache, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
     };
-    use crate::context_breakdown::StaticBreakdownCache;
     use crate::message::Message;
 
     // The three `effective_step_limit_*` tests mutate the process-global
@@ -3771,98 +3837,6 @@ mod tests {
         assert!(
             result.is_some(),
             "elapsed == timeout must fire the deadline"
-        );
-    }
-
-    /// Issue #40 — a non-streaming `complete()` call that never resolves must
-    /// be cancellable via the shutdown token, instead of parking the run
-    /// forever inside `call_llm`.
-    #[tokio::test]
-    async fn call_llm_nonstream_respects_shutdown_token() {
-        // HangingProvider: complete() sleeps 3600s — only the token can end it.
-        struct HangingProvider;
-        #[async_trait::async_trait]
-        impl crate::llm::ChatProvider for HangingProvider {
-            async fn complete(
-                &self,
-                _messages: &[Message],
-                _tools: &[crate::llm::ToolSpec],
-            ) -> crate::error::Result<crate::llm::Completion> {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                unreachable!("should have been cancelled")
-            }
-            async fn stream(
-                &self,
-                _m: &[Message],
-                _t: &[crate::llm::ToolSpec],
-                _tx: Option<crate::llm::StreamSender>,
-                _c: Option<tokio_util::sync::CancellationToken>,
-            ) -> crate::error::Result<crate::llm::Completion> {
-                unreachable!("stream not used")
-            }
-        }
-        let hooks = crate::hooks::HookRegistry::new();
-        let provider: Arc<dyn crate::llm::ChatProvider> = Arc::new(HangingProvider);
-        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
-        core.llm = provider;
-        let token = tokio_util::sync::CancellationToken::new();
-        core.shutdown_token = Some(token.clone());
-        let core = core; // immutable from here
-
-        let fut = core.call_llm(&[], None);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            token.cancel();
-        });
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut).await;
-        match result {
-            Ok(Err(crate::error::Error::Cancelled)) => {}
-            other => panic!(
-                "expected Err(Cancelled) within 5s, got {:?}",
-                other.map(|r| r.map(|_| ()))
-            ),
-        }
-    }
-
-    /// Issue #40 — when the wall budget is already spent, `call_llm` must
-    /// short-circuit with a WallClockExceeded error instead of issuing
-    /// another (potentially hanging) call.
-    #[tokio::test]
-    async fn call_llm_nonstream_wall_deadline_short_circuits() {
-        struct NeverProvider;
-        #[async_trait::async_trait]
-        impl crate::llm::ChatProvider for NeverProvider {
-            async fn complete(
-                &self,
-                _messages: &[Message],
-                _tools: &[crate::llm::ToolSpec],
-            ) -> crate::error::Result<crate::llm::Completion> {
-                panic!("complete() must not be reached when the budget is spent")
-            }
-            async fn stream(
-                &self,
-                _m: &[Message],
-                _t: &[crate::llm::ToolSpec],
-                _tx: Option<crate::llm::StreamSender>,
-                _c: Option<tokio_util::sync::CancellationToken>,
-            ) -> crate::error::Result<crate::llm::Completion> {
-                panic!("stream not used")
-            }
-        }
-        let hooks = crate::hooks::HookRegistry::new();
-        let provider: Arc<dyn crate::llm::ChatProvider> = Arc::new(NeverProvider);
-        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
-        core.llm = provider;
-        core.wall_timeout_secs = 3;
-        core.wall_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
-        let result = core.call_llm(&[], None).await;
-        assert!(
-            matches!(
-                result,
-                Err(crate::error::Error::WallClockExceeded { secs: 3 })
-            ),
-            "expected Err(WallClockExceeded) on spent budget, got {:?}",
-            result.map(|_| ())
         );
     }
 }

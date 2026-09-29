@@ -238,16 +238,6 @@ pub struct AgentTool {
     /// when a worker is spawned in the background; `send_message` reads here
     /// to continue a worker across turns.
     workers: WorkerTable,
-    /// Wall-clock budget propagated to worker runtimes (Goal 399 semantics:
-    /// 0 = unbounded; children must not outlive the parent's budget).
-    wall_timeout_secs: u64,
-    /// Cancellation token propagated to worker runtimes. Workers receive a
-    /// CHILD token so a parent cancel stops all workers, while one worker's
-    /// own cancellation cannot affect its siblings (issue #40).
-    shutdown_token: Option<tokio_util::sync::CancellationToken>,
-    /// Per-turn token slot (TUI): the host refreshes the token at each turn
-    /// start. Only consulted when `shutdown_token` is unset (static wins).
-    shutdown_token_slot: Option<crate::multi::SharedTokenSlot>,
 }
 
 impl AgentTool {
@@ -271,9 +261,6 @@ impl AgentTool {
             task_registry: Arc::new(TaskRegistry::new()),
             definitions: None,
             workers: Arc::new(Mutex::new(HashMap::new())),
-            wall_timeout_secs: 0,
-            shutdown_token: None,
-            shutdown_token_slot: None,
         }
     }
 
@@ -310,40 +297,6 @@ impl AgentTool {
     pub fn with_workers(mut self, workers: WorkerTable) -> Self {
         self.workers = workers;
         self
-    }
-
-    /// Propagate the parent's wall-clock budget to worker runtimes
-    /// (issue #40; 0 = unbounded, matching Goal 399 semantics).
-    pub fn with_wall_timeout_secs(mut self, secs: u64) -> Self {
-        self.wall_timeout_secs = secs;
-        self
-    }
-
-    /// Propagate a cancellation token so Ctrl-C / host interrupt can stop
-    /// hanging workers (issue #40).
-    pub fn with_shutdown_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
-        self.shutdown_token = Some(token);
-        self
-    }
-
-    /// Attach a per-turn token slot (TUI). The host stores the current turn's
-    /// CancellationToken into the slot; each worker invocation clones it out
-    /// at dispatch time, so a Ctrl-C interrupt reaches in-flight parallel
-    /// workers via the same child-token tree as a static token.
-    pub fn with_shutdown_token_slot(mut self, slot: crate::multi::SharedTokenSlot) -> Self {
-        self.shutdown_token_slot = Some(slot);
-        self
-    }
-
-    /// Resolve the effective parent token: a static `shutdown_token` (if set)
-    /// wins; otherwise the current value of the per-turn slot (if attached).
-    /// The slot lock is only held for the clone (microsecond scale, no await).
-    fn effective_shutdown_token(&self) -> Option<tokio_util::sync::CancellationToken> {
-        if let Some(token) = &self.shutdown_token {
-            return Some(token.clone());
-        }
-        let slot = self.shutdown_token_slot.as_ref()?;
-        slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     // ------------------------------------------------------------------
@@ -450,16 +403,10 @@ impl AgentTool {
             child_agent = child_agent.with_pool(pool.clone());
         }
         // Always propagate the task registry and worker table so descendants
-        // share coordination state with the coordinator. Issue #40: propagate
-        // the wall budget and a CHILD cancellation token (parent cancel → all
-        // workers cancel; workers stay independent of each other).
+        // share coordination state with the coordinator.
         child_agent = child_agent
             .with_task_registry(self.task_registry.clone())
-            .with_workers(self.workers.clone())
-            .with_wall_timeout_secs(self.wall_timeout_secs);
-        if let Some(token) = self.effective_shutdown_token() {
-            child_agent = child_agent.with_shutdown_token(token.child_token());
-        }
+            .with_workers(self.workers.clone());
         sub_registry = sub_registry.register(Arc::new(child_agent));
 
         // Inject shared-memory tools if pool is available
@@ -493,20 +440,17 @@ impl AgentTool {
             }
         }
 
-        let mut builder = AgentRuntimeBuilder::new()
+        AgentRuntimeBuilder::new()
             .llm(self.provider.clone())
             .tools(sub_registry)
             .max_steps(max_steps)
             .system_prompt(system_prompt)
-            .wall_timeout_secs(self.wall_timeout_secs);
-        if let Some(token) = self.effective_shutdown_token() {
-            builder = builder.shutdown_token(token.child_token());
-        }
-        builder.build().map_err(|e| Error::Tool {
-            name: "agent".into(),
-            call_id: None,
-            message: format!("failed to build worker '{}' runtime: {e}", worker_id),
-        })
+            .build()
+            .map_err(|e| Error::Tool {
+                name: "agent".into(),
+                call_id: None,
+                message: format!("failed to build worker '{}' runtime: {e}", worker_id),
+            })
     }
 
     /// Run a single worker synchronously and return its final text.
@@ -714,16 +658,6 @@ impl AgentTool {
         let pool = self.pool.clone();
         let definitions = self.definitions.clone();
         let workers = self.workers.clone();
-        let wall_timeout_secs = self.wall_timeout_secs;
-        // Child token: cancelling the parent cancels all workers at once;
-        // a single worker's runtime never cancels its siblings.
-        let child_token = self.effective_shutdown_token().map(|t| t.child_token());
-        let token_slot = self.shutdown_token_slot.clone();
-        let deadline = if wall_timeout_secs > 0 {
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(wall_timeout_secs))
-        } else {
-            None
-        };
 
         // Spawn each worker into a tokio task, collecting JoinHandles.
         let mut handles: Vec<tokio::task::JoinHandle<(String, Result<String>)>> = Vec::new();
@@ -739,28 +673,8 @@ impl AgentTool {
             let pool = pool.clone();
             let definitions = definitions.clone();
             let workers = workers.clone();
-            let worker_token = child_token.as_ref().map(|t| t.child_token());
-            let token_slot = token_slot.clone();
 
             handles.push(tokio::spawn(async move {
-                // Deregister on every exit path, including the abort path of
-                // issue #40's aggregate-cancel branch (the trailing
-                // `deregister().await` used to be skipped on abort).
-                struct ParallelDeregister {
-                    registry: Option<WorkerRegistry>,
-                    worker_id: String,
-                }
-                impl Drop for ParallelDeregister {
-                    fn drop(&mut self) {
-                        if let Some(reg) = &self.registry {
-                            reg.deregister_sync(&self.worker_id);
-                        }
-                    }
-                }
-                let _dereg = ParallelDeregister {
-                    registry: registry.clone(),
-                    worker_id: worker_id.clone(),
-                };
                 let agent = AgentTool {
                     workspace,
                     provider,
@@ -773,105 +687,33 @@ impl AgentTool {
                     task_registry: Arc::new(crate::tasks::TaskRegistry::new()),
                     definitions,
                     workers,
-                    wall_timeout_secs,
-                    shutdown_token: worker_token,
-                    shutdown_token_slot: token_slot,
                 };
                 let result = agent
                     .run_worker(&worker_id, &entry, &prompt, max_steps, child_depth)
                     .await;
 
+                // Deregister this worker
+                if let Some(reg) = &registry {
+                    reg.deregister(&worker_id).await;
+                }
+
                 (worker_id, result)
             }));
         }
 
-        // Await all handles, bounded by the aggregate cancellation/deadline
-        // paths (issue #40): a stalled worker must not park the parent turn
-        // forever. When the cancel/timeout branch wins, we cancel the child
-        // token, abort unfinished handles, and emit a placeholder result per
-        // unfinished worker — invariant #7 (finish is data, not Err) and #8
-        // (every dispatched worker has a paired result in the aggregate).
-        // `join_all` borrows the handles (`&mut JoinHandle` is a Future), so
-        // they remain available for the abort path after the select.
-        let mut handles = handles;
-        let mut aggregated = false;
-        // Label must be decided by WHICH branch fired, BEFORE `cancel()` is
-        // called below (cancel() synchronously flips `is_cancelled()`, so
-        // post-hoc `is_cancelled()` probing would always say "Cancelled").
-        let mut timed_out = false;
-        let outcomes: Vec<Result<(String, Result<String>), tokio::task::JoinError>> =
-            match (&child_token, deadline) {
-                (Some(token), Some(dl)) => {
-                    let remaining = dl.saturating_duration_since(std::time::Instant::now());
-                    let mut join = futures_util::future::join_all(handles.iter_mut());
-                    tokio::select! {
-                        o = &mut join => { aggregated = true; o }
-                        _ = token.cancelled() => Vec::new(),
-                        _ = tokio::time::sleep(remaining) => { timed_out = true; Vec::new() }
-                    }
-                }
-                (Some(token), None) => {
-                    let mut join = futures_util::future::join_all(handles.iter_mut());
-                    tokio::select! {
-                        o = &mut join => { aggregated = true; o }
-                        _ = token.cancelled() => Vec::new(),
-                    }
-                }
-                (None, Some(dl)) => {
-                    let remaining = dl.saturating_duration_since(std::time::Instant::now());
-                    let mut join = futures_util::future::join_all(handles.iter_mut());
-                    match tokio::time::timeout(remaining, &mut join).await {
-                        Ok(o) => {
-                            aggregated = true;
-                            o
-                        }
-                        Err(_elapsed) => {
-                            timed_out = true;
-                            Vec::new()
-                        }
-                    }
-                }
-                (None, None) => {
-                    aggregated = true;
-                    futures_util::future::join_all(handles.iter_mut()).await
-                }
-            };
+        // Await all handles
+        let outcomes = futures_util::future::join_all(handles).await;
 
-        // If the cancel/timeout branch fired, `outcomes` is empty but handles
-        // may still be running: cancel the child token (graceful), abort the
-        // stragglers, and produce placeholder results so the parent LLM sees
-        // one result line per dispatched worker.
+        // Collect results, preserving order by worker ID
         let mut results: Vec<(String, String)> = Vec::new();
-        if !aggregated {
-            if let Some(token) = &child_token {
-                token.cancel();
-            }
-            for handle in handles {
-                handle.abort();
-            }
-            let label = if timed_out {
-                "WallClockExceeded"
-            } else {
-                "Cancelled"
-            };
-            for id in manifest.keys() {
-                results.push((
-                    id.clone(),
-                    format!(
-                        "[worker '{id}' finished: {label}]\n(aggregate deadline/cancellation; worker did not finish)"
-                    ),
-                ));
-            }
-        } else {
-            for outcome in outcomes {
-                match outcome {
-                    Ok((id, Ok(text))) => results.push((id, text)),
-                    Ok((id, Err(e))) => {
-                        results.push((id, format!("ERROR: {e}")));
-                    }
-                    Err(join_err) => {
-                        results.push(("(unknown)".into(), format!("join error: {join_err}")));
-                    }
+        for outcome in outcomes {
+            match outcome {
+                Ok((id, Ok(text))) => results.push((id, text)),
+                Ok((id, Err(e))) => {
+                    results.push((id, format!("ERROR: {e}")));
+                }
+                Err(join_err) => {
+                    results.push(("(unknown)".into(), format!("join error: {join_err}")));
                 }
             }
         }
@@ -1881,161 +1723,5 @@ allowed_tools:
             !send_result.contains("will run it as a new turn"),
             "stopped worker must not claim a new turn, got: {send_result}"
         );
-    }
-
-    /// Issue #40 — parallel mode with a stalled LLM and a wall budget must
-    /// return Ok with a paired placeholder result per worker (invariants #7
-    /// and #8), not hang forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn execute_parallel_timeout_produces_paired_results() {
-        struct HangingProvider;
-        #[async_trait::async_trait]
-        impl crate::llm::ChatProvider for HangingProvider {
-            async fn complete(
-                &self,
-                _m: &[crate::message::Message],
-                _t: &[crate::llm::ToolSpec],
-            ) -> crate::error::Result<Completion> {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                unreachable!("should have been aborted")
-            }
-            async fn stream(
-                &self,
-                _m: &[crate::message::Message],
-                _t: &[crate::llm::ToolSpec],
-                _tx: Option<crate::llm::StreamSender>,
-                _c: Option<tokio_util::sync::CancellationToken>,
-            ) -> crate::error::Result<Completion> {
-                unreachable!("stream not used")
-            }
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let provider: Arc<dyn ChatProvider> = Arc::new(HangingProvider);
-        let all_tools = ToolRegistry::new(Arc::new(LocalTransport));
-        let agent =
-            AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None).with_wall_timeout_secs(1);
-
-        let fut = agent.execute(serde_json::json!({
-            "mode": "parallel",
-            "manifest": {
-                "w0": { "system_prompt": "a", "allowed_tools": [] },
-                "w1": { "system_prompt": "b", "allowed_tools": [] }
-            },
-            "prompt": "go",
-            "max_steps": 3
-        }));
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-            .await
-            .expect("must terminate via wall budget")
-            .expect("execute must return Ok (finish is data, not Err)");
-        assert!(result.contains("WallClockExceeded"), "got: {result}");
-        assert!(result.contains("=== w0 ==="), "got: {result}");
-        assert!(result.contains("=== w1 ==="), "got: {result}");
-    }
-
-    /// Issue #40 — cancelling the parent token mid-parallel-run must yield
-    /// Ok with Cancelled placeholders for every worker.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn execute_parallel_cancel_produces_paired_results() {
-        struct HangingProvider;
-        #[async_trait::async_trait]
-        impl crate::llm::ChatProvider for HangingProvider {
-            async fn complete(
-                &self,
-                _m: &[crate::message::Message],
-                _t: &[crate::llm::ToolSpec],
-            ) -> crate::error::Result<Completion> {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                unreachable!("should have been cancelled")
-            }
-            async fn stream(
-                &self,
-                _m: &[crate::message::Message],
-                _t: &[crate::llm::ToolSpec],
-                _tx: Option<crate::llm::StreamSender>,
-                _c: Option<tokio_util::sync::CancellationToken>,
-            ) -> crate::error::Result<Completion> {
-                unreachable!("stream not used")
-            }
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let provider: Arc<dyn ChatProvider> = Arc::new(HangingProvider);
-        let all_tools = ToolRegistry::new(Arc::new(LocalTransport));
-        let token = tokio_util::sync::CancellationToken::new();
-        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
-            .with_shutdown_token(token.clone());
-
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            token.cancel();
-        });
-
-        let fut = agent.execute(serde_json::json!({
-            "mode": "parallel",
-            "manifest": {
-                "w0": { "system_prompt": "a", "allowed_tools": [] },
-                "w1": { "system_prompt": "b", "allowed_tools": [] }
-            },
-            "prompt": "go",
-            "max_steps": 3
-        }));
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-            .await
-            .expect("must terminate via cancellation")
-            .expect("execute must return Ok");
-        assert!(result.contains("Cancelled"), "got: {result}");
-        assert!(result.contains("=== w0 ==="), "got: {result}");
-        assert!(result.contains("=== w1 ==="), "got: {result}");
-    }
-
-    /// Issue #40 — the per-turn token slot resolves to a cancellable token
-    /// when no static token is attached, and a static token takes precedence
-    /// over the slot when both are present.
-    #[test]
-    fn token_slot_resolves_and_prefers_static() {
-        let tmp = tempfile::tempdir().unwrap();
-        let all_tools = ToolRegistry::new(Arc::new(LocalTransport));
-        let agent = AgentTool::new(
-            tmp.path(),
-            mock_provider(vec![]),
-            all_tools.clone(),
-            2,
-            0,
-            None,
-        );
-        // No slot, no static token → None.
-        assert!(agent.effective_shutdown_token().is_none());
-
-        // Slot only → resolves the slot's token.
-        let slot: crate::multi::SharedTokenSlot = Arc::new(std::sync::Mutex::new(Some(
-            tokio_util::sync::CancellationToken::new(),
-        )));
-        let agent = agent.with_shutdown_token_slot(slot.clone());
-        let resolved = agent
-            .effective_shutdown_token()
-            .expect("slot token must resolve");
-        assert!(!resolved.is_cancelled());
-        resolved.cancel();
-        assert!(
-            agent
-                .effective_shutdown_token()
-                .map(|t| t.is_cancelled())
-                .unwrap_or(false),
-            "slot resolution must be live (same token)"
-        );
-
-        // Empty slot → None.
-        *slot.lock().unwrap() = None;
-        assert!(agent.effective_shutdown_token().is_none());
-
-        // Static + slot → static wins.
-        *slot.lock().unwrap() = Some(tokio_util::sync::CancellationToken::new());
-        let static_token = tokio_util::sync::CancellationToken::new();
-        let agent = agent.with_shutdown_token(static_token.clone());
-        let resolved = agent
-            .effective_shutdown_token()
-            .expect("static token must resolve");
-        static_token.cancel();
-        assert!(resolved.is_cancelled(), "static token must take precedence");
     }
 }

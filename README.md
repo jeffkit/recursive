@@ -169,7 +169,7 @@ Anything OpenAI-compatible works. Override via env vars (or CLI flags):
 | `RECURSIVE_API_KEY` | _(required)_ | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Loop budget (0 = unlimited; set to N to cap at N steps) |
-| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds (0 = unlimited). Effective as of Goal 399 — previously parsed but never consumed. **Recommended for multi-worker `agent(mode=parallel)` long tasks** — a stalled worker can otherwise hang the parent turn (issue #40) |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds (0 = unlimited). Effective as of Goal 399 — previously parsed but never consumed |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_WORKSPACE` | cwd | Root all fs/shell tools are sandboxed to |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a system prompt to load |
@@ -300,7 +300,7 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_PROVIDER_TYPE` | `openai` | Protocol: `openai` or `anthropic` |
 | `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Max tool-call loop iterations per run (0 = unlimited) |
-| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds; expiry finishes with `wall_clock_exceeded` (`0` = unlimited). Effective as of Goal 399 — previously parsed but never consumed. **Recommended for long-running multi-worker `agent(mode=parallel)` runs**: with the default `0`, one stalled worker LLM call can park the parent turn indefinitely (issue #40) |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds; expiry finishes with `wall_clock_exceeded` (`0` = unlimited). Effective as of Goal 399 — previously parsed but never consumed |
 | `RECURSIVE_HARD_STEP_CAP` | _(unset)_ | Process-level step ceiling. When set (>0), the effective step limit is `min(max_steps, cap)` — an operator ceiling that clamps even `max_steps=0` sessions |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a custom system-prompt file |

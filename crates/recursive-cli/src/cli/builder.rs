@@ -456,13 +456,8 @@ pub(crate) async fn build_runtime(
     // Sub-agent / team coordination is a channel-agnostic capability: every
     // agent-loop surface registers the unified `Agent` tool when
     // `config.subagent_enabled` is set, in lockstep with the coordinator
-    // prompt injected by `assemble_system_prompt`. Issue #40: the CLI loop
-    // mints its shutdown token once, so a one-shot filled slot (never
-    // refreshed) carries the same static-token semantics as before.
-    let subagent_token_slot = shutdown_token
-        .clone()
-        .map(|token| Arc::new(Mutex::new(Some(token))));
-    tools = register_subagent_if_enabled(tools, config, provider.clone(), subagent_token_slot);
+    // prompt injected by `assemble_system_prompt`.
+    tools = register_subagent_if_enabled(tools, config, provider.clone());
 
     let skills = discover_loaded_skills(config);
 

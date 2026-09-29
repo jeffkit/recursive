@@ -99,37 +99,6 @@ impl std::fmt::Display for FinishReason {
     }
 }
 
-/// Inject the skill catalog as a `<system-reminder>` user turn, appended
-/// to the **tail** of the per-request message copy.
-///
-/// Why tail (not head): the catalog is volatile — it changes when skills
-/// load/unload. Placing it at the head (right after the leading `system`
-/// message, as an earlier draft did) busts the prefix cache for every
-/// message that follows it on each skill change. At the tail it sits in
-/// the most-recent turn, mirroring fake-cc's `skill_listing` attachment,
-/// which `reorderAttachmentsForAPI` bubbles to the end of the
-/// conversation. The static `system` field is untouched either way, so
-/// prefix caching of the system prompt + stable history is preserved.
-///
-/// Correctness: appending a `user` turn at the tail is safe on both
-/// Anthropic and OpenAI-compatible providers. It never splits an
-/// assistant→tool_result pair (we only append, never insert), so
-/// AGENTS.md invariant #8 holds. The transcript is never mutated — only
-/// the per-request copy is wrapped.
-pub(crate) fn inject_skill_reminder(
-    messages: &[crate::message::Message],
-    skills: &[crate::skills::Skill],
-) -> Vec<crate::message::Message> {
-    if skills.is_empty() {
-        return messages.to_vec();
-    }
-    let reminder = crate::skills::skill_reminder(skills);
-    let mut out = Vec::with_capacity(messages.len() + 1);
-    out.extend(messages.iter().cloned());
-    out.push(crate::message::Message::user(reminder));
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

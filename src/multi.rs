@@ -18,14 +18,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock};
 
-/// Per-turn cancellation token slot (issue #40). Hosts that mint a fresh
-/// CancellationToken at each turn start (the TUI) store the current token
-/// here instead of attaching one static token; the `Agent` tool clones it
-/// out at dispatch time so parallel workers receive a child token of the
-/// CURRENT turn's interrupt token. A static `with_shutdown_token` token, if
-/// attached, takes precedence.
-pub type SharedTokenSlot = Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>;
-
 /// Shared memory store for multi-agent coordination.
 #[derive(Clone)]
 pub struct SharedMemory {
@@ -569,15 +561,10 @@ pub fn coordinator_system_prompt() -> &'static str {
 /// with the `Agent` tool, so a coordinator can dispatch a worker via `agent`
 /// and then inspect / message / cancel it. Without this wiring the coordinator
 /// prompt would advertise tools it cannot actually call.
-///
-/// Cancellation wiring (issue #40): pass a static token via `shutdown_token`
-/// (CLI loop / HTTP-serve mint the token once), or a per-turn
-/// [`SharedTokenSlot`] (TUI refreshes it each turn), or both (static wins).
 pub fn register_subagent_if_enabled(
     tools: ToolRegistry,
     config: &Config,
     provider: Arc<dyn ChatProvider>,
-    shutdown_token: Option<SharedTokenSlot>,
 ) -> ToolRegistry {
     if !config.subagent_enabled {
         return tools;
@@ -607,14 +594,7 @@ pub fn register_subagent_if_enabled(
     .with_definitions(defs)
     .with_task_registry(task_registry.clone())
     .with_registry(worker_registry.clone())
-    .with_workers(worker_table.clone())
-    // Issue #40: workers inherit the parent's wall budget and cancellation
-    // token so a stalled worker LLM call can never park the parent turn.
-    .with_wall_timeout_secs(config.wall_timeout_secs);
-    let agent = match shutdown_token {
-        Some(slot) => agent.with_shutdown_token_slot(slot),
-        None => agent,
-    };
+    .with_workers(worker_table.clone());
 
     // Register the `Agent` tool first, then the coordination tools that the
     // coordinator prompt teaches alongside it. Each is built from the same
@@ -1312,7 +1292,7 @@ mod tests {
         let config = test_config(); // subagent_enabled: false
         let tools = crate::tools::ToolRegistry::local();
         let initial_names = tools.names();
-        let result = register_subagent_if_enabled(tools, &config, provider, None);
+        let result = register_subagent_if_enabled(tools, &config, provider);
         assert_eq!(
             result.names(),
             initial_names,

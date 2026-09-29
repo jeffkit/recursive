@@ -801,19 +801,7 @@ async fn main() -> anyhow::Result<()> {
             // Register the unified `Agent` tool when sub-agent is enabled, so
             // the HTTP API matches CLI/TUI capabilities. Done before deriving
             // tool_infos so /tools/list also advertises the Agent tool.
-            // Issue #40: pass the server-level shutdown token so sub-agent
-            // workers are cancellable on graceful shutdown (SIGTERM/Ctrl-C).
-            // Wrapped in a one-shot filled slot (never refreshed — the token
-            // is server-lifetime), preserving static-token semantics.
-            let http_shutdown = shutdown_signal();
-            let tools = recursive::register_subagent_if_enabled(
-                tools,
-                &config,
-                provider.clone(),
-                Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
-                    http_shutdown.clone(),
-                )))),
-            );
+            let tools = recursive::register_subagent_if_enabled(tools, &config, provider.clone());
             let tool_infos: Vec<recursive::http::ToolInfo> = tools
                 .specs()
                 .into_iter()
@@ -923,8 +911,9 @@ async fn main() -> anyhow::Result<()> {
                      Any client with network access can execute commands."
                 );
             }
+            let shutdown = shutdown_signal();
             recursive::http::serve_with_graceful_shutdown(listener, router, async move {
-                http_shutdown.cancelled().await
+                shutdown.cancelled().await
             })
             .await?;
             eprintln!("shutdown: HTTP server stopped gracefully");
@@ -2047,16 +2036,8 @@ async fn run_loop(
     };
 
     // Sub-agent tool registration (channel-agnostic) + common prompt assembly,
-    // matching every other agent-loop surface. Issue #40: one-shot filled
-    // slot with the loop's static shutdown token (never refreshed).
-    tools = recursive::register_subagent_if_enabled(
-        tools,
-        &config,
-        provider.clone(),
-        Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
-            shutdown.clone(),
-        )))),
-    );
+    // matching every other agent-loop surface.
+    tools = recursive::register_subagent_if_enabled(tools, &config, provider.clone());
     let skills = cli::builder::discover_loaded_skills(&config);
     let assembled = recursive::assemble_system_prompt(
         &config.system_prompt,

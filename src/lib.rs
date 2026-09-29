@@ -25,7 +25,6 @@ pub mod checkpoint_log;
 pub mod compact;
 pub mod config;
 pub mod config_file;
-pub(crate) mod context_breakdown;
 pub mod coordinator;
 pub mod cost;
 pub mod error;
@@ -100,7 +99,7 @@ pub use message::{Message, Role};
 pub use migrate::{migrate_workspace, MigrateReport};
 pub use multi::{
     register_subagent_if_enabled, AgentMessage, AgentPool, AgentRole, MessageBus, MessageType,
-    SharedMemory, SharedTokenSlot,
+    SharedMemory,
 };
 pub use paths::{
     legacy_paths_in_workspace, user_data_dir, user_scratchpad_path, user_sessions_dir,

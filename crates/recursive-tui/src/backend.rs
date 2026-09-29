@@ -45,10 +45,6 @@ pub struct Backend {
     /// with `JoinHandle::abort()`. Exposed so tests can assert the wiring;
     /// the UI can also observe it to know whether a turn is interruptible.
     pub current_interrupt_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
-    /// Issue #40: the same per-turn token mirrored into the `agent` tool's
-    /// slot, so Ctrl-C interrupts parallel sub-agent workers too. Written
-    /// and cleared alongside `current_interrupt_token`.
-    pub subagent_token_slot: recursive::SharedTokenSlot,
     /// Goal-161: side-channel for runtime permission requests.
     /// Separate from `event_rx` because `PermissionRequest` carries a
     /// `oneshot::Sender<bool>` which is not `PartialEq`/`Clone`.
@@ -94,7 +90,6 @@ impl Backend {
             state: RuntimeBuild::Ready(Some(Box::new(rt))),
             session_roots: new_shared_sandbox_roots(),
             wakeup_slot: Arc::new(std::sync::Mutex::new(None)),
-            subagent_token_slot: Arc::new(std::sync::Mutex::new(None)),
             bg_manager: Arc::new(tokio::sync::Mutex::new(
                 recursive::tools::BackgroundJobManager::new(),
             )),
@@ -114,7 +109,6 @@ impl Backend {
 
         let session_roots = tui_rt.session_roots.clone();
         let wakeup_slot = tui_rt.wakeup_slot.clone();
-        let subagent_token_slot = tui_rt.subagent_token_slot.clone();
         let bg_manager = tui_rt.bg_manager.clone();
 
         let worker = tokio::spawn(worker_loop(
@@ -124,7 +118,6 @@ impl Backend {
             perm_tx,
             current_interrupt_token.clone(),
             permission_enabled.clone(),
-            subagent_token_slot.clone(),
             wakeup_slot.clone(),
             bg_manager.clone(),
             #[cfg(feature = "weixin")]
@@ -137,7 +130,6 @@ impl Backend {
             perm_rx,
             current_interrupt_token,
             permission_enabled,
-            subagent_token_slot,
             #[cfg(feature = "weixin")]
             weixin_tx,
             skill_install_rx,
@@ -163,7 +155,6 @@ impl Backend {
 
         let session_roots = tui_rt.session_roots.clone();
         let wakeup_slot = tui_rt.wakeup_slot.clone();
-        let subagent_token_slot = tui_rt.subagent_token_slot.clone();
         let bg_manager = tui_rt.bg_manager.clone();
 
         let worker = tokio::spawn(worker_loop(
@@ -173,7 +164,6 @@ impl Backend {
             perm_tx,
             current_interrupt_token.clone(),
             permission_enabled.clone(),
-            subagent_token_slot.clone(),
             wakeup_slot.clone(),
             bg_manager.clone(),
             #[cfg(feature = "weixin")]
@@ -186,7 +176,6 @@ impl Backend {
             perm_rx,
             current_interrupt_token,
             permission_enabled,
-            subagent_token_slot,
             #[cfg(feature = "weixin")]
             weixin_tx,
             skill_install_rx,
@@ -583,7 +572,6 @@ async fn worker_loop(
     perm_tx: mpsc::UnboundedSender<PermissionRequest>,
     current_interrupt_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     permission_enabled: Arc<AtomicBool>,
-    subagent_token_slot: recursive::SharedTokenSlot,
     wakeup_slot: recursive::tools::WakeupSlot,
     bg_manager: Arc<tokio::sync::Mutex<recursive::tools::BackgroundJobManager>>,
     #[cfg(feature = "weixin")] mut weixin_rx: mpsc::UnboundedReceiver<WeixinBackendRequest>,
@@ -904,9 +892,6 @@ async fn worker_loop(
                     *current_interrupt_token
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
-                    *subagent_token_slot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
 
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for SendMessage task");
@@ -957,9 +942,6 @@ async fn worker_loop(
                     *current_interrupt_token
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
-                    *subagent_token_slot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
                 } else if let RuntimeBuild::Offline { reason } = &state {
                     let _ = event_tx.send(UiEvent::Error {
                         message: reason.clone(),
@@ -983,9 +965,6 @@ async fn worker_loop(
                     let interrupt_token = CancellationToken::new();
                     rt_mut.set_interrupt_token(interrupt_token.clone());
                     *current_interrupt_token
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
-                    *subagent_token_slot
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
                     let Some(rt) = rt_opt.take() else {
@@ -1021,9 +1000,6 @@ async fn worker_loop(
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     *current_interrupt_token
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
-                    *subagent_token_slot
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
                 }
@@ -1157,9 +1133,6 @@ async fn worker_loop(
                     *current_interrupt_token
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
-                    *subagent_token_slot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for SetGoal task");
                         continue;
@@ -1199,9 +1172,6 @@ async fn worker_loop(
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     *current_interrupt_token
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
-                    *subagent_token_slot
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
                 } else if let RuntimeBuild::Offline { reason } = &state {
@@ -1343,9 +1313,6 @@ async fn worker_loop(
                     *current_interrupt_token
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
-                    *subagent_token_slot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(interrupt_token.clone());
                     let Some(rt) = rt_opt.take() else {
                         tracing::warn!("backend: runtime not available for RunSkillPrompt task");
                         continue;
@@ -1431,9 +1398,6 @@ async fn worker_loop(
                     *rt_opt = Some(recovered);
                     let _ = event_tx.send(UiEvent::TurnFinished);
                     *current_interrupt_token
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = None;
-                    *subagent_token_slot
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = None;
                 } else if let RuntimeBuild::Offline { reason } = &state {
@@ -3381,178 +3345,5 @@ mod tests {
             None => std::env::remove_var("OPENAI_API_KEY"),
         }
         assert!(got_error, "expected an offline error for SwitchModel");
-    }
-
-    /// Issue #40 — the per-turn interrupt token is mirrored into the
-    /// `agent` tool's token slot (`subagent_token_slot`), so a Ctrl-C
-    /// interrupt reaches parallel sub-agent workers via the child-token
-    /// tree, and the slot is cleared when the turn ends.
-    #[tokio::test]
-    #[cfg_attr(target_os = "windows", ignore)]
-    async fn turn_start_populates_subagent_token_slot() {
-        // Reuse the Goal-383 shape: a HangTool keeps the turn in-flight so
-        // the slot is observable mid-turn.
-        use recursive::llm::{Completion, MockProvider, ToolCall};
-        use recursive::tools::{Tool, ToolRegistry};
-        use recursive::AgentRuntime;
-        use serde_json::{json, Value};
-
-        struct HangTool;
-
-        #[async_trait::async_trait]
-        impl Tool for HangTool {
-            fn spec(&self) -> recursive::llm::ToolSpec {
-                recursive::llm::ToolSpec {
-                    name: "hang".into(),
-                    description: "test tool that never returns".into(),
-                    parameters: json!({"type":"object","properties":{}}),
-                }
-            }
-            async fn execute(&self, _args: Value) -> recursive::error::Result<String> {
-                std::future::pending::<()>().await;
-                Ok("never".into())
-            }
-        }
-
-        let empty_home = tempfile::tempdir().expect("tempdir");
-        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
-
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let llm = Arc::new(
-            MockProvider::new(vec![Completion {
-                content: "calling hang".into(),
-                tool_calls: vec![ToolCall {
-                    id: "c1".into(),
-                    name: "hang".into(),
-                    arguments: json!({}),
-                }],
-                finish_reason: Some("tool_calls".into()),
-                usage: None,
-                reasoning_content: None,
-            }])
-            .with_on_complete(notify.clone()),
-        );
-        let tools = ToolRegistry::local().register(Arc::new(HangTool));
-        let rt = AgentRuntime::builder()
-            .llm(llm)
-            .tools(tools)
-            .build()
-            .expect("runtime builds");
-
-        let backend = Backend::spawn_with_runtime(rt);
-        assert!(
-            backend
-                .subagent_token_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none(),
-            "slot must be empty before a turn starts"
-        );
-
-        backend
-            .action_tx
-            .send(UserAction::SendMessage("hi".into()))
-            .unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), notify.notified()).await;
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-        // Turn start installs the SAME token in both slots.
-        let cur = backend
-            .current_interrupt_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let slotted = backend
-            .subagent_token_slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(slotted.is_some(), "slot must be populated mid-turn");
-        assert!(
-            cur.as_ref().map(|t| t.is_cancelled()) == slotted.as_ref().map(|t| t.is_cancelled()),
-            "slot and current token must be live mirrors"
-        );
-        drop(cur);
-        drop(slotted);
-
-        // Interrupt cancels the slotted token.
-        backend.action_tx.send(UserAction::Interrupt).unwrap();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut cancelled = false;
-        while tokio::time::Instant::now() < deadline {
-            let tok = backend
-                .subagent_token_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if tok.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
-                cancelled = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(cancelled, "Interrupt should cancel the slotted token");
-        // (backend detached; the hung turn task is dropped with it)
-    }
-
-    /// Issue #40 — a turn that completes normally clears the sub-agent token
-    /// slot back to None (no stale token for the next turn).
-    #[tokio::test]
-    #[cfg_attr(target_os = "windows", ignore)]
-    async fn turn_end_clears_subagent_token_slot() {
-        let empty_home = tempfile::tempdir().expect("tempdir");
-        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
-        use recursive::llm::{Completion, MockProvider};
-        use recursive::tools::ToolRegistry;
-        use recursive::AgentRuntime;
-
-        let llm = Arc::new(MockProvider::new(vec![Completion {
-            content: "done".into(),
-            tool_calls: vec![],
-            finish_reason: Some("stop".into()),
-            usage: None,
-            reasoning_content: None,
-        }]));
-        let rt = AgentRuntime::builder()
-            .llm(llm)
-            .tools(ToolRegistry::local())
-            .build()
-            .expect("runtime builds");
-        let mut backend = Backend::spawn_with_runtime(rt);
-        backend
-            .action_tx
-            .send(UserAction::SendMessage("hi".into()))
-            .unwrap();
-
-        // Wait for TurnFinished; then the slot must be empty again.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match backend.event_rx.try_recv() {
-                Ok(UiEvent::TurnFinished) => break,
-                Ok(_) => continue,
-                Err(_) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "timed out waiting for TurnFinished"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            }
-        }
-        // Small grace: the clear happens right before TurnFinished in some
-        // arms and right after in others; poll briefly for None.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let cleared = backend
-                .subagent_token_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none();
-            if cleared {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "slot must be cleared after the turn ends"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
     }
 }
