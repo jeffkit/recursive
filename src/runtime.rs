@@ -171,6 +171,9 @@ pub struct AgentRuntime {
     /// Goal-165: plan mode 2.0 gate — shared with `EnterPlanModeTool` and
     /// `ExitPlanModeTool`. `confirm_plan` / `reject_plan` forward to it.
     plan_approval_gate: Arc<PlanApprovalGate>,
+    /// Issue #47④: optional bound on the `exit_plan_mode` approval wait for
+    /// sink-swapping hosts (REPL). `None` keeps wait-forever semantics.
+    approval_wait_timeout_secs: Option<u64>,
     /// Goal-202: pre-confirmation gate — shared with `RequestPlanModeTool`.
     /// `approve_plan_mode_request` / `reject_plan_mode_request` forward here.
     plan_mode_request_gate: Arc<PlanModeRequestGate>,
@@ -932,12 +935,21 @@ impl AgentRuntime {
             )));
         // Goal-165: re-register ExitPlanModeTool with the new sink so that
         // AgentEvent::PlanProposed reaches the new consumer (e.g. TUI).
-        self.kernel
-            .tools_mut()
-            .register_mut(Arc::new(ExitPlanModeTool::new(
-                self.plan_approval_gate.clone(),
-                sink,
-            )));
+        // Issue #47④: hosts that opt in (REPL) get a bounded approval wait
+        // so an unanswered plan review cannot park the turn forever; TUI /
+        // SDK hosts keep the default wait-forever semantics.
+        let mut tool = ExitPlanModeTool::new(self.plan_approval_gate.clone(), sink);
+        if let Some(secs) = self.approval_wait_timeout_secs {
+            tool = tool.with_approval_wait_timeout(std::time::Duration::from_secs(secs));
+        }
+        self.kernel.tools_mut().register_mut(Arc::new(tool));
+    }
+
+    /// Enable a bounded approval wait for `exit_plan_mode` when the event
+    /// sink is swapped (REPL turn loop). On timeout the plan is treated as
+    /// rejected ("plan approval timed out") so the turn can finish (#7).
+    pub fn set_approval_wait_timeout_secs(&mut self, secs: u64) {
+        self.approval_wait_timeout_secs = Some(secs);
     }
 
     /// Swap the event sink **without** re-registering any sink-dependent tools.

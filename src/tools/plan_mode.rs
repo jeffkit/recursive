@@ -281,6 +281,11 @@ pub struct ExitPlanModeTool {
     event_sink: Arc<dyn EventSink>,
     /// Optional permissions config to validate plan coverage.
     permissions: Option<Arc<PermissionsConfig>>,
+    /// Optional upper bound on how long to wait for the reviewer's decision
+    /// (issue #47④). `None` (default) preserves the existing
+    /// wait-forever semantics for TUI / HTTP; REPL sets a finite bound so
+    /// an approval nobody answers still ends the turn (finish is data, #7).
+    approval_wait_timeout: Option<std::time::Duration>,
 }
 
 impl ExitPlanModeTool {
@@ -293,7 +298,16 @@ impl ExitPlanModeTool {
             gate,
             event_sink,
             permissions: None,
+            approval_wait_timeout: None,
         }
+    }
+
+    /// Bound the approval wait (issue #47④). On timeout the tool returns a
+    /// rejection result ("plan approval timed out") instead of parking the
+    /// turn forever.
+    pub fn with_approval_wait_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.approval_wait_timeout = Some(timeout);
+        self
     }
 
     /// Attach a permissions config so the tool can validate that the plan
@@ -364,9 +378,25 @@ impl Tool for ExitPlanModeTool {
             })
             .await;
 
-        // Block until the human makes a decision.
+        // Block until the human makes a decision (bounded when the host set
+        // an approval wait timeout — issue #47④; a timed-out wait surfaces
+        // as a rejection so the turn can finish).
         // No lock is held across this await (see PlanApprovalGate::wait_for_approval).
-        let result = self.gate.wait_for_approval().await;
+        let result = match self.approval_wait_timeout {
+            Some(limit) => match tokio::time::timeout(limit, self.gate.wait_for_approval()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Route through gate.reject() so `pending_plan` is
+                    // cleared — otherwise a later compaction would re-inject
+                    // a plan that is no longer awaiting approval.
+                    let reason =
+                        format!("plan approval timed out after {limit:?}: no reviewer decision");
+                    self.gate.reject(reason.clone());
+                    PlanApprovalResult::Rejected { reason }
+                }
+            },
+            None => self.gate.wait_for_approval().await,
+        };
 
         match result {
             PlanApprovalResult::Approved => Ok(json!({ "approved": true }).to_string()),
@@ -849,6 +879,24 @@ mod tests {
             !tool.is_readonly(),
             "EnterPlanModeTool must NOT be readonly (it sets exploring_plan_mode)"
         );
+    }
+
+    /// Issue #47④ — a bounded approval wait must return a rejection on
+    /// timeout (no reviewer decision), and quickly.
+    #[tokio::test]
+    async fn wait_for_approval_times_out_and_rejects() {
+        let gate = make_gate();
+        let tool = ExitPlanModeTool::new(gate, Arc::new(NullSink))
+            .with_approval_wait_timeout(std::time::Duration::from_millis(100));
+
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({ "plan": "do the thing" }))
+            .await
+            .expect("execute must return (finish is data, not Err)");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(out.contains("\"approved\":false"), "got: {out}");
+        assert!(out.contains("timed out"), "got: {out}");
     }
 
     #[test]

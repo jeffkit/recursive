@@ -41,6 +41,31 @@ use crate::tools::fs::{ReadFile, ReadFileState, WriteFile};
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
+/// Fallback aggregate deadline for agent dispatches with no configured
+/// wall-clock budget (issue #47③). Far above the provider reqwest timeout
+/// (180s) times a reasonable `max_steps`, so legitimate long workers are
+/// never truncated in production — it only bounds the pathological
+/// "no worker ever finishes and nothing is configured" case.
+const DEFAULT_FALLBACK_DEADLINE_SECS: u64 = 3600;
+
+fn cancelled_result(worker_id: &str) -> Error {
+    Error::BadToolArgs {
+        name: "agent".into(),
+        message: format!(
+            "[worker '{worker_id}' finished: Cancelled]\n(aggregate cancellation; worker did not finish)"
+        ),
+    }
+}
+
+fn timeout_result(worker_id: &str) -> Error {
+    Error::BadToolArgs {
+        name: "agent".into(),
+        message: format!(
+            "[worker '{worker_id}' finished: WallClockExceeded]\n(aggregate deadline; worker did not finish)"
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SharedMemoryRead
 // ---------------------------------------------------------------------------
@@ -241,6 +266,11 @@ pub struct AgentTool {
     /// Wall-clock budget propagated to worker runtimes (Goal 399 semantics:
     /// 0 = unbounded; children must not outlive the parent's budget).
     wall_timeout_secs: u64,
+    /// Fallback aggregate deadline (secs) when `wall_timeout_secs == 0`.
+    /// Issue #47③: even an unconfigured dispatch must be bounded so a
+    /// stalled worker cannot park the parent turn forever. Default is far
+    /// above the provider's 180s request timeout × reasonable max_steps.
+    fallback_deadline_secs: u64,
     /// Cancellation token propagated to worker runtimes. Workers receive a
     /// CHILD token so a parent cancel stops all workers, while one worker's
     /// own cancellation cannot affect its siblings (issue #40).
@@ -272,6 +302,7 @@ impl AgentTool {
             definitions: None,
             workers: Arc::new(Mutex::new(HashMap::new())),
             wall_timeout_secs: 0,
+            fallback_deadline_secs: DEFAULT_FALLBACK_DEADLINE_SECS,
             shutdown_token: None,
             shutdown_token_slot: None,
         }
@@ -317,6 +348,25 @@ impl AgentTool {
     pub fn with_wall_timeout_secs(mut self, secs: u64) -> Self {
         self.wall_timeout_secs = secs;
         self
+    }
+
+    /// Override the fallback aggregate deadline used when no wall-clock
+    /// budget is configured (issue #47③). Mainly for tests.
+    pub fn with_fallback_deadline_secs(mut self, secs: u64) -> Self {
+        self.fallback_deadline_secs = secs;
+        self
+    }
+
+    /// Resolve the effective aggregate deadline for a dispatch
+    /// (issue #47②③): configured wall timeout if set, else the fallback
+    /// bound so an unconfigured dispatch is never unbounded.
+    fn effective_deadline(&self) -> std::time::Instant {
+        let secs = if self.wall_timeout_secs > 0 {
+            self.wall_timeout_secs
+        } else {
+            self.fallback_deadline_secs
+        };
+        std::time::Instant::now() + std::time::Duration::from_secs(secs)
     }
 
     /// Propagate a cancellation token so Ctrl-C / host interrupt can stop
@@ -676,8 +726,39 @@ impl AgentTool {
             name: "agent".into(),
             message: "mode 'single' requires exactly one manifest entry".to_string(),
         })?;
-        self.run_worker(worker_id, entry, prompt, max_steps, child_depth)
-            .await
+        // Issue #47②: single mode gets the same cancel/deadline bounds as
+        // parallel — a hanging provider must not park the parent turn.
+        let token = self.effective_shutdown_token().map(|t| t.child_token());
+        let deadline = self.effective_deadline();
+        let worker = self.run_worker(worker_id, entry, prompt, max_steps, child_depth);
+        let mut worker = std::pin::pin!(worker);
+        let mut timed_out = false;
+        let result = match token.as_ref() {
+            Some(t) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                tokio::select! {
+                    r = worker.as_mut() => r,
+                    _ = t.cancelled() => Err(cancelled_result(worker_id)),
+                    _ = tokio::time::sleep(remaining) => { timed_out = true; Err(timeout_result(worker_id)) }
+                }
+            }
+            None => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, worker.as_mut()).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        timed_out = true;
+                        Err(timeout_result(worker_id))
+                    }
+                }
+            }
+        };
+        if timed_out {
+            if let Some(t) = &token {
+                t.cancel();
+            }
+        }
+        result
     }
 
     /// Parallel mode: all workers run concurrently via `futures_util::future::join_all`.
@@ -715,15 +796,12 @@ impl AgentTool {
         let definitions = self.definitions.clone();
         let workers = self.workers.clone();
         let wall_timeout_secs = self.wall_timeout_secs;
+        let fallback_deadline_secs = self.fallback_deadline_secs;
         // Child token: cancelling the parent cancels all workers at once;
         // a single worker's runtime never cancels its siblings.
         let child_token = self.effective_shutdown_token().map(|t| t.child_token());
         let token_slot = self.shutdown_token_slot.clone();
-        let deadline = if wall_timeout_secs > 0 {
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(wall_timeout_secs))
-        } else {
-            None
-        };
+        let deadline = self.effective_deadline();
 
         // 结果登记表：worker 任务返回前先把结果写入这里。聚合超时/取消分支据此
         // 抢救已完成 worker 的真实结果——此时 JoinHandle 可能已被 join_all 的
@@ -782,6 +860,7 @@ impl AgentTool {
                     definitions,
                     workers,
                     wall_timeout_secs,
+                    fallback_deadline_secs,
                     shutdown_token: worker_token,
                     shutdown_token_slot: token_slot,
                 };
@@ -815,10 +894,13 @@ impl AgentTool {
         // called below (cancel() synchronously flips `is_cancelled()`, so
         // post-hoc `is_cancelled()` probing would always say "Cancelled").
         let mut timed_out = false;
+        // `deadline` is always `Some` (issue #47③: effective_deadline falls
+        // back to a large bound), so the unbounded `(None, None)` shape no
+        // longer exists.
         let outcomes: Vec<Result<(String, Result<String>), tokio::task::JoinError>> =
-            match (&child_token, deadline) {
-                (Some(token), Some(dl)) => {
-                    let remaining = dl.saturating_duration_since(std::time::Instant::now());
+            match &child_token {
+                Some(token) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     let mut join = futures_util::future::join_all(handles.iter_mut());
                     tokio::select! {
                         o = &mut join => { aggregated = true; o }
@@ -826,15 +908,8 @@ impl AgentTool {
                         _ = tokio::time::sleep(remaining) => { timed_out = true; Vec::new() }
                     }
                 }
-                (Some(token), None) => {
-                    let mut join = futures_util::future::join_all(handles.iter_mut());
-                    tokio::select! {
-                        o = &mut join => { aggregated = true; o }
-                        _ = token.cancelled() => Vec::new(),
-                    }
-                }
-                (None, Some(dl)) => {
-                    let remaining = dl.saturating_duration_since(std::time::Instant::now());
+                None => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     let mut join = futures_util::future::join_all(handles.iter_mut());
                     match tokio::time::timeout(remaining, &mut join).await {
                         Ok(o) => {
@@ -846,10 +921,6 @@ impl AgentTool {
                             Vec::new()
                         }
                     }
-                }
-                (None, None) => {
-                    aggregated = true;
-                    futures_util::future::join_all(handles.iter_mut()).await
                 }
             };
 
@@ -934,12 +1005,40 @@ impl AgentTool {
         keys.sort();
 
         let mut result_parts = Vec::new();
+        // Issue #47②: sequential mode gets the same cancel/deadline bounds as
+        // parallel, computed once for the whole sequence; a hanging worker
+        // must not park the parent turn. Finished parts are still returned
+        // (labelled) alongside the cut-off tail — finish is data (#7).
+        let token = self.effective_shutdown_token().map(|t| t.child_token());
+        let deadline = self.effective_deadline();
         for worker_id in &keys {
             let entry = &manifest[*worker_id];
-            let result = self
-                .run_worker(worker_id, entry, prompt, max_steps, child_depth)
-                .await?;
-            result_parts.push(result);
+            let worker = self.run_worker(worker_id, entry, prompt, max_steps, child_depth);
+            let mut worker = std::pin::pin!(worker);
+            let (result, timed_out) = match &token {
+                Some(t) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    tokio::select! {
+                        r = worker.as_mut() => (r, false),
+                        _ = t.cancelled() => (Err(cancelled_result(worker_id)), false),
+                        _ = tokio::time::sleep(remaining) => (Err(timeout_result(worker_id)), true),
+                    }
+                }
+                None => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match tokio::time::timeout(remaining, worker.as_mut()).await {
+                        Ok(r) => (r, false),
+                        Err(_) => (Err(timeout_result(worker_id)), true),
+                    }
+                }
+            };
+            if timed_out {
+                // Finish is data (#7): label the cut-off tail and return the
+                // parts already completed alongside it, like parallel mode.
+                result_parts.push(timeout_result(worker_id).to_string());
+                break;
+            }
+            result_parts.push(result?);
         }
 
         Ok(result_parts.join("\n\n"))
@@ -2065,5 +2164,120 @@ allowed_tools:
             .expect("static token must resolve");
         static_token.cancel();
         assert!(resolved.is_cancelled(), "static token must take precedence");
+    }
+
+    /// Issue #47③ — parallel mode with no wall budget configured must still
+    /// be bounded by the fallback deadline (overridden short here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_parallel_unconfigured_wall_timeout_still_bounded() {
+        let agent = hanging_agent().0.with_fallback_deadline_secs(2);
+        let fut = agent.execute(serde_json::json!({
+            "mode": "parallel",
+            "manifest": { "w0": { "system_prompt": "a", "allowed_tools": [] } },
+            "prompt": "go",
+            "max_steps": 3
+        }));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("fallback deadline must bound the unconfigured dispatch")
+            .expect("execute must return Ok");
+        assert!(result.contains("WallClockExceeded"), "got: {result}");
+    }
+
+    /// Issue #47② — single mode with a cancelled parent token must return
+    /// (cancelled semantics), not park forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_single_cancel_returns_within_budget() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let agent = hanging_agent().0.with_shutdown_token(token.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            token.cancel();
+        });
+        let fut = agent.execute(serde_json::json!({
+            "mode": "single",
+            "manifest": { "w0": { "system_prompt": "a", "allowed_tools": [] } },
+            "prompt": "go",
+            "max_steps": 3
+        }));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("single mode must terminate via cancellation");
+        let err = result.expect_err("cancelled single dispatch surfaces the cut-off");
+        assert!(err.to_string().contains("Cancelled"), "got: {err}");
+    }
+
+    /// Issue #47② — single mode with a short wall budget must return
+    /// WallClockExceeded semantics rather than park forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_single_wall_timeout_returns() {
+        let agent = hanging_agent().0.with_wall_timeout_secs(1);
+        let fut = agent.execute(serde_json::json!({
+            "mode": "single",
+            "manifest": { "w0": { "system_prompt": "a", "allowed_tools": [] } },
+            "prompt": "go",
+            "max_steps": 3
+        }));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("single mode must terminate via wall budget");
+        let err = result.expect_err("timed-out single dispatch surfaces the cut-off");
+        assert!(err.to_string().contains("WallClockExceeded"), "got: {err}");
+    }
+
+    /// Issue #47② — sequential mode: a hanging first worker must not park
+    /// the parent turn; the cut-off surfaces via the fallback deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_sequential_wall_timeout_returns() {
+        let agent = hanging_agent().0.with_fallback_deadline_secs(2);
+        let fut = agent.execute(serde_json::json!({
+            "mode": "sequential",
+            "manifest": {
+                "w0": { "system_prompt": "a", "allowed_tools": [] },
+                "w1": { "system_prompt": "b", "allowed_tools": [] }
+            },
+            "prompt": "go",
+            "max_steps": 3
+        }));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("sequential mode must terminate via fallback deadline");
+        // The cut-off tail is returned as labelled data (finish is data #7),
+        // not an Err — matching parallel-mode semantics.
+        let out = result.expect("timed-out sequential dispatch returns labelled parts");
+        assert!(out.contains("WallClockExceeded"), "got: {out}");
+    }
+
+    /// Test helper (issue #47): an AgentTool whose provider never returns —
+    /// kept alive by the returned tempdir.
+    fn hanging_agent() -> (AgentTool, tempfile::TempDir) {
+        struct HangingProvider;
+        #[async_trait::async_trait]
+        impl crate::llm::ChatProvider for HangingProvider {
+            async fn complete(
+                &self,
+                _m: &[crate::message::Message],
+                _t: &[crate::llm::ToolSpec],
+            ) -> crate::error::Result<Completion> {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                unreachable!("should have been cut off")
+            }
+            async fn stream(
+                &self,
+                _m: &[crate::message::Message],
+                _t: &[crate::llm::ToolSpec],
+                _tx: Option<crate::llm::StreamSender>,
+                _c: Option<tokio_util::sync::CancellationToken>,
+            ) -> crate::error::Result<Completion> {
+                unreachable!("stream not used")
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn ChatProvider> = Arc::new(HangingProvider);
+        let all_tools = ToolRegistry::new(Arc::new(LocalTransport));
+        (
+            AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None),
+            tmp,
+        )
     }
 }

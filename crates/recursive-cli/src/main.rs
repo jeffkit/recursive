@@ -2669,6 +2669,9 @@ async fn repl(
         }
 
         // Fresh ChannelSink per turn; swap back to NullSink when done.
+        // Issue #47④: bound the REPL's plan-approval wait so an unanswered
+        // exit_plan_mode review cannot park the turn forever.
+        runtime.set_approval_wait_timeout_secs(300);
         let (sink, event_rx) = ChannelSink::new();
         runtime.set_event_sink(Arc::new(sink));
 

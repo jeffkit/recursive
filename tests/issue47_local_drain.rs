@@ -1,0 +1,100 @@
+//! Issue #47 regression: `LocalTransport::exec_shell` stdout/stderr drain must
+//! be bounded. If a timed-out (or normally-exited) command leaves a descendant
+//! process holding the pipe write ends (`cmd &`, `nohup`), the `read_capped`
+//! reader tasks never see EOF; the drain is capped at `DRAIN_GRACE` so
+//! `exec_shell` still returns once the child itself has exited.
+
+use std::time::Duration;
+
+use recursive::tools::{LocalTransport, ToolTransport};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_exec_shell_returns_despite_orphan_descendant() {
+    let t = LocalTransport;
+    let tmp = tempfile::tempdir().unwrap();
+
+    // `sh -c "sleep 8 & echo hi"` — sh exits immediately; the forked `sleep`
+    // inherits the stdout/stderr write ends, so EOF never arrives on the
+    // tool's reader side until sleep exits.
+    let fut = t.exec_shell(
+        "sleep 8 & echo hi",
+        tmp.path(),
+        &[],
+        Duration::from_secs(2), // command timeout: sh exits instantly anyway
+        64 * 1024,
+    );
+
+    // Bounded grace: command timeout (2s) + DRAIN_GRACE (2s) + margin (1s).
+    // If the drain were unbounded, this outer timeout fires while `sleep 8`
+    // still holds the pipes.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), fut).await;
+
+    match outcome {
+        Ok(res) => {
+            let res = res.expect("exec_shell should succeed (sh exited normally)");
+            assert!(res.stdout.contains("hi"), "stdout: {}", res.stdout);
+        }
+        Err(_) => panic!(
+            "issue #47 regression: exec_shell did not return within 5s — \
+             reader tasks are parked on a pipe held by the orphaned `sleep`"
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_exec_shell_timeout_branch_returns_promptly() {
+    let t = LocalTransport;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let start = std::time::Instant::now();
+    let res = t
+        .exec_shell(
+            "sleep 30",
+            tmp.path(),
+            &[],
+            Duration::from_secs(1),
+            64 * 1024,
+        )
+        .await;
+
+    let err = res.expect_err("sleep 30 with 1s timeout must time out");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "timeout branch took {:?} — drain is unbounded",
+        start.elapsed()
+    );
+}
+
+/// Timeout + orphan descendant: the timeout branch must drain the reader
+/// tasks through `drain_with_grace` too, not park on pipes held by the
+/// orphaned `sleep`.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_exec_shell_timeout_with_orphan_returns_bounded() {
+    let t = LocalTransport;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let start = std::time::Instant::now();
+    // The shell itself stays alive (blocking `child.wait()` until the 1s
+    // timeout fires) while the forked `sleep` orphan holds the pipe write
+    // ends, so the post-kill drain must be bounded.
+    let res = t
+        .exec_shell(
+            "sleep 30 & sleep 30",
+            tmp.path(),
+            &[],
+            Duration::from_secs(1),
+            64 * 1024,
+        )
+        .await;
+
+    let err = res.expect_err("sleep 30 & sleep 30 with 1s timeout must time out");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+    // timeout (1s) + two sequential DRAIN_GRACE drains (2s each, orphan holds
+    // both pipes) + margin (1s).
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "timeout+orphan branch took {:?} — reader tasks parked on the orphaned sleep's pipes",
+        start.elapsed()
+    );
+}

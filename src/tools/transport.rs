@@ -47,6 +47,66 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use walkdir::WalkDir;
 
+/// Upper bound on how long we wait for the stdout/stderr reader tasks to see
+/// EOF after the child process has exited (or been killed). Normally the pipe
+/// write ends close immediately, but an orphaned descendant (`cmd &`,
+/// `nohup`) that inherited them keeps the pipe open forever; without this
+/// bound, `exec_shell` would park indefinitely on `task.await`.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Mirror of the bytes a reader task has read so far; lets us recover partial
+/// output when the drain is aborted because an orphaned descendant keeps the
+/// pipe write end open.
+type ReadMirror = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Spawn a `read_capped` reader task, mirroring bytes read so far.
+fn spawn_reader<R: AsyncReadExt + Unpin + Send + 'static>(
+    reader: R,
+    max: usize,
+) -> (tokio::task::JoinHandle<String>, ReadMirror) {
+    let mirror: ReadMirror = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let m = std::sync::Arc::clone(&mirror);
+    let handle = tokio::spawn(async move {
+        let mut reader = reader;
+        let mut buf = Vec::with_capacity(8 * 1024);
+        let mut tmp = [0u8; 8 * 1024];
+        loop {
+            match reader.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut m) = m.lock() {
+                        m.extend_from_slice(&tmp[..n]);
+                    }
+                    if buf.len() + n > max {
+                        let take = max.saturating_sub(buf.len());
+                        buf.extend_from_slice(&tmp[..take]);
+                        buf.extend_from_slice(b"\n... [output truncated]");
+                        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    (handle, mirror)
+}
+
+/// Bounded drain of a reader task: on timeout, return whatever output it had
+/// already read (mirrored) — a descendant holding the write end means EOF
+/// will never arrive, so we must not wait for the task to finish.
+async fn drain_with_grace(task: tokio::task::JoinHandle<String>, mirror: ReadMirror) -> String {
+    match tokio::time::timeout(DRAIN_GRACE, task).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(_) => mirror
+            .lock()
+            .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+            .unwrap_or_default(),
+    }
+}
+
 /// Result of reading a file.
 #[derive(Debug, Clone)]
 pub struct ReadResult {
@@ -464,16 +524,16 @@ impl SshTransport {
     async fn ssh_exec(&self, command: &str) -> std::io::Result<ExecResult> {
         let mut child = self.build_ssh_command(command).spawn()?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
         })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = child.stderr.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe not available")
         })?;
 
         let max: usize = 128 * 1024;
-        let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
-        let stderr_task = tokio::spawn(async move { read_capped(&mut stderr, max).await });
+        let (stdout_task, stdout_mirror) = spawn_reader(stdout, max);
+        let (stderr_task, stderr_mirror) = spawn_reader(stderr, max);
 
         let wait = child.wait();
         let status = match tokio::time::timeout(self.command_timeout, wait).await {
@@ -488,8 +548,8 @@ impl SshTransport {
                 // the error path — swallow secondary failures from it.
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = drain_with_grace(stdout_task, stdout_mirror).await;
+                let _ = drain_with_grace(stderr_task, stderr_mirror).await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("SSH command timed out after {:?}", self.command_timeout),
@@ -497,8 +557,8 @@ impl SshTransport {
             }
         };
 
-        let out = stdout_task.await.unwrap_or_default();
-        let err = stderr_task.await.unwrap_or_default();
+        let out = drain_with_grace(stdout_task, stdout_mirror).await;
+        let err = drain_with_grace(stderr_task, stderr_mirror).await;
         let code = status.code();
 
         Ok(ExecResult {
@@ -641,16 +701,16 @@ impl ToolTransport for SshTransport {
 
         let mut child = self.build_ssh_command(&remote_cmd).spawn()?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
         })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = child.stderr.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe not available")
         })?;
 
         let max = max_output_bytes;
-        let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
-        let stderr_task = tokio::spawn(async move { read_capped(&mut stderr, max).await });
+        let (stdout_task, stdout_mirror) = spawn_reader(stdout, max);
+        let (stderr_task, stderr_mirror) = spawn_reader(stderr, max);
 
         let wait = child.wait();
         let status = match tokio::time::timeout(timeout, wait).await {
@@ -662,8 +722,8 @@ impl ToolTransport for SshTransport {
                 // detaching with buffered output.
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = drain_with_grace(stdout_task, stdout_mirror).await;
+                let _ = drain_with_grace(stderr_task, stderr_mirror).await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("SSH command timed out after {:?}", timeout),
@@ -671,8 +731,8 @@ impl ToolTransport for SshTransport {
             }
         };
 
-        let out = stdout_task.await.unwrap_or_default();
-        let err = stderr_task.await.unwrap_or_default();
+        let out = drain_with_grace(stdout_task, stdout_mirror).await;
+        let err = drain_with_grace(stderr_task, stderr_mirror).await;
         let code = status.code();
 
         Ok(ExecResult {
@@ -797,26 +857,32 @@ impl ToolTransport for LocalTransport {
 
         let mut child = cmd.spawn()?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
         })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
+        let stderr = child.stderr.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stderr pipe not available")
         })?;
 
         let max = max_output_bytes;
-        let stdout_task = tokio::spawn(async move { read_capped(&mut stdout, max).await });
-        let stderr_task = tokio::spawn(async move { read_capped(&mut stderr, max).await });
+        let (stdout_task, stdout_mirror) = spawn_reader(stdout, max);
+        let (stderr_task, stderr_mirror) = spawn_reader(stderr, max);
 
         let wait = child.wait();
         let status = match tokio::time::timeout(timeout, wait).await {
             Ok(s) => s?,
             Err(_) => {
-                // Best-effort SIGKILL of the timed-out process before the
-                // error return; `kill_on_drop(true)` set at spawn is the
-                // safety net for any other early-exit path.
+                // Best-effort SIGKILL of the timed-out process; then drain
+                // both reader tasks through the same bounded grace as the
+                // SSH arms — an orphaned descendant (`cmd &`, `nohup`) that
+                // inherited the pipe write ends keeps EOF from ever arriving,
+                // and the reader tasks would otherwise park forever (issue
+                // #47①). `kill_on_drop(true)` set at spawn is the safety net
+                // for any other early-exit path.
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                let _ = drain_with_grace(stdout_task, stdout_mirror).await;
+                let _ = drain_with_grace(stderr_task, stderr_mirror).await;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("command timed out after {:?}", timeout),
@@ -824,8 +890,8 @@ impl ToolTransport for LocalTransport {
             }
         };
 
-        let out = stdout_task.await.unwrap_or_default();
-        let err = stderr_task.await.unwrap_or_default();
+        let out = drain_with_grace(stdout_task, stdout_mirror).await;
+        let err = drain_with_grace(stderr_task, stderr_mirror).await;
         let code = status.code();
 
         Ok(ExecResult {
@@ -865,28 +931,6 @@ pub fn retryable_prefix(e: &std::io::Error) -> &'static str {
     } else {
         ""
     }
-}
-
-async fn read_capped<R: AsyncReadExt + Unpin>(reader: &mut R, max: usize) -> String {
-    let mut buf = Vec::with_capacity(8 * 1024);
-    let mut tmp = [0u8; 8 * 1024];
-    loop {
-        match reader.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len() + n > max {
-                    let take = max.saturating_sub(buf.len());
-                    buf.extend_from_slice(&tmp[..take]);
-                    buf.extend_from_slice(b"\n... [output truncated]");
-                    let _ = tokio::io::copy(reader, &mut tokio::io::sink()).await;
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Parse a host string of the form `user@host` or `user@host:port`.

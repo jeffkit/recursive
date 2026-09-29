@@ -1258,6 +1258,86 @@ async fn plan_mode_write_tool_blocked_until_exit() {
     );
 }
 
+/// Issue #47④ acceptance: with `set_approval_wait_timeout_secs` installed
+/// before `set_event_sink` (the CLI/REPL wiring), an unanswered
+/// `exit_plan_mode` must let the whole turn return — the timeout surfaces
+/// as a rejected plan (data, not an Err) and `pending_plan` is cleared so
+/// post-compaction re-injection cannot resurrect it.
+#[tokio::test]
+async fn approval_timeout_lets_turn_finish_with_rejection() {
+    use recursive::agent::FinishReason;
+    use recursive::event::{EventSink, NullSink};
+    use recursive::llm::{Completion, MockProvider, ToolCall};
+    use recursive::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+
+    let script = vec![
+        Completion {
+            content: "proposing a plan".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: EXIT_PLAN_MODE_TOOL_NAME.into(),
+                arguments: json!({"plan": "I will write a file"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "plan was rejected; done".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let tools = ToolRegistry::new(std::sync::Arc::new(recursive::tools::LocalTransport))
+        .register(std::sync::Arc::new(recursive::tools::WriteFile::new(root)));
+
+    let mut runtime = AgentRuntime::builder()
+        .llm(std::sync::Arc::new(MockProvider::new(script)))
+        .tools(tools)
+        .system_prompt("test")
+        .max_steps(5)
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+
+    // Same order as `cli::builder::build_runtime` / the REPL turn loop.
+    runtime.set_approval_wait_timeout_secs(1);
+    runtime.set_event_sink(std::sync::Arc::new(NullSink) as std::sync::Arc<dyn EventSink>);
+
+    // No approver is spawned — the wait must time out, not park forever.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.run("go"))
+        .await
+        .expect("turn must return despite no reviewer decision (issue #47④)")
+        .unwrap();
+
+    assert_eq!(outcome.finish_reason, FinishReason::NoMoreToolCalls);
+
+    let tool_msgs: Vec<&recursive::message::Message> = runtime
+        .transcript()
+        .iter()
+        .filter(|m| m.role == recursive::message::Role::Tool)
+        .collect();
+    assert_eq!(tool_msgs.len(), 1, "one tool result (exit_plan_mode)");
+    assert!(
+        tool_msgs[0].content.contains("\"approved\":false"),
+        "exit_plan_mode result: {}",
+        tool_msgs[0].content
+    );
+    assert!(tool_msgs[0].content.contains("timed out"));
+
+    assert_eq!(
+        runtime.plan_approval_gate().pending_plan(),
+        None,
+        "timeout must clear pending_plan so compaction cannot re-inject a stale plan"
+    );
+}
+
 // ============================================================================
 // Goal-317: Memory + skill loading pipeline integration test
 //

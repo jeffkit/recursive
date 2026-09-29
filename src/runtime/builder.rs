@@ -389,6 +389,7 @@ impl AgentRuntimeBuilder {
             checkpoints: CheckpointState::disabled(),
             todo_list,
             plan_approval_gate,
+            approval_wait_timeout_secs: None,
             plan_mode_request_gate,
             goal_state: Arc::new(RwLock::new(None)),
             message_queue: std::collections::VecDeque::new(),
