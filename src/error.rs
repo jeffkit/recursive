@@ -86,6 +86,13 @@ pub enum Error {
     #[error("cancelled")]
     Cancelled,
 
+    /// Wall-clock budget exhausted (issue #40). Surfaced by the non-stream
+    /// LLM call path so `run_inner` can finish with
+    /// `FinishReason::WallClockExceeded` — finish is data, not an error
+    /// (invariant #7), but it travels as an Error through the per-call path.
+    #[error("wall-clock budget of {secs}s exceeded")]
+    WallClockExceeded { secs: u64 },
+
     /// Timeout after a specified duration
     #[error("timeout after {duration_ms}ms")]
     Timeout { duration_ms: u64 },

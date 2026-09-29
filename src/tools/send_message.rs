@@ -99,6 +99,17 @@ impl WorkerRegistry {
         self.inner.write().await.remove(worker_id);
     }
 
+    /// Synchronous deregister for use from `Drop` (e.g. the parallel-mode
+    /// abort path of issue #40, where the async deregister after the run
+    /// would be skipped by the task abort). Uses `try_write`; on contention
+    /// the entry is removed by a later sweep — acceptable because the table
+    /// is best-effort presence info.
+    pub fn deregister_sync(&self, worker_id: &str) {
+        if let Ok(mut guard) = self.inner.try_write() {
+            guard.remove(worker_id);
+        }
+    }
+
     /// Get the mailbox for a worker, or `None` if not registered.
     pub async fn get(&self, worker_id: &str) -> Option<WorkerMailbox> {
         self.inner.read().await.get(worker_id).cloned()
