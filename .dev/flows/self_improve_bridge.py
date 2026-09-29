@@ -117,15 +117,13 @@ def main() -> None:
     from plaita.node import register_code_node
     register_code_node(default_backend="subprocess")
     from plaita.core.executor import FlowExecution
+    from plaita.dsl.ir_validate import build_flow
     from plaita.obs import LangfuseCallback
 
     callbacks = []
-    lf_cb = None
     if os.environ.get("LANGFUSE_PUBLIC_KEY"):
         try:
-            from plaita.obs import LangfuseCallback as _LF
-            lf_cb = _LF(tags=["self-improve", "plaita"])
-            callbacks.append(lf_cb)
+            callbacks.append(LangfuseCallback(tags=["self-improve", "plaita"]))
         except Exception as e:
             print(f"[bridge] Langfuse 未启用: {e}", file=sys.stderr)
 
@@ -134,7 +132,8 @@ def main() -> None:
     cb = callbacks[0] if callbacks else None
     if cb is not None and hasattr(cb, "bind_execution"):
         cb.bind_execution(execution)
-    result = execution.run_compatible(flow_def, False, **payload)
+    flow_obj = build_flow(flow_def)
+    result = execution.run_compatible(flow_obj, False, **payload)
     if cb is not None and hasattr(cb, "finalize"):
         try:
             cb.finalize()
