@@ -231,7 +231,7 @@ def self_improve(INPUT):
             ),
             input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'commit-land', 'sub_timeout': 590, 'wtSha': rebase.rebasedSha},
         )
-        cleanup = CODE.python(sandbox_backend="subprocess", timeout=300,
+        cleanup_b = CODE.python(sandbox_backend="subprocess", timeout=300,
             code=(
                 "def run(input):\n"
                 "    import json, subprocess\n"
@@ -242,7 +242,7 @@ def self_improve(INPUT):
             ),
             input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'worktree-cleanup', 'verdict': 'committed'},
         )
-        fin = CODE.python(sandbox_backend="subprocess", timeout=120,
+        fin_b = CODE.python(sandbox_backend="subprocess", timeout=120,
             code=(
                 "def run(input):\n"
                 "    import json, subprocess\n"
@@ -253,9 +253,9 @@ def self_improve(INPUT):
             ),
             input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'finish', 'verdict': 'committed', 'detail': ''},
         )
-        return {"verdict": "committed", "landed": land.landed, "cleanup": cleanup.removed, "finish": fin.verdict}
+        return {"verdict": "committed", "landed": land_b.landed, "cleanup": cleanup_b.removed, "finish": fin_b.verdict}
 
-    land = CODE.python(sandbox_backend="subprocess", timeout=600,
+    land_b = CODE.python(sandbox_backend="subprocess", timeout=600,
         code=(
             "def run(input):\n"
             "    import json, subprocess\n"
@@ -266,7 +266,7 @@ def self_improve(INPUT):
         ),
         input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'commit-land', 'sub_timeout': 590, 'wtSha': prep.wtSha},
     )
-    cleanup = CODE.python(sandbox_backend="subprocess", timeout=300,
+    cleanup_b = CODE.python(sandbox_backend="subprocess", timeout=300,
         code=(
             "def run(input):\n"
             "    import json, subprocess\n"
@@ -277,7 +277,7 @@ def self_improve(INPUT):
         ),
         input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'worktree-cleanup', 'verdict': 'committed'},
     )
-    fin = CODE.python(sandbox_backend="subprocess", timeout=120,
+    fin_b = CODE.python(sandbox_backend="subprocess", timeout=120,
         code=(
             "def run(input):\n"
             "    import json, subprocess\n"
@@ -288,4 +288,4 @@ def self_improve(INPUT):
         ),
         input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'finish', 'verdict': 'committed', 'detail': ''},
     )
-    return {"verdict": "committed", "landed": land.landed, "cleanup": cleanup.removed, "finish": fin.verdict}
+    return {"verdict": "committed", "landed": land_b.landed, "cleanup": cleanup_b.removed, "finish": fin_b.verdict}
