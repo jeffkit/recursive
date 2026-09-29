@@ -1187,9 +1187,12 @@ def main() -> None:
         print(__doc__)
         raise SystemExit(1)
     cmd = sys.argv[1]
-    run_dir = Path(os.environ.get("SELF_IMPROVE_RUN_DIR", ""))
-    if not run_dir.is_dir():
-        raise SystemExit(f"SELF_IMPROVE_RUN_DIR 未设置或不存在: {run_dir}")
+    # Path("") == Path(".")：空 env 会让 run 目录静默解析到 cwd（repo 根），
+    # artifact 写进主 checkout 还能骗过 is_dir 守卫——必须显式非空（2026-09-29 影子验证实证）。
+    run_dir_raw = os.environ.get("SELF_IMPROVE_RUN_DIR", "")
+    run_dir = Path(run_dir_raw) if run_dir_raw else None
+    if run_dir is None or not run_dir.is_dir():
+        raise SystemExit(f"SELF_IMPROVE_RUN_DIR 未设置或不存在: {run_dir_raw!r}")
     st = Engine(run_dir)
     steps = {
         "preflight.disk": step_preflight_disk,
