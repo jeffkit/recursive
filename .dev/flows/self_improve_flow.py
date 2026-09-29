@@ -122,7 +122,7 @@ def self_improve(INPUT):
             "def run(input):\n"
             "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
-            "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 28800))\n"
+            "    r = subprocess.run(['python3', input['engine'], 'step', input['step'], '--run-dir', input['run_dir']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
             "    return json.load(open(input['run_dir'] + '/step-result.json'))\n"
         ),
