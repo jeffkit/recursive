@@ -17,6 +17,7 @@ drill into what you need.
 * [Overview](overview.md) - high-level architecture and data flow
 * [Agent Loop](agent-loop.md) - AgentRuntime, Kernel, ReAct loop, FinishReason
 * [Layer 0 Injection](layer0-injection.md) - how the system prompt is assembled from memory sources
+* [Execution Environments](execution-environments.md) - sandbox tiers (none/policy/container/microvm), capability matrix, tier selection
 
 ## Memory System
 

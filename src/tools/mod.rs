@@ -25,6 +25,8 @@ pub mod docker_provider;
 pub mod docker_sandbox;
 #[cfg(feature = "e2b-sandbox")]
 pub mod e2b_provider;
+#[cfg(feature = "e2b-sandbox")]
+pub use e2b_provider::E2bToolSetProvider;
 pub mod edit;
 pub mod episodic_recall;
 pub mod estimate_tokens;

@@ -84,12 +84,40 @@ pub(crate) async fn build_tools(
             return (registry, read_state);
         }
         Some(recursive::SandboxMode::MicroVm) => {
-            eprintln!(
-                "recursive: RECURSIVE_SANDBOX=microvm requires the E2B provider \
-                 (RECURSIVE_E2B_*), which is not wired to this entry point yet; \
-                 refusing to fall back to local execution"
-            );
-            std::process::exit(2);
+            // Goal 405: microVM tier via E2B — same fatal-on-failure
+            // contract as the container tier (never a silent local
+            // fallback).
+            #[cfg(feature = "e2b-sandbox")]
+            {
+                let skills = discover_loaded_skills(config);
+                let provider = match recursive::tools::E2bToolSetProvider::from_env_provider(
+                    root.clone(),
+                    config.shell_timeout_secs,
+                    skills,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "recursive: RECURSIVE_SANDBOX=microvm requires the E2B \
+                                 provider: {e} (refusing to fall back to local execution)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let registry = recursive::ToolSetProvider::build_registry(&provider);
+                let read_state = registry
+                    .read_file_state()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(ReadFileState::new())));
+                return (registry, read_state);
+            }
+            #[cfg(not(feature = "e2b-sandbox"))]
+            {
+                eprintln!(
+                    "recursive: RECURSIVE_SANDBOX=microvm requires a build with the \
+                     `e2b-sandbox` feature; refusing to fall back to local execution"
+                );
+                std::process::exit(2);
+            }
         }
         Some(recursive::SandboxMode::None) | None => {}
     }
@@ -745,9 +773,17 @@ mod tests {
             .nth(1)
             .and_then(|r| r.split("Some(recursive::SandboxMode::None)").next())
             .expect("MicroVm arm");
+        // Goal 405: the microvm arm wires the E2B provider when the
+        // feature is on, and still refuses (exit 2) on the no-feature /
+        // no-key paths — the arm text contains both the provider dispatch
+        // and the exit(2) refusals.
+        assert!(
+            microvm_arm.contains("E2bToolSetProvider"),
+            "microvm tier must dispatch to E2bToolSetProvider (feature build)"
+        );
         assert!(
             microvm_arm.contains("std::process::exit(2)"),
-            "microvm tier must refuse (exit 2), not degrade"
+            "microvm tier must refuse (exit 2) on missing feature/key, not degrade"
         );
         // The container tier without the cloud-runtime feature must also
         // exit(2) — that is the "no silent downgrade" contract for the

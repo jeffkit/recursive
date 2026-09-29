@@ -42,6 +42,7 @@ default = ["web_search", "http"]
 web_search = ["recursive/web_search"]
 http = ["recursive/http"]
 cloud-runtime = ["recursive/cloud-runtime"]
+e2b-sandbox = ["recursive/e2b-sandbox"]
 weixin = ["recursive/weixin"]
 otel = [
   "dep:opentelemetry",

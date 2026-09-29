@@ -355,10 +355,10 @@ wired in http mode** (recognized + startup log only).
 
 | Env | Default | Purpose |
 |-----|---------|---------|
-| `RECURSIVE_SANDBOX_MODE` | `local` | `local` / `policy` / `docker` / `e2b` |
-| `RECURSIVE_E2B_API_KEY` | _(required for e2b mode)_ | E2B API key |
+| `RECURSIVE_SANDBOX` | _(unset = local)_ | `none` / `policy` / `container` / `microvm` |
+| `RECURSIVE_E2B_API_KEY` | _(required for microvm)_ | E2B API key |
 | `RECURSIVE_E2B_TEMPLATE` | `base` | E2B sandbox template ID |
-| `RECURSIVE_E2B_TIMEOUT_SECS` | `300` | Sandbox timeout in seconds |
+| `RECURSIVE_E2B_TIMEOUT_SECS` | `3600` | Sandbox TTL in seconds |
 | `RECURSIVE_SHELL_TIMEOUT_SECS` | `30` | Per-command shell timeout |
 
 ### Local vs cloud mode — cheatsheet
