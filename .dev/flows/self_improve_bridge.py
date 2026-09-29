@@ -116,6 +116,13 @@ def main() -> None:
     import plaita_nodes  # noqa: F401
     from plaita.node import register_code_node
     register_code_node(default_backend="subprocess")
+    # 沙箱 env 白名单（plaita 2026-09 安全评审 P1）只传 PATH/HOME 等 7 个变量，
+    # provider key 会被剥掉 → 引擎插值必炸。按白名单设计意图走 SUBPROCESS_ENV_EXTRA
+    # 注入凭据/配置前缀，不全量透传。
+    from plaita.node import code as _plaita_code
+    _extra = {k: v for k, v in os.environ.items()
+              if k.startswith(("DEEPSEEK_", "GLM_", "MINIMAX_", "RECURSIVE_", "LANGFUSE_"))}
+    _plaita_code.SUBPROCESS_ENV_EXTRA.update(_extra)
     from plaita.core.executor import FlowExecution
     from plaita.dsl.ir_validate import build_flow
     from plaita.obs import LangfuseCallback
