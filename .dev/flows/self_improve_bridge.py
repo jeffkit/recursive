@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -139,6 +140,7 @@ def main() -> None:
     cb = callbacks[0] if callbacks else None
     if cb is not None and hasattr(cb, "bind_execution"):
         cb.bind_execution(execution)
+    print("[bridge] FLOW-MD5", hashlib.md5(json.dumps(flow_def, sort_keys=True).encode()).hexdigest()[:12], "nodes:", len(flow_def.get("nodes", [])), file=sys.stderr)
     flow_obj = build_flow(flow_def)
     result = execution.run_compatible(flow_obj, False, **payload)
     if cb is not None and hasattr(cb, "finalize"):

@@ -1186,6 +1186,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         print(__doc__)
         raise SystemExit(1)
+    print("ENGINE-ARGV", sys.argv, file=sys.stderr)
     cmd = sys.argv[1]
     # run 目录优先取 argv（免疫沙箱 env 白名单清洗——2026-09-29 影子验证实证
     # SystemExit('') 空串案例）；env 作为兼容回退。Path("") == Path(".")，
