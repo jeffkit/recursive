@@ -220,7 +220,7 @@ def self_improve(INPUT):
         )
         if not rg2.passed:
             return {"verdict": "failed-preserved", "preserve": rg2.preserve, "gate": rg2.gate}
-        land = CODE.python(sandbox_backend="subprocess", timeout=600,
+        land_a = CODE.python(sandbox_backend="subprocess", timeout=600,
             code=(
                 "def run(input):\n"
                 "    import json, subprocess\n"
@@ -231,7 +231,7 @@ def self_improve(INPUT):
             ),
             input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'commit-land', 'sub_timeout': 590, 'wtSha': rebase.rebasedSha},
         )
-        cleanup_b = CODE.python(sandbox_backend="subprocess", timeout=300,
+        cleanup_a = CODE.python(sandbox_backend="subprocess", timeout=300,
             code=(
                 "def run(input):\n"
                 "    import json, subprocess\n"
@@ -242,7 +242,7 @@ def self_improve(INPUT):
             ),
             input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'worktree-cleanup', 'verdict': 'committed'},
         )
-        fin_b = CODE.python(sandbox_backend="subprocess", timeout=120,
+        fin_a = CODE.python(sandbox_backend="subprocess", timeout=120,
             code=(
                 "def run(input):\n"
                 "    import json, subprocess\n"

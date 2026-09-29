@@ -9,30 +9,13 @@
     {
       "type": "start",
       "id": "start",
-      "next": "shim_code"
-    },
-    {
-      "type": "assignment",
-      "id": "shim_code",
-      "output": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']],\n                       capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0:\n        raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
-      "next": "base_input",
-      "source_line": 25
-    },
-    {
-      "type": "assignment",
-      "id": "base_input",
-      "output": {
-        "engine": "$INPUT.engine",
-        "run_dir": "$INPUT.run_dir"
-      },
-      "next": "pf_kill",
-      "source_line": 35
+      "next": "pf_kill"
     },
     {
       "type": "code",
       "id": "pf_kill",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -40,13 +23,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_disk",
-      "source_line": 38
+      "source_line": 21
     },
     {
       "type": "code",
       "id": "pf_disk",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -54,13 +37,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_base",
-      "source_line": 40
+      "source_line": 32
     },
     {
       "type": "code",
       "id": "pf_base",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -68,13 +51,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_build",
-      "source_line": 42
+      "source_line": 43
     },
     {
       "type": "code",
       "id": "pf_build",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -83,13 +66,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_tests",
-      "source_line": 44
+      "source_line": 54
     },
     {
       "type": "code",
       "id": "pf_tests",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -98,13 +81,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_wt",
-      "source_line": 47
+      "source_line": 65
     },
     {
       "type": "code",
       "id": "pf_wt",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -112,13 +95,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_prompt",
-      "source_line": 50
+      "source_line": 76
     },
     {
       "type": "code",
       "id": "pf_prompt",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -126,13 +109,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_ping",
-      "source_line": 52
+      "source_line": 87
     },
     {
       "type": "code",
       "id": "pf_ping",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -140,13 +123,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "pf_prereq",
-      "source_line": 54
+      "source_line": 98
     },
     {
       "type": "code",
       "id": "pf_prereq",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -155,13 +138,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "run",
-      "source_line": 56
+      "source_line": 109
     },
     {
       "type": "code",
       "id": "run",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 28800))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -170,7 +153,7 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n1",
-      "source_line": 62
+      "source_line": 120
     },
     {
       "type": "if",
@@ -180,7 +163,7 @@
         "operator": "eq",
         "value": "panic"
       },
-      "source_line": 66,
+      "source_line": 132,
       "next": "_n22",
       "else_next": "_n2"
     },
@@ -192,7 +175,7 @@
         "operator": "eq",
         "value": "watchdog-hang"
       },
-      "source_line": 68,
+      "source_line": 134,
       "next": "_n21",
       "else_next": "_n3"
     },
@@ -204,7 +187,7 @@
         "operator": "eq",
         "value": "timeout-resumed"
       },
-      "source_line": 70,
+      "source_line": 136,
       "next": "_n20",
       "else_next": "_n4"
     },
@@ -216,7 +199,7 @@
         "operator": "eq",
         "value": "budget-exhausted"
       },
-      "source_line": 72,
+      "source_line": 138,
       "next": "_n19",
       "else_next": "gates"
     },
@@ -224,7 +207,7 @@
       "type": "code",
       "id": "gates",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -233,7 +216,7 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n5",
-      "source_line": 76
+      "source_line": 141
     },
     {
       "type": "if",
@@ -243,7 +226,7 @@
         "operator": "eq",
         "value": false
       },
-      "source_line": 79,
+      "source_line": 152,
       "next": "_n18",
       "else_next": "review"
     },
@@ -251,7 +234,7 @@
       "type": "code",
       "id": "review",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -260,7 +243,7 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n6",
-      "source_line": 83
+      "source_line": 155
     },
     {
       "type": "if",
@@ -270,7 +253,7 @@
         "operator": "eq",
         "value": "NEEDS_FIX"
       },
-      "source_line": 86,
+      "source_line": 166,
       "next": "_n17",
       "else_next": "_n7"
     },
@@ -282,7 +265,7 @@
         "operator": "ne",
         "value": false
       },
-      "source_line": 90,
+      "source_line": 169,
       "next": "regate",
       "else_next": "prep"
     },
@@ -290,7 +273,7 @@
       "type": "code",
       "id": "prep",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -298,7 +281,7 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n8",
-      "source_line": 99
+      "source_line": 184
     },
     {
       "type": "if",
@@ -308,7 +291,7 @@
         "operator": "ne",
         "value": false
       },
-      "source_line": 101,
+      "source_line": 195,
       "next": "_n14",
       "else_next": "_n9"
     },
@@ -320,15 +303,15 @@
         "operator": "ne",
         "value": false
       },
-      "source_line": 103,
+      "source_line": 198,
       "next": "rebase",
-      "else_next": "land2"
+      "else_next": "land_b"
     },
     {
       "type": "code",
-      "id": "land2",
+      "id": "land_b",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -337,14 +320,14 @@
         "wtSha": "$NODE.prep.wtSha"
       },
       "sandbox_backend": "subprocess",
-      "next": "cleanup2",
-      "source_line": 121
+      "next": "cleanup_b",
+      "source_line": 258
     },
     {
       "type": "code",
-      "id": "cleanup2",
+      "id": "cleanup_b",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -352,14 +335,14 @@
         "verdict": "committed"
       },
       "sandbox_backend": "subprocess",
-      "next": "fin2",
-      "source_line": 124
+      "next": "fin_b",
+      "source_line": 269
     },
     {
       "type": "code",
-      "id": "fin2",
+      "id": "fin_b",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -369,25 +352,25 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n10",
-      "source_line": 127
+      "source_line": 280
     },
     {
       "type": "end",
       "id": "_n10",
       "output": {
         "verdict": "committed",
-        "landed": "$NODE.land2.landed",
-        "cleanup": "$NODE.cleanup2.removed",
-        "finish": "$NODE.fin2.verdict"
+        "landed": "$NODE.land_b.landed",
+        "cleanup": "$NODE.cleanup_b.removed",
+        "finish": "$NODE.fin_b.verdict"
       },
       "resultType": "success",
-      "source_line": 130
+      "source_line": 291
     },
     {
       "type": "code",
       "id": "rebase",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -395,13 +378,13 @@
       },
       "sandbox_backend": "subprocess",
       "next": "rg2",
-      "source_line": 104
+      "source_line": 199
     },
     {
       "type": "code",
       "id": "rg2",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -410,7 +393,7 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n11",
-      "source_line": 106
+      "source_line": 210
     },
     {
       "type": "if",
@@ -420,15 +403,15 @@
         "operator": "eq",
         "value": false
       },
-      "source_line": 109,
+      "source_line": 221,
       "next": "_n13",
-      "else_next": "land"
+      "else_next": "land_a"
     },
     {
       "type": "code",
-      "id": "land",
+      "id": "land_a",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -437,14 +420,14 @@
         "wtSha": "$NODE.rebase.rebasedSha"
       },
       "sandbox_backend": "subprocess",
-      "next": "cleanup",
-      "source_line": 111
+      "next": "cleanup_a",
+      "source_line": 223
     },
     {
       "type": "code",
-      "id": "cleanup",
+      "id": "cleanup_a",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -452,14 +435,14 @@
         "verdict": "committed"
       },
       "sandbox_backend": "subprocess",
-      "next": "fin",
-      "source_line": 114
+      "next": "fin_a",
+      "source_line": 234
     },
     {
       "type": "code",
-      "id": "fin",
+      "id": "fin_a",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -469,19 +452,19 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n12",
-      "source_line": 117
+      "source_line": 245
     },
     {
       "type": "end",
       "id": "_n12",
       "output": {
         "verdict": "committed",
-        "landed": "$NODE.land.landed",
-        "cleanup": "$NODE.cleanup.removed",
-        "finish": "$NODE.fin.verdict"
+        "landed": "$NODE.land_b.landed",
+        "cleanup": "$NODE.cleanup_b.removed",
+        "finish": "$NODE.fin_b.verdict"
       },
       "resultType": "success",
-      "source_line": 120
+      "source_line": 256
     },
     {
       "type": "end",
@@ -492,7 +475,7 @@
         "gate": "$NODE.rg2.gate"
       },
       "resultType": "success",
-      "source_line": 110
+      "source_line": 222
     },
     {
       "type": "end",
@@ -502,13 +485,13 @@
         "detail": "no changes in worktree"
       },
       "resultType": "success",
-      "source_line": 102
+      "source_line": 196
     },
     {
       "type": "code",
       "id": "regate",
       "language": "python",
-      "code": "$NODE.shim_code",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -517,7 +500,7 @@
       },
       "sandbox_backend": "subprocess",
       "next": "_n15",
-      "source_line": 91
+      "source_line": 170
     },
     {
       "type": "if",
@@ -527,7 +510,7 @@
         "operator": "eq",
         "value": false
       },
-      "source_line": 94,
+      "source_line": 181,
       "next": "_n16",
       "else_next": "prep"
     },
@@ -540,7 +523,7 @@
         "gate": "$NODE.regate.gate"
       },
       "resultType": "success",
-      "source_line": 95
+      "source_line": 182
     },
     {
       "type": "end",
@@ -551,7 +534,7 @@
         "review": "$NODE.review.text"
       },
       "resultType": "success",
-      "source_line": 87
+      "source_line": 167
     },
     {
       "type": "end",
@@ -562,7 +545,7 @@
         "gate": "$NODE.gates.gate"
       },
       "resultType": "success",
-      "source_line": 80
+      "source_line": 153
     },
     {
       "type": "end",
@@ -572,7 +555,7 @@
         "detail": "budget exceeded after one resume"
       },
       "resultType": "success",
-      "source_line": 73
+      "source_line": 139
     },
     {
       "type": "end",
@@ -583,7 +566,7 @@
         "status": "$NODE.run.status"
       },
       "resultType": "success",
-      "source_line": 71
+      "source_line": 137
     },
     {
       "type": "end",
@@ -594,7 +577,7 @@
         "status": "$NODE.run.status"
       },
       "resultType": "success",
-      "source_line": 69
+      "source_line": 135
     },
     {
       "type": "end",
@@ -605,7 +588,7 @@
         "status": "$NODE.run.status"
       },
       "resultType": "success",
-      "source_line": 67
+      "source_line": 133
     }
   ]
 }
