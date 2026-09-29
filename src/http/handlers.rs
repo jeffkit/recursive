@@ -59,6 +59,26 @@ fn admission_error(err: AcquireError, gate: &AdmissionGate) -> ApiError {
     }
 }
 
+/// Issue #31 §2: inject the `<environment>` segment into an assembled
+/// prompt ONLY when the session's transport reports non-local capabilities
+/// (container tier). The local tier (empty `path_root` + default local
+/// semantics) keeps the prompt byte-identical to the pre-#31 form.
+pub(super) fn inject_environment_segment(
+    mut full: String,
+    mut segments: crate::system_prompt::PromptSegments,
+    registry: &ToolRegistry,
+) -> (String, crate::system_prompt::PromptSegments) {
+    let caps = registry.transport().capabilities();
+    // Local semantics = empty path_root; treat as "no environment segment".
+    if caps.path_root.as_os_str().is_empty() {
+        return (full, segments);
+    }
+    let seg = caps.render_environment_segment();
+    full.push_str(&seg);
+    segments.environment = seg;
+    (full, segments)
+}
+
 /// Goal-393: the one place where HTTP session runtimes get built. Every
 /// build point (`POST /run`, `POST /sessions`, session fork, `/agui`) goes
 /// through here so the channels cannot drift apart — the compactor /
@@ -205,7 +225,14 @@ pub(super) async fn run_agent(
     );
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
-    let mut tool_registry = state.session_tool_registry();
+    let mut tool_registry = state
+        .session_tool_registry()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    // Issue #31 §2: inject the `<environment>` segment only when the
+    // session's transport is a real sandbox (non-local capabilities).
+    let (system_prompt, prompt_segments) =
+        inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
         tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
@@ -224,10 +251,18 @@ pub(super) async fn run_agent(
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
-    let outcome = runtime.run(&body.goal).await.map_err(|e| {
-        record_run_failed(&state.metrics);
-        map_run_error(&e)
-    })?;
+    // Issue #31 §B: this one-shot run owns its environment (container tier
+    // creates one per run) — destroy it on BOTH exits so no container
+    // outlives the request.
+    let outcome = match runtime.run(&body.goal).await {
+        Ok(o) => o,
+        Err(e) => {
+            runtime.destroy_environment().await;
+            record_run_failed(&state.metrics);
+            return Err(map_run_error(&e));
+        }
+    };
+    runtime.destroy_environment().await;
 
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
 
@@ -327,7 +362,12 @@ pub(super) async fn create_session(
         .max_steps
         .map(|n| n as usize)
         .unwrap_or(state.config.max_steps);
-    let mut tool_registry = state.session_tool_registry();
+    let mut tool_registry = state
+        .session_tool_registry()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let (system_prompt, prompt_segments) =
+        inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
     if let Some(mode_str) = body.permission_mode.as_deref() {
         let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
         tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
@@ -545,6 +585,10 @@ pub(super) async fn delete_session(
         // runtime is dropped. Idempotent on repeated calls.
         let mut rt = runtime.lock().await;
         rt.close(None).await;
+        // Issue #31 §B: explicit, idempotent environment teardown paired
+        // with session deletion. Failure is logged only — destroy is
+        // idempotent and retryable, it must not block the HTTP delete.
+        rt.destroy_environment().await;
         // Goal 396: snapshot the transcript before releasing the runtime
         // Mutex, but persist it only after the session is out of the map —
         // the save is I/O and must not run under either lock. 会话结束即落盘是
@@ -685,9 +729,16 @@ pub(super) async fn fork_session(
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
 
+    let tool_registry = state
+        .session_tool_registry()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let (system_prompt, prompt_segments) =
+        inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
+
     let mut runtime = build_session_runtime(
         &state,
-        state.session_tool_registry(),
+        tool_registry,
         system_prompt,
         prompt_segments,
         state.config.max_steps,
@@ -1763,7 +1814,15 @@ pub(super) async fn agui_run(
     let client_tool_names: std::collections::HashSet<String> =
         agui_tools.iter().map(|t| t.name.clone()).collect();
 
-    let mut tool_registry = state.session_tool_registry();
+    let mut tool_registry = state.session_tool_registry().await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: e,
+            }),
+        )
+    })?;
     for t in &agui_tools {
         tool_registry = tool_registry.register(Arc::new(ClientToolStub {
             name: t.name.clone(),
@@ -2000,6 +2059,12 @@ pub(super) async fn agui_run(
         // before we emit anything else, so checkpoint_post and
         // RunFinished are guaranteed to arrive last.
         let _ = converter_handle.await;
+
+        // Issue #31 §B: the AG-UI run's environment dies with the run —
+        // on success AND error (the outcome match above already recorded
+        // metrics; teardown is unconditional here, before RunFinished is
+        // emitted, so the SSE stream stays the last observer).
+        runtime.destroy_environment().await;
 
         if let (Some(cp), Some(turn)) = (checkpoint_id, finished_turn) {
             let _ = sse_tx.send(ag::Event::Custom(ag::Custom {

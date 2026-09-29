@@ -121,6 +121,50 @@ impl EnvironmentCapabilities {
     }
 }
 
+impl EnvironmentCapabilities {
+    /// Render the `<environment>` system-prompt segment (issue #31 §2).
+    ///
+    /// Contains ONLY the in-environment view (network / persistence /
+    /// path_root / user / toolchain / snapshot) — never host paths or
+    /// credentials. The environment segment is injected ONLY by
+    /// non-local tiers; the local (sandbox=none) tier keeps the prompt
+    /// byte-identical to its pre-#31 form by passing `None`/empty instead.
+    pub fn render_environment_segment(&self) -> String {
+        let mut s = String::from(
+            "\n\n---\n\n## Environment\n\n\
+             You are running inside a sandboxed execution environment:\n",
+        );
+        s.push_str(&format!(
+            "- network access: {}\n",
+            if self.network { "yes" } else { "no" }
+        ));
+        s.push_str(&format!(
+            "- persistent filesystem across commands: {}\n",
+            if self.persistent { "yes" } else { "no" }
+        ));
+        let root_desc: std::borrow::Cow<str> = if self.path_root.as_os_str().is_empty() {
+            "the resolved workspace".into()
+        } else {
+            self.path_root.to_string_lossy()
+        };
+        s.push_str(&format!("- workspace root: {root_desc}\n"));
+        if let Some(u) = &self.user {
+            s.push_str(&format!("- runs as user: {u}\n"));
+        }
+        if !self.toolchain.is_empty() {
+            s.push_str(&format!(
+                "- available toolchain: {}\n",
+                self.toolchain.join(", ")
+            ));
+        }
+        s.push_str(&format!(
+            "- snapshot support: {}",
+            if self.snapshot { "yes" } else { "no" }
+        ));
+        s
+    }
+}
+
 /// Result of running a shell command.
 #[derive(Debug, Clone, Default)]
 pub struct ExecResult {
@@ -197,6 +241,15 @@ pub trait ToolTransport: Send + Sync + std::fmt::Debug {
     fn capabilities(&self) -> EnvironmentCapabilities {
         EnvironmentCapabilities::local()
     }
+
+    /// Destroy this environment (terminal, idempotent reclamation).
+    ///
+    /// Called by session teardown paths (delete / idle eviction / shutdown)
+    /// exactly when the session owning this transport ends. MUST be safe to
+    /// call repeatedly: the second and later calls are no-ops. Failures are
+    /// the caller's to log only — destroy never resurrects a session. The
+    /// default is a no-op (local / SSH tiers have nothing to reclaim).
+    async fn destroy(&self) {}
 
     /// Read the full contents of a file at `path`.
     async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>>;

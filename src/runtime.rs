@@ -112,11 +112,18 @@ impl From<TurnOutcome> for RuntimeOutcome {
 /// rather than the runtime's own lifecycle phase.
 struct SessionLifecycle {
     closed: bool,
+    /// Issue #31: environment teardown is once-per-runtime (mirrors
+    /// `closed`); repeated `destroy_environment` is a no-op even for
+    /// transports whose own destroy isn't idempotent.
+    environment_destroyed: bool,
 }
 
 impl SessionLifecycle {
     fn open() -> Self {
-        Self { closed: false }
+        Self {
+            closed: false,
+            environment_destroyed: false,
+        }
     }
 }
 
@@ -842,6 +849,28 @@ impl AgentRuntime {
     /// Return a reference to the inner kernel.
     pub fn kernel(&self) -> &AgentKernel {
         &self.kernel
+    }
+
+    /// Issue #31: session-bound environment teardown. Drains the session's
+    /// background-job manager (transport-backed jobs die with the
+    /// environment) and calls `destroy()` on the registry's transport —
+    /// idempotent by contract, safe on every teardown path (DELETE / idle
+    /// eviction / graceful shutdown).
+    pub async fn destroy_environment(&mut self) {
+        // Issue #31 §D: session teardown order — drain the session's
+        // background jobs (transport-backed jobs die with the environment
+        // when the transport is destroyed below), then destroy the
+        // transport itself. The once-guard makes this idempotent even for
+        // transports whose own destroy isn't; the manager clear runs first
+        // so a late-arriving job completion finds an empty map instead of
+        // a destroyed environment it cannot record into.
+        if self.session.environment_destroyed {
+            return;
+        }
+        self.session.environment_destroyed = true;
+        let tools = self.kernel.tools();
+        tools.bg_manager().lock().await.clear();
+        tools.transport().destroy().await;
     }
 
     /// Hot-swap the LLM provider backing this runtime.

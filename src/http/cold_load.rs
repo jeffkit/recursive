@@ -103,7 +103,7 @@ pub(super) async fn get_or_load_session(
     let non_system_count = seed.len();
 
     // Phase 3: build the restored runtime with no lock held.
-    let runtime = build_restored_runtime(state, id, seed)?;
+    let runtime = build_restored_runtime(state, id, seed).await?;
     let plan_approval_gate = runtime.plan_approval_gate();
 
     // Phase 4: short write lock — first insert wins a concurrent race.
@@ -176,7 +176,7 @@ fn normalize_stored_transcript(msgs: Vec<Message>) -> Option<Vec<Message>> {
 ///   read-before-edit sharing bug through the back door.
 /// - Goal 393: CLI assembles a compactor + microcompactor here; HTTP paths
 ///   gain that together once the front-end-neutral helper exists.
-fn build_restored_runtime(
+async fn build_restored_runtime(
     state: &Arc<AppState>,
     id: &str,
     seed: Vec<Message>,
@@ -189,11 +189,22 @@ fn build_restored_runtime(
         &state.skills,
         state.config.subagent_enabled,
     );
+    // Issue #31: a restored session gets its OWN environment (container
+    // tier) like a fresh one, plus the environment prompt segment.
+    let tool_registry = state
+        .session_tool_registry()
+        .await
+        .map_err(ApiError::internal)?;
+    let (full, segments) = super::handlers::inject_environment_segment(
+        assembled.full,
+        assembled.segments,
+        &tool_registry,
+    );
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
-        .tools(state.tool_registry.clone())
-        .system_prompt(assembled.full)
-        .prompt_segments(assembled.segments)
+        .tools(tool_registry)
+        .system_prompt(full)
+        .prompt_segments(segments)
         .max_steps(state.config.max_steps)
         // Goal 399: same wall-clock budget as freshly created sessions.
         .wall_timeout_secs(state.config.wall_timeout_secs)

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- feat(sandbox): 会话级环境绑定 + 能力注入 + 后台任务随环境销毁 (#31)：`ToolRegistry`
+  持有会话的 `BackgroundJobManager`（`Clone` 共享、fork 新建），`run_background` 在容器档
+  经共享 transport 在沙箱内执行（解除宿主执行的排除）；新增幂等
+  `AgentRuntime::destroy_environment` / `ToolTransport::destroy`，会话删除、空闲驱逐、
+  优雅关停及一次性 run（含 `/agui`）路径均回收环境；`session_tool_registry()` 改为
+  async/Result 形态，容器创建失败按会话返回 503 而非进程退出；非本地档向系统提示注入
+  `<environment>` 段（网络/持久化/工具链等能力），本地档提示保持逐字节不变。
 - feat(sandbox): ContainerEnvironment 容器档执行环境与选择入口 (#30)：`RECURSIVE_SANDBOX=container`
   或 `--sandbox container` 时，所有 I/O 工具（Read/Write/Edit/Glob/Grep/Bash 等）通过
   `ContainerTransport` 在沙箱容器内执行，HTTP 服务为每会话构建独立容器 registry；非

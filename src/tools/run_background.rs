@@ -293,6 +293,11 @@ impl BackgroundJobManager {
 pub struct RunBackground {
     root: PathBuf,
     manager: Arc<Mutex<BackgroundJobManager>>,
+    /// Optional shared transport (issue #31 §3). When `Some`, the command
+    /// executes via `transport.exec_shell` (container tier) instead of the
+    /// host `/bin/sh` — so background jobs live inside the session's
+    /// sandbox and die with it (`ToolTransport::destroy`).
+    transport: Option<Arc<dyn super::transport::ToolTransport>>,
 }
 
 impl RunBackground {
@@ -300,7 +305,14 @@ impl RunBackground {
         Self {
             root: root.into(),
             manager,
+            transport: None,
         }
+    }
+
+    /// Bind execution to a shared transport (Goal 403 / issue #31 §3).
+    pub fn with_transport(mut self, transport: Arc<dyn super::transport::ToolTransport>) -> Self {
+        self.transport = Some(transport);
+        self
     }
 }
 
@@ -376,6 +388,72 @@ impl Tool for RunBackground {
             .unwrap_or(DEFAULT_JOB_TIMEOUT as i64)
             .clamp(1, 86400) as u64;
 
+        // Collect optional env overrides (validated for both branches).
+        let mut env_pairs: Vec<(String, String)> = Vec::new();
+        if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
+            for (key, val) in env_map {
+                let val_str = val.as_str().ok_or_else(|| Error::BadToolArgs {
+                    name: "run_background".to_string(),
+                    message: format!("env value for `{key}` must be a string, got {:?}", val),
+                })?;
+                env_pairs.push((key.clone(), val_str.to_string()));
+            }
+        }
+
+        // Issue #31 §3: transport-bound execution (container tier) — the
+        // command runs inside the session's sandbox environment, so it dies
+        // with the environment (transport destroy) instead of leaking on
+        // the host.
+        if let Some(transport) = self.transport.clone() {
+            let mut manager = self.manager.lock().await;
+            manager.cleanup();
+            let job_id = manager.insert(Job {
+                state: JobState::Running,
+                created_at: Instant::now(),
+            });
+            drop(manager);
+
+            let manager_clone = self.manager.clone();
+            let job_id_clone = job_id.clone();
+            let command_display = command.to_string();
+            let command = command.to_string();
+            tokio::spawn(async move {
+                let result = match transport
+                    .exec_shell(
+                        &command,
+                        &cwd,
+                        &env_pairs,
+                        Duration::from_secs(timeout_secs),
+                        MAX_OUTPUT_BYTES,
+                    )
+                    .await
+                {
+                    Ok(r) => match r.failure {
+                        Some(_) => JobState::Failed { message: r.stderr },
+                        None => JobState::Completed {
+                            stdout: r.stdout,
+                            stderr: r.stderr,
+                            exit_code: r.exit_code.unwrap_or(-1),
+                        },
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => JobState::TimedOut,
+                    Err(e) => JobState::Failed {
+                        message: format!("exec failed: {e}"),
+                    },
+                };
+                let mut mgr = manager_clone.lock().await;
+                mgr.update(&job_id_clone, result);
+            });
+
+            return Ok(json!({
+                "job_id": job_id,
+                "status": "spawned",
+                "message": format!("Background job `{}` spawned. Use `check_background` with job_id `{}` to retrieve output.", command_display, job_id)
+            })
+            .to_string());
+        }
+
+        // Host path (none / policy tiers): unchanged legacy behaviour.
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(command);
         cmd.current_dir(&cwd);
@@ -383,14 +461,8 @@ impl Tool for RunBackground {
         cmd.stderr(Stdio::piped());
 
         // Apply optional env overrides
-        if let Some(env_map) = args.get("env").and_then(|v| v.as_object()) {
-            for (key, val) in env_map {
-                let val_str = val.as_str().ok_or_else(|| Error::BadToolArgs {
-                    name: "run_background".to_string(),
-                    message: format!("env value for `{key}` must be a string, got {:?}", val),
-                })?;
-                cmd.env(key, val_str);
-            }
+        for (key, val) in &env_pairs {
+            cmd.env(key, val);
         }
 
         // Spawn the process

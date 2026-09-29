@@ -248,3 +248,95 @@ fn container_provider_reports_container_mode() {
     let p = ContainerToolSetProvider::new(PathBuf::from("/tmp"), 30, vec![]);
     assert_eq!(ToolSetProvider::sandbox_mode(&p), SandboxMode::Container);
 }
+
+// ── Issue #31: session-bound, idempotent environment destroy ────────────
+
+/// destroy() removes the container; a second destroy() is a no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn destroy_removes_container_and_is_idempotent() {
+    if !docker_available() {
+        return;
+    }
+    let (t, _dir) = transport().await;
+    let id = t.container_id().to_string();
+    t.destroy().await;
+    assert!(t.is_destroyed());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let out = std::process::Command::new("docker")
+        .args(["inspect", &id])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "container {id} must be removed after destroy()"
+    );
+    // Second destroy: must not error and must not re-run removal.
+    t.destroy().await;
+    assert!(t.is_destroyed());
+}
+
+/// A background command spawned via run_background on a transport-bound
+/// registry dies with the environment: after destroy(), no sandbox
+/// container (and therefore no in-container background process) survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_job_dies_with_environment() {
+    if !docker_available() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let transport = ContainerTransport::new(dir.path()).await.unwrap();
+    transport.prime_toolchain().await;
+    let shared: std::sync::Arc<dyn ToolTransport> = std::sync::Arc::new(transport);
+
+    // Build the tool registry exactly like the container provider does —
+    // run_background is bound to the shared transport.
+    let registry = recursive::tools::build_standard_tools_with_transport_opt(
+        shared.clone(),
+        dir.path(),
+        &[],
+        None,
+        &[],
+        30,
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+
+    // Spawn a long background job inside the container.
+    let run = registry
+        .find_by_name("run_background")
+        .expect("run_background must be registered in the container tier");
+    let out = run
+        .execute(serde_json::json!({
+            "command": "echo marker > /tmp/bg-issue31.marker; sleep 60"
+        }))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "spawned", "{v}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Destroy the environment (session teardown semantics).
+    shared.destroy().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // No sandbox container may outlive destroy(): the job's environment
+    // was reclaimed, killing the background process with it.
+    let ps = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "name=recursive-sandbox-",
+            "--format",
+            "{{.ID}}",
+        ])
+        .output()
+        .unwrap();
+    let running = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        running.trim().is_empty(),
+        "no sandbox container may outlive destroy(): {running}"
+    );
+}

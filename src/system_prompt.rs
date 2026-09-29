@@ -83,6 +83,10 @@ pub struct PromptSegments {
     /// `## Sub-agents enabled` + sub-agent usage note (or `""` when
     /// `sub_agent_enabled` is false).
     pub subagents: String,
+    /// `## Environment` segment rendered from the session transport's
+    /// `capabilities()` (issue #31 §2), or `""` for the local tier — the
+    /// joined prompt must stay byte-identical when this is empty.
+    pub environment: String,
 }
 
 /// Assemble the final system prompt for an agent run.
@@ -108,6 +112,22 @@ pub fn assemble_system_prompt(
     skills: &[Skill],
     sub_agent_enabled: bool,
 ) -> AssembledPrompt {
+    assemble_system_prompt_with_environment(base, workspace, skills, sub_agent_enabled, None)
+}
+
+/// [`assemble_system_prompt`] with an optional `<environment>` segment
+/// (issue #31 §2). `environment` is the pre-rendered environment segment
+/// (see `EnvironmentCapabilities::render_environment_segment`) — pass
+/// `None` for the local tier to keep the prompt byte-identical to the
+/// legacy form. When `Some`, the segment is appended after the sub-agent
+/// note (empty `subagents` keeps ordering stable: environment last).
+pub fn assemble_system_prompt_with_environment(
+    base: &str,
+    workspace: &Path,
+    skills: &[Skill],
+    sub_agent_enabled: bool,
+    environment: Option<&str>,
+) -> AssembledPrompt {
     // ── Rules segment ────────────────────────────────────────────────────
     // `prepend_project_context` either wraps `base` with a `# Project
     // context` header + AGENTS.md/CLAUDE.md + `---` separator, or returns
@@ -131,6 +151,7 @@ pub fn assemble_system_prompt(
         } else {
             String::new()
         },
+        environment: environment.unwrap_or("").to_string(),
     };
 
     // ── Joined full prompt ───────────────────────────────────────────────
@@ -149,6 +170,9 @@ pub fn assemble_system_prompt(
     // above so the prompt-breakdown estimator can account for its tokens.
     if !segments.subagents.is_empty() {
         full.push_str(&segments.subagents);
+    }
+    if !segments.environment.is_empty() {
+        full.push_str(&segments.environment);
     }
 
     AssembledPrompt { full, segments }

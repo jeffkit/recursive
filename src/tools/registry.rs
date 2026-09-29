@@ -198,6 +198,12 @@ pub struct ToolRegistry {
     /// LLM before execution. Wrapped in a `Mutex` (tokio) because `classify()`
     /// takes `&mut self` (it updates the denial tracker).
     pub(crate) auto_classifier: Option<Arc<tokio::sync::Mutex<AutoClassifier>>>,
+    /// Issue #31: the session's background-job manager. `Clone`/`fork_session`
+    /// semantics differ — `Clone` SHARES it (same session continues),
+    /// `fork_session` creates a fresh one (jobs are not inherited). Kept at
+    /// registry level so `destroy_environment` can drain it wherever the
+    /// registry went. Empty (unused) for empty `new()`/`local()` registries.
+    pub(crate) bg_manager: Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>,
 }
 
 impl Default for ToolRegistry {
@@ -224,6 +230,9 @@ impl ToolRegistry {
             policy: None,
             headless: false,
             hook_runner: crate::hooks::ExternalHookRunner::discover(&[]),
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                super::run_background::BackgroundJobManager::new(),
+            )),
         }
     }
 
@@ -235,6 +244,15 @@ impl ToolRegistry {
     /// Returns a reference to the transport layer.
     pub fn transport(&self) -> &Arc<dyn super::transport::ToolTransport> {
         &self.transport
+    }
+
+    /// The registry's background-job manager (issue #31). Same `Arc` as the
+    /// `RunBackground` / `CheckBackground` tools hold, so draining it kills
+    /// the bookkeeping for every job this session spawned.
+    pub fn bg_manager(
+        &self,
+    ) -> &Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>> {
+        &self.bg_manager
     }
 
     /// Create a new empty registry that shares the same transport.
@@ -255,6 +273,8 @@ impl ToolRegistry {
             policy: self.policy.clone(),
             headless: self.headless,
             hook_runner: self.hook_runner.clone(),
+            // Issue #31: empty registry, same session manager (Clone shares).
+            bg_manager: self.bg_manager.clone(),
         }
     }
 
@@ -350,6 +370,8 @@ impl ToolRegistry {
             headless: self.headless,
             hook_runner: self.hook_runner.clone(),
             auto_classifier: self.auto_classifier.clone(),
+            // Fresh manager built above via `state.bg_manager` semantics.
+            bg_manager: state.bg_manager.clone(),
         }
     }
 
@@ -1035,10 +1057,14 @@ pub fn build_standard_tools_with_transport_opt(
         // `build_standard_tools_with_transport_opt`.
         .register_when(!disable_host_exec, || {
             vec![
-                Arc::new(super::run_background::RunBackground::new(
-                    workspace,
-                    bg_manager.clone(),
-                )) as Arc<dyn Tool>,
+                // Issue #31 §3: run_background executes via the shared
+                // transport when bound (container tier), so background jobs
+                // live in the sandbox and die with it. check_background only
+                // reads the shared job manager — no host exec.
+                Arc::new(
+                    super::run_background::RunBackground::new(workspace, bg_manager.clone())
+                        .with_transport(shared_transport.clone()),
+                ) as Arc<dyn Tool>,
                 Arc::new(super::run_background::CheckBackground::new(
                     bg_manager.clone(),
                 )),
@@ -1098,6 +1124,11 @@ pub fn build_standard_tools_with_transport_opt(
     if let Some(roots) = session_roots {
         registry = registry.with_session_roots(roots);
     }
+    // Issue #31: the registry must own the SAME manager the background
+    // tools were built with, so `destroy_environment` drains the manager
+    // the jobs actually live in (not the empty one `ToolRegistry::new`
+    // allocated).
+    registry.bg_manager = bg_manager;
     registry
 }
 

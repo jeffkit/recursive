@@ -139,7 +139,10 @@ pub use storage::S3StorageBackend;
 pub use storage::{
     AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
-pub use system_prompt::{assemble_system_prompt, AssembledPrompt, PromptSegments};
+pub use system_prompt::{
+    assemble_system_prompt, assemble_system_prompt_with_environment, AssembledPrompt,
+    PromptSegments,
+};
 pub use tool_set_provider::{
     LocalToolSetProvider, PolicyToolSetProvider, SandboxMode, ToolSetProvider,
 };

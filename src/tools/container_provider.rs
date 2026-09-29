@@ -78,13 +78,41 @@ impl ContainerToolSetProvider {
     }
 }
 
+impl ContainerToolSetProvider {
+    /// Result-returning registry build (issue #31 §C): container creation
+    /// failure surfaces as `Err(ContainerSetupError)` so HTTP callers can
+    /// map it to a per-session 503/500 instead of the process dying.
+    /// Building the tool set itself never fails — only transport creation.
+    pub async fn build_registry_result(&self) -> Result<ToolRegistry, ContainerSetupError> {
+        let transport = Self::create_transport(&self.workspace).await?;
+        // Issue §5: capabilities() must reflect the environment — probe
+        // the toolchain once so the report is not permanently empty.
+        transport.prime_toolchain().await;
+        let shared: Arc<dyn crate::tools::ToolTransport> = Arc::new(transport);
+        Ok(crate::tools::build_standard_tools_with_transport_opt(
+            shared,
+            &self.workspace,
+            &[],
+            None,
+            &self.skills,
+            self.shell_timeout_secs,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ))
+    }
+}
+
 impl ToolSetProvider for ContainerToolSetProvider {
     fn build_registry(&self) -> ToolRegistry {
         // `build_registry` is sync but container creation is async; same
         // pattern as `docker_provider.rs` (requires a multi-thread
         // runtime — the CLI already runs one). Creation failure aborts
         // with a clear message: silently degrading to host execution
-        // would defeat the sandbox.
+        // would defeat the sandbox. Non-HTTP callers keep this fatal
+        // contract; the HTTP layer uses `build_registry_result`.
         let workspace = self.workspace.clone();
         let transport = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
@@ -117,14 +145,12 @@ impl ToolSetProvider for ContainerToolSetProvider {
             None,
             None,
             None,
-            // `disable_host_exec=true`: run_background / check_background /
-            // watch_file / stop_loop execute via the HOST `/bin/sh` and read
-            // the HOST filesystem, which would bypass the container sandbox
-            // (issue #30: "container runs the commands, host executes them"
-            // split). Until they are re-bound to the transport, the
-            // container tier honestly omits them instead of silently
-            // exposing host execution.
-            true,
+            // Issue #31 §3: run_background now executes through the shared
+            // ContainerTransport (dies with the environment), so the
+            // host-exec exclusion is lifted. watch_file / stop_loop remain
+            // host-read-only utilities (no command execution); they read the
+            // same bind-mounted workspace that the container sees.
+            false,
         )
     }
 

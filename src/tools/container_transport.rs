@@ -150,6 +150,10 @@ pub struct ContainerTransport {
     /// Toolchain probed once at startup (issue §5: capabilities must match
     /// the environment). Empty until probed; `prime_toolchain()` fills it.
     toolchain: std::sync::OnceLock<Vec<String>>,
+    /// Issue #31: set by `destroy()` so repeated destroy calls are no-ops
+    /// (idempotent terminal reclamation). `Drop` still force-removes —
+    /// docker tolerates removing an already-removed container id.
+    destroyed: std::sync::atomic::AtomicBool,
 }
 
 impl ContainerTransport {
@@ -189,6 +193,7 @@ impl ContainerTransport {
             image,
             network_on: std::env::var("RECURSIVE_SANDBOX_NETWORK").as_deref() == Ok("on"),
             toolchain: std::sync::OnceLock::new(),
+            destroyed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -210,6 +215,11 @@ impl ContainerTransport {
     /// The container id (for tests / diagnostics).
     pub fn container_id(&self) -> &str {
         &self.container_id
+    }
+
+    /// Was [`ToolTransport::destroy`] already called? (diagnostics/tests)
+    pub fn is_destroyed(&self) -> bool {
+        self.destroyed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Image the container was created from.
@@ -763,6 +773,20 @@ impl ToolTransport for ContainerTransport {
             stderr,
             failure,
         })
+    }
+
+    /// Issue #31: session-bound terminal reclamation. Force-removes the
+    /// container once; repeated calls are no-ops (the `destroyed` flag is
+    /// set **before** the async removal so concurrent callers cannot both
+    /// proceed — swap semantics).
+    async fn destroy(&self) {
+        if self
+            .destroyed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        self.remove().await;
     }
 
     fn capabilities(&self) -> EnvironmentCapabilities {

@@ -7,6 +7,8 @@
 
 mod auth;
 mod cold_load;
+#[cfg(test)]
+mod environment_binding_tests;
 mod handlers;
 mod rate_limit;
 
@@ -397,11 +399,11 @@ pub struct ToolInfo {
 /// Process-level configuration on the startup registry (permissions,
 /// headless, hook runner) is carried over so the per-session rebuild does
 /// not silently drop it.
-fn rebind_per_session_registry(
+async fn rebind_per_session_registry(
     base: &ToolRegistry,
     #[allow(unused_variables)] config: &Config,
     #[allow(unused_variables)] skills: &[crate::skills::Skill],
-) -> ToolRegistry {
+) -> Result<ToolRegistry, String> {
     #[cfg(feature = "cloud-runtime")]
     {
         if matches!(
@@ -413,16 +415,21 @@ fn rebind_per_session_registry(
                 config.shell_timeout_secs,
                 skills.to_vec(),
             );
-            let mut reg = crate::ToolSetProvider::build_registry(&provider);
+            // Issue #31 §C: container creation failure is a per-session
+            // error (503/500 at the handler), never a process exit.
+            let mut reg = provider
+                .build_registry_result()
+                .await
+                .map_err(|e| e.to_string())?;
             if let Some(sp) = base.shared_permissions() {
                 reg = reg.with_shared_permissions(sp);
             }
-            return reg
+            return Ok(reg
                 .with_headless(base.headless)
-                .with_hook_runner(base.hook_runner.clone());
+                .with_hook_runner(base.hook_runner.clone()));
         }
     }
-    base.clone()
+    Ok(base.clone())
 }
 
 impl AppState {
@@ -431,8 +438,10 @@ impl AppState {
     /// Container tier: a fresh registry with its own container (issue §3 —
     /// one container per session, not one per process). Other tiers: a
     /// handle-clone of the shared startup registry (previous behaviour).
-    pub fn session_tool_registry(&self) -> ToolRegistry {
-        rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills)
+    /// Issue #31 §C: Result-shaped — container creation failure is a
+    /// per-session error mapped by handlers to 503/500, not a process exit.
+    pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
+        rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await
     }
 }
 
@@ -1205,6 +1214,11 @@ pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
                 async move {
                     if let Ok(mut rt) = session.runtime.try_lock() {
                         rt.close(None).await;
+                        // Issue #31 §B: explicit environment teardown on
+                        // idle eviction (idempotent; runs outside every
+                        // sessions lock — this closure is phase-3 by
+                        // contract).
+                        rt.destroy_environment().await;
                         let transcript = rt.transcript().to_vec();
                         drop(rt);
                         if let Err(e) = storage.save_transcript(&session.id, &transcript).await {
@@ -1253,6 +1267,9 @@ pub async fn flush_all_sessions(state: &AppState) -> usize {
     for session in drained {
         if let Ok(mut rt) = session.runtime.try_lock() {
             rt.close(None).await;
+            // Issue #31 §B: graceful-shutdown teardown — destroy the
+            // session's environment (idempotent), then persist.
+            rt.destroy_environment().await;
             let transcript = rt.transcript().to_vec();
             drop(rt);
             match state
@@ -1796,8 +1813,16 @@ mod goal_403_http_sandbox_entry {
              per session, issue §3)"
         );
         assert!(
-            src.contains("state.session_tool_registry()"),
-            "per-session runtimes must be built from session_tool_registry()"
+            src.contains("state\n        .session_tool_registry()\n        .await"),
+            "per-session runtimes must be built from session_tool_registry() \
+             (issue #31 made it async/Result-shaped)"
+        );
+        // Issue #31: the Result-shaped registry build must NOT fall back to
+        // the shared startup registry on failure — container-tier failures
+        // are per-session errors (503), never a silent share.
+        assert!(
+            !src.contains("tool_registry.clone().await"),
+            "session_tool_registry() failures must propagate, not clone the shared registry"
         );
     }
 }

@@ -3660,6 +3660,7 @@ mod tests {
             system_prompt: "SS".into(),
             skills: String::new(),
             subagents: String::new(),
+            environment: String::new(),
         });
 
         let outcome = core.run_inner().await.expect("run_inner must not error");
@@ -3734,6 +3735,7 @@ mod tests {
             system_prompt: "1234567890".into(), // 10 chars → 3 tokens (10/4=2.5, ceil=3)
             skills: "abcde".into(),             // 5 chars → 2 tokens (5/4=1.25, ceil=2)
             subagents: "abcdefgh".into(),       // 8 chars → 2 tokens (8/4=2.0, ceil=2)
+            environment: String::new(),
         };
         let registry = crate::tools::ToolRegistry::default();
         let cache = StaticBreakdownCache::build(&segments, &[], &registry);
