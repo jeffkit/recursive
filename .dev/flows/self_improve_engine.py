@@ -126,6 +126,8 @@ class Engine:
         # flow 节点经 node-input.json 传参（wtSha/verdict 等）——覆盖层，最优先
         self.overlay_path = run_dir / "node-input.json"
         self.overlay: dict = json.loads(self.overlay_path.read_text()) if self.overlay_path.exists() else {}
+        if "goal" not in self.state and self.payload.get("goal"):
+            self.state["goal"] = self.payload["goal"]
 
     # -- 状态 --
     def save(self) -> None:
@@ -1032,7 +1034,7 @@ def step_run(st: Engine) -> None:
     sys_prompt = st.state["sysPromptFile"]
     env = build_env(st)
     transcript = str(st.run_dir / "transcript.json")
-    goal = st.state["goal"]
+    goal = st.p("goal")
     meta = run_recursive(st, goal, cwd=worktree, sys_prompt_file=sys_prompt,
                          transcript_out=transcript, env=env)
     st.state["transcriptOut"] = transcript
@@ -1107,7 +1109,7 @@ def step_regate_entry(st: Engine) -> None:
 
 def step_commit_prep(st: Engine) -> None:
     worktree = st.state["worktreeDir"]
-    goal = st.state["goal"]
+    goal = st.p("goal")
     subject = goal_subject(goal)
     for f in Path(worktree).glob(".gate-*-output.log"):
         try:
@@ -1143,7 +1145,7 @@ def step_commit_rebase(st: Engine) -> None:
 
 def step_commit_land(st: Engine) -> None:
     wt_sha = st.p("wtSha") or (st.state.get("commitPrep") or {}).get("wtSha")
-    goal = st.state["goal"]
+    goal = st.p("goal")
     subject = goal_subject(goal)
     try:
         sh(["git", "cherry-pick", "--no-commit", wt_sha], cwd=st.repo)
