@@ -1804,7 +1804,10 @@ mod goal_403_http_sandbox_entry {
 
     #[test]
     fn sessions_rebind_their_own_registry_in_container_tier() {
-        let src = include_str!("handlers.rs");
+        // Windows checkout 是 CRLF（git autocrlf），而 include_str! 原样嵌入文件——
+        // 多行源码断言必须在归一化行尾之后再匹配，否则只在 windows-latest 上挂
+        // （2026-09-29 实测：main 的 windows 矩阵因此变红，ubuntu/macOS 正常）。
+        let src = include_str!("handlers.rs").replace("\r\n", "\n");
         assert!(
             !src.contains("state.tool_registry.clone()"),
             "per-session build points must go through \
