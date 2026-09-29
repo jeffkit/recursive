@@ -38,9 +38,10 @@
     },
     "cli-mutants": {
       "_comment": "CLI crate 测试有效性门。cli-mutants.sh 自带变更检测：未动 crates/recursive-cli/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix。",
+      "_timeout_note": "2026-09-29（goal-407）：20 分钟预算在这台机器上**不可能**跑完。cli-mutants 的作用域是「相对 main 变更过的整文件」，而 crates/recursive-cli/src/main.rs 有 ~150 个可变点；改动 main.rs 会让变更集变成 4 个文件 / ~200 个 mutant。copy 模式每个 --jobs 副本都要先冷编译一遍依赖树，之后每个 mutant 还要 build ~27s + test ~11s（实测中位数；6 个 test target 的链接占大头），整机吞吐约 1.9 mutant/分钟。实测一轮 ≈ 110–120 分钟，20 分钟预算只能跑掉 ~150/242 个 mutant，于是 gate 被 SIGKILL、报告只剩截断的 survivor 列表（flow 日志里的 `timeout (exit -1)`；报告没有收尾汇总行就是判据）。这里把预算设为 150 分钟，**不改任何判定语义**（同样的 mutant、同样的测试命令、同样 fail-on-survivor）。若要真正缩短，应由维护者决定更结构化的做法（`--in-diff` 差分作用域 / 合并 integration test target 以减少每 mutant 的链接次数 / dev profile 关掉 debug info），不要靠改判定阈值来掩盖。",
       "cmd": "bash .dev/scripts/cli-mutants.sh",
       "onFail": "resume-fix",
-      "timeout": 1200000
+      "timeout": 9000000
     },
     "flow-watchdog": {
       "_comment": "Goal 346: watchdog unit tests for self-improve.flow.js (startRecursiveWatchdog / findRecursivePid). Run with node --test. Keeps the flow's own test coverage enforceable in CI.",

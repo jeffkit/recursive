@@ -40,19 +40,47 @@ impl OrphanPolicy {
     }
 }
 
+/// Classify one answer line into an [`OrphanPolicy`].
+///
+/// Pure helper (no I/O) so the accepted/aborted mapping — the part a prompt
+/// mutation silently breaks — is pinned by unit tests without touching stdin.
+/// Returns `None` for an unrecognised answer so the caller can count it as an
+/// invalid attempt.
+fn classify_orphan_answer(line: &str) -> Option<OrphanPolicy> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "r" | "redo" => Some(OrphanPolicy::Redo),
+        "s" | "skip" => Some(OrphanPolicy::Skip),
+        "a" | "abort" | "" => Some(OrphanPolicy::Abort),
+        _ => None,
+    }
+}
+
 pub(crate) fn prompt_orphan_choice(tool_name: &str) -> std::io::Result<OrphanPolicy> {
-    use std::io::{stdin, stdout, Write};
+    use std::io::stdin;
+    prompt_orphan_choice_with(tool_name, || {
+        let mut line = String::new();
+        stdin().read_line(&mut line)?;
+        Ok(line)
+    })
+}
+
+/// Prompt loop, parameterised over the line source so tests can script input
+/// (the public [`prompt_orphan_choice`] plugs in stdin).
+///
+/// Re-prompts on unrecognised input and gives up after three invalid attempts.
+fn prompt_orphan_choice_with(
+    tool_name: &str,
+    mut read_line: impl FnMut() -> std::io::Result<String>,
+) -> std::io::Result<OrphanPolicy> {
+    use std::io::{stdout, Write};
     let mut attempts = 0;
     loop {
         print!("  [r]edo  [s]kip  [a]bort  — choice for '{tool_name}': ");
         stdout().flush()?;
-        let mut line = String::new();
-        stdin().read_line(&mut line)?;
-        match line.trim().to_ascii_lowercase().as_str() {
-            "r" | "redo" => return Ok(OrphanPolicy::Redo),
-            "s" | "skip" => return Ok(OrphanPolicy::Skip),
-            "a" | "abort" | "" => return Ok(OrphanPolicy::Abort),
-            _ => {
+        let line = read_line()?;
+        match classify_orphan_answer(&line) {
+            Some(policy) => return Ok(policy),
+            None => {
                 attempts += 1;
                 if attempts >= 3 {
                     eprintln!("Too many invalid inputs — aborting.");
@@ -333,6 +361,15 @@ pub(crate) async fn cmd_resume(
     .await
 }
 
+/// Whether `run_resumed` should print the `resuming from N seeded message(s)`
+/// banner: text consumers want it, JSON consumers must keep stderr clean.
+///
+/// Extracted as a pure predicate so the banner-on/off contract is unit-tested
+/// without capturing stderr.
+fn resume_banner_enabled(json_mode: bool) -> bool {
+    !json_mode
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_resumed(
     config: recursive::config::Config,
@@ -428,6 +465,7 @@ pub(crate) async fn run_resumed(
         Some(&message),
         Some(event_sink),
         Some(shutdown.clone()),
+        None, // static token above already fills the agent tool's slot
         true, // interactive resume — plan mode tools enabled
     )
     .await?;
@@ -463,7 +501,7 @@ pub(crate) async fn run_resumed(
     let tool_specs = runtime.kernel().tools().specs();
     let json_mode = json_output.is_some();
 
-    if !json_mode {
+    if resume_banner_enabled(json_mode) {
         eprintln!("resuming from {seed_len} seeded message(s)");
     }
 
@@ -641,8 +679,13 @@ pub(crate) async fn run_resumed(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_resume_message;
+    use super::{
+        classify_orphan_answer, cmd_resume, legacy_resume_error, prompt_orphan_choice_with,
+        resolve_resume_message, resolve_resume_target, resume_banner_enabled, run_resumed,
+        OrphanPolicy,
+    };
     use crate::cli::session::resolve_session_path;
+    use std::path::Path;
 
     #[test]
     fn explicit_message_wins() {
@@ -700,5 +743,321 @@ mod tests {
             Some(v) => std::env::set_var("RECURSIVE_HOME", v),
             None => std::env::remove_var("RECURSIVE_HOME"),
         }
+    }
+
+    // ── prompt_orphan_choice / classify_orphan_answer ────────────────────────
+
+    /// Drive [`prompt_orphan_choice_with`] from a scripted list of lines.
+    /// Running the script dry yields `Err` so a runaway loop (a broken attempt
+    /// counter) fails the test instead of hanging.
+    fn choice_with_script(inputs: &[&str]) -> std::io::Result<OrphanPolicy> {
+        let mut it = inputs.iter();
+        prompt_orphan_choice_with("t", || match it.next() {
+            Some(s) => Ok((*s).to_string()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "script exhausted",
+            )),
+        })
+    }
+
+    #[test]
+    fn classify_orphan_answer_maps_every_accepted_spelling() {
+        assert_eq!(classify_orphan_answer("r\n"), Some(OrphanPolicy::Redo));
+        assert_eq!(classify_orphan_answer("redo\n"), Some(OrphanPolicy::Redo));
+        assert_eq!(classify_orphan_answer("s\n"), Some(OrphanPolicy::Skip));
+        assert_eq!(classify_orphan_answer("skip\n"), Some(OrphanPolicy::Skip));
+        assert_eq!(classify_orphan_answer("a\n"), Some(OrphanPolicy::Abort));
+        assert_eq!(classify_orphan_answer("abort\n"), Some(OrphanPolicy::Abort));
+        // Empty line == Abort (the documented "just press enter" default).
+        assert_eq!(classify_orphan_answer("\n"), Some(OrphanPolicy::Abort));
+        // Case/whitespace-insensitive.
+        assert_eq!(
+            classify_orphan_answer("  ReDo  \n"),
+            Some(OrphanPolicy::Redo)
+        );
+        // Unrecognised answers are not silently accepted.
+        assert_eq!(classify_orphan_answer("nope\n"), None);
+    }
+
+    #[test]
+    fn prompt_orphan_choice_accepts_first_valid_answer() {
+        assert_eq!(choice_with_script(&["r"]).unwrap(), OrphanPolicy::Redo);
+        assert_eq!(choice_with_script(&["s"]).unwrap(), OrphanPolicy::Skip);
+        assert_eq!(choice_with_script(&["a"]).unwrap(), OrphanPolicy::Abort);
+        assert_eq!(choice_with_script(&[""]).unwrap(), OrphanPolicy::Abort);
+    }
+
+    #[test]
+    fn prompt_orphan_choice_reprompts_instead_of_aborting_on_one_bad_answer() {
+        // One invalid answer must NOT abort: the later valid line wins.
+        assert_eq!(choice_with_script(&["x", "r"]).unwrap(), OrphanPolicy::Redo);
+        assert_eq!(
+            choice_with_script(&["x", "y", "s"]).unwrap(),
+            OrphanPolicy::Skip
+        );
+    }
+
+    #[test]
+    fn prompt_orphan_choice_aborts_after_three_invalid_answers() {
+        // Exactly three invalid attempts → Abort. A wrong attempt counter
+        // (*= / -=) never reaches three and runs the script dry → Err.
+        assert_eq!(
+            choice_with_script(&["x", "y", "z"]).unwrap(),
+            OrphanPolicy::Abort
+        );
+    }
+
+    // ── legacy_resume_error ──────────────────────────────────────────────────
+
+    #[test]
+    fn legacy_resume_error_names_the_path_and_the_migration_command() {
+        let msg = legacy_resume_error(Path::new("/tmp/sessions/abc.json"));
+        assert!(
+            msg.contains("/tmp/sessions/abc.json"),
+            "must name the offending path: {msg}"
+        );
+        assert!(
+            msg.contains("migrate-legacy"),
+            "must point at the migration command: {msg}"
+        );
+    }
+
+    // ── resolve_resume_target ────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_resume_target_accepts_jsonl_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = resolve_resume_target(Path::new("/unused"), None, Some(dir.path().to_path_buf()));
+        assert_eq!(got.unwrap(), dir.path());
+    }
+
+    #[test]
+    fn resolve_resume_target_rejects_legacy_json_extension() {
+        // `.json` suffix alone is enough to flag a legacy session (even when
+        // the path does not exist on disk).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("session.json");
+        let err = resolve_resume_target(Path::new("/unused"), None, Some(missing)).unwrap_err();
+        assert!(err.to_string().contains("legacy"), "err: {err}");
+    }
+
+    #[test]
+    fn resolve_resume_target_rejects_existing_non_json_file() {
+        // An existing regular file (no `.json`) is also treated as legacy.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session");
+        std::fs::write(&file, "{}").unwrap();
+        let err = resolve_resume_target(Path::new("/unused"), None, Some(file)).unwrap_err();
+        assert!(err.to_string().contains("legacy"), "err: {err}");
+    }
+
+    #[test]
+    fn resolve_resume_target_rejects_json_extension_session_id() {
+        let err =
+            resolve_resume_target(Path::new("/unused"), Some("foo.json".into()), None).unwrap_err();
+        assert!(err.to_string().contains("legacy"), "err: {err}");
+    }
+
+    #[test]
+    fn resolve_resume_target_rejects_existing_file_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain");
+        std::fs::write(&file, "{}").unwrap();
+        let err = resolve_resume_target(
+            Path::new("/unused"),
+            Some(file.to_string_lossy().into_owned()),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("legacy"), "err: {err}");
+    }
+
+    // ── cmd_resume / run_resumed ─────────────────────────────────────────────
+
+    fn test_config(workspace: &Path) -> recursive::config::Config {
+        recursive::config::Config {
+            workspace: workspace.to_path_buf(),
+            api_base: "https://api.deepseek.com/v1".to_string(),
+            api_key: Some("sk-test".to_string()),
+            model: "deepseek-chat".to_string(),
+            provider_type: "openai".to_string(),
+            preset: None,
+            max_steps: 32,
+            max_tokens: 65536,
+            temperature: 0.2,
+            system_prompt: String::new(),
+            retry_max: 0,
+            retry_initial_backoff_secs: 0,
+            retry_max_backoff_secs: 0,
+            shell_timeout_secs: 300,
+            headless: true,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            goal_eval_transcript_tail: 12,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+            wall_timeout_secs: 0,
+        }
+    }
+
+    async fn current_tool_hash(cfg: &recursive::config::Config) -> String {
+        let (tools, _) = crate::cli::builder::build_tools(cfg, None).await;
+        recursive::session::hash_tool_specs(&tools.specs())
+    }
+
+    fn write_session_meta(dir: &Path, hash: Option<String>) {
+        let meta = serde_json::json!({
+            "session_id": "sess-1",
+            "goal": "g",
+            "model": "m",
+            "provider": "openai",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "message_count": 0,
+            "tool_registry_hash": hash,
+        });
+        std::fs::write(dir.join(".meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cmd_resume_propagates_target_resolution_error() {
+        // A `--from-file` pointing at a missing, non-`.json`, non-dir path must
+        // surface as an error rather than silently returning Ok(()).
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let missing = ws.path().join("does-not-exist");
+        let res = cmd_resume(
+            cfg,
+            None,
+            Some(missing),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(res.is_err(), "resolve error must propagate: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn cmd_resume_refuses_tool_registry_hash_mismatch() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let sdir = ws.path().join("sess-a");
+        std::fs::create_dir_all(&sdir).unwrap();
+        write_session_meta(&sdir, Some("definitely-not-the-current-hash".into()));
+
+        let err = cmd_resume(
+            cfg,
+            None,
+            Some(sdir),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("tool registry hash mismatch"),
+            "a drifted tool set must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_resume_accepts_matching_tool_registry_hash() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let hash = current_tool_hash(&cfg).await;
+        let sdir = ws.path().join("sess-b");
+        std::fs::create_dir_all(&sdir).unwrap();
+        write_session_meta(&sdir, Some(hash));
+
+        // The stored hash matches → validation must pass. The next observable
+        // failure is the missing `transcript.jsonl`, never a hash mismatch.
+        let err = cmd_resume(
+            cfg,
+            None,
+            Some(sdir),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.to_string().contains("hash mismatch"),
+            "a matching hash must not be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_resumed_propagates_runtime_failure() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(ws.path());
+        // Unreachable endpoint + no retries → the runtime fails fast and
+        // `run_resumed` must propagate that error rather than swallow it.
+        cfg.api_base = "http://127.0.0.1:1/v1".into();
+
+        let res = run_resumed(
+            cfg,
+            Vec::new(),
+            "hello".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "runtime failure must propagate, not be swallowed: {res:?}"
+        );
+    }
+
+    #[test]
+    fn resume_banner_is_printed_only_for_text_output() {
+        assert!(resume_banner_enabled(false));
+        assert!(!resume_banner_enabled(true));
     }
 }

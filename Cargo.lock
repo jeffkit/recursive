@@ -3664,6 +3664,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "mutants",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

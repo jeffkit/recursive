@@ -169,6 +169,34 @@ Don't edit files a live worktree run is working on.
    ~1-2 min; subsequent runs in the same HEAD can use `--no-build`). Host-mode runs
    (`e2e-run-host.sh`) are unaffected — they use the host `target/release/recursive`
    binary, not the image.
+7. **Docker VM (colima) storage corruption — looks exactly like a code regression.**
+   Symptoms: `docker system df` / `docker builder prune` / any `docker pull` fails
+   with `write /var/lib/docker/buildkit/…: input/output error` (or the containerd
+   `meta.db` variant), `colima ssh -- <cmd>` reports `/bin/bash: Input/output error`,
+   and `argus-build` reports `"status": "failed", "error": "Build exited with code 1"`
+   while `argus-setup` still says `"created": true` — so every smoke case then fails
+   with `File … does not exist` (no container ever started). `docker ps -a` may still
+   work, which makes it look agent-caused; it is not. The VM's guest FS is wedged
+   (restarting colima does **not** fix it). Cheapest non-destructive recovery: keep
+   the broken profile and spin up a fresh one —
+   `colima start --profile e2e --cpu 4 --memory 8 --disk 60 --runtime docker`
+   (colima switches the current docker context to `colima-e2e` automatically; the
+   broken profile's disk is left intact for manual recovery). Also note
+   `e2e-local.sh` hard-requires `target/release/recursive` —
+   `cargo build --release -p recursive-cli` before blaming the gate's
+   `not found — run 'cargo build --release …' first` line on the code.
+8. **`cli-mutants` times out (not: survivors) when the change touches `main.rs`.**
+   `cli-mutants.sh` scopes to the whole *files* changed vs `main`, and
+   `crates/recursive-cli/src/main.rs` alone carries ~150 mutable points. Any change to it
+   (plus `cli/builder.rs` / `cli/resume.rs`) makes the run ~200 mutants / 4 files in copy
+   mode, where each of the `--jobs` copies must first cold-build the dependency tree
+   (10 copies contend, load 100+, ~10 min) before producing results (~30–50 s per mutant).
+   Measured: 40–60 min for such a run, so a 20-minute budget is killed mid-flight and the
+   gate reports the *truncated* survivor list (`find` it in the flow log as
+   `quality gate 'cli-mutants': timeout (exit -1)`; a report with no closing summary line
+   is the tell). Symptom to react to: you clean every listed survivor, re-run, and the gate
+   is red again. Fix: budget the gate for a long run (`.flowcast/gates.json` → `timeout`,
+   aligned with `agent-mutants`) — never shrink the gate's scope to hide this.
 
 New failure modes should be added here, not silently worked around.
 

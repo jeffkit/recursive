@@ -31,7 +31,6 @@ use recursive::SessionStatus;
 use recursive::SessionWriter;
 use recursive::{
     config::Config,
-    llm::{AnthropicProvider, ChatProvider, OpenAiProvider},
     tools::{ScheduleWakeup, WakeupSlot},
     AgentRuntimeBuilder, ChannelSink, CompositeSink, EventSink, FinishReason, NullSink,
     RetryPolicy, SessionPersistenceSink, ToolRegistry,
@@ -601,11 +600,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // --effort: map to thinking_budget (low=0 disables, normal=default, high=max).
     if let Some(effort) = &cli.effort {
-        config.thinking_budget = match effort.as_str() {
-            "low" => Some(0),
-            "high" => Some(16000),
-            _ => None, // "normal" → leave as default
-        };
+        config.thinking_budget = effort_thinking_budget(effort);
     }
     // --name: optional display name for the session.
     if let Some(name) = cli.name {
@@ -618,9 +613,7 @@ async fn main() -> anyhow::Result<()> {
     // --add-dir: extra allowed sandbox roots (read-write). Appended to any
     // roots already loaded from [sandbox] extra_dirs in config.toml so the
     // two sources compose.
-    if !cli.add_dir.is_empty() {
-        config.extra_dirs.extend(cli.add_dir.clone());
-    }
+    merge_extra_dirs(&mut config.extra_dirs, &cli.add_dir);
     // --allow-tools: restrict agent to a subset of tools.
     if let Some(ref allow) = cli.allow_tools {
         config.allow_tools = allow.split(',').map(|s| s.trim().to_string()).collect();
@@ -633,9 +626,8 @@ async fn main() -> anyhow::Result<()> {
         cli.stream,
     );
     let effective_json = json_output.is_some();
-    let effective_stream = cli.stream
-        || json_output.is_some_and(|m| m.enables_token_streaming())
-        || matches!(cli.output_format.as_deref(), Some("stream-json"));
+    let effective_stream =
+        resolve_effective_stream(cli.stream, json_output, cli.output_format.as_deref());
     // Log level was already resolved and applied at startup (early_log above).
 
     // Determine effective command:
@@ -726,28 +718,7 @@ async fn main() -> anyhow::Result<()> {
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
-            let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
-                "anthropic" => {
-                    let anthropic_retry = recursive::llm::RetryPolicy {
-                        max_retries: config.retry_max,
-                        initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                        max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-                    };
-                    let anthropic =
-                        AnthropicProvider::new(&config.api_base, api_key, &config.model)?
-                            .with_temperature(config.temperature)
-                            .with_max_tokens(config.max_tokens)
-                            .with_retry_policy(anthropic_retry);
-                    Arc::new(anthropic)
-                }
-                _ => {
-                    let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
-                        .with_temperature(config.temperature)
-                        .with_max_tokens(config.max_tokens)
-                        .with_retry_policy(retry);
-                    Arc::new(openai)
-                }
-            };
+            let provider = cli::builder::build_llm_provider(&config, api_key, retry, None)?;
             recursive::acp::server::AcpServer::run(Some(provider)).await;
             Ok(())
         }
@@ -775,29 +746,7 @@ async fn main() -> anyhow::Result<()> {
                 initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
-            let provider: Arc<dyn recursive::llm::ChatProvider> =
-                match config.provider_type.as_str() {
-                    "anthropic" => {
-                        let anthropic_retry = recursive::llm::RetryPolicy {
-                            max_retries: config.retry_max,
-                            initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                            max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-                        };
-                        let anthropic =
-                            AnthropicProvider::new(&config.api_base, api_key, &config.model)?
-                                .with_temperature(config.temperature)
-                                .with_max_tokens(config.max_tokens)
-                                .with_retry_policy(anthropic_retry);
-                        Arc::new(anthropic)
-                    }
-                    _ => {
-                        let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
-                            .with_temperature(config.temperature)
-                            .with_max_tokens(config.max_tokens)
-                            .with_retry_policy(retry);
-                        Arc::new(openai)
-                    }
-                };
+            let provider = cli::builder::build_llm_provider(&config, api_key, retry, None)?;
             // Register the unified `Agent` tool when sub-agent is enabled, so
             // the HTTP API matches CLI/TUI capabilities. Done before deriving
             // tool_infos so /tools/list also advertises the Agent tool.
@@ -914,14 +863,12 @@ async fn main() -> anyhow::Result<()> {
                  admission_timeout={admission_timeout_secs}s (0 = wait indefinitely)"
             );
             // Warn if auth is effectively disabled
-            let auth_enabled = std::env::var("RECURSIVE_API_KEY").is_ok()
-                || std::env::var("RECURSIVE_JWT_SECRET").is_ok();
-            if !auth_enabled {
-                tracing::warn!(
-                    "HTTP server started with authentication DISABLED. \
-                     Set RECURSIVE_API_KEY or RECURSIVE_JWT_SECRET to enable auth. \
-                     Any client with network access can execute commands."
-                );
+            let auth_enabled = http_auth_enabled(
+                std::env::var("RECURSIVE_API_KEY").ok().as_deref(),
+                std::env::var("RECURSIVE_JWT_SECRET").ok().as_deref(),
+            );
+            if let Some(warning) = disabled_auth_warning(auth_enabled) {
+                tracing::warn!("{warning}");
             }
             recursive::http::serve_with_graceful_shutdown(listener, router, async move {
                 http_shutdown.cancelled().await
@@ -953,7 +900,7 @@ async fn main() -> anyhow::Result<()> {
                 effective_stream,
                 cli.mcp_config,
                 cli.hook_timing,
-                !cli.no_session,
+                session_recording_enabled(cli.no_session),
                 shutdown,
                 matches!(cli.input_format.as_deref(), Some("stream-json")),
             )
@@ -980,7 +927,7 @@ async fn main() -> anyhow::Result<()> {
                 effective_stream,
                 cli.mcp_config,
                 cli.hook_timing,
-                !cli.no_session,
+                session_recording_enabled(cli.no_session),
                 shutdown,
             )
             .await
@@ -993,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
             head,
         } => {
             // Check mutual exclusivity of --head and --tail
-            if tail.is_some() && head.is_some() {
+            if head_tail_conflict(head.is_some(), tail.is_some()) {
                 anyhow::bail!("--head and --tail are mutually exclusive");
             }
 
@@ -1011,7 +958,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(())
                 }
-                Some(_) if goal.is_empty() => {
+                Some(_) if resume_from_needs_goal(goal.is_empty()) => {
                     anyhow::bail!("--resume-from requires a trailing <goal> to continue the run");
                 }
                 Some(n) => {
@@ -1032,7 +979,7 @@ async fn main() -> anyhow::Result<()> {
                         json_output,
                         cli.mcp_config,
                         cli.hook_timing,
-                        !cli.no_session,
+                        session_recording_enabled(cli.no_session),
                         shutdown,
                         None, // existing_writer — legacy --resume-from creates a fresh session
                         matches!(cli.input_format.as_deref(), Some("stream-json")),
@@ -1059,7 +1006,7 @@ async fn main() -> anyhow::Result<()> {
                 json_output,
                 cli.mcp_config,
                 cli.hook_timing,
-                !cli.no_session,
+                session_recording_enabled(cli.no_session),
                 matches!(cli.input_format.as_deref(), Some("stream-json")),
             )
             .await
@@ -1069,8 +1016,8 @@ async fn main() -> anyhow::Result<()> {
                 let old_sessions = recursive::session::list_sessions(&config.workspace)?;
                 let new_sessions =
                     recursive::session::SessionReader::list_sessions(&config.workspace)?;
-                let total = old_sessions.len() + new_sessions.len();
-                if total == 0 {
+                let total = total_sessions(old_sessions.len(), new_sessions.len());
+                if !has_sessions(total) {
                     let sessions_root = recursive::user_sessions_dir(&config.workspace)
                         .unwrap_or_else(|_| config.workspace.join(".recursive").join("sessions"));
                     println!("No sessions found in {}", sessions_root.display());
@@ -1137,16 +1084,16 @@ async fn main() -> anyhow::Result<()> {
                         match entry {
                             LoadedEntry::Message(msg) => {
                                 let preview: String = msg.content.chars().take(200).collect();
-                                let truncated = if msg.content.len() > 200 { "…" } else { "" };
+                                let truncated = truncation_marker(msg.content.len(), 200);
                                 println!("  [{:>3}] {:>9}: {}{}", i, msg.role, preview, truncated);
-                                if !msg.tool_calls.is_empty() {
+                                if has_tool_calls(&msg.tool_calls) {
                                     for tc in &msg.tool_calls {
                                         println!("         tool_call: {} ({})", tc.name, tc.id);
                                     }
                                 }
                                 if let Some(ref rc) = msg.reasoning_content {
                                     let rp: String = rc.chars().take(100).collect();
-                                    let rt = if rc.len() > 100 { "…" } else { "" };
+                                    let rt = truncation_marker(rc.len(), 100);
                                     println!("         reasoning: {}{}", rp, rt);
                                 }
                             }
@@ -1184,9 +1131,9 @@ async fn main() -> anyhow::Result<()> {
                             recursive::Role::Tool => "tool",
                         };
                         let preview: String = msg.content.chars().take(200).collect();
-                        let truncated = if msg.content.len() > 200 { "…" } else { "" };
+                        let truncated = truncation_marker(msg.content.len(), 200);
                         println!("  [{:>3}] {:>9}: {}{}", i, role, preview, truncated);
-                        if !msg.tool_calls.is_empty() {
+                        if has_tool_calls(&msg.tool_calls) {
                             for tc in &msg.tool_calls {
                                 println!("         tool_call: {} ({})", tc.name, tc.id);
                             }
@@ -1198,14 +1145,14 @@ async fn main() -> anyhow::Result<()> {
             SessionCmd::Delete { session, force } => {
                 let path = cli::session::resolve_session_path(&config.workspace, &session)?;
 
-                if !force {
+                if delete_needs_confirmation(force) {
                     eprint!("Delete session '{}'? [y/N] ", path.display());
                     use std::io::Write;
                     std::io::stderr().flush()?;
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
                     let input = input.trim().to_lowercase();
-                    if input != "y" && input != "yes" {
+                    if !is_delete_confirmation(&input) {
                         println!("Aborted.");
                         return Ok(());
                     }
@@ -1317,11 +1264,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 println!("workspace:     {}", config.workspace.display());
-                if config.max_steps == 0 {
-                    println!("max_steps:     unlimited");
-                } else {
-                    println!("max_steps:     {}", config.max_steps);
-                }
+                println!("max_steps:     {}", max_steps_label(config.max_steps));
                 println!("temperature:   {}", config.temperature);
                 println!("shell_timeout: {}s", config.shell_timeout_secs);
                 if let Some(path) = recursive::config_file::config_file_path() {
@@ -1342,7 +1285,7 @@ async fn main() -> anyhow::Result<()> {
                 // set_value() itself refuses the write, but we pre-empt
                 // with a more helpful message pointing the user at
                 // set-secret.
-                if key == "provider.api_key" || key.starts_with("provider.api_key.") {
+                if is_api_key_config_key(&key) {
                     anyhow::bail!(
                         "refusing to persist {} to config.toml.\n\
                          \n\
@@ -1622,10 +1565,13 @@ async fn cmd_update() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let resp = client
-        .get("https://api.github.com/repos/recursive-ai/recursive/releases/latest")
-        .send()
-        .await;
+    // Endpoint is overridable via `RECURSIVE_UPDATE_URL` so the response
+    // handling (success vs. non-2xx vs. unparseable) can be exercised
+    // against a local stub without reaching GitHub. Default is unchanged.
+    let endpoint = std::env::var("RECURSIVE_UPDATE_URL").unwrap_or_else(|_| {
+        "https://api.github.com/repos/recursive-ai/recursive/releases/latest".to_string()
+    });
+    let resp = client.get(&endpoint).send().await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
@@ -1811,32 +1757,21 @@ async fn cmd_providers(cmd: ProvidersCmd) -> anyhow::Result<()> {
 }
 
 /// Returns a [`CancellationToken`] that fires on SIGINT (Ctrl+C) or SIGTERM.
+///
+/// Used by every single-shot surface (run / loop / resume / HTTP serve /
+/// weixin daemon): the token is minted once and lives as long as the surface.
+/// The REPL instead drives [`cli::interrupt::InterruptController`], which
+/// re-arms this same wait for every turn.
+// cargo-mutants: the only emitted mutant here replaces the body with
+// `Default::default()`, which *is* `CancellationToken::new()` — an equivalent
+// mutant. The token can only ever fire from the spawned signal listener, which
+// no unit test can drive without raising a real SIGTERM for the test process.
+#[cfg_attr(test, mutants::skip)]
 fn shutdown_signal() -> tokio_util::sync::CancellationToken {
     let token = tokio_util::sync::CancellationToken::new();
     let t = token.clone();
     tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = ctrl_c => {},
-                    _ = sigterm.recv() => {},
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to register SIGTERM handler: {e}; only Ctrl+C will trigger shutdown"
-                );
-                if let Err(e) = ctrl_c.await {
-                    tracing::error!("ctrl_c signal error: {e}");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        if let Err(e) = ctrl_c.await {
-            tracing::error!("ctrl_c signal error: {e}");
-        }
+        cli::interrupt::next_shutdown_signal().await;
         t.cancel();
     });
     token
@@ -1848,6 +1783,122 @@ fn mask_key(key: Option<&str>) -> String {
         Some(k) if k.len() <= 8 => "****".to_string(),
         Some(k) => format!("{}...{}", &k[..4], &k[k.len() - 4..]),
     }
+}
+
+/// `--effort` → thinking-budget mapping (`low` disables, `high` maxes out,
+/// anything else keeps the configured default).
+fn effort_thinking_budget(effort: &str) -> Option<u32> {
+    match effort {
+        "low" => Some(0),
+        "high" => Some(16000),
+        _ => None, // "normal" → leave as default
+    }
+}
+
+/// Whether the effective output streams tokens: an explicit `--stream`, a JSON
+/// output mode that implies token streaming, or `--output-format stream-json`.
+fn resolve_effective_stream(
+    stream: bool,
+    json_output: Option<cli::claude_json::JsonOutputMode>,
+    output_format: Option<&str>,
+) -> bool {
+    stream
+        || json_output.is_some_and(|m| m.enables_token_streaming())
+        || matches!(output_format, Some("stream-json"))
+}
+
+/// Merge `--add-dir` roots into the configured extra read-write roots. An
+/// empty flag list must be a no-op so the config-file roots survive.
+fn merge_extra_dirs(dest: &mut Vec<PathBuf>, add: &[PathBuf]) {
+    if !add.is_empty() {
+        dest.extend_from_slice(add);
+    }
+}
+
+/// Sessions are recorded unless `--no-session` was passed.
+fn session_recording_enabled(no_session: bool) -> bool {
+    !no_session
+}
+
+/// `--head` and `--tail` are mutually exclusive.
+fn head_tail_conflict(head: bool, tail: bool) -> bool {
+    head && tail
+}
+
+/// A `--resume-from` replay needs a trailing `<goal>` to continue the run.
+fn resume_from_needs_goal(goal_is_empty: bool) -> bool {
+    goal_is_empty
+}
+
+/// Whether HTTP auth is enabled (either credential env var is set).
+fn http_auth_enabled(api_key: Option<&str>, jwt_secret: Option<&str>) -> bool {
+    api_key.is_some() || jwt_secret.is_some()
+}
+
+/// The warning to emit when the HTTP server starts without authentication.
+fn disabled_auth_warning(auth_enabled: bool) -> Option<&'static str> {
+    if !auth_enabled {
+        Some(
+            "HTTP server started with authentication DISABLED. \
+             Set RECURSIVE_API_KEY or RECURSIVE_JWT_SECRET to enable auth. \
+             Any client with network access can execute commands.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Elision marker appended to a preview cut at `limit` characters.
+fn truncation_marker(len: usize, limit: usize) -> &'static str {
+    if len > limit {
+        "…"
+    } else {
+        ""
+    }
+}
+
+/// Whether a transcript entry carries tool calls (whose ids are also printed).
+fn has_tool_calls(calls: &[recursive::llm::ToolCall]) -> bool {
+    !calls.is_empty()
+}
+
+/// Deleting a session asks for confirmation unless `--force` was passed.
+fn delete_needs_confirmation(force: bool) -> bool {
+    !force
+}
+
+/// A delete confirmation answer means "proceed" ("y"/"yes", already lowercased).
+fn is_delete_confirmation(answer: &str) -> bool {
+    answer == "y" || answer == "yes"
+}
+
+/// `config show` renders an unlimited step budget as a word.
+fn max_steps_label(max_steps: usize) -> String {
+    if max_steps == 0 {
+        "unlimited".to_string()
+    } else {
+        max_steps.to_string()
+    }
+}
+
+/// L1 guard: `provider.api_key` must never be persisted via `config set`.
+fn is_api_key_config_key(key: &str) -> bool {
+    key == "provider.api_key" || key.starts_with("provider.api_key.")
+}
+
+/// Total session count across the two on-disk formats.
+fn total_sessions(old: usize, new: usize) -> usize {
+    old + new
+}
+
+/// Does the session list have anything to show at all?
+fn has_sessions(total: usize) -> bool {
+    total != 0
+}
+
+/// Whether span-close logging was requested (`RECURSIVE_TRACE_SPANS=1`).
+fn trace_spans_requested() -> bool {
+    std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1")
 }
 
 /// Guard returned by `init_logging`. When the `otel` feature is active
@@ -1863,7 +1914,7 @@ pub struct LoggingGuard {
 
 fn init_logging(level: &str) -> anyhow::Result<LoggingGuard> {
     let lvl: Level = level.parse().context("invalid log level")?;
-    let trace_spans = std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1");
+    let trace_spans = trace_spans_requested();
     // When span timings are requested, the user-provided `--log warn`
     // would suppress the close events (they fire at INFO). Layer an
     // info-level filter for the `recursive` crate's instrumented spans
@@ -2024,27 +2075,7 @@ async fn run_loop(
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
-        "anthropic" => {
-            let anthropic_retry = recursive::llm::RetryPolicy {
-                max_retries: config.retry_max,
-                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-            };
-            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
-                .with_temperature(config.temperature)
-                .with_max_tokens(config.max_tokens)
-                .with_retry_policy(anthropic_retry);
-            Arc::new(anthropic)
-        }
-        _ => {
-            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
-                .with_temperature(config.temperature)
-                .with_max_tokens(config.max_tokens)
-                .with_retry_policy(retry);
-            Arc::new(openai)
-        }
-    };
+    let provider = cli::builder::build_llm_provider(&config, api_key, retry, None)?;
 
     // Sub-agent tool registration (channel-agnostic) + common prompt assembly,
     // matching every other agent-loop surface. Issue #40: one-shot filled
@@ -2243,8 +2274,9 @@ async fn run_once(
         Some(&goal),
         Some(event_sink),
         Some(shutdown.clone()),
+        None, // static token above already fills the agent tool's slot
         false, // headless batch run — no human to approve plans
-               // (plan mode is available in TUI and HTTP API sessions)
+              // (plan mode is available in TUI and HTTP API sessions)
     )
     .await?;
 
@@ -2567,6 +2599,17 @@ async fn repl(
         );
     }
 
+    // Issue #40 blocker 1 / Goal 407: the REPL is a multi-turn survivor, so it
+    // must NOT bind a static token to the runtime (the first Ctrl-C would leave
+    // every later turn pre-cancelled). The controller owns the process-lifetime
+    // token and mints a fresh child per turn, mirroring it into the `agent`
+    // tool's slot — so a parallel worker parked inside `provider.complete()` is
+    // cancellable and the turn after an interrupt still runs normally.
+    // NOTE: pass `shutdown_signal()` here and the parent dies on the first
+    // Ctrl-C, which is the very poisoning the per-turn design removes.
+    let interrupt = Arc::new(cli::interrupt::InterruptController::new());
+    cli::interrupt::spawn_signal_supervisor(interrupt.clone());
+
     // Build runtime ONCE — MCP servers are spawned here and stay alive.
     // Start with NullSink; we swap in a fresh ChannelSink per turn.
     let mut runtime = cli::builder::build_runtime(
@@ -2578,7 +2621,8 @@ async fn repl(
         hook_timing,
         None,
         None,
-        None,
+        None, // no static shutdown token: the kernel token is per-turn
+        Some(interrupt.slot()),
         false, // plan approval not yet wired into the REPL event loop;
                // use TUI or HTTP API for plan-mode sessions
     )
@@ -2592,7 +2636,20 @@ async fn repl(
         eprint!("recursive> ");
         use std::io::Write;
         let _ = std::io::stderr().flush();
-        let Some(line) = lines.next_line().await? else {
+        // A signal that lands while we are idle stops the REPL (the pre-#407
+        // behaviour was an unhandled SIGINT killing the process); the
+        // supervisor routes a mid-turn signal to the turn token instead.
+        let line = tokio::select! {
+            biased;
+            _ = interrupt.wait_for_quit() => {
+                if !json_mode {
+                    eprintln!("\n(interrupted)");
+                }
+                break;
+            }
+            line = lines.next_line() => line?,
+        };
+        let Some(line) = line else {
             break;
         };
         let goal = line.trim();
@@ -2621,7 +2678,14 @@ async fn repl(
             tokio::spawn(cli::output::stream_events_repl(event_rx))
         };
 
-        match runtime.run(goal.to_string()).await {
+        // Install this turn's token (kernel step boundary + non-streaming LLM
+        // select) and mirror it into the agent tool's slot for parallel
+        // workers. `end_turn` runs on every exit path below.
+        runtime.set_interrupt_token(interrupt.begin_turn());
+        let outcome = runtime.run(goal.to_string()).await;
+        interrupt.end_turn();
+
+        match outcome {
             Ok(outcome) => {
                 // Reset to NullSink so the channel is dropped and printer finishes
                 runtime.set_event_sink(Arc::new(NullSink));
@@ -2817,6 +2881,11 @@ async fn dispatch_request_via_registry(
 ///
 /// All interaction happens through WeChat messages. The agent runs in a
 /// simple request-response loop.
+// Behind the non-default `weixin` feature: `cli-mutants.sh` runs
+// `cargo mutants` with default features, so this body is never compiled and
+// no default-feature test can observe its mutants. Skipping is the only
+// honest option (the `--features weixin` build is exercised separately).
+#[cfg_attr(test, mutants::skip)]
 #[cfg(feature = "weixin")]
 async fn run_weixin_headless_daemon(
     config: recursive::config::Config,
@@ -2843,6 +2912,14 @@ async fn run_weixin_headless_daemon(
     info!("WeChat daemon started — waiting for messages");
     eprintln!("📱 Recursive WeChat daemon running. Send a message to get started.");
 
+    // Issue #40 blocker 1 / Goal 407: this daemon is unattended, so before
+    // this wiring a parked parallel-agent worker left no way out but
+    // `kill -9`. The token's lifetime IS the process lifetime (one-shot
+    // semantics), so the daemon uses the static-token shape: SIGINT/SIGTERM
+    // finishes the in-flight turn with `FinishReason::Cancelled` and then
+    // breaks the request loop below.
+    let shutdown = shutdown_signal();
+
     // Build runtime.
     let mut runtime = cli::builder::build_runtime(
         &config,
@@ -2853,12 +2930,13 @@ async fn run_weixin_headless_daemon(
         false, // hook_timing
         None,  // goal
         None,  // event_sink (WeChat responses come from enqueue return value)
-        None,  // shutdown_token
+        Some(shutdown.clone()),
+        None,  // static token above already fills the agent tool's slot
         false, // headless daemon — no human to confirm plans
     )
     .await?;
 
-    while let Some(req) = weixin_req_rx.recv().await {
+    while let Some(req) = next_weixin_request(&mut weixin_req_rx, &shutdown).await {
         info!("WeChat: processing message from {}", req.user_id);
         match runtime.enqueue(&req.text).await {
             Ok(Some(outcome)) => {
@@ -2874,7 +2952,37 @@ async fn run_weixin_headless_daemon(
         }
     }
 
+    if shutdown.is_cancelled() {
+        tracing::info!("WeChat daemon shutting down after shutdown signal");
+        eprintln!("📱 Recursive WeChat daemon stopped.");
+    }
     Ok(())
+}
+
+/// Await the next WeChat request, or `None` when the daemon must stop.
+///
+/// `None` covers both "polling channel closed" and "SIGINT/SIGTERM fired"
+/// (issue #40 blocker 1 / Goal 407). The loop is only polled *between* turns,
+/// so an in-flight turn has already been finished with
+/// `FinishReason::Cancelled` by the runtime's own shutdown token by the time we
+/// get here; an already-cancelled token then wins over a queued request
+/// (`biased`), so shutdown never starts new work.
+// Behind the non-default `weixin` feature: `cli-mutants.sh` builds with
+// default features, so this function is not compiled and its mutants are
+// unobservable from any default-feature test. The `biased` ordering itself is
+// pinned by `weixin_loop_stops_on_shutdown_but_serves_pending_requests` under
+// `cargo test -p recursive-cli --features weixin`.
+#[cfg_attr(test, mutants::skip)]
+#[cfg(feature = "weixin")]
+async fn next_weixin_request(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<recursive::weixin::WeixinRequest>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Option<recursive::weixin::WeixinRequest> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        req = rx.recv() => req,
+    }
 }
 
 #[cfg(test)]
@@ -2952,6 +3060,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         )
         .await;
@@ -2964,6 +3073,7 @@ mod tests {
             /* stream */ true,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -2986,6 +3096,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         )
         .await;
@@ -2994,6 +3105,167 @@ mod tests {
             None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),
         }
         assert!(r3.is_ok(), "anthropic/stream=false: must not panic or fail");
+    }
+
+    /// Goal 407 — `build_runtime` must thread a caller-supplied per-turn slot
+    /// (the REPL's `InterruptController::slot`) into the registered `agent`
+    /// tool, instead of the one-shot slot minted from a static token.
+    ///
+    /// Observable proof without a controllable LLM: dispatch the registered
+    /// `agent` tool directly with a *pre-cancelled* slot token. Workers then
+    /// short-circuit at the step-0 token check, so every worker result is
+    /// labelled `Cancelled` and no HTTP call is made. With a live token (and an
+    /// unreachable API base) the same dispatch must NOT report `Cancelled` —
+    /// that control separates "the slot was threaded through" from "everything
+    /// says Cancelled".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_runtime_threads_per_turn_slot_into_agent_tool() {
+        // 127.0.0.1:1 refuses instantly — deterministic, no DNS, no network.
+        let mut cfg = dummy_config(tempfile::tempdir().expect("tempdir").path());
+        cfg.api_base = "http://127.0.0.1:1/v1".into();
+        cfg.subagent_enabled = true;
+        cfg.subagent_max_depth = 2;
+
+        let manifest = serde_json::json!({
+            "worker-0": { "system_prompt": "You are a researcher.", "allowed_tools": ["Read"] }
+        });
+        let call = serde_json::json!({
+            "mode": "parallel",
+            "manifest": manifest,
+            "prompt": "go",
+            "max_steps": 2
+        });
+
+        // (1) Cancelled slot token → workers inherit it and stop immediately.
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let slot: recursive::SharedTokenSlot = Arc::new(std::sync::Mutex::new(Some(token)));
+        let runtime = build_runtime(
+            &cfg,
+            None,
+            Vec::new(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(slot),
+            false,
+        )
+        .await
+        .expect("build_runtime with a per-turn slot");
+        let agent = runtime
+            .kernel()
+            .tools()
+            .get("agent")
+            .expect("sub-agent enabled ⇒ `agent` tool registered");
+        let cancelled = tokio::time::timeout(Duration::from_secs(20), agent.execute(call.clone()))
+            .await
+            .expect("pre-cancelled slot must not park the dispatch")
+            .expect("agent tool returns Ok (finish is data, not Err)");
+        assert!(
+            cancelled.contains("Cancelled"),
+            "workers must inherit the slotted turn token, got: {cancelled}"
+        );
+
+        // (2) Live slot token → no phantom Cancelled label.
+        let slot: recursive::SharedTokenSlot = Arc::new(std::sync::Mutex::new(Some(
+            tokio_util::sync::CancellationToken::new(),
+        )));
+        let runtime = build_runtime(
+            &cfg,
+            None,
+            Vec::new(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(slot),
+            false,
+        )
+        .await
+        .expect("build_runtime with a live per-turn slot");
+        let agent = runtime
+            .kernel()
+            .tools()
+            .get("agent")
+            .expect("`agent` tool registered");
+        let live = tokio::time::timeout(Duration::from_secs(20), agent.execute(call))
+            .await
+            .expect("unreachable API base must fail fast, not hang")
+            .expect("agent tool returns Ok");
+        assert!(
+            !live.contains("Cancelled"),
+            "a live slot token must not label workers Cancelled, got: {live}"
+        );
+        assert!(
+            live.contains("worker-0"),
+            "every dispatched worker needs a paired result, got: {live}"
+        );
+    }
+
+    /// Goal 407 — the weixin daemon's request loop must yield to a shutdown
+    /// signal instead of parking on `recv()`: SIGTERM/SIGINT has to stop an
+    /// unattended daemon that has no terminal to Ctrl-C.
+    #[cfg(feature = "weixin")]
+    #[tokio::test]
+    async fn weixin_loop_stops_on_shutdown_but_serves_pending_requests() {
+        type Rx = tokio::sync::mpsc::UnboundedReceiver<recursive::weixin::WeixinRequest>;
+        fn request(
+            text: &str,
+        ) -> (
+            recursive::weixin::WeixinRequest,
+            tokio::sync::oneshot::Receiver<Option<String>>,
+        ) {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            (
+                recursive::weixin::WeixinRequest {
+                    user_id: "u".into(),
+                    text: text.into(),
+                    reply_tx,
+                },
+                reply_rx,
+            )
+        }
+
+        // Live token + queued request → the request is served.
+        let (tx, mut rx): (_, Rx) = tokio::sync::mpsc::unbounded_channel();
+        let (req, _reply) = request("hi");
+        tx.send(req).expect("send");
+        let live = tokio_util::sync::CancellationToken::new();
+        let served = next_weixin_request(&mut rx, &live).await;
+        assert_eq!(served.map(|r| r.text), Some("hi".to_string()));
+
+        // Closed channel → None.
+        drop(tx);
+        assert!(next_weixin_request(&mut rx, &live).await.is_none());
+
+        // Signal mid-wait (idle daemon, nothing queued) → None: the loop
+        // stops instead of parking on `recv()` forever.
+        let (_tx, mut rx): (_, Rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let cancel = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        assert!(
+            next_weixin_request(&mut rx, &shutdown).await.is_none(),
+            "a shutdown signal must break the daemon loop"
+        );
+
+        // Already-cancelled token wins over an already-queued request: a
+        // shutdown never starts new work (an in-flight turn is drained by the
+        // runtime's own token, not by this loop).
+        let (tx, mut rx): (_, Rx) = tokio::sync::mpsc::unbounded_channel();
+        let (req, _reply) = request("never served");
+        tx.send(req).expect("send");
+        let stopped = tokio_util::sync::CancellationToken::new();
+        stopped.cancel();
+        assert!(next_weixin_request(&mut rx, &stopped).await.is_none());
     }
 
     #[test]
@@ -3088,5 +3360,172 @@ mod tests {
         let jwt_set = false;
         let auth_enabled = api_key_set || jwt_set;
         assert!(!auth_enabled);
+    }
+    // ── extracted dispatch helpers ──────────────────────────────────────────
+    // `main()` used to open-code each of these; they are pinned here so the
+    // cli-mutants gate can see the behaviour without spawning a process.
+
+    #[test]
+    fn mask_key_masks_short_and_long_keys() {
+        assert_eq!(mask_key(None), "(not set)");
+        assert_eq!(mask_key(Some("short")), "****");
+        assert_eq!(mask_key(Some("12345678")), "****"); // exactly 8 → masked
+        assert_eq!(mask_key(Some("123456789")), "1234...6789");
+        assert_eq!(mask_key(Some("abcdefghijkl")), "abcd...ijkl");
+    }
+
+    #[test]
+    fn effort_thinking_budget_maps_low_high_and_default() {
+        assert_eq!(effort_thinking_budget("low"), Some(0));
+        assert_eq!(effort_thinking_budget("high"), Some(16000));
+        assert_eq!(effort_thinking_budget("normal"), None);
+        assert_eq!(effort_thinking_budget(""), None);
+    }
+
+    #[test]
+    fn resolve_effective_stream_covers_each_streaming_source() {
+        use cli::claude_json::JsonOutputMode;
+        assert!(resolve_effective_stream(true, None, None));
+        assert!(resolve_effective_stream(
+            false,
+            Some(JsonOutputMode::Stream),
+            None
+        ));
+        assert!(resolve_effective_stream(false, None, Some("stream-json")));
+        assert!(!resolve_effective_stream(false, None, None));
+        assert!(!resolve_effective_stream(
+            false,
+            Some(JsonOutputMode::Single),
+            Some("text")
+        ));
+    }
+
+    #[test]
+    fn merge_extra_dirs_appends_flag_roots_after_config_roots() {
+        let mut dest = vec![PathBuf::from("from-config")];
+        merge_extra_dirs(&mut dest, &[]);
+        assert_eq!(dest, vec![PathBuf::from("from-config")]);
+        merge_extra_dirs(&mut dest, &[PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(
+            dest,
+            vec![
+                PathBuf::from("from-config"),
+                PathBuf::from("a"),
+                PathBuf::from("b")
+            ]
+        );
+    }
+
+    #[test]
+    fn session_recording_enabled_tracks_the_no_session_flag() {
+        assert!(session_recording_enabled(false));
+        assert!(!session_recording_enabled(true));
+    }
+
+    #[test]
+    fn head_tail_conflict_requires_both() {
+        assert!(head_tail_conflict(true, true));
+        assert!(!head_tail_conflict(true, false));
+        assert!(!head_tail_conflict(false, true));
+        assert!(!head_tail_conflict(false, false));
+    }
+
+    #[test]
+    fn resume_from_needs_goal_tracks_an_empty_goal() {
+        assert!(resume_from_needs_goal(true));
+        assert!(!resume_from_needs_goal(false));
+    }
+
+    #[test]
+    fn truncation_marker_only_when_the_preview_is_cut() {
+        assert_eq!(truncation_marker(201, 200), "…");
+        assert_eq!(truncation_marker(200, 200), "");
+        assert_eq!(truncation_marker(100, 200), "");
+    }
+
+    #[test]
+    fn has_tool_calls_distinguishes_empty_from_populated() {
+        let call = recursive::llm::ToolCall {
+            id: "call-1".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({}),
+        };
+        assert!(!has_tool_calls(&[]));
+        assert!(has_tool_calls(std::slice::from_ref(&call)));
+    }
+
+    #[test]
+    fn delete_needs_confirmation_unless_forced() {
+        assert!(delete_needs_confirmation(false));
+        assert!(!delete_needs_confirmation(true));
+    }
+
+    #[test]
+    fn is_delete_confirmation_accepts_only_y_and_yes() {
+        assert!(is_delete_confirmation("y"));
+        assert!(is_delete_confirmation("yes"));
+        assert!(!is_delete_confirmation("n"));
+        assert!(!is_delete_confirmation("no"));
+        assert!(!is_delete_confirmation(""));
+        assert!(!is_delete_confirmation("ya"));
+    }
+
+    #[test]
+    fn max_steps_label_words_an_unlimited_budget() {
+        assert_eq!(max_steps_label(0), "unlimited");
+        assert_eq!(max_steps_label(1), "1");
+        assert_eq!(max_steps_label(200), "200");
+    }
+
+    #[test]
+    fn is_api_key_config_key_matches_key_and_nested_variants() {
+        assert!(is_api_key_config_key("provider.api_key"));
+        assert!(is_api_key_config_key("provider.api_key.backup"));
+        assert!(!is_api_key_config_key("provider.model"));
+        assert!(!is_api_key_config_key("agent.max_steps"));
+    }
+
+    #[test]
+    fn total_sessions_sums_both_on_disk_formats() {
+        assert_eq!(total_sessions(0, 0), 0);
+        assert_eq!(total_sessions(3, 4), 7);
+    }
+
+    #[test]
+    fn has_sessions_is_false_only_for_an_empty_list() {
+        assert!(!has_sessions(0));
+        assert!(has_sessions(1));
+    }
+
+    #[test]
+    fn http_auth_enabled_when_either_credential_is_set() {
+        assert!(http_auth_enabled(Some("k"), None));
+        assert!(http_auth_enabled(None, Some("j")));
+        assert!(http_auth_enabled(Some("k"), Some("j")));
+        assert!(!http_auth_enabled(None, None));
+    }
+
+    #[test]
+    fn disabled_auth_warning_is_emitted_only_without_auth() {
+        assert!(disabled_auth_warning(true).is_none());
+        let warning = disabled_auth_warning(false).expect("warning without auth");
+        assert!(warning.contains("authentication DISABLED"), "{warning}");
+        assert!(warning.contains("RECURSIVE_API_KEY"), "{warning}");
+    }
+
+    #[test]
+    fn trace_spans_requested_only_for_exact_one() {
+        let previous = std::env::var("RECURSIVE_TRACE_SPANS").ok();
+        std::env::set_var("RECURSIVE_TRACE_SPANS", "1");
+        assert!(trace_spans_requested());
+        std::env::set_var("RECURSIVE_TRACE_SPANS", "on");
+        assert!(!trace_spans_requested());
+        std::env::set_var("RECURSIVE_TRACE_SPANS", "0");
+        assert!(!trace_spans_requested());
+        std::env::remove_var("RECURSIVE_TRACE_SPANS");
+        assert!(!trace_spans_requested());
+        if let Some(v) = previous {
+            std::env::set_var("RECURSIVE_TRACE_SPANS", v);
+        }
     }
 }

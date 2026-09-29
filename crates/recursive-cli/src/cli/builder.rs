@@ -255,27 +255,54 @@ pub(crate) async fn build_tools(
 /// brick the CLI for unrelated commands.
 fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfig> {
     if let Ok(path) = std::env::var("RECURSIVE_TOOL_PERMISSIONS_FILE") {
-        if !path.is_empty() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    match toml::from_str::<recursive::permissions::OldPermissionsConfig>(&content) {
-                        Ok(old) => return Some(old.into()),
-                        Err(e) => {
-                            eprintln!("permissions: failed to parse {path}: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("permissions: failed to read {path}: {e}");
-                }
-            }
+        if let Some(perms) = permissions_from_env_path(&path) {
+            return Some(perms);
         }
     }
     let file_config = recursive::config_file::FileConfig::load().ok().flatten()?;
-    let section = file_config.permissions?;
+    Some(permissions_from_section(file_config.permissions?))
+}
+
+/// Parse a `RECURSIVE_TOOL_PERMISSIONS_FILE` value into a permissions config.
+///
+/// Returns `None` for an empty path, an unreadable file, or malformed TOML
+/// (each failure is logged) so `resolve_tool_permissions` can fall through to
+/// the `~/.recursive/config.toml` source.
+fn permissions_from_env_path(path: &str) -> Option<recursive::permissions::PermissionsConfig> {
+    if !path.is_empty() {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                match toml::from_str::<recursive::permissions::OldPermissionsConfig>(&content) {
+                    Ok(old) => return Some(old.into()),
+                    Err(e) => {
+                        eprintln!("permissions: failed to parse {path}: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("permissions: failed to read {path}: {e}");
+            }
+        }
+    }
+    None
+}
+
+/// Whether a `[permissions]` section carries any user rule list at all.
+///
+/// A section with no allow/deny/interactive entries contributes no layer
+/// (the mode still applies), so callers must not push an empty layer.
+fn permissions_section_has_rules(section: &recursive::config_file::PermissionsSection) -> bool {
+    !section.allow.is_empty() || !section.deny.is_empty() || !section.interactive.is_empty()
+}
+
+/// Turn a `[permissions]` section into a single-layer user config.
+fn permissions_from_section(
+    section: recursive::config_file::PermissionsSection,
+) -> recursive::permissions::PermissionsConfig {
+    let has_rules = permissions_section_has_rules(&section);
     let mode = section.mode.unwrap_or_default();
     let mut layers = Vec::new();
-    if !section.allow.is_empty() || !section.deny.is_empty() || !section.interactive.is_empty() {
+    if has_rules {
         layers.push(recursive::permissions::PermissionLayer {
             source: recursive::permissions::RuleSource::User,
             allow: section.allow,
@@ -283,7 +310,21 @@ fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfi
             interactive: section.interactive,
         });
     }
-    Some(recursive::permissions::LayeredPermissionsConfig { mode, layers })
+    recursive::permissions::LayeredPermissionsConfig { mode, layers }
+}
+
+/// The operator-facing log line for workspace auto-discovery, or `None` when
+/// no servers were found (silence is the documented behaviour for an empty
+/// discovery result).
+fn auto_discovered_message(servers: &[McpServer]) -> Option<String> {
+    if !servers.is_empty() {
+        Some(format!(
+            "mcp: auto-discovered {} server(s) from workspace",
+            servers.len()
+        ))
+    } else {
+        None
+    }
 }
 
 /// Register MCP tools from a config file into the registry.
@@ -317,8 +358,8 @@ pub(crate) async fn register_mcp_tools(
         // Auto-discover from workspace
         match discover_mcp_servers(workspace).await {
             Ok(s) => {
-                if !s.is_empty() {
-                    eprintln!("mcp: auto-discovered {} server(s) from workspace", s.len());
+                if let Some(msg) = auto_discovered_message(&s) {
+                    eprintln!("{msg}");
                 }
                 s
             }
@@ -389,7 +430,102 @@ pub(crate) fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
+/// Append auto-loaded skill bodies to the assembled system prompt.
+///
+/// Injects `=== Skill: <name> (auto-loaded) ===` blocks until the running
+/// total would exceed a fixed 8192-byte budget; the block that crosses the
+/// budget is truncated (or replaced by a bare `[truncated]` marker when
+/// fewer than 20 bytes remain) and iteration stops. Extracted from
+/// `build_runtime` so the truncation arithmetic is unit-testable.
+fn apply_skill_injection(mut base: String, injected: &[(String, String)]) -> String {
+    if !injected.is_empty() {
+        let mut injection_block = String::new();
+        let mut total_chars = 0usize;
+        let max_injection_chars = 8192usize;
+        for (name, body) in injected {
+            let snippet = format!("=== Skill: {name} (auto-loaded) ===\n{body}\n\n");
+            if total_chars + snippet.len() > max_injection_chars {
+                let remaining = max_injection_chars.saturating_sub(total_chars);
+                let truncated = if remaining > 20 {
+                    format!(
+                        "{}...\n[truncated]\n",
+                        &snippet[..remaining.saturating_sub(20)]
+                    )
+                } else {
+                    "[truncated]\n".to_string()
+                };
+                injection_block.push_str(&truncated);
+                break;
+            }
+            injection_block.push_str(&snippet);
+            total_chars += snippet.len();
+        }
+        base = format!("{}\n\n{}", base, injection_block);
+    }
+    base
+}
+
+/// Construct the LLM provider named by `config.provider_type`.
+///
+/// Shared by every surface that used to open-code the same `match` (the
+/// agent runtime, loop mode, the ACP server and the HTTP server), so the
+/// `"anthropic"` arm exists in exactly one place. `max_search_rounds`
+/// preserves the per-surface behaviour: agent surfaces forward
+/// `config.max_search_rounds`, while the ACP/HTTP servers keep the
+/// provider default (`None`) as before this helper existed.
+pub(crate) fn build_llm_provider(
+    config: &Config,
+    api_key: &str,
+    retry: RetryPolicy,
+    max_search_rounds: Option<usize>,
+) -> anyhow::Result<Arc<dyn ChatProvider>> {
+    let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
+        "anthropic" => {
+            let anthropic_retry = recursive::llm::RetryPolicy {
+                max_retries: config.retry_max,
+                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
+                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
+            };
+            let mut anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
+                .with_temperature(config.temperature)
+                .with_max_tokens(config.max_tokens)
+                .with_retry_policy(anthropic_retry);
+            if let Some(rounds) = max_search_rounds {
+                anthropic = anthropic.with_max_search_rounds(rounds);
+            }
+            Arc::new(anthropic)
+        }
+        _ => {
+            let mut openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
+                .with_temperature(config.temperature)
+                .with_max_tokens(config.max_tokens)
+                .with_retry_policy(retry);
+            if let Some(rounds) = max_search_rounds {
+                openai = openai.with_max_search_rounds(rounds);
+            }
+            Arc::new(openai)
+        }
+    };
+    Ok(provider)
+}
+
 /// Build an [`AgentRuntime`], optionally registering MCP tools from a config file.
+///
+/// Cancellation is supplied by the caller in one of two shapes (issue #40 /
+/// Goal 407):
+///
+/// - `shutdown_token`: a static, one-shot token minted once per process (loop
+///   mode, HTTP serve, weixin daemon, `resume`). The `agent` tool gets a
+///   one-shot filled [`SharedTokenSlot`] carrying it, so parallel workers
+///   inherit a child token through the existing child-token tree.
+/// - `subagent_token_slot`: a host-owned per-turn slot (REPL). The host
+///   refreshes it at every turn start and clears it at every turn end; the
+///   `agent` tool reads it at dispatch time. Use this — never a static token —
+///   for a long-lived multi-turn runtime, where a static token would poison
+///   every turn after the first cancellation.
+///
+/// When both are given the explicit slot wins for the `agent` tool while the
+/// static token still arms the parent kernel. No current caller passes both.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_runtime(
     config: &Config,
@@ -401,40 +537,18 @@ pub(crate) async fn build_runtime(
     goal: Option<&str>,
     event_sink: Option<Arc<dyn EventSink>>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    subagent_token_slot: Option<recursive::SharedTokenSlot>,
     // Pass `true` for interactive channels (TUI, CLI) that have a live human
     // to call `confirm_plan()`. Headless/batch callers pass `false`.
     interactive: bool,
 ) -> anyhow::Result<AgentRuntime> {
     let api_key = config.require_api_key()?;
-    let provider_type = &config.provider_type;
     let retry = RetryPolicy {
         max_retries: config.retry_max,
         initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
-    let provider: Arc<dyn ChatProvider> = match provider_type.as_str() {
-        "anthropic" => {
-            let anthropic_retry = recursive::llm::RetryPolicy {
-                max_retries: config.retry_max,
-                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-            };
-            let anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
-                .with_temperature(config.temperature)
-                .with_max_tokens(config.max_tokens)
-                .with_retry_policy(anthropic_retry)
-                .with_max_search_rounds(config.max_search_rounds);
-            Arc::new(anthropic)
-        }
-        _ => {
-            let openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
-                .with_temperature(config.temperature)
-                .with_max_tokens(config.max_tokens)
-                .with_retry_policy(retry)
-                .with_max_search_rounds(config.max_search_rounds);
-            Arc::new(openai)
-        }
-    };
+    let provider = build_llm_provider(config, api_key, retry, Some(config.max_search_rounds))?;
     let (mut tools, read_state) = build_tools(config, None).await;
     let elicitation = recursive::mcp::new_elicitation_slot();
     tools = tools.with_elicitation_slot(elicitation.clone());
@@ -456,12 +570,18 @@ pub(crate) async fn build_runtime(
     // Sub-agent / team coordination is a channel-agnostic capability: every
     // agent-loop surface registers the unified `Agent` tool when
     // `config.subagent_enabled` is set, in lockstep with the coordinator
-    // prompt injected by `assemble_system_prompt`. Issue #40: the CLI loop
-    // mints its shutdown token once, so a one-shot filled slot (never
-    // refreshed) carries the same static-token semantics as before.
-    let subagent_token_slot = shutdown_token
-        .clone()
-        .map(|token| Arc::new(Mutex::new(Some(token))));
+    // prompt injected by `assemble_system_prompt`.
+    //
+    // Issue #40: single-turn surfaces mint their shutdown token once, so a
+    // one-shot filled slot (never refreshed) carries static-token semantics.
+    // Goal 407: multi-turn surfaces (REPL) pass their own per-turn slot
+    // instead — it wins over the one-shot fallback, so the host can refresh
+    // the token at every turn start without rebuilding the runtime.
+    let subagent_token_slot = subagent_token_slot.or_else(|| {
+        shutdown_token
+            .clone()
+            .map(|token| Arc::new(Mutex::new(Some(token))))
+    });
     tools = register_subagent_if_enabled(tools, config, provider.clone(), subagent_token_slot);
 
     let skills = discover_loaded_skills(config);
@@ -482,44 +602,7 @@ pub(crate) async fn build_runtime(
         config.subagent_enabled,
     );
     let injected = skills_for_injection(&skills, goal.unwrap_or(""));
-    if !injected.is_empty() {
-        let mut injection_block = String::new();
-        let mut total_chars = 0usize;
-        let max_injection_chars = 8192usize;
-        for (name, body) in &injected {
-            let snippet = format!(
-                "=== Skill: {name} (auto-loaded) ===
-{body}
-
-"
-            );
-            if total_chars + snippet.len() > max_injection_chars {
-                let remaining = max_injection_chars.saturating_sub(total_chars);
-                let truncated = if remaining > 20 {
-                    format!(
-                        "{}...
-[truncated]
-",
-                        &snippet[..remaining.saturating_sub(20)]
-                    )
-                } else {
-                    "[truncated]
-"
-                    .to_string()
-                };
-                injection_block.push_str(&truncated);
-                break;
-            }
-            injection_block.push_str(&snippet);
-            total_chars += snippet.len();
-        }
-        assembled.full = format!(
-            "{}
-
-{}",
-            assembled.full, injection_block
-        );
-    }
+    assembled.full = apply_skill_injection(assembled.full, &injected);
     // Goal-328: forward the structured segments to the runtime so the
     // local ContextBreakdown estimator can size the static buckets.
     // The joined prompt (`assembled.full`) is consumed directly by the
@@ -702,6 +785,464 @@ mod tests {
         assert!(
             Arc::ptr_eq(&read_state, &custom),
             "build_tools must reuse the caller-supplied read_state arc verbatim"
+        );
+    }
+
+    // ── Test harness helpers ─────────────────────────────────────────────
+
+    /// Serialises tests that mutate process-wide env vars. Every env-writing
+    /// test holds this lock via [`EnvGuard`] and restores the prior value on
+    /// drop, so the developer's real environment (and parallel tests) are
+    /// never left modified.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = vars
+                .iter()
+                .map(|(k, _)| ((*k).to_string(), std::env::var_os(k)))
+                .collect();
+            for (k, v) in vars {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+            EnvGuard { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// A discovered skill lives at `<root>/<dir>/SKILL.md`. Returns `root`.
+    fn seed_skill(root: &Path, dir: &str, name: &str) {
+        let skill_dir = root.join(dir);
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: demo\nmode: always\n---\n\nBody.\n"),
+        )
+        .expect("write SKILL.md");
+    }
+
+    // ── build_tools: LoadSkill registration (line 216) ───────────────────
+
+    /// `build_tools` registers the `Skill` (LoadSkill) tool *only* when skill
+    /// discovery actually found something. Deleting the `!` inverts that, so a
+    /// workspace with a discovered skill must surface the tool.
+    #[tokio::test]
+    async fn build_tools_registers_the_skill_tool_when_skills_are_discovered() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_root = tmp.path().join("skills");
+        seed_skill(&skills_root, "demo", "demo");
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_SKILL_PATHS",
+            Some(skills_root.to_str().expect("utf8 path")),
+        )]);
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        let (tools, _read_state) = build_tools(&cfg, None).await;
+        assert!(
+            tools.find_by_name("Skill").is_some(),
+            "a discovered skill must make build_tools register the Skill tool"
+        );
+    }
+
+    // ── resolve_tool_permissions (lines 257/258/278) ─────────────────────
+
+    /// `resolve_tool_permissions` returns `Some(Default::default())` /
+    /// `None` mutants unless the env-file branch is genuinely reached with a
+    /// non-default payload.
+    #[test]
+    fn resolve_tool_permissions_prefers_the_env_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("perms.toml");
+        std::fs::write(&file, "interactive = [\"write_file\"]\n").expect("write perms");
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_TOOL_PERMISSIONS_FILE",
+            Some(file.to_str().expect("utf8 path")),
+        )]);
+        let perms = resolve_tool_permissions().expect("env file must be honoured");
+        assert_eq!(
+            perms.layers.len(),
+            1,
+            "the env file's single layer must be present, not a default config"
+        );
+        assert_eq!(perms.layers[0].interactive, vec!["write_file".to_string()]);
+    }
+
+    /// `permissions_from_env_path` must actually read a non-empty path; the
+    /// `!path.is_empty()` guard mutant makes a real file look empty.
+    #[test]
+    fn permissions_from_env_path_parses_a_valid_file_and_ignores_an_empty_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("perms.toml");
+        std::fs::write(&file, "deny = [\"run_shell\"]\n").expect("write perms");
+        let perms = permissions_from_env_path(file.to_str().expect("utf8 path"))
+            .expect("a valid file must parse");
+        assert_eq!(perms.layers.len(), 1);
+        assert_eq!(perms.layers[0].deny, vec!["run_shell".to_string()]);
+        assert!(
+            permissions_from_env_path("").is_none(),
+            "an empty path is 'no env override', not an error"
+        );
+    }
+
+    fn perms_section(
+        allow: &[&str],
+        deny: &[&str],
+        interactive: &[&str],
+    ) -> recursive::config_file::PermissionsSection {
+        recursive::config_file::PermissionsSection {
+            allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            deny: deny.iter().map(|s| (*s).to_string()).collect(),
+            interactive: interactive.iter().map(|s| (*s).to_string()).collect(),
+            plan: Vec::new(),
+            mode: None,
+        }
+    }
+
+    /// Pins the `allow || deny || interactive` predicate that decides whether a
+    /// user layer is pushed: only a non-empty list counts, and one non-empty
+    /// list is enough (kills the per-clause `!` deletions and the `||`→`&&`
+    /// swaps at line 278).
+    #[test]
+    fn permissions_section_has_rules_needs_exactly_one_non_empty_list() {
+        assert!(!permissions_section_has_rules(&perms_section(
+            &[],
+            &[],
+            &[]
+        )));
+        assert!(permissions_section_has_rules(&perms_section(
+            &["a"],
+            &[],
+            &[]
+        )));
+        assert!(permissions_section_has_rules(&perms_section(
+            &[],
+            &["d"],
+            &[]
+        )));
+        assert!(permissions_section_has_rules(&perms_section(
+            &[],
+            &[],
+            &["i"]
+        )));
+    }
+
+    /// A section with no rules contributes no layer; one with rules contributes
+    /// a single `User` layer carrying them.
+    #[test]
+    fn permissions_from_section_pushes_a_layer_only_when_rules_exist() {
+        let empty = permissions_from_section(perms_section(&[], &[], &[]));
+        assert!(
+            empty.layers.is_empty(),
+            "an empty section contributes no layer"
+        );
+
+        let with_rules = permissions_from_section(perms_section(&["a"], &[], &[]));
+        assert_eq!(with_rules.layers.len(), 1);
+        assert_eq!(with_rules.layers[0].allow, vec!["a".to_string()]);
+    }
+
+    // ── MCP registration (lines 296/298/320/358) ─────────────────────────
+
+    /// A tiny stdio JSON-RPC MCP server: it handles `initialize` and
+    /// `tools/list` (returning two tools) by echoing the request id. Written in
+    /// POSIX `sh` so no extra test binary or runtime is required.
+    const MOCK_MCP_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":true}}}\n' "${id:-0}"
+      ;;
+    *'"method":"tools/list"'*)
+      id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"alpha","description":"Alpha","inputSchema":{"type":"object"}},{"name":"beta","description":"Beta","inputSchema":{"type":"object"}}]}}\n' "${id:-0}"
+      ;;
+  esac
+done
+"#;
+
+    fn mock_mcp_server_script(dir: &Path) -> String {
+        let path = dir.join("mock_mcp_server.sh");
+        std::fs::write(&path, MOCK_MCP_SERVER).expect("write mock server");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn explicit_mcp_config(dir: &Path, script: &str) -> PathBuf {
+        let path = dir.join("explicit_mcp.json");
+        let cfg = serde_json::json!({
+            "servers": [ { "name": "mock", "command": "sh", "args": [script] } ]
+        });
+        std::fs::write(&path, cfg.to_string()).expect("write mcp config");
+        path
+    }
+
+    /// `register_mcp_tools` must actually register the tools of an explicit
+    /// config file (kills the whole-body `()` mutant) and must not bail out on
+    /// a path that exists (kills the `!path.exists()` guard mutant).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_mcp_tools_registers_tools_from_an_explicit_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = mock_mcp_server_script(tmp.path());
+        let config = explicit_mcp_config(tmp.path(), &script);
+        let mut registry = ToolRegistry::local();
+        register_mcp_tools(&mut registry, tmp.path(), Some(config), None).await;
+        assert!(
+            registry.find_by_name("mcp__mock__alpha").is_some(),
+            "the explicit config's `alpha` tool must be registered"
+        );
+        assert!(
+            registry.find_by_name("mcp__mock__beta").is_some(),
+            "the explicit config's `beta` tool must be registered"
+        );
+    }
+
+    /// `register_mcp_server_tools` must report the real number of tools the
+    /// server listed (kills the `Ok(0)` / `Ok(1)` return mutants).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_mcp_server_tools_reports_the_real_tool_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = mock_mcp_server_script(tmp.path());
+        let server = McpServer {
+            name: "mock".into(),
+            command: "sh".into(),
+            args: vec![script],
+            url: None,
+            env: None,
+        };
+        let mut registry = ToolRegistry::local();
+        let count = register_mcp_server_tools(&mut registry, &server, None)
+            .await
+            .expect("spawn + list must succeed against the mock server");
+        assert_eq!(count, 2, "must report the two tools the server listed");
+    }
+
+    /// The auto-discovery log line is emitted only for a non-empty result;
+    /// the `!servers.is_empty()` guard mutant silences the message.
+    #[test]
+    fn auto_discovered_message_is_emitted_only_when_servers_exist() {
+        assert!(auto_discovered_message(&[]).is_none());
+        let server = McpServer {
+            name: "mock".into(),
+            command: "true".into(),
+            args: Vec::new(),
+            url: None,
+            env: None,
+        };
+        let msg = auto_discovered_message(std::slice::from_ref(&server))
+            .expect("a discovered server must produce a log line");
+        assert!(msg.contains("auto-discovered 1 server(s)"), "got: {msg}");
+    }
+
+    // ── discover_loaded_skills (line 376) ────────────────────────────────
+
+    #[test]
+    fn discover_loaded_skills_reads_the_env_skill_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("skills");
+        seed_skill(&root, "demo", "demo");
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_SKILL_PATHS",
+            Some(root.to_str().expect("utf8 path")),
+        )]);
+        let cfg = test_config();
+        let skills = discover_loaded_skills(&cfg);
+        assert_eq!(skills.len(), 1, "the env skill path must be discovered");
+        assert_eq!(skills[0].name, "demo");
+    }
+
+    // ── apply_skill_injection (lines 508/519/521/537) ────────────────────
+
+    fn injected_one(name: &str, body: &str) -> Vec<(String, String)> {
+        vec![(name.to_string(), body.to_string())]
+    }
+
+    /// The block is appended for a non-empty selection and skipped entirely for
+    /// an empty one (kills the `!injected.is_empty()` guard mutants in both
+    /// directions).
+    #[test]
+    fn apply_skill_injection_appends_a_block_and_is_a_noop_without_skills() {
+        let out = apply_skill_injection("BASE".to_string(), &injected_one("demo", "hello"));
+        // Byte-identical to the pre-refactor `format!("{}\n\n{}", …)` join: one
+        // blank line between the assembled prompt and the injected block.
+        assert!(
+            out.starts_with("BASE\n\n=== Skill: demo (auto-loaded) ==="),
+            "join separator drifted: {out:?}"
+        );
+        assert!(out.contains("=== Skill: demo (auto-loaded) ==="));
+        assert!(out.contains("hello"));
+        assert_eq!(
+            apply_skill_injection("BASE".to_string(), &[]),
+            "BASE",
+            "no skills means the prompt is left untouched"
+        );
+    }
+
+    /// An oversized block is truncated with the prefix+ellipsis form (kills the
+    /// `+`→`*`, `>`→`<`, `>`→`==` mutants of the budget test and the
+    /// `remaining > 20`→`<`/`==` mutants).
+    #[test]
+    fn apply_skill_injection_truncates_when_the_budget_is_exceeded() {
+        let big = "x".repeat(20_000);
+        let out = apply_skill_injection("BASE".to_string(), &injected_one("demo", &big));
+        assert!(
+            out.contains("[truncated]"),
+            "oversized input must be truncated"
+        );
+        assert!(
+            out.contains("..."),
+            "the slice-truncation path keeps a prefix and an ellipsis"
+        );
+        assert!(
+            !out.contains(&"x".repeat(9_000)),
+            "no single block may exceed the 8192-byte budget"
+        );
+    }
+
+    /// A block that exactly fills the budget is kept whole (kills the
+    /// `>`→`>=` mutant of the budget test).
+    #[test]
+    fn apply_skill_injection_keeps_a_block_that_exactly_fills_the_budget() {
+        let name = "s";
+        let prefix = format!("=== Skill: {name} (auto-loaded) ===\n");
+        let body = "y".repeat(8192 - prefix.len() - 2);
+        let out = apply_skill_injection("BASE".to_string(), &injected_one(name, &body));
+        assert!(
+            out.contains(&body),
+            "a block that exactly fills the budget is not truncated"
+        );
+        assert!(!out.contains("[truncated]"));
+    }
+
+    /// With <= 20 bytes of headroom the bare `[truncated]` marker is used
+    /// (kills the `remaining > 20`→`>=` mutant).
+    #[test]
+    fn apply_skill_injection_uses_the_bare_marker_when_little_room_remains() {
+        let p1 = "=== Skill: a (auto-loaded) ===\n".len();
+        let body1 = "a".repeat(8172 - p1 - 2); // exactly 8172 bytes appended
+        let p2 = "=== Skill: b (auto-loaded) ===\n".len();
+        let body2 = "b".repeat(100 - p2 - 2); // 100 bytes, over the 20 left
+        let injected = vec![("a".to_string(), body1), ("b".to_string(), body2)];
+        let out = apply_skill_injection("BASE".to_string(), &injected);
+        assert!(out.contains("[truncated]"));
+        assert!(
+            !out.contains("..."),
+            "when <= 20 bytes remain the ellipsis form must not be used"
+        );
+    }
+
+    /// The running total accumulates across blocks, so the second block is
+    /// truncated once the first has eaten the budget (kills the `+=`→`*=` /
+    /// `-=` mutants).
+    #[test]
+    fn apply_skill_injection_accumulates_the_running_total() {
+        let p1 = "=== Skill: a (auto-loaded) ===\n".len();
+        let body1 = "a".repeat(8000 - p1 - 2); // 8000 bytes, appended whole
+        let injected = vec![("a".to_string(), body1), ("b".to_string(), "b".repeat(500))];
+        let out = apply_skill_injection("BASE".to_string(), &injected);
+        assert!(
+            out.contains("[truncated]"),
+            "the second block must be truncated once the first fills the budget"
+        );
+    }
+
+    // ── build_runtime (lines 433/568) ────────────────────────────────────
+
+    /// A non-empty seed is installed on the runtime transcript (kills the
+    /// `!seed.is_empty()` guard mutant).
+    #[tokio::test]
+    async fn build_runtime_seeds_the_transcript_from_seed_messages() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        let seed = vec![recursive::message::Message::user("seeded hello")];
+        let runtime = build_runtime(
+            &cfg, None, seed, false, None, false, None, None, None, None, false,
+        )
+        .await
+        .expect("build_runtime must succeed with a valid config");
+        assert!(
+            runtime
+                .transcript()
+                .iter()
+                .any(|m| m.content == "seeded hello"),
+            "a non-empty seed must be installed on the runtime transcript"
+        );
+    }
+
+    /// The `"anthropic"` match arm constructs an `AnthropicProvider`, which
+    /// POSTs to `/v1/messages` (vs the OpenAI arm's `/chat/completions`).
+    /// Deleting the arm silently downgrades an Anthropic config to OpenAI, so
+    /// this drives one real turn against a loopback server and pins the path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_runtime_uses_the_anthropic_endpoint_for_an_anthropic_config() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = Arc::new(Mutex::new(String::new()));
+        let sink = captured.clone();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let request_line = req.lines().next().unwrap_or_default().to_string();
+                    *sink.lock().unwrap_or_else(|e| e.into_inner()) = request_line;
+                }
+                // Close without a response: the request path is what matters.
+            }
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        cfg.provider_type = "anthropic".to_string();
+        cfg.api_base = format!("http://{addr}");
+        cfg.retry_max = 0;
+        let mut runtime = build_runtime(
+            &cfg,
+            None,
+            Vec::new(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("build_runtime must build an anthropic provider");
+        // The turn errors out (the mock drops the connection); we only care that
+        // it actually reached the Anthropic endpoint.
+        let _ = runtime.run("hello").await;
+        let _ = server.await;
+        let request_line = captured.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            request_line.contains("/v1/messages"),
+            "an anthropic config must POST to /v1/messages, got {request_line:?}"
         );
     }
 }

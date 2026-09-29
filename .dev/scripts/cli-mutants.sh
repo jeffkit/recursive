@@ -25,6 +25,22 @@ FEATURES=""
 # ~60s/mutant single-threaded (2026-08-03 gate-timeout incident).
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
+# 2026-09-29 (goal-407) gate-timeout root cause: every `--jobs` copy owns a
+# *cold* target dir, so N jobs means N concurrent full builds of the dependency
+# tree. With the default `--jobserver-tasks = NCPUS` that is ~10 fat rustc
+# processes at once; on a 32 GB machine this drove swap to 7.9/9.2 GB and
+# throughput down to ~1.4 mutants/min (a 200-mutant run needed ~2 h, so the
+# gate was SIGKILLed at its 20-min budget and reported a truncated survivor
+# list). Capping the *global* jobserver pool keeps memory bounded and the
+# machine out of swap: same mutants, same test command, same fail-on-survivor
+# semantics — only the compile concurrency is limited.
+JOBSERVER_TASKS="${CARGO_MUTANTS_JOBSERVER_TASKS:-4}"
+
+if ! command -v cargo-mutants >/dev/null 2>&1; then
+  echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
+  exit 2
+fi
+
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
   exit 2
@@ -118,9 +134,11 @@ run_mutants() {
   local rc=0 out
   out=$(mktemp)
   if [[ -n "$FEATURES" ]]; then
-    cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+    cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" \
+      --jobserver-tasks "$JOBSERVER_TASKS" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
   else
-    cargo mutants -p "$CRATE" "${mode_args[@]}" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+    cargo mutants -p "$CRATE" "${mode_args[@]}" \
+      --jobserver-tasks "$JOBSERVER_TASKS" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
   fi
   if [[ "$rc" -eq 3 ]]; then
     if grep -q "MISSED" "$out"; then
