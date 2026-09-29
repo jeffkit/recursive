@@ -1,0 +1,611 @@
+{
+  "runtime": "python",
+  "flow_id": "self-improve",
+  "inputType": {
+    "dataType": "object"
+  },
+  "desc": "recursive 自迭代（plaita 版）：preflight → run.recursive(+budget resume) → 质量门(N轮fix) → 跨provider评审(N轮fix) → commit(rebase/regate) → preserve/verdict。引擎=self_improve_engine.py，逻辑变更不需重发本定义。",
+  "nodes": [
+    {
+      "type": "start",
+      "id": "start",
+      "next": "shim_code"
+    },
+    {
+      "type": "assignment",
+      "id": "shim_code",
+      "output": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']],\n                       capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0:\n        raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "next": "base_input",
+      "source_line": 25
+    },
+    {
+      "type": "assignment",
+      "id": "base_input",
+      "output": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir"
+      },
+      "next": "pf_kill",
+      "source_line": 35
+    },
+    {
+      "type": "code",
+      "id": "pf_kill",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.kill-stale"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_disk",
+      "source_line": 38
+    },
+    {
+      "type": "code",
+      "id": "pf_disk",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.disk"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_base",
+      "source_line": 40
+    },
+    {
+      "type": "code",
+      "id": "pf_base",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.baseline"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_build",
+      "source_line": 42
+    },
+    {
+      "type": "code",
+      "id": "pf_build",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.build",
+        "sub_timeout": 3500
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_tests",
+      "source_line": 44
+    },
+    {
+      "type": "code",
+      "id": "pf_tests",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.baseline-tests",
+        "sub_timeout": 650
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_wt",
+      "source_line": 47
+    },
+    {
+      "type": "code",
+      "id": "pf_wt",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.worktree"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_prompt",
+      "source_line": 50
+    },
+    {
+      "type": "code",
+      "id": "pf_prompt",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.system-prompt"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_ping",
+      "source_line": 52
+    },
+    {
+      "type": "code",
+      "id": "pf_ping",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.provider-ping"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "pf_prereq",
+      "source_line": 54
+    },
+    {
+      "type": "code",
+      "id": "pf_prereq",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "preflight.gate-prereqs",
+        "sub_timeout": 280
+      },
+      "sandbox_backend": "subprocess",
+      "next": "run",
+      "source_line": 56
+    },
+    {
+      "type": "code",
+      "id": "run",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "run",
+        "sub_timeout": 28800
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n1",
+      "source_line": 62
+    },
+    {
+      "type": "if",
+      "id": "_n1",
+      "condition": {
+        "field": "$NODE.run.status",
+        "operator": "eq",
+        "value": "panic"
+      },
+      "source_line": 66,
+      "next": "_n22",
+      "else_next": "_n2"
+    },
+    {
+      "type": "if",
+      "id": "_n2",
+      "condition": {
+        "field": "$NODE.run.status",
+        "operator": "eq",
+        "value": "watchdog-hang"
+      },
+      "source_line": 68,
+      "next": "_n21",
+      "else_next": "_n3"
+    },
+    {
+      "type": "if",
+      "id": "_n3",
+      "condition": {
+        "field": "$NODE.run.status",
+        "operator": "eq",
+        "value": "timeout-resumed"
+      },
+      "source_line": 70,
+      "next": "_n20",
+      "else_next": "_n4"
+    },
+    {
+      "type": "if",
+      "id": "_n4",
+      "condition": {
+        "field": "$NODE.run.status",
+        "operator": "eq",
+        "value": "budget-exhausted"
+      },
+      "source_line": 72,
+      "next": "_n19",
+      "else_next": "gates"
+    },
+    {
+      "type": "code",
+      "id": "gates",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "gates",
+        "sub_timeout": 86000
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n5",
+      "source_line": 76
+    },
+    {
+      "type": "if",
+      "id": "_n5",
+      "condition": {
+        "field": "$NODE.gates.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "source_line": 79,
+      "next": "_n18",
+      "else_next": "review"
+    },
+    {
+      "type": "code",
+      "id": "review",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "review",
+        "sub_timeout": 86000
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n6",
+      "source_line": 83
+    },
+    {
+      "type": "if",
+      "id": "_n6",
+      "condition": {
+        "field": "$NODE.review.decision",
+        "operator": "eq",
+        "value": "NEEDS_FIX"
+      },
+      "source_line": 86,
+      "next": "_n17",
+      "else_next": "_n7"
+    },
+    {
+      "type": "if",
+      "id": "_n7",
+      "condition": {
+        "field": "$NODE.review.fixRan",
+        "operator": "ne",
+        "value": false
+      },
+      "source_line": 90,
+      "next": "regate",
+      "else_next": "prep"
+    },
+    {
+      "type": "code",
+      "id": "prep",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "commit-prep"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n8",
+      "source_line": 99
+    },
+    {
+      "type": "if",
+      "id": "_n8",
+      "condition": {
+        "field": "$NODE.prep.empty",
+        "operator": "ne",
+        "value": false
+      },
+      "source_line": 101,
+      "next": "_n14",
+      "else_next": "_n9"
+    },
+    {
+      "type": "if",
+      "id": "_n9",
+      "condition": {
+        "field": "$NODE.prep.mainMoved",
+        "operator": "ne",
+        "value": false
+      },
+      "source_line": 103,
+      "next": "rebase",
+      "else_next": "land2"
+    },
+    {
+      "type": "code",
+      "id": "land2",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "commit-land",
+        "sub_timeout": 590,
+        "wtSha": "$NODE.prep.wtSha"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "cleanup2",
+      "source_line": 121
+    },
+    {
+      "type": "code",
+      "id": "cleanup2",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "worktree-cleanup",
+        "verdict": "committed"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "fin2",
+      "source_line": 124
+    },
+    {
+      "type": "code",
+      "id": "fin2",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "finish",
+        "verdict": "committed",
+        "detail": ""
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n10",
+      "source_line": 127
+    },
+    {
+      "type": "end",
+      "id": "_n10",
+      "output": {
+        "verdict": "committed",
+        "landed": "$NODE.land2.landed",
+        "cleanup": "$NODE.cleanup2.removed",
+        "finish": "$NODE.fin2.verdict"
+      },
+      "resultType": "success",
+      "source_line": 130
+    },
+    {
+      "type": "code",
+      "id": "rebase",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "commit-rebase"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "rg2",
+      "source_line": 104
+    },
+    {
+      "type": "code",
+      "id": "rg2",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "regate",
+        "sub_timeout": 7200
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n11",
+      "source_line": 106
+    },
+    {
+      "type": "if",
+      "id": "_n11",
+      "condition": {
+        "field": "$NODE.rg2.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "source_line": 109,
+      "next": "_n13",
+      "else_next": "land"
+    },
+    {
+      "type": "code",
+      "id": "land",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "commit-land",
+        "sub_timeout": 590,
+        "wtSha": "$NODE.rebase.rebasedSha"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "cleanup",
+      "source_line": 111
+    },
+    {
+      "type": "code",
+      "id": "cleanup",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "worktree-cleanup",
+        "verdict": "committed"
+      },
+      "sandbox_backend": "subprocess",
+      "next": "fin",
+      "source_line": 114
+    },
+    {
+      "type": "code",
+      "id": "fin",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "finish",
+        "verdict": "committed",
+        "detail": ""
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n12",
+      "source_line": 117
+    },
+    {
+      "type": "end",
+      "id": "_n12",
+      "output": {
+        "verdict": "committed",
+        "landed": "$NODE.land.landed",
+        "cleanup": "$NODE.cleanup.removed",
+        "finish": "$NODE.fin.verdict"
+      },
+      "resultType": "success",
+      "source_line": 120
+    },
+    {
+      "type": "end",
+      "id": "_n13",
+      "output": {
+        "verdict": "failed-preserved",
+        "preserve": "$NODE.rg2.preserve",
+        "gate": "$NODE.rg2.gate"
+      },
+      "resultType": "success",
+      "source_line": 110
+    },
+    {
+      "type": "end",
+      "id": "_n14",
+      "output": {
+        "verdict": "skip-commit",
+        "detail": "no changes in worktree"
+      },
+      "resultType": "success",
+      "source_line": 102
+    },
+    {
+      "type": "code",
+      "id": "regate",
+      "language": "python",
+      "code": "$NODE.shim_code",
+      "input": {
+        "engine": "$INPUT.engine",
+        "run_dir": "$INPUT.run_dir",
+        "step": "regate",
+        "sub_timeout": 7200
+      },
+      "sandbox_backend": "subprocess",
+      "next": "_n15",
+      "source_line": 91
+    },
+    {
+      "type": "if",
+      "id": "_n15",
+      "condition": {
+        "field": "$NODE.regate.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "source_line": 94,
+      "next": "_n16",
+      "else_next": "prep"
+    },
+    {
+      "type": "end",
+      "id": "_n16",
+      "output": {
+        "verdict": "failed-preserved",
+        "preserve": "$NODE.regate.preserve",
+        "gate": "$NODE.regate.gate"
+      },
+      "resultType": "success",
+      "source_line": 95
+    },
+    {
+      "type": "end",
+      "id": "_n17",
+      "output": {
+        "verdict": "failed-preserved",
+        "preserve": "$NODE.review.preserve",
+        "review": "$NODE.review.text"
+      },
+      "resultType": "success",
+      "source_line": 87
+    },
+    {
+      "type": "end",
+      "id": "_n18",
+      "output": {
+        "verdict": "failed-preserved",
+        "preserve": "$NODE.gates.preserve",
+        "gate": "$NODE.gates.gate"
+      },
+      "resultType": "success",
+      "source_line": 80
+    },
+    {
+      "type": "end",
+      "id": "_n19",
+      "output": {
+        "verdict": "skip-commit",
+        "detail": "budget exceeded after one resume"
+      },
+      "resultType": "success",
+      "source_line": 73
+    },
+    {
+      "type": "end",
+      "id": "_n20",
+      "output": {
+        "verdict": "failed-preserved",
+        "preserve": "$NODE.run.preserve",
+        "status": "$NODE.run.status"
+      },
+      "resultType": "success",
+      "source_line": 71
+    },
+    {
+      "type": "end",
+      "id": "_n21",
+      "output": {
+        "verdict": "failed-preserved",
+        "preserve": "$NODE.run.preserve",
+        "status": "$NODE.run.status"
+      },
+      "resultType": "success",
+      "source_line": 69
+    },
+    {
+      "type": "end",
+      "id": "_n22",
+      "output": {
+        "verdict": "panic-preserved",
+        "preserve": "$NODE.run.preserve",
+        "status": "$NODE.run.status"
+      },
+      "resultType": "success",
+      "source_line": 67
+    }
+  ]
+}
