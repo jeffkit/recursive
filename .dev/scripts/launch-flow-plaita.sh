@@ -26,6 +26,9 @@ LOG=".flowcast/logs/flow-plaita-$(date +%Y%m%dT%H%M%S).log"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PYTHONPATH="$HOME/projects/infra4agent/plaita:$HOME/projects/infra4agent/plaita-nodes/src"
+# code 沙箱默认 10s 墙钟对自迭代完全不够（preflight.build 就要几分钟）。
+# 沙箱墙钟全局放宽；真实每步超时由 shim 内层 sub_timeout 与节点 timeout 把关。
+export PLAITA_SANDBOX_TIMEOUT="${PLAITA_SANDBOX_TIMEOUT:-90000}"
 
 nohup python3 .dev/flows/self_improve_bridge.py --run-id "$RID" "$@" > "$LOG" 2>&1 &
 PID=$!
