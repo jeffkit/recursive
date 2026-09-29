@@ -15,7 +15,7 @@
       "type": "code",
       "id": "pf_kill",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -29,7 +29,7 @@
       "type": "code",
       "id": "pf_disk",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -43,7 +43,7 @@
       "type": "code",
       "id": "pf_base",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -57,7 +57,7 @@
       "type": "code",
       "id": "pf_build",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -72,7 +72,7 @@
       "type": "code",
       "id": "pf_tests",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -87,7 +87,7 @@
       "type": "code",
       "id": "pf_wt",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -101,7 +101,7 @@
       "type": "code",
       "id": "pf_prompt",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -115,7 +115,7 @@
       "type": "code",
       "id": "pf_ping",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -129,7 +129,7 @@
       "type": "code",
       "id": "pf_prereq",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -207,7 +207,7 @@
       "type": "code",
       "id": "gates",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -234,7 +234,7 @@
       "type": "code",
       "id": "review",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -273,7 +273,7 @@
       "type": "code",
       "id": "prep",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -311,7 +311,7 @@
       "type": "code",
       "id": "land_b",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -327,7 +327,7 @@
       "type": "code",
       "id": "cleanup_b",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -342,7 +342,7 @@
       "type": "code",
       "id": "fin_b",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -370,7 +370,7 @@
       "type": "code",
       "id": "rebase",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -384,7 +384,7 @@
       "type": "code",
       "id": "rg2",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -411,7 +411,7 @@
       "type": "code",
       "id": "land_a",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -427,7 +427,7 @@
       "type": "code",
       "id": "cleanup_a",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -442,7 +442,7 @@
       "type": "code",
       "id": "fin_a",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
@@ -491,7 +491,7 @@
       "type": "code",
       "id": "regate",
       "language": "python",
-      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
+      "code": "def run(input):\n    import json, subprocess\n    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n    return json.load(open(input['run_dir'] + '/step-result.json'))\n",
       "input": {
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
