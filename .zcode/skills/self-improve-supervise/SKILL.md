@@ -1,18 +1,38 @@
 ---
 type: Skill
 name: self-improve-supervise
-description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow (.dev/flows/self-improve.flow.js). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Event-driven: arm a Bash watcher with run_in_background: true; the kernel wakes you with a <task-notification> when the flow reaches verdict or dies. Foreground sleep+probe is only a forensic fallback for between-tick steering. (This contrasts with recursive's *own* loop-supervise skill, which targets recursive's kernel and uses its run_background/watch_file/schedule_wakeup/stop_loop toolset.)"
+description: "ZCode-as-supervisor playbook for running Recursive's self-improve flow — plaita engine (launch-flow-plaita.sh + self_improve_engine.py, default since 2026-09-30) or flowcast engine (launch-flow.sh, fallback). Location-independent: run from the infra4agent monorepo root OR the recursive repo itself — step 0a resolves the recursive root into $RR. Use when the user wants YOU (not recursive's own agent) to drive a self-improve goal end-to-end: write the goal, launch the flow, monitor it, intervene only when it can't self-heal, and report the verdict. Event-driven: arm a Bash watcher with run_in_background: true; the kernel wakes you with a <task-notification> when the flow reaches verdict or dies. Foreground sleep+probe is only a forensic fallback for between-tick steering. (This contrasts with recursive's *own* loop-supervise skill, which targets recursive's kernel and uses its run_background/watch_file/schedule_wakeup/stop_loop toolset.)"
 mode: trigger
 triggers: self-improve, self improve, 自改, 跑一个goal, 跑一个 goal, 带跑, supervisor, 督战
 ---
 
 # self-improve-supervise — ZCode drives Recursive's self-improve flow
 
+## ⚡ 引擎选择：plaita（2026-09-30 起，flowcast 为回滚）
+
+self-improve 现有**两个引擎**，监督 SOP 基本通用：
+
+| | plaita 引擎（**默认推荐**） | flowcast 引擎（回滚） |
+|---|---|---|
+| 启动 | `.dev/scripts/launch-flow-plaita.sh`（参数面与 launch-flow.sh 一致） | `.dev/scripts/launch-flow.sh` |
+| 定义 | `.dev/flows/self-improve.plaita.json`（源 `self_improve_flow.py`，45 节点，console 已发布 v1.0.0） | `.dev/flows/self-improve.flow.js`（2033 行） |
+| 逻辑 | **厚引擎** `.dev/flows/self_improve_engine.py`（watchdog/门禁fix循环/评审/commit/preserve 全移植；改逻辑只动它，不需重发 flow 定义） | 全在 JS 里 |
+| 运行目录 | 同：`.flowcast/runs/<run-id>/`；state.json 含 `engine: "plaita"` 字段 + 兼容 status/currentStep/verdict | `.flowcast/runs/<run-id>/` |
+| 观测 | Langfuse（trace id = execution_id）+ console 执行页 | 日志 + state.json |
+
+plaita 专属注意：
+- launcher 已内置 `PLAITA_SANDBOX_TIMEOUT=90000`（沙箱默认 10s 墙钟装不下 preflight.build）；
+- 凭据经沙箱 env 白名单会**被剥**——bridge 已用 `SUBPROCESS_ENV_EXTRA` 按前缀注入
+  （DEEPSEEK_/GLM_/MINIMAX_/RECURSIVE_/LANGFUSE_），新增凭据前缀要同步 bridge；
+- 引擎子命令带 `--run-dir`（argv 优先于 env——`Path("")`==`Path(".")` 的坑）；
+- 门禁语义等价：gates.json 运行时读取、per-gate fix ≤3 轮、mutants 变更自跳；
+  run.recursive 内置 budget/timeout 一次 resume + watchdog（g346 逻辑同款）。
+
 ## When to use
 
 The user wants **you (ZCode)** to act as supervisor and run a Recursive
 self-improve goal end-to-end: write a goal file, launch
-`.dev/scripts/launch-flow.sh`, watch it to verdict, and intervene only on
+`.dev/scripts/launch-flow.sh`（或 plaita 的 `launch-flow-plaita.sh`）, watch it to verdict, and intervene only on
 problems the flow/agent can't self-heal. The product of the run is a code
 change in the `recursive` sub-repo.
 
