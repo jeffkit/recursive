@@ -21,7 +21,7 @@ def self_improve(INPUT):
     pf_kill = CODE.python(sandbox_backend="subprocess", timeout=300,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -32,7 +32,7 @@ def self_improve(INPUT):
     pf_disk = CODE.python(sandbox_backend="subprocess", timeout=120,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -43,7 +43,7 @@ def self_improve(INPUT):
     pf_base = CODE.python(sandbox_backend="subprocess", timeout=120,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -54,7 +54,7 @@ def self_improve(INPUT):
     pf_build = CODE.python(sandbox_backend="subprocess", timeout=3600,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -65,7 +65,7 @@ def self_improve(INPUT):
     pf_tests = CODE.python(sandbox_backend="subprocess", timeout=700,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -76,7 +76,7 @@ def self_improve(INPUT):
     pf_wt = CODE.python(sandbox_backend="subprocess", timeout=300,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -87,7 +87,7 @@ def self_improve(INPUT):
     pf_prompt = CODE.python(sandbox_backend="subprocess", timeout=120,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -98,7 +98,7 @@ def self_improve(INPUT):
     pf_ping = CODE.python(sandbox_backend="subprocess", timeout=120,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -109,7 +109,7 @@ def self_improve(INPUT):
     pf_prereq = CODE.python(sandbox_backend="subprocess", timeout=300,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -120,7 +120,7 @@ def self_improve(INPUT):
     run = CODE.python(sandbox_backend="subprocess", timeout=29000,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 28800))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -141,7 +141,7 @@ def self_improve(INPUT):
     gates = CODE.python(sandbox_backend="subprocess", timeout=86400,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -155,7 +155,7 @@ def self_improve(INPUT):
     review = CODE.python(sandbox_backend="subprocess", timeout=86400,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -170,7 +170,7 @@ def self_improve(INPUT):
         regate = CODE.python(sandbox_backend="subprocess", timeout=7200,
             code=(
                 "def run(input):\n"
-                "    import json, subprocess\n"
+                "    import json, os, subprocess\n"
                 "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
                 "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
                 "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -184,7 +184,7 @@ def self_improve(INPUT):
     prep = CODE.python(sandbox_backend="subprocess", timeout=600,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -199,7 +199,7 @@ def self_improve(INPUT):
         rebase = CODE.python(sandbox_backend="subprocess", timeout=1800,
             code=(
                 "def run(input):\n"
-                "    import json, subprocess\n"
+                "    import json, os, subprocess\n"
                 "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
                 "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
                 "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -210,7 +210,7 @@ def self_improve(INPUT):
         rg2 = CODE.python(sandbox_backend="subprocess", timeout=7200,
             code=(
                 "def run(input):\n"
-                "    import json, subprocess\n"
+                "    import json, os, subprocess\n"
                 "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
                 "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
                 "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -223,7 +223,7 @@ def self_improve(INPUT):
         land_a = CODE.python(sandbox_backend="subprocess", timeout=600,
             code=(
                 "def run(input):\n"
-                "    import json, subprocess\n"
+                "    import json, os, subprocess\n"
                 "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
                 "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
                 "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -234,7 +234,7 @@ def self_improve(INPUT):
         cleanup_a = CODE.python(sandbox_backend="subprocess", timeout=300,
             code=(
                 "def run(input):\n"
-                "    import json, subprocess\n"
+                "    import json, os, subprocess\n"
                 "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
                 "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
                 "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -245,7 +245,7 @@ def self_improve(INPUT):
         fin_a = CODE.python(sandbox_backend="subprocess", timeout=120,
             code=(
                 "def run(input):\n"
-                "    import json, subprocess\n"
+                "    import json, os, subprocess\n"
                 "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
                 "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
                 "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -258,7 +258,7 @@ def self_improve(INPUT):
     land_b = CODE.python(sandbox_backend="subprocess", timeout=600,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -269,7 +269,7 @@ def self_improve(INPUT):
     cleanup_b = CODE.python(sandbox_backend="subprocess", timeout=300,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
@@ -280,7 +280,7 @@ def self_improve(INPUT):
     fin_b = CODE.python(sandbox_backend="subprocess", timeout=120,
         code=(
             "def run(input):\n"
-            "    import json, subprocess\n"
+            "    import json, os, subprocess\n"
             "    json.dump(input, open(input['run_dir'] + '/node-input.json', 'w'))\n"
             "    r = subprocess.run(['python3', input['engine'], 'step', input['step']], capture_output=True, text=True, timeout=input.get('sub_timeout', 3600), env=dict(os.environ, SELF_IMPROVE_RUN_DIR=input['run_dir']))\n"
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
