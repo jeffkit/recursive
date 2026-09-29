@@ -3457,32 +3457,38 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         // Turn start installs the SAME token in both slots.
-        let cur = backend
-            .current_interrupt_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let slotted = backend
-            .subagent_token_slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert!(slotted.is_some(), "slot must be populated mid-turn");
-        assert!(
-            cur.as_ref().map(|t| t.is_cancelled()) == slotted.as_ref().map(|t| t.is_cancelled()),
-            "slot and current token must be live mirrors"
-        );
-        drop(cur);
-        drop(slotted);
+        // （两个 guard 必须收在块作用域里：clippy::await_holding_lock 不认 drop()，
+        //   裸 let 绑定的词法作用域会一直延伸到函数尾，扫到下面的 sleep await。）
+        {
+            let cur = backend
+                .current_interrupt_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let slotted = backend
+                .subagent_token_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(slotted.is_some(), "slot must be populated mid-turn");
+            assert!(
+                cur.as_ref().map(|t| t.is_cancelled())
+                    == slotted.as_ref().map(|t| t.is_cancelled()),
+                "slot and current token must be live mirrors"
+            );
+        }
 
         // Interrupt cancels the slotted token.
         backend.action_tx.send(UserAction::Interrupt).unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut cancelled = false;
         while tokio::time::Instant::now() < deadline {
-            let tok = backend
-                .subagent_token_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if tok.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
+            let cancelled_now = {
+                let tok = backend
+                    .subagent_token_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                tok.as_ref().map(|t| t.is_cancelled()).unwrap_or(false)
+            };
+            if cancelled_now {
                 cancelled = true;
                 break;
             }

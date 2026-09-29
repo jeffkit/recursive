@@ -284,3 +284,85 @@ async fn parallel_workers_static_token_and_slot_both_resolve() {
         );
     }
 }
+
+/// COORD blocker 2（2026-09-29）：聚合 deadline 触发时，**已完成** worker 的真实
+/// 结果必须被抢救（is_finished() → await 立即返回），只有未完成的才 abort +
+/// "did not finish" 占位——否则 3 个先完成 worker 的报告会被占位整体顶掉。
+#[tokio::test]
+async fn aggregate_deadline_rescues_completed_worker_results() {
+    struct MixedProvider;
+
+    #[async_trait]
+    impl ChatProvider for MixedProvider {
+        async fn complete(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> recursive::Result<Completion> {
+            // manifest 的 system_prompt 会进入 messages[0]，用它区分快慢 worker。
+            let slow = messages.iter().any(|m| m.content.contains("SLOW-WORKER"));
+            if slow {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                unreachable!("hung forever")
+            }
+            Ok(Completion {
+                content: "fast-done".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _tx: Option<recursive::llm::StreamSender>,
+            _cancel: Option<tokio_util::sync::CancellationToken>,
+        ) -> recursive::Result<Completion> {
+            unreachable!("stream not used")
+        }
+    }
+
+    let mut manifest = serde_json::Map::new();
+    for (id, marker) in [
+        ("worker-fast", "FAST-WORKER"),
+        ("worker-slow", "SLOW-WORKER"),
+    ] {
+        manifest.insert(
+            id.to_string(),
+            json!({
+                "system_prompt": format!("You are a researcher. marker={marker}"),
+                "allowed_tools": ["Read"]
+            }),
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+    let provider = Arc::new(MixedProvider);
+    let all_tools = tool_registry(tmp.path());
+    let agent =
+        AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None).with_wall_timeout_secs(5);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        agent.execute(json!({
+            "mode": "parallel",
+            "manifest": manifest,
+            "prompt": "read files",
+            "max_steps": 45
+        })),
+    )
+    .await
+    .expect("aggregate deadline must not hang")
+    .expect("execute ok");
+
+    // 快 worker 的真实结果被抢救，而不是 "did not finish" 占位。
+    assert!(result.contains("fast-done"), "got: {result}");
+    // 慢 worker 仍拿到配对占位 + 超时标签。
+    assert!(result.contains("worker-slow"), "got: {result}");
+    assert!(result.contains("did not finish"), "got: {result}");
+    assert!(result.contains("WallClockExceeded"), "got: {result}");
+}

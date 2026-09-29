@@ -725,6 +725,13 @@ impl AgentTool {
             None
         };
 
+        // 结果登记表：worker 任务返回前先把结果写入这里。聚合超时/取消分支据此
+        // 抢救已完成 worker 的真实结果——此时 JoinHandle 可能已被 join_all 的
+        // 部分轮询消费，再 poll 已完成的句柄会 panic，登记表是唯一可靠出口。
+        let rescued: Arc<
+            std::sync::Mutex<std::collections::BTreeMap<String, Result<String, String>>>,
+        > = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
         // Spawn each worker into a tokio task, collecting JoinHandles.
         let mut handles: Vec<tokio::task::JoinHandle<(String, Result<String>)>> = Vec::new();
         for (worker_id, entry) in manifest.iter() {
@@ -741,6 +748,7 @@ impl AgentTool {
             let workers = workers.clone();
             let worker_token = child_token.as_ref().map(|t| t.child_token());
             let token_slot = token_slot.clone();
+            let rescued = rescued.clone();
 
             handles.push(tokio::spawn(async move {
                 // Deregister on every exit path, including the abort path of
@@ -780,6 +788,14 @@ impl AgentTool {
                 let result = agent
                     .run_worker(&worker_id, &entry, &prompt, max_steps, child_depth)
                     .await;
+                let entry = match &result {
+                    Ok(t) => Ok(t.clone()),
+                    Err(e) => Err(e.to_string()),
+                };
+                rescued
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(worker_id.clone(), entry);
 
                 (worker_id, result)
             }));
@@ -838,30 +854,42 @@ impl AgentTool {
             };
 
         // If the cancel/timeout branch fired, `outcomes` is empty but handles
-        // may still be running: cancel the child token (graceful), abort the
-        // stragglers, and produce placeholder results so the parent LLM sees
-        // one result line per dispatched worker.
+        // may still be running: cancel the child token (graceful), rescue the
+        // already-finished workers' real results, abort the stragglers, and
+        // produce placeholder results so the parent LLM sees one result line
+        // per dispatched worker.
         let mut results: Vec<(String, String)> = Vec::new();
         if !aggregated {
             if let Some(token) = &child_token {
                 token.cancel();
-            }
-            for handle in handles {
-                handle.abort();
             }
             let label = if timed_out {
                 "WallClockExceeded"
             } else {
                 "Cancelled"
             };
-            for id in manifest.keys() {
-                results.push((
-                    id.clone(),
-                    format!(
-                        "[worker '{id}' finished: {label}]\n(aggregate deadline/cancellation; worker did not finish)"
-                    ),
-                ));
+            // 超时/取消分支按登记表抢救已完成 worker 的真实结果；只对登记表里
+            // 没有的（未完成）abort + 占位——deadline 一到，先完成的报告不能被
+            // "did not finish" 占位整体顶掉。
+            let ids: Vec<String> = manifest.keys().cloned().collect();
+            let ledger = rescued.lock().unwrap_or_else(|e| e.into_inner());
+            for (idx, handle) in handles.into_iter().enumerate() {
+                let id = ids.get(idx).cloned().unwrap_or_else(|| "(unknown)".into());
+                match ledger.get(&id) {
+                    Some(Ok(text)) => results.push((id, text.clone())),
+                    Some(Err(e)) => results.push((id, format!("ERROR: {e}"))),
+                    None => {
+                        handle.abort();
+                        results.push((
+                            id.clone(),
+                            format!(
+                                "[worker '{id}' finished: {label}]\n(aggregate deadline/cancellation; worker did not finish)"
+                            ),
+                        ));
+                    }
+                }
             }
+            drop(ledger);
         } else {
             for outcome in outcomes {
                 match outcome {
