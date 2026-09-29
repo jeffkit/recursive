@@ -147,7 +147,7 @@ def self_improve(INPUT):
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
             "    return json.load(open(input['run_dir'] + '/step-result.json'))\n"
         ),
-        input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'gates', 'sub_timeout': 86000},
+        input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'gates', 'sub_timeout': 28800},
     )
     if not gates.passed:
         return {"verdict": "failed-preserved", "preserve": gates.preserve, "gate": gates.gate}
@@ -161,7 +161,7 @@ def self_improve(INPUT):
             "    if r.returncode != 0: raise RuntimeError('engine step ' + input['step'] + ' failed: ' + (r.stderr or r.stdout or '')[-800:])\n"
             "    return json.load(open(input['run_dir'] + '/step-result.json'))\n"
         ),
-        input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'review', 'sub_timeout': 86000},
+        input={'engine': INPUT.engine, 'run_dir': INPUT.run_dir, 'step': 'review', 'sub_timeout': 28800},
     )
     if review.decision == "NEEDS_FIX":
         return {"verdict": "failed-preserved", "preserve": review.preserve, "review": review.text}

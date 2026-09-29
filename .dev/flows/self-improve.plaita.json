@@ -212,7 +212,7 @@
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
         "step": "gates",
-        "sub_timeout": 86000
+        "sub_timeout": 28800
       },
       "sandbox_backend": "subprocess",
       "next": "_n5",
@@ -239,7 +239,7 @@
         "engine": "$INPUT.engine",
         "run_dir": "$INPUT.run_dir",
         "step": "review",
-        "sub_timeout": 86000
+        "sub_timeout": 28800
       },
       "sandbox_backend": "subprocess",
       "next": "_n6",
