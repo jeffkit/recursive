@@ -440,8 +440,23 @@ impl AppState {
     /// handle-clone of the shared startup registry (previous behaviour).
     /// Issue #31 §C: Result-shaped — container creation failure is a
     /// per-session error mapped by handlers to 503/500, not a process exit.
+    ///
+    /// Issue #65: the surface contracts (operator allow-list, coordinator
+    /// pruning) are re-applied here because the container tier rebuilds the
+    /// registry from scratch — filtering only the startup registry would
+    /// silently hand rebuilt sessions the full toolset again. On the clone
+    /// path this is an idempotent re-filter. (MCP tools are still lost on a
+    /// container rebuild — the provider builds a fresh local registry —
+    /// which stays a documented container-tier gap, not a silent contract
+    /// violation.)
     pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
-        rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await
+        let mut registry =
+            rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await?;
+        crate::coordinator::filter_registry(&mut registry);
+        if !self.config.allow_tools.is_empty() {
+            registry.retain_tools(&self.config.allow_tools);
+        }
+        Ok(registry)
     }
 }
 
@@ -1620,6 +1635,45 @@ mod goal_396_persistence_tests {
         }
     }
 
+    /// Issue #65: `session_tool_registry` is the choke point every handler
+    /// builds sessions from, so the operator allow-list must hold there —
+    /// including on a registry that arrives unfiltered (the container tier
+    /// rebuilds one from scratch per session; the clone path re-filters
+    /// idempotently).
+    #[tokio::test]
+    async fn session_tool_registry_applies_allow_tools() {
+        let host = test_host(0);
+        let storage: Arc<dyn StorageBackend> = RecordingStorage::new();
+        let mut config = test_config();
+        config.allow_tools = vec!["Read".into()];
+        let state = AppState {
+            tools: vec![],
+            tool_registry: crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host,
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage,
+        };
+
+        let registry = state.session_tool_registry().await.expect("registry");
+        assert!(
+            registry.find_by_name("Read").is_some(),
+            "allow-listed tools must survive"
+        );
+        for dropped in ["Write", "Edit", "Bash", "TodoWrite"] {
+            assert!(
+                registry.find_by_name(dropped).is_none(),
+                "{dropped} is outside RECURSIVE_ALLOW_TOOLS and must not leak \
+                 into per-session registries"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn evict_persists_each_sessions_transcript_outside_the_lock() {
         let host = test_host(0);
@@ -1767,6 +1821,34 @@ mod goal_403_http_sandbox_entry {
             "HTTP entry must build its tool registry through cli::builder::build_tools \
              (which dispatches RECURSIVE_SANDBOX=container to ContainerToolSetProvider), \
              not a local-only registry"
+        );
+    }
+
+    /// Issues #70 / #65: the base registry alone is not enough — the HTTP
+    /// entry must run the shared cross-cutting tail (`finish_tool_surface`)
+    /// so MCP tools (#70) and the coordinator / allow-list pruning (#65)
+    /// land on the registry that backs `/tools` and every session.
+    #[test]
+    fn http_entry_applies_the_shared_tool_surface_tail() {
+        let src = include_str!("../../crates/recursive-cli/src/main.rs");
+        let http_block = src
+            .split("Cmd::Http { addr } => {")
+            .nth(1)
+            .expect("HTTP entry block must exist")
+            .split("Cmd::Run { goal } => {")
+            .next()
+            .expect("HTTP entry block must be terminated by the Run arm");
+        assert!(
+            http_block.contains("finish_tool_surface"),
+            "HTTP entry must run cli::builder::finish_tool_surface on top of \
+             build_tools — a base-only registry silently drops MCP tools \
+             (#70) and ignores RECURSIVE_ALLOW_TOOLS (#65)"
+        );
+        assert!(
+            http_block.contains("apply_operator_allow_list"),
+            "HTTP entry must apply the operator allow-list AFTER sub-agent \
+             registration — tools registered post-prune (agent/send_message/\
+             list_workers) would otherwise escape RECURSIVE_ALLOW_TOOLS (#65)"
         );
     }
 

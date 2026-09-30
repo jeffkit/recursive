@@ -269,6 +269,59 @@ pub(crate) async fn build_tools(
     (registry, read_state)
 }
 
+/// Apply the cross-cutting tool-surface wiring every agent-loop channel must
+/// layer on top of [`build_tools`], in one place:
+///
+/// 1. MCP registration (`--mcp-config` / workspace auto-discovery) —
+///    issue #70: `Cmd::Http` used to skip this, so AG-UI sessions saw no
+///    `mcp__*` business tools at all.
+/// 2. The per-registry `TouchedFiles` collector (per-turn checkpoint
+///    recording reads it back via `ToolRegistry::touched_files`).
+/// 3. Coordinator-mode pruning (`coordinator::filter_registry`; no-op
+///    outside coordinator mode).
+///
+/// `elicitation` follows [`register_mcp_tools`]: interactive channels pass a
+/// slot they pump; headless channels (HTTP) pass `None` — an MCP
+/// `UrlElicitationRequired` then surfaces as a tool error instead of
+/// blocking on a host that does not exist.
+///
+/// Registration runs before the coordinator prune, so coordinator mode keeps
+/// every tool in its allow-set. The operator allow-list is deliberately NOT
+/// applied here: sub-agent registration happens after this function (it adds
+/// `agent` / `send_message` / `list_workers` post-prune by design), and the
+/// operator's list must be the last word — call [`apply_operator_allow_list`]
+/// after sub-agent registration (issue #65's "exactly the allowed set").
+pub(crate) async fn finish_tool_surface(
+    mut tools: ToolRegistry,
+    config: &Config,
+    mcp_config: Option<PathBuf>,
+    elicitation: Option<recursive::mcp::SharedElicitationHandler>,
+) -> ToolRegistry {
+    if let Some(slot) = elicitation.clone() {
+        tools = tools.with_elicitation_slot(slot);
+    }
+    register_mcp_tools(&mut tools, &config.workspace, mcp_config, elicitation).await;
+    // Always attach a TouchedFiles collector so AgentRuntime can record
+    // per-turn file touches when checkpoints are enabled later via
+    // enable_checkpoints(). When checkpoints are disabled this is a
+    // no-op observer.
+    tools = tools.with_touched_files(Arc::new(std::sync::Mutex::new(
+        recursive::TouchedFiles::new(),
+    )));
+    coordinator::filter_registry(&mut tools);
+    tools
+}
+
+/// Apply the operator allow-list (`--allow-tools` / `RECURSIVE_ALLOW_TOOLS`)
+/// — issue #65. Must run as the LAST step of a channel's tool assembly,
+/// after sub-agent registration, so the advertised surface is exactly the
+/// allowed set. No-op when no list is configured.
+pub(crate) fn apply_operator_allow_list(tools: &mut ToolRegistry, config: &Config) {
+    if !config.allow_tools.is_empty() {
+        tools.retain_tools(&config.allow_tools);
+    }
+}
+
 /// Resolve the active tool-permission configuration.
 ///
 /// Resolution order:
@@ -579,23 +632,11 @@ pub(crate) async fn build_runtime(
         max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
     };
     let provider = build_llm_provider(config, api_key, retry, Some(config.max_search_rounds))?;
-    let (mut tools, read_state) = build_tools(config, None).await;
+    let (tools, read_state) = build_tools(config, None).await;
+    // MCP + touched-files + coordinator pruning all live in one shared tail
+    // (issues #70 / #65) so channels cannot drift apart.
     let elicitation = recursive::mcp::new_elicitation_slot();
-    tools = tools.with_elicitation_slot(elicitation.clone());
-    register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation)).await;
-
-    // Always attach a TouchedFiles collector so AgentRuntime can record
-    // per-turn file touches when checkpoints are enabled later via
-    // enable_checkpoints(). When checkpoints are disabled this is a
-    // no-op observer.
-    tools = tools.with_touched_files(Arc::new(std::sync::Mutex::new(
-        recursive::TouchedFiles::new(),
-    )));
-
-    // Coordinator mode: when RECURSIVE_COORDINATOR_MODE=1 is set with the
-    // coordinator-mode feature, prune the tool registry to the coordinator
-    // allow-list (Read/Grep/Glob/team_*/task_*/etc.) and drop Edit/Write/Bash.
-    coordinator::filter_registry(&mut tools);
+    let mut tools = finish_tool_surface(tools, config, mcp_config, Some(elicitation)).await;
 
     // Sub-agent / team coordination is a channel-agnostic capability: every
     // agent-loop surface registers the unified `Agent` tool when
@@ -613,6 +654,9 @@ pub(crate) async fn build_runtime(
             .map(|token| Arc::new(Mutex::new(Some(token))))
     });
     tools = register_subagent_if_enabled(tools, config, provider.clone(), subagent_token_slot);
+    // Issue #65: the operator allow-list is the last word — applied after
+    // sub-agent registration so the surface is exactly the allowed set.
+    apply_operator_allow_list(&mut tools, config);
 
     let skills = discover_loaded_skills(config);
 
@@ -1051,6 +1095,59 @@ done
             registry.find_by_name("mcp__mock__beta").is_some(),
             "the explicit config's `beta` tool must be registered"
         );
+    }
+
+    /// Issues #70 / #65: `finish_tool_surface` + `apply_operator_allow_list`
+    /// are the tail every agent-loop channel must run. Registration happens
+    /// BEFORE the allow-list filter, so an operator can allow-list an MCP
+    /// tool by name — and everything not listed (base or MCP) is dropped.
+    /// The touched-files collector must be attached for checkpoint recording.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_tool_surface_registers_mcp_then_applies_allow_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = mock_mcp_server_script(tmp.path());
+        let mcp_config = explicit_mcp_config(tmp.path(), &script);
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        cfg.allow_tools = vec!["Read".into(), "mcp__mock__alpha".into()];
+
+        let (tools, _) = build_tools(&cfg, None).await;
+        let mut tools = finish_tool_surface(tools, &cfg, Some(mcp_config), None).await;
+        apply_operator_allow_list(&mut tools, &cfg);
+
+        assert!(
+            tools.find_by_name("mcp__mock__alpha").is_some(),
+            "allow-listed MCP tool must survive (issue #70)"
+        );
+        assert!(
+            tools.find_by_name("mcp__mock__beta").is_none(),
+            "MCP tools outside the allow-list must be dropped (issue #65)"
+        );
+        assert!(tools.find_by_name("Read").is_some());
+        assert!(
+            tools.find_by_name("Bash").is_none(),
+            "base tools outside the allow-list must be dropped (issue #65)"
+        );
+        assert!(
+            tools.touched_files().is_some(),
+            "the checkpoint touched-files collector must be attached"
+        );
+    }
+
+    /// Without an allow-list (and outside coordinator mode) the surface is
+    /// only added to — MCP registers, nothing is pruned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_tool_surface_keeps_full_registry_without_filters() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+
+        let (tools, _) = build_tools(&cfg, None).await;
+        let tools = finish_tool_surface(tools, &cfg, None, None).await;
+
+        assert!(tools.find_by_name("Bash").is_some());
+        assert!(tools.find_by_name("Read").is_some());
+        assert!(tools.touched_files().is_some());
     }
 
     /// `register_mcp_server_tools` must report the real number of tools the
