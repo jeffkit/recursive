@@ -163,7 +163,11 @@ fn reject(ip: IpAddr) -> Error {
 ///
 /// Returns `None` for any malformed input (including real hostnames), so
 /// callers can fall back to treating the host as a DNS name.
-fn parse_lenient_ipv4(s: &str) -> Option<IpAddr> {
+///
+/// Also consumed by the `HttpCall` endpoint-registry load-time guard
+/// (`http_call.rs`), which classifies operator-configured base URLs with
+/// the same lenient-parse semantics.
+pub(crate) fn parse_lenient_ipv4(s: &str) -> Option<IpAddr> {
     let parts: Vec<&str> = s.split('.').collect();
     if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
         return None;
