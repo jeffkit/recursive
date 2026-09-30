@@ -203,6 +203,24 @@ fn tools_do_not_import_llm_internals() {
     }
 }
 
+/// `src/message.rs` is the message-primitive layer, below providers. Its
+/// production code must not import `crate::llm` — `ToolCall` lives in
+/// `message.rs` (it is part of the assistant message shape) and `llm`
+/// re-exports it, keeping the dependency one-directional: llm → message.
+#[test]
+fn message_module_does_not_import_llm() {
+    let path = src_file("message.rs");
+    let content = std::fs::read_to_string(&path).expect("message.rs must exist");
+    let production = content.split("#[cfg(test)]").next().unwrap_or("");
+
+    assert!(
+        !production.contains("crate::llm"),
+        "invariant #2 violation: src/message.rs production code imports crate::llm. \
+         Shared types like ToolCall belong in message.rs (with a re-export from \
+         llm), so the message layer never depends on the provider layer."
+    );
+}
+
 /// LLM providers must not import from tools/ (they are orthogonal layers).
 /// Imports in `#[cfg(test)]` blocks are exempt — test code needs to reference
 /// tool constants/types for assertions.

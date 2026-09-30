@@ -6,7 +6,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::ToolCall;
+/// A structured request to invoke one of the registered tools.
+///
+/// Part of the assistant message shape (a field of `Message`), so it lives
+/// here rather than in the provider layer; the llm module re-exports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON arguments as produced by the model.
+    pub arguments: serde_json::Value,
+}
 
 /// Serde helper: skip serializing `is_compaction_summary` when false, so old
 /// JSONL transcripts on disk deserialize cleanly without the field.
@@ -203,7 +213,7 @@ mod tests {
     #[test]
     fn assistant_with_tool_calls_stores_tool_calls() {
         // kills `tool_calls: vec![]` mutation in assistant_with_tool_calls
-        use crate::llm::ToolCall;
+        use super::ToolCall;
         let tc = ToolCall {
             id: "tc-1".to_string(),
             name: "Read".to_string(),

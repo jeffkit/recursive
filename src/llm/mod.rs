@@ -30,8 +30,13 @@ pub mod openai;
 
 pub use chat::{
     estimate_tokens, Completion, ContextBreakdown, StreamChunk, StreamSender, StructuredRequest,
-    TokenUsage, ToolCall, ToolSpec,
+    TokenUsage, ToolSpec,
 };
+
+// `ToolCall` moved to `crate::message` (it is part of the assistant message
+// shape, not a provider detail). Re-exported here so existing
+// `use recursive::llm::ToolCall` paths keep working.
+pub use crate::message::ToolCall;
 
 // ── Re-exports: pricing ───────────────────────────────────────────────────────
 
