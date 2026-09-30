@@ -3342,6 +3342,7 @@ mod tests {
             name: "rust-patch-discipline".to_string(),
             description: "V4A patch format rules".to_string(),
             path: std::path::PathBuf::from("/tmp/skills/rust-patch-discipline/SKILL.md"),
+            body: None,
             mode: crate::skills::SkillMode::Manual,
             triggers: vec![],
             hint: String::new(),

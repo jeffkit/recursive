@@ -203,6 +203,7 @@ mod tests {
             name: name.to_string(),
             description: desc.to_string(),
             path: PathBuf::from(format!("/tmp/skills/{name}/SKILL.md")),
+            body: None,
             mode: SkillMode::Manual,
             triggers: vec![],
             hint: String::new(),

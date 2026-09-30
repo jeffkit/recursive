@@ -7,7 +7,6 @@
 //! patterns, that skill's body is returned for injection as a system message.
 
 use std::collections::HashSet;
-use std::fs;
 
 use crate::skills::{Skill, SkillMode};
 
@@ -117,7 +116,7 @@ impl SkillInjector {
                 .iter()
                 .any(|p| patterns.iter().any(|pat| glob_matches(pat, p)));
             if matches {
-                if let Ok(content) = fs::read_to_string(&skill.path) {
+                if let Ok(content) = crate::skills::read_skill_content(skill) {
                     let body = crate::skills::extract_skill_body(&content);
                     injected.push((skill.name.clone(), body.to_string()));
                     self.already_injected.insert(skill.name.clone());

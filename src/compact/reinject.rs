@@ -261,7 +261,7 @@ impl SkillReinjector {
                 None => continue,
             };
 
-            let content = match std::fs::read_to_string(&skill.path) {
+            let content = match crate::skills::read_skill_content(skill) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -688,6 +688,7 @@ mod tests {
             name: name.to_string(),
             description: format!("{name} skill"),
             path,
+            body: None,
             mode: SkillMode::Manual,
             triggers: vec![],
             hint: String::new(),

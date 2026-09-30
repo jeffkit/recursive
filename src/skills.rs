@@ -30,7 +30,15 @@ pub struct Skill {
     /// Brief description for the skill index.
     pub description: String,
     /// Absolute path to the SKILL.md file.
+    ///
+    /// Empty for content-backed skills (see [`skill_from_content`]) — those
+    /// carry their text in [`Skill::body`] and never touch the filesystem.
     pub path: PathBuf,
+    /// Raw SKILL.md text for content-backed skills (`Some` when constructed
+    /// from memory rather than discovered on disk). Readers prefer this over
+    /// `path` and treat it exactly like a disk read, frontmatter included —
+    /// stripping happens at use time, not storage time.
+    pub body: Option<String>,
     /// Injection mode.
     pub mode: SkillMode,
     /// Trigger words (only relevant when mode == Trigger).
@@ -69,8 +77,12 @@ pub struct SkillSection {
 pub struct SkillRef {
     /// Filename without extension, e.g. "api-spec"
     pub name: String,
-    /// Absolute path to the ref file
+    /// Absolute path to the ref file. Empty for content-backed refs —
+    /// those carry their text in `content`.
     pub path: PathBuf,
+    /// Raw ref text for content-backed refs (`Some` when the ref was
+    /// constructed from memory rather than found on disk).
+    pub content: Option<String>,
 }
 
 /// A parameter declared in a skill's frontmatter.
@@ -139,6 +151,7 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                         name,
                         description,
                         path: skill_file,
+                        body: None,
                         mode,
                         triggers,
                         hint,
@@ -155,6 +168,63 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
     }
 
     skills
+}
+
+/// Construct a [`Skill`] from in-memory skill-document content.
+///
+/// The content is parsed exactly like a `SKILL.md` discovered on disk
+/// (frontmatter, sections, params), but nothing touches the filesystem:
+/// `path` is left empty and the full text — frontmatter included — is
+/// stored in [`Skill::body`]. `refs`/`scripts` are empty; a content-backed
+/// skill cannot bundle sibling files, so attach extra documents via
+/// [`SkillRef::content`] instead.
+///
+/// `name` is the fallback name (used when the frontmatter omits `name:`),
+/// mirroring the directory-name fallback of `discover_skills`; a
+/// frontmatter `name:` still wins.
+pub fn skill_from_content(name: &str, content: &str) -> Skill {
+    let (parsed_name, description, mode, triggers, hint, depends_on, params, raw_globs) =
+        parse_skill_meta(content, Path::new(name));
+    let globs = if raw_globs.is_empty() {
+        None
+    } else {
+        Some(raw_globs)
+    };
+    Skill {
+        name: parsed_name,
+        description,
+        path: PathBuf::new(),
+        body: Some(content.to_string()),
+        mode,
+        triggers,
+        hint,
+        depends_on,
+        refs: Vec::new(),
+        params,
+        scripts: Vec::new(),
+        sections: parse_sections(content),
+        globs,
+    }
+}
+
+/// Read a skill's raw SKILL.md text: content first (content-backed skills),
+/// disk second (dir-discovered skills). For a disk skill the result is
+/// byte-identical to `fs::read_to_string(&skill.path)`.
+pub fn read_skill_content(skill: &Skill) -> std::io::Result<String> {
+    match &skill.body {
+        Some(content) => Ok(content.clone()),
+        None => fs::read_to_string(&skill.path),
+    }
+}
+
+/// Read a ref document's raw text: content first (content-backed refs),
+/// disk second. For a disk ref the result is byte-identical to
+/// `fs::read_to_string(&skill_ref.path)`.
+pub fn read_ref_content(skill_ref: &SkillRef) -> std::io::Result<String> {
+    match &skill_ref.content {
+        Some(content) => Ok(content.clone()),
+        None => fs::read_to_string(&skill_ref.path),
+    }
 }
 
 /// Parse named sections from a skill's body content.
@@ -211,6 +281,7 @@ fn discover_refs(skill_dir: &Path) -> Vec<SkillRef> {
                             refs.push(SkillRef {
                                 name: stem.to_string(),
                                 path,
+                                content: None,
                             });
                         }
                     }
@@ -533,8 +604,9 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
     for skill in skills {
         match skill.mode {
             SkillMode::Always => {
-                // Read the body from the SKILL.md file
-                if let Ok(content) = fs::read_to_string(&skill.path) {
+                // Read the body from the SKILL.md file (or inline for
+                // content-backed skills)
+                if let Ok(content) = read_skill_content(skill) {
                     let body = extract_body(&content);
                     result.push((skill.name.clone(), body.to_string()));
                 }
@@ -814,6 +886,7 @@ mod tests {
                 name: "rust-traits".to_string(),
                 description: "Explain Rust trait design".to_string(),
                 path: PathBuf::from("/tmp/skills/rust-traits/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -828,6 +901,7 @@ mod tests {
                 name: "python-api".to_string(),
                 description: "Python API patterns".to_string(),
                 path: PathBuf::from("/tmp/skills/python-api/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -915,6 +989,7 @@ mod tests {
                 name: "with-refs".to_string(),
                 description: "Has references".to_string(),
                 path: PathBuf::from("/tmp/skills/with-refs/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -923,10 +998,12 @@ mod tests {
                     SkillRef {
                         name: "api-spec".to_string(),
                         path: PathBuf::from("/tmp/skills/with-refs/refs/api-spec.md"),
+                        content: None,
                     },
                     SkillRef {
                         name: "examples".to_string(),
                         path: PathBuf::from("/tmp/skills/with-refs/refs/examples.txt"),
+                        content: None,
                     },
                 ],
                 params: vec![],
@@ -938,6 +1015,7 @@ mod tests {
                 name: "no-refs".to_string(),
                 description: "No references".to_string(),
                 path: PathBuf::from("/tmp/skills/no-refs/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1027,6 +1105,7 @@ mod tests {
                 name: "code-review".to_string(),
                 description: "Review code".to_string(),
                 path: PathBuf::from("/tmp/skills/code-review/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1052,6 +1131,7 @@ mod tests {
                 name: "simple".to_string(),
                 description: "No params".to_string(),
                 path: PathBuf::from("/tmp/skills/simple/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1154,6 +1234,7 @@ mod tests {
                 name: "with-scripts".to_string(),
                 description: "Has scripts".to_string(),
                 path: PathBuf::from("/tmp/skills/with-scripts/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1179,6 +1260,7 @@ mod tests {
                 name: "no-scripts".to_string(),
                 description: "No scripts".to_string(),
                 path: PathBuf::from("/tmp/skills/no-scripts/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1412,6 +1494,7 @@ mod tests {
                 name: "always-skill".to_string(),
                 description: "Always injected".to_string(),
                 path: PathBuf::from("/tmp/skills/always-skill/SKILL.md"),
+                body: None,
                 mode: SkillMode::Always,
                 triggers: vec![],
                 hint: String::new(),
@@ -1426,6 +1509,7 @@ mod tests {
                 name: "trigger-skill".to_string(),
                 description: "Trigger based".to_string(),
                 path: PathBuf::from("/tmp/skills/trigger-skill/SKILL.md"),
+                body: None,
                 mode: SkillMode::Trigger,
                 triggers: vec!["rust".to_string()],
                 hint: "trigger-skill: Trigger based".to_string(),
@@ -1440,6 +1524,7 @@ mod tests {
                 name: "manual-skill".to_string(),
                 description: "Manual only".to_string(),
                 path: PathBuf::from("/tmp/skills/manual-skill/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1498,6 +1583,7 @@ mod tests {
                 name: "with-sections".to_string(),
                 description: "Has sections".to_string(),
                 path: PathBuf::from("/tmp/skills/with-sections/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1521,6 +1607,7 @@ mod tests {
                 name: "no-sections".to_string(),
                 description: "No sections".to_string(),
                 path: PathBuf::from("/tmp/skills/no-sections/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1567,6 +1654,7 @@ mod tests {
             name: format!("skill-{i}"),
             description: desc,
             path: PathBuf::from(format!("/tmp/skills/skill-{i}/SKILL.md")),
+            body: None,
             mode: SkillMode::Manual,
             triggers: vec![],
             hint: String::new(),
@@ -2055,6 +2143,7 @@ mod tests {
             name: "arch-sync".into(),
             description: "sync docs".into(),
             path: PathBuf::from("/fake/arch-sync/SKILL.md"),
+            body: None,
             mode: SkillMode::Globs,
             triggers: vec![],
             hint: String::new(),
@@ -2114,5 +2203,100 @@ mod tests {
             found.iter().any(|s| s.name == "runme"),
             "chmod+x file without script ext must be included: {found:?}"
         );
+    }
+
+    // ---- content-backed skills (issue #64) ----
+
+    #[test]
+    fn skill_from_content_parses_frontmatter_and_sections() {
+        let skill = skill_from_content(
+            "order-service",
+            "---\nname: order-service\ndescription: Order API docs\nmode: always\n---\n\n## Overview\nUse the order API.\n\n## Auth\nBearer token.\n",
+        );
+        assert_eq!(skill.name, "order-service");
+        assert_eq!(skill.description, "Order API docs");
+        assert_eq!(skill.mode, SkillMode::Always);
+        assert!(skill.path.as_os_str().is_empty(), "no disk backing");
+        assert!(skill.body.is_some(), "content carried inline");
+        assert_eq!(skill.sections.len(), 2);
+        assert_eq!(skill.sections[0].name, "Overview");
+        assert_eq!(skill.sections[1].content, "Bearer token.");
+    }
+
+    #[test]
+    fn skill_from_content_falls_back_to_explicit_name() {
+        // No frontmatter: explicit name acts like the directory name would
+        // for a disk skill; description falls back to the first line.
+        let skill = skill_from_content("tenant-billing", "Billing how-to.\n\nDetails.");
+        assert_eq!(skill.name, "tenant-billing");
+        assert_eq!(skill.description, "Billing how-to.");
+        assert_eq!(skill.mode, SkillMode::Manual);
+    }
+
+    #[test]
+    fn read_skill_content_prefers_inline_body_over_disk() {
+        // `path` points at a file that must never be read — content wins.
+        let mut skill = skill_from_content("inline-skill", "Inline body.\n");
+        skill.path = PathBuf::from("/nonexistent/recursive-issue64/SKILL.md");
+        let content =
+            read_skill_content(&skill).expect("inline body must be returned without disk access");
+        assert_eq!(content, "Inline body.\n");
+    }
+
+    #[test]
+    fn read_skill_content_falls_back_to_disk_for_dir_skills() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("disk-skill");
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: disk-skill\n---\n\nDisk body.\n",
+        )
+        .unwrap();
+        let skill = &discover_skills(&[tmp.path().to_path_buf()])[0];
+        assert!(skill.body.is_none());
+        let content = read_skill_content(skill).expect("dir skill reads from disk");
+        assert!(content.contains("Disk body."));
+    }
+
+    #[test]
+    fn read_ref_content_prefers_inline_content_over_disk() {
+        let r = SkillRef {
+            name: "api-spec".to_string(),
+            path: PathBuf::from("/nonexistent/recursive-issue64/refs/api-spec.md"),
+            content: Some("Inline ref.".to_string()),
+        };
+        assert_eq!(
+            read_ref_content(&r).expect("inline ref must be returned without disk access"),
+            "Inline ref."
+        );
+    }
+
+    #[test]
+    fn skill_index_renders_content_backed_skills() {
+        let skills = vec![skill_from_content(
+            "order-service",
+            "---\nname: order-service\ndescription: Order API docs\n---\n\nBody.\n",
+        )];
+        let index = skill_index(&skills);
+        assert!(index.contains("order-service"), "name rendered: {index}");
+        assert!(
+            index.contains("Order API docs"),
+            "description rendered: {index}"
+        );
+    }
+
+    #[test]
+    fn skills_for_injection_always_uses_inline_body() {
+        // Always-mode content-backed skill injects from memory — no disk.
+        let mut skill = skill_from_content(
+            "always-inline",
+            "---\nname: always-inline\ndescription: Always docs\nmode: always\n---\n\nInline always body.\n",
+        );
+        skill.path = PathBuf::from("/nonexistent/recursive-issue64/SKILL.md");
+        let injected = skills_for_injection(&[skill], "anything");
+        assert_eq!(injected.len(), 1, "always skill must inject: {injected:?}");
+        assert_eq!(injected[0].0, "always-inline");
+        assert!(injected[0].1.contains("Inline always body."));
     }
 }

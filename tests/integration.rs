@@ -1510,6 +1510,7 @@ async fn load_skill_then_act_in_scripted_run() {
         name: "test-task".to_string(),
         description: "How to run Rust tests".to_string(),
         path: skill_dir.join("SKILL.md"),
+        body: None,
         mode: SkillMode::Manual,
         triggers: vec![],
         hint: String::new(),

@@ -12,7 +12,6 @@
 //! detected and skipped with a warning.
 
 use std::collections::HashSet;
-use std::fs;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,12 +91,13 @@ impl LoadSkill {
             let sub_deps = self.resolve_deps(dep_skill, visited, depth + 1)?;
             deps.extend(sub_deps);
 
-            // Read the dependency's body
-            let content = fs::read_to_string(&dep_skill.path).map_err(|e| Error::Tool {
-                name: "Skill".into(),
-                call_id: None,
-                message: format!("failed to read dependency '{}': {e}", dep_skill.name),
-            })?;
+            // Read the dependency's body (inline for content-backed skills)
+            let content =
+                crate::skills::read_skill_content(dep_skill).map_err(|e| Error::Tool {
+                    name: "Skill".into(),
+                    call_id: None,
+                    message: format!("failed to read dependency '{}': {e}", dep_skill.name),
+                })?;
 
             let body = content
                 .strip_prefix("---")
@@ -201,7 +201,7 @@ impl Tool for LoadSkill {
                     }
                 })?;
 
-            let content = fs::read_to_string(&skill_ref.path).map_err(|e| Error::Tool {
+            let content = crate::skills::read_ref_content(skill_ref).map_err(|e| Error::Tool {
                 name: "Skill".into(),
                 call_id: None,
                 message: format!("failed to read ref file: {e}"),
@@ -259,13 +259,14 @@ impl Tool for LoadSkill {
             // (e.g. `bash ${SKILL_DIR}/scripts/lint.sh`). Ref documents
             // are returned as-is and never receive this substitution —
             // they may legitimately contain literal `${...}` text.
-            let rendered = substitute_skill_dir(&rendered, skill);
+            let rendered = substitute_skill_dir(&rendered, skill)?;
 
             return Ok(rendered);
         }
 
         // No ref or section specified — return the main SKILL.md body
-        let content = fs::read_to_string(&skill.path).map_err(|e| Error::Tool {
+        // (inline for content-backed skills)
+        let content = crate::skills::read_skill_content(skill).map_err(|e| Error::Tool {
             name: "Skill".into(),
             call_id: None,
             message: format!("failed to read skill file: {e}"),
@@ -296,7 +297,7 @@ impl Tool for LoadSkill {
         // for the requested skill's body only. Dependency bodies are not
         // recursed into here — they will get their own substitution when
         // they are loaded by a future `Skill` call (do not recurse).
-        let rendered = substitute_skill_dir(&rendered, skill);
+        let rendered = substitute_skill_dir(&rendered, skill)?;
 
         // Resolve dependencies (if any)
         let mut visited = HashSet::new();
@@ -322,15 +323,20 @@ impl Tool for LoadSkill {
 /// absolute path of the directory containing the skill's SKILL.md.
 /// Trailing slashes are not added — authors write the slash after the
 /// placeholder (e.g. `${SKILL_DIR}/scripts/lint.sh`) so the resulting
-/// path is well-formed. If `skill.path` has no parent (degenerate case),
-/// the placeholders are left as-is (no panic).
+/// path is well-formed.
+///
+/// If `skill.path` has no parent (the content-backed case — see
+/// [`crate::skills::skill_from_content`]) and the text still references an
+/// unescaped placeholder, an error is returned: there is no local directory
+/// to substitute, and silently handing the model a literal `${SKILL_DIR}`
+/// would invite it to run a broken command.
 ///
 /// To include a literal `${SKILL_DIR}` in the body (e.g. when a skill
 /// documents the feature itself), prefix it with a backslash:
 /// `\${SKILL_DIR}` renders as the literal text `${SKILL_DIR}`. A lone
 /// backslash that is not followed by one of the two placeholders is
 /// preserved unchanged.
-fn substitute_skill_dir(content: &str, skill: &Skill) -> String {
+fn substitute_skill_dir(content: &str, skill: &Skill) -> Result<String> {
     const SKILL_DIR: &str = "${SKILL_DIR}";
     const RECURSIVE_SKILL_DIR: &str = "${RECURSIVE_SKILL_DIR}";
 
@@ -369,6 +375,19 @@ fn substitute_skill_dir(content: &str, skill: &Skill) -> String {
                 i += RECURSIVE_SKILL_DIR.len();
                 continue;
             }
+        } else if rest.starts_with(SKILL_DIR) || rest.starts_with(RECURSIVE_SKILL_DIR) {
+            // No local directory (content-backed skill) and the text wants
+            // one. Fail loudly instead of emitting a literal placeholder.
+            return Err(Error::Tool {
+                name: "Skill".into(),
+                call_id: None,
+                message: format!(
+                    "skill '{}' is content-backed (no local directory), so ${{SKILL_DIR}} \
+                     cannot be substituted; content-backed skills must not use ${{SKILL_DIR}} \
+                     or reference scripts/ files",
+                    skill.name
+                ),
+            });
         }
         // Copy one char (advancing to the next char boundary so multi-byte
         // sequences are preserved intact).
@@ -380,7 +399,7 @@ fn substitute_skill_dir(content: &str, skill: &Skill) -> String {
         out.push_str(&content[i..end]);
         i = end;
     }
-    out
+    Ok(out)
 }
 
 /// Resolve parameter values: use provided values, fall back to defaults,
@@ -439,6 +458,7 @@ fn resolve_params(
 mod tests {
     use super::*;
     use crate::skills::{SkillMode, SkillSection};
+    use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -1063,15 +1083,16 @@ mod tests {
 
     #[test]
     fn load_skill_no_skill_dir_when_path_has_no_parent() {
-        // Degenerate case: a Skill whose `path` has no parent (e.g. the
-        // filesystem root "/"). The substitution helper must return content
-        // unchanged rather than panic. We exercise the section-return path
-        // because it doesn't read `skill.path` from disk (so we can use a
-        // non-existent root path safely).
+        // No-parent path (content-backed skill, or the filesystem root "/").
+        // When the text still references ${SKILL_DIR} there is no directory
+        // to substitute — the tool must fail with a clear error rather than
+        // panic or hand the model a literal placeholder. We exercise the
+        // section-return path because it doesn't read `skill.path` from disk.
         let skill = Skill {
             name: "weird-skill".to_string(),
             description: "Skill with no parent path".to_string(),
             path: PathBuf::from("/"),
+            body: None,
             mode: SkillMode::Manual,
             triggers: vec![],
             hint: String::new(),
@@ -1092,9 +1113,120 @@ mod tests {
             .unwrap()
             .block_on(tool.execute(json!({"name": "weird-skill", "section": "Overview"})));
 
-        assert!(result.is_ok(), "should not panic: {result:?}");
-        // No parent → no substitution; content unchanged
-        assert_eq!(result.unwrap(), "Run bash ${SKILL_DIR}/scripts/lint.sh");
+        let err = result.expect_err("no local dir + ${SKILL_DIR} must error, not pass through");
+        assert!(
+            err.to_string().contains("${SKILL_DIR}"),
+            "error should mention the un-substitutable placeholder: {err}"
+        );
+    }
+
+    #[test]
+    fn load_skill_content_backed_body_without_disk() {
+        // A content-backed skill whose path points nowhere must load its
+        // full body (frontmatter stripped) purely from memory — issue #64.
+        let skill = crate::skills::skill_from_content(
+            "order-service",
+            "---\nname: order-service\ndescription: Order API docs\n---\n\n## Overview\nUse the order API.\n\n## Auth\nBearer token required.\n",
+        );
+        assert!(skill.path.as_os_str().is_empty());
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "order-service"})));
+
+        let body = result.expect("body-only skill must load without any file");
+        assert!(body.contains("Use the order API."));
+        assert!(
+            !body.contains("name: order-service"),
+            "frontmatter stripped"
+        );
+    }
+
+    #[test]
+    fn load_skill_content_backed_section_without_disk() {
+        let skill = crate::skills::skill_from_content(
+            "order-service",
+            "---\nname: order-service\ndescription: Order API docs\n---\n\n## Overview\nUse the order API.\n",
+        );
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "order-service", "section": "overview"})));
+
+        assert_eq!(
+            result.expect("section-only skill must load"),
+            "Use the order API."
+        );
+    }
+
+    #[test]
+    fn load_skill_content_backed_ref_without_disk() {
+        let mut skill = crate::skills::skill_from_content(
+            "order-service",
+            "---\nname: order-service\ndescription: Order API docs\n---\n\nBody.\n",
+        );
+        skill.refs.push(crate::skills::SkillRef {
+            name: "api-spec".to_string(),
+            path: PathBuf::new(),
+            content: Some("POST /orders {sku, qty}".to_string()),
+        });
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "order-service", "ref": "api-spec"})));
+
+        assert_eq!(
+            result.expect("content-backed ref must load without any file"),
+            "POST /orders {sku, qty}"
+        );
+    }
+
+    #[test]
+    fn load_skill_content_backed_dependency_without_disk() {
+        // depends_on where both provider and dependency are content-backed —
+        // the dependency body must come from memory, not `dep.path`.
+        let dep = crate::skills::skill_from_content(
+            "base-auth",
+            "---\nname: base-auth\ndescription: Auth basics\n---\n\nAuth body.\n",
+        );
+        let skill = crate::skills::skill_from_content(
+            "order-service",
+            "---\nname: order-service\ndescription: Order API docs\ndepends_on: base-auth\n---\n\nOrder body.\n",
+        );
+        let tool = LoadSkill::new(vec![dep, skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "order-service"})));
+
+        let out = result.expect("content-backed dependency must load without any file");
+        assert!(out.contains("=== Dependency: base-auth ==="));
+        assert!(out.contains("Auth body."));
+        assert!(out.contains("Order body."));
+    }
+
+    #[test]
+    fn load_skill_content_backed_skill_dir_placeholder_errors() {
+        // Content-backed skills have no local directory: an unescaped
+        // ${SKILL_DIR} in the body must produce a clear error (issue #64).
+        let skill = crate::skills::skill_from_content(
+            "remote-skill",
+            "---\nname: remote-skill\ndescription: Remote docs\n---\n\nRun bash ${SKILL_DIR}/scripts/lint.sh\n",
+        );
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "remote-skill"})));
+
+        let err = result.expect_err("${SKILL_DIR} must error for content-backed skills");
+        assert!(
+            err.to_string().contains("content-backed"),
+            "error should explain the content-backed restriction: {err}"
+        );
     }
 
     #[test]
@@ -1385,6 +1517,7 @@ mod tests {
                 name: "with-deps".to_string(),
                 description: "Has dependencies".to_string(),
                 path: PathBuf::from("/tmp/skills/with-deps/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),
@@ -1399,6 +1532,7 @@ mod tests {
                 name: "no-deps".to_string(),
                 description: "No dependencies".to_string(),
                 path: PathBuf::from("/tmp/skills/no-deps/SKILL.md"),
+                body: None,
                 mode: SkillMode::Manual,
                 triggers: vec![],
                 hint: String::new(),

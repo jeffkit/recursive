@@ -1226,6 +1226,7 @@ fn runtime_builder_skills_stores_skills_list() {
         name: "my-skill".to_string(),
         description: "A test skill".to_string(),
         path: std::path::PathBuf::from("/tmp/my-skill/SKILL.md"),
+        body: None,
         mode: SkillMode::Always,
         triggers: vec![],
         hint: String::new(),
