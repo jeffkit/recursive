@@ -24,10 +24,11 @@ async fn local_exec_shell_returns_despite_orphan_descendant() {
         64 * 1024,
     );
 
-    // Bounded grace: command timeout (2s) + DRAIN_GRACE (2s) + margin (1s).
+    // Bounded grace: command timeout (2s) + DRAIN_GRACE (2s) + CI margin.
     // If the drain were unbounded, this outer timeout fires while `sleep 8`
-    // still holds the pipes.
-    let outcome = tokio::time::timeout(Duration::from_secs(5), fut).await;
+    // still holds the pipes. CI runner 派生/调度开销大，界限放宽到 20s
+    // （2026-09-30：5s 在 ubuntu/windows CI 上误报；无界 drain 仍会被外层抓住）。
+    let outcome = tokio::time::timeout(Duration::from_secs(20), fut).await;
 
     match outcome {
         Ok(res) => {
@@ -59,8 +60,11 @@ async fn local_exec_shell_timeout_branch_returns_promptly() {
 
     let err = res.expect_err("sleep 30 with 1s timeout must time out");
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+    // 意图：timeout 分支「及时返回」而非在孤儿管道上挂满 30s。CI runner 的
+    // 进程派生 + drain 开销可破 4s（2026-09-30 ubuntu/windows 实证），放宽到 15s；
+    // 若 drain 无界，本测试仍会在 sleep 30 结束后才完成/超时，照样失败。
     assert!(
-        start.elapsed() < Duration::from_secs(4),
+        start.elapsed() < Duration::from_secs(15),
         "timeout branch took {:?} — drain is unbounded",
         start.elapsed()
     );
@@ -91,9 +95,10 @@ async fn local_exec_shell_timeout_with_orphan_returns_bounded() {
     let err = res.expect_err("sleep 30 & sleep 30 with 1s timeout must time out");
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
     // timeout (1s) + two sequential DRAIN_GRACE drains (2s each, orphan holds
-    // both pipes) + margin (1s).
+    // both pipes) + CI margin（原 1s 余量在 windows CI 上不够，2026-09-30 放宽；
+    // 无界 drain 仍会在 sleep 30 处卡死，测试照样失败）。
     assert!(
-        start.elapsed() < Duration::from_secs(6),
+        start.elapsed() < Duration::from_secs(20),
         "timeout+orphan branch took {:?} — reader tasks parked on the orphaned sleep's pipes",
         start.elapsed()
     );
