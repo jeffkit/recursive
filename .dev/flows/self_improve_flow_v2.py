@@ -197,27 +197,28 @@ def self_improve_v2(INPUT):
         "source files you need to cross-check claims.\n"
         "Review for correctness, regressions and contract violations.\n"
         'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
-    rev = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                   timeout_secs=3600)
-    if F.contains(rev.text, "VERDICT:PASS") != True:
-        if F.contains(rev.text, "VERDICT:NEEDS_FIX") != True:
+    # 节点 id 按赋值名派生且全局唯一（跨分支也算重复，64dfd7d/61294d0 两次实证）——
+    # 评审段赋值名一律带序号：rev1/rev2/wfr/wfr2。
+    rev1 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
+                    timeout_secs=3600)
+    if F.contains(rev1.text, "VERDICT:PASS") != True:
+        if F.contains(rev1.text, "VERDICT:NEEDS_FIX") != True:
             wfr = WRITEFILE(path=F.concat(run_dir, "/review-unavailable.log"),
-                            content=rev.text)
+                            content=rev1.text)
             return {"verdict": "failed-preserved", "stage": "review",
                     "why": "reviewer UNAVAILABLE (no VERDICT line)"}
         fix_prompt = F.concat(
             "An independent reviewer rejected this change with NEEDS_FIX. ",
             "Address every issue below. Do not regress passing checks.",
-            "\n\n--- reviewer feedback ---\n", rev.text)
+            "\n\n--- reviewer feedback ---\n", rev1.text)
         AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
-        rev = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                       timeout_secs=3600)
-    if F.contains(rev.text, "VERDICT:PASS") != True:
-        # 变量名不可与上面 wfr 重复——DSL 节点 id 按赋值名派生（跨分支也算重复）
-        wfr2 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
-                         content=rev.text)
-        return {"verdict": "failed-preserved", "stage": "review",
-                "why": "review did not pass after one fix round"}
+        rev2 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
+                        timeout_secs=3600)
+        if F.contains(rev2.text, "VERDICT:PASS") != True:
+            wfr2 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
+                             content=rev2.text)
+            return {"verdict": "failed-preserved", "stage": "review",
+                    "why": "review did not pass after one fix round"}
 
     # ── 落地：GIT_PUBLISH（幂等 commit + main 模式 ff 推送）──
     pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name="self-improve",
