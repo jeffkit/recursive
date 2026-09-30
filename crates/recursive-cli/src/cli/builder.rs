@@ -244,6 +244,15 @@ pub(crate) async fn build_tools(
     if !skills.is_empty() {
         registry = registry.register(Arc::new(LoadSkill::new(skills)));
     }
+    // Issue #63: registry-bound business-API tool. Only registered when an
+    // endpoints config exists (`<workspace>/.recursive/endpoints.json` or
+    // `RECURSIVE_ENDPOINTS_FILE`) — absent config leaves the tool surface
+    // unchanged. The `RECURSIVE_ALLOW_TOOLS` allow-list is applied later as
+    // the last assembly step (issue #65), so `HttpCall` narrows like any
+    // other tool.
+    if let Some(endpoints) = recursive::tools::EndpointRegistry::discover(root) {
+        registry = registry.register(Arc::new(recursive::tools::HttpCall::new(endpoints)));
+    }
     // Note: read-only checkpoint tools (checkpoint_list / checkpoint_diff)
     // are registered by the runtime when a session id is known, since
     // they must be scoped to the current session's checkpoint chain.
