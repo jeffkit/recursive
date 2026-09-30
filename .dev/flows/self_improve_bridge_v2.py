@@ -122,30 +122,23 @@ def main() -> int:
     st["verdict"] = verdict
     st["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))
-    # 成功终态回收 worktree（冷 target 可达 8-12G/run）——但必须先确认工作已上
-    # origin（okguitar 2026-10-01 建议）：committed 时 worktree HEAD 必须是
-    # origin/main 的祖先（GIT_PUBLISH merge_mode=main 已推）、skip-commit 本就
-    # 无改动直接放行。确认失败/网络异常 → 保留现场并在 verdict 里注明，
-    # 宁可多占 10G 也不冒险丢一轮 agent 的工作。
-    if verdict.get("verdict") in ("committed", "skip-commit"):
-        wt = run_dir / "worktree"
-        safe = True
-        if verdict.get("verdict") == "committed" and wt.is_dir():
-            head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
-                                  capture_output=True, text=True).stdout.strip()
-            subprocess.run(["git", "-C", str(wt), "fetch", "origin", "main", "--quiet"],
-                           capture_output=True, text=True, timeout=120)
-            anc = subprocess.run(
-                ["git", "-C", str(wt), "merge-base", "--is-ancestor", head, "origin/main"],
-                capture_output=True, text=True)
-            if anc.returncode != 0:
-                safe = False
-                verdict["note"] = (str(verdict.get("note") or "")
-                                   + " [worktree 保留：HEAD 未确认已在 origin/main]")
-        if safe:
-            shutil.rmtree(wt, ignore_errors=True)
-    print(json.dumps(verdict, ensure_ascii=False))
-    return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
+    # 终态统一回收（2026-10-01，替代仅成功终态回收版）：所有终态先做 WIP 快照
+    # （未提交改动 commit 到本地分支 wip-<run目录名>，提交对象进主仓共享库、
+    # 分支引用保可达），再删 worktree。每 run 的 worktree+冷 target 可达 8-12G，
+    # failed-preserved 现场堆积曾把根盘拖到 11-13G 触守卫、整批 preflight 被拦；
+    # 快照后 diff/日志都在 run_dir 与分支里，现场本体不再有保留价值。
+    # 事故教训（#59）：回收前必须确认 run 已终态——本函数仅在 flow 返回终态后
+    # 由 bridge 调用，天然满足；外部手工清理必须先核对 keeper 工件锁与台账。
+    wt = run_dir / "worktree"
+    if wt.is_dir():
+        wip_branch = f"wip-{run_dir.name}"
+        subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True, timeout=120)
+        subprocess.run(["git", "-C", str(wt), "commit", "-m",
+                        f"WIP: {run_dir.name} (terminal {verdict.get('verdict')})"],
+                       capture_output=True, timeout=120)
+        subprocess.run(["git", "-C", str(wt), "branch", "-f", wip_branch],
+                       capture_output=True, timeout=30)
+        shutil.rmtree(wt, ignore_errors=True)
     print(json.dumps(verdict, ensure_ascii=False))
     return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
 
