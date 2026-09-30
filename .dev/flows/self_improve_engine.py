@@ -1122,14 +1122,16 @@ def step_commit_prep(st: Engine) -> None:
         except Exception:
             pass
     sh(["git", "add", "-A"], cwd=worktree)
-    if not worktree_dirty(worktree):
+    empty = not worktree_dirty(worktree)
+    if empty:
         st.finish({"empty": True})
         return
     sh(["git", "commit", "-m", f"wt: {subject}"], cwd=worktree)
     wt_sha = git(["rev-parse", "HEAD"], worktree)
     main_head = git(["rev-parse", "HEAD"], st.repo)
     st.state["commitPrep"] = {"wtSha": wt_sha, "mainHead": main_head,
-                              "mainMoved": main_head != st.state["baseline"]}
+                              "mainMoved": main_head != st.state["baseline"],
+                              "empty": False}
     st.save()
     st.finish(st.state["commitPrep"])
 
