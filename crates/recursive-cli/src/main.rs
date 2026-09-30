@@ -752,6 +752,17 @@ async fn main() -> anyhow::Result<()> {
             config.max_steps = http_max_steps;
             config.wall_timeout_secs = http_wall_timeout_secs;
             let (tools, _) = cli::builder::build_tools(&config, None).await;
+            // Issues #70 / #65: HTTP is an agent-loop channel like run/loop,
+            // so it must go through the same cross-cutting surface wiring —
+            // MCP registration, touched-files collector, coordinator pruning.
+            // Skipping any of these made `recursive http` silently drift: no
+            // `mcp__*` business tools (#70) and RECURSIVE_ALLOW_TOOLS ignored
+            // (#65). Elicitation stays `None`: headless HTTP has no host to
+            // answer elicitation requests, so `UrlElicitationRequired`
+            // surfaces as a tool error instead of blocking forever.
+            let tools =
+                cli::builder::finish_tool_surface(tools, &config, cli.mcp_config.clone(), None)
+                    .await;
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
             let retry = RetryPolicy {
@@ -768,7 +779,7 @@ async fn main() -> anyhow::Result<()> {
             // Wrapped in a one-shot filled slot (never refreshed — the token
             // is server-lifetime), preserving static-token semantics.
             let http_shutdown = shutdown_signal();
-            let tools = recursive::register_subagent_if_enabled(
+            let mut tools = recursive::register_subagent_if_enabled(
                 tools,
                 &config,
                 provider.clone(),
@@ -776,6 +787,11 @@ async fn main() -> anyhow::Result<()> {
                     http_shutdown.clone(),
                 )))),
             );
+            // Issue #65: the operator allow-list is the last word — applied
+            // after sub-agent registration so /tools is exactly the allowed
+            // set (sub-agent tools register post-prune and would otherwise
+            // escape it).
+            cli::builder::apply_operator_allow_list(&mut tools, &config);
             let tool_infos: Vec<recursive::http::ToolInfo> = tools
                 .specs()
                 .into_iter()
@@ -2077,9 +2093,9 @@ async fn run_loop(
     cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation))
         .await;
     tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot.clone())));
-    if !config.allow_tools.is_empty() {
-        tools.retain_tools(&config.allow_tools);
-    }
+    // The operator allow-list is NOT applied here — it is applied once, as
+    // the last assembly step, after sub-agent registration (issue #65), so
+    // the advertised surface is exactly the allowed set.
 
     // Build LLM provider
     let api_key = config.require_api_key()?;
@@ -2101,6 +2117,11 @@ async fn run_loop(
             shutdown.clone(),
         )))),
     );
+    // Issue #65: the operator allow-list is the last word — applied after
+    // sub-agent registration so the loop's surface is exactly the allowed set
+    // (previously the early retain ran before `agent`/`send_message`/
+    // `list_workers` registered, letting them escape the list).
+    cli::builder::apply_operator_allow_list(&mut tools, &config);
     let skills = cli::builder::discover_loaded_skills(&config);
     let assembled = recursive::assemble_system_prompt(
         &config.system_prompt,

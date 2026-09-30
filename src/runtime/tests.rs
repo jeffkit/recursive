@@ -1773,6 +1773,73 @@ async fn set_event_sink_reregisters_todo_write_tool() {
     );
 }
 
+/// Issue #65: `set_event_sink` re-points the sink-dependent tools that are
+/// present — it must not re-introduce tools a surface filter dropped.
+/// HTTP/CLI sessions call `set_event_sink` right after build, so an
+/// allow-list without TodoWrite would otherwise be silently undone on the
+/// first session.
+#[tokio::test]
+async fn set_event_sink_respects_a_filtered_todo_write() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let mut filtered = crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30);
+    filtered.retain_tools(&["Read".to_string()]);
+
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .tools(filtered)
+        .build()
+        .expect("build() with a filtered registry must succeed");
+    assert!(rt.kernel.tools().find_by_name("TodoWrite").is_none());
+
+    let (new_sink, _rx) = crate::event::ChannelSink::new();
+    rt.set_event_sink(Arc::new(new_sink));
+
+    assert!(
+        rt.kernel.tools().find_by_name("TodoWrite").is_none(),
+        "set_event_sink must not re-add a TodoWrite removed by the allow-list"
+    );
+    assert!(
+        rt.kernel.tools().find_by_name("Read").is_some(),
+        "allow-listed tools are untouched by the sink swap"
+    );
+}
+
+/// Issue #65, interactive variant: an explicitly filtered registry with
+/// `with_plan_mode_tools(true)` keeps the plan tools out, and the subsequent
+/// `set_event_sink` does not sneak `exit_plan_mode` back in (interactive
+/// hosts swap sinks right after build).
+#[tokio::test]
+async fn set_event_sink_respects_a_filtered_exit_plan_mode() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let mut filtered = crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30);
+    filtered.retain_tools(&["Read".to_string()]);
+
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .tools(filtered)
+        .with_plan_mode_tools(true)
+        .build()
+        .expect("build() with a filtered registry must succeed");
+    assert!(
+        rt.kernel
+            .tools()
+            .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+            .is_none(),
+        "a filtered surface stays strict through build even with plan tools enabled"
+    );
+
+    let (new_sink, _rx) = crate::event::ChannelSink::new();
+    rt.set_event_sink(Arc::new(new_sink));
+
+    assert!(
+        rt.kernel
+            .tools()
+            .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+            .is_none(),
+        "set_event_sink must not re-add a plan tool the filter dropped"
+    );
+}
+
 // ── is_context_window_exceeded ──────────────────────────────────────────
 
 #[test]

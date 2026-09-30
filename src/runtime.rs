@@ -927,22 +927,36 @@ impl AgentRuntime {
         self.event_sink = sink.clone();
         // Goal-167: re-register TodoWriteTool with the new sink so that
         // AgentEvent::TodoUpdated reaches the new consumer (e.g. TUI).
-        self.kernel
-            .tools_mut()
-            .register_mut(Arc::new(TodoWriteTool::new(
-                self.todo_list.clone(),
-                sink.clone(),
-            )));
+        // Issue #65: only when the tool is actually in the registry — a
+        // surface filter (operator allow-list) that dropped TodoWrite must
+        // not be silently undone by a per-session/per-turn sink swap, which
+        // is exactly when HTTP/CLI sessions call this.
+        if self.kernel.tools().find_by_name("TodoWrite").is_some() {
+            self.kernel
+                .tools_mut()
+                .register_mut(Arc::new(TodoWriteTool::new(
+                    self.todo_list.clone(),
+                    sink.clone(),
+                )));
+        }
         // Goal-165: re-register ExitPlanModeTool with the new sink so that
         // AgentEvent::PlanProposed reaches the new consumer (e.g. TUI).
         // Issue #47④: hosts that opt in (REPL) get a bounded approval wait
         // so an unanswered plan review cannot park the turn forever; TUI /
         // SDK hosts keep the default wait-forever semantics.
-        let mut tool = ExitPlanModeTool::new(self.plan_approval_gate.clone(), sink);
-        if let Some(secs) = self.approval_wait_timeout_secs {
-            tool = tool.with_approval_wait_timeout(std::time::Duration::from_secs(secs));
+        // Issue #65: same presence guard — re-point, never re-introduce.
+        if self
+            .kernel
+            .tools()
+            .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+            .is_some()
+        {
+            let mut tool = ExitPlanModeTool::new(self.plan_approval_gate.clone(), sink);
+            if let Some(secs) = self.approval_wait_timeout_secs {
+                tool = tool.with_approval_wait_timeout(std::time::Duration::from_secs(secs));
+            }
+            self.kernel.tools_mut().register_mut(Arc::new(tool));
         }
-        self.kernel.tools_mut().register_mut(Arc::new(tool));
     }
 
     /// Enable a bounded approval wait for `exit_plan_mode` when the event

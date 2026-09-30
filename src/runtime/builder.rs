@@ -326,11 +326,24 @@ impl AgentRuntimeBuilder {
 
         // Goal-167: create the shared todo list and register a properly-sinked
         // TodoWriteTool, overriding the NullSink version from build_standard_tools.
+        //
+        // Issue #65: skip the re-register only when a surface filter
+        // deliberately dropped TodoWrite — `retain_tools` marks the registry
+        // (`surface_filtered`), so "placeholder present" or "never filtered"
+        // both keep the legacy always-registered behavior (default
+        // `AgentRuntime::builder()` runtimes carry an EMPTY local registry,
+        // not a filtered one), while an operator allow-list without TodoWrite
+        // stays strict through build. The `todo_list` arc is still created
+        // unconditionally: compaction's PlanTodoReinjector and
+        // `AgentRuntime::todo_list` share it regardless of tool presence.
         let todo_list = Arc::new(RwLock::new(Vec::<TodoItem>::new()));
-        kernel.tools_mut().register_mut(Arc::new(TodoWriteTool::new(
-            todo_list.clone(),
-            event_sink.clone(),
-        )));
+        if kernel.tools().find_by_name("TodoWrite").is_some() || !kernel.tools().surface_filtered()
+        {
+            kernel.tools_mut().register_mut(Arc::new(TodoWriteTool::new(
+                todo_list.clone(),
+                event_sink.clone(),
+            )));
+        }
 
         // Goal-165 / Goal-202: plan mode tools block waiting for human approval
         // via the gate. They must only be registered when a live interactive
@@ -339,7 +352,11 @@ impl AgentRuntimeBuilder {
         // so the model never sees these tools and cannot trigger a deadlock.
         let plan_approval_gate = Arc::new(PlanApprovalGate::new());
         let plan_mode_request_gate = Arc::new(PlanModeRequestGate::new());
-        if self.with_plan_mode_tools {
+        // Issue #65: `with_plan_mode_tools` may only ADD to a surface that
+        // was never explicitly filtered — a `retain_tools` allow-list
+        // (operator or coordinator prune) that dropped the plan tools stays
+        // strict even on interactive channels.
+        if self.with_plan_mode_tools && !kernel.tools().surface_filtered() {
             let permissions_arc = kernel.tools().permissions_config().map(Arc::new);
             kernel.tools_mut().register_mut({
                 let mut tool = EnterPlanModeTool::new(plan_approval_gate.clone());
@@ -458,6 +475,60 @@ mod tests {
         assert!(rt.transcript.is_empty());
         assert!(!rt.checkpoints.enabled());
         assert_eq!(rt.goal_eval_transcript_tail, 12);
+    }
+
+    /// Issue #65: `build()` must not re-add TodoWrite when the caller's
+    /// registry deliberately excluded it (operator allow-list) — but the
+    /// legacy always-registered behavior stays for the default path, whose
+    /// registry is EMPTY (`ToolRegistry::local()`), not filtered. The
+    /// `retain_tools` marker (`surface_filtered`) separates the two.
+    #[test]
+    fn build_does_not_reinject_a_filtered_todo_write() {
+        // Default path (no explicit registry): empty local registry, never
+        // filtered → TodoWrite is registered as before (P0-2 contract).
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .build()
+            .expect("build() with the default registry must succeed");
+        assert!(
+            rt.kernel.tools().find_by_name("TodoWrite").is_some(),
+            "default-path runtimes keep TodoWrite"
+        );
+
+        // Explicit unfiltered registry: the NullSink placeholder is replaced
+        // by the properly-sinked tool — name still present.
+        let std_registry = crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30);
+        assert!(
+            std_registry.find_by_name("TodoWrite").is_some(),
+            "fixture needs the unfiltered registry to carry TodoWrite"
+        );
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(std_registry)
+            .build()
+            .expect("build() with a standard registry must succeed");
+        assert!(
+            rt.kernel.tools().find_by_name("TodoWrite").is_some(),
+            "unfiltered registries keep TodoWrite"
+        );
+
+        // Filtered (RECURSIVE_ALLOW_TOOLS without TodoWrite): build() must
+        // NOT sneak it back in.
+        let mut filtered = crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30);
+        filtered.retain_tools(&["Read".to_string()]);
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(filtered)
+            .build()
+            .expect("build() with a filtered registry must succeed");
+        assert!(
+            rt.kernel.tools().find_by_name("TodoWrite").is_none(),
+            "a TodoWrite filtered out by the allow-list must not be re-added at build time"
+        );
+        assert!(
+            rt.kernel.tools().find_by_name("Read").is_some(),
+            "allow-listed tools survive the build"
+        );
     }
 
     #[test]

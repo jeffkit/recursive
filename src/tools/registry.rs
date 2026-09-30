@@ -204,6 +204,12 @@ pub struct ToolRegistry {
     /// registry level so `destroy_environment` can drain it wherever the
     /// registry went. Empty (unused) for empty `new()`/`local()` registries.
     pub(crate) bg_manager: Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>,
+    /// Issue #65: set by [`Self::retain_tools`] — an explicit surface
+    /// decision happened (operator allow-list / coordinator prune). Lets
+    /// `AgentRuntimeBuilder::build` distinguish "registry never had
+    /// TodoWrite because it's the default empty/local one" (safe to add the
+    /// real tool) from "a filter deliberately dropped it" (must stay strict).
+    surface_filtered: bool,
 }
 
 impl Default for ToolRegistry {
@@ -233,6 +239,7 @@ impl ToolRegistry {
             bg_manager: Arc::new(tokio::sync::Mutex::new(
                 super::run_background::BackgroundJobManager::new(),
             )),
+            surface_filtered: false,
         }
     }
 
@@ -275,6 +282,8 @@ impl ToolRegistry {
             hook_runner: self.hook_runner.clone(),
             // Issue #31: empty registry, same session manager (Clone shares).
             bg_manager: self.bg_manager.clone(),
+            // Fresh empty registry — any later filter marks it itself.
+            surface_filtered: false,
         }
     }
 
@@ -372,6 +381,8 @@ impl ToolRegistry {
             auto_classifier: self.auto_classifier.clone(),
             // Fresh manager built above via `state.bg_manager` semantics.
             bg_manager: state.bg_manager.clone(),
+            // Session forks inherit the surface contract (issue #65).
+            surface_filtered: self.surface_filtered,
         }
     }
 
@@ -696,6 +707,10 @@ impl ToolRegistry {
     /// Tool names are matched case-insensitively. Aliases for removed tools
     /// are also dropped. Used by `--allow-tools` to give agents a limited
     /// tool set (e.g. read-only review agents).
+    ///
+    /// Marks the registry as explicitly filtered (see
+    /// [`Self::surface_filtered`]) so downstream assembly steps don't
+    /// re-add tools the operator removed.
     pub fn retain_tools(&mut self, allow: &[String]) {
         let allowed: std::collections::HashSet<String> =
             allow.iter().map(|n| n.to_lowercase()).collect();
@@ -703,6 +718,14 @@ impl ToolRegistry {
             .retain(|name, _| allowed.contains(&name.to_lowercase()));
         self.aliases
             .retain(|_, primary| self.tools.contains_key(primary));
+        self.surface_filtered = true;
+    }
+
+    /// Whether an explicit surface filter (`retain_tools`) ran on this
+    /// registry. `true` means a missing tool was removed on purpose, not
+    /// merely never registered.
+    pub(crate) fn surface_filtered(&self) -> bool {
+        self.surface_filtered
     }
 
     /// Split the registry's tools into eager and deferred partitions.
@@ -1211,6 +1234,40 @@ mod tests {
     #[test]
     fn names_empty_on_fresh_registry() {
         assert!(make_registry().names().is_empty());
+    }
+
+    /// Issue #65: `retain_tools` marks the registry as explicitly filtered so
+    /// `AgentRuntimeBuilder::build` can tell "dropped on purpose" from
+    /// "default registry that simply never had the tool". Fresh and cloned
+    /// registries carry the flag; only a `retain_tools` call sets it.
+    #[test]
+    fn retain_tools_marks_surface_filtered() {
+        let mut reg = make_registry().register(Arc::new(ReadOnlyTool { name: "Alpha" }));
+        assert!(!reg.surface_filtered(), "fresh registry is not filtered");
+
+        let clone = reg.clone();
+        assert!(
+            !clone.surface_filtered(),
+            "clone of unfiltered stays unfiltered"
+        );
+
+        reg.retain_tools(&["Alpha".to_string()]);
+        assert!(
+            reg.surface_filtered(),
+            "retain_tools marks the surface filtered"
+        );
+        assert!(
+            reg.clone().surface_filtered(),
+            "the flag survives Clone (session registries inherit it)"
+        );
+
+        let mut empty_allow = make_registry().register(Arc::new(ReadOnlyTool { name: "Alpha" }));
+        empty_allow.retain_tools(&[]);
+        assert!(empty_allow.surface_filtered());
+        assert!(
+            empty_allow.names().is_empty(),
+            "empty allow-list drops everything"
+        );
     }
 
     #[test]
