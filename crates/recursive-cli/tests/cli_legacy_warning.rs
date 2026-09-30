@@ -44,7 +44,9 @@ fn run(workspace: &Path, args: &[&str]) -> Output {
 }
 
 fn stderr_of(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).to_string()
+    // windows 的警告里路径是反斜杠（.recursive\sessions）；归一成正斜杠，
+    // 让下面的 contains 断言跨平台成立（2026-09-30 CI 实证）。
+    String::from_utf8_lossy(&out.stderr).to_string().replace('\\', "/")
 }
 
 #[test]
