@@ -17,6 +17,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -33,14 +34,36 @@ use crate::tools::{Tool, ToolSideEffect};
 ///
 /// The coordinator pushes messages here; the worker's kernel drains them
 /// between steps.
+///
+/// The queue alone carries no "peer is gone" signal (a `VecDeque` behind a
+/// mutex has no close state), so a `done` flag travels alongside it: the
+/// worker (or, on the abort path, the parallel aggregator) flips it at the
+/// worker's terminal state, and `WorkerRegistry::register` uses it to sweep
+/// stale entries (goal-408). `Clone` shares the flag (and the queue), so every
+/// handle to the same mailbox observes the same liveness bit.
 #[derive(Clone, Default)]
 pub struct WorkerMailbox {
     queue: Arc<tokio::sync::Mutex<VecDeque<String>>>,
+    done: Arc<AtomicBool>,
 }
 
 impl WorkerMailbox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark this worker as finished (normal exit, cut-off, or abort).
+    ///
+    /// Only an `AtomicBool::store`, so it is safe to call from a `Drop` guard
+    /// and is idempotent — a mailbox may be marked by both the worker's own
+    /// exit guard and the parallel aggregator that aborted it.
+    pub fn mark_done(&self) {
+        self.done.store(true, Ordering::Release);
+    }
+
+    /// Whether this worker has reached a terminal state.
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
     }
 
     /// Push a message into the mailbox.
@@ -85,12 +108,18 @@ impl WorkerRegistry {
     }
 
     /// Register a new worker and return its mailbox.
+    ///
+    /// While holding the write lock this also sweeps entries whose mailbox is
+    /// already marked done: `deregister_sync` hands off to `try_write` and
+    /// gives up on contention (Drop context — no waiting allowed), so a
+    /// finished worker's entry can linger until the next registration. The
+    /// sweep runs here rather than on a timer so the registry self-heals
+    /// lazily, with zero standing cost (goal-408).
     pub async fn register(&self, worker_id: &str) -> WorkerMailbox {
         let mailbox = WorkerMailbox::new();
-        self.inner
-            .write()
-            .await
-            .insert(worker_id.to_string(), mailbox.clone());
+        let mut guard = self.inner.write().await;
+        guard.retain(|_, existing| !existing.is_done());
+        guard.insert(worker_id.to_string(), mailbox.clone());
         mailbox
     }
 
@@ -102,8 +131,9 @@ impl WorkerRegistry {
     /// Synchronous deregister for use from `Drop` (e.g. the parallel-mode
     /// abort path of issue #40, where the async deregister after the run
     /// would be skipped by the task abort). Uses `try_write`; on contention
-    /// the entry is removed by a later sweep — acceptable because the table
-    /// is best-effort presence info.
+    /// the entry is left behind, and is swept by the next
+    /// [`WorkerRegistry::register`] (it must be marked done for that to
+    /// happen) — acceptable because the table is best-effort presence info.
     pub fn deregister_sync(&self, worker_id: &str) {
         if let Ok(mut guard) = self.inner.try_write() {
             guard.remove(worker_id);
@@ -428,6 +458,106 @@ mod tests {
         reg.register("w1").await;
         reg.deregister("w1").await;
         assert!(reg.get("w1").await.is_none());
+    }
+
+    // ── goal-408: alive flag + lazy sweep ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_sweeps_done_entries() {
+        // The registry self-heals: a finished worker's entry is dropped by the
+        // next `register`, so a stale id never looks live to `send_message` /
+        // `list_workers`.
+        let reg = WorkerRegistry::new();
+        let a = reg.register("worker-a").await;
+        assert!(!a.is_done(), "a freshly registered mailbox is alive");
+        a.mark_done();
+
+        let b = reg.register("worker-b").await;
+
+        assert!(
+            reg.get("worker-a").await.is_none(),
+            "done entry 'worker-a' must be swept by the next register"
+        );
+        assert!(
+            reg.get("worker-b").await.is_some(),
+            "the newly registered worker must survive the sweep"
+        );
+        assert!(!b.is_done(), "the new mailbox must start alive");
+    }
+
+    #[tokio::test]
+    async fn register_does_not_sweep_live_entries() {
+        // The sweep must key on the done flag only — live workers are kept.
+        let reg = WorkerRegistry::new();
+        reg.register("alive-1").await;
+        reg.register("alive-2").await;
+        reg.register("alive-3").await;
+
+        let mut active = reg.active_workers().await;
+        active.sort_unstable();
+        assert_eq!(
+            active,
+            vec![
+                "alive-1".to_string(),
+                "alive-2".to_string(),
+                "alive-3".to_string()
+            ],
+            "live entries must not be swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_sweeps_entry_marked_through_registry_clone() {
+        // The done flag is shared by `Clone` (queue + Arc<AtomicBool>), so
+        // marking the mailbox obtained from `get` marks the registered entry.
+        let reg = WorkerRegistry::new();
+        reg.register("ghost").await;
+        let handle = reg.get("ghost").await.expect("registered");
+        handle.mark_done();
+
+        reg.register("fresh").await;
+
+        assert!(
+            reg.get("ghost").await.is_none(),
+            "entry marked done via a registry-obtained clone must be swept"
+        );
+        assert!(reg.get("fresh").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn deregister_sync_removes_entry_without_marking_done() {
+        // The Drop-context fast path still removes outright (no sweep needed).
+        let reg = WorkerRegistry::new();
+        let mb = reg.register("w-sync").await;
+        assert!(!mb.is_done());
+
+        reg.deregister_sync("w-sync");
+
+        assert!(
+            reg.get("w-sync").await.is_none(),
+            "deregister_sync must remove the entry on the uncontended path"
+        );
+        assert!(
+            !mb.is_done(),
+            "deregister_sync removes the entry; it must not flip the alive flag"
+        );
+    }
+
+    #[test]
+    fn mailbox_done_flag_is_shared_and_defaults_alive() {
+        let mb = WorkerMailbox::new();
+        let clone = mb.clone();
+        assert!(!mb.is_done(), "a new mailbox starts alive");
+        assert!(!clone.is_done());
+
+        clone.mark_done();
+
+        assert!(mb.is_done(), "Clone must share the done flag");
+        assert!(clone.is_done());
+        assert!(
+            !WorkerMailbox::new().is_done(),
+            "marking one mailbox must not affect an unrelated one"
+        );
     }
 
     #[tokio::test]

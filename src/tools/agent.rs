@@ -38,7 +38,7 @@ use crate::tasks::{TaskId, TaskRegistry, TaskState};
 use crate::tools::agent_defs::AgentDefinitions;
 use crate::tools::edit::EditTool;
 use crate::tools::fs::{ReadFile, ReadFileState, WriteFile};
-use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerRegistry};
+use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 use crate::tools::{PermissionHook, Tool, ToolRegistry, ToolSideEffect};
 
 /// Fallback aggregate deadline for agent dispatches with no configured
@@ -241,6 +241,31 @@ impl Drop for WorkerDeregisterGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.worker_key);
+    }
+}
+
+/// RAII guard that flags a worker's `WorkerRegistry` mailbox as done when the
+/// worker's `run_worker` future ends — on normal return, on an early `?`
+/// return (e.g. the runtime failed to build), on panic unwind, and on abort
+/// unwind.
+///
+/// The flag is what lets `WorkerRegistry::register` sweep a finished worker's
+/// entry: `register` is the only place the sweep runs (lazy, no background
+/// task), so an entry is only reclaimable if its mailbox says the worker is
+/// gone. `deregister_sync` normally removes the entry outright; the flag
+/// covers the path where that synchronous `try_write` loses its race
+/// (goal-408). The abort path additionally marks the mailbox from
+/// `execute_parallel`, because an aborted task is not guaranteed to run any of
+/// its own code.
+struct WorkerMailboxDoneGuard {
+    mailbox: Option<WorkerMailbox>,
+}
+
+impl Drop for WorkerMailboxDoneGuard {
+    fn drop(&mut self) {
+        if let Some(mailbox) = &self.mailbox {
+            mailbox.mark_done();
+        }
     }
 }
 
@@ -572,6 +597,17 @@ impl AgentTool {
         max_steps: usize,
         child_depth: usize,
     ) -> Result<String> {
+        // Snapshot the mailbox this worker was pre-registered with (parallel
+        // mode) and flag it done however this call ends — every return path,
+        // including the `?` on a runtime-build failure and the cut-off
+        // finish reasons below. Single/sequential mode (or no registry) has
+        // nothing registered, so the guard is a no-op.
+        let mailbox = match &self.registry {
+            Some(registry) => registry.get(worker_id).await,
+            None => None,
+        };
+        let _done_guard = WorkerMailboxDoneGuard { mailbox };
+
         let mut runtime = self
             .build_worker_runtime(worker_id, entry, max_steps, child_depth)
             .await?;
@@ -776,10 +812,15 @@ impl AgentTool {
             });
         }
 
-        // Pre-register all workers in the registry so they can message each other.
+        // Pre-register all workers in the registry so they can message each
+        // other. The mailboxes are kept here too: the aggregate
+        // cancel/deadline branch below must flag the workers it aborts as
+        // done itself, because an aborted task is not guaranteed to run any
+        // of its own code (goal-408).
+        let mut registered: HashMap<String, WorkerMailbox> = HashMap::new();
         if let Some(reg) = &self.registry {
             for worker_id in manifest.keys() {
-                reg.register(worker_id).await;
+                registered.insert(worker_id.clone(), reg.register(worker_id).await);
             }
         }
 
@@ -950,6 +991,14 @@ impl AgentTool {
                     Some(Ok(text)) => results.push((id, text.clone())),
                     Some(Err(e)) => results.push((id, format!("ERROR: {e}"))),
                     None => {
+                        // Flag the unfinished worker's mailbox as done *before*
+                        // aborting it: the aborted task may never be polled
+                        // again, so its own exit guard cannot be relied on.
+                        // The entry (if `deregister_sync` also lost its race)
+                        // is then reclaimed by the next `register`.
+                        if let Some(mailbox) = registered.get(&id) {
+                            mailbox.mark_done();
+                        }
                         handle.abort();
                         results.push((
                             id.clone(),
@@ -2164,6 +2213,117 @@ allowed_tools:
             .expect("static token must resolve");
         static_token.cancel();
         assert!(resolved.is_cancelled(), "static token must take precedence");
+    }
+
+    /// Goal 408 — a worker that *does* return flags its own registry mailbox
+    /// as done on the way out, so a stale presence entry stays reclaimable
+    /// even when `deregister_sync` loses its `try_write` race. Exercised in
+    /// single mode: that is the dispatch path where the registry entry is
+    /// created by the caller (the parallel path removes its own entry via
+    /// `ParallelDeregister`, hiding the flag).
+    #[tokio::test]
+    async fn run_worker_flags_its_mailbox_done_on_exit() {
+        let provider = mock_provider(vec![Completion {
+            content: "all done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let worker_registry = WorkerRegistry::new();
+        let mailbox = worker_registry.register("helper").await;
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_registry(worker_registry.clone());
+
+        let out = agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": { "helper": { "system_prompt": "You are a helper.", "allowed_tools": [] } },
+                "prompt": "say hi"
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("NoMoreToolCalls"), "got: {out}");
+        assert!(
+            mailbox.is_done(),
+            "a returned worker must flag its own mailbox as done"
+        );
+
+        // ...and the entry it left behind is swept by the next register.
+        worker_registry.register("other").await;
+        assert!(
+            worker_registry.get("helper").await.is_none(),
+            "the finished worker's entry must be swept by the next register"
+        );
+    }
+
+    /// Goal 408 — when the aggregate deadline fires, the unfinished workers
+    /// are aborted; an aborted task is not guaranteed to run any of its own
+    /// code, so `execute_parallel` must flag their registry mailboxes as done
+    /// itself (rather than relying on the worker's exit guard or on
+    /// `deregister_sync` winning its `try_write` race). The next `register`
+    /// then sweeps the stale entries.
+    ///
+    /// Deliberately a `current_thread` runtime: the abort is asynchronous,
+    /// and the assertions below must observe the registry before the aborted
+    /// tasks get a chance to be dropped (nothing between the dispatch
+    /// returning and the assertions yields to the scheduler, since the
+    /// uncontended `RwLock` reads complete inline).
+    #[tokio::test]
+    async fn execute_parallel_timeout_flags_unfinished_workers_done() {
+        let (agent, _tmp) = hanging_agent();
+        let worker_registry = WorkerRegistry::new();
+        let agent = agent
+            .with_registry(worker_registry.clone())
+            .with_wall_timeout_secs(1);
+
+        let fut = agent.execute(serde_json::json!({
+            "mode": "parallel",
+            "manifest": {
+                "w0": { "system_prompt": "a", "allowed_tools": [] },
+                "w1": { "system_prompt": "b", "allowed_tools": [] }
+            },
+            "prompt": "go",
+            "max_steps": 3
+        }));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .expect("must terminate via wall budget")
+            .expect("execute must return Ok (finish is data, not Err)");
+        // Placeholder pairing is untouched by this goal (invariants #7/#8).
+        assert!(result.contains("WallClockExceeded"), "got: {result}");
+        assert!(result.contains("=== w0 ==="), "got: {result}");
+        assert!(result.contains("=== w1 ==="), "got: {result}");
+
+        // Both workers were pre-registered and neither ever returned, so their
+        // entries are still in the table at this instant — and the aggregator
+        // must have flagged them done even though their tasks were aborted
+        // before they could mark themselves.
+        for id in ["w0", "w1"] {
+            let mailbox = worker_registry
+                .get(id)
+                .await
+                .expect("unfinished worker must still be registered right after the dispatch");
+            assert!(
+                mailbox.is_done(),
+                "unfinished worker '{id}' must be flagged done by the aggregator"
+            );
+        }
+
+        // The next register sweeps both stale entries, keeping the new one.
+        worker_registry.register("probe").await;
+        assert!(
+            worker_registry.get("probe").await.is_some(),
+            "the newly registered worker must survive the sweep"
+        );
+        for id in ["w0", "w1"] {
+            assert!(
+                worker_registry.get(id).await.is_none(),
+                "stale entry '{id}' must be swept by the next register"
+            );
+        }
     }
 
     /// Issue #47③ — parallel mode with no wall budget configured must still
