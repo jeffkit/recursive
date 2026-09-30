@@ -122,11 +122,30 @@ def main() -> int:
     st["verdict"] = verdict
     st["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))
-    # 成功终态立即回收 worktree（冷 target 可达 8-12G/run）：改动已合并或本就
-    # 无改动，现场无保留价值。failed-preserved/engine_error 保留现场供排查。
-    # 2026-09-30：.flowcast/runs 曾积 48G/33 目录把根盘拖到 11GiB 触守卫。
+    # 成功终态回收 worktree（冷 target 可达 8-12G/run）——但必须先确认工作已上
+    # origin（okguitar 2026-10-01 建议）：committed 时 worktree HEAD 必须是
+    # origin/main 的祖先（GIT_PUBLISH merge_mode=main 已推）、skip-commit 本就
+    # 无改动直接放行。确认失败/网络异常 → 保留现场并在 verdict 里注明，
+    # 宁可多占 10G 也不冒险丢一轮 agent 的工作。
     if verdict.get("verdict") in ("committed", "skip-commit"):
-        shutil.rmtree(run_dir / "worktree", ignore_errors=True)
+        wt = run_dir / "worktree"
+        safe = True
+        if verdict.get("verdict") == "committed" and wt.is_dir():
+            head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "-C", str(wt), "fetch", "origin", "main", "--quiet"],
+                           capture_output=True, text=True, timeout=120)
+            anc = subprocess.run(
+                ["git", "-C", str(wt), "merge-base", "--is-ancestor", head, "origin/main"],
+                capture_output=True, text=True)
+            if anc.returncode != 0:
+                safe = False
+                verdict["note"] = (str(verdict.get("note") or "")
+                                   + " [worktree 保留：HEAD 未确认已在 origin/main]")
+        if safe:
+            shutil.rmtree(wt, ignore_errors=True)
+    print(json.dumps(verdict, ensure_ascii=False))
+    return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
     print(json.dumps(verdict, ensure_ascii=False))
     return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
 
