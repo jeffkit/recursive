@@ -110,6 +110,12 @@ e2e/
 3. **Sandbox.** Every fs / shell tool resolves paths through
    `tools::resolve_within`. Never bypass it.
    Automated test: `tests/invariants/sandbox.rs`
+   Extension (issue #51): sandboxed tiers never inherit host environment
+   variables — `RunShell::execute` starts `env_pairs` empty and only
+   appends the tool call's explicit `env`; `ContainerTransport::exec_shell`
+   and `E2bTransport::exec_shell` build env solely from that slice. The
+   `none` tier intentionally inherits host env.
+   Automated test: `tests/issue51_sandbox_env_inheritance.rs`
 4. **Tests are non-negotiable.** Every new public function / tool / provider
    gets unit tests in the same file (`#[cfg(test)] mod tests`).
    Automated test: `tests/invariants/test_coverage.rs`

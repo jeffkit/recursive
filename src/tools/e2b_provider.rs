@@ -20,6 +20,15 @@
 //! - `RECURSIVE_E2B_TIMEOUT_SECS` (default: `3600`) — sandbox TTL; renewed
 //!   after each successful exec once half of it has elapsed.
 //! - `RECURSIVE_E2B_API_BASE` (default: `"https://api.e2b.dev"`)
+//!
+//! # Egress gate (issue #51)
+//!
+//! E2B is a managed service — the host cannot toggle the VM NIC. With the
+//! default `base` template (outbound network on), `from_env` refuses to
+//! start unless `RECURSIVE_SANDBOX_NETWORK=on` is set (the same opt-in
+//! switch the container tier uses). Point `RECURSIVE_E2B_TEMPLATE` at a
+//! self-built no-egress template to bypass the gate; the template author
+//! then owns the egress decision.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,7 +68,7 @@ pub struct E2bConfig {
 impl E2bConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let config = Self {
             api_key: std::env::var("RECURSIVE_E2B_API_KEY").map_err(|_| Error::Config {
                 message: "RECURSIVE_E2B_API_KEY not set".into(),
             })?,
@@ -70,7 +79,24 @@ impl E2bConfig {
                 .unwrap_or(3600),
             api_base: std::env::var("RECURSIVE_E2B_API_BASE")
                 .unwrap_or_else(|_| "https://api.e2b.dev".into()),
-        })
+        };
+        // Host-side startup gate (issue #51): the default `base` template
+        // ships with outbound network. E2B is a managed service so the host
+        // cannot turn the NIC off — the only faithful "default-off egress"
+        // semantics is refusing to start unless the user explicitly opts in
+        // via RECURSIVE_SANDBOX_NETWORK=on (same switch as the container
+        // tier) or brings their own no-egress template.
+        if config.template_id == "base"
+            && std::env::var("RECURSIVE_SANDBOX_NETWORK").as_deref() != Ok("on")
+        {
+            return Err(Error::Config {
+                message: "microvm tier uses the 'base' template which allows outbound network; \
+                    set RECURSIVE_SANDBOX_NETWORK=on to acknowledge, or point \
+                    RECURSIVE_E2B_TEMPLATE at a no-egress custom template"
+                    .into(),
+            });
+        }
+        Ok(config)
     }
 }
 
@@ -479,9 +505,13 @@ fn err_to_io(e: Error) -> std::io::Error {
     }
 }
 
-fn default_caps() -> EnvironmentCapabilities {
+fn default_caps(template_id: &str) -> EnvironmentCapabilities {
     EnvironmentCapabilities {
-        network: true,
+        // Honest reporting (issue #51): with the `base` template the host-side
+        // gate only lets this transport exist when the user opted in; with a
+        // custom template the template author owns the egress decision.
+        network: std::env::var("RECURSIVE_SANDBOX_NETWORK").as_deref() == Ok("on")
+            || template_id != "base",
         persistent: true,
         path_root: PathBuf::from(VM_WORKSPACE_ROOT),
         user: Some("root".into()),
@@ -494,11 +524,12 @@ impl E2bTransport {
     pub fn new(config: E2bConfig, workspace: impl Into<PathBuf>) -> Self {
         // Pre-probe defaults: path_root is the fixed VM workspace root;
         // user/toolchain are overwritten by the real probe at sandbox start.
+        let caps = default_caps(&config.template_id);
         Self {
             config,
             workspace: workspace.into(),
             sandbox: Arc::new(Mutex::new(None)),
-            caps: std::sync::RwLock::new(default_caps()),
+            caps: std::sync::RwLock::new(caps),
             last_refresh: Mutex::new(None),
             destroyed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -666,7 +697,7 @@ impl ToolTransport for E2bTransport {
             .map(|c| c.clone())
             // poisoned lock: report the conservative default rather than
             // panic (invariant #5 — no panics in non-test code)
-            .unwrap_or_else(|_| default_caps())
+            .unwrap_or_else(|_| default_caps(&self.config.template_id))
     }
 
     async fn destroy(&self) {
@@ -965,17 +996,41 @@ mod tests {
             "RECURSIVE_E2B_TEMPLATE",
             "RECURSIVE_E2B_TIMEOUT_SECS",
             "RECURSIVE_E2B_API_BASE",
+            "RECURSIVE_SANDBOX_NETWORK",
         ];
         let saved: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
         for k in keys {
             std::env::remove_var(k);
         }
+        // base template default passes the egress gate only with opt-in;
+        // the defaults test exercises it with the gate acknowledged.
+        std::env::set_var("RECURSIVE_SANDBOX_NETWORK", "on");
 
         // Missing key → Config error.
         let err = E2bConfig::from_env().unwrap_err();
         assert!(err.to_string().contains("RECURSIVE_E2B_API_KEY"));
 
+        // Egress gate (issue #51): base template without opt-in → refuse;
+        // with opt-in → ok; custom template → gate does not apply.
         std::env::set_var("RECURSIVE_E2B_API_KEY", "k1");
+        std::env::remove_var("RECURSIVE_SANDBOX_NETWORK");
+        let err = E2bConfig::from_env().unwrap_err();
+        assert!(err.to_string().contains("RECURSIVE_SANDBOX_NETWORK=on"));
+        // base + not opted in → capabilities honestly report network=false
+        let t = E2bTransport::new(
+            E2bConfig {
+                api_key: "k1".into(),
+                template_id: "base".into(),
+                timeout_secs: 60,
+                api_base: "https://api.e2b.dev".into(),
+            },
+            "/host/ws",
+        );
+        assert!(
+            !t.capabilities().network,
+            "base + no opt-in: host gate blocks startup, so report network=false"
+        );
+        std::env::set_var("RECURSIVE_SANDBOX_NETWORK", "on");
         let c = E2bConfig::from_env().unwrap();
         assert_eq!(c.api_key, "k1");
         assert_eq!(c.template_id, "base", "template default");
@@ -990,10 +1045,39 @@ mod tests {
         assert_eq!(c.timeout_secs, 120);
         assert_eq!(c.api_base, "http://localhost:9999");
 
+        // custom template bypasses the gate even without the opt-in
+        // (the template author owns the egress decision).
+        std::env::remove_var("RECURSIVE_SANDBOX_NETWORK");
+        let c = E2bConfig::from_env().unwrap();
+        assert_eq!(c.template_id, "custom");
+        std::env::set_var("RECURSIVE_SANDBOX_NETWORK", "on");
+
         // Non-numeric timeout falls back to the default (documented).
         std::env::set_var("RECURSIVE_E2B_TIMEOUT_SECS", "not-a-number");
         let c = E2bConfig::from_env().unwrap();
         assert_eq!(c.timeout_secs, 3600);
+
+        // base + opted in → capabilities report network=true.
+        std::env::remove_var("RECURSIVE_E2B_TEMPLATE");
+        let t = E2bTransport::new(
+            E2bConfig {
+                api_key: "k1".into(),
+                template_id: "base".into(),
+                timeout_secs: 60,
+                api_base: "https://api.e2b.dev".into(),
+            },
+            "/host/ws",
+        );
+        assert!(
+            t.capabilities().network,
+            "base + RECURSIVE_SANDBOX_NETWORK=on: egress acknowledged"
+        );
+        assert!(t.capabilities().persistent);
+        assert!(
+            !t.capabilities().snapshot,
+            "snapshot/clone is a documented non-goal"
+        );
+        assert_eq!(t.capabilities().path_root, PathBuf::from("/workspace"));
 
         for (k, v) in keys.iter().zip(saved.iter()) {
             match v {
@@ -1069,25 +1153,6 @@ mod tests {
         let mut short = String::from("abc");
         cap_string(&mut short, 10);
         assert_eq!(short, "abc");
-    }
-
-    #[test]
-    fn e2b_transport_default_capabilities_are_conservative() {
-        let config = E2bConfig {
-            api_key: "k".into(),
-            template_id: "base".into(),
-            timeout_secs: 60,
-            api_base: "https://api.e2b.dev".into(),
-        };
-        let t = E2bTransport::new(config, "/host/ws");
-        let caps = t.capabilities();
-        assert!(
-            caps.network,
-            "base template has outbound network by default"
-        );
-        assert!(caps.persistent);
-        assert!(!caps.snapshot, "snapshot/clone is a documented non-goal");
-        assert_eq!(caps.path_root, PathBuf::from("/workspace"));
     }
 
     #[test]
