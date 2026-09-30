@@ -13,6 +13,11 @@
 use axum::http::StatusCode;
 use std::sync::Arc;
 
+/// Env var holding the comma-separated inbound API keys.
+pub const ENV_AUTH_KEYS: &str = "RECURSIVE_HTTP_AUTH_KEYS";
+/// Env var holding the inbound JWT HMAC secret.
+pub const ENV_AUTH_JWT_SECRET: &str = "RECURSIVE_HTTP_AUTH_JWT_SECRET";
+
 /// API key authentication for the HTTP server.
 ///
 /// Configured from `RECURSIVE_HTTP_AUTH_KEYS`, a comma-separated list of
@@ -157,14 +162,14 @@ impl JwtConfig {
 ///
 /// All unset = auth disabled (back-compat zero-config default).
 pub(super) fn auth_config_from_env() -> AuthConfig {
-    let raw = std::env::var("RECURSIVE_HTTP_AUTH_KEYS").unwrap_or_default();
+    let raw = std::env::var(ENV_AUTH_KEYS).unwrap_or_default();
     let keys: Vec<String> = raw
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
     let mut config = AuthConfig::new(keys);
-    let jwt_secret = std::env::var("RECURSIVE_HTTP_AUTH_JWT_SECRET").unwrap_or_default();
+    let jwt_secret = std::env::var(ENV_AUTH_JWT_SECRET).unwrap_or_default();
     let jwt_audience = std::env::var("RECURSIVE_HTTP_AUTH_JWT_AUDIENCE")
         .ok()
         .filter(|s| !s.is_empty());

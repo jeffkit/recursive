@@ -17,7 +17,7 @@ mod rate_limit;
 // external `recursive::http::AdmissionGate` paths keep working.
 pub use crate::session_host::SessionHost;
 pub use crate::session_host::{AcquireError, AdmissionGate, RunPermit};
-pub use auth::{AuthConfig, JwtConfig};
+pub use auth::{AuthConfig, JwtConfig, ENV_AUTH_JWT_SECRET, ENV_AUTH_KEYS};
 pub use handlers::map_agent_event;
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 

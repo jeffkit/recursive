@@ -875,10 +875,16 @@ async fn main() -> anyhow::Result<()> {
                 "admission: max_concurrent_runs={max_concurrent} (0 = unlimited), \
                  admission_timeout={admission_timeout_secs}s (0 = wait indefinitely)"
             );
-            // Warn if auth is effectively disabled
+            // Warn if auth is effectively disabled. Uses the same env
+            // constants as `auth_config_from_env` so the check cannot
+            // drift from what actually guards the routes.
             let auth_enabled = http_auth_enabled(
-                std::env::var("RECURSIVE_API_KEY").ok().as_deref(),
-                std::env::var("RECURSIVE_JWT_SECRET").ok().as_deref(),
+                std::env::var(recursive::http::ENV_AUTH_KEYS)
+                    .ok()
+                    .as_deref(),
+                std::env::var(recursive::http::ENV_AUTH_JWT_SECRET)
+                    .ok()
+                    .as_deref(),
             );
             if let Some(warning) = disabled_auth_warning(auth_enabled) {
                 tracing::warn!("{warning}");
@@ -1843,7 +1849,9 @@ fn resume_from_needs_goal(goal_is_empty: bool) -> bool {
     goal_is_empty
 }
 
-/// Whether HTTP auth is enabled (either credential env var is set).
+/// Whether HTTP auth is enabled (either inbound credential env var is set).
+/// The env-var names are shared with `src/http/auth.rs` via the exported
+/// constants — keep it that way to prevent drift.
 fn http_auth_enabled(api_key: Option<&str>, jwt_secret: Option<&str>) -> bool {
     api_key.is_some() || jwt_secret.is_some()
 }
@@ -1853,8 +1861,8 @@ fn disabled_auth_warning(auth_enabled: bool) -> Option<&'static str> {
     if !auth_enabled {
         Some(
             "HTTP server started with authentication DISABLED. \
-             Set RECURSIVE_API_KEY or RECURSIVE_JWT_SECRET to enable auth. \
-             Any client with network access can execute commands.",
+             Set RECURSIVE_HTTP_AUTH_KEYS or RECURSIVE_HTTP_AUTH_JWT_SECRET \
+             to enable auth. Any client with network access can execute commands.",
         )
     } else {
         None
@@ -3526,7 +3534,81 @@ mod tests {
         assert!(disabled_auth_warning(true).is_none());
         let warning = disabled_auth_warning(false).expect("warning without auth");
         assert!(warning.contains("authentication DISABLED"), "{warning}");
-        assert!(warning.contains("RECURSIVE_API_KEY"), "{warning}");
+        assert!(warning.contains("RECURSIVE_HTTP_AUTH_KEYS"), "{warning}");
+    }
+
+    /// Issue #67: the startup auth warning must read the same env vars the
+    /// auth middleware actually reads (`RECURSIVE_HTTP_AUTH_KEYS` /
+    /// `RECURSIVE_HTTP_AUTH_JWT_SECRET`), not the outbound
+    /// `RECURSIVE_API_KEY`. Env mutations live in ONE test to avoid
+    /// `cargo test` parallel env races (`.dev/AGENTS.md` lesson).
+    #[test]
+    fn auth_warning_tracks_inbound_env_vars_in_one_test() {
+        let prev_keys = std::env::var(recursive::http::ENV_AUTH_KEYS).ok();
+        let prev_jwt = std::env::var(recursive::http::ENV_AUTH_JWT_SECRET).ok();
+        let prev_outbound = std::env::var("RECURSIVE_API_KEY").ok();
+
+        unsafe {
+            std::env::remove_var(recursive::http::ENV_AUTH_KEYS);
+            std::env::remove_var(recursive::http::ENV_AUTH_JWT_SECRET);
+            // Outbound LLM key must NOT suppress the warning.
+            std::env::set_var("RECURSIVE_API_KEY", "outbound-llm-key");
+        }
+        // No inbound credentials → warning, even with RECURSIVE_API_KEY set.
+        let enabled = http_auth_enabled(
+            std::env::var(recursive::http::ENV_AUTH_KEYS)
+                .ok()
+                .as_deref(),
+            std::env::var(recursive::http::ENV_AUTH_JWT_SECRET)
+                .ok()
+                .as_deref(),
+        );
+        assert!(disabled_auth_warning(enabled).is_some());
+
+        // Inbound keys set → no warning.
+        unsafe {
+            std::env::set_var(recursive::http::ENV_AUTH_KEYS, "k1,k2");
+        }
+        let enabled = http_auth_enabled(
+            std::env::var(recursive::http::ENV_AUTH_KEYS)
+                .ok()
+                .as_deref(),
+            std::env::var(recursive::http::ENV_AUTH_JWT_SECRET)
+                .ok()
+                .as_deref(),
+        );
+        assert!(disabled_auth_warning(enabled).is_none());
+
+        // JWT secret alone also enables auth.
+        unsafe {
+            std::env::remove_var(recursive::http::ENV_AUTH_KEYS);
+            std::env::set_var(recursive::http::ENV_AUTH_JWT_SECRET, "s3cret");
+        }
+        let enabled = http_auth_enabled(
+            std::env::var(recursive::http::ENV_AUTH_KEYS)
+                .ok()
+                .as_deref(),
+            std::env::var(recursive::http::ENV_AUTH_JWT_SECRET)
+                .ok()
+                .as_deref(),
+        );
+        assert!(disabled_auth_warning(enabled).is_none());
+
+        // Restore.
+        unsafe {
+            match prev_keys {
+                Some(v) => std::env::set_var(recursive::http::ENV_AUTH_KEYS, v),
+                None => std::env::remove_var(recursive::http::ENV_AUTH_KEYS),
+            }
+            match prev_jwt {
+                Some(v) => std::env::set_var(recursive::http::ENV_AUTH_JWT_SECRET, v),
+                None => std::env::remove_var(recursive::http::ENV_AUTH_JWT_SECRET),
+            }
+            match prev_outbound {
+                Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+                None => std::env::remove_var("RECURSIVE_API_KEY"),
+            }
+        }
     }
 
     #[test]
