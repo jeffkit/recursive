@@ -92,12 +92,15 @@ impl LoadSkill {
             let sub_deps = self.resolve_deps(dep_skill, visited, depth + 1)?;
             deps.extend(sub_deps);
 
-            // Read the dependency's body
-            let content = fs::read_to_string(&dep_skill.path).map_err(|e| Error::Tool {
-                name: "Skill".into(),
-                call_id: None,
-                message: format!("failed to read dependency '{}': {e}", dep_skill.name),
-            })?;
+            // Read the dependency's body (content-first, path fallback)
+            let content = match &dep_skill.body {
+                Some(b) => b.clone(),
+                None => fs::read_to_string(&dep_skill.path).map_err(|e| Error::Tool {
+                    name: "Skill".into(),
+                    call_id: None,
+                    message: format!("failed to read dependency '{}': {e}", dep_skill.name),
+                })?,
+            };
 
             let body = content
                 .strip_prefix("---")
@@ -201,11 +204,14 @@ impl Tool for LoadSkill {
                     }
                 })?;
 
-            let content = fs::read_to_string(&skill_ref.path).map_err(|e| Error::Tool {
-                name: "Skill".into(),
-                call_id: None,
-                message: format!("failed to read ref file: {e}"),
-            })?;
+            let content = match &skill_ref.content {
+                Some(c) => c.clone(),
+                None => fs::read_to_string(&skill_ref.path).map_err(|e| Error::Tool {
+                    name: "Skill".into(),
+                    call_id: None,
+                    message: format!("failed to read ref file: {e}"),
+                })?,
+            };
 
             return Ok(content.trim().to_string());
         }
@@ -265,11 +271,15 @@ impl Tool for LoadSkill {
         }
 
         // No ref or section specified — return the main SKILL.md body
-        let content = fs::read_to_string(&skill.path).map_err(|e| Error::Tool {
-            name: "Skill".into(),
-            call_id: None,
-            message: format!("failed to read skill file: {e}"),
-        })?;
+        // (content-first, path fallback)
+        let content = match &skill.body {
+            Some(b) => b.clone(),
+            None => fs::read_to_string(&skill.path).map_err(|e| Error::Tool {
+                name: "Skill".into(),
+                call_id: None,
+                message: format!("failed to read skill file: {e}"),
+            })?,
+        };
 
         let body = content
             .strip_prefix("---")
@@ -1084,6 +1094,7 @@ mod tests {
                 content: "Run bash ${SKILL_DIR}/scripts/lint.sh".to_string(),
             }],
             globs: None,
+            body: None,
         };
 
         let tool = LoadSkill::new(vec![skill]);
@@ -1394,6 +1405,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "no-deps".to_string(),
@@ -1408,6 +1420,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -1419,6 +1432,136 @@ mod tests {
         assert!(
             result.contains("- no-deps: No dependencies"),
             "should show skill without deps normally"
+        );
+    }
+
+    // --- Goal 64: content-backed (body-only) skill tests ---
+
+    #[test]
+    fn load_skill_body_only_returns_body_without_file() {
+        let skill = crate::skills::skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: Remote doc skill\n---\n\nRemote body content.",
+            vec![],
+        );
+        assert!(skill.body.is_some());
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "remote-doc"})));
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap(), "Remote body content.");
+    }
+
+    #[test]
+    fn load_skill_body_only_returns_section() {
+        let skill = crate::skills::skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: d\n---\n\n## Overview\n\nRemote overview.\n\n## Details\n\nRemote details.",
+            vec![],
+        );
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "remote-doc", "section": "Details"})));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Remote details.");
+    }
+
+    #[test]
+    fn load_skill_body_only_ref_content() {
+        let skill = crate::skills::skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: d\n---\n\nBody",
+            vec![crate::skills::SkillRef {
+                name: "api-spec".to_string(),
+                path: PathBuf::from("/virtual/skills/remote-doc/refs/api-spec.md"),
+                content: Some("# API Spec\n\nInline content.".to_string()),
+            }],
+        );
+        let tool = LoadSkill::new(vec![skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "remote-doc", "ref": "api-spec"})));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "# API Spec\n\nInline content.");
+    }
+
+    #[test]
+    fn load_skill_body_only_dependency_resolution() {
+        let dep = crate::skills::skill_from_content(
+            "remote-base",
+            "---\nname: remote-base\ndescription: d\n---\n\nBase body",
+            vec![],
+        );
+        let main_skill = crate::skills::skill_from_content(
+            "remote-main",
+            "---\nname: remote-main\ndescription: d\ndepends_on: remote-base\n---\n\nMain body",
+            vec![],
+        );
+        let tool = LoadSkill::new(vec![dep, main_skill]);
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "remote-main"})));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "=== Dependency: remote-base ===\nBase body\n\n=== Skill: remote-main ===\nMain body"
+        );
+    }
+
+    #[test]
+    fn skill_index_renders_body_only_skill() {
+        let skill = crate::skills::skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: Remote doc description\n---\n\nBody",
+            vec![],
+        );
+        let idx = crate::skills::skill_index(&[skill]);
+        assert!(
+            idx.contains("- remote-doc: Remote doc description"),
+            "index must render body-only skill: {idx}"
+        );
+    }
+
+    #[test]
+    fn skills_for_injection_always_mode_body_only() {
+        let skill = crate::skills::skill_from_content(
+            "remote-always",
+            "---\nname: remote-always\ndescription: d\nmode: always\n---\n\nInjected body",
+            vec![],
+        );
+        let result = crate::skills::skills_for_injection(&[skill], "anything");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "remote-always");
+        assert_eq!(result[0].1, "Injected body");
+    }
+
+    #[test]
+    fn load_skill_body_only_no_skill_dir_substitution() {
+        // Remote skills have a synthetic path; ${SKILL_DIR} still resolves to
+        // the virtual dir (documented behavior) — verify it does not error.
+        let skill = crate::skills::skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: d\n---\n\nRun ${SKILL_DIR}/scripts/lint.sh",
+            vec![],
+        );
+        let tool = LoadSkill::new(vec![skill]);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "remote-doc"})));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "Run /virtual/skills/remote-doc/scripts/lint.sh"
         );
     }
 }

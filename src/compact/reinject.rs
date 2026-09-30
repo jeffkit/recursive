@@ -697,6 +697,7 @@ mod tests {
             scripts: vec![],
             sections: vec![],
             globs: None,
+            body: None,
         }
     }
 

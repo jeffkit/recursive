@@ -1235,6 +1235,7 @@ fn runtime_builder_skills_stores_skills_list() {
         scripts: vec![],
         sections: vec![],
         globs: None,
+        body: None,
     };
     let rt = AgentRuntime::builder()
         .llm(llm)

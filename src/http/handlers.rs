@@ -3351,6 +3351,7 @@ mod tests {
             scripts: vec![],
             sections: vec![],
             globs: None,
+            body: None,
         }];
 
         let idx = crate::skills::skill_index(&skills);

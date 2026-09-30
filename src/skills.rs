@@ -52,6 +52,11 @@ pub struct Skill {
     /// E.g. `["src/tools/**", "src/runtime.rs"]`.
     /// `None` when mode is not Globs (or globs list is empty/absent).
     pub globs: Option<Vec<String>>,
+    /// In-memory SKILL.md content (full text incl. frontmatter), when the
+    /// skill was constructed from content instead of a local file
+    /// (remote/tenant-configured skills). When `Some`, it takes precedence
+    /// over reading `path`.
+    pub body: Option<String>,
 }
 
 /// A named section within a skill's body, delimited by `## Section Name`.
@@ -71,6 +76,9 @@ pub struct SkillRef {
     pub name: String,
     /// Absolute path to the ref file
     pub path: PathBuf,
+    /// In-memory ref content, when constructed from content instead of a
+    /// local file. When `Some`, it takes precedence over reading `path`.
+    pub content: Option<String>,
 }
 
 /// A parameter declared in a skill's frontmatter.
@@ -148,6 +156,7 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
                         scripts,
                         sections,
                         globs,
+                        body: None,
                     });
                 }
             }
@@ -155,6 +164,45 @@ pub fn discover_skills(search_paths: &[PathBuf]) -> Vec<Skill> {
     }
 
     skills
+}
+
+/// Construct a skill from raw SKILL.md content (no local file involved).
+///
+/// Parses frontmatter/sections the same way [`discover_skills`] does, but
+/// keeps the full content in memory (`body`). `path` is used only for
+/// display/`${SKILL_DIR}` purposes and need not exist — callers building
+/// remote/tenant-configured skills should pass a synthetic path (and must
+/// not use `${SKILL_DIR}` or `scripts/`, which have no local backing).
+/// Refs may carry in-memory `content`; scripts cannot (they require a
+/// local executable).
+pub fn skill_from_content(name: &str, content: &str, refs: Vec<SkillRef>) -> Skill {
+    let dir_path = PathBuf::from(format!("/virtual/skills/{name}"));
+    let (parsed_name, description, mode, triggers, hint, depends_on, params, raw_globs) =
+        parse_skill_meta(content, &dir_path);
+    let globs = if raw_globs.is_empty() {
+        None
+    } else {
+        Some(raw_globs)
+    };
+    Skill {
+        name: if parsed_name == "unnamed" {
+            name.to_string()
+        } else {
+            parsed_name
+        },
+        description,
+        path: dir_path.join("SKILL.md"),
+        mode,
+        triggers,
+        hint,
+        depends_on,
+        refs,
+        params,
+        scripts: Vec::new(),
+        sections: parse_sections(content),
+        globs,
+        body: Some(content.to_string()),
+    }
 }
 
 /// Parse named sections from a skill's body content.
@@ -211,6 +259,7 @@ fn discover_refs(skill_dir: &Path) -> Vec<SkillRef> {
                             refs.push(SkillRef {
                                 name: stem.to_string(),
                                 path,
+                                content: None,
                             });
                         }
                     }
@@ -533,11 +582,14 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
     for skill in skills {
         match skill.mode {
             SkillMode::Always => {
-                // Read the body from the SKILL.md file
-                if let Ok(content) = fs::read_to_string(&skill.path) {
-                    let body = extract_body(&content);
-                    result.push((skill.name.clone(), body.to_string()));
-                }
+                let body = match &skill.body {
+                    Some(b) => extract_body(b).to_string(),
+                    None => match fs::read_to_string(&skill.path) {
+                        Ok(content) => extract_body(&content).to_string(),
+                        Err(_) => continue,
+                    },
+                };
+                result.push((skill.name.clone(), body));
             }
             SkillMode::Trigger => {
                 // Check if any trigger matches the goal (case-insensitive)
@@ -823,6 +875,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "python-api".to_string(),
@@ -837,6 +890,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -923,16 +977,19 @@ mod tests {
                     SkillRef {
                         name: "api-spec".to_string(),
                         path: PathBuf::from("/tmp/skills/with-refs/refs/api-spec.md"),
+                        content: None,
                     },
                     SkillRef {
                         name: "examples".to_string(),
                         path: PathBuf::from("/tmp/skills/with-refs/refs/examples.txt"),
+                        content: None,
                     },
                 ],
                 params: vec![],
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "no-refs".to_string(),
@@ -947,6 +1004,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -1047,6 +1105,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "simple".to_string(),
@@ -1061,6 +1120,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -1174,6 +1234,7 @@ mod tests {
                 ],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "no-scripts".to_string(),
@@ -1188,6 +1249,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -1421,6 +1483,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "trigger-skill".to_string(),
@@ -1435,6 +1498,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "manual-skill".to_string(),
@@ -1449,6 +1513,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -1516,6 +1581,7 @@ mod tests {
                     },
                 ],
                 globs: None,
+                body: None,
             },
             Skill {
                 name: "no-sections".to_string(),
@@ -1530,6 +1596,7 @@ mod tests {
                 scripts: vec![],
                 sections: vec![],
                 globs: None,
+                body: None,
             },
         ];
 
@@ -1576,6 +1643,7 @@ mod tests {
             scripts: vec![],
             sections: vec![],
             globs: None,
+            body: None,
         }
     }
 
@@ -2064,6 +2132,7 @@ mod tests {
             scripts: vec![],
             sections: vec![],
             globs: Some(vec!["src/**".into()]),
+            body: None,
         }];
         let idx = skill_index(&skills);
         assert!(idx.contains("[globs]"), "globs mode tag missing: {idx}");

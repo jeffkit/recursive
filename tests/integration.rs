@@ -1519,6 +1519,7 @@ async fn load_skill_then_act_in_scripted_run() {
         scripts: vec![],
         sections: vec![],
         globs: None,
+        body: None,
     }];
 
     // Sanity: skill_index should list the skill so the agent
