@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -121,6 +122,11 @@ def main() -> int:
     st["verdict"] = verdict
     st["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    # 成功终态立即回收 worktree（冷 target 可达 8-12G/run）：改动已合并或本就
+    # 无改动，现场无保留价值。failed-preserved/engine_error 保留现场供排查。
+    # 2026-09-30：.flowcast/runs 曾积 48G/33 目录把根盘拖到 11GiB 触守卫。
+    if verdict.get("verdict") in ("committed", "skip-commit"):
+        shutil.rmtree(run_dir / "worktree", ignore_errors=True)
     print(json.dumps(verdict, ensure_ascii=False))
     return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
 
