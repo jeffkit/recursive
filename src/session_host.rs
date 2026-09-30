@@ -46,7 +46,7 @@
 //! this with a fake session whose `close` sleeps: concurrent `get()`/`len()`
 //! must still complete within 50 ms while an eviction is in flight.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -267,6 +267,8 @@ impl AdmissionGate {
 ///   [`SessionHost::get_with`] read, and a raw `sessions()` escape hatch for
 ///   rich front-end queries);
 /// - the run-admission [`AdmissionGate`];
+/// - the per-session **run fence** ([`SessionHost::try_begin_run`]) used to
+///   refuse a second concurrent run for one session id;
 /// - the session TTL used by [`SessionHost::evict_idle`].
 ///
 /// Eviction is closure-injected so this module never depends on front-end
@@ -276,7 +278,30 @@ impl AdmissionGate {
 pub struct SessionHost<S> {
     sessions: Arc<RwLock<HashMap<String, S>>>,
     admission: Arc<AdmissionGate>,
+    /// Session ids with a run currently in flight (issue #57 §④).
+    /// A sync mutex on purpose: guard acquire/release is a tiny critical
+    /// section with no `.await` inside.
+    active_runs: Arc<std::sync::Mutex<HashSet<String>>>,
     ttl: Duration,
+}
+
+/// Guard returned by [`SessionHost::try_begin_run`]: marks a session as
+/// having a run in flight until dropped.
+///
+/// Dropping the guard (run finished, driver task ended, handler returned
+/// early, or the task panicked — `Drop` runs on unwind) releases the fence
+/// so the next run for the same session can start.
+#[derive(Debug)]
+pub struct ActiveRunGuard {
+    runs: Arc<std::sync::Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        runs.remove(&self.key);
+    }
 }
 
 impl<S> SessionHost<S> {
@@ -285,8 +310,38 @@ impl<S> SessionHost<S> {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             admission: Arc::new(admission),
+            active_runs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             ttl,
         }
+    }
+
+    /// Fence off a run for `key`: returns a guard while no other run for
+    /// the same key is in flight, `None` otherwise (issue #57 §④).
+    ///
+    /// The admission gate bounds *total* concurrency; this fence pins
+    /// *per-session* concurrency to one. Callers refuse (HTTP 409) rather
+    /// than queue: a queued duplicate run would execute the same prompt
+    /// twice back-to-back — worse for retrying mobile clients than an
+    /// immediate conflict.
+    pub fn try_begin_run(&self, key: impl Into<String>) -> Option<ActiveRunGuard> {
+        let key = key.into();
+        let mut runs = self.active_runs.lock().unwrap_or_else(|e| e.into_inner());
+        if runs.contains(&key) {
+            return None;
+        }
+        runs.insert(key.clone());
+        Some(ActiveRunGuard {
+            runs: Arc::clone(&self.active_runs),
+            key,
+        })
+    }
+
+    /// Number of sessions with a run currently in flight.
+    pub fn active_run_count(&self) -> usize {
+        self.active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// The session TTL used by [`SessionHost::evict_idle`].
@@ -458,6 +513,61 @@ mod tests {
         // Waiting gauge must be back to zero after the timeout.
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         assert_eq!(gate.runs_waiting(), 0);
+    }
+
+    // ── per-session run fence (issue #57 §④) ──────────────────────────────
+
+    #[test]
+    fn try_begin_run_fences_same_key_and_releases_on_drop() {
+        let host: SessionHost<()> = SessionHost::new(
+            Duration::ZERO,
+            AdmissionGate::new(8, Duration::ZERO, counter(), counter()),
+        );
+
+        let guard = host
+            .try_begin_run("agui-thread-a")
+            .expect("first run acquires");
+        assert_eq!(host.active_run_count(), 1);
+        assert!(
+            host.try_begin_run("agui-thread-a").is_none(),
+            "second concurrent run for the same session must be refused"
+        );
+        // Different sessions don't interfere.
+        let guard_b = host
+            .try_begin_run("agui-thread-b")
+            .expect("different session runs independently");
+        assert_eq!(host.active_run_count(), 2);
+
+        drop(guard);
+        assert_eq!(
+            host.active_run_count(),
+            1,
+            "dropping the guard releases the fence"
+        );
+        assert!(
+            host.try_begin_run("agui-thread-a").is_some(),
+            "fence must re-open after the guard is dropped"
+        );
+        drop(guard_b);
+        assert_eq!(host.active_run_count(), 0);
+    }
+
+    #[test]
+    fn active_run_guard_releases_on_panic_unwind() {
+        let host: SessionHost<()> = SessionHost::new(
+            Duration::ZERO,
+            AdmissionGate::new(8, Duration::ZERO, counter(), counter()),
+        );
+        let key = "agui-panic";
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.try_begin_run(key).expect("acquire");
+            panic!("driver task blew up");
+        }));
+        assert!(result.is_err());
+        assert!(
+            host.try_begin_run(key).is_some(),
+            "guard must release during unwind, not wedge the session"
+        );
     }
 
     #[tokio::test]

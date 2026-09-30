@@ -19,6 +19,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod agui_session;
 pub(crate) mod atomic;
 pub mod checkpoint;
 pub mod checkpoint_log;
