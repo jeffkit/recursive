@@ -535,7 +535,7 @@
       "name": null,
       "desc": null,
       "output": null,
-      "next": "_n2",
+      "next": "_n8",
       "timeout": "",
       "source_line": null,
       "timeout_handler": {
@@ -553,11 +553,11 @@
       }
      },
      {
-      "id": "_n2",
+      "id": "_n8",
       "name": null,
       "desc": null,
-      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修复 ≤3 轮。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n    轮次用 WHILE 自带的 rounds（$INPUT.index，恒为 int）——不要自己串\n    item.rounds：首轮 item=None，F.add(None,1) 抛 TypeError（2026-09-30\n    #70 实证：计数器坏 → 循环空转打满 max_iterations → \"exhausted\"）。\n    ",
-      "next": "fix_loop",
+      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n\n    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复\n    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue\n    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义\n    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘\n    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。\n    ",
+      "next": "run",
       "timeout": "",
       "source_line": 3,
       "timeout_handler": {
@@ -577,17 +577,276 @@
       "upstream_output": []
      },
      {
+      "id": "run",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n1",
+      "timeout": "",
+      "source_line": 14,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "command": "$INPUT.cmd",
+      "gate_name": "$INPUT.name",
+      "cwd": "$INPUT.wt",
+      "timeout_secs": "$INPUT.timeout_secs",
+      "max_retries": 0,
+      "dry_run": false
+     },
+     {
       "id": "_n1",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n7",
+      "timeout": "",
+      "source_line": 16,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": {
+       "data_type": "string",
+       "name": "branch_name",
+       "label": null,
+       "desc": null,
+       "is_required": false,
+       "default_value": null,
+       "item_type": null,
+       "children": []
+      },
+      "branches": [
+       {
+        "name": "_n7",
+        "condition": {
+         "field": "$NODE.run.passed",
+         "operator": "eq",
+         "value": true
+        },
+        "priority": 0,
+        "label": "true",
+        "desc": "true",
+        "next": "_n7",
+        "is_default": false
+       },
+       {
+        "name": "fix_prompt",
+        "condition": null,
+        "priority": 0,
+        "label": "false",
+        "desc": "false",
+        "next": "fix_prompt",
+        "is_default": true
+       }
+      ],
+      "else_next": "fix_prompt",
+      "condition": {
+       "field": "$NODE.run.passed",
+       "operator": "eq",
+       "value": true
+      }
+     },
+     {
+      "id": "fix_prompt",
+      "name": null,
+      "desc": null,
+      "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed. \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
+      "next": "_n6",
+      "timeout": "",
+      "source_line": 18,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": null,
+      "upstream_output": []
+     },
+     {
+      "id": "_n6",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "run2",
+      "timeout": "",
+      "source_line": 24,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "agent": "$INPUT.agent",
+      "prompt": "$NODE.fix_prompt",
+      "repo": "$INPUT.wt",
+      "timeout_secs": 7200,
+      "details": false,
+      "dry_run": false
+     },
+     {
+      "id": "run2",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n2",
+      "timeout": "",
+      "source_line": 26,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "command": "$INPUT.cmd",
+      "gate_name": "$INPUT.name",
+      "cwd": "$INPUT.wt",
+      "timeout_secs": "$INPUT.timeout_secs",
+      "max_retries": 0,
+      "dry_run": false
+     },
+     {
+      "id": "_n2",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n5",
+      "timeout": "",
+      "source_line": 28,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": {
+       "data_type": "string",
+       "name": "branch_name",
+       "label": null,
+       "desc": null,
+       "is_required": false,
+       "default_value": null,
+       "item_type": null,
+       "children": []
+      },
+      "branches": [
+       {
+        "name": "_n5",
+        "condition": {
+         "field": "$NODE.run2.passed",
+         "operator": "eq",
+         "value": true
+        },
+        "priority": 0,
+        "label": "true",
+        "desc": "true",
+        "next": "_n5",
+        "is_default": false
+       },
+       {
+        "name": "_n4",
+        "condition": null,
+        "priority": 0,
+        "label": "false",
+        "desc": "false",
+        "next": "_n4",
+        "is_default": true
+       }
+      ],
+      "else_next": "_n4",
+      "condition": {
+       "field": "$NODE.run2.passed",
+       "operator": "eq",
+       "value": true
+      }
+     },
+     {
+      "id": "_n4",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n3",
+      "timeout": "",
+      "source_line": 30,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "path": "$F.concat($INPUT.wt, \"/../failure-gate-\", $INPUT.name, \".log\")",
+      "content": "$F.concat(\"cmd: \", $INPUT.cmd, \"\\n--- stdout ---\\n\", $NODE.run2.stdout, \"\\n--- stderr ---\\n\", $NODE.run2.stderr)",
+      "json": false,
+      "indent": 2,
+      "workspace_root": null
+     },
+     {
+      "id": "_n3",
       "name": null,
       "desc": null,
       "output": {
        "passed": false,
        "gate": "$INPUT.name",
-       "out": "fix-loop exhausted"
+       "out": "$NODE.run2.stdout"
       },
       "next": null,
       "timeout": "",
-      "source_line": 28,
+      "source_line": 33,
       "timeout_handler": {
        "strategy": "abort",
        "defaultValue": null,
@@ -605,13 +864,16 @@
       "error": null
      },
      {
-      "id": "fix_loop",
+      "id": "_n5",
       "name": null,
       "desc": null,
-      "output": null,
-      "next": "_n1",
+      "output": {
+       "passed": true,
+       "gate": "$INPUT.name"
+      },
+      "next": null,
       "timeout": "",
-      "source_line": 11,
+      "source_line": 29,
       "timeout_handler": {
        "strategy": "abort",
        "defaultValue": null,
@@ -625,344 +887,35 @@
        "message": null,
        "retryTimes": 0
       },
-      "input": null,
-      "child_flow": {
-       "flow_id": null,
-       "version": null,
-       "runtime": "python",
-       "input_type": {
-        "data_type": "object",
-        "name": null,
-        "label": null,
-        "desc": null,
-        "is_required": false,
-        "default_value": null,
-        "item_type": null,
-        "children": {}
-       },
-       "output_type": null,
-       "nodes": [
-        {
-         "id": "start",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "run",
-         "timeout": "",
-         "source_line": null,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         }
-        },
-        {
-         "id": "run",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n1",
-         "timeout": "",
-         "source_line": 12,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "command": "$INPUT.cmd",
-         "gate_name": "$INPUT.name",
-         "cwd": "$INPUT.wt",
-         "timeout_secs": "$INPUT.timeout_secs",
-         "max_retries": 0,
-         "dry_run": false
-        },
-        {
-         "id": "_n1",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n6",
-         "timeout": "",
-         "source_line": 14,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": {
-          "data_type": "string",
-          "name": "branch_name",
-          "label": null,
-          "desc": null,
-          "is_required": false,
-          "default_value": null,
-          "item_type": null,
-          "children": []
-         },
-         "branches": [
-          {
-           "name": "_n6",
-           "condition": {
-            "field": "$NODE.run.passed",
-            "operator": "eq",
-            "value": true
-           },
-           "priority": 0,
-           "label": "true",
-           "desc": "true",
-           "next": "_n6",
-           "is_default": false
-          },
-          {
-           "name": "_n2",
-           "condition": null,
-           "priority": 0,
-           "label": "false",
-           "desc": "false",
-           "next": "_n2",
-           "is_default": true
-          }
-         ],
-         "else_next": "_n2",
-         "condition": {
-          "field": "$NODE.run.passed",
-          "operator": "eq",
-          "value": true
-         }
-        },
-        {
-         "id": "_n2",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n5",
-         "timeout": "",
-         "source_line": 16,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": {
-          "data_type": "string",
-          "name": "branch_name",
-          "label": null,
-          "desc": null,
-          "is_required": false,
-          "default_value": null,
-          "item_type": null,
-          "children": []
-         },
-         "branches": [
-          {
-           "name": "_n5",
-           "condition": {
-            "field": "$INPUT.index",
-            "operator": "gte",
-            "value": 3
-           },
-           "priority": 0,
-           "label": "true",
-           "desc": "true",
-           "next": "_n5",
-           "is_default": false
-          },
-          {
-           "name": "fix_prompt",
-           "condition": null,
-           "priority": 0,
-           "label": "false",
-           "desc": "false",
-           "next": "fix_prompt",
-           "is_default": true
-          }
-         ],
-         "else_next": "fix_prompt",
-         "condition": {
-          "field": "$INPUT.index",
-          "operator": "gte",
-          "value": 3
-         }
-        },
-        {
-         "id": "fix_prompt",
-         "name": null,
-         "desc": null,
-         "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed (fix round \", $F.str($F.add($INPUT.index, 1)), \"/3). \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
-         "next": "_n4",
-         "timeout": "",
-         "source_line": 18,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": null,
-         "upstream_output": []
-        },
-        {
-         "id": "_n4",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n3",
-         "timeout": "",
-         "source_line": 25,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "agent": "$INPUT.agent",
-         "prompt": "$NODE.fix_prompt",
-         "repo": "$INPUT.wt",
-         "timeout_secs": 7200,
-         "details": false,
-         "dry_run": false
-        },
-        {
-         "id": "_n3",
-         "name": null,
-         "desc": null,
-         "output": {
-          "done": false
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 27,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        },
-        {
-         "id": "_n5",
-         "name": null,
-         "desc": null,
-         "output": {
-          "passed": false,
-          "gate": "$INPUT.name",
-          "out": "$NODE.run.stdout"
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 17,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        },
-        {
-         "id": "_n6",
-         "name": null,
-         "desc": null,
-         "output": {
-          "passed": true,
-          "gate": "$INPUT.name"
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 15,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        }
-       ],
-       "author": "",
-       "desc": "",
-       "metadata": {},
-       "timeout": "",
-       "global_context": {},
-       "exposeEnv": []
+      "result_type": "success",
+      "error": null
+     },
+     {
+      "id": "_n7",
+      "name": null,
+      "desc": null,
+      "output": {
+       "passed": true,
+       "gate": "$INPUT.name"
       },
-      "condition": {
-       "field": "$LOOP-ITEM.done",
-       "operator": "ne",
-       "value": true
+      "next": null,
+      "timeout": "",
+      "source_line": 17,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
       },
-      "max_iterations": 8
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "result_type": "success",
+      "error": null
      }
     ],
     "author": "",
@@ -1084,7 +1037,7 @@
       "name": null,
       "desc": null,
       "output": null,
-      "next": "_n2",
+      "next": "_n8",
       "timeout": "",
       "source_line": null,
       "timeout_handler": {
@@ -1102,11 +1055,11 @@
       }
      },
      {
-      "id": "_n2",
+      "id": "_n8",
       "name": null,
       "desc": null,
-      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修复 ≤3 轮。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n    轮次用 WHILE 自带的 rounds（$INPUT.index，恒为 int）——不要自己串\n    item.rounds：首轮 item=None，F.add(None,1) 抛 TypeError（2026-09-30\n    #70 实证：计数器坏 → 循环空转打满 max_iterations → \"exhausted\"）。\n    ",
-      "next": "fix_loop",
+      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n\n    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复\n    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue\n    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义\n    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘\n    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。\n    ",
+      "next": "run",
       "timeout": "",
       "source_line": 3,
       "timeout_handler": {
@@ -1126,17 +1079,276 @@
       "upstream_output": []
      },
      {
+      "id": "run",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n1",
+      "timeout": "",
+      "source_line": 14,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "command": "$INPUT.cmd",
+      "gate_name": "$INPUT.name",
+      "cwd": "$INPUT.wt",
+      "timeout_secs": "$INPUT.timeout_secs",
+      "max_retries": 0,
+      "dry_run": false
+     },
+     {
       "id": "_n1",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n7",
+      "timeout": "",
+      "source_line": 16,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": {
+       "data_type": "string",
+       "name": "branch_name",
+       "label": null,
+       "desc": null,
+       "is_required": false,
+       "default_value": null,
+       "item_type": null,
+       "children": []
+      },
+      "branches": [
+       {
+        "name": "_n7",
+        "condition": {
+         "field": "$NODE.run.passed",
+         "operator": "eq",
+         "value": true
+        },
+        "priority": 0,
+        "label": "true",
+        "desc": "true",
+        "next": "_n7",
+        "is_default": false
+       },
+       {
+        "name": "fix_prompt",
+        "condition": null,
+        "priority": 0,
+        "label": "false",
+        "desc": "false",
+        "next": "fix_prompt",
+        "is_default": true
+       }
+      ],
+      "else_next": "fix_prompt",
+      "condition": {
+       "field": "$NODE.run.passed",
+       "operator": "eq",
+       "value": true
+      }
+     },
+     {
+      "id": "fix_prompt",
+      "name": null,
+      "desc": null,
+      "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed. \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
+      "next": "_n6",
+      "timeout": "",
+      "source_line": 18,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": null,
+      "upstream_output": []
+     },
+     {
+      "id": "_n6",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "run2",
+      "timeout": "",
+      "source_line": 24,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "agent": "$INPUT.agent",
+      "prompt": "$NODE.fix_prompt",
+      "repo": "$INPUT.wt",
+      "timeout_secs": 7200,
+      "details": false,
+      "dry_run": false
+     },
+     {
+      "id": "run2",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n2",
+      "timeout": "",
+      "source_line": 26,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "command": "$INPUT.cmd",
+      "gate_name": "$INPUT.name",
+      "cwd": "$INPUT.wt",
+      "timeout_secs": "$INPUT.timeout_secs",
+      "max_retries": 0,
+      "dry_run": false
+     },
+     {
+      "id": "_n2",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n5",
+      "timeout": "",
+      "source_line": 28,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": {
+       "data_type": "string",
+       "name": "branch_name",
+       "label": null,
+       "desc": null,
+       "is_required": false,
+       "default_value": null,
+       "item_type": null,
+       "children": []
+      },
+      "branches": [
+       {
+        "name": "_n5",
+        "condition": {
+         "field": "$NODE.run2.passed",
+         "operator": "eq",
+         "value": true
+        },
+        "priority": 0,
+        "label": "true",
+        "desc": "true",
+        "next": "_n5",
+        "is_default": false
+       },
+       {
+        "name": "_n4",
+        "condition": null,
+        "priority": 0,
+        "label": "false",
+        "desc": "false",
+        "next": "_n4",
+        "is_default": true
+       }
+      ],
+      "else_next": "_n4",
+      "condition": {
+       "field": "$NODE.run2.passed",
+       "operator": "eq",
+       "value": true
+      }
+     },
+     {
+      "id": "_n4",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n3",
+      "timeout": "",
+      "source_line": 30,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "path": "$F.concat($INPUT.wt, \"/../failure-gate-\", $INPUT.name, \".log\")",
+      "content": "$F.concat(\"cmd: \", $INPUT.cmd, \"\\n--- stdout ---\\n\", $NODE.run2.stdout, \"\\n--- stderr ---\\n\", $NODE.run2.stderr)",
+      "json": false,
+      "indent": 2,
+      "workspace_root": null
+     },
+     {
+      "id": "_n3",
       "name": null,
       "desc": null,
       "output": {
        "passed": false,
        "gate": "$INPUT.name",
-       "out": "fix-loop exhausted"
+       "out": "$NODE.run2.stdout"
       },
       "next": null,
       "timeout": "",
-      "source_line": 28,
+      "source_line": 33,
       "timeout_handler": {
        "strategy": "abort",
        "defaultValue": null,
@@ -1154,13 +1366,16 @@
       "error": null
      },
      {
-      "id": "fix_loop",
+      "id": "_n5",
       "name": null,
       "desc": null,
-      "output": null,
-      "next": "_n1",
+      "output": {
+       "passed": true,
+       "gate": "$INPUT.name"
+      },
+      "next": null,
       "timeout": "",
-      "source_line": 11,
+      "source_line": 29,
       "timeout_handler": {
        "strategy": "abort",
        "defaultValue": null,
@@ -1174,344 +1389,35 @@
        "message": null,
        "retryTimes": 0
       },
-      "input": null,
-      "child_flow": {
-       "flow_id": null,
-       "version": null,
-       "runtime": "python",
-       "input_type": {
-        "data_type": "object",
-        "name": null,
-        "label": null,
-        "desc": null,
-        "is_required": false,
-        "default_value": null,
-        "item_type": null,
-        "children": {}
-       },
-       "output_type": null,
-       "nodes": [
-        {
-         "id": "start",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "run",
-         "timeout": "",
-         "source_line": null,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         }
-        },
-        {
-         "id": "run",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n1",
-         "timeout": "",
-         "source_line": 12,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "command": "$INPUT.cmd",
-         "gate_name": "$INPUT.name",
-         "cwd": "$INPUT.wt",
-         "timeout_secs": "$INPUT.timeout_secs",
-         "max_retries": 0,
-         "dry_run": false
-        },
-        {
-         "id": "_n1",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n6",
-         "timeout": "",
-         "source_line": 14,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": {
-          "data_type": "string",
-          "name": "branch_name",
-          "label": null,
-          "desc": null,
-          "is_required": false,
-          "default_value": null,
-          "item_type": null,
-          "children": []
-         },
-         "branches": [
-          {
-           "name": "_n6",
-           "condition": {
-            "field": "$NODE.run.passed",
-            "operator": "eq",
-            "value": true
-           },
-           "priority": 0,
-           "label": "true",
-           "desc": "true",
-           "next": "_n6",
-           "is_default": false
-          },
-          {
-           "name": "_n2",
-           "condition": null,
-           "priority": 0,
-           "label": "false",
-           "desc": "false",
-           "next": "_n2",
-           "is_default": true
-          }
-         ],
-         "else_next": "_n2",
-         "condition": {
-          "field": "$NODE.run.passed",
-          "operator": "eq",
-          "value": true
-         }
-        },
-        {
-         "id": "_n2",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n5",
-         "timeout": "",
-         "source_line": 16,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": {
-          "data_type": "string",
-          "name": "branch_name",
-          "label": null,
-          "desc": null,
-          "is_required": false,
-          "default_value": null,
-          "item_type": null,
-          "children": []
-         },
-         "branches": [
-          {
-           "name": "_n5",
-           "condition": {
-            "field": "$INPUT.index",
-            "operator": "gte",
-            "value": 3
-           },
-           "priority": 0,
-           "label": "true",
-           "desc": "true",
-           "next": "_n5",
-           "is_default": false
-          },
-          {
-           "name": "fix_prompt",
-           "condition": null,
-           "priority": 0,
-           "label": "false",
-           "desc": "false",
-           "next": "fix_prompt",
-           "is_default": true
-          }
-         ],
-         "else_next": "fix_prompt",
-         "condition": {
-          "field": "$INPUT.index",
-          "operator": "gte",
-          "value": 3
-         }
-        },
-        {
-         "id": "fix_prompt",
-         "name": null,
-         "desc": null,
-         "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed (fix round \", $F.str($F.add($INPUT.index, 1)), \"/3). \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
-         "next": "_n4",
-         "timeout": "",
-         "source_line": 18,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": null,
-         "upstream_output": []
-        },
-        {
-         "id": "_n4",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n3",
-         "timeout": "",
-         "source_line": 25,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "agent": "$INPUT.agent",
-         "prompt": "$NODE.fix_prompt",
-         "repo": "$INPUT.wt",
-         "timeout_secs": 7200,
-         "details": false,
-         "dry_run": false
-        },
-        {
-         "id": "_n3",
-         "name": null,
-         "desc": null,
-         "output": {
-          "done": false
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 27,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        },
-        {
-         "id": "_n5",
-         "name": null,
-         "desc": null,
-         "output": {
-          "passed": false,
-          "gate": "$INPUT.name",
-          "out": "$NODE.run.stdout"
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 17,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        },
-        {
-         "id": "_n6",
-         "name": null,
-         "desc": null,
-         "output": {
-          "passed": true,
-          "gate": "$INPUT.name"
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 15,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        }
-       ],
-       "author": "",
-       "desc": "",
-       "metadata": {},
-       "timeout": "",
-       "global_context": {},
-       "exposeEnv": []
+      "result_type": "success",
+      "error": null
+     },
+     {
+      "id": "_n7",
+      "name": null,
+      "desc": null,
+      "output": {
+       "passed": true,
+       "gate": "$INPUT.name"
       },
-      "condition": {
-       "field": "$LOOP-ITEM.done",
-       "operator": "ne",
-       "value": true
+      "next": null,
+      "timeout": "",
+      "source_line": 17,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
       },
-      "max_iterations": 8
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "result_type": "success",
+      "error": null
      }
     ],
     "author": "",
@@ -1633,7 +1539,7 @@
       "name": null,
       "desc": null,
       "output": null,
-      "next": "_n2",
+      "next": "_n8",
       "timeout": "",
       "source_line": null,
       "timeout_handler": {
@@ -1651,11 +1557,11 @@
       }
      },
      {
-      "id": "_n2",
+      "id": "_n8",
       "name": null,
       "desc": null,
-      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修复 ≤3 轮。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n    轮次用 WHILE 自带的 rounds（$INPUT.index，恒为 int）——不要自己串\n    item.rounds：首轮 item=None，F.add(None,1) 抛 TypeError（2026-09-30\n    #70 实证：计数器坏 → 循环空转打满 max_iterations → \"exhausted\"）。\n    ",
-      "next": "fix_loop",
+      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n\n    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复\n    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue\n    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义\n    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘\n    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。\n    ",
+      "next": "run",
       "timeout": "",
       "source_line": 3,
       "timeout_handler": {
@@ -1675,17 +1581,276 @@
       "upstream_output": []
      },
      {
+      "id": "run",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n1",
+      "timeout": "",
+      "source_line": 14,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "command": "$INPUT.cmd",
+      "gate_name": "$INPUT.name",
+      "cwd": "$INPUT.wt",
+      "timeout_secs": "$INPUT.timeout_secs",
+      "max_retries": 0,
+      "dry_run": false
+     },
+     {
       "id": "_n1",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n7",
+      "timeout": "",
+      "source_line": 16,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": {
+       "data_type": "string",
+       "name": "branch_name",
+       "label": null,
+       "desc": null,
+       "is_required": false,
+       "default_value": null,
+       "item_type": null,
+       "children": []
+      },
+      "branches": [
+       {
+        "name": "_n7",
+        "condition": {
+         "field": "$NODE.run.passed",
+         "operator": "eq",
+         "value": true
+        },
+        "priority": 0,
+        "label": "true",
+        "desc": "true",
+        "next": "_n7",
+        "is_default": false
+       },
+       {
+        "name": "fix_prompt",
+        "condition": null,
+        "priority": 0,
+        "label": "false",
+        "desc": "false",
+        "next": "fix_prompt",
+        "is_default": true
+       }
+      ],
+      "else_next": "fix_prompt",
+      "condition": {
+       "field": "$NODE.run.passed",
+       "operator": "eq",
+       "value": true
+      }
+     },
+     {
+      "id": "fix_prompt",
+      "name": null,
+      "desc": null,
+      "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed. \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
+      "next": "_n6",
+      "timeout": "",
+      "source_line": 18,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": null,
+      "upstream_output": []
+     },
+     {
+      "id": "_n6",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "run2",
+      "timeout": "",
+      "source_line": 24,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "agent": "$INPUT.agent",
+      "prompt": "$NODE.fix_prompt",
+      "repo": "$INPUT.wt",
+      "timeout_secs": 7200,
+      "details": false,
+      "dry_run": false
+     },
+     {
+      "id": "run2",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n2",
+      "timeout": "",
+      "source_line": 26,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "command": "$INPUT.cmd",
+      "gate_name": "$INPUT.name",
+      "cwd": "$INPUT.wt",
+      "timeout_secs": "$INPUT.timeout_secs",
+      "max_retries": 0,
+      "dry_run": false
+     },
+     {
+      "id": "_n2",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n5",
+      "timeout": "",
+      "source_line": 28,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "output_type": {
+       "data_type": "string",
+       "name": "branch_name",
+       "label": null,
+       "desc": null,
+       "is_required": false,
+       "default_value": null,
+       "item_type": null,
+       "children": []
+      },
+      "branches": [
+       {
+        "name": "_n5",
+        "condition": {
+         "field": "$NODE.run2.passed",
+         "operator": "eq",
+         "value": true
+        },
+        "priority": 0,
+        "label": "true",
+        "desc": "true",
+        "next": "_n5",
+        "is_default": false
+       },
+       {
+        "name": "_n4",
+        "condition": null,
+        "priority": 0,
+        "label": "false",
+        "desc": "false",
+        "next": "_n4",
+        "is_default": true
+       }
+      ],
+      "else_next": "_n4",
+      "condition": {
+       "field": "$NODE.run2.passed",
+       "operator": "eq",
+       "value": true
+      }
+     },
+     {
+      "id": "_n4",
+      "name": null,
+      "desc": null,
+      "output": null,
+      "next": "_n3",
+      "timeout": "",
+      "source_line": 30,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
+      },
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "path": "$F.concat($INPUT.wt, \"/../failure-gate-\", $INPUT.name, \".log\")",
+      "content": "$F.concat(\"cmd: \", $INPUT.cmd, \"\\n--- stdout ---\\n\", $NODE.run2.stdout, \"\\n--- stderr ---\\n\", $NODE.run2.stderr)",
+      "json": false,
+      "indent": 2,
+      "workspace_root": null
+     },
+     {
+      "id": "_n3",
       "name": null,
       "desc": null,
       "output": {
        "passed": false,
        "gate": "$INPUT.name",
-       "out": "fix-loop exhausted"
+       "out": "$NODE.run2.stdout"
       },
       "next": null,
       "timeout": "",
-      "source_line": 28,
+      "source_line": 33,
       "timeout_handler": {
        "strategy": "abort",
        "defaultValue": null,
@@ -1703,13 +1868,16 @@
       "error": null
      },
      {
-      "id": "fix_loop",
+      "id": "_n5",
       "name": null,
       "desc": null,
-      "output": null,
-      "next": "_n1",
+      "output": {
+       "passed": true,
+       "gate": "$INPUT.name"
+      },
+      "next": null,
       "timeout": "",
-      "source_line": 11,
+      "source_line": 29,
       "timeout_handler": {
        "strategy": "abort",
        "defaultValue": null,
@@ -1723,344 +1891,35 @@
        "message": null,
        "retryTimes": 0
       },
-      "input": null,
-      "child_flow": {
-       "flow_id": null,
-       "version": null,
-       "runtime": "python",
-       "input_type": {
-        "data_type": "object",
-        "name": null,
-        "label": null,
-        "desc": null,
-        "is_required": false,
-        "default_value": null,
-        "item_type": null,
-        "children": {}
-       },
-       "output_type": null,
-       "nodes": [
-        {
-         "id": "start",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "run",
-         "timeout": "",
-         "source_line": null,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         }
-        },
-        {
-         "id": "run",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n1",
-         "timeout": "",
-         "source_line": 12,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "command": "$INPUT.cmd",
-         "gate_name": "$INPUT.name",
-         "cwd": "$INPUT.wt",
-         "timeout_secs": "$INPUT.timeout_secs",
-         "max_retries": 0,
-         "dry_run": false
-        },
-        {
-         "id": "_n1",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n6",
-         "timeout": "",
-         "source_line": 14,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": {
-          "data_type": "string",
-          "name": "branch_name",
-          "label": null,
-          "desc": null,
-          "is_required": false,
-          "default_value": null,
-          "item_type": null,
-          "children": []
-         },
-         "branches": [
-          {
-           "name": "_n6",
-           "condition": {
-            "field": "$NODE.run.passed",
-            "operator": "eq",
-            "value": true
-           },
-           "priority": 0,
-           "label": "true",
-           "desc": "true",
-           "next": "_n6",
-           "is_default": false
-          },
-          {
-           "name": "_n2",
-           "condition": null,
-           "priority": 0,
-           "label": "false",
-           "desc": "false",
-           "next": "_n2",
-           "is_default": true
-          }
-         ],
-         "else_next": "_n2",
-         "condition": {
-          "field": "$NODE.run.passed",
-          "operator": "eq",
-          "value": true
-         }
-        },
-        {
-         "id": "_n2",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n5",
-         "timeout": "",
-         "source_line": 16,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": {
-          "data_type": "string",
-          "name": "branch_name",
-          "label": null,
-          "desc": null,
-          "is_required": false,
-          "default_value": null,
-          "item_type": null,
-          "children": []
-         },
-         "branches": [
-          {
-           "name": "_n5",
-           "condition": {
-            "field": "$INPUT.index",
-            "operator": "gte",
-            "value": 3
-           },
-           "priority": 0,
-           "label": "true",
-           "desc": "true",
-           "next": "_n5",
-           "is_default": false
-          },
-          {
-           "name": "fix_prompt",
-           "condition": null,
-           "priority": 0,
-           "label": "false",
-           "desc": "false",
-           "next": "fix_prompt",
-           "is_default": true
-          }
-         ],
-         "else_next": "fix_prompt",
-         "condition": {
-          "field": "$INPUT.index",
-          "operator": "gte",
-          "value": 3
-         }
-        },
-        {
-         "id": "fix_prompt",
-         "name": null,
-         "desc": null,
-         "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed (fix round \", $F.str($F.add($INPUT.index, 1)), \"/3). \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
-         "next": "_n4",
-         "timeout": "",
-         "source_line": 18,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "output_type": null,
-         "upstream_output": []
-        },
-        {
-         "id": "_n4",
-         "name": null,
-         "desc": null,
-         "output": null,
-         "next": "_n3",
-         "timeout": "",
-         "source_line": 25,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "agent": "$INPUT.agent",
-         "prompt": "$NODE.fix_prompt",
-         "repo": "$INPUT.wt",
-         "timeout_secs": 7200,
-         "details": false,
-         "dry_run": false
-        },
-        {
-         "id": "_n3",
-         "name": null,
-         "desc": null,
-         "output": {
-          "done": false
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 27,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        },
-        {
-         "id": "_n5",
-         "name": null,
-         "desc": null,
-         "output": {
-          "passed": false,
-          "gate": "$INPUT.name",
-          "out": "$NODE.run.stdout"
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 17,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        },
-        {
-         "id": "_n6",
-         "name": null,
-         "desc": null,
-         "output": {
-          "passed": true,
-          "gate": "$INPUT.name"
-         },
-         "next": null,
-         "timeout": "",
-         "source_line": 15,
-         "timeout_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null
-         },
-         "error_handler": {
-          "strategy": "abort",
-          "defaultValue": null,
-          "code": -9527,
-          "message": null,
-          "retryTimes": 0
-         },
-         "result_type": "success",
-         "error": null
-        }
-       ],
-       "author": "",
-       "desc": "",
-       "metadata": {},
-       "timeout": "",
-       "global_context": {},
-       "exposeEnv": []
+      "result_type": "success",
+      "error": null
+     },
+     {
+      "id": "_n7",
+      "name": null,
+      "desc": null,
+      "output": {
+       "passed": true,
+       "gate": "$INPUT.name"
       },
-      "condition": {
-       "field": "$LOOP-ITEM.done",
-       "operator": "ne",
-       "value": true
+      "next": null,
+      "timeout": "",
+      "source_line": 17,
+      "timeout_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null
       },
-      "max_iterations": 8
+      "error_handler": {
+       "strategy": "abort",
+       "defaultValue": null,
+       "code": -9527,
+       "message": null,
+       "retryTimes": 0
+      },
+      "result_type": "success",
+      "error": null
      }
     ],
     "author": "",

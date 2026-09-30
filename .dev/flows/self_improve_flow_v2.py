@@ -57,32 +57,37 @@ def has_changes(INPUT):
 
 @childflow()
 def gate_with_fix(INPUT):
-    """跑一道门（GATE 库节点）→ 红则 AGENTRUN 修复 ≤3 轮。
+    """跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。
 
     INPUT: name / cmd / timeout_secs / wt / agent
     输出: {passed, gate, out?}
-    轮次用 WHILE 自带的 rounds（$INPUT.index，恒为 int）——不要自己串
-    item.rounds：首轮 item=None，F.add(None,1) 抛 TypeError（2026-09-30
-    #70 实证：计数器坏 → 循环空转打满 max_iterations → "exhausted"）。
+
+    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复
+    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue
+    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义
+    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘
+    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。
     """
-    for fr in WHILE(item.done != True, id="fix_loop", max_iterations=8):
-        run = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
-                   timeout_secs=INPUT.timeout_secs)
-        if run.passed == True:
-            return {"passed": True, "gate": INPUT.name}
-        if rounds >= 3:
-            return {"passed": False, "gate": INPUT.name, "out": run.stdout}
-        fix_prompt = F.concat(
-            'The "', INPUT.name, '" check failed (fix round ',
-            F.str(F.add(rounds, 1)), '/3). ',
-            "Edit the source files to fix every error below, then re-run `",
-            INPUT.cmd, "` yourself to verify before stopping.",
-            "\nFix the source, never silence with #[allow].\n--- output tail ---\n",
-            run.stdout)
-        AGENTRUN(agent=INPUT.agent, prompt=fix_prompt, repo=INPUT.wt,
-                 timeout_secs=7200)
-        return {"done": False}
-    return {"passed": False, "gate": INPUT.name, "out": "fix-loop exhausted"}
+    run = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
+               timeout_secs=INPUT.timeout_secs)
+    if run.passed == True:
+        return {"passed": True, "gate": INPUT.name}
+    fix_prompt = F.concat(
+        'The "', INPUT.name, '" check failed. ',
+        "Edit the source files to fix every error below, then re-run `",
+        INPUT.cmd, "` yourself to verify before stopping.",
+        "\nFix the source, never silence with #[allow].\n--- output tail ---\n",
+        run.stdout)
+    AGENTRUN(agent=INPUT.agent, prompt=fix_prompt, repo=INPUT.wt,
+             timeout_secs=7200)
+    run2 = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
+                timeout_secs=INPUT.timeout_secs)
+    if run2.passed == True:
+        return {"passed": True, "gate": INPUT.name}
+    WRITEFILE(path=F.concat(INPUT.wt, "/../failure-gate-", INPUT.name, ".log"),
+              content=F.concat("cmd: ", INPUT.cmd, "\n--- stdout ---\n", run2.stdout,
+                               "\n--- stderr ---\n", run2.stderr))
+    return {"passed": False, "gate": INPUT.name, "out": run2.stdout}
 
 
 @flow("self-improve-v2", desc="Self-improve v2：库节点为主，code 只做 preflight/has_changes")
