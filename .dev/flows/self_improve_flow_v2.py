@@ -185,35 +185,38 @@ def self_improve_v2(INPUT):
         return {"verdict": "failed-preserved", "stage": "gates", "gate": g3.gate,
                 "out": g3.out}
 
-    # ── 评审环：独立 reviewer，VERDICT 用 F.contains 判，NEEDS_FIX 喂回 ≤3 ──
-    for rs in WHILE(item.done != True, id="review_loop", max_iterations=8):
-        review_prompt = F.concat(
-            "You are an independent reviewer (different provider). In the current ",
-            "workspace, run `git diff HEAD` to see the full change, and Read any ",
-            "source files you need to cross-check claims.\n",
-            "Review for correctness, regressions and contract violations.\n",
-            'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
-        rev = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                       timeout_secs=3600)
-        if F.contains(rev.text, "VERDICT:PASS") == True:
-            return {"done": True, "verdict": "PASS"}
-        if F.contains(rev.text, "VERDICT:NEEDS_FIX") == False:
-            return {"done": True, "verdict": "UNAVAILABLE", "text": rev.text}
-        if rounds >= 3:
-            return {"done": True, "verdict": "NEEDS_FIX", "text": rev.text}
+    # ── 评审（线性两轮）：独立 reviewer → NEEDS_FIX 则修一轮 → 复审定论 ──
+    # 2026-09-30 弃用 WHILE 版：#63/#64 实证 WHILE 循环体内表达式上下文没有
+    # F（KeyError "$F not found"，可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/FLOW_ID），
+    # review_prompt 的 F.concat 直接炸 node。主流程顶层 F 可用（preflight 失败
+    # 分支同款已实证），故线性展开到顶层：首评 → NEEDS_FIX 修一轮 → 复评定论；
+    # UNAVAILABLE / 修后仍不过均 failed-preserved 并落盘评审原文。
+    review_prompt = (
+        "You are an independent reviewer (different provider). In the current "
+        "workspace, run `git diff HEAD` to see the full change, and Read any "
+        "source files you need to cross-check claims.\n"
+        "Review for correctness, regressions and contract violations.\n"
+        'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
+    rev = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
+                   timeout_secs=3600)
+    if F.contains(rev.text, "VERDICT:PASS") != True:
+        if F.contains(rev.text, "VERDICT:NEEDS_FIX") != True:
+            wfr = WRITEFILE(path=F.concat(run_dir, "/review-unavailable.log"),
+                            content=rev.text)
+            return {"verdict": "failed-preserved", "stage": "review",
+                    "why": "reviewer UNAVAILABLE (no VERDICT line)"}
         fix_prompt = F.concat(
             "An independent reviewer rejected this change with NEEDS_FIX. ",
             "Address every issue below. Do not regress passing checks.",
             "\n\n--- reviewer feedback ---\n", rev.text)
         AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
-        return {"done": False}
-
-    if NODE.review_loop.verdict != "PASS":
+        rev = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
+                       timeout_secs=3600)
+    if F.contains(rev.text, "VERDICT:PASS") != True:
         wfr = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
-                        content=F.concat(str(NODE.review_loop.verdict), "\n",
-                                         str(NODE.review_loop.text)))
+                        content=rev.text)
         return {"verdict": "failed-preserved", "stage": "review",
-                "why": NODE.review_loop.verdict}
+                "why": "review did not pass after one fix round"}
 
     # ── 落地：GIT_PUBLISH（幂等 commit + main 模式 ff 推送）──
     pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name="self-improve",
