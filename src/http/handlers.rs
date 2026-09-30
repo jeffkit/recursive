@@ -94,10 +94,14 @@ fn build_session_runtime(
     prompt_segments: crate::system_prompt::PromptSegments,
     max_steps: usize,
 ) -> AgentRuntimeBuilder {
+    let strict_surface = !state.config.allow_tools.is_empty();
     crate::runtime::apply_context_management(
         AgentRuntimeBuilder::new()
             .llm(state.provider.clone())
             .tools(tool_registry)
+            // Issue #65: a strict `--allow-tools` surface must not be widened
+            // by the builder's build-time TodoWriteTool injection.
+            .with_todo_tool(!strict_surface)
             .system_prompt(system_prompt)
             .prompt_segments(prompt_segments)
             .max_steps(max_steps)

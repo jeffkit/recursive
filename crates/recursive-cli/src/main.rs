@@ -760,6 +760,13 @@ async fn main() -> anyhow::Result<()> {
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
             let provider = cli::builder::build_llm_provider(&config, api_key, retry, None)?;
+            // Issue #65: `--allow-tools` must gate the HTTP tool surface too.
+            // Applied before tool_infos is derived so `GET /tools` reflects
+            // the restriction, and before AppState snapshots the registry.
+            let mut tools = tools;
+            if !config.allow_tools.is_empty() {
+                tools.retain_tools(&config.allow_tools);
+            }
             // Register the unified `Agent` tool when sub-agent is enabled, so
             // the HTTP API matches CLI/TUI capabilities. Done before deriving
             // tool_infos so /tools/list also advertises the Agent tool.

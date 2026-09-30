@@ -441,7 +441,14 @@ impl AppState {
     /// Issue #31 §C: Result-shaped — container creation failure is a
     /// per-session error mapped by handlers to 503/500, not a process exit.
     pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
-        rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await
+        let mut reg =
+            rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await?;
+        // Issue #65: re-apply the allow-list after any per-session rebuild so
+        // the container tier cannot resurrect tools outside `--allow-tools`.
+        if !self.config.allow_tools.is_empty() {
+            reg.retain_tools(&self.config.allow_tools);
+        }
+        Ok(reg)
     }
 }
 
@@ -1605,10 +1612,18 @@ mod goal_396_persistence_tests {
         host: Arc<SessionHost<SessionState>>,
         storage: Arc<dyn StorageBackend>,
     ) -> AppState {
+        test_state_with_config(host, storage, test_config()).await
+    }
+
+    async fn test_state_with_config(
+        host: Arc<SessionHost<SessionState>>,
+        storage: Arc<dyn StorageBackend>,
+        config: crate::config::Config,
+    ) -> AppState {
         AppState {
             tools: vec![],
             tool_registry: crate::tools::ToolRegistry::local(),
-            config: test_config(),
+            config,
             provider: Arc::new(MockProvider::new(vec![])),
             host,
             event_channels: Arc::new(RwLock::new(HashMap::new())),
@@ -1618,6 +1633,56 @@ mod goal_396_persistence_tests {
             skills: vec![],
             storage,
         }
+    }
+
+    /// Issue #65: `--allow-tools` must gate the HTTP session tool surface.
+    /// `session_tool_registry()` is the single entry point for /run,
+    /// session-message, and AG-UI paths — restricting there covers all three.
+    #[tokio::test]
+    async fn session_tool_registry_applies_allow_tools_filter() {
+        use crate::llm::ToolSpec;
+        use crate::tools::registry::{Tool, ToolRegistry};
+
+        struct FakeTool(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for FakeTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.0.into(),
+                    description: self.0.into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let reg = ToolRegistry::local()
+            .register(Arc::new(FakeTool("Skill")))
+            .register(Arc::new(FakeTool("HttpCall")))
+            .register(Arc::new(FakeTool("Read")))
+            .register(Arc::new(FakeTool("Bash")));
+        let mut config = test_config();
+        config.allow_tools = vec!["Skill".to_string(), "HttpCall".to_string()];
+
+        let host = test_host(3600);
+        let storage: Arc<dyn StorageBackend> = RecordingStorage::new();
+        let mut state = test_state(host, storage).await;
+        state.tool_registry = reg;
+        state.config = config;
+
+        let filtered = state
+            .session_tool_registry()
+            .await
+            .expect("registry rebuild");
+        let mut names: Vec<String> = filtered.specs().into_iter().map(|s| s.name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["HttpCall".to_string(), "Skill".to_string()],
+            "HTTP session registry must contain EXACTLY the allowed tools"
+        );
     }
 
     #[tokio::test]

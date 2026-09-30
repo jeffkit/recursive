@@ -41,6 +41,11 @@ pub struct AgentRuntimeBuilder {
     /// callers must leave this `false` (the default) — the tools simply do not
     /// exist in the registry, so the model cannot invoke them.
     with_plan_mode_tools: bool,
+    /// When `true` (the default), register a `TodoWriteTool` on the runtime's
+    /// registry at build time. Channels that enforce a strict tool surface
+    /// (`--allow-tools`) set this to `false` so the injected tool cannot
+    /// bypass the allow-list (issue #65).
+    with_todo_tool: bool,
     /// Goal-291: goal-evaluator judge tail-window size. Default 12.
     goal_eval_transcript_tail: usize,
     /// Goal-318: skills passed through to AgentKernel for Globs-mode injection.
@@ -92,6 +97,7 @@ impl AgentRuntimeBuilder {
             compactor: None,
             microcompactor: None,
             with_plan_mode_tools: false,
+            with_todo_tool: true,
             goal_eval_transcript_tail: 12,
             skills: Vec::new(),
             prompt_segments: None,
@@ -115,6 +121,13 @@ impl AgentRuntimeBuilder {
     /// ```
     pub fn prompt_segments(mut self, segments: crate::system_prompt::PromptSegments) -> Self {
         self.prompt_segments = Some(segments);
+        self
+    }
+
+    /// Disable the build-time `TodoWriteTool` injection. Only channels that
+    /// enforce a strict `--allow-tools` surface need this.
+    pub fn with_todo_tool(mut self, enabled: bool) -> Self {
+        self.with_todo_tool = enabled;
         self
     }
 
@@ -326,11 +339,14 @@ impl AgentRuntimeBuilder {
 
         // Goal-167: create the shared todo list and register a properly-sinked
         // TodoWriteTool, overriding the NullSink version from build_standard_tools.
+        // Skipped entirely when a strict tool surface (issue #65) forbids it.
         let todo_list = Arc::new(RwLock::new(Vec::<TodoItem>::new()));
-        kernel.tools_mut().register_mut(Arc::new(TodoWriteTool::new(
-            todo_list.clone(),
-            event_sink.clone(),
-        )));
+        if self.with_todo_tool {
+            kernel.tools_mut().register_mut(Arc::new(TodoWriteTool::new(
+                todo_list.clone(),
+                event_sink.clone(),
+            )));
+        }
 
         // Goal-165 / Goal-202: plan mode tools block waiting for human approval
         // via the gate. They must only be registered when a live interactive
@@ -414,6 +430,46 @@ mod tests {
 
     fn mock_llm() -> Arc<dyn ChatProvider> {
         Arc::new(MockProvider::new(vec![]))
+    }
+
+    /// Issue #65: `with_todo_tool(false)` must keep the registry exactly as
+    /// supplied — no build-time TodoWriteTool injection widening a strict
+    /// `--allow-tools` surface.
+    #[test]
+    fn build_with_todo_tool_disabled_leaves_registry_untouched() {
+        use crate::tools::{Tool, ToolRegistry};
+
+        struct Only;
+
+        #[async_trait::async_trait]
+        impl Tool for Only {
+            fn spec(&self) -> crate::llm::ToolSpec {
+                crate::llm::ToolSpec {
+                    name: "Only".into(),
+                    description: "only tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let reg = ToolRegistry::local().register(Arc::new(Only));
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(reg)
+            .with_todo_tool(false)
+            .build()
+            .expect("build");
+        let names: Vec<String> = rt
+            .kernel()
+            .tools()
+            .specs()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["Only".to_string()]);
     }
 
     /// Goal 396: minimal fake backend that only records its own identity —

@@ -203,6 +203,9 @@ async fn build_restored_runtime(
     let mut runtime = AgentRuntimeBuilder::new()
         .llm(state.provider.clone())
         .tools(tool_registry)
+        // Issue #65: honor a strict `--allow-tools` surface on restored
+        // sessions too — no build-time TodoWriteTool injection.
+        .with_todo_tool(state.config.allow_tools.is_empty())
         .system_prompt(full)
         .prompt_segments(segments)
         .max_steps(state.config.max_steps)
