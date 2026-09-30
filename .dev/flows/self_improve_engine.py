@@ -657,9 +657,14 @@ def load_project_gates(repo: str) -> list[dict]:
         return []
     try:
         data = json.loads(p.read_text())
-        return list((data.get("gates") or {}).items()) and [
-            {"name": k, **v} for k, v in (data.get("gates") or {}).items()
-        ]
+        gates = [{"name": k, **v} for k, v in (data.get("gates") or {}).items()]
+        # gates.json 的 timeout 是毫秒（flowcast runGate 语义）；本引擎按秒计。
+        # 不换算会把 e2e 的 600000ms 当成 600000s 传给 communicate → select 溢出
+        # （2026-09-30 影子验证实证，gates 两次暴毙的真因之一）。
+        for g in gates:
+            if g.get("timeout") is not None:
+                g["timeout"] = max(60, int(g["timeout"]) // 1000)
+        return gates
     except Exception:
         return []
 
