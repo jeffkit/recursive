@@ -3,6 +3,11 @@
 //! process holding the pipe write ends (`cmd &`, `nohup`), the `read_capped`
 //! reader tasks never see EOF; the drain is capped at `DRAIN_GRACE` so
 //! `exec_shell` still returns once the child itself has exited.
+//!
+//! Unix-only：用例依赖 sh 语法（`sleep 30 & echo hi`）与 forked 孤儿进程语义，
+//! windows 上本质靠 git-bash 可用性碰运气（2026-09-30 CI 实证 os error 3），
+//! 整文件 cfg(unix) 确定性跳过。
+#![cfg(unix)]
 
 use std::time::Duration;
 
