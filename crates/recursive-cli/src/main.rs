@@ -751,7 +751,23 @@ async fn main() -> anyhow::Result<()> {
             let mut config = config;
             config.max_steps = http_max_steps;
             config.wall_timeout_secs = http_wall_timeout_secs;
-            let (tools, _) = cli::builder::build_tools(&config, None).await;
+            let (mut tools, _) = cli::builder::build_tools(&config, None).await;
+            // Issue #70: register MCP server tools on the HTTP channel too,
+            // matching the CLI/TUI path (`register_mcp_tools` in run_loop /
+            // build_runtime). Without this, `.mcp.json` in the workspace was
+            // silently ignored for `recursive http`.
+            let elicitation = recursive::mcp::new_elicitation_slot();
+            tools = tools.with_elicitation_slot(elicitation.clone());
+            cli::builder::register_mcp_tools(
+                &mut tools,
+                &config.workspace,
+                cli.mcp_config.clone(),
+                Some(elicitation),
+            )
+            .await;
+            if !config.allow_tools.is_empty() {
+                tools.retain_tools(&config.allow_tools);
+            }
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
             let retry = RetryPolicy {
