@@ -443,7 +443,9 @@ async fn register_mcp_server_tools(
 /// Override with RECURSIVE_SKILL_PATHS=path1:path2 (colon-separated).
 pub(crate) fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     let paths: Vec<PathBuf> = if let Ok(env_paths) = std::env::var("RECURSIVE_SKILL_PATHS") {
-        env_paths.split(':').map(PathBuf::from).collect()
+        // 平台路径分隔符：unix ':' / windows ';'。硬编码 ':' 会把 windows 盘符
+        // 路径（C:\...）从盘符处切碎（2026-09-30 windows CI 实证）。
+        std::env::split_paths(&env_paths).collect()
     } else {
         let mut defaults = vec![
             config.workspace.join(".recursive").join("skills"),
