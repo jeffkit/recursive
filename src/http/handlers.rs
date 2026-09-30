@@ -1616,6 +1616,31 @@ pub(super) async fn agui_run(
     };
     let mut seed_transcript: Option<Vec<crate::message::Message>> = None;
 
+    if resume_items.is_empty() {
+        // Issue #62: standard AG-UI clients resend the FULL `messages`
+        // array every turn and expect the agent to see the whole history.
+        // Seed it so multi-turn context works without tool side effects.
+        // (Tool-related messages are skipped inside — invariant #8.)
+        // The LAST user message is dropped from the seed: it becomes the
+        // `goal` and `runtime.run()` re-appends it as a fresh user turn —
+        // seeding it too would duplicate it (the resume branch notes a
+        // duplicate makes the model re-issue the same request).
+        let goal_user_idx = input.messages.iter().rposition(|m| {
+            m.role == "user" && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+        });
+        let seeded = input
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != goal_user_idx)
+            .map(|(_, m)| m)
+            .collect::<Vec<_>>();
+        let seeded = agui_seed_from_messages(&seeded);
+        if !seeded.is_empty() {
+            seed_transcript = Some(seeded);
+        }
+    }
+
     if !resume_items.is_empty() {
         let session_dir =
             agui_session_dir(&state.config.workspace, &input.thread_id).ok_or_else(|| {
@@ -2236,6 +2261,33 @@ fn sanitize_thread_id_for_session(thread: &str) -> String {
         out.push_str("default");
     }
     out
+}
+
+/// Map AG-UI `input.messages` into a seed transcript for a NON-resume run.
+///
+/// Standard AG-UI clients (CopilotKit, `@ag-ui/client`) send the FULL
+/// `messages` array on every turn and expect the agent to see all of it —
+/// the server keeps no other per-thread context. We map plain-text
+/// user/assistant messages verbatim. Tool-related messages (`tool`-role
+/// results, and assistant messages carrying `tool_calls`) are SKIPPED
+/// wholesale: seeding either half without its pair would orphan a tool
+/// result or a tool call and violate invariant #8 (HTTP 400 from the
+/// provider).
+fn agui_seed_from_messages(msgs: &[&agui_protocol::Message]) -> Vec<crate::message::Message> {
+    msgs.iter()
+        .filter(|m| m.tool_call_id.is_none() && m.tool_calls.is_none())
+        .filter_map(|m| {
+            let content = m.content.clone()?.trim().to_string();
+            if content.is_empty() {
+                return None;
+            }
+            match m.role.as_str() {
+                "user" => Some(crate::message::Message::user(content)),
+                "assistant" => Some(crate::message::Message::assistant(content)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 // ── AG-UI Interrupt/Resume helpers ──────────────────────────────────────
@@ -3736,5 +3788,195 @@ mod tests {
     #[test]
     fn sanitize_thread_id_empty_becomes_default() {
         assert_eq!(sanitize_thread_id_for_session(""), "default");
+    }
+
+    // ── Issue #62: agui non-resume seeding ─────────────────────────────
+
+    /// Unit-level: tool-related messages are skipped (invariant #8 —
+    /// seeding an assistant tool_call or a tool result without its pair
+    /// orphans the other half and gets HTTP 400 from the provider), and
+    /// plain user/assistant text passes through in order.
+    #[test]
+    fn agui_seed_from_messages_skips_tool_roles_and_maps_text() {
+        use agui_protocol as ag;
+        let mk = |role: &str, content: Option<&str>| ag::Message {
+            id: format!("m-{role}"),
+            role: role.into(),
+            content: content.map(Into::into),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+        let mut tool_result = mk("tool", Some("result"));
+        tool_result.tool_call_id = Some("tc-1".into());
+        let mut assistant_with_calls = mk("assistant", Some("calling"));
+        assistant_with_calls.tool_calls = Some(serde_json::json!([]));
+
+        let msgs: Vec<ag::Message> = vec![
+            mk("user", Some("turn one")),
+            assistant_with_calls,
+            tool_result,
+            mk("assistant", Some("answer one")),
+            mk("user", Some("turn two")),
+            mk("user", None),          // empty content → dropped
+            mk("system", Some("sys")), // non-user/assistant → dropped
+        ];
+        let msgs: Vec<&ag::Message> = msgs.iter().collect();
+        let seed = agui_seed_from_messages(&msgs);
+        let rendered: Vec<(crate::message::Role, String)> =
+            seed.into_iter().map(|m| (m.role, m.content)).collect();
+        use crate::message::Role;
+        assert_eq!(
+            rendered,
+            vec![
+                (Role::User, "turn one".into()),
+                (Role::Assistant, "answer one".into()),
+                (Role::User, "turn two".into()),
+            ],
+            "tool roles / empty / system messages must be skipped, rest mapped in order"
+        );
+    }
+
+    /// End-to-end issue #62 acceptance: two turns on the same thread where
+    /// the second turn carries the FULL `messages` array (no resume). The
+    /// provider must see turn-one history in its request — multi-turn
+    /// context works without any tool side effect.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_non_resume_turn_seeds_full_messages_history() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+
+        let _env = crate::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        std::env::set_var("RECURSIVE_HOME", home.path());
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::llm::Completion {
+                content: "the codename is bluebird".into(),
+                ..Default::default()
+            },
+            crate::llm::Completion {
+                content: "i remember: bluebird".into(),
+                ..Default::default()
+            },
+        ]));
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: provider.clone(),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-agui-seed-test-{}", std::process::id())),
+            )),
+        };
+        let app = crate::http::build_router_with_auth_and_rate_limit(
+            state,
+            crate::http::auth::AuthConfig::default(),
+            crate::http::RateLimiter::new(100, 1.0),
+        );
+
+        let post = |body: serde_json::Value| {
+            app.clone().oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let drain = |resp: axum::response::Response| async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+        };
+
+        // Turn 1: single user message.
+        drain(
+            post(serde_json::json!({
+                "threadId": "bluebird-thread",
+                "runId": "r1",
+                "messages": [
+                    {"id": "m1", "role": "user", "content": "the codename is bluebird, remember it"}
+                ],
+            }))
+            .await
+            .unwrap(),
+        )
+        .await;
+
+        // Turn 2: full history, no resume — the standard AG-UI client shape.
+        drain(
+            post(serde_json::json!({
+                "threadId": "bluebird-thread",
+                "runId": "r2",
+                "messages": [
+                    {"id": "m1", "role": "user", "content": "the codename is bluebird, remember it"},
+                    {"id": "m2", "role": "assistant", "content": "the codename is bluebird"},
+                    {"id": "m3", "role": "user", "content": "what was the codename?"}
+                ],
+            }))
+            .await
+            .unwrap(),
+        )
+        .await;
+
+        let calls = provider.calls();
+        assert!(
+            calls.len() >= 2,
+            "expected ≥2 provider calls, got {}",
+            calls.len()
+        );
+        let turn2 = &calls[1];
+        let flat: Vec<(&crate::message::Role, &str)> = turn2
+            .iter()
+            .map(|m| (&m.role, m.content.as_str()))
+            .collect();
+        assert!(
+            flat.iter().any(|(r, c)| {
+                matches!(r, crate::message::Role::User)
+                    && c.contains("codename is bluebird, remember it")
+            }),
+            "turn-2 provider request must contain turn-1 history; got {flat:?}"
+        );
+        // The goal message must appear exactly once (not duplicated by seeding).
+        let goal_count = flat
+            .iter()
+            .filter(|(_, c)| *c == "what was the codename?")
+            .count();
+        assert_eq!(goal_count, 1, "goal must appear exactly once; got {flat:?}");
+        // Invariant #8: no tool roles in the seeded request at all.
+        assert!(
+            !turn2
+                .iter()
+                .any(|m| matches!(m.role, crate::message::Role::Tool)),
+            "no tool-role messages expected"
+        );
+
+        std::env::remove_var("RECURSIVE_WORKSPACE");
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
     }
 }
