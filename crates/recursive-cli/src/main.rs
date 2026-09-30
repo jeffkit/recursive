@@ -875,14 +875,12 @@ async fn main() -> anyhow::Result<()> {
                 "admission: max_concurrent_runs={max_concurrent} (0 = unlimited), \
                  admission_timeout={admission_timeout_secs}s (0 = wait indefinitely)"
             );
-            // Warn if auth is effectively disabled
-            let auth_enabled = http_auth_enabled(
-                std::env::var("RECURSIVE_API_KEY").ok().as_deref(),
-                std::env::var("RECURSIVE_JWT_SECRET").ok().as_deref(),
-            );
-            if let Some(warning) = disabled_auth_warning(auth_enabled) {
-                tracing::warn!("{warning}");
-            }
+            // Issue #67: no separate startup warning here. The auth layer
+            // already logs an ERROR (with the correct `RECURSIVE_HTTP_AUTH_*`
+            // var names) from `auth_config_from_env` when auth is
+            // unconfigured, and the middleware default-denies with 503
+            // (Goal 277 / SEC-003). The old check read the *outbound* LLM
+            // key vars, so it could never fire.
             recursive::http::serve_with_graceful_shutdown(listener, router, async move {
                 http_shutdown.cancelled().await
             })
@@ -1841,24 +1839,6 @@ fn head_tail_conflict(head: bool, tail: bool) -> bool {
 /// A `--resume-from` replay needs a trailing `<goal>` to continue the run.
 fn resume_from_needs_goal(goal_is_empty: bool) -> bool {
     goal_is_empty
-}
-
-/// Whether HTTP auth is enabled (either credential env var is set).
-fn http_auth_enabled(api_key: Option<&str>, jwt_secret: Option<&str>) -> bool {
-    api_key.is_some() || jwt_secret.is_some()
-}
-
-/// The warning to emit when the HTTP server starts without authentication.
-fn disabled_auth_warning(auth_enabled: bool) -> Option<&'static str> {
-    if !auth_enabled {
-        Some(
-            "HTTP server started with authentication DISABLED. \
-             Set RECURSIVE_API_KEY or RECURSIVE_JWT_SECRET to enable auth. \
-             Any client with network access can execute commands.",
-        )
-    } else {
-        None
-    }
 }
 
 /// Elision marker appended to a preview cut at `limit` characters.
@@ -3511,22 +3491,6 @@ mod tests {
     fn has_sessions_is_false_only_for_an_empty_list() {
         assert!(!has_sessions(0));
         assert!(has_sessions(1));
-    }
-
-    #[test]
-    fn http_auth_enabled_when_either_credential_is_set() {
-        assert!(http_auth_enabled(Some("k"), None));
-        assert!(http_auth_enabled(None, Some("j")));
-        assert!(http_auth_enabled(Some("k"), Some("j")));
-        assert!(!http_auth_enabled(None, None));
-    }
-
-    #[test]
-    fn disabled_auth_warning_is_emitted_only_without_auth() {
-        assert!(disabled_auth_warning(true).is_none());
-        let warning = disabled_auth_warning(false).expect("warning without auth");
-        assert!(warning.contains("authentication DISABLED"), "{warning}");
-        assert!(warning.contains("RECURSIVE_API_KEY"), "{warning}");
     }
 
     #[test]
