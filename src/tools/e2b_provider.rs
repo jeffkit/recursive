@@ -1,6 +1,12 @@
 //! E2B Firecracker microVM-backed [`ToolSetProvider`] (L3 sandbox, Goal 405).
 //!
-//! Each session lazily creates one E2B sandbox via the REST API. The whole
+//! Sandbox lifecycle is **per provider / per process**: each
+//! `E2bToolSetProvider` / `E2bTransport` holds one sandbox in an
+//! `Arc<Mutex<Option<E2bSandbox>>>`, lazily created via the REST API and
+//! reused until `destroy()`. For a CLI single run the process ≈ the
+//! session, but under `recursive http` all sessions share one VM
+//! (`single-tenant`) — see the deployment warning in
+//! `docs/architecture/execution-environments.md`. The whole
 //! shared [`ToolTransport`] (`E2bTransport`) is rebound — every I/O tool
 //! (Read / Write / Edit / Glob / Grep / count_lines / Bash) executes inside
 //! the microVM (hardware-isolated, <150ms cold start); files move via the

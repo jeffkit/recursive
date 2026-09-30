@@ -728,6 +728,19 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
+            // Issue #50: the microvm sandbox is per provider/process, so
+            // every HTTP session shares one E2B VM (single-tenant).
+            if matches!(
+                recursive::SandboxMode::from_env().ok().flatten(),
+                Some(recursive::SandboxMode::MicroVm)
+            ) {
+                eprintln!(
+                    "WARN: RECURSIVE_SANDBOX=microvm — all HTTP sessions will \
+                     share one E2B microVM (single-tenant); files, processes, \
+                     and network state are mutually visible. Do not use this \
+                     for multi-tenant deployments."
+                );
+            }
             // Goal 399: HTTP sessions get safe execution budgets by default
             // (`RECURSIVE_HTTP_MAX_STEPS`=100, `RECURSIVE_HTTP_WALL_TIMEOUT_SECS`=1800;
             // an explicit 0 restores unbounded). Applied to the server's config
