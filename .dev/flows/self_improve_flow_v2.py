@@ -120,8 +120,9 @@ def self_improve_v2(INPUT):
         "        except Exception:\n"
         "            pass\n"
         "    wt = str(rd / \"worktree\")\n"
+        "    branch = \"v2-\" + rd.name\n"
         "    if not Path(wt).exists():\n"
-        "        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"--detach\", wt, \"HEAD\"],\n"
+        "        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, \"HEAD\"],\n"
         "                           capture_output=True, text=True)\n"
         "        if r.returncode != 0:\n"
         "            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n"
@@ -146,7 +147,7 @@ def self_improve_v2(INPUT):
         "\n"
         "The flow runs these again as a backstop. Fix the source, never `#[allow]`.\n"
         "Only stop once fmt + clippy + test are all green by your own hand.\"\"\")\n"
-        "    return {\"ok\": True, \"worktree\": wt, \"baseline\": head, \"sys_prompt\": str(sp)}\n"))
+        "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp)}\n"))
     if pre.ok == False:
         wf = WRITEFILE(path=F.concat(run_dir, "/failure-context.md"),
                        content=F.concat("## preflight failed\n\nreason: ", pre.why))
@@ -221,7 +222,7 @@ def self_improve_v2(INPUT):
                     "why": "review did not pass after one fix round"}
 
     # ── 落地：GIT_PUBLISH（幂等 commit + main 模式 ff 推送）──
-    pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name="self-improve",
+    pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
                       commit_message=F.concat("self-improve: ", goal),
                       merge_mode="main", main_clone=repo, base_branch="main")
     if pub.merged == True:
