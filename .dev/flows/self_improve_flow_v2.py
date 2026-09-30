@@ -155,7 +155,12 @@ def self_improve_v2(INPUT):
                 "why": "agent made no changes", "impl_text": impl.text}
 
     # ── 门禁 ×3（gate_with_fix 子流程：GATE 库节点 + AGENTRUN 修复 ≤3）──
-    g1 = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all -- --check",
+    # fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死实证：impl 不跑 fmt、
+    # fix-loop LLM 手改源码救不动）。cargo fmt --all 幂等且秒级：可解析即绿、
+    # 格式化结果随提交走；解析错误才红并交 fix-loop 修语法。不用 --check：
+    # apply 后 check 恒过，纯冗余；也不用 && 链——GATE 对单字符串 shlex.split
+    # 后无 shell 直执行，&& 会变字面量参数（keeper 同款教训）。
+    g1 = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
                       "timeout_secs": 120, "wt": pre.worktree, "agent": agent},
                flow=gate_with_fix)
     if g1.passed == False:
