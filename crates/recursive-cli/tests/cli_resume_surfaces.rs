@@ -7,6 +7,11 @@
 //! * a JSON-output, non-headless resume serves host `control_request` frames
 //!   (the `json_mode && !config.headless` control bridge),
 //! * `--session-out` is written only for a *non*-clean finish.
+//!
+//! Unix-only：Rig 直接 spawn 真实二进制 + stub turn，windows 上 stub resume
+//! 非零退出（--session-out legacy 警告路径，2026-09-30 CI 实证），属 windows
+//! 行为差异而非回归——需要 windows 覆盖时先修 resume 的 windows 路径再解封。
+#![cfg(unix)]
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
