@@ -40,3 +40,20 @@ LLM response, which self-resolved.
 
 *(This file is the in-repo errata record; the orchestrator mirrors this
 correction to the #40 entry in the issue tracker.)*
+
+## Addendum (2026-09-30, from #48 re-verification): assert the binary contains the fix BEFORE judging it
+
+A #48 re-verification ran against a stale `target/debug/recursive` (built before
+the fix commit), produced a confident false "the fix doesn't work" conclusion,
+and cost a full wasted round — third occurrence of this exact mistake in one
+session. Symmetric with the byte-activity rule above (validate the measuring
+instrument before trusting its verdict), re-verification must first assert the
+artifact under test actually contains the fix:
+
+1. **Build postdates the fix**: `stat -f '%Sm' <binary>` must be newer than
+   `git log -1 --format=%ci <fix-commit>`.
+2. **Fix marker present**: `strings <binary> | grep -c '<literal introduced by
+   the fix>'` must be ≥ 1 (for #47④ that literal is `plan approval timed out`).
+
+A binary failing either check is not evidence about the fix — rebuild and
+re-run before drawing any conclusion.
