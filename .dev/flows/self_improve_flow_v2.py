@@ -213,8 +213,9 @@ def self_improve_v2(INPUT):
         rev = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                        timeout_secs=3600)
     if F.contains(rev.text, "VERDICT:PASS") != True:
-        wfr = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
-                        content=rev.text)
+        # 变量名不可与上面 wfr 重复——DSL 节点 id 按赋值名派生（跨分支也算重复）
+        wfr2 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
+                         content=rev.text)
         return {"verdict": "failed-preserved", "stage": "review",
                 "why": "review did not pass after one fix round"}
 
