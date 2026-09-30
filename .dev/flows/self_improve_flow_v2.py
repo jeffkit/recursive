@@ -61,24 +61,27 @@ def gate_with_fix(INPUT):
 
     INPUT: name / cmd / timeout_secs / wt / agent
     输出: {passed, gate, out?}
+    轮次用 WHILE 自带的 rounds（$INPUT.index，恒为 int）——不要自己串
+    item.rounds：首轮 item=None，F.add(None,1) 抛 TypeError（2026-09-30
+    #70 实证：计数器坏 → 循环空转打满 max_iterations → "exhausted"）。
     """
     for fr in WHILE(item.done != True, id="fix_loop", max_iterations=8):
         run = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
                    timeout_secs=INPUT.timeout_secs)
         if run.passed == True:
             return {"passed": True, "gate": INPUT.name}
-        if item.rounds >= 3:
+        if rounds >= 3:
             return {"passed": False, "gate": INPUT.name, "out": run.stdout}
         fix_prompt = F.concat(
             'The "', INPUT.name, '" check failed (fix round ',
-            F.str(F.add(item.rounds, 1)), '/3). ',
+            F.str(F.add(rounds, 1)), '/3). ',
             "Edit the source files to fix every error below, then re-run `",
             INPUT.cmd, "` yourself to verify before stopping.",
             "\nFix the source, never silence with #[allow].\n--- output tail ---\n",
             run.stdout)
         AGENTRUN(agent=INPUT.agent, prompt=fix_prompt, repo=INPUT.wt,
                  timeout_secs=7200)
-        return {"rounds": F.add(item.rounds, 1), "done": False}
+        return {"done": False}
     return {"passed": False, "gate": INPUT.name, "out": "fix-loop exhausted"}
 
 
@@ -186,14 +189,14 @@ def self_improve_v2(INPUT):
             return {"done": True, "verdict": "PASS"}
         if F.contains(rev.text, "VERDICT:NEEDS_FIX") == False:
             return {"done": True, "verdict": "UNAVAILABLE", "text": rev.text}
-        if item.rounds >= 3:
+        if rounds >= 3:
             return {"done": True, "verdict": "NEEDS_FIX", "text": rev.text}
         fix_prompt = F.concat(
             "An independent reviewer rejected this change with NEEDS_FIX. ",
             "Address every issue below. Do not regress passing checks.",
             "\n\n--- reviewer feedback ---\n", rev.text)
         AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
-        return {"rounds": F.add(item.rounds, 1), "done": False}
+        return {"done": False}
 
     if NODE.review_loop.verdict != "PASS":
         wfr = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
