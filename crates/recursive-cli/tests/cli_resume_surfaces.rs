@@ -10,7 +10,8 @@
 //!
 //! Unix-only：Rig 直接 spawn 真实二进制 + stub turn，windows 上 stub resume
 //! 非零退出（--session-out legacy 警告路径，2026-09-30 CI 实证），属 windows
-//! 行为差异而非回归——需要 windows 覆盖时先修 resume 的 windows 路径再解封。
+//! 行为差异而非回归——需要 windows 覆盖时按 .dev/goals/410-windows-session-
+//! recording-path.md 修 resume 的 windows 路径再解封。
 #![cfg(unix)]
 
 use std::io::Write;

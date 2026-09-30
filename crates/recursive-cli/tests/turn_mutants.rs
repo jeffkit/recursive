@@ -13,8 +13,9 @@
 //!
 //! Unix-only：loop/session 录制在 windows 上写 workspaces 路径即失败
 //! （"loop failed: session: recording to C:\\Users\\…"，2026-09-30 CI 实证
-//! 8 用例同因）——疑似 session 录制的 windows 路径兼容产品 bug，已立项
-//! follow-up；修好前 windows 确定性跳过（这些用例在 windows 从未通过）。
+//! 8 用例同因）——疑似 session 录制的 windows 路径兼容产品 bug，follow-up
+//! 见 .dev/goals/410-windows-session-recording-path.md；修好前 windows
+//! 确定性跳过（这些用例在 windows 从未通过）。
 #![cfg(unix)]
 
 use std::io::{Read, Write};

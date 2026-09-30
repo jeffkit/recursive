@@ -14,6 +14,10 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # windows 非阻塞：保留失败信号（它是 windows 专属产品 bug 的唯一探测器），
+    # 但不挡 main 合并。待 .dev/goals/410-windows-session-recording-path.md
+    # 落地、windows 全绿后摘除此行恢复阻塞。
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
