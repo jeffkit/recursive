@@ -420,10 +420,79 @@ The terminal UI is in `crates/recursive-tui/`. For an experience-level
 comparison against fake-cc (Claude Code-style baseline), see
 [docs/tui-fake-cc-gap.md](docs/tui-fake-cc-gap.md).
 
+## Self-Improving Agents
+
+Recursive develops itself. The same kernel you embed above is the one that
+implements new features in Recursive — a run reads a goal from
+`.dev/goals/`, drives `recursive` over the codebase in an isolated
+worktree, runs the quality gates, self-reviews through a *different*
+provider, then commits on success (a failing gate preserves the worktree
+for a stronger agent or a human instead of discarding it), and records the
+outcome in `.dev/journal/` so the next run starts from the last run's
+lessons.
+
+The loop runs on the **plaita engine**:
+
+```bash
+.dev/scripts/launch-flow-plaita.sh \
+  --goal-file .dev/goals/01-my-goal.md \
+  --provider deepseek
+```
+
+`launch-flow-plaita.sh` takes the same core flag surface as
+`launch-flow.sh` (`--goal` / `--goal-file` / `--provider` / `--model` /
+`--run-id` / `--hitl` / `--no-review` / `--no-commit` / `--max-steps` /
+`--reviewer-provider`), starts the run in the background, and prints the
+run id plus the log path. Every run writes to `.flowcast/runs/<run-id>/`;
+a supervisor (or you) follows progress by polling `state.json` until a
+terminal verdict appears.
+
+### Architecture: thin flow, thick engine
+
+Definition and observation belong to **plaita-console**; execution stays
+local:
+
+| Layer | Where | Owns |
+|---|---|---|
+| Node graph (thin) | `.dev/flows/self_improve_flow.py`, compiled to `self-improve.plaita.json` | The 45-node skeleton — one node per step of the loop |
+| Engine (thick) | `.dev/flows/self_improve_engine.py` | All the real logic — watchdog, gate fix-loops, cross-provider review, commit/rebase, preserve |
+| Bridge | `.dev/flows/self_improve_bridge.py` | Resolves the flow definition, then runs it locally |
+
+Each node is a thin shim that shells out to
+`self_improve_engine.py step <name>` and reads back `step-result.json`;
+the engine owns the cross-step state. So changing loop *behaviour* means
+editing only `self_improve_engine.py` — no re-publish of the flow
+definition. Changing the node *graph* means editing
+`self_improve_flow.py`, re-running `build_self_improve_flow.py`, and
+publishing a new version to the console. Definitions resolve with a
+three-tier fallback — published console version → cached copy in the run
+directory → the in-repo JSON — while execution always stays on the local
+machine.
+
+### flowcast path (rollback)
+
+`.dev/scripts/launch-flow.sh` — the Flowcast orchestrator
+(`.dev/flows/self-improve.flow.js`) — is retained as the **rollback
+path**, behaviourally equivalent to the plaita engine: same gates, same
+cross-provider review, same verdicts (`committed` / `failed-preserved` /
+`skip-commit` / `panic-preserved`), and the same run directory and
+`state.json` contract. (flowcast has one extra, rare terminal value —
+`rolled-back` — emitted only when an attempt error coincides with a failed
+scene-preserve; the plaita engine always preserves instead.) A run can be
+resumed or supervised identically on either engine; reach for flowcast if
+the plaita path misbehaves on a given goal.
+
+See [`.dev/flows/SELF_IMPROVE.md`](.dev/flows/SELF_IMPROVE.md) for the
+operative guide and
+[website/en/guide/self-improve.md](website/en/guide/self-improve.md) for
+a walkthrough.
+
 ## Docs
 
 - [LLM gateway compatibility](docs/llm-gateway-compat.md) — known traps with
   new-api/one-api/Bedrock (#15/#16/#17).
+- [Self-improving agents](website/en/guide/self-improve.md) — how Recursive
+  develops itself (plaita engine + flowcast rollback).
 
 ## License
 

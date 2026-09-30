@@ -4,10 +4,22 @@ One of Recursive's most distinctive features is that it runs its own development
 
 ## How it works
 
-The self-improvement loop is orchestrated by a Flowcast flow at
-`.dev/flows/self-improve.flow.js` (launched via
-`.dev/scripts/launch-flow.sh`; see `.dev/flows/SELF_IMPROVE.md`). At a
-high level:
+The self-improvement loop runs on the **plaita engine**:
+
+```bash
+.dev/scripts/launch-flow-plaita.sh \
+  --goal-file .dev/goals/01-my-goal.md \
+  --provider deepseek
+```
+
+`launch-flow-plaita.sh` takes the same core flag surface as
+`launch-flow.sh` (`--goal` / `--goal-file` / `--provider` / `--model` /
+`--run-id` / `--hitl` / `--no-review` / `--no-commit` / `--max-steps` /
+`--reviewer-provider`), runs in the background, and prints the run id and
+the log path. The Flowcast flow at `.dev/flows/self-improve.flow.js`
+(launched via `.dev/scripts/launch-flow.sh`) is retained as a
+behaviourally equivalent **rollback path**. At a high level the loop is
+the same on either engine:
 
 ```
 1. Read goal from .dev/goals/ or .dev/ROADMAP.md
@@ -15,12 +27,40 @@ high level:
 3. Agent reads the codebase, understands the goal, makes changes
 4. Quality gates: cargo test / clippy / fmt (+ project gates from .flowcast/gates.json)
 5. If all pass: commit the changes
-6. If fail: resume-fix once, then rollback
+6. If fail: resume-fix, then preserve the worktree (verdict `failed-preserved`)
 7. Emit an observation to .dev/journal/ for the next run
 ```
 
 > The legacy `.dev/scripts/self-improve.sh` bash wrapper is deprecated;
 > the flow is the canonical, auditable, resumable path.
+
+## Engines: thin flow, thick engine
+
+| | plaita (recommended) | flowcast (rollback) |
+|---|---|---|
+| Launcher | `.dev/scripts/launch-flow-plaita.sh` | `.dev/scripts/launch-flow.sh` |
+| Orchestration | `.dev/flows/self_improve_flow.py` — thin 45-node skeleton, compiled to `self-improve.plaita.json` | `.dev/flows/self-improve.flow.js` |
+| Logic | `.dev/flows/self_improve_engine.py` — watchdog, gate fix-loops, review, commit/rebase, preserve | inline in the flow |
+
+The plaita form splits **definition** from **execution**: definition and
+observation belong to plaita-console, while execution stays local. Each
+node in the skeleton is a thin shim that shells out to
+`self_improve_engine.py step <name>`; the engine holds the cross-step
+state. Changing loop *behaviour* therefore means editing only
+`self_improve_engine.py` — no re-publish of the flow definition. Changing
+the node *graph* means editing `self_improve_flow.py`, re-running
+`build_self_improve_flow.py`, and publishing a new version. Definitions
+resolve with a three-tier fallback (published console version → cached
+copy in the run directory → the in-repo JSON), and both engines write the
+same `.flowcast/runs/<run-id>/` artifacts with the same `state.json`
+contract, so supervision and resume are identical.
+
+Both engines enforce the same quality gates and emit the same verdicts —
+`committed` / `failed-preserved` / `skip-commit` / `panic-preserved`.
+(flowcast can additionally report `rolled-back` in one rare case: an
+attempt error which coincides with a failed scene-preserve. The plaita
+path always preserves instead, so it never emits `rolled-back`.) Reach for
+flowcast if the plaita path misbehaves on a given goal.
 
 ## The observation system
 
