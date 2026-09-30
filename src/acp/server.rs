@@ -845,7 +845,7 @@ async fn handle_session_load(
                                 "sessionUpdate": "tool_call",
                                 "toolCallId": tc.id,
                                 "title": tc.name,
-                                "kind": ToolKind::from_acp_tool_name(&tc.name),
+                                "kind": ToolKind::from_tool_name(&tc.name),
                                 "status": "pending",
                             }
                         }

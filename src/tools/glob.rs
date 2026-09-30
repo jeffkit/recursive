@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use super::transport::{retryable_prefix, ToolTransport, WalkOptions};
 use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
-use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::tool_kind::ToolKind;
 
 const MAX_RESULTS: usize = 200;
 

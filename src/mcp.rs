@@ -212,34 +212,9 @@ impl fmt::Debug for McpTransport {
     }
 }
 
-/// MCP elicitation request forwarded to a host (Claude `elicitation` control).
-#[derive(Debug, Clone)]
-pub struct ElicitationRequest {
-    pub mcp_server_name: String,
-    pub message: String,
-    pub mode: Option<String>,
-    pub url: Option<String>,
-    pub elicitation_id: Option<String>,
-    pub requested_schema: Option<Value>,
-    pub title: Option<String>,
-    pub display_name: Option<String>,
-    pub description: Option<String>,
-}
-
-/// Handles MCP `-32042` UrlElicitationRequired by asking the host.
-#[async_trait]
-pub trait ElicitationHandler: Send + Sync {
-    async fn elicit(&self, request: ElicitationRequest) -> Option<Value>;
-}
-
-/// Shared slot so the CLI control channel can install a handler after MCP
-/// clients are constructed.
-pub type SharedElicitationHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn ElicitationHandler>>>>;
-
-/// Create an empty elicitation-handler slot.
-pub fn new_elicitation_slot() -> SharedElicitationHandler {
-    Arc::new(tokio::sync::RwLock::new(None))
-}
+pub use crate::tools::elicitation::{
+    new_elicitation_slot, ElicitationHandler, ElicitationRequest, SharedElicitationHandler,
+};
 
 /// An MCP client owns a transport and manages JSON-RPC communication.
 pub struct McpClient {

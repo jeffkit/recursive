@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-use crate::acp::ToolKind;
 use crate::agent::PermissionDecision;
 use crate::error::Result;
 use crate::llm::ToolSpec;
@@ -18,6 +17,7 @@ use crate::permissions::auto_classifier::AutoClassifier;
 use crate::permissions::SharedPermissions;
 use crate::permissions::{PermissionMode, PermissionsConfig};
 use crate::tools::fs::ReadFileState;
+use crate::tools::tool_kind::ToolKind;
 
 use super::audit::TouchedFiles;
 use super::policy_sandbox;
@@ -178,7 +178,7 @@ pub struct ToolRegistry {
     session_roots: Option<super::dispatch::SharedSandboxRoots>,
     /// Shared MCP elicitation handler slot (Claude control `elicitation`).
     #[cfg(feature = "mcp")]
-    elicitation: Option<crate::mcp::SharedElicitationHandler>,
+    elicitation: Option<crate::tools::elicitation::SharedElicitationHandler>,
     /// Goal-161: optional runtime permission hook. When `Some`, called
     /// before every tool invocation. `None` means allow all (backward-
     /// compatible default).
@@ -584,14 +584,17 @@ impl ToolRegistry {
 
     /// Attach a shared MCP elicitation-handler slot.
     #[cfg(feature = "mcp")]
-    pub fn with_elicitation_slot(mut self, slot: crate::mcp::SharedElicitationHandler) -> Self {
+    pub fn with_elicitation_slot(
+        mut self,
+        slot: crate::tools::elicitation::SharedElicitationHandler,
+    ) -> Self {
         self.elicitation = Some(slot);
         self
     }
 
     /// Return the shared elicitation-handler slot, if any.
     #[cfg(feature = "mcp")]
-    pub fn elicitation_slot(&self) -> Option<crate::mcp::SharedElicitationHandler> {
+    pub fn elicitation_slot(&self) -> Option<crate::tools::elicitation::SharedElicitationHandler> {
         self.elicitation.clone()
     }
 

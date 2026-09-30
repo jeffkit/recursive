@@ -11,6 +11,5 @@ pub mod permission;
 pub mod protocol;
 pub mod server;
 pub mod session;
-pub mod tool_kind;
 
-pub use tool_kind::ToolKind;
+pub use crate::tools::tool_kind::ToolKind;

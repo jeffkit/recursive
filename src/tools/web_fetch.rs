@@ -8,9 +8,9 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::Tool;
-use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::tool_kind::ToolKind;
 use crate::tools::url_guard::validate_url;
 
 const DEFAULT_MAX_BYTES: usize = 65536;

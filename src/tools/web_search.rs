@@ -20,9 +20,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::Tool;
-use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::tool_kind::ToolKind;
 
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 const CONNECT_TIMEOUT_SECS: u64 = 5;

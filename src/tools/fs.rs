@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use super::transport::ToolTransport;
 use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
-use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::tool_kind::ToolKind;
 
 // ---------------------------------------------------------------------------
 // ReadFileState — shared between ReadFile, EditTool, and WriteFile

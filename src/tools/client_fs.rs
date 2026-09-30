@@ -203,8 +203,8 @@ impl Tool for ClientReadFile {
         })
     }
 
-    fn kind(&self) -> crate::acp::ToolKind {
-        crate::acp::ToolKind::Read
+    fn kind(&self) -> crate::tools::tool_kind::ToolKind {
+        crate::tools::tool_kind::ToolKind::Read
     }
 }
 
@@ -368,8 +368,8 @@ impl Tool for ClientWriteFile {
         Ok(format!("Content queued for client write to {file_path}"))
     }
 
-    fn kind(&self) -> crate::acp::ToolKind {
-        crate::acp::ToolKind::Write
+    fn kind(&self) -> crate::tools::tool_kind::ToolKind {
+        crate::tools::tool_kind::ToolKind::Write
     }
 }
 

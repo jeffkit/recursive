@@ -28,6 +28,7 @@ pub mod e2b_provider;
 #[cfg(feature = "e2b-sandbox")]
 pub use e2b_provider::E2bToolSetProvider;
 pub mod edit;
+pub mod elicitation;
 pub mod episodic_recall;
 pub mod estimate_tokens;
 pub mod facts;
@@ -65,6 +66,7 @@ pub mod team_create;
 #[cfg(feature = "coordinator-mode")]
 pub mod team_delete;
 pub mod todo;
+pub mod tool_kind;
 pub mod tool_search;
 pub mod transport;
 pub(crate) mod url_guard;

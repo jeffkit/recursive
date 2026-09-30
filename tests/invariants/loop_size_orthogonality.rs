@@ -264,3 +264,75 @@ fn providers_do_not_import_tools_internals() {
         );
     }
 }
+
+/// Tools (core capability layer) must not import transport/protocol adapters
+/// (acp, mcp, http, weixin). Adapters depend on tools, never the reverse.
+/// Imports in `#[cfg(test)]` blocks are exempt.
+#[test]
+fn tools_do_not_import_transport_adapters() {
+    let tools_dir = workspace_root().join("src").join("tools");
+
+    let forbidden = [
+        "use crate::acp",
+        "use crate::mcp",
+        "use crate::http",
+        "use crate::weixin",
+        "crate::acp::",
+        "crate::mcp::",
+        "crate::http::",
+        "crate::weixin::",
+    ];
+
+    let mut violations = Vec::new();
+    for entry in walkdir::WalkDir::new(&tools_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+    {
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+
+        // Track whether we're inside a #[cfg(test)] block
+        let mut in_test_module = false;
+        let mut brace_depth = 0u32;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Detect entering/exiting test module
+            if trimmed.starts_with("#[cfg(test)]") {
+                in_test_module = true;
+                continue;
+            }
+
+            if in_test_module {
+                // Count braces to track test module scope
+                brace_depth += trimmed.matches('{').count() as u32;
+                if trimmed.contains('}') {
+                    let closes = trimmed.matches('}').count() as u32;
+                    if closes >= brace_depth {
+                        brace_depth = 0;
+                        in_test_module = false;
+                    } else {
+                        brace_depth -= closes;
+                    }
+                }
+                continue;
+            }
+
+            if !trimmed.contains("//") && forbidden.iter().any(|p| trimmed.contains(p)) {
+                violations.push(format!(
+                    "{}: `{trimmed}`",
+                    entry.path().strip_prefix(&tools_dir).unwrap().display()
+                ));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        panic!(
+            "invariant #2 violation: tools/ modules import transport adapters:\n  - {}\n\
+             Protocol adapters (acp/mcp/http/weixin) must depend on tools, never the reverse.",
+            violations.join("\n  - ")
+        );
+    }
+}

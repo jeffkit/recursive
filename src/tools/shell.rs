@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use super::resolve_within;
 use super::Tool;
-use crate::acp::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::tool_kind::ToolKind;
 
 /// Hard ceiling for the LLM-supplied `max_output_bytes` arg. Generous
 /// enough for a full `cargo build` diagnostic dump, small enough that a
