@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agui_client::{AguiClient, ClientError, Event, RunAgentInput};
@@ -18,10 +19,11 @@ use recursive::config::Config;
 use recursive::http::{
     build_router_with_auth_and_rate_limit, AppState, AuthConfig, Metrics, RateLimiter,
 };
-use recursive::llm::{Completion, MockProvider, ToolCall};
+use recursive::llm::{ChatProvider, Completion, MockProvider, TokenUsage, ToolCall};
+use recursive::session::{SessionReader, SessionStatus};
 use recursive::tools::ToolRegistry;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 // Goal 396: reuse the shared HTTP fixtures (in-memory storage backend) so
 // AppState keeps compiling without touching the real filesystem.
@@ -110,7 +112,7 @@ fn mock_config(workspace: PathBuf) -> Config {
     }
 }
 
-fn state(workspace: PathBuf, provider: Arc<MockProvider>) -> AppState {
+fn state(workspace: PathBuf, provider: Arc<dyn ChatProvider>) -> AppState {
     AppState {
         tools: vec![],
         config: mock_config(workspace),
@@ -162,7 +164,7 @@ fn input_with(thread: &str, run: &str, messages: Vec<Message>) -> RunAgentInput 
 }
 
 /// Bind to 127.0.0.1:0, spawn the server, return its base URL.
-async fn spawn_server(workspace: PathBuf, provider: Arc<MockProvider>) -> url::Url {
+async fn spawn_server(workspace: PathBuf, provider: Arc<dyn ChatProvider>) -> url::Url {
     // Since Goal 277, the HTTP server refuses requests when auth is
     // not configured unless INSECURE_OK=1 is set. These e2e tests
     // don't need auth — they talk to loopback.
@@ -476,4 +478,373 @@ fn event_name(ev: &Event) -> &'static str {
         Event::Custom(_) => "Custom",
         Event::Raw(_) => "Raw",
     }
+}
+
+// ── Issue #57: an AG-UI thread IS a session ─────────────────────────────────
+
+#[tokio::test]
+async fn agui_run_persists_a_listable_native_session() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    let provider = Arc::new(MockProvider::new(vec![Completion {
+        content: "hi from recursive".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: Some(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 100,
+            reasoning_tokens: 0,
+        }),
+        reasoning_content: None,
+    }]));
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
+    let client = AguiClient::new(endpoint);
+
+    let input = input_with("vis-thread", "vis-run-0", vec![user_msg("u1", "say hi")]);
+    let mut rx = client.run(input).await.expect("run");
+    // persist_run happens BEFORE RunFinished is emitted, so seeing
+    // RunFinished guarantees the session is on disk.
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, Event::RunFinished(_)) {
+            break;
+        }
+    }
+
+    // 1. The consumer chain from the issue report: SessionReader::list_sessions
+    //    (sessions list, episodic_recall, resume picker) must see the thread.
+    let listed = SessionReader::list_sessions(workspace.path()).expect("list sessions");
+    let dir = listed
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with("agui-"))
+                .unwrap_or(false)
+        })
+        .expect("AG-UI thread must be visible to SessionReader::list_sessions")
+        .clone();
+
+    // 2. `.meta.json` exists and is fully populated.
+    let meta = SessionReader::load_meta(&dir).expect("load meta");
+    assert_eq!(meta.status, SessionStatus::Completed);
+    assert_eq!(meta.message_count, 2, "user + assistant");
+    assert_eq!(meta.first_prompt.as_deref(), Some("say hi"));
+    assert_eq!(meta.last_prompt.as_deref(), Some("say hi"));
+
+    // 3. Cost lands in meta (tokens) + cost.json (tracker block).
+    let cost = meta.cost.expect("run usage must reach .meta.json cost");
+    assert_eq!(cost.total_input_tokens, 100);
+    assert_eq!(cost.total_output_tokens, 20);
+    let cost_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("cost.json")).expect("cost.json must exist"),
+    )
+    .expect("cost.json parses");
+    assert_eq!(cost_json["total_usage"]["total_tokens"], 120);
+
+    // 4. The transcript is native-format — readable by the exact tool
+    //    (`episodic_recall` → load_transcript) that used to see nothing.
+    let entries = SessionReader::load_transcript(&dir).expect("load transcript");
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.role == "assistant" && e.content == "hi from recursive"),
+        "assistant reply must be retrievable via load_transcript"
+    );
+}
+
+/// Provider that holds the first `complete()` call open until released —
+/// lets the test hold run #1 in flight while probing the fence.
+struct BarrierProvider {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    notified: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl ChatProvider for BarrierProvider {
+    async fn complete(
+        &self,
+        _messages: &[recursive::message::Message],
+        _tools: &[recursive::llm::ToolSpec],
+    ) -> recursive::error::Result<Completion> {
+        self.entered.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.release.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                break; // fail the test below by finishing late, not hanging forever
+            }
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                self.notified.notified(),
+            )
+            .await;
+        }
+        Ok(Completion {
+            content: "released".into(),
+            finish_reason: Some("stop".into()),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agui_run_rejects_a_second_concurrent_run_for_the_same_thread() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
+    let provider = Arc::new(BarrierProvider {
+        entered: entered.clone(),
+        release: release.clone(),
+        notified: notify.clone(),
+    });
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
+    let client = AguiClient::new(endpoint);
+
+    // Run #1 for the thread: parks inside the provider.
+    let mut rx1 = client
+        .run(input_with(
+            "fence-thread",
+            "run-1",
+            vec![user_msg("u1", "slow please")],
+        ))
+        .await
+        .expect("first run starts");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "run #1 never reached the provider"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // A second run for the SAME thread while #1 is in flight → 409 Conflict,
+    // not a queued duplicate and not a silent transcript race.
+    let second = client
+        .run(input_with(
+            "fence-thread",
+            "run-2",
+            vec![user_msg("u1", "duplicate")],
+        ))
+        .await;
+    match second {
+        Err(ClientError::HttpStatus { status, body }) => {
+            assert_eq!(status, 409, "expected 409, got {status}: {body}");
+        }
+        Err(other) => panic!("expected HTTP 409, got error: {other}"),
+        Ok(_) => panic!("second concurrent run for the same thread must be refused"),
+    }
+
+    // Let run #1 finish and drain its stream to RunFinished (guard drops
+    // with the driver task).
+    release.store(true, Ordering::SeqCst);
+    notify.notify_waiters();
+    while let Some(ev) = rx1.recv().await {
+        if matches!(ev, Event::RunFinished(_)) {
+            break;
+        }
+    }
+
+    // The fence re-opens: the same thread runs again...
+    let mut rx_again = client
+        .run(input_with(
+            "fence-thread",
+            "run-3",
+            vec![user_msg("u1", "again")],
+        ))
+        .await
+        .expect("same thread must run again once the previous run finished");
+    while let Some(ev) = rx_again.recv().await {
+        if matches!(ev, Event::RunFinished(_)) {
+            break;
+        }
+    }
+    // ...and the transcript accumulated all three runs (append, not overwrite).
+    let listed = SessionReader::list_sessions(workspace.path()).expect("list sessions");
+    let dir = listed
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .map(|n| {
+                    n.to_string_lossy()
+                        == recursive::agui_session::thread_session_key("fence-thread")
+                })
+                .unwrap_or(false)
+        })
+        .expect("fence-thread session dir");
+    let entries = SessionReader::load_transcript(dir).expect("transcript");
+    let user_texts: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.role == "user")
+        .map(|e| e.content.as_str())
+        .collect();
+    assert_eq!(
+        user_texts,
+        vec!["slow please", "again"],
+        "second run must be appended, first-run history preserved; got {user_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn agui_interrupt_resume_round_trips_through_the_native_session() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    // Run 1 makes the model call a client tool; run 2 (resume) completes.
+    // Completion 2 answers the post-deny turn (the interrupt is detected
+    // after the loop stops), completion 3 answers the resumed turn.
+    let provider = Arc::new(MockProvider::new(vec![
+        Completion {
+            content: "checking weather".into(),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "get_weather".into(),
+                arguments: serde_json::json!({"city": "SF"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "waiting for the weather service".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "It is sunny.".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ]));
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
+    let client = AguiClient::new(endpoint);
+
+    let input = RunAgentInput {
+        thread_id: "round-trip".into(),
+        run_id: "rt-run-0".into(),
+        messages: vec![user_msg("u1", "weather in SF?")],
+        tools: vec![agui_protocol::Tool {
+            name: "get_weather".into(),
+            description: "client-side weather lookup".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }],
+        context: vec![],
+        resume: None,
+        state: None,
+        interrupt_before: None,
+        forwarded_props: None,
+    };
+    let mut rx = client.run(input).await.expect("run 1");
+    let mut interrupt_id = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let Event::RunFinished(f) = ev {
+            match f.outcome {
+                Some(agui_protocol::RunFinishedOutcome::Interrupt { interrupts }) => {
+                    interrupt_id = interrupts[0].id.clone();
+                }
+                other => panic!("run 1 must end in Interrupt, got {other:?}"),
+            }
+            break;
+        }
+    }
+    assert!(!interrupt_id.is_empty(), "interrupt must carry an id");
+
+    // The interrupted run is persisted as a session with status
+    // Interrupted and the open interrupt next to the transcript.
+    let listed = SessionReader::list_sessions(workspace.path()).expect("list sessions");
+    let dir = listed
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .map(|n| {
+                    n.to_string_lossy() == recursive::agui_session::thread_session_key("round-trip")
+                })
+                .unwrap_or(false)
+        })
+        .expect("round-trip session dir")
+        .clone();
+    let meta = SessionReader::load_meta(&dir).expect("meta after run 1");
+    assert_eq!(meta.status, SessionStatus::Interrupted);
+    let interrupts: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(".interrupts.json")).expect("interrupts"))
+            .expect("interrupts parse");
+    assert_eq!(interrupts[0]["interrupt_id"], interrupt_id.as_str());
+
+    // Run 2: resume with the client-tool result.
+    let resume_input = RunAgentInput {
+        thread_id: "round-trip".into(),
+        run_id: "rt-run-1".into(),
+        messages: vec![],
+        tools: vec![],
+        context: vec![],
+        resume: Some(vec![agui_protocol::Resume {
+            interrupt_id: interrupt_id.clone(),
+            status: agui_protocol::ResumeStatus::Resolved,
+            payload: Some(serde_json::json!({"forecast": "sunny"})),
+        }]),
+        state: None,
+        interrupt_before: None,
+        forwarded_props: None,
+    };
+    let mut rx2 = client.run(resume_input).await.expect("resume run");
+    while let Some(ev) = rx2.recv().await {
+        if let Event::RunFinished(f) = ev {
+            assert!(
+                matches!(f.outcome, Some(agui_protocol::RunFinishedOutcome::Success)),
+                "resume must end in Success, got {:?}",
+                f.outcome
+            );
+            break;
+        }
+    }
+
+    // The native session now carries BOTH runs with the tool pairing
+    // intact across the persist ↔ resume boundary (invariant #8).
+    let entries = SessionReader::load_transcript(&dir).expect("transcript");
+    let roles: Vec<&str> = entries.iter().map(|e| e.role.as_str()).collect();
+    assert_eq!(
+        roles,
+        vec![
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "user",
+            "assistant"
+        ],
+        "both runs must be appended; got {roles:?}"
+    );
+    assert_eq!(entries[1].tool_calls[0].id, "t1");
+    assert_eq!(entries[2].tool_call_id.as_deref(), Some("t1"));
+    // The resume payload replaced the deny marker ON DISK — a later resume
+    // of this thread re-seeds the real client-tool result, not the deny text.
+    assert!(
+        !entries[2].content.contains("[frontend tool]"),
+        "deny marker must not survive on disk after resume; got {}",
+        entries[2].content
+    );
+    assert!(
+        entries[2].content.contains("sunny"),
+        "disk must carry the resume payload; got {}",
+        entries[2].content
+    );
+    assert_eq!(entries[5].content, "It is sunny.");
+
+    // Meta reflects the finished run; interrupt marker cleared.
+    let meta2 = SessionReader::load_meta(&dir).expect("meta after resume");
+    assert_eq!(meta2.status, SessionStatus::Completed);
+    assert!(
+        !dir.join(".interrupts.json").exists(),
+        "interrupt marker must be cleared after resume"
+    );
 }

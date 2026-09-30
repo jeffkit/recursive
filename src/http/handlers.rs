@@ -1581,6 +1581,29 @@ pub(super) async fn agui_run(
         )
     })?;
 
+    // ── Per-thread run fence (issue #57 §④) ─────────────────────────────
+    // At most one in-flight run per thread. Mobile retries / double
+    // submits used to run two drivers concurrently against one transcript
+    // (measured lost-update); refuse the second run instead of queueing
+    // it — a queued duplicate would run the same prompt twice. The guard
+    // is released when the driver task below finishes (or on unwind).
+    let run_guard = state
+        .host
+        .try_begin_run(crate::agui_session::thread_session_key(&input.thread_id))
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    status: "error".into(),
+                    error: format!(
+                        "a run is already active for thread '{}'; \
+                         wait for it to finish before starting another",
+                        input.thread_id
+                    ),
+                }),
+            )
+        })?;
+
     // ── Resume handling ──────────────────────────────────────────────────
     // If `input.resume` is present and non-empty, process the interrupt
     // resolutions before building the runtime.
@@ -1706,6 +1729,11 @@ pub(super) async fn agui_run(
         // the TestInterruptHook, so we look for the tool result whose
         // `tool_call_id` matches the interrupt's bound tool_call_id.
         let mut modified = loaded_messages;
+        // The same splices must land on disk (issue #57): runs append, so
+        // without this the persisted transcript keeps the deny-marker text
+        // and a later resume re-seeds the wrong history.
+        let mut disk_replacements: Vec<(String, String)> = Vec::new();
+        let mut disk_injections: Vec<(String, String)> = Vec::new();
         for open_int in &open_interrupts {
             let Some(resume) = resume_by_id.get(open_int.interrupt_id.as_str()) else {
                 continue;
@@ -1719,6 +1747,10 @@ pub(super) async fn agui_run(
                     "[interrupt cancelled by user]",
                 );
                 modified.push(sentinel);
+                disk_injections.push((
+                    tool_call_id.clone(),
+                    "[interrupt cancelled by user]".to_string(),
+                ));
             } else if let Some(ref payload) = resume.payload {
                 // Resolved: replace the denied tool result content with the
                 // resume payload, or inject a new tool result if none exists.
@@ -1737,8 +1769,19 @@ pub(super) async fn agui_run(
                         tool_call_id,
                         &payload_str,
                     ));
+                    disk_injections.push((tool_call_id.clone(), payload_str));
+                } else {
+                    disk_replacements.push((tool_call_id.clone(), payload_str));
                 }
             }
+        }
+
+        if !disk_replacements.is_empty() || !disk_injections.is_empty() {
+            crate::agui_session::apply_resume_tool_results(
+                &session_dir,
+                &disk_replacements,
+                &disk_injections,
+            );
         }
 
         // Clear the open interrupts now that they've been consumed.
@@ -1883,17 +1926,19 @@ pub(super) async fn agui_run(
         runtime.set_permission_hook(hook.clone());
     }
 
-    // Wire per-turn workspace checkpoints. The AG-UI thread is the
-    // natural session boundary, so we use a sanitised version of the
-    // thread_id as the checkpoint chain id. Failures (no git on PATH,
+    // Wire per-turn workspace checkpoints. The AG-UI thread IS the
+    // session (issue #57): the checkpoint chain id is the thread's
+    // session key and the log lives inside the thread's session
+    // directory, next to transcript.jsonl. Failures (no git on PATH,
     // bad workspace path, etc.) only log a warning — the run still
     // proceeds without checkpoints.
     if let Ok(repo) = crate::ShadowRepo::open(&state.config.workspace) {
-        let session_id = sanitize_thread_id_for_session(&input.thread_id);
-        if let Ok(session_dir) = crate::user_sessions_dir(&state.config.workspace) {
-            let log_dir = session_dir.join(format!("agui-{session_id}"));
-            let _ = std::fs::create_dir_all(&log_dir);
-            let log_path = log_dir.join("checkpoints.jsonl");
+        if let Some(session_dir) =
+            crate::agui_session::session_dir(&state.config.workspace, &input.thread_id)
+        {
+            let session_id = crate::agui_session::thread_session_key(&input.thread_id);
+            let _ = std::fs::create_dir_all(&session_dir);
+            let log_path = session_dir.join("checkpoints.jsonl");
             let touched = runtime.kernel().tools().touched_files();
             if let Err(e) =
                 runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
@@ -1952,6 +1997,16 @@ pub(super) async fn agui_run(
     let drv_client_hook = client_hook.clone();
     let drv_client_tools = agui_tools.clone();
     let drv_workspace = state.config.workspace.clone();
+    // Session identity for `.meta.json` (issue #57): the config that is
+    // about to serve this run.
+    let drv_model = state.config.model.clone();
+    let drv_provider = state.config.provider_type.clone();
+    let drv_preset = state.config.preset.clone();
+    // Transcript length before the run: everything after this index is
+    // THIS run's contribution — only that gets appended to the session
+    // (on resume runs the transcript starts with the seeded history;
+    // appending it again would duplicate it).
+    let drv_pre_run_len = runtime.transcript().len();
 
     let driver_handle = tokio::spawn(async move {
         let outcome = runtime.run(&goal).await;
@@ -2000,21 +2055,41 @@ pub(super) async fn agui_run(
             Err(_) => record_run_failed(&metrics),
         }
 
-        // Persist the transcript so a later `resume` (client-tool result
-        // round-trip) can load and seed it. Format: one Message JSON per
-        // line — the resume loader reads the same shape.
-        if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
-            let _ = std::fs::create_dir_all(&session_dir);
-            let mut lines = String::new();
-            for m in runtime.transcript() {
-                if let Ok(v) = serde_json::to_string(m) {
-                    lines.push_str(&v);
-                    lines.push('\n');
+        // Persist the run into the thread's native session (issue #57):
+        // SessionWriter appends this run's messages (uuid chain, msg ids,
+        // timestamps) and updates `.meta.json` — status, prompts, message
+        // count and cumulative token cost — so the thread is a first-class
+        // session (`sessions list`, `episodic_recall`, resume picker).
+        // `CostTracker` adds `cost.json` + the `cost_usd` block. Only the
+        // messages this run produced are appended (drv_pre_run_len skips
+        // the seeded history on resume runs).
+        {
+            let status = if client_denied.is_some() || test_was_interrupted {
+                crate::session::SessionStatus::Interrupted
+            } else {
+                match &outcome {
+                    Ok(o) => crate::session::SessionStatus::for_finish(&o.finish_reason),
+                    Err(_) => crate::session::SessionStatus::Crashed,
                 }
-            }
-            let path = session_dir.join("transcript.jsonl");
-            if let Err(e) = std::fs::write(&path, lines) {
-                tracing::warn!("agui: transcript persist failed: {e}");
+            };
+            let transcript = runtime.transcript();
+            let new_messages = transcript
+                .get(drv_pre_run_len.min(transcript.len())..)
+                .unwrap_or(&[]);
+            let record = crate::agui_session::RunRecord {
+                workspace: &drv_workspace,
+                thread_id: &drv_thread,
+                messages: new_messages,
+                goal: &goal,
+                model: &drv_model,
+                provider: &drv_provider,
+                preset: drv_preset.as_deref(),
+                status,
+                usage: outcome.as_ref().ok().map(|o| o.total_usage),
+                llm_latency_ms: outcome.as_ref().ok().map(|o| o.llm_latency_ms).unwrap_or(0),
+            };
+            if let Err(e) = crate::agui_session::persist_run(record) {
+                tracing::warn!("agui: session persist failed: {e}");
             }
         }
 
@@ -2191,6 +2266,11 @@ pub(super) async fn agui_run(
                 base: ag::BaseEvent::default(),
             }));
         }
+
+        // Release the per-thread run fence (issue #57 §④): the next run
+        // for this thread may start once RunFinished is out. On panic the
+        // guard's Drop unwinds it free.
+        drop(run_guard);
     });
 
     // Monitor the driver task so panics are surfaced in logs rather than
@@ -2209,43 +2289,16 @@ pub(super) async fn agui_run(
     Ok(Sse::new(stream))
 }
 
-/// Map an arbitrary AG-UI thread id onto a checkpoint session id that
-/// satisfies `validate_session_id` in the checkpoint module
-/// (alphanumerics + `-` `_` `.`, no leading dot, no `..`, no path
-/// separators). Disallowed chars become `-`.
-fn sanitize_thread_id_for_session(thread: &str) -> String {
-    let mut out: String = thread
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // Drop a leading dot so we don't produce a hidden dir.
-    while out.starts_with('.') {
-        out.replace_range(..1, "-");
-    }
-    // Collapse `..` so we don't produce ref-traversal sequences.
-    while out.contains("..") {
-        out = out.replace("..", "-.");
-    }
-    if out.is_empty() {
-        out.push_str("default");
-    }
-    out
-}
-
 // ── AG-UI Interrupt/Resume helpers ──────────────────────────────────────
 
-/// Path to the JSONL session directory for an AG-UI thread.
+/// Path to the session directory for an AG-UI thread.
+///
+/// Since issue #57 this is the native session layout
+/// (`<sessions>/<workspace-slug>/agui-<thread-key>/`, see
+/// [`crate::agui_session`]); pre-#57 flat thread directories are
+/// migrated on resolve.
 fn agui_session_dir(workspace: &std::path::Path, thread_id: &str) -> Option<std::path::PathBuf> {
-    let session_id = sanitize_thread_id_for_session(thread_id);
-    crate::user_sessions_dir(workspace)
-        .ok()
-        .map(|d| d.join(format!("agui-{session_id}")))
+    crate::agui_session::resolve_session_dir(workspace, thread_id)
 }
 
 /// Which interrupt mechanism fired during an AG-UI run.
@@ -3700,41 +3753,39 @@ mod tests {
         assert_eq!(&ts[17..19], "30", "seconds mismatch; got {ts}");
     }
 
-    // ── sanitize_thread_id_for_session ──────────────────────────────────────
+    // ── thread-id sanitising (issue #57) ────────────────────────────────────
+    //
+    // Live threads map to `agui_session::thread_session_key` (blake3, no
+    // collisions); the old lossy sanitiser survives only as
+    // `legacy_sanitize_thread_id` for pre-#57 directory lookups. The
+    // traversal-safety tests for it live in `src/agui_session.rs`; here we
+    // pin the properties the /agui route relies on for the LIVE mapping.
 
     #[test]
-    fn sanitize_thread_id_valid_passthrough() {
-        assert_eq!(sanitize_thread_id_for_session("abc-123"), "abc-123");
-        assert_eq!(sanitize_thread_id_for_session("foo_bar.baz"), "foo_bar.baz");
+    fn thread_session_key_is_a_safe_directory_and_chain_id() {
+        for thread in [
+            "abc-123",
+            "a/b:c",
+            "..",
+            ".hidden",
+            "tenantA/user1/conv1",
+            "",
+        ] {
+            let key = crate::agui_session::thread_session_key(thread);
+            assert!(key.starts_with("agui-"), "prefix required; got {key}");
+            assert!(!key.contains('/'), "no path separators; got {key}");
+            assert!(!key.contains(".."), "no traversal sequences; got {key}");
+            assert!(!key.starts_with('.'), "no hidden dirs; got {key}");
+            assert!(!key.is_empty());
+        }
     }
 
     #[test]
-    fn sanitize_thread_id_replaces_special_chars() {
-        let out = sanitize_thread_id_for_session("a/b:c");
-        assert!(!out.contains('/'), "slash must be replaced");
-        assert!(!out.contains(':'), "colon must be replaced");
-    }
-
-    #[test]
-    fn sanitize_thread_id_leading_dot_replaced() {
-        let out = sanitize_thread_id_for_session(".hidden");
-        assert!(
-            !out.starts_with('.'),
-            "leading dot must be replaced; got {out}"
-        );
-    }
-
-    #[test]
-    fn sanitize_thread_id_double_dot_collapsed() {
-        let out = sanitize_thread_id_for_session("a..b");
-        assert!(
-            !out.contains(".."),
-            "double dot must be collapsed; got {out}"
-        );
-    }
-
-    #[test]
-    fn sanitize_thread_id_empty_becomes_default() {
-        assert_eq!(sanitize_thread_id_for_session(""), "default");
+    fn distinct_thread_ids_never_share_a_session_directory() {
+        // The exact collision pair from the issue report: under the old
+        // sanitiser both mapped to "tenantA-user1-conv1".
+        let a = crate::agui_session::thread_session_key("tenantA/user1/conv1");
+        let b = crate::agui_session::thread_session_key("tenantA/user1-conv1");
+        assert_ne!(a, b, "distinct (tenant, user, conv) ids must not collide");
     }
 }
