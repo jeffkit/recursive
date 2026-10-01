@@ -786,6 +786,11 @@ pub(crate) struct AguiRuntimeDeps<'a> {
     pub prompt_segments: crate::system_prompt::PromptSegments,
     /// Step budget for the run (config.max_steps at the HTTP layer).
     pub max_steps: usize,
+    /// Model id (`config.model` at the HTTP layer). Context management
+    /// derives the auto-compaction thresholds from it — passing the SAME
+    /// model the REST endpoints use keeps every channel's thresholds
+    /// identical.
+    pub model: String,
     /// Transcript seed from [`prepare_run`] (`Some` on resume / history
     /// seeding).
     pub seed_transcript: Option<Vec<crate::message::Message>>,
@@ -858,6 +863,7 @@ pub(crate) fn build_agui_runtime(
         deps.system_prompt,
         deps.prompt_segments,
         deps.max_steps,
+        &deps.model,
     )
     .llm(deps.llm)
     // Issue #66 §3.2: token-level streaming — RunCore only builds the
@@ -1693,6 +1699,7 @@ mod tests {
             seed_transcript: None,
             interrupt_before,
             client_tools,
+            model: "mock".into(),
         }
     }
 

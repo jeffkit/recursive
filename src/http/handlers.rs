@@ -98,28 +98,34 @@ fn build_session_runtime(
     max_steps: usize,
 ) -> AgentRuntimeBuilder {
     crate::runtime::apply_context_management(
-        build_session_runtime_parts(tool_registry, system_prompt, prompt_segments, max_steps)
-            .llm(state.provider.clone())
-            // Goal 399: safe wall-clock budget for HTTP sessions
-            // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
-            // into state.config at server startup). Exceeding it finishes
-            // with WallClockExceeded.
-            .wall_timeout_secs(state.config.wall_timeout_secs)
-            // Goal 396: the host layer persists this session's transcript
-            // through the same storage backend on teardown (DELETE / idle
-            // eviction / graceful shutdown) — not per turn.
-            .storage(state.storage.clone())
-            // Issue #66 §3.2: token-level streaming for every HTTP entry
-            // point (/sessions, /runs, /agui). RunCore only builds the
-            // partial-token forwarder when `streaming` is set, so before
-            // this an AG-UI answer arrived as ONE TextMessageContent frame
-            // and `/sessions/:id/events` never emitted `partial_message`.
-            // Consumers are ready: the AguiConverter frames PartialToken
-            // deltas into TextMessageStart/Content/End, and both SDKs treat
-            // `partial_message`/`stream_event` as fire-hose-only — their
-            // final result still aggregates from the complete `message`
-            // events.
-            .streaming(true),
+        build_session_runtime_parts(
+            tool_registry,
+            system_prompt,
+            prompt_segments,
+            max_steps,
+            &state.config.model,
+        )
+        .llm(state.provider.clone())
+        // Goal 399: safe wall-clock budget for HTTP sessions
+        // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
+        // into state.config at server startup). Exceeding it finishes
+        // with WallClockExceeded.
+        .wall_timeout_secs(state.config.wall_timeout_secs)
+        // Goal 396: the host layer persists this session's transcript
+        // through the same storage backend on teardown (DELETE / idle
+        // eviction / graceful shutdown) — not per turn.
+        .storage(state.storage.clone())
+        // Issue #66 §3.2: token-level streaming for every HTTP entry
+        // point (/sessions, /runs, /agui). RunCore only builds the
+        // partial-token forwarder when `streaming` is set, so before
+        // this an AG-UI answer arrived as ONE TextMessageContent frame
+        // and `/sessions/:id/events` never emitted `partial_message`.
+        // Consumers are ready: the AguiConverter frames PartialToken
+        // deltas into TextMessageStart/Content/End, and both SDKs treat
+        // `partial_message`/`stream_event` as fire-hose-only — their
+        // final result still aggregates from the complete `message`
+        // events.
+        .streaming(true),
         &state.config,
     )
 }
@@ -133,13 +139,16 @@ pub(super) fn build_session_runtime_parts(
     system_prompt: String,
     prompt_segments: crate::system_prompt::PromptSegments,
     max_steps: usize,
+    model: &str,
 ) -> AgentRuntimeBuilder {
     // `apply_context_management` only reads `config.model` (auto compaction
-    // thresholds); a minimal stub keeps the AG-UI build path independent of
-    // `AppState` while producing identical thresholds.
+    // thresholds); a minimal stub carrying exactly that model keeps the
+    // AG-UI build path independent of `AppState` while producing thresholds
+    // identical to `/run` and `/sessions` — they all pass the SAME model
+    // (`state.config.model`) in, so the channels cannot drift apart.
     let config = crate::config::Config {
         workspace: std::path::PathBuf::from("."),
-        model: std::env::var("RECURSIVE_MODEL").unwrap_or_default(),
+        model: model.to_string(),
         ..crate::http::test_config_stub()
     };
     crate::runtime::apply_context_management(
@@ -1484,6 +1493,7 @@ pub(super) async fn agui_run(
             seed_transcript: prepared.seed_transcript,
             interrupt_before: input.interrupt_before.as_deref().unwrap_or(&[]),
             client_tools: &input.tools,
+            model: state.config.model.clone(),
         },
     )
     .map_err(|e| {

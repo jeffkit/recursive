@@ -470,8 +470,10 @@ impl AppState {
 }
 
 /// Minimal `Config` for build paths that only need the model name
-/// (auto compaction thresholds). Values mirror safe defaults; tests and
-/// the AG-UI runtime assembly use it to stay independent of `AppState`.
+/// (auto compaction thresholds). Values mirror safe defaults; the shared
+/// HTTP runtime assembly uses it to stay independent of `AppState`.
+/// Every field of `Config` must be listed here, so a newly added field
+/// breaks compilation instead of silently defaulting.
 pub(crate) fn test_config_stub() -> crate::config::Config {
     crate::config::Config {
         workspace: std::path::PathBuf::from("."),
