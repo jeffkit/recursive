@@ -139,11 +139,11 @@ fn parse_dev_numbering(text: &str) -> BTreeMap<u32, String> {
     let mut map = BTreeMap::new();
     for line in section.lines() {
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) else {
-            continue;
-        };
-        // match "N. **Title" possibly with leading digits (e.g. "10.")
+        // match "N. **Title" possibly with multi-digit numbers (e.g. "10.")
         let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
         let Some(rest) = trimmed.strip_prefix(&digits) else {
             continue;
         };
