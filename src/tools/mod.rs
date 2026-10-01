@@ -166,6 +166,7 @@ pub use transport::{
     DirEntry, EnvironmentCapabilities, ExecResult, LocalTransport, ReadResult, ToolTransport,
     TransportFailure, WalkEntry, WalkOptions,
 };
+#[cfg(feature = "web_fetch")]
 pub use web_fetch::WebFetch;
 #[cfg(feature = "web_search")]
 pub use web_search::WebSearch;
