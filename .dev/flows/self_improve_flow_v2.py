@@ -149,6 +149,11 @@ def self_improve_v2(INPUT):
         "Only stop once fmt + clippy + test are all green by your own hand.\"\"\")\n"
         "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp)}\n"))
     if pre.ok == False:
+        # 磁盘守卫等环境性失败 → retry-later：keeper 不消费、自动重派（写回
+        # failure-context 无意义——现场还没建）。worktree add 等持久性失败仍走
+        # failed-preserved 供人工排查。
+        if str(pre.why or "").startswith("disk"):
+            return {"verdict": "retry-later", "stage": "preflight", "why": pre.why}
         wf = WRITEFILE(path=F.concat(run_dir, "/failure-context.md"),
                        content=F.concat("## preflight failed\n\nreason: ", pre.why))
         return {"verdict": "failed-preserved", "stage": "preflight", "why": pre.why}
