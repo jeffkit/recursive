@@ -615,9 +615,20 @@ async fn main() -> anyhow::Result<()> {
     // roots already loaded from [sandbox] extra_dirs in config.toml so the
     // two sources compose.
     merge_extra_dirs(&mut config.extra_dirs, &cli.add_dir);
-    // --allow-tools: restrict agent to a subset of tools.
-    if let Some(ref allow) = cli.allow_tools {
-        config.allow_tools = allow.split(',').map(|s| s.trim().to_string()).collect();
+    // --allow-tools: restrict agent to a subset of tools. The flag overwrites
+    // whatever `Config::from_env` read from RECURSIVE_ALLOW_TOOLS — but the
+    // clap `env = "RECURSIVE_ALLOW_TOOLS"` injection also lands in
+    // `cli.allow_tools`, so both sources converge to the same parsed value
+    // when only the env var is set. Always re-split for a uniform shape.
+    if cli.allow_tools.is_some() {
+        config.allow_tools = cli
+            .allow_tools
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     // --output-format: supersedes --json and --stream. Default JSON shapes
     // match Claude Code (`json` = one result object, `stream-json` = NDJSON).

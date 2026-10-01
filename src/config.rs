@@ -498,6 +498,11 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        // `--allow-tools` (clap `env = "RECURSIVE_ALLOW_TOOLS"`) overwrites
+        // this below when the flag/env is present, so the flag still wins.
+        // Reading the var here keeps non-clap embedders of `Config::from_env`
+        // (TUI `config_for_preset_model`, HTTP session rebuilds) on the same
+        // operator contract as the CLI.
 
         let allow_bypass_permissions = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS")
             .ok()

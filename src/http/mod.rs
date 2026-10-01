@@ -424,12 +424,6 @@ async fn rebind_per_session_registry(
             if let Some(sp) = base.shared_permissions() {
                 reg = reg.with_shared_permissions(sp);
             }
-            // Issue #69: the container tier rebuilds the registry per session,
-            // bypassing the startup narrowing in the HTTP entry — reapply
-            // `allow_tools` here so `RECURSIVE_ALLOW_TOOLS` holds on every tier.
-            if !config.allow_tools.is_empty() {
-                reg.retain_tools(&config.allow_tools);
-            }
             return Ok(reg
                 .with_headless(base.headless)
                 .with_hook_runner(base.hook_runner.clone()));
@@ -1858,35 +1852,52 @@ mod goal_403_http_sandbox_entry {
         );
     }
 
+    /// Issue #69: `RECURSIVE_ALLOW_TOOLS` must reach `config.allow_tools`
+    /// even when only the env var is set. The CLI path is covered by clap's
+    /// `env = "RECURSIVE_ALLOW_TOOLS"` injection; this pins the
+    /// `Config::from_env` read that serves non-clap embedders (TUI preset
+    /// config, HTTP session rebuilds).
     #[test]
-    fn http_entry_applies_allow_tools_narrowing() {
-        let src = include_str!("../../crates/recursive-cli/src/main.rs");
-        let http_block = src
-            .split("Cmd::Http { addr } => {")
+    fn config_from_env_reads_allow_tools() {
+        let src = include_str!("../config.rs");
+        let from_env = src
+            .split("pub fn from_env() -> Result<Self> {")
             .nth(1)
-            .expect("HTTP entry block must exist");
+            .and_then(|rest| rest.split("pub fn ").next())
+            .expect("Config::from_env must exist");
         assert!(
-            http_block.contains("tools.retain_tools(&config.allow_tools)"),
-            "HTTP entry must apply config.allow_tools narrowing to its startup \
-             registry (issue #69: RECURSIVE_ALLOW_TOOLS had no effect on \
-             `recursive http`)"
+            from_env.contains("RECURSIVE_ALLOW_TOOLS"),
+            "Config::from_env must read RECURSIVE_ALLOW_TOOLS so the operator \
+             allow-list applies to non-clap embedders (issue #69)"
         );
     }
 
     #[test]
     fn session_rebind_reapplies_allow_tools_in_container_tier() {
-        // Issue #69: the container tier rebuilds the registry per session,
-        // bypassing the startup narrowing — rebind must reapply it.
+        // Issue #69: the container tier rebuilds the registry per session.
+        // Main's choke point for this is `session_tool_registry` (applies
+        // coordinator pruning + the operator allow-list after every rebind);
+        // `rebind_per_session_registry` itself must stay a pure rebuild.
         let src = include_str!("mod.rs").replace("\r\n", "\n");
-        let block = src
+        let rebind_block = src
             .split("async fn rebind_per_session_registry")
             .nth(1)
             .and_then(|rest| rest.split("impl AppState").next())
             .expect("rebind_per_session_registry must exist");
         assert!(
-            block.contains("reg.retain_tools(&config.allow_tools)"),
-            "rebind_per_session_registry must reapply allow_tools narrowing to \
-             the per-session container registry"
+            !rebind_block.contains("retain_tools"),
+            "rebind_per_session_registry is a rebuild helper — the allow-list \
+             must stay in session_tool_registry, not duplicated here"
+        );
+        let session_block = src
+            .split("pub async fn session_tool_registry")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .expect("session_tool_registry must exist");
+        assert!(
+            session_block.contains("retain_tools(&self.config.allow_tools)"),
+            "session_tool_registry must reapply allow_tools narrowing to the \
+             per-session (container-rebuilt) registry"
         );
     }
 
