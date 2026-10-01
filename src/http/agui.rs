@@ -3,19 +3,27 @@
 //! Everything AG-UI lives here, not in `handlers.rs`: the AgentEvent→Event
 //! converter, the thread↔session-directory mapping, the persisted
 //! open-interrupt store, the client-tool / test-interrupt permission hooks,
-//! and the resume/interrupt state machine (input parsing → seed transcript).
+//! the resume/interrupt state machine (input parsing → seed transcript),
+//! the runtime assembly for an AG-UI run, and the driver task that maps a
+//! finished run onto AG-UI events (transcript persistence, interrupt
+//! bookkeeping, checkpoint / RunFinished emission).
 //!
 //! The only axum-aware piece is [`super::handlers::agui_run`], which parses
-//! the JSON body, calls [`prepare_run`] (this module, HTTP-free), drives the
-//! runtime, and maps the event stream onto SSE frames. All logic below is
+//! the JSON body, maps admission/prepare errors onto status codes, and
+//! frames the returned event stream as SSE. Everything below is
 //! unit-testable without an HTTP server.
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::event::AgentEvent;
+use agui_protocol as ag;
+use tokio::sync::mpsc;
+
+use crate::event::{AgentEvent, ChannelSink, NullSink};
+use crate::runtime::AgentRuntime;
+use crate::tools::ToolRegistry;
 
 // ── AgentEvent → AG-UI Event converter ────────────────────────────────────
 
@@ -463,6 +471,7 @@ pub(crate) struct AguiRunInput<'a> {
 }
 
 /// The prepared run: what to ask the agent and what transcript to seed.
+#[derive(Debug)]
 pub(crate) struct PreparedAguiRun {
     /// The goal (last user message, resume directive, or context fallback).
     pub goal: String,
@@ -555,6 +564,19 @@ pub(crate) fn prepare_run(
     };
 
     if resume_items.is_empty() {
+        // Interrupt-before check (spec rule 4): if the thread has open
+        // interrupts and no resume is provided, reject. Runs BEFORE any
+        // early return — the conflict applies no matter what history the
+        // client re-sent.
+        if let Some(session_dir) = agui_session_dir(workspace, &input.thread_id) {
+            let open = load_open_interrupts(&session_dir);
+            if !open.is_empty() {
+                return Err(PrepareAguiError::InterruptBeforeConflict {
+                    thread_id: input.thread_id.clone(),
+                    open: open.len(),
+                });
+            }
+        }
         // Issue #62: standard AG-UI clients resend the FULL `messages`
         // array every turn and expect the agent to see the whole history.
         // Seed it so multi-turn context works without tool side effects.
@@ -580,17 +602,6 @@ pub(crate) fn prepare_run(
                 seed_transcript: None,
             });
         }
-        // Interrupt-before check (spec rule 4): if the thread has open
-        // interrupts and no resume is provided, reject.
-        if let Some(session_dir) = agui_session_dir(workspace, &input.thread_id) {
-            let open = load_open_interrupts(&session_dir);
-            if !open.is_empty() {
-                return Err(PrepareAguiError::InterruptBeforeConflict {
-                    thread_id: input.thread_id.clone(),
-                    open: open.len(),
-                });
-            }
-        }
         return Ok(PreparedAguiRun {
             goal,
             seed_transcript: Some(seeded),
@@ -598,8 +609,9 @@ pub(crate) fn prepare_run(
     }
 
     // ── Resume handling ────────────────────────────────────────────────
-    let session_dir = agui_session_dir(workspace, &input.thread_id)
-        .ok_or_else(|| PrepareAguiError::Internal("cannot resolve session directory for resume".into()))?;
+    let session_dir = agui_session_dir(workspace, &input.thread_id).ok_or_else(|| {
+        PrepareAguiError::Internal("cannot resolve session directory for resume".into())
+    })?;
 
     if !session_dir.join("transcript.jsonl").is_file() {
         return Err(PrepareAguiError::BadRequest(format!(
@@ -618,7 +630,10 @@ pub(crate) fn prepare_run(
     }
 
     // Spec rule 3: a single resume must address EVERY open interrupt.
-    let resume_ids: HashSet<String> = resume_items.iter().map(|r| r.interrupt_id.clone()).collect();
+    let resume_ids: HashSet<String> = resume_items
+        .iter()
+        .map(|r| r.interrupt_id.clone())
+        .collect();
     for open_int in &open_interrupts {
         if !resume_ids.contains(&open_int.interrupt_id) {
             return Err(PrepareAguiError::BadRequest(format!(
@@ -631,13 +646,12 @@ pub(crate) fn prepare_run(
     // Load the transcript from the session. The AG-UI run persists one
     // `Message` JSON per line (see the write side in the driver task).
     let transcript_path = session_dir.join("transcript.jsonl");
-    let loaded_messages: Vec<crate::message::Message> =
-        std::fs::read_to_string(&transcript_path)
-            .map_err(|e| PrepareAguiError::Internal(format!("failed to load session transcript: {e}")))?
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+    let loaded_messages: Vec<crate::message::Message> = std::fs::read_to_string(&transcript_path)
+        .map_err(|e| PrepareAguiError::Internal(format!("failed to load session transcript: {e}")))?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
 
     // Build an index of resume items by interrupt_id.
     let resume_by_id: HashMap<&str, &ag::Resume> = resume_items
@@ -657,12 +671,22 @@ pub(crate) fn prepare_run(
         let tool_call_id = &open_int.tool_call_id;
 
         if resume.status == ag::ResumeStatus::Cancelled {
-            // For cancelled interrupts, inject a sentinel tool result.
-            let sentinel = crate::message::Message::tool_result(
-                tool_call_id,
-                "[interrupt cancelled by user]",
-            );
-            modified.push(sentinel);
+            // For cancelled interrupts, replace the denied tool result with
+            // a sentinel (or inject one if no result exists) so the model
+            // sees exactly one tool message for the call.
+            let sentinel =
+                crate::message::Message::tool_result(tool_call_id, "[interrupt cancelled by user]");
+            let replaced = modified.iter_mut().any(|msg| {
+                if msg.tool_call_id.as_deref() == Some(tool_call_id.as_str()) {
+                    *msg = sentinel.clone();
+                    true
+                } else {
+                    false
+                }
+            });
+            if !replaced {
+                modified.push(sentinel);
+            }
         } else if let Some(ref payload) = resume.payload {
             // Resolved: replace the denied tool result content with the
             // resume payload, or inject a new tool result if none exists.
@@ -694,11 +718,481 @@ pub(crate) fn prepare_run(
     })
 }
 
+// ── Runtime assembly for an AG-UI run (transport-free) ────────────────────
+
+/// Everything needed to turn a [`PreparedAguiRun`] into a running
+/// [`AgentRuntime`]. Built by the HTTP adapter from `AppState`; consumed
+/// by [`build_agui_runtime`].
+pub(crate) struct AguiRuntimeDeps<'a> {
+    /// LLM provider for the run (`AppState.provider` at the HTTP layer).
+    pub llm: Arc<dyn crate::llm::ChatProvider>,
+    /// Registry the per-run runtime should be built from (already
+    /// tier-resolved via `AppState::session_tool_registry`).
+    pub tool_registry: ToolRegistry,
+    /// Fully assembled system prompt (project context + skill index).
+    pub system_prompt: String,
+    /// Prompt segments from the same assembly.
+    pub prompt_segments: crate::system_prompt::PromptSegments,
+    /// Step budget for the run (config.max_steps at the HTTP layer).
+    pub max_steps: usize,
+    /// Transcript seed from [`prepare_run`] (`Some` on resume / history
+    /// seeding).
+    pub seed_transcript: Option<Vec<crate::message::Message>>,
+    /// Names of tools in `interrupt_before` (test-only interrupt trigger).
+    pub interrupt_before: &'a [String],
+    /// AG-UI client tools to register as stubs with a deny hook.
+    pub client_tools: &'a [ag::Tool],
+}
+
+/// The hooks installed by [`build_agui_runtime`], handed back so the
+/// driver can detect which mechanism (if any) fired during the run.
+pub(crate) struct AguiHooks {
+    pub interrupt_hook: Option<Arc<TestInterruptHook>>,
+    pub client_hook: Option<Arc<ClientToolHook>>,
+}
+
+/// Build the runtime for an AG-UI run: registers client-tool stubs,
+/// installs the interrupt / client-tool permission hook, seeds the
+/// transcript, wires per-turn checkpoints under the thread's session
+/// directory, and routes the hook into the runtime's TurnContext.
+///
+/// Transport-free: no axum types, no HTTP status mapping. Hook selection
+/// rule (unchanged): client tools take the permission-hook slot;
+/// `interrupt_before` is a test-only facility ignored when client tools
+/// are present. Returns the hooks alongside the runtime so the driver
+/// ([`spawn_agui_run`]) can detect which mechanism fired.
+pub(crate) fn build_agui_runtime(
+    workspace: &Path,
+    thread_id: &str,
+    deps: AguiRuntimeDeps<'_>,
+) -> crate::error::Result<(AgentRuntime, AguiHooks)> {
+    let interrupt_hook = if deps.interrupt_before.is_empty() {
+        None
+    } else {
+        Some(Arc::new(TestInterruptHook {
+            interrupt_before: deps.interrupt_before.to_vec(),
+            interrupted_tool_call_id: Mutex::new(None),
+            interrupted_tool_name: Mutex::new(None),
+            interrupted_arguments: Mutex::new(None),
+        }))
+    };
+
+    let mut tool_registry = deps.tool_registry;
+    for t in deps.client_tools {
+        tool_registry = tool_registry.register(Arc::new(ClientToolStub {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters: t.parameters.clone(),
+        }));
+    }
+
+    let client_tool_names: HashSet<String> =
+        deps.client_tools.iter().map(|t| t.name.clone()).collect();
+    let client_hook: Option<Arc<ClientToolHook>> = if client_tool_names.is_empty() {
+        None
+    } else {
+        Some(Arc::new(ClientToolHook {
+            names: client_tool_names,
+            denied: Mutex::new(None),
+        }))
+    };
+    if let Some(ref hook) = client_hook {
+        tool_registry.set_permission_hook(hook.clone());
+    } else if let Some(ref hook) = interrupt_hook {
+        tool_registry.set_permission_hook(hook.clone());
+    }
+
+    let mut runtime_builder = super::handlers::build_session_runtime_parts(
+        tool_registry,
+        deps.system_prompt,
+        deps.prompt_segments,
+        deps.max_steps,
+    )
+    .llm(deps.llm);
+    if let Some(seed) = deps.seed_transcript {
+        runtime_builder = runtime_builder.seed_transcript(seed);
+    }
+    let mut runtime = runtime_builder.build()?;
+
+    // Route the permission hook into the runtime's TurnContext: client
+    // tools must be denied at dispatch so they surface as interrupts.
+    if let Some(ref hook) = client_hook {
+        runtime.set_permission_hook(hook.clone());
+    } else if let Some(ref hook) = interrupt_hook {
+        runtime.set_permission_hook(hook.clone());
+    }
+
+    // Wire per-turn workspace checkpoints. The AG-UI thread is the
+    // natural session boundary, so we use a sanitised version of the
+    // thread_id as the checkpoint chain id. Failures (no git on PATH,
+    // bad workspace path, etc.) only log a warning — the run still
+    // proceeds without checkpoints.
+    if let Ok(repo) = crate::ShadowRepo::open(workspace) {
+        let session_id = sanitize_thread_id_for_session(thread_id);
+        if let Ok(session_dir) = crate::user_sessions_dir(workspace) {
+            let log_dir = session_dir.join(format!("agui-{session_id}"));
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log_path = log_dir.join("checkpoints.jsonl");
+            let touched = runtime.kernel().tools().touched_files();
+            if let Err(e) =
+                runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
+            {
+                tracing::warn!("agui: enable_checkpoints failed, continuing without: {e}");
+            }
+        }
+    } else {
+        tracing::debug!("agui: shadow git unavailable, no per-turn checkpoints");
+    }
+
+    Ok((
+        runtime,
+        AguiHooks {
+            interrupt_hook,
+            client_hook,
+        },
+    ))
+}
+
+// ── Run driver: maps a finished run onto AG-UI events ─────────────────────
+
+/// Inputs to [`spawn_agui_run`] beyond the runtime and goal. Bundled so the
+/// spawn signature stays readable.
+pub(crate) struct AguiRunContext {
+    pub thread_id: String,
+    pub run_id: String,
+    pub client_tools: Vec<ag::Tool>,
+    pub hooks: AguiHooks,
+    pub workspace: PathBuf,
+    pub metrics: Arc<super::Metrics>,
+}
+
+/// Spawn the AG-UI run driver.
+///
+/// Returns the receiving end of a channel that yields the run's
+/// [`ag::Event`]s in protocol order: `RunStarted` was already emitted by
+/// the caller (see [`spawn_agui_run`]); the driver adds converter-forwarded
+/// events, the optional `Custom("agui-tui/checkpoint_post")`, snapshot
+/// events for interrupts, and finally `RunFinished` — always last.
+///
+/// The driver owns the runtime: it runs the agent, records metrics,
+/// persists the transcript under the thread's session directory (so a
+/// later `resume` can reload it), detects which interrupt mechanism fired
+/// (client tools / `interrupt_before`), persists the open interrupt
+/// before emitting it (crash safety), and destroys the run environment
+/// unconditionally before `RunFinished` is emitted.
+pub(crate) fn spawn_agui_run(
+    mut runtime: AgentRuntime,
+    goal: String,
+    ctx: AguiRunContext,
+) -> mpsc::UnboundedReceiver<ag::Event> {
+    let AguiRunContext {
+        thread_id,
+        run_id,
+        client_tools,
+        hooks,
+        workspace,
+        metrics,
+    } = ctx;
+    let (sse_tx, sse_rx) = mpsc::unbounded_channel::<ag::Event>();
+
+    // Emit RunStarted up front so clients can render the run shell
+    // before the first model token arrives.
+    let _ = sse_tx.send(ag::Event::RunStarted(ag::RunStarted {
+        thread_id: thread_id.clone(),
+        run_id: run_id.clone(),
+        base: ag::BaseEvent::default(),
+    }));
+
+    let (sink, mut event_rx) = ChannelSink::new();
+    runtime.set_event_sink(Arc::new(sink));
+
+    // Converter task: forward AgentEvents → AG-UI Events. Owns the
+    // AguiConverter so framing state survives across the whole run.
+    // It does NOT emit RunFinished — the driver task does that after
+    // it can also surface the optional checkpoint_post Custom event.
+    let conv_tx = sse_tx.clone();
+    let converter_handle = tokio::spawn(async move {
+        let mut conv = AguiConverter::new();
+        while let Some(agent_event) = event_rx.recv().await {
+            for ev in conv.convert(&agent_event) {
+                if conv_tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    // Drive the agent on a background task so the response stream can
+    // flush bytes to the client incrementally. Order of events emitted
+    // by the driver after run() returns:
+    //   1. Wait for the converter to drain all AgentEvents.
+    //   2. If a checkpoint id was produced, emit
+    //      Custom("agui-tui/checkpoint_post").
+    //   3. Emit RunFinished — always last.
+    let drv_thread = thread_id;
+    let drv_run = run_id;
+    let drv_workspace = workspace;
+
+    let driver_handle = tokio::spawn(async move {
+        let outcome = runtime.run(&goal).await;
+
+        // Locate the interrupted tool call after the run:
+        // - test hook: transcript contains the fixed deny marker
+        // - client tools: transcript contains CLIENT_TOOL_DENY_PREFIX
+        // Both markers land in the Tool-role message that the registry
+        // writes for a denied call, and carry the real tool_call_id.
+        let find_denied_tool_call = |transcript: &[crate::message::Message], marker: &str| {
+            transcript
+                .iter()
+                .rev()
+                .find(|msg| msg.role == crate::message::Role::Tool && msg.content.contains(marker))
+                .and_then(|msg| msg.tool_call_id.clone())
+        };
+
+        let client_denied: Option<(String, String)> = hooks.client_hook.as_ref().and_then(|h| {
+            let guard = h.denied.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        });
+        let test_was_interrupted = hooks
+            .interrupt_hook
+            .as_ref()
+            .and_then(|hook| {
+                hook.interrupted_tool_name
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+            .is_some();
+        // Replace the sink so the converter task's recv() sees a closed
+        // channel and exits cleanly.
+        runtime.set_event_sink(Arc::new(NullSink));
+
+        // Snapshot what we need from the outcome before metrics consume it.
+        let (checkpoint_id, finished_turn): (Option<String>, Option<usize>) = match &outcome {
+            Ok(o) => (
+                o.checkpoint_id.as_ref().map(|c| c.0.clone()),
+                runtime.turn_index().checked_sub(1),
+            ),
+            Err(_) => (None, None),
+        };
+
+        match &outcome {
+            Ok(o) => super::handlers::record_run_success(&metrics, o.steps, &o.total_usage),
+            Err(_) => super::handlers::record_run_failed(&metrics),
+        }
+
+        // Persist the transcript so a later `resume` (client-tool result
+        // round-trip) can load and seed it. Format: one Message JSON per
+        // line — the resume loader reads the same shape.
+        if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
+            let _ = std::fs::create_dir_all(&session_dir);
+            let mut lines = String::new();
+            for m in runtime.transcript() {
+                if let Ok(v) = serde_json::to_string(m) {
+                    lines.push_str(&v);
+                    lines.push('\n');
+                }
+            }
+            let path = session_dir.join("transcript.jsonl");
+            if let Err(e) = std::fs::write(&path, lines) {
+                tracing::warn!("agui: transcript persist failed: {e}");
+            }
+        }
+
+        // Interrupt details for whichever mechanism fired. `parameters`
+        // carries the client tool's input schema so the frontend knows how
+        // to execute it; `args` echoes the model's arguments.
+        let interrupt_details: Option<AguiInterruptDetail> =
+            if let Some((name, args)) = client_denied {
+                let transcript = runtime.transcript();
+                find_denied_tool_call(transcript, CLIENT_TOOL_DENY_PREFIX).map(|tc_id| {
+                    let parameters = client_tools
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.parameters.clone())
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                    AguiInterruptDetail::Client {
+                        tool_call_id: tc_id,
+                        tool_name: name,
+                        parameters,
+                        args: serde_json::Value::String(args),
+                    }
+                })
+            } else if test_was_interrupted {
+                let transcript = runtime.transcript();
+                let denied_tool_name = hooks.interrupt_hook.as_ref().and_then(|h| {
+                    h.interrupted_tool_name
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                });
+                find_denied_tool_call(transcript, "test interrupt trigger").map(|tc_id| {
+                    AguiInterruptDetail::Test {
+                        tool_call_id: tc_id,
+                        tool_name: denied_tool_name.unwrap_or_else(|| "unknown".into()),
+                    }
+                })
+            } else {
+                None
+            };
+
+        // Wait for the converter task to translate the last AgentEvent
+        // before we emit anything else, so checkpoint_post and
+        // RunFinished are guaranteed to arrive last.
+        let _ = converter_handle.await;
+
+        // Issue #31 §B: the AG-UI run's environment dies with the run —
+        // on success AND error (the outcome match above already recorded
+        // metrics; teardown is unconditional here, before RunFinished is
+        // emitted, so the SSE stream stays the last observer).
+        runtime.destroy_environment().await;
+
+        if let (Some(cp), Some(turn)) = (checkpoint_id, finished_turn) {
+            let _ = sse_tx.send(ag::Event::Custom(ag::Custom {
+                name: "agui-tui/checkpoint_post".into(),
+                value: serde_json::json!({
+                    "turn": turn,
+                    "postId": cp,
+                }),
+                base: ag::BaseEvent::default(),
+            }));
+        }
+
+        // Emit RunFinished — with Interrupt outcome if a test trigger or a
+        // client-tool call fired.
+        if let Some(detail) = interrupt_details {
+            let (tc_id, _tc_name, response_schema, metadata, message) = match detail {
+                AguiInterruptDetail::Test {
+                    tool_call_id,
+                    tool_name,
+                } => (
+                    tool_call_id,
+                    tool_name.clone(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": { "approved": { "type": "boolean" } }
+                    }),
+                    serde_json::json!({ "testTrigger": true, "toolName": tool_name }),
+                    format!("Test interrupt: tool '{tool_name}' needs user input to proceed"),
+                ),
+                AguiInterruptDetail::Client {
+                    tool_call_id,
+                    tool_name,
+                    parameters,
+                    args,
+                } => (
+                    tool_call_id,
+                    tool_name.clone(),
+                    parameters,
+                    serde_json::json!({ "frontendTool": true, "toolName": tool_name, "args": args }),
+                    format!("Frontend tool '{tool_name}' needs client execution to proceed"),
+                ),
+            };
+            let tool_call_id = tc_id.clone();
+            let interrupt_message = message.clone();
+
+            // Build the interrupt and persist it.
+            let interrupt_id = uuid::Uuid::new_v4().to_string();
+            let open_interrupt = OpenInterrupt {
+                interrupt_id: interrupt_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                reason: "tool_call".into(),
+                message: Some(interrupt_message.clone()),
+                created_at: crate::session::chrono_lite_now(),
+            };
+
+            // Persist before emitting (crash safety).
+            if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
+                let _ = std::fs::create_dir_all(&session_dir);
+                save_open_interrupts(&session_dir, std::slice::from_ref(&open_interrupt));
+
+                // Emit StateSnapshot and MessagesSnapshot before RunFinished
+                // per spec requirement (snapshots must precede the interrupting
+                // RunFinished event).
+                if let Ok(state_val) = serde_json::to_value(runtime.transcript()) {
+                    let _ = sse_tx.send(ag::Event::StateSnapshot(ag::StateSnapshot {
+                        snapshot: state_val,
+                        base: ag::BaseEvent::default(),
+                    }));
+                }
+                let messages_json: Vec<serde_json::Value> = runtime
+                    .transcript()
+                    .iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect();
+                let _ = sse_tx.send(ag::Event::MessagesSnapshot(ag::MessagesSnapshot {
+                    messages: messages_json,
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+
+            let _ = sse_tx.send(ag::Event::RunFinished(ag::RunFinished {
+                thread_id: drv_thread,
+                run_id: drv_run,
+                outcome: Some(ag::RunFinishedOutcome::Interrupt {
+                    interrupts: vec![ag::Interrupt {
+                        id: interrupt_id,
+                        reason: "tool_call".into(),
+                        message: Some(interrupt_message),
+                        tool_call_id: Some(tool_call_id),
+                        response_schema: Some(response_schema),
+                        expires_at: None,
+                        metadata: Some(metadata),
+                    }],
+                }),
+                result: None,
+                base: ag::BaseEvent::default(),
+            }));
+        } else {
+            // Report the run's real outcome. When runtime.run() returned
+            // Err (LLM failure, tool failure, provider down, ...), the
+            // RunFinished must carry an Error outcome so the client can
+            // distinguish a failed run from a successful one with no
+            // result — otherwise the failure is silently swallowed at
+            // the SSE boundary. `code` is reserved for a follow-up goal
+            // that maps Error::Cancelled / RateLimited / etc. to codes.
+            let (run_outcome, result_msg) = match &outcome {
+                Ok(o) => (
+                    ag::RunFinishedOutcome::Success,
+                    o.final_text.clone().map(serde_json::Value::String),
+                ),
+                Err(e) => (
+                    ag::RunFinishedOutcome::Error {
+                        message: e.to_string(),
+                        code: None,
+                    },
+                    None,
+                ),
+            };
+            let _ = sse_tx.send(ag::Event::RunFinished(ag::RunFinished {
+                thread_id: drv_thread,
+                run_id: drv_run,
+                outcome: Some(run_outcome),
+                result: result_msg,
+                base: ag::BaseEvent::default(),
+            }));
+        }
+    });
+
+    // Monitor the driver task so panics are surfaced in logs rather than
+    // silently swallowed by the dropped JoinHandle.
+    tokio::spawn(async move {
+        if let Err(e) = driver_handle.await {
+            tracing::error!("agui: driver task panicked: {e}");
+        }
+    });
+
+    sse_rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn run_input(thread: &str, resume: Option<Vec<agui_protocol::Resume>>) -> agui_protocol::RunAgentInput {
+    fn run_input(
+        thread: &str,
+        resume: Option<Vec<agui_protocol::Resume>>,
+    ) -> agui_protocol::RunAgentInput {
         agui_protocol::RunAgentInput {
             thread_id: thread.into(),
             run_id: "r1".into(),
@@ -713,7 +1207,9 @@ mod tests {
             context: vec![],
             tools: vec![],
             resume,
-            ..Default::default()
+            state: None,
+            interrupt_before: None,
+            forwarded_props: None,
         }
     }
 
@@ -873,7 +1369,7 @@ mod tests {
         input.messages.clear();
         match prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input,
+            input: &input,
         }) {
             Err(PrepareAguiError::BadRequest(m)) => assert!(m.contains("user message"), "{m}"),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -897,7 +1393,7 @@ mod tests {
         );
         match prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input: run_input("t-conflict", None),
+            input: &run_input("t-conflict", None),
         }) {
             Err(PrepareAguiError::InterruptBeforeConflict { open, .. }) => assert_eq!(open, 1),
             other => panic!("expected conflict, got {other:?}"),
@@ -914,7 +1410,7 @@ mod tests {
         }];
         match prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input: run_input("t-fresh", Some(resume)),
+            input: &run_input("t-fresh", Some(resume)),
         }) {
             Err(PrepareAguiError::BadRequest(m)) => assert!(m.contains("no prior run"), "{m}"),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -961,7 +1457,7 @@ mod tests {
         }];
         match prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input: run_input("t-cover", Some(partial)),
+            input: &run_input("t-cover", Some(partial)),
         }) {
             Err(PrepareAguiError::BadRequest(m)) => assert!(m.contains("missing 'i2'"), "{m}"),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -983,7 +1479,7 @@ mod tests {
         ];
         let prepared = prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input: run_input("t-cover", Some(full)),
+            input: &run_input("t-cover", Some(full)),
         })
         .expect("resume prepares");
         assert_eq!(prepared.goal, RESUME_GOAL_DIRECTIVE);
@@ -1019,9 +1515,11 @@ mod tests {
         }];
         match prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input: run_input("t-none", Some(resume)),
+            input: &run_input("t-none", Some(resume)),
         }) {
-            Err(PrepareAguiError::BadRequest(m)) => assert!(m.contains("no open interrupts"), "{m}"),
+            Err(PrepareAguiError::BadRequest(m)) => {
+                assert!(m.contains("no open interrupts"), "{m}")
+            }
             other => panic!("expected BadRequest, got {other:?}"),
         }
     }
@@ -1058,12 +1556,140 @@ mod tests {
         ];
         let prepared = prepare_run(AguiRunInput {
             workspace: ws.path(),
-            input,
+            input: &input,
         })
         .expect("prepare");
         assert_eq!(prepared.goal, "turn two");
         let seed = prepared.seed_transcript.expect("seed");
         let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(contents, vec!["turn one", "answer"]);
+    }
+
+    // ── build_agui_runtime (Issue #56: runtime assembly, no HTTP) ──────────
+
+    use crate::tools::PermissionHook;
+
+    fn runtime_deps<'a>(
+        registry: ToolRegistry,
+        client_tools: &'a [ag::Tool],
+        interrupt_before: &'a [String],
+    ) -> AguiRuntimeDeps<'a> {
+        AguiRuntimeDeps {
+            llm: Arc::new(crate::llm::MockProvider::new(vec![])),
+            tool_registry: registry,
+            system_prompt: "sys".into(),
+            prompt_segments: crate::system_prompt::PromptSegments::default(),
+            max_steps: 8,
+            seed_transcript: None,
+            interrupt_before: interrupt_before,
+            client_tools: client_tools,
+        }
+    }
+
+    /// Pin a temp `RECURSIVE_HOME` so the checkpoints wiring inside
+    /// `build_agui_runtime` cannot touch the developer's real user dir.
+    /// (Env is process-global; the lock prevents parallel tests from
+    /// racing on it.)
+    fn pinned_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_HOME", tmp.path());
+        (tmp, guard)
+    }
+
+    /// Client tools must be registered as callable stubs AND take the
+    /// registry's permission-hook slot (deny-before-dispatch).
+    #[tokio::test]
+    async fn build_agui_runtime_registers_client_tool_stubs_with_deny_hook() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let client_tools = vec![ag::Tool {
+            name: "get_weather".into(),
+            description: "frontend-owned".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let (runtime, hooks) = build_agui_runtime(
+            ws.path(),
+            "t-hooks",
+            runtime_deps(ToolRegistry::local(), &client_tools, &[]),
+        )
+        .expect("runtime builds");
+        let registry = runtime.kernel().tools();
+        assert!(
+            registry.get("get_weather").is_some(),
+            "client tool stub must be registered"
+        );
+        let hook = hooks.client_hook.expect("client hook installed");
+        assert!(hooks.interrupt_hook.is_none(), "no interrupt_before given");
+        let decision = hook
+            .check("get_weather", &serde_json::json!({"city": "sf"}))
+            .await;
+        assert!(
+            matches!(decision, crate::agent::PermissionDecision::Deny(_)),
+            "client tools must be denied at dispatch, got {decision:?}"
+        );
+        let denied = hook.denied.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            denied.as_ref().map(|(n, _)| n.as_str()),
+            Some("get_weather"),
+            "first denied call must be recorded for the driver"
+        );
+    }
+
+    /// `interrupt_before` installs the test-interrupt hook when no client
+    /// tools are present; unrelated tools stay allowed.
+    #[tokio::test]
+    async fn build_agui_runtime_installs_test_interrupt_hook_for_interrupt_before() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let interrupt_before = vec!["Bash".to_string()];
+        let (runtime, hooks) = build_agui_runtime(
+            ws.path(),
+            "t-interrupt",
+            runtime_deps(ToolRegistry::local(), &[], &interrupt_before),
+        )
+        .expect("runtime builds");
+        let _ = runtime;
+        assert!(
+            hooks.client_hook.is_none(),
+            "no client tools → no client hook"
+        );
+        let hook = hooks.interrupt_hook.expect("interrupt hook installed");
+        let deny = hook.check("Bash", &serde_json::json!({})).await;
+        assert!(matches!(deny, crate::agent::PermissionDecision::Deny(_)));
+        let allow = hook.check("Read", &serde_json::json!({})).await;
+        assert!(matches!(allow, crate::agent::PermissionDecision::Allow));
+    }
+
+    /// With neither client tools nor interrupt_before, no hook is installed
+    /// and the runtime still builds (checkpoints wiring is best-effort —
+    /// no git repo in the temp workspace must not fail the build). Uses the
+    /// standard tool set so a real tool name (Read) is present.
+    #[test]
+    fn build_agui_runtime_no_hooks_still_builds_without_git() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let registry = crate::tools::build_standard_tools(ws.path(), &[], 60);
+        let (runtime, hooks) =
+            build_agui_runtime(ws.path(), "t-plain", runtime_deps(registry, &[], &[]))
+                .expect("runtime builds without hooks and without git");
+        assert!(hooks.client_hook.is_none());
+        assert!(hooks.interrupt_hook.is_none());
+        assert!(runtime.kernel().tools().get("Read").is_some());
+    }
+
+    /// Seed transcript is handed to the runtime (resume path).
+    #[test]
+    fn build_agui_runtime_seeds_transcript() {
+        let ws = tempfile::tempdir().unwrap();
+        let seed = vec![crate::message::Message::user("prior turn")];
+        let mut deps = runtime_deps(ToolRegistry::local(), &[], &[]);
+        deps.seed_transcript = Some(seed);
+        let (runtime, _) = build_agui_runtime(ws.path(), "t-seed", deps).expect("runtime builds");
+        let transcript = runtime.transcript();
+        assert!(
+            transcript.iter().any(|m| m.content == "prior turn"),
+            "seed transcript must be present, got {transcript:?}"
+        );
     }
 }
