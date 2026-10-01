@@ -165,16 +165,25 @@ def main() -> int:
     # 快照后 diff/日志都在 run_dir 与分支里，现场本体不再有保留价值。
     # 事故教训（#59）：回收前必须确认 run 已终态——本函数仅在 flow 返回终态后
     # 由 bridge 调用，天然满足；外部手工清理必须先核对 keeper 工件锁与台账。
-    wt = run_dir / "worktree"
-    if wt.is_dir():
-        wip_branch = f"wip-{run_dir.name}"
-        subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True, timeout=120)
-        subprocess.run(["git", "-C", str(wt), "commit", "-m",
-                        f"WIP: {run_dir.name} (terminal {verdict.get('verdict')})"],
-                       capture_output=True, timeout=120)
-        subprocess.run(["git", "-C", str(wt), "branch", "-f", wip_branch],
-                       capture_output=True, timeout=30)
-        shutil.rmtree(wt, ignore_errors=True)
+    # ⚠️ 回收是 best-effort：任何异常都不得吃掉末尾的 RESULT 行（keeper 契约）
+    # ——bc63d74 之前 NameError 让全部终态 run 变 exit=1 无 verdict 即此雷。
+    try:
+        wt = run_dir / "worktree"
+        if wt.is_dir():
+            wip_branch = f"wip-{run_dir.name}"
+            subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True, timeout=120)
+            subprocess.run(["git", "-C", str(wt), "commit", "-m",
+                            f"WIP: {run_dir.name} (terminal {verdict.get('verdict')})"],
+                           capture_output=True, timeout=120)
+            subprocess.run(["git", "-C", str(wt), "branch", "-f", wip_branch],
+                           capture_output=True, timeout=30)
+            shutil.rmtree(wt, ignore_errors=True)
+    except Exception as e:  # 快照失败只记日志，RESULT 照发
+        try:
+            (run_dir / "recovery-error.log").write_text(
+                f"{type(e).__name__}: {e}\n")
+        except Exception:
+            pass
     print(json.dumps(verdict, ensure_ascii=False))
     return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
 
