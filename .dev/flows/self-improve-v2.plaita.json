@@ -178,7 +178,7 @@
     "retryTimes": 0
    },
    "language": "python",
-   "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    out = subprocess.run([\"pgrep\", \"-f\", \"recursive.*--transcript-out\"],\n                         capture_output=True, text=True)\n    for pid in [int(x) for x in out.stdout.split() if x.isdigit()]:\n        try:\n            os.killpg(os.getpgid(pid), signal.SIGTERM)\n        except Exception:\n            pass\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, \"HEAD\"],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp)}\n",
+   "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    out = subprocess.run([\"pgrep\", \"-f\", \"recursive.*--transcript-out\"],\n                         capture_output=True, text=True)\n    for pid in [int(x) for x in out.stdout.split() if x.isdigit()]:\n        try:\n            os.killpg(os.getpgid(pid), signal.SIGTERM)\n        except Exception:\n            pass\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True)\n    cands = [l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n    if cands:\n        newest, newest_t = None, -1.0\n        for c in cands:\n            t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                               capture_output=True, text=True)\n            try:\n                ct = float(t.stdout.strip())\n            except ValueError:\n                continue\n            if ct > newest_t:\n                newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。\\n\")\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp)}\n",
    "input": {
     "repo": "$NODE.repo",
     "run_dir": "$NODE.run_dir"
@@ -192,7 +192,7 @@
    "output": null,
    "next": "_n19",
    "timeout": "",
-   "source_line": 59,
+   "source_line": 86,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -254,7 +254,7 @@
    "output": null,
    "next": "chg",
    "timeout": "",
-   "source_line": 72,
+   "source_line": 99,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -282,7 +282,7 @@
    "output": null,
    "next": "_n2",
    "timeout": "",
-   "source_line": 73,
+   "source_line": 100,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -431,7 +431,7 @@
    "output": null,
    "next": "_n18",
    "timeout": "",
-   "source_line": 74,
+   "source_line": 101,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -493,7 +493,7 @@
    "output": null,
    "next": "_n3",
    "timeout": "",
-   "source_line": 84,
+   "source_line": 111,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -933,7 +933,7 @@
    "output": null,
    "next": "_n17",
    "timeout": "",
-   "source_line": 87,
+   "source_line": 114,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -995,7 +995,7 @@
    "output": null,
    "next": "_n4",
    "timeout": "",
-   "source_line": 90,
+   "source_line": 117,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1435,7 +1435,7 @@
    "output": null,
    "next": "_n16",
    "timeout": "",
-   "source_line": 94,
+   "source_line": 121,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1497,7 +1497,7 @@
    "output": null,
    "next": "_n5",
    "timeout": "",
-   "source_line": 97,
+   "source_line": 124,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1937,7 +1937,7 @@
    "output": null,
    "next": "_n15",
    "timeout": "",
-   "source_line": 100,
+   "source_line": 127,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1999,7 +1999,7 @@
    "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff HEAD` to see the full change, and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
    "next": "rev1",
    "timeout": "",
-   "source_line": 110,
+   "source_line": 137,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2023,7 +2023,7 @@
    "output": null,
    "next": "_n6",
    "timeout": "",
-   "source_line": 118,
+   "source_line": 145,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2051,7 +2051,7 @@
    "output": null,
    "next": "_n10",
    "timeout": "",
-   "source_line": 120,
+   "source_line": 147,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2113,7 +2113,7 @@
    "output": null,
    "next": "_n7",
    "timeout": "",
-   "source_line": 140,
+   "source_line": 167,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2145,7 +2145,7 @@
    "output": null,
    "next": "_n9",
    "timeout": "",
-   "source_line": 143,
+   "source_line": 170,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2207,7 +2207,7 @@
    "output": null,
    "next": "_n8",
    "timeout": "",
-   "source_line": 146,
+   "source_line": 173,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2239,7 +2239,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 149,
+   "source_line": 176,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2267,7 +2267,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 144,
+   "source_line": 171,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2291,7 +2291,7 @@
    "output": null,
    "next": "wfr",
    "timeout": "",
-   "source_line": 121,
+   "source_line": 148,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2353,7 +2353,7 @@
    "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
    "next": "_n13",
    "timeout": "",
-   "source_line": 126,
+   "source_line": 153,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2377,7 +2377,7 @@
    "output": null,
    "next": "rev2",
    "timeout": "",
-   "source_line": 130,
+   "source_line": 157,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2405,7 +2405,7 @@
    "output": null,
    "next": "_n11",
    "timeout": "",
-   "source_line": 131,
+   "source_line": 158,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2433,7 +2433,7 @@
    "output": null,
    "next": "wfr2",
    "timeout": "",
-   "source_line": 133,
+   "source_line": 160,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2495,7 +2495,7 @@
    "output": null,
    "next": "_n12",
    "timeout": "",
-   "source_line": 134,
+   "source_line": 161,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2526,7 +2526,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 136,
+   "source_line": 163,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2550,7 +2550,7 @@
    "output": null,
    "next": "_n14",
    "timeout": "",
-   "source_line": 122,
+   "source_line": 149,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2581,7 +2581,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 124,
+   "source_line": 151,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2610,7 +2610,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 101,
+   "source_line": 128,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2639,7 +2639,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 95,
+   "source_line": 122,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2668,7 +2668,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 88,
+   "source_line": 115,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2697,7 +2697,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 75,
+   "source_line": 102,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2721,7 +2721,7 @@
    "output": null,
    "next": "_n21",
    "timeout": "",
-   "source_line": 65,
+   "source_line": 92,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2783,7 +2783,7 @@
    "output": null,
    "next": "_n20",
    "timeout": "",
-   "source_line": 67,
+   "source_line": 94,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2814,7 +2814,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 69,
+   "source_line": 96,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2842,7 +2842,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 66,
+   "source_line": 93,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
