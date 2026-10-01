@@ -2,7 +2,7 @@
 
 > **Two files, two audiences — read both.**
 > - **This file** (`.dev/AGENTS.md`) — source-code invariants. Read
->   before editing `src/`. Documents the 8 invariants the kernel and
+>   before editing `src/`. Documents the 10 invariants the kernel and
 >   run loop depend on, the current module layout, and the quality
 >   gates that must pass before a commit lands.
 > - **`/AGENTS.md`** (project root) — short runtime contract Recursive
@@ -90,7 +90,7 @@ src/
   crates/agui-{protocol,client,tui}   AG-UI protocol stack
 
 tests/
-  invariants/       the 8 invariant tests (loop_size, sandbox, pairing, ...)
+  invariants/       the invariant tests (loop_size, sandbox, pairing, ...)
   smoke.rs          end-to-end: scripted LLM + real fs tools
   http.rs           HTTP API integration tests
   http_common/      shared fixtures for HTTP tests
@@ -150,6 +150,18 @@ e2e/
    a tool result whose parent assistant had just been drained. Fix:
    retreat the split until `transcript[split].role != Role::Tool`.
    Automated test: `tests/invariants/tool_call_pairing.rs`
+9. **New tool → new file.** A new tool is a new file under `src/tools/`,
+   registered in `src/tools/mod.rs`. No tool logic goes directly into
+   `runtime.rs`, `kernel.rs`, or `agent/`.
+   Automated test: `tests/invariants/invariant_registry.rs` (module layout)
+10. **New provider → new file + trait.** A new LLM provider is a new file
+    under `src/llm/` implementing `ChatProvider`. No provider logic in the
+    agent, runtime, or kernel.
+    Automated test: `tests/invariants/invariant_registry.rs` (module layout)
+
+Numbering guard: `tests/invariants/invariant_registry.rs` asserts that
+`docs/architecture/invariants.md` carries the same (number → title) mapping
+as this list. Update both together — or the test together with them.
 
 ## How to do work
 
