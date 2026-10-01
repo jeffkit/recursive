@@ -199,13 +199,11 @@ async fn client_cancel_posts_to_thread_cancel_path_and_parses_reply() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/agui/t-42/cancel"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "status": "interrupted",
-                "threadId": "t-42",
-                "cancelled": true,
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "interrupted",
+            "threadId": "t-42",
+            "cancelled": true,
+        })))
         .mount(&server)
         .await;
 
@@ -219,13 +217,11 @@ async fn client_cancel_posts_to_thread_cancel_path_and_parses_reply() {
     let server2 = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/agui/gone/cancel"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "status": "interrupted",
-                "threadId": "gone",
-                "cancelled": false,
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "interrupted",
+            "threadId": "gone",
+            "cancelled": false,
+        })))
         .mount(&server2)
         .await;
     let endpoint2 = format!("{}/agui", server2.uri()).parse().unwrap();

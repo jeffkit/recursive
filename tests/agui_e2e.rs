@@ -35,8 +35,16 @@ static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Per-test redirect for `RECURSIVE_HOME` so tests don't write into
 /// the developer's real `~/.recursive` and don't race each other.
+///
+/// `RECURSIVE_SESSIONS_DIR` (Goal-H J1) is a hard override that beats
+/// `RECURSIVE_HOME`; a value inherited from the surrounding environment
+/// (self-improve pipelines, e2e harnesses) would redirect every
+/// `persist_run` into one shared root, making the session-count and
+/// transcript-shape assertions below see unrelated sessions. It is
+/// therefore pinned to `<home>/sessions` together with `RECURSIVE_HOME`.
 struct HomeOverride {
     prev: Option<std::ffi::OsString>,
+    prev_sessions: Option<std::ffi::OsString>,
     _home: tempfile::TempDir,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -45,10 +53,16 @@ impl HomeOverride {
     fn new() -> Self {
         let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("RECURSIVE_HOME");
+        let prev_sessions = std::env::var_os("RECURSIVE_SESSIONS_DIR");
         let dir = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("RECURSIVE_HOME", dir.path());
+        // SAFETY: process-global env mutation; protected by HOME_LOCK.
+        unsafe {
+            std::env::set_var("RECURSIVE_HOME", dir.path());
+            std::env::set_var("RECURSIVE_SESSIONS_DIR", dir.path().join("sessions"));
+        }
         Self {
             prev,
+            prev_sessions,
             _home: dir,
             _lock: lock,
         }
@@ -57,9 +71,16 @@ impl HomeOverride {
 
 impl Drop for HomeOverride {
     fn drop(&mut self) {
-        match self.prev.take() {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
+        // SAFETY: still under HOME_LOCK held by `_lock`.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+                None => std::env::remove_var("RECURSIVE_HOME"),
+            }
+            match self.prev_sessions.take() {
+                Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+            }
         }
     }
 }

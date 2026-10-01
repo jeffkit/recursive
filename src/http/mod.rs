@@ -1696,6 +1696,7 @@ mod goal_396_persistence_tests {
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let registry = state.session_tool_registry().await.expect("registry");
