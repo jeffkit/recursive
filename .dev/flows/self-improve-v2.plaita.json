@@ -190,7 +190,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "wf",
+   "next": "_n19",
    "timeout": "",
    "source_line": 59,
    "timeout_handler": {
@@ -218,7 +218,7 @@
    },
    "branches": [
     {
-     "name": "wf",
+     "name": "_n19",
      "condition": {
       "field": "$NODE.pre.ok",
       "operator": "eq",
@@ -227,7 +227,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "wf",
+     "next": "_n19",
      "is_default": false
     },
     {
@@ -254,7 +254,7 @@
    "output": null,
    "next": "chg",
    "timeout": "",
-   "source_line": 65,
+   "source_line": 72,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -282,7 +282,7 @@
    "output": null,
    "next": "_n2",
    "timeout": "",
-   "source_line": 66,
+   "source_line": 73,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -431,7 +431,7 @@
    "output": null,
    "next": "_n18",
    "timeout": "",
-   "source_line": 67,
+   "source_line": 74,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -493,7 +493,7 @@
    "output": null,
    "next": "_n3",
    "timeout": "",
-   "source_line": 77,
+   "source_line": 84,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -933,7 +933,7 @@
    "output": null,
    "next": "_n17",
    "timeout": "",
-   "source_line": 80,
+   "source_line": 87,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -995,7 +995,7 @@
    "output": null,
    "next": "_n4",
    "timeout": "",
-   "source_line": 83,
+   "source_line": 90,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1435,7 +1435,7 @@
    "output": null,
    "next": "_n16",
    "timeout": "",
-   "source_line": 87,
+   "source_line": 94,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1497,7 +1497,7 @@
    "output": null,
    "next": "_n5",
    "timeout": "",
-   "source_line": 90,
+   "source_line": 97,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1937,7 +1937,7 @@
    "output": null,
    "next": "_n15",
    "timeout": "",
-   "source_line": 93,
+   "source_line": 100,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -1999,7 +1999,7 @@
    "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff HEAD` to see the full change, and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
    "next": "rev1",
    "timeout": "",
-   "source_line": 103,
+   "source_line": 110,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2023,7 +2023,7 @@
    "output": null,
    "next": "_n6",
    "timeout": "",
-   "source_line": 111,
+   "source_line": 118,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2051,7 +2051,7 @@
    "output": null,
    "next": "_n10",
    "timeout": "",
-   "source_line": 113,
+   "source_line": 120,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2113,7 +2113,7 @@
    "output": null,
    "next": "_n7",
    "timeout": "",
-   "source_line": 133,
+   "source_line": 140,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2145,7 +2145,7 @@
    "output": null,
    "next": "_n9",
    "timeout": "",
-   "source_line": 136,
+   "source_line": 143,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2207,7 +2207,7 @@
    "output": null,
    "next": "_n8",
    "timeout": "",
-   "source_line": 139,
+   "source_line": 146,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2239,7 +2239,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 142,
+   "source_line": 149,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2267,7 +2267,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 137,
+   "source_line": 144,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2291,7 +2291,7 @@
    "output": null,
    "next": "wfr",
    "timeout": "",
-   "source_line": 114,
+   "source_line": 121,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2353,7 +2353,7 @@
    "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
    "next": "_n13",
    "timeout": "",
-   "source_line": 119,
+   "source_line": 126,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2377,7 +2377,7 @@
    "output": null,
    "next": "rev2",
    "timeout": "",
-   "source_line": 123,
+   "source_line": 130,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2405,7 +2405,7 @@
    "output": null,
    "next": "_n11",
    "timeout": "",
-   "source_line": 124,
+   "source_line": 131,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2433,7 +2433,7 @@
    "output": null,
    "next": "wfr2",
    "timeout": "",
-   "source_line": 126,
+   "source_line": 133,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2495,7 +2495,7 @@
    "output": null,
    "next": "_n12",
    "timeout": "",
-   "source_line": 127,
+   "source_line": 134,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2526,7 +2526,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 129,
+   "source_line": 136,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2550,7 +2550,7 @@
    "output": null,
    "next": "_n14",
    "timeout": "",
-   "source_line": 115,
+   "source_line": 122,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2581,7 +2581,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 117,
+   "source_line": 124,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2610,7 +2610,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 94,
+   "source_line": 101,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2639,7 +2639,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 88,
+   "source_line": 95,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2668,7 +2668,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 81,
+   "source_line": 88,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2697,7 +2697,7 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 68,
+   "source_line": 75,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2715,13 +2715,75 @@
    "error": null
   },
   {
+   "id": "_n19",
+   "name": null,
+   "desc": null,
+   "output": null,
+   "next": "_n21",
+   "timeout": "",
+   "source_line": 65,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "output_type": {
+    "data_type": "string",
+    "name": "branch_name",
+    "label": null,
+    "desc": null,
+    "is_required": false,
+    "default_value": null,
+    "item_type": null,
+    "children": []
+   },
+   "branches": [
+    {
+     "name": "_n21",
+     "condition": {
+      "field": "$F.contains($F.concat($F.or($NODE.pre.why, \"\")), \"disk\")",
+      "operator": "ne",
+      "value": false
+     },
+     "priority": 0,
+     "label": "true",
+     "desc": "true",
+     "next": "_n21",
+     "is_default": false
+    },
+    {
+     "name": "wf",
+     "condition": null,
+     "priority": 0,
+     "label": "false",
+     "desc": "false",
+     "next": "wf",
+     "is_default": true
+    }
+   ],
+   "else_next": "wf",
+   "condition": {
+    "field": "$F.contains($F.concat($F.or($NODE.pre.why, \"\")), \"disk\")",
+    "operator": "ne",
+    "value": false
+   }
+  },
+  {
    "id": "wf",
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n19",
+   "next": "_n20",
    "timeout": "",
-   "source_line": 60,
+   "source_line": 67,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2742,7 +2804,7 @@
    "workspace_root": null
   },
   {
-   "id": "_n19",
+   "id": "_n20",
    "name": null,
    "desc": null,
    "output": {
@@ -2752,7 +2814,35 @@
    },
    "next": null,
    "timeout": "",
-   "source_line": 62,
+   "source_line": 69,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "result_type": "success",
+   "error": null
+  },
+  {
+   "id": "_n21",
+   "name": null,
+   "desc": null,
+   "output": {
+    "verdict": "retry-later",
+    "stage": "preflight",
+    "why": "$NODE.pre.why"
+   },
+   "next": null,
+   "timeout": "",
+   "source_line": 66,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,

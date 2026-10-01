@@ -152,7 +152,9 @@ def self_improve_v2(INPUT):
         # 磁盘守卫等环境性失败 → retry-later：keeper 不消费、自动重派（写回
         # failure-context 无意义——现场还没建）。worktree add 等持久性失败仍走
         # failed-preserved 供人工排查。
-        if str(pre.why or "").startswith("disk"):
+        # DSL 表达式只允许 F.xxx()/len/abs/round/str——方法调用（.startswith 等）
+        # 编译期即炸（2026-10-01 59/61 秒崩根因），字符串包含一律走 F.contains
+        if F.contains(str(pre.why or ""), "disk"):
             return {"verdict": "retry-later", "stage": "preflight", "why": pre.why}
         wf = WRITEFILE(path=F.concat(run_dir, "/failure-context.md"),
                        content=F.concat("## preflight failed\n\nreason: ", pre.why))
