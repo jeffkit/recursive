@@ -135,6 +135,7 @@ fn state(workspace: PathBuf, provider: Arc<dyn ChatProvider>) -> AppState {
         storage: Arc::new(recursive::storage::LocalStorageBackend::new(
             std::env::temp_dir().join(format!("recursive-agui-test-{}", std::process::id())),
         )),
+        agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 

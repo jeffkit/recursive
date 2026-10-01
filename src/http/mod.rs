@@ -23,9 +23,9 @@ pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
-    agui_run, create_session, delete_session, fork_session, get_session, health, list_sessions,
-    list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session, run_agent,
-    send_session_message, session_clear_goal, session_events, session_interrupt,
+    agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
+    list_sessions, list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session,
+    run_agent, send_session_message, session_clear_goal, session_events, session_interrupt,
     session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
@@ -378,6 +378,14 @@ pub struct AppState {
     /// Goal 397 cold-load reads this same backend to restore sessions after a
     /// restart (`cold_load::get_or_load_session`).
     pub storage: Arc<dyn StorageBackend>,
+    /// Issue #66: cancellation tokens for in-flight `/agui` runs, keyed by
+    /// AG-UI thread id. `agui_run` inserts a fresh token before spawning its
+    /// driver task and removes the entry on completion; the disconnect guard
+    /// on the SSE body and `POST /agui/{thread_id}/cancel` both cancel it.
+    /// AG-UI runs have no `SessionState` row, so they cannot reuse the
+    /// per-session `interrupt_token` slot.
+    pub agui_active_runs:
+        Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -714,6 +722,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
+        .route("/agui/{thread_id}/cancel", post(agui_cancel))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .layer(axum::middleware::from_fn_with_state(
             (limiter.clone(), state_arc.metrics.clone()),
@@ -993,6 +1002,34 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             }
                         },
                         "400": { "description": "Invalid AG-UI RunAgentInput" }
+                    }
+                }
+            },
+            "/agui/{thread_id}/cancel": {
+                "post": {
+                    "summary": "Cancel the in-flight AG-UI run for a thread",
+                    "description": "Issue #66 §3.3: asks the run to stop. The kernel exits \
+                        with FinishReason::Cancelled at the next step boundary or mid-LLM-call; \
+                        the driver then persists the partial transcript and emits RunFinished \
+                        with an Error outcome carrying code \"cancelled\". The SSE body also \
+                        cancels its run automatically when the client disconnects. Idempotent: \
+                        an unknown (or already-finished) thread answers 200 with \
+                        \"cancelled\": false.",
+                    "parameters": [{
+                        "name": "thread_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Cancel requested (or nothing to cancel)",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -1632,6 +1669,7 @@ mod goal_396_persistence_tests {
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

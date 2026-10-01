@@ -880,6 +880,12 @@ async fn main() -> anyhow::Result<()> {
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
                 storage,
+                // Issue #66: registry of cancellation tokens for in-flight
+                // /agui runs, keyed by thread id (SSE disconnect guard +
+                // POST /agui/{thread_id}/cancel both cancel through it).
+                agui_active_runs: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the

@@ -109,7 +109,18 @@ fn build_session_runtime(
             // Goal 396: the host layer persists this session's transcript
             // through the same storage backend on teardown (DELETE / idle
             // eviction / graceful shutdown) — not per turn.
-            .storage(state.storage.clone()),
+            .storage(state.storage.clone())
+            // Issue #66 §3.2: token-level streaming for every HTTP entry
+            // point (/sessions, /runs, /agui). RunCore only builds the
+            // partial-token forwarder when `streaming` is set, so before
+            // this an AG-UI answer arrived as ONE TextMessageContent frame
+            // and `/sessions/:id/events` never emitted `partial_message`.
+            // Consumers are ready: the AguiConverter frames PartialToken
+            // deltas into TextMessageStart/Content/End, and both SDKs treat
+            // `partial_message`/`stream_event` as fire-hose-only — their
+            // final result still aggregates from the complete `message`
+            // events.
+            .streaming(true),
         &state.config,
     )
 }
@@ -1345,6 +1356,12 @@ struct AguiConverter {
     /// TextMessageEnd yet. Used as the `messageId` for streaming
     /// `PartialToken` deltas and as the `parentMessageId` for tool calls.
     open_message_id: Option<String>,
+    /// Issue #66: concatenation of the `PartialToken` deltas already emitted
+    /// for the open message. When the step's final `AssistantText` arrives it
+    /// usually equals this string — emitting it again as a fresh message
+    /// would render the answer twice in AG-UI clients, so only the unsent
+    /// remainder (if any) is flushed before `TextMessageEnd`.
+    open_accumulated: String,
     /// Last fully-emitted (or currently-open) assistant message id. Used as
     /// the `parent_message_id` on ToolCallStart even after the message has
     /// been closed, so a client can attribute the tool call back to the
@@ -1364,30 +1381,72 @@ impl AguiConverter {
         let mut out = Vec::new();
         match ev {
             AgentEvent::AssistantText { text, .. } => {
-                // Close any in-flight streamed message first.
+                // Close any in-flight streamed message first. Issue #66: the
+                // deltas already carried (almost always) the whole text —
+                // flush only the unsent remainder into the SAME message and
+                // close it, instead of emitting a second full-text message
+                // that would make clients render the answer twice.
                 if let Some(id) = self.open_message_id.take() {
-                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                        message_id: id,
+                    let accumulated = std::mem::take(&mut self.open_accumulated);
+                    if let Some(rest) = text.strip_prefix(accumulated.as_str()) {
+                        if !rest.is_empty() {
+                            out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                                message_id: id.clone(),
+                                delta: rest.to_string(),
+                                base: ag::BaseEvent::default(),
+                            }));
+                        }
+                        out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                            message_id: id.clone(),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        self.last_assistant_message_id = Some(id);
+                    } else {
+                        // Deltas diverged from the final text (misbehaving
+                        // provider): keep the streamed message as-is and fall
+                        // back to the historical full-message emission so no
+                        // text is lost.
+                        out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                            message_id: id,
+                            base: ag::BaseEvent::default(),
+                        }));
+                        let id = uuid::Uuid::new_v4().to_string();
+                        out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
+                            message_id: id.clone(),
+                            role: Some("assistant".into()),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                            message_id: id.clone(),
+                            delta: text.clone(),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                            message_id: id.clone(),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        self.last_assistant_message_id = Some(id);
+                    }
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
+                        message_id: id.clone(),
+                        role: Some("assistant".into()),
                         base: ag::BaseEvent::default(),
                     }));
+                    out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                        message_id: id.clone(),
+                        delta: text.clone(),
+                        base: ag::BaseEvent::default(),
+                    }));
+                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                        message_id: id.clone(),
+                        base: ag::BaseEvent::default(),
+                    }));
+                    self.last_assistant_message_id = Some(id);
                 }
-                let id = uuid::Uuid::new_v4().to_string();
-                out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
-                    message_id: id.clone(),
-                    role: Some("assistant".into()),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
-                    message_id: id.clone(),
-                    delta: text.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                    message_id: id.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                self.last_assistant_message_id = Some(id);
                 self.open_message_id = None;
+                self.open_accumulated.clear();
             }
             AgentEvent::PartialToken { text, .. } => {
                 let id = if let Some(id) = self.open_message_id.clone() {
@@ -1403,6 +1462,7 @@ impl AguiConverter {
                     self.last_assistant_message_id = Some(id.clone());
                     id
                 };
+                self.open_accumulated.push_str(text);
                 out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
                     message_id: id,
                     delta: text.clone(),
@@ -1423,6 +1483,7 @@ impl AguiConverter {
                         base: ag::BaseEvent::default(),
                     }));
                 }
+                self.open_accumulated.clear();
                 out.push(ag::Event::ToolCallStart(ag::ToolCallStart {
                     tool_call_id: id.clone(),
                     tool_call_name: name.clone(),
@@ -1464,6 +1525,7 @@ impl AguiConverter {
                         base: ag::BaseEvent::default(),
                     }));
                 }
+                self.open_accumulated.clear();
                 // Actual RunFinished is emitted by the caller (it knows
                 // the thread/run ids); we just flush state here.
             }
@@ -1843,7 +1905,11 @@ pub(super) async fn agui_run(
     // awaiting indefinitely, which would hang every /agui request when the
     // pool is full). Goal 398 routes it through the same admission gate as
     // the REST endpoints; only the waiting policy differs (none).
-    let _permit = state.host.admission().try_acquire_run().map_err(|_| {
+    // Issue #66: the permit now moves into the driver task — the run keeps
+    // its admission slot (and `runs_in_flight` stays truthful) until the run
+    // actually finishes, instead of releasing it when the handler returns
+    // while the agent keeps running in the background.
+    let permit = state.host.admission().try_acquire_run().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -1983,6 +2049,22 @@ pub(super) async fn agui_run(
     let thread_id = input.thread_id.clone();
     let run_id = input.run_id.clone();
 
+    // Issue #66 §3.3: per-run cancellation token. Two entry points cancel
+    // it — the SSE body's disconnect guard (client closed the stream) and
+    // `POST /agui/{thread_id}/cancel` (explicit stop, covers network
+    // partitions where TCP never notices). The token is installed on the
+    // runtime (the kernel checks it between steps and mid-LLM-call) and
+    // registered under the thread id; AG-UI runs have no SessionState row,
+    // hence the dedicated registry. The driver task removes the entry when
+    // the run finishes; cancelling a finished run is a no-op.
+    let run_cancel = tokio_util::sync::CancellationToken::new();
+    runtime.set_interrupt_token(run_cancel.clone());
+    state
+        .agui_active_runs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(thread_id.clone(), run_cancel.clone());
+
     // Emit RunStarted up front so clients can render the run shell
     // before the first model token arrives.
     let _ = sse_tx.send(ag::Event::RunStarted(ag::RunStarted {
@@ -2032,8 +2114,15 @@ pub(super) async fn agui_run(
     // (on resume runs the transcript starts with the seeded history;
     // appending it again would duplicate it).
     let drv_pre_run_len = runtime.transcript().len();
+    // Issue #66: cancel-registry bookkeeping — the driver removes its
+    // thread's token when the run finishes so a later run registers a
+    // fresh one.
+    let drv_state = Arc::clone(&state);
+    let drv_thread_key = thread_id.clone();
 
     let driver_handle = tokio::spawn(async move {
+        // Issue #66: hold the admission permit for the whole background run.
+        let _permit = permit;
         let outcome = runtime.run(&goal).await;
 
         // Locate the interrupted tool call after the run:
@@ -2075,9 +2164,16 @@ pub(super) async fn agui_run(
             Err(_) => (None, None),
         };
 
+        // Issue #66: a cancelled run did not complete — count it as failed
+        // rather than inflating `agent_runs_success` (matches the RunFinished
+        // Error outcome with code "cancelled" the client receives below).
+        let cancelled = matches!(
+            &outcome,
+            Ok(o) if matches!(o.finish_reason, crate::agent::FinishReason::Cancelled)
+        );
         match &outcome {
-            Ok(o) => record_run_success(&metrics, o.steps, &o.total_usage),
-            Err(_) => record_run_failed(&metrics),
+            Ok(o) if !cancelled => record_run_success(&metrics, o.steps, &o.total_usage),
+            _ => record_run_failed(&metrics),
         }
 
         // Persist the run into the thread's native session (issue #57):
@@ -2268,9 +2364,17 @@ pub(super) async fn agui_run(
             // RunFinished must carry an Error outcome so the client can
             // distinguish a failed run from a successful one with no
             // result — otherwise the failure is silently swallowed at
-            // the SSE boundary. `code` is reserved for a follow-up goal
-            // that maps Error::Cancelled / RateLimited / etc. to codes.
+            // the SSE boundary. Issue #66: a cancelled run (disconnect or
+            // explicit cancel) is reported with code "cancelled" instead of
+            // masquerading as Success.
             let (run_outcome, result_msg) = match &outcome {
+                Ok(o) if matches!(o.finish_reason, crate::agent::FinishReason::Cancelled) => (
+                    ag::RunFinishedOutcome::Error {
+                        message: "run cancelled by client".into(),
+                        code: Some("cancelled".into()),
+                    },
+                    None,
+                ),
                 Ok(o) => (
                     ag::RunFinishedOutcome::Success,
                     o.final_text.clone().map(serde_json::Value::String),
@@ -2292,6 +2396,14 @@ pub(super) async fn agui_run(
             }));
         }
 
+        // Issue #66: the run is over — release its admission slot (the
+        // permit drops with this task) and drop the cancel-registry entry so
+        // a later run on the same thread registers a fresh token.
+        drv_state
+            .agui_active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&drv_thread_key);
         // Release the per-thread run fence (issue #57 §④): the next run
         // for this thread may start once RunFinished is out. On panic the
         // guard's Drop unwinds it free.
@@ -2311,7 +2423,98 @@ pub(super) async fn agui_run(
         Ok::<_, Infallible>(Event::default().data(data))
     });
 
-    Ok(Sse::new(stream))
+    // Issue #66 §3.3 (approach A, AG-UI ecosystem convention): when the
+    // client disconnects, hyper drops this response body — the wrapper's
+    // `Drop` then cancels the run token. Normal completion drops it too,
+    // but by then `runtime.run()` has returned and the token is inert.
+    //
+    // The 30s keep-alive bounds how long a disconnect can go unnoticed:
+    // hyper only notices a dead socket on a write attempt, and a silent
+    // tool-execution stretch would otherwise delay the cancel until the
+    // next event. (axum emits the idle comment itself, so the stream still
+    // ends the moment the driver drops `sse_tx` after RunFinished —
+    // unlike a merged heartbeat interval, which would never end.)
+    Ok(Sse::new(CancelOnDrop {
+        inner: stream,
+        token: Some(run_cancel),
+    })
+    .keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("heartbeat"),
+    ))
+}
+
+/// SSE body wrapper that cancels an in-flight AG-UI run when the response
+/// stream is dropped (client disconnect). Issue #66 §3.3 approach A.
+struct CancelOnDrop<S> {
+    inner: S,
+    token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl<S> futures_util::Stream for CancelOnDrop<S>
+where
+    S: futures_util::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for CancelOnDrop<S> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            // Normal completion also drops the body — by then the driver has
+            // finished `runtime.run()` and the token already fired, so only a
+            // still-live token means the client actually went away.
+            if !token.is_cancelled() {
+                tracing::info!(
+                    target: "recursive::http",
+                    "agui: SSE stream dropped — cancelling in-flight run"
+                );
+                token.cancel();
+            }
+        }
+    }
+}
+
+/// POST /agui/:thread_id/cancel — cancel the in-flight AG-UI run for a
+/// thread. Issue #66 §3.3 approach B (explicit endpoint fallback): stream
+/// drop (approach A) cannot fire when a network partition keeps the TCP
+/// connection half-open, so clients get a direct stop button.
+///
+/// Idempotent like `session_interrupt`: an unknown thread or an
+/// already-finished run answers `200 OK` with `"cancelled": false` —
+/// stopping something that already stopped is not an error.
+pub(super) async fn agui_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(thread_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let token = state
+        .agui_active_runs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&thread_id)
+        .cloned();
+    let cancelled = token.is_some();
+    if let Some(token) = token {
+        tracing::info!(
+            target: "recursive::http",
+            thread_id = %thread_id,
+            "agui: explicit cancel requested"
+        );
+        token.cancel();
+    }
+    Json(serde_json::json!({
+        "status": "interrupted",
+        "thread_id": thread_id,
+        "cancelled": cancelled,
+    }))
 }
 
 fn agui_seed_from_messages(msgs: &[&agui_protocol::Message]) -> Vec<crate::message::Message> {
@@ -2640,6 +2843,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let builder = build_session_runtime(
@@ -2677,6 +2881,74 @@ mod tests {
         assert!(matches!(out[0], ag::Event::TextMessageStart(_)));
         assert!(matches!(out[1], ag::Event::TextMessageContent(_)));
         assert!(matches!(out[2], ag::Event::TextMessageEnd(_)));
+    }
+
+    /// Issue #66 §3.2: once a step streamed `PartialToken` deltas, the
+    /// finalising `AssistantText` must NOT re-emit the same text as a second
+    /// message — clients would render the answer twice. Exact match → only
+    /// `TextMessageEnd`; extended match → the unsent remainder is flushed
+    /// into the SAME message, then it is closed.
+    #[test]
+    fn agui_streamed_step_finalises_without_duplicating_text() {
+        use agui_protocol as ag;
+
+        // Exact match (the normal case: providers deliver every token).
+        let mut conv = AguiConverter::new();
+        let mut deltas = String::new();
+        for chunk in ["你", "好，", "世", "界"] {
+            for ev in conv.convert(&AgentEvent::PartialToken {
+                text: chunk.into(),
+                step: 0,
+            }) {
+                if let ag::Event::TextMessageContent(c) = ev {
+                    deltas.push_str(&c.delta);
+                }
+            }
+        }
+        assert_eq!(deltas, "你好，世界");
+        let tail = conv.convert(&AgentEvent::AssistantText {
+            text: deltas,
+            step: 0,
+        });
+        assert_eq!(tail.len(), 1, "exact-match final must only close: {tail:?}");
+        assert!(matches!(tail[0], ag::Event::TextMessageEnd(_)));
+
+        // Remainder: the final text extends what was already streamed.
+        let mut conv = AguiConverter::new();
+        let _ = conv.convert(&AgentEvent::PartialToken {
+            text: "Hel".into(),
+            step: 0,
+        });
+        let tail = conv.convert(&AgentEvent::AssistantText {
+            text: "Hello".into(),
+            step: 0,
+        });
+        assert_eq!(tail.len(), 2, "remainder + end expected: {tail:?}");
+        assert!(matches!(&tail[0], ag::Event::TextMessageContent(c) if c.delta == "lo"));
+        assert!(matches!(tail[1], ag::Event::TextMessageEnd(_)));
+    }
+
+    /// Issue #66 §3.2 fallback: deltas that diverge from the final text
+    /// (misbehaving provider) keep the historical full-message emission so
+    /// no text is lost — the streamed message is closed, then a fresh
+    /// Start/Content/End carries the final text.
+    #[test]
+    fn agui_divergent_final_text_falls_back_to_full_message() {
+        use agui_protocol as ag;
+        let mut conv = AguiConverter::new();
+        let _ = conv.convert(&AgentEvent::PartialToken {
+            text: "abc".into(),
+            step: 0,
+        });
+        let tail = conv.convert(&AgentEvent::AssistantText {
+            text: "xyz".into(),
+            step: 0,
+        });
+        assert_eq!(tail.len(), 4, "{tail:?}");
+        assert!(matches!(tail[0], ag::Event::TextMessageEnd(_)));
+        assert!(matches!(tail[1], ag::Event::TextMessageStart(_)));
+        assert!(matches!(&tail[2], ag::Event::TextMessageContent(c) if c.delta == "xyz"));
+        assert!(matches!(tail[3], ag::Event::TextMessageEnd(_)));
     }
 
     // ── SDK Phase B: tool_progress forwarder ─────────────────────────────
@@ -2821,6 +3093,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let body = serde_json::json!({
@@ -2902,6 +3175,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -2988,6 +3262,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         (state, runtime_arc)
     }
@@ -3120,6 +3395,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -3173,6 +3449,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -3225,6 +3502,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let auth = crate::http::auth::AuthConfig::default();
@@ -3933,6 +4211,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-agui-seed-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let app = crate::http::build_router_with_auth_and_rate_limit(
             state,
@@ -4015,6 +4294,207 @@ mod tests {
                 .any(|m| matches!(m.role, crate::message::Role::Tool)),
             "no tool-role messages expected"
         );
+
+        std::env::remove_var("RECURSIVE_WORKSPACE");
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+    }
+
+    // ── Issue #66: token streaming + cancellation ────────────────────────
+
+    /// POST /agui/{thread_id}/cancel cancels the registered token; an
+    /// unknown (or already-finished) thread is an idempotent 200 with
+    /// `"cancelled": false`.
+    #[tokio::test]
+    async fn agui_cancel_cancels_registered_thread_and_is_idempotent() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = Arc::new(crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-cancel-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .agui_active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("t-cancel".into(), token.clone());
+
+        let Json(res) = agui_cancel(State(Arc::clone(&state)), Path("t-cancel".into())).await;
+        assert_eq!(res["status"], "interrupted");
+        assert_eq!(res["cancelled"], true);
+        assert!(token.is_cancelled(), "registered token must be cancelled");
+
+        let Json(res) = agui_cancel(State(state), Path("no-such-thread".into())).await;
+        assert_eq!(res["cancelled"], false, "unknown thread stays idempotent");
+    }
+
+    /// Dropping the wrapped SSE body (client disconnect) must cancel the
+    /// run token; polling through the wrapper still forwards events.
+    #[tokio::test]
+    async fn agui_sse_drop_cancels_run_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        // `Ready` (not an async block): the wrapper's Stream impl requires
+        // `S: Unpin`, which `Once<Ready<_>>` satisfies the same way the
+        // production stream (map over an unbounded receiver) does.
+        let inner = futures_util::stream::once(futures_util::future::ready(Ok::<_, Infallible>(
+            Event::default().data("x"),
+        )));
+        let mut guarded = CancelOnDrop {
+            inner,
+            token: Some(token.clone()),
+        };
+        // File scope imports tokio_stream::StreamExt; disambiguate.
+        assert!(
+            futures_util::StreamExt::next(&mut guarded).await.is_some(),
+            "wrapper must forward items"
+        );
+        assert!(!token.is_cancelled());
+        drop(guarded);
+        assert!(
+            token.is_cancelled(),
+            "dropping the SSE body cancels the run"
+        );
+    }
+
+    /// Issue #66 §3.2 end-to-end: a chunked provider must reach the wire as
+    /// multiple `TextMessageContent` frames whose concatenation carries the
+    /// answer EXACTLY once (the finalising `AssistantText` must not
+    /// duplicate it), and the stream must end with `RunFinished`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_streams_token_deltas_without_duplicating_final_text() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+
+        let _env = crate::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        std::env::set_var("RECURSIVE_HOME", home.path());
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(
+            MockProvider::new(vec![crate::llm::Completion {
+                content: "abcdefgh".into(),
+                ..Default::default()
+            }])
+            .with_stream_chunk_chars(3),
+        );
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-stream-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let app = crate::http::build_router_with_auth_and_rate_limit(
+            state,
+            crate::http::auth::AuthConfig::default(),
+            crate::http::RateLimiter::new(100, 1.0),
+        );
+
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "threadId": "stream-th",
+                            "runId": "r-stream",
+                            "messages": [
+                                {"id": "m1", "role": "user", "content": "hi"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+
+        let mut deltas = String::new();
+        let mut saw_run_finished = false;
+        let mut content_frames = 0usize;
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("TextMessageContent") => {
+                    content_frames += 1;
+                    deltas.push_str(v["delta"].as_str().unwrap_or_default());
+                }
+                Some("RunFinished") => saw_run_finished = true,
+                _ => {}
+            }
+        }
+        assert!(
+            content_frames >= 2,
+            "chunked provider must yield multiple content frames, got {content_frames}"
+        );
+        assert_eq!(
+            deltas, "abcdefgh",
+            "deltas must carry the answer exactly once — no duplicated final message"
+        );
+        assert!(saw_run_finished, "stream must end with RunFinished");
 
         std::env::remove_var("RECURSIVE_WORKSPACE");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");
