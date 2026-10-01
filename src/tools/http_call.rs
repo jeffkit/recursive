@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 use url::Host;
 
 use super::Tool;
-use crate::acp::ToolKind;
+use crate::tools::tool_kind::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::url_guard::is_private_ip;
