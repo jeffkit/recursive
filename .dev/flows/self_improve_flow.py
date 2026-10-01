@@ -1,3 +1,6 @@
+# ⚠️ DEPRECATED 2026-10-01（jeffkit 拍板 v1 退役）：本文件属 v1 厚引擎世代，
+# 不再维护、不再接新修复；现行实现 = self_improve_bridge_v2.py + self_improve_flow_v2.py
+# （codeflow 库节点版，keeper 接单与自迭代共用）。保留仅为历史对照与回滚取证。
 """self-improve 的 plaita flow 定义（薄骨架）：每个节点内联 shim 字面量，调一次
 self_improve_engine.py 的 step 子命令；引擎持有全部实际逻辑与跨步状态。
 
