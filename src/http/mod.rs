@@ -1853,6 +1853,21 @@ mod goal_403_http_sandbox_entry {
     }
 
     #[test]
+    fn http_entry_applies_allow_tools_narrowing() {
+        let src = include_str!("../../crates/recursive-cli/src/main.rs");
+        let http_block = src
+            .split("Cmd::Http { addr } => {")
+            .nth(1)
+            .expect("HTTP entry block must exist");
+        assert!(
+            http_block.contains("tools.retain_tools(&config.allow_tools)"),
+            "HTTP entry must apply config.allow_tools narrowing to its startup \
+             registry (issue #69: RECURSIVE_ALLOW_TOOLS had no effect on \
+             `recursive http`)"
+        );
+    }
+
+    #[test]
     fn builder_dispatches_container_tier_to_container_provider() {
         // The builder's Container arm must construct a
         // ContainerToolSetProvider and build the registry through the
