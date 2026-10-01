@@ -1126,6 +1126,10 @@ pub fn build_standard_tools_with_transport_opt(
         );
         registry = registry.register(Arc::new(search));
     }
+    #[cfg(not(feature = "web_search"))]
+    {
+        let _ = (web_search_provider, web_search_api_key, web_search_jina_key);
+    }
 
     if !skills.is_empty() {
         registry = registry.register(Arc::new(super::load_skill::LoadSkill::new(skills.to_vec())));
