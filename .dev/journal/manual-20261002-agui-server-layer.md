@@ -102,3 +102,46 @@ uncompiled code), and the 8 AG-UI unit tests existed in **both** files.
 | 5. No `unwrap()`/`expect()` in non-test code | ✅ new clippy work is test-only |
 | 7. Finish reasons are data | ✅ Error outcome stays a `RunFinished` variant |
 | 8. Tool-call ↔ tool-result pairing | ✅ seed mapping still skips unpaired halves; tests pin it |
+
+## NEEDS_FIX resolution (2026-10-02) — rebase onto main, port #66 on top
+
+The reviewed branch had forked at `aaa49cc` while main advanced 20+ commits;
+the diff was part #56 extraction, part wholesale revert of landed main work
+(#57/#63/#58/#59/#65/#69/#70/#54, flow v2 fixes). Resolution, per the review:
+
+1. **Rebased the branch onto `main` (14af0cd2)** — every deleted main feature/
+   test restored by the rebase itself; conflicts resolved toward main, with the
+   #56 extraction re-applied on top. Verified identical to main afterwards:
+   `src/agui_session.rs`, `src/tools/http_call.rs`, `tests/docs_living_paths.rs`,
+   `tests/invariants/loop_size_orthogonality.rs`, flow v2 files, CI gates.
+2. **Ported main's #66 work (`da0aa94c` + `182d5f94`) onto the layered shape**
+   instead of letting the rebase drop it: `CancelOnDrop` + keep-alive in the
+   thin `agui_run` adapter; the cancel token registry (`agui_active_runs`)
+   insert/remove inside `spawn_agui_run`; admission permit + per-thread run
+   fence (`SessionHost::try_begin_run`, 409 on duplicate runs) held by the
+   driver task for the whole background run; `AguiConverter::open_accumulated`
+   dedup (token deltas must not duplicate the final `AssistantText`);
+   `.streaming(true)`; fixture `agui_active_runs` fields; `agui_e2e`
+   HomeOverride pinning `RECURSIVE_SESSIONS_DIR`.
+3. **Re-landed the reviewer-endorsed branch-local fixes** resolved against
+   main: native-session persistence (`persist_run` — meta/cost/lock/uuid
+   chain), resume disk splices (`apply_resume_tool_results`), blake3
+   `thread_session_key` mapping (+ `distinct_thread_ids_never_share_a_session_directory`
+   restored in handlers.rs tests), SessionWriter same-second collision fix
+   (`create_in_same_second_gets_distinct_dirs`), `PinnedRecursiveHome` also
+   clearing `RECURSIVE_SESSIONS_DIR`, `docs/architecture/agui.md` + README.
+4. **Fixed on the way**: `build_session_runtime_parts` took the model from
+   `RECURSIVE_MODEL` env — now a parameter fed `state.config.model` on both
+   the REST and AG-UI paths (channels cannot drift). The dead legacy
+   sanitiser left in `agui.rs` was dropped (it lives on as
+   `legacy_sanitize_thread_id` in `src/agui_session.rs`).
+
+The diff vs main is now 9 files, all #56/#57-adjacent: `src/http/agui.rs`
+(new layer), `src/http/handlers.rs` (thin adapter), `src/http/mod.rs`
+(`mod agui` + `test_config_stub`), `src/session/writer.rs` (collision fix),
+`src/test_util.rs` (env pin), docs/README/journals.
+
+Gates after resolution: `cargo test --workspace` 3,827 passed / 0 failed
+(58 suites, incl. `agui_e2e` 8/8 with the three #57 native-session tests);
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` clean;
+`cargo fmt --all -- --check` clean.

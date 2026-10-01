@@ -34,10 +34,14 @@ Everything AG-UI server-side lives here, in five pieces:
    translator. Opens/closes `TextMessage*` framing across `PartialToken`
    deltas, anchors `ToolCall*` events to the last assistant message, and
    forwards hook/todo lifecycle as `Custom` events.
-2. **Thread ↔ session mapping** — `sanitize_thread_id_for_session` maps an
-   arbitrary client thread id onto a filesystem-safe session directory under
-   the workspace user dir (`agui-<sanitized-thread>/`), holding
-   `transcript.jsonl` and `.interrupts.json`.
+2. **Thread ↔ session mapping** — `agui_session::thread_session_key` maps an
+   arbitrary client thread id onto the native session directory
+   (`<sessions>/<workspace-slug>/agui-<blake3-16>/`, issue #57 — distinct
+   thread ids cannot collide, and the thread IS a first-class session:
+   `.meta.json`, cost, `SessionLock`). Pre-#57 flat `agui-<sanitized>/`
+   directories are migrated on first resolve; the old lossy sanitiser
+   survives only as `legacy_sanitize_thread_id` for those lookups.
+   Open interrupts persist as `.interrupts.json` next to the transcript.
 3. **`prepare_run`** — the resume/interrupt state machine (steps 1–3 of a
    run): derive the goal, validate resume coverage ("a resume must address
    every open interrupt"), reject runs that arrive while interrupts are open
@@ -50,9 +54,14 @@ Everything AG-UI server-side lives here, in five pieces:
    dispatch permission hook that turns a frontend tool call into an
    interrupt, seeds the transcript, wires per-turn checkpoints.
 5. **`spawn_agui_run`** — the driver task. Runs the agent, records metrics,
-   persists the transcript, persists open interrupts **before** emitting
-   them (crash safety), and emits `RunFinished` — always last, with
-   `Interrupt` / `Success` / `Error` outcome as appropriate.
+   persists the run into the thread's native session (`agui_session::persist_run`
+   — uuid-chained transcript lines, `.meta.json` status/cost, `cost.json`),
+   persists open interrupts **before** emitting them (crash safety), and
+   emits `RunFinished` — always last, with `Interrupt` / `Success` / `Error`
+   outcome as appropriate. The driver also holds the admission permit and
+   the per-thread run-fence guard for the whole background run (issue #57
+   §④ / #66), and removes the thread's cancel token from
+   `AppState::agui_active_runs` when it finishes.
 
 ## Wire flow
 
