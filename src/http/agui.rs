@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::event::AgentEvent;
 
@@ -459,7 +459,7 @@ impl crate::tools::PermissionHook for ClientToolHook {
 /// the workspace root that anchors the thread's session directory.
 pub(crate) struct AguiRunInput<'a> {
     pub workspace: &'a Path,
-    pub input: agui_protocol::RunAgentInput,
+    pub input: &'a agui_protocol::RunAgentInput,
 }
 
 /// The prepared run: what to ask the agent and what transcript to seed.

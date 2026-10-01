@@ -5,6 +5,7 @@
 //! endpoint that executes the agent with a given goal, session management
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
+mod agui;
 mod auth;
 mod cold_load;
 #[cfg(test)]
