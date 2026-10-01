@@ -88,7 +88,7 @@ Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md)
 | 5 | No unwrap in product code | (everywhere) |
 | 6 | New provider → new file | `src/llm/` |
 | 7 | Finish reasons are data | `src/agent/types.rs`, `src/runtime.rs` |
-| 8 | Tool-call ↔ result pairing | `src/compact.rs`, `src/session/` |
+| 8 | Tool-call ↔ result pairing | `src/compact/`, `src/session/` |
 
 ## Related Concepts
 

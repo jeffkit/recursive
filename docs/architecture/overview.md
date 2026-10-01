@@ -17,7 +17,8 @@ and repeats until a [finish reason](/architecture/agent-loop.md) is reached.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Entry Points                             │
-│  CLI (src/cli/)   TUI (src/tui/)   HTTP (src/http/)             │
+│  CLI (crates/recursive-cli/)  TUI (crates/recursive-tui/)        │
+│  HTTP (src/http/)                                                │
 └────────────────────┬────────────────────────────────────────────┘
                      │
                      ▼

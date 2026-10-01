@@ -76,11 +76,11 @@ file.
 (`max_tokens` above the model's limit).
 
 **Workaround.**
-- `Config::resolve_max_tokens()` (`src/config.rs:236`) resolves the priority:
+- `Config::resolve_max_tokens()` (`src/config.rs`) resolves the priority:
   `RECURSIVE_MAX_TOKENS` env var > preset's `ModelSpec.max_tokens` > config
   file `agent.max_tokens` > crate default. The CLI
-  (`crates/recursive-cli/src/main.rs:535-557`) and the TUI
-  (`crates/recursive-tui/src/runtime_builder.rs:101-128`) both re-derive
+  (`crates/recursive-cli/src/main.rs`) and the TUI
+  (`crates/recursive-tui/src/runtime_builder.rs`) both re-derive
   after an override, so this is handled automatically.
 - Escape hatch: set `RECURSIVE_MAX_TOKENS` explicitly to pin the value.
 

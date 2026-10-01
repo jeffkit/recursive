@@ -49,7 +49,7 @@ When the transcript grows large, `AgentRuntime` calls `Compactor` to:
 2. Replace old messages with a compacted stub.
 3. **Tool-call ↔ tool-result pairing must be preserved** (Invariant #8).
 
-`Compactor` lives in `src/compact.rs`. It uses a structured JSON output schema
+`Compactor` lives in `src/compact/` (see `src/compact/mod.rs`). It uses a structured JSON output schema
 so the LLM returns machine-readable fields.
 
 ## Tool Dispatch Safety

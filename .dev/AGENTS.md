@@ -42,7 +42,7 @@ src/
   runtime_goal.rs   GoalState / GoalStatus / GoalEvaluator (auto-loop judge)
   coordinator.rs    coordinator-mode orchestrator (multi-agent dispatch)
   multi.rs          multi-agent pool, shared memory, message bus
-  compact.rs        LLM-driven transcript compaction
+  compact/          LLM-driven transcript compaction (see compact/mod.rs)
   checkpoint.rs     git-backed shadow-repo snapshots + restore
   transcript.rs     on-disk transcript (jsonl) reader/writer
   session/          session lifecycle, persistence, resume, orphan cleanup
@@ -62,7 +62,7 @@ src/
     search.rs       deferred-tool search engine (software ToolSearch)
     pricing.rs      cost tracking
   tools/
-    mod.rs          Tool trait + ToolRegistry + path sandboxing
+    mod.rs          Tool trait + path sandboxing
     dispatch.rs     invoke_with_audit + touched-file recording + sandbox roots
     registry.rs     ToolRegistry state, permissions, hooks, classifier
     fs.rs           Read, Write, Glob
@@ -85,7 +85,7 @@ src/
     docker_sandbox.rs / docker_provider.rs / e2b_provider.rs
                     sandboxed Bash providers (feature-gated)
     run_background.rs       background-job Bash manager
-  main.rs / crates/recursive-cli   CLI: run / repl / tools / loop / http / mcp
+  crates/recursive-cli             CLI: run / repl / tools / loop / http / mcp
   crates/recursive-tui             ratatui TUI
   crates/agui-{protocol,client,tui}   AG-UI protocol stack
 
@@ -132,7 +132,7 @@ e2e/
    `ProviderStop`). Only honest-to-god failures (network, JSON,
    provider transport, IO) become `Err`. The CLI decides binary
    exit code by inspecting `outcome.finish_reason` AFTER persisting the
-   transcript — see `main.rs::exit_for_finish`. **NEVER** introduce
+   transcript — see `crates/recursive-cli/src/cli/output.rs::exit_for_finish`. **NEVER** introduce
    a new `Error::XxxBudget` or `Error::XxxLimit` variant that
    short-circuits the transcript save. The self-improve flow's auto-resume
    step depends on the saved transcript existing on disk.
