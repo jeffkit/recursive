@@ -1581,8 +1581,8 @@ mod tests {
             prompt_segments: crate::system_prompt::PromptSegments::default(),
             max_steps: 8,
             seed_transcript: None,
-            interrupt_before: interrupt_before,
-            client_tools: client_tools,
+            interrupt_before,
+            client_tools,
         }
     }
 
@@ -1600,6 +1600,7 @@ mod tests {
     /// Client tools must be registered as callable stubs AND take the
     /// registry's permission-hook slot (deny-before-dispatch).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
     async fn build_agui_runtime_registers_client_tool_stubs_with_deny_hook() {
         let (_home, _guard) = pinned_home();
         let ws = tempfile::tempdir().unwrap();
@@ -1639,6 +1640,7 @@ mod tests {
     /// `interrupt_before` installs the test-interrupt hook when no client
     /// tools are present; unrelated tools stay allowed.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
     async fn build_agui_runtime_installs_test_interrupt_hook_for_interrupt_before() {
         let (_home, _guard) = pinned_home();
         let ws = tempfile::tempdir().unwrap();
