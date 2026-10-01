@@ -35,7 +35,13 @@ fn living_docs_reference_existing_paths() {
     let mut bad: Vec<String> = Vec::new();
     for f in &files {
         let text = fs::read_to_string(f).unwrap_or_else(|e| panic!("read {f}: {e}"));
+        // Intentional historical mentions: the legacy `src/agent.rs` split and
+        // frozen session-log excerpts quoted inside layer3-episodic.md.
+        const ALLOWED: &[&str] = &["src/agent.rs", "src/permissions.rs"];
         for p in extract_repo_paths(&text) {
+            if ALLOWED.contains(&p.as_str()) {
+                continue;
+            }
             if !Path::new(&p).exists() {
                 bad.push(format!("{f}: `{p}` does not exist"));
             }
@@ -50,7 +56,9 @@ fn living_docs_reference_existing_paths() {
 }
 
 fn collect_md(dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -66,16 +74,34 @@ fn collect_md(dir: &Path, out: &mut Vec<String>) {
 /// suffixes.
 fn extract_repo_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = text.char_indices().peekable();
+    let bytes = text.as_bytes();
     let prefixes = ["src/", "crates/", "tests/", "e2e/", ".dev/scripts/"];
-    while let Some((i, _)) = chars.next() {
+    for (i, _) in text.char_indices() {
         let rest = &text[i..];
         let Some(pref) = prefixes.iter().find(|p| rest.starts_with(**p)) else {
             continue;
         };
+        // Path boundary: skip matches embedded in a longer path
+        // (e.g. the `src/ui/chat.rs` inside `crates/recursive-tui/src/ui/chat.rs`).
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev == b'/'
+                || prev == b'_'
+                || prev == b'.'
+                || prev.is_ascii_alphanumeric()
+                || prev == b'-'
+            {
+                continue;
+            }
+        }
         let mut end = i + pref.len();
         for c in rest[pref.len()..].chars() {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '/' || c == '.' || c == '-' || c == '{'
+            if c.is_ascii_alphanumeric()
+                || c == '_'
+                || c == '/'
+                || c == '.'
+                || c == '-'
+                || c == '{'
                 || c == '}'
             {
                 end += c.len_utf8();
