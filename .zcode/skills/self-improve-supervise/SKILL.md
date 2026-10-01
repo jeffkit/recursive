@@ -8,25 +8,31 @@ triggers: self-improve, self improve, 自改, 跑一个goal, 跑一个 goal, 带
 
 # self-improve-supervise — ZCode drives Recursive's self-improve flow
 
-## ⚡ 引擎选择：plaita（2026-09-30 起，flowcast 为回滚）
+## ⚡ 引擎选择：v2 codeflow（2026-10-01 起；v1 厚引擎与 flowcast 均退役/回滚）
 
-self-improve 现有**两个引擎**，监督 SOP 基本通用：
+self-improve 与 keeper 接单共用 **v2 引擎**（`self_improve_flow_v2.py`，codeflow
+库节点版——同一条 flow：keeper goal=issue、自迭代 goal=内部目标）。
 
-| | plaita 引擎（**默认推荐**） | flowcast 引擎（回滚） |
+| | **v2 codeflow（默认唯一）** | flowcast 引擎（回滚） |
 |---|---|---|
-| 启动 | `.dev/scripts/launch-flow-plaita.sh`（参数面与 launch-flow.sh 一致） | `.dev/scripts/launch-flow.sh` |
-| 定义 | `.dev/flows/self-improve.plaita.json`（源 `self_improve_flow.py`，45 节点，console 已发布 v1.0.0） | `.dev/flows/self-improve.flow.js`（2033 行） |
-| 逻辑 | **厚引擎** `.dev/flows/self_improve_engine.py`（watchdog/门禁fix循环/评审/commit/preserve 全移植；改逻辑只动它，不需重发 flow 定义） | 全在 JS 里 |
-| 运行目录 | 同：`.flowcast/runs/<run-id>/`；state.json 含 `engine: "plaita"` 字段 + 兼容 status/currentStep/verdict | `.flowcast/runs/<run-id>/` |
-| 观测 | Langfuse（trace id = execution_id）+ console 执行页 | 日志 + state.json |
+| 启动 | `.dev/scripts/launch-flow-plaita.sh`（旧 v1 旗标自动翻译/丢弃） | `.dev/scripts/launch-flow.sh` |
+| 定义 | `.dev/flows/self_improve_flow_v2.py`（`@flow` codeflow 源码为权威，import 期编译） | `.dev/flows/self-improve.flow.js`（2033 行） |
+| 逻辑 | 全在图里：preflight/impl(AGENTRUN)/三门(GATE+主层修复环)/评审(独立 reviewer)/GIT_PUBLISH；L1 代码续跑+wip 快照+L2 会话续跑（2026-10-01） | 全在 JS 里 |
+| 执行位置 | **本地 bridge 进程**（keeper 派发同款；迁 console = L3 设计稿 docs/DESIGN-console-execution.md，待 worker 四件套） | 本地 |
+| 运行目录 | `.flowcast/runs/<run-id>/`；state.json：status/currentStep/verdict/node_timings（探针） | 同左 |
+| 观测 | Langfuse（trace id = execution_id）；console 页对 v2 不适用（未迁） | 日志 + state.json |
 
-plaita 专属注意：
-- launcher 已内置 `PLAITA_SANDBOX_TIMEOUT=90000`（沙箱默认 10s 墙钟装不下 preflight.build）；
-- 凭据经沙箱 env 白名单会**被剥**——bridge 已用 `SUBPROCESS_ENV_EXTRA` 按前缀注入
-  （DEEPSEEK_/GLM_/MINIMAX_/RECURSIVE_/LANGFUSE_），新增凭据前缀要同步 bridge；
-- 引擎子命令带 `--run-dir`（argv 优先于 env——`Path("")`==`Path(".")` 的坑）；
-- 门禁语义等价：gates.json 运行时读取、per-gate fix ≤3 轮、mutants 变更自跳；
-  run.recursive 内置 budget/timeout 一次 resume + watchdog（g346 逻辑同款）。
+v1 退役注记（2026-10-01，jeffkit 拍板）：`self_improve_bridge.py`/`self_improve_engine.py`/
+`self_improve_flow.py`/`self-improve.plaita.json` 为遗留实现，不再维护；console 上的
+self-improve v1.0.0 注册同样陈旧勿用。
+
+v2 专属注意：
+- launcher 已内置 `PLAITA_SANDBOX_TIMEOUT=90000` + `SELF_IMPROVE_AGENT/REVIEWER`
+  默认 glm53-flash（换模型改 agents.json，与 keeper 管线同源）；
+- 门禁修复环在主层（childflow 表达式上下文无 F——DSL 地雷，59/69 实证）；
+- fmt 门 apply 模式（`cargo fmt --all`）；impl 会话与 wip 分支跨重试持久
+  （会话存 `~/.issue-keeper/pipeline/recursive-<n>/sessions/` 仅 keeper 派发路径）；
+- flow/bridge 改动三过纪律：编译 + 全图 dry-run + `test/flow_v2_paths.py`（10 场景）。
 
 ## When to use
 
