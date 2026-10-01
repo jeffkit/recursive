@@ -42,9 +42,9 @@ use serde_json::{json, Value};
 use url::Host;
 
 use super::Tool;
-use crate::tools::tool_kind::ToolKind;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::tool_kind::ToolKind;
 use crate::tools::url_guard::is_private_ip;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
