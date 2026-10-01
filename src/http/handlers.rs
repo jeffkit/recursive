@@ -1484,9 +1484,6 @@ pub(super) async fn agui_run(
             seed_transcript: prepared.seed_transcript,
             interrupt_before: input.interrupt_before.as_deref().unwrap_or(&[]),
             client_tools: &input.tools,
-            model: state.config.model.clone(),
-            provider: state.config.provider_type.clone(),
-            preset: state.config.preset.clone(),
         },
     )
     .map_err(|e| {

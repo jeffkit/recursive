@@ -305,42 +305,14 @@ pub(crate) fn agui_events_for(ev: &AgentEvent) -> Vec<agui_protocol::Event> {
 
 // ── Thread ↔ session directory mapping ────────────────────────────────────
 
-/// Map an arbitrary AG-UI thread id onto a checkpoint session id that
-/// satisfies `validate_session_id` in the checkpoint module
-/// (alphanumerics + `-` `_` `.`, no leading dot, no `..`, no path
-/// separators). Disallowed chars become `-`.
-pub(crate) fn sanitize_thread_id_for_session(thread: &str) -> String {
-    let mut out: String = thread
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // Drop a leading dot so we don't produce a hidden dir.
-    while out.starts_with('.') {
-        out.replace_range(..1, "-");
-    }
-    // Collapse `..` so we don't produce ref-traversal sequences.
-    while out.contains("..") {
-        out = out.replace("..", "-.");
-    }
-    if out.is_empty() {
-        out.push_str("default");
-    }
-    out
-}
-
 /// Path to the session directory for an AG-UI thread.
 ///
 /// Since issue #57 this is the native session layout
 /// (`<sessions>/<workspace-slug>/agui-<thread-key>/`, see
 /// [`crate::agui_session`]); pre-#57 flat thread directories are
-/// migrated on resolve. The sanitiser below survives only as the
-/// legacy-layout mapper inside [`crate::agui_session`].
+/// migrated on resolve. The old lossy sanitiser survives only as
+/// `legacy_sanitize_thread_id` inside [`crate::agui_session`] (kept for
+/// migration lookups; its traversal tests live there too).
 pub(crate) fn agui_session_dir(workspace: &Path, thread_id: &str) -> Option<PathBuf> {
     crate::agui_session::resolve_session_dir(workspace, thread_id)
 }
@@ -821,14 +793,6 @@ pub(crate) struct AguiRuntimeDeps<'a> {
     pub interrupt_before: &'a [String],
     /// AG-UI client tools to register as stubs with a deny hook.
     pub client_tools: &'a [ag::Tool],
-    /// Model id for `.meta.json` (issue #57) — `config.model` at the HTTP
-    /// layer; pricing and `sessions list` read it back.
-    pub model: String,
-    /// Provider id for `.meta.json` — `config.provider_type` at the HTTP
-    /// layer.
-    pub provider: String,
-    /// Resolved preset id (`.meta.json` pricing identity), if any.
-    pub preset: Option<String>,
 }
 
 /// The hooks installed by [`build_agui_runtime`], handed back so the
@@ -1459,44 +1423,6 @@ mod tests {
         );
     }
 
-    // ── sanitize_thread_id_for_session ──────────────────────────────────────
-
-    #[test]
-    fn sanitize_thread_id_valid_passthrough() {
-        assert_eq!(sanitize_thread_id_for_session("abc-123"), "abc-123");
-        assert_eq!(sanitize_thread_id_for_session("foo_bar.baz"), "foo_bar.baz");
-    }
-
-    #[test]
-    fn sanitize_thread_id_replaces_special_chars() {
-        let out = sanitize_thread_id_for_session("a/b:c");
-        assert!(!out.contains('/'), "slash must be replaced");
-        assert!(!out.contains(':'), "colon must be replaced");
-    }
-
-    #[test]
-    fn sanitize_thread_id_leading_dot_replaced() {
-        let out = sanitize_thread_id_for_session(".hidden");
-        assert!(
-            !out.starts_with('.'),
-            "leading dot must be replaced; got {out}"
-        );
-    }
-
-    #[test]
-    fn sanitize_thread_id_double_dot_collapsed() {
-        let out = sanitize_thread_id_for_session("a..b");
-        assert!(
-            !out.contains(".."),
-            "double dot must be collapsed; got {out}"
-        );
-    }
-
-    #[test]
-    fn sanitize_thread_id_empty_becomes_default() {
-        assert_eq!(sanitize_thread_id_for_session(""), "default");
-    }
-
     // ── agui_seed_from_messages ─────────────────────────────────────────────
 
     /// Unit-level: tool-related messages are skipped (invariant #8 —
@@ -1767,9 +1693,6 @@ mod tests {
             seed_transcript: None,
             interrupt_before,
             client_tools,
-            model: "mock".into(),
-            provider: "mock".into(),
-            preset: None,
         }
     }
 
