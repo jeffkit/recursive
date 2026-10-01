@@ -87,7 +87,21 @@ impl SessionWriter {
         preset: Option<&str>,
     ) -> std::io::Result<Self> {
         let slug = workspace_slug(workspace);
-        let session_id = format!("{}-{}", super::filesystem_safe_timestamp(), slug);
+        // The timestamp has 1-second granularity, so two sessions created
+        // for the same workspace within the same second (fast test suites,
+        // retry loops, parallel runs) would otherwise derive the SAME
+        // session_id and silently append to each other's transcript.jsonl.
+        // A short random suffix makes the id collision-proof; the readable
+        // `<timestamp>-<slug>` prefix is kept for sort order (sessions are
+        // listed by directory name) and substring matching (`recursive
+        // resume <id fragment>`).
+        let unique_suffix: String = Uuid::new_v4().simple().to_string()[..8].to_string();
+        let session_id = format!(
+            "{}-{}-{}",
+            super::filesystem_safe_timestamp(),
+            slug,
+            unique_suffix
+        );
         // Sessions live under the per-user data dir, not the project,
         // so they don't pollute the user's `git status`.
         let sessions_root = crate::paths::user_sessions_dir(workspace)
