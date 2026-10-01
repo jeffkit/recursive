@@ -301,7 +301,7 @@ def self_improve_v2(INPUT):
     # 节点 id 按赋值名派生且全局唯一（跨分支也算重复，64dfd7d/61294d0 两次实证）——
     # 评审段赋值名一律带序号：rev1/rev2/wfr/wfr2。
     rev1 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                    timeout_secs=3600)
+                    timeout_secs=5400)
     if F.contains(rev1.text, "VERDICT:PASS") != True:
         if F.contains(rev1.text, "VERDICT:NEEDS_FIX") != True:
             wfr = WRITEFILE(path=F.concat(run_dir, "/review-unavailable.log"),
@@ -314,7 +314,7 @@ def self_improve_v2(INPUT):
             "\n\n--- reviewer feedback ---\n", rev1.text)
         AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
         rev2 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                        timeout_secs=3600)
+                        timeout_secs=5400)
         if F.contains(rev2.text, "VERDICT:PASS") != True:
             wfr2 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
                              content=rev2.text)
