@@ -71,38 +71,18 @@ def has_changes(INPUT):
 
 
 @childflow()
-def gate_with_fix(INPUT):
-    """跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。
+def gate_once(INPUT):
+    """单发一道门（只包 GATE 本体，返回结果即走）。
 
-    INPUT: name / cmd / timeout_secs / wt / agent
-    输出: {passed, gate, out?}
-
-    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复
-    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue
-    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义
-    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘
-    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。
+    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/
+    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，
+    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切
+    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。
     """
     run = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
                timeout_secs=INPUT.timeout_secs)
-    if run.passed == True:
-        return {"passed": True, "gate": INPUT.name}
-    fix_prompt = F.concat(
-        'The "', INPUT.name, '" check failed. ',
-        "Edit the source files to fix every error below, then re-run `",
-        INPUT.cmd, "` yourself to verify before stopping.",
-        "\nFix the source, never silence with #[allow].\n--- output tail ---\n",
-        run.stdout)
-    AGENTRUN(agent=INPUT.agent, prompt=fix_prompt, repo=INPUT.wt,
-             timeout_secs=7200)
-    run2 = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
-                timeout_secs=INPUT.timeout_secs)
-    if run2.passed == True:
-        return {"passed": True, "gate": INPUT.name}
-    WRITEFILE(path=F.concat(INPUT.wt, "/../failure-gate-", INPUT.name, ".log"),
-              content=F.concat("cmd: ", INPUT.cmd, "\n--- stdout ---\n", run2.stdout,
-                               "\n--- stderr ---\n", run2.stderr))
-    return {"passed": False, "gate": INPUT.name, "out": run2.stdout}
+    return {"passed": run.passed, "gate": INPUT.name, "out": run.stdout,
+            "err": run.stderr}
 
 
 @flow("self-improve-v2", desc="Self-improve v2：库节点为主，code 只做 preflight/has_changes")
@@ -216,31 +196,73 @@ def self_improve_v2(INPUT):
         return {"verdict": "skip-commit", "stage": "commit",
                 "why": "agent made no changes", "impl_text": impl.text}
 
-    # ── 门禁 ×3（gate_with_fix 子流程：GATE 库节点 + AGENTRUN 修复 ≤3）──
+    # ── 门禁 ×3（gate_once 单发子流程 + 主层修复环：首检→AGENTRUN 修→复检定论）──
+    # 修复环放主层的原因：childflow 表达式上下文没有 F（59/69 实证 KeyError），
+    # 详见 gate_once docstring。fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死
+    # 实证：impl 不跑 fmt、fix-loop LLM 手改源码救不动）。cargo fmt --all 幂等且
+    # 秒级：可解析即绿、格式化结果随提交走；解析错误才红并交 fix-loop 修语法。
+    # 不用 --check：apply 后 check 恒过，纯冗余；也不用 && 链——GATE 对单字符串
+    # shlex.split 后无 shell 直执行，&& 会变字面量参数（keeper 同款教训）。
     # fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死实证：impl 不跑 fmt、
     # fix-loop LLM 手改源码救不动）。cargo fmt --all 幂等且秒级：可解析即绿、
     # 格式化结果随提交走；解析错误才红并交 fix-loop 修语法。不用 --check：
     # apply 后 check 恒过，纯冗余；也不用 && 链——GATE 对单字符串 shlex.split
     # 后无 shell 直执行，&& 会变字面量参数（keeper 同款教训）。
     g1 = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
-                      "timeout_secs": 120, "wt": pre.worktree, "agent": agent},
-               flow=gate_with_fix)
+                      "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
-        return {"verdict": "failed-preserved", "stage": "gates", "gate": g1.gate,
-                "out": g1.out}
+        AGENTRUN(agent=agent, prompt=F.concat(
+                'The "fmt" check failed. Edit the source files to fix every '
+                "error below, then re-run `cargo fmt --all` yourself to verify "
+                "before stopping.\nFix the source, never silence with #[allow]."
+                "\n--- output tail ---\n", g1.out),
+            repo=pre.worktree, timeout_secs=7200)
+        g1b = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
+                           "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
+        if g1b.passed == False:
+            wgf1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-fmt.log"),
+                             content=F.concat("cmd: cargo fmt --all\n--- stdout ---\n",
+                                              g1b.out, "\n--- stderr ---\n", g1b.err))
+            return {"verdict": "failed-preserved", "stage": "gates", "gate": g1b.gate,
+                    "out": g1b.out}
     g2 = CHILD(input={"name": "clippy",
                       "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-                      "timeout_secs": 1200, "wt": pre.worktree, "agent": agent},
-               flow=gate_with_fix)
+                      "timeout_secs": 1200, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
-        return {"verdict": "failed-preserved", "stage": "gates", "gate": g2.gate,
-                "out": g2.out}
+        AGENTRUN(agent=agent, prompt=F.concat(
+                'The "clippy" check failed. Edit the source files to fix every '
+                "error below, then re-run `cargo clippy --workspace --all-targets "
+                "--all-features -- -D warnings` yourself to verify before stopping."
+                "\nFix the source, never silence with #[allow]."
+                "\n--- output tail ---\n", g2.out),
+            repo=pre.worktree, timeout_secs=7200)
+        g2b = CHILD(input={"name": "clippy",
+                           "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+                           "timeout_secs": 1200, "wt": pre.worktree}, flow=gate_once)
+        if g2b.passed == False:
+            wgf2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-clippy.log"),
+                             content=F.concat("cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\n--- stdout ---\n",
+                                              g2b.out, "\n--- stderr ---\n", g2b.err))
+            return {"verdict": "failed-preserved", "stage": "gates", "gate": g2b.gate,
+                    "out": g2b.out}
     g3 = CHILD(input={"name": "test", "cmd": "cargo test --workspace",
-                      "timeout_secs": 1800, "wt": pre.worktree, "agent": agent},
-               flow=gate_with_fix)
+                      "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
     if g3.passed == False:
-        return {"verdict": "failed-preserved", "stage": "gates", "gate": g3.gate,
-                "out": g3.out}
+        AGENTRUN(agent=agent, prompt=F.concat(
+                'The "cargo test" check failed. Edit the source files to fix every '
+                "failing test below, then re-run `cargo test --workspace` yourself "
+                "to verify before stopping."
+                "\nFix the source, never silence with #[allow]."
+                "\n--- output tail ---\n", g3.out),
+            repo=pre.worktree, timeout_secs=7200)
+        g3b = CHILD(input={"name": "test", "cmd": "cargo test --workspace",
+                           "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
+        if g3b.passed == False:
+            wgf3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-test.log"),
+                             content=F.concat("cmd: cargo test --workspace\n--- stdout ---\n",
+                                              g3b.out, "\n--- stderr ---\n", g3b.err))
+            return {"verdict": "failed-preserved", "stage": "gates", "gate": g3b.gate,
+                    "out": g3b.out}
 
     # ── 评审（线性两轮）：独立 reviewer → NEEDS_FIX 则修一轮 → 复审定论 ──
     # 2026-09-30 弃用 WHILE 版：#63/#64 实证 WHILE 循环体内表达式上下文没有
