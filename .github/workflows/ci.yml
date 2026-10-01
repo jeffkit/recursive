@@ -60,6 +60,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+      # Feature-gate guards: the lib must build with no features at all and
+      # with a minimal adapter set — `acp` must stay optional (#54).
+      - name: Check --no-default-features (lib)
+        run: cargo check --no-default-features --lib
+      - name: Check --no-default-features --features http (lib)
+        run: cargo check --no-default-features --features http --lib
+
   supply-chain:
     name: supply-chain (cargo audit + machete)
     runs-on: ubuntu-latest

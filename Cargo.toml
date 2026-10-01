@@ -26,7 +26,8 @@ categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.75"
 exclude = [".dev/", "journal/", "goals/"]
 [features]
-default = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"]
+default = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub", "acp"]
+acp = ["dep:agent-client-protocol-schema", "mcp"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:anyhow"]
 test-utils = ["dep:tempfile"]
 mcp = []
@@ -98,7 +99,7 @@ tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 jsonwebtoken = { version = "9", optional = true }
 tempfile = { version = "3", optional = true }
-agent-client-protocol-schema = "1.4"
+agent-client-protocol-schema = { version = "1.4", optional = true }
 agui-protocol = { version = "=0.8.3", path = "crates/agui-protocol", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 deadpool-redis = { version = "0.18", optional = true }

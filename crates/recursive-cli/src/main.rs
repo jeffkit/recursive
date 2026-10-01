@@ -247,6 +247,7 @@ enum Cmd {
         workspace: PathBuf,
     },
     /// Start as an ACP (Agent Client Protocol) server (stdio transport).
+    #[cfg(feature = "acp")]
     Acp,
     /// Start the HTTP API server.
     #[cfg(feature = "http")]
@@ -706,6 +707,7 @@ async fn main() -> anyhow::Result<()> {
             config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
         }
+        #[cfg(feature = "acp")]
         Cmd::Acp => {
             // ACP server: stdio JSON-RPC transport for Agent Client Protocol.
             tracing::info!("starting ACP v1 server on stdio");
