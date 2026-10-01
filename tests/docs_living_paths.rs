@@ -15,6 +15,7 @@ const SCAN_FILES: &[&str] = &[
     "docs/tui-fake-cc-gap.md",
     "docs/llm-gateway-compat.md",
     "docs/INTERNALS.md",
+    ".dev/OPERATIONS.md",
 ];
 
 const SCAN_DIRS: &[&str] = &["docs/architecture"];

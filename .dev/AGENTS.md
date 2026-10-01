@@ -62,7 +62,8 @@ src/
     search.rs       deferred-tool search engine (software ToolSearch)
     pricing.rs      cost tracking
   tools/
-    mod.rs          Tool trait + path sandboxing
+    mod.rs          re-exports (Tool trait + ToolRegistry live in registry.rs,
+                    path sandboxing in dispatch.rs::resolve_within)
     dispatch.rs     invoke_with_audit + touched-file recording + sandbox roots
     registry.rs     ToolRegistry state, permissions, hooks, classifier
     fs.rs           Read, Write, Glob

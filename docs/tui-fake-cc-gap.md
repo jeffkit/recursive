@@ -373,8 +373,7 @@ Recursive 是 ⛔，详见末节），重点在每类的 ✅/🔴 决断。
 
 fake-cc 的 dialog 系统是 Ink 组件树自然形成的：每个 dialog 是一个
 React 组件，挂载即遮蔽。Recursive 的对应是 `Vec<Modal>` 后入先出栈
-（`crates/recursive-tui/src/app/`，`crates/recursive-tui/src/
-ui/modal.rs:43-71`）。
+（`crates/recursive-tui/src/app/`，`crates/recursive-tui/src/ui/modal.rs`）。
 
 | Modal | fake-cc | Recursive | 状态 | 备注 |
 |---|---|---|---|---|
@@ -389,7 +388,7 @@ ui/modal.rs:43-71`）。
 | History search | 是（`HistorySearchDialog.tsx`） | 是 | ✅ | Goal-160：Ctrl+R，`InputMode::HistorySearch` |
 | Quick open | 是（`QuickOpenDialog.tsx`） | 否 | 🔴 | 候选；与 Ctrl+Shift+P 绑定 |
 | Global search | 是（`GlobalSearchDialog.tsx`） | 否 | 🔴 | 候选 |
-| Permission request | 是（`src/components/permissions/`） | 否 | 🔴 | **重要候选**；runtime 已有 permission_hook（参考 `src/runtime.rs:204` 类似位置），需要加 UI 通道（mpsc 双向） |
+| Permission request | 是（`src/components/permissions/`） | 否 | 🔴 | **重要候选**；runtime 已有 permission_hook（`src/runtime.rs::set_permission_hook`），需要加 UI 通道（mpsc 双向） |
 | Auto-mode opt-in | 是（`AutoModeOptInDialog.tsx`） | 否 | 🔴 | 候选；与 permission modal 配套 |
 | Bypass permissions | 是（`BypassPermissionsModeDialog.tsx`） | 否 | 🔴 | 同 |
 | Cost threshold dialog | 是（`CostThresholdDialog.tsx`） | 否 | 🔴 | 候选；超过阈值警告 |

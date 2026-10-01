@@ -143,9 +143,8 @@ Before running two goals in parallel, verify their expected file
 touch-sets do not overlap. Goals that both modify any of the following
 files **MUST be serialized**:
 
-- `src/main.rs`
+- `crates/recursive-cli/src/main.rs`
 - `src/lib.rs`
-- `src/agent.rs`
 - `Cargo.toml`
 
 How to check: read each goal file and grep for these file names in the
@@ -181,7 +180,7 @@ For each terminated run:
    ```bash
    git merge self-improve/<id> -m "merge: goal-NN <tag> (<provider>)"
    ```
-4. Resolve conflicts if needed (common: `src/main.rs` CLI struct).
+4. Resolve conflicts if needed (common: `crates/recursive-cli/src/main.rs` CLI struct).
 5. Run `cargo test` — must be green.
 6. Commit the observation file to main:
    ```bash
@@ -284,13 +283,13 @@ history IS the state.
 
 Two concurrent goals MUST touch disjoint product files:
 
-| if A touches             | B can touch                       |
-|--------------------------|-----------------------------------|
-| `src/agent.rs`           | new `src/<thing>.rs` module       |
-| `src/tools/<old>.rs`     | `src/llm/*` or `src/config.rs`    |
-| `src/main.rs` (new flag) | new `src/tools/<new>.rs` module   |
+| if A touches                                  | B can touch                       |
+|-----------------------------------------------|-----------------------------------|
+| `src/agent/types.rs`                          | new `src/<thing>.rs` module       |
+| `src/tools/<old>.rs`                          | `src/llm/*` or `src/config.rs`    |
+| `crates/recursive-cli/src/main.rs` (new flag) | new `src/tools/<new>.rs` module   |
 
-`src/lib.rs` re-exports usually auto-merge. `src/main.rs` CLI struct
+`src/lib.rs` re-exports usually auto-merge. The `crates/recursive-cli/src/main.rs` CLI struct
 is the recurring conflict — avoid two CLI-flag goals in one batch.
 
 ### 4.2 Provider rotation
@@ -357,8 +356,8 @@ Stop and call HITL when **any** of:
 - You'd need to invent a new product direction (new phase, dropping
   a feature, architectural pivot).
 - Spend on a single batch exceeds ~$2.00.
-- A goal would require non-trivial changes to `src/agent.rs`'s main
-  loop (violates design principle #1).
+- A goal would require non-trivial changes to
+  `src/run_core.rs::RunCore::run_inner` (violates design principle #1).
 
 ### Auto-resume on BudgetExceeded
 

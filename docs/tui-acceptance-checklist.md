@@ -775,7 +775,7 @@
   - `q`（空 buffer）
   - `/exit` `/quit` `/q` 命令
   - Ctrl+C 第一次在 modal/turn/buffer 都无 → arm hint；**2s 内**第二次 → 真退出
-  - 终端 Ctrl+D（crossterm 默认 EOF → `Event::Key(Char('d'))` 不在代码处理，**实际可能不退出**——`mod.rs:331-411` 看不到 Ctrl+D 分支）
+  - 终端 Ctrl+D（crossterm 默认 EOF → `Event::Key(Char('d'))` 不在代码处理，**实际可能不退出**——`crates/recursive-tui/src/app/event_loop.rs` 看不到 Ctrl+D 分支）
   - Confirm modal y + on_yes=Exit
 - 验证：分别测这几种
 - 来源：`crates/recursive-tui/src/app/`
@@ -917,7 +917,7 @@
 - 状态:[ ]
 
 ### S.5 Plan mode request banner (Goal 202)
-- 期望:1 行高;`plan_mode_request_pending` 时显示(且 `plan_awaiting_approval` 不显示时——优先级看 `chat.rs:125-129`)
+- 期望:1 行高;`plan_mode_request_pending` 时显示(且 `plan_awaiting_approval` 不显示时——优先级看 `crates/recursive-tui/src/ui/chat.rs`)
 - 期望:内容格式 `" ⓘ Plan mode request — [y/Enter] Allow  [n/Esc] Skip — execute directly "`
 - 期望:背景色 蓝;`[y/Enter]` 绿底、`[n/Esc]` 红底
 - 验证:让 agent 调 `request_plan_mode` 工具
