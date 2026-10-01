@@ -424,6 +424,12 @@ async fn rebind_per_session_registry(
             if let Some(sp) = base.shared_permissions() {
                 reg = reg.with_shared_permissions(sp);
             }
+            // Issue #69: the container tier rebuilds the registry per session,
+            // bypassing the startup narrowing in the HTTP entry — reapply
+            // `allow_tools` here so `RECURSIVE_ALLOW_TOOLS` holds on every tier.
+            if !config.allow_tools.is_empty() {
+                reg.retain_tools(&config.allow_tools);
+            }
             return Ok(reg
                 .with_headless(base.headless)
                 .with_hook_runner(base.hook_runner.clone()));
@@ -1864,6 +1870,23 @@ mod goal_403_http_sandbox_entry {
             "HTTP entry must apply config.allow_tools narrowing to its startup \
              registry (issue #69: RECURSIVE_ALLOW_TOOLS had no effect on \
              `recursive http`)"
+        );
+    }
+
+    #[test]
+    fn session_rebind_reapplies_allow_tools_in_container_tier() {
+        // Issue #69: the container tier rebuilds the registry per session,
+        // bypassing the startup narrowing — rebind must reapply it.
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let block = src
+            .split("async fn rebind_per_session_registry")
+            .nth(1)
+            .and_then(|rest| rest.split("impl AppState").next())
+            .expect("rebind_per_session_registry must exist");
+        assert!(
+            block.contains("reg.retain_tools(&config.allow_tools)"),
+            "rebind_per_session_registry must reapply allow_tools narrowing to \
+             the per-session container registry"
         );
     }
 
