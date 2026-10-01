@@ -40,6 +40,12 @@ pub(crate) struct AguiConverter {
     /// TextMessageEnd yet. Used as the `messageId` for streaming
     /// `PartialToken` deltas and as the `parentMessageId` for tool calls.
     open_message_id: Option<String>,
+    /// Issue #66: concatenation of the `PartialToken` deltas already emitted
+    /// for the open message. When the step's final `AssistantText` arrives it
+    /// usually equals this string — emitting it again as a fresh message
+    /// would render the answer twice in AG-UI clients, so only the unsent
+    /// remainder (if any) is flushed before `TextMessageEnd`.
+    open_accumulated: String,
     /// Last fully-emitted (or currently-open) assistant message id. Used as
     /// the `parent_message_id` on ToolCallStart even after the message has
     /// been closed, so a client can attribute the tool call back to the
@@ -59,30 +65,72 @@ impl AguiConverter {
         let mut out = Vec::new();
         match ev {
             AgentEvent::AssistantText { text, .. } => {
-                // Close any in-flight streamed message first.
+                // Close any in-flight streamed message first. Issue #66: the
+                // deltas already carried (almost always) the whole text —
+                // flush only the unsent remainder into the SAME message and
+                // close it, instead of emitting a second full-text message
+                // that would make clients render the answer twice.
                 if let Some(id) = self.open_message_id.take() {
-                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                        message_id: id,
+                    let accumulated = std::mem::take(&mut self.open_accumulated);
+                    if let Some(rest) = text.strip_prefix(accumulated.as_str()) {
+                        if !rest.is_empty() {
+                            out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                                message_id: id.clone(),
+                                delta: rest.to_string(),
+                                base: ag::BaseEvent::default(),
+                            }));
+                        }
+                        out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                            message_id: id.clone(),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        self.last_assistant_message_id = Some(id);
+                    } else {
+                        // Deltas diverged from the final text (misbehaving
+                        // provider): keep the streamed message as-is and fall
+                        // back to the historical full-message emission so no
+                        // text is lost.
+                        out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                            message_id: id,
+                            base: ag::BaseEvent::default(),
+                        }));
+                        let id = uuid::Uuid::new_v4().to_string();
+                        out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
+                            message_id: id.clone(),
+                            role: Some("assistant".into()),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                            message_id: id.clone(),
+                            delta: text.clone(),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                            message_id: id.clone(),
+                            base: ag::BaseEvent::default(),
+                        }));
+                        self.last_assistant_message_id = Some(id);
+                    }
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
+                        message_id: id.clone(),
+                        role: Some("assistant".into()),
                         base: ag::BaseEvent::default(),
                     }));
+                    out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
+                        message_id: id.clone(),
+                        delta: text.clone(),
+                        base: ag::BaseEvent::default(),
+                    }));
+                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
+                        message_id: id.clone(),
+                        base: ag::BaseEvent::default(),
+                    }));
+                    self.last_assistant_message_id = Some(id);
                 }
-                let id = uuid::Uuid::new_v4().to_string();
-                out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
-                    message_id: id.clone(),
-                    role: Some("assistant".into()),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
-                    message_id: id.clone(),
-                    delta: text.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                    message_id: id.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                self.last_assistant_message_id = Some(id);
                 self.open_message_id = None;
+                self.open_accumulated.clear();
             }
             AgentEvent::PartialToken { text, .. } => {
                 let id = if let Some(id) = self.open_message_id.clone() {
@@ -98,6 +146,7 @@ impl AguiConverter {
                     self.last_assistant_message_id = Some(id.clone());
                     id
                 };
+                self.open_accumulated.push_str(text);
                 out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
                     message_id: id,
                     delta: text.clone(),
@@ -118,6 +167,7 @@ impl AguiConverter {
                         base: ag::BaseEvent::default(),
                     }));
                 }
+                self.open_accumulated.clear();
                 out.push(ag::Event::ToolCallStart(ag::ToolCallStart {
                     tool_call_id: id.clone(),
                     tool_call_name: name.clone(),
@@ -159,6 +209,7 @@ impl AguiConverter {
                         base: ag::BaseEvent::default(),
                     }));
                 }
+                self.open_accumulated.clear();
                 // Actual RunFinished is emitted by the caller (it knows
                 // the thread/run ids); we just flush state here.
             }
@@ -283,12 +334,15 @@ pub(crate) fn sanitize_thread_id_for_session(thread: &str) -> String {
     out
 }
 
-/// Path to the JSONL session directory for an AG-UI thread.
+/// Path to the session directory for an AG-UI thread.
+///
+/// Since issue #57 this is the native session layout
+/// (`<sessions>/<workspace-slug>/agui-<thread-key>/`, see
+/// [`crate::agui_session`]); pre-#57 flat thread directories are
+/// migrated on resolve. The sanitiser below survives only as the
+/// legacy-layout mapper inside [`crate::agui_session`].
 pub(crate) fn agui_session_dir(workspace: &Path, thread_id: &str) -> Option<PathBuf> {
-    let session_id = sanitize_thread_id_for_session(thread_id);
-    crate::user_sessions_dir(workspace)
-        .ok()
-        .map(|d| d.join(format!("agui-{session_id}")))
+    crate::agui_session::resolve_session_dir(workspace, thread_id)
 }
 
 // ── Open-interrupt persistence (resume state machine's backing store) ─────
@@ -664,6 +718,11 @@ pub(crate) fn prepare_run(
     // the TestInterruptHook, so we look for the tool result whose
     // `tool_call_id` matches the interrupt's bound tool_call_id.
     let mut modified = loaded_messages;
+    // The same splices must land on disk (issue #57): runs append, so
+    // without this the persisted transcript keeps the deny-marker text
+    // and a later resume re-seeds the wrong history.
+    let mut disk_replacements: Vec<(String, String)> = Vec::new();
+    let mut disk_injections: Vec<(String, String)> = Vec::new();
     for open_int in &open_interrupts {
         let Some(resume) = resume_by_id.get(open_int.interrupt_id.as_str()) else {
             continue;
@@ -684,8 +743,17 @@ pub(crate) fn prepare_run(
                     false
                 }
             });
-            if !replaced {
+            if replaced {
+                disk_replacements.push((
+                    tool_call_id.clone(),
+                    "[interrupt cancelled by user]".to_string(),
+                ));
+            } else {
                 modified.push(sentinel);
+                disk_injections.push((
+                    tool_call_id.clone(),
+                    "[interrupt cancelled by user]".to_string(),
+                ));
             }
         } else if let Some(ref payload) = resume.payload {
             // Resolved: replace the denied tool result content with the
@@ -705,8 +773,19 @@ pub(crate) fn prepare_run(
                     tool_call_id,
                     &payload_str,
                 ));
+                disk_injections.push((tool_call_id.clone(), payload_str));
+            } else {
+                disk_replacements.push((tool_call_id.clone(), payload_str));
             }
         }
+    }
+
+    if !disk_replacements.is_empty() || !disk_injections.is_empty() {
+        crate::agui_session::apply_resume_tool_results(
+            &session_dir,
+            &disk_replacements,
+            &disk_injections,
+        );
     }
 
     // Clear the open interrupts now that they've been consumed.
@@ -742,6 +821,14 @@ pub(crate) struct AguiRuntimeDeps<'a> {
     pub interrupt_before: &'a [String],
     /// AG-UI client tools to register as stubs with a deny hook.
     pub client_tools: &'a [ag::Tool],
+    /// Model id for `.meta.json` (issue #57) — `config.model` at the HTTP
+    /// layer; pricing and `sessions list` read it back.
+    pub model: String,
+    /// Provider id for `.meta.json` — `config.provider_type` at the HTTP
+    /// layer.
+    pub provider: String,
+    /// Resolved preset id (`.meta.json` pricing identity), if any.
+    pub preset: Option<String>,
 }
 
 /// The hooks installed by [`build_agui_runtime`], handed back so the
@@ -808,7 +895,12 @@ pub(crate) fn build_agui_runtime(
         deps.prompt_segments,
         deps.max_steps,
     )
-    .llm(deps.llm);
+    .llm(deps.llm)
+    // Issue #66 §3.2: token-level streaming — RunCore only builds the
+    // partial-token forwarder when `streaming` is set. The converter above
+    // frames `PartialToken` deltas into TextMessageStart/Content/End and
+    // suppresses the duplicate final full-text message.
+    .streaming(true);
     if let Some(seed) = deps.seed_transcript {
         runtime_builder = runtime_builder.seed_transcript(seed);
     }
@@ -822,17 +914,17 @@ pub(crate) fn build_agui_runtime(
         runtime.set_permission_hook(hook.clone());
     }
 
-    // Wire per-turn workspace checkpoints. The AG-UI thread is the
-    // natural session boundary, so we use a sanitised version of the
-    // thread_id as the checkpoint chain id. Failures (no git on PATH,
+    // Wire per-turn workspace checkpoints. The AG-UI thread IS the
+    // session (issue #57): the checkpoint chain id is the thread's
+    // session key and the log lives inside the thread's session
+    // directory, next to transcript.jsonl. Failures (no git on PATH,
     // bad workspace path, etc.) only log a warning — the run still
     // proceeds without checkpoints.
     if let Ok(repo) = crate::ShadowRepo::open(workspace) {
-        let session_id = sanitize_thread_id_for_session(thread_id);
-        if let Ok(session_dir) = crate::user_sessions_dir(workspace) {
-            let log_dir = session_dir.join(format!("agui-{session_id}"));
-            let _ = std::fs::create_dir_all(&log_dir);
-            let log_path = log_dir.join("checkpoints.jsonl");
+        if let Some(session_dir) = crate::agui_session::session_dir(workspace, thread_id) {
+            let session_id = crate::agui_session::thread_session_key(thread_id);
+            let _ = std::fs::create_dir_all(&session_dir);
+            let log_path = session_dir.join("checkpoints.jsonl");
             let touched = runtime.kernel().tools().touched_files();
             if let Err(e) =
                 runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
@@ -864,6 +956,28 @@ pub(crate) struct AguiRunContext {
     pub hooks: AguiHooks,
     pub workspace: PathBuf,
     pub metrics: Arc<super::Metrics>,
+    /// Model/provider identity for `.meta.json` (issue #57), carried over
+    /// from the deps that built the runtime.
+    pub model: String,
+    pub provider: String,
+    pub preset: Option<String>,
+    /// Issue #66 §3.3: the per-run cancellation token. `spawn_agui_run`
+    /// installs it on the runtime and registers it under the thread id in
+    /// `AppState::agui_active_runs`; the SSE body's disconnect guard and
+    /// `POST /agui/{thread_id}/cancel` cancel it, and the driver removes
+    /// the registry entry when the run finishes.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Issue #66: the admission permit for this run. Held by the driver
+    /// task for the whole background run so `runs_in_flight` stays
+    /// truthful and the slot is not released while the agent still runs.
+    pub permit: crate::session_host::RunPermit,
+    /// Issue #57 §④: the per-thread run fence guard. Held by the driver
+    /// task so the fence stays closed for the whole background run — a
+    /// second run for the same thread gets 409 until this drops.
+    pub run_guard: crate::session_host::ActiveRunGuard,
+    /// Issue #66: the AppState-level cancel registry (thread id → token).
+    /// Borrowed only to insert/remove this run's own entry.
+    pub active_runs: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 /// Spawn the AG-UI run driver.
@@ -892,8 +1006,27 @@ pub(crate) fn spawn_agui_run(
         hooks,
         workspace,
         metrics,
+        model,
+        provider,
+        preset,
+        cancel,
+        permit,
+        run_guard,
+        active_runs,
     } = ctx;
     let (sse_tx, sse_rx) = mpsc::unbounded_channel::<ag::Event>();
+
+    // Issue #66 §3.3: install the per-run cancellation token on the
+    // runtime (the kernel checks it between steps and mid-LLM-call) and
+    // register it under the thread id — the SSE body's disconnect guard
+    // and `POST /agui/{thread_id}/cancel` both cancel through this
+    // registry. The driver task removes the entry when the run finishes;
+    // cancelling a finished run is a no-op.
+    runtime.set_interrupt_token(cancel.clone());
+    active_runs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(thread_id.clone(), cancel.clone());
 
     // Emit RunStarted up front so clients can render the run shell
     // before the first model token arrives.
@@ -932,8 +1065,26 @@ pub(crate) fn spawn_agui_run(
     let drv_thread = thread_id;
     let drv_run = run_id;
     let drv_workspace = workspace;
+    // Session identity for `.meta.json` (issue #57): the config that is
+    // about to serve this run. The provider the runtime was built with is
+    // not nameable from a `dyn ChatProvider`, so the record keeps the
+    // provider that assembled the runtime (`deps.provider_name`).
+    let drv_model = model;
+    let drv_provider = provider;
+    let drv_preset = preset;
+    // Transcript length before the run: everything after this index is
+    // THIS run's contribution — only that gets appended to the session
+    // (on resume runs the transcript starts with the seeded history;
+    // appending it again would duplicate it).
+    let drv_pre_run_len = runtime.transcript().len();
+    // Issue #66: cancel-registry bookkeeping — the driver removes its
+    // thread's token when the run finishes so a later run registers a
+    // fresh one.
+    let drv_thread_key = drv_thread.clone();
 
     let driver_handle = tokio::spawn(async move {
+        // Issue #66: hold the admission permit for the whole background run.
+        let _permit = permit;
         let outcome = runtime.run(&goal).await;
 
         // Locate the interrupted tool call after the run:
@@ -963,6 +1114,7 @@ pub(crate) fn spawn_agui_run(
                     .clone()
             })
             .is_some();
+
         // Replace the sink so the converter task's recv() sees a closed
         // channel and exits cleanly.
         runtime.set_event_sink(Arc::new(NullSink));
@@ -981,21 +1133,41 @@ pub(crate) fn spawn_agui_run(
             Err(_) => super::handlers::record_run_failed(&metrics),
         }
 
-        // Persist the transcript so a later `resume` (client-tool result
-        // round-trip) can load and seed it. Format: one Message JSON per
-        // line — the resume loader reads the same shape.
-        if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
-            let _ = std::fs::create_dir_all(&session_dir);
-            let mut lines = String::new();
-            for m in runtime.transcript() {
-                if let Ok(v) = serde_json::to_string(m) {
-                    lines.push_str(&v);
-                    lines.push('\n');
+        // Persist the run into the thread's native session (issue #57):
+        // SessionWriter appends this run's messages (uuid chain, msg ids,
+        // timestamps) and updates `.meta.json` — status, prompts, message
+        // count and cumulative token cost — so the thread is a first-class
+        // session (`sessions list`, `episodic_recall`, resume picker).
+        // `CostTracker` adds `cost.json` + the `cost_usd` block. Only the
+        // messages this run produced are appended (drv_pre_run_len skips
+        // the seeded history on resume runs).
+        {
+            let status = if client_denied.is_some() || test_was_interrupted {
+                crate::session::SessionStatus::Interrupted
+            } else {
+                match &outcome {
+                    Ok(o) => crate::session::SessionStatus::for_finish(&o.finish_reason),
+                    Err(_) => crate::session::SessionStatus::Crashed,
                 }
-            }
-            let path = session_dir.join("transcript.jsonl");
-            if let Err(e) = std::fs::write(&path, lines) {
-                tracing::warn!("agui: transcript persist failed: {e}");
+            };
+            let transcript = runtime.transcript();
+            let new_messages = transcript
+                .get(drv_pre_run_len.min(transcript.len())..)
+                .unwrap_or(&[]);
+            let record = crate::agui_session::RunRecord {
+                workspace: &drv_workspace,
+                thread_id: &drv_thread,
+                messages: new_messages,
+                goal: &goal,
+                model: &drv_model,
+                provider: &drv_provider,
+                preset: drv_preset.as_deref(),
+                status,
+                usage: outcome.as_ref().ok().map(|o| o.total_usage),
+                llm_latency_ms: outcome.as_ref().ok().map(|o| o.llm_latency_ms).unwrap_or(0),
+            };
+            if let Err(e) = crate::agui_session::persist_run(record) {
+                tracing::warn!("agui: session persist failed: {e}");
             }
         }
 
@@ -1172,6 +1344,18 @@ pub(crate) fn spawn_agui_run(
                 base: ag::BaseEvent::default(),
             }));
         }
+
+        // Issue #66: drop the cancel-registry entry so a later run on the
+        // same thread registers a fresh token; cancelling a finished run
+        // must be a no-op.
+        active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&drv_thread_key);
+        // Release the per-thread run fence (issue #57 §④): the next run
+        // for this thread may start once RunFinished is out. On panic the
+        // guard's Drop unwinds it free.
+        drop(run_guard);
     });
 
     // Monitor the driver task so panics are surfaced in logs rather than
@@ -1583,6 +1767,9 @@ mod tests {
             seed_transcript: None,
             interrupt_before,
             client_tools,
+            model: "mock".into(),
+            provider: "mock".into(),
+            preset: None,
         }
     }
 

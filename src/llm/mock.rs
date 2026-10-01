@@ -35,6 +35,12 @@ pub struct MockProvider {
     /// before returning. Prefer this over `on_complete` when the side
     /// effect must happen before the agent continues (e.g. cancellation).
     on_complete_fn: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Issue #66: when set, `stream()` splits the scripted completion's
+    /// content into chunks of this many characters (instead of emitting the
+    /// whole text as a single chunk) so HTTP-layer streaming tests can
+    /// assert multi-frame delivery. `None` (default) keeps the single-chunk
+    /// behaviour every pre-existing test relies on.
+    stream_chunk_chars: Option<usize>,
 }
 
 impl MockProvider {
@@ -53,7 +59,16 @@ impl MockProvider {
             structured_responses: Mutex::new(Vec::new()),
             on_complete: None,
             on_complete_fn: None,
+            stream_chunk_chars: None,
         }
+    }
+
+    /// Issue #66: make `stream()` emit the scripted content in chunks of
+    /// `chars` characters, mimicking token-level SSE delivery. Builder-style,
+    /// chainable after `new`.
+    pub fn with_stream_chunk_chars(mut self, chars: usize) -> Self {
+        self.stream_chunk_chars = Some(chars.max(1));
+        self
     }
 
     /// Attach a notifier that fires once per `complete()` call, after the
@@ -161,11 +176,39 @@ impl ChatProvider for MockProvider {
                 }
             }
             if !completion.content.is_empty() {
-                let _ = tx.send(super::StreamChunk::Text(completion.content.clone()));
+                // Issue #66: honour the configured chunk size so streaming
+                // tests can assert multi-frame delivery; the default stays
+                // one chunk = one PartialToken event.
+                match self.stream_chunk_chars {
+                    Some(size) => {
+                        for chunk in chunk_str(&completion.content, size) {
+                            let _ = tx.send(super::StreamChunk::Text(chunk));
+                        }
+                    }
+                    None => {
+                        let _ = tx.send(super::StreamChunk::Text(completion.content.clone()));
+                    }
+                }
             }
         }
         Ok(completion)
     }
+}
+
+/// Split `s` into chunks of at most `size` chars, respecting char
+/// boundaries (content is frequently CJK — slicing bytes would panic).
+fn chunk_str(s: &str, size: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < s.len() {
+        let mut end = (start + size).min(s.len());
+        while !s.is_char_boundary(end) {
+            end += 1;
+        }
+        out.push(s[start..end].to_string());
+        start = end;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -297,6 +340,35 @@ mod tracing_tests {
             matches!(chunk, StreamChunk::Text(t) if t == "streamed text"),
             "must receive Text chunk with completion content"
         );
+    }
+
+    /// Issue #66: `with_stream_chunk_chars` splits the content into
+    /// multiple Text chunks whose concatenation equals the full content —
+    /// including across a multi-byte char boundary.
+    #[tokio::test]
+    async fn stream_chunks_content_when_configured() {
+        use crate::llm::StreamChunk;
+        let content = "回答内容超过十个字符用于分块测试".to_string();
+        let provider = MockProvider::new(vec![Completion {
+            content: content.clone(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }])
+        .with_stream_chunk_chars(4);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        provider.stream(&[], &[], Some(tx), None).await.unwrap();
+        let mut joined = String::new();
+        let mut chunks = 0;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Text(t) = chunk {
+                joined.push_str(&t);
+                chunks += 1;
+            }
+        }
+        assert!(chunks > 1, "expected multiple chunks, got {chunks}");
+        assert_eq!(joined, content, "chunks must reassemble the content");
     }
 
     #[tokio::test]

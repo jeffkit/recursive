@@ -397,6 +397,7 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: Arc::new(LocalStorageBackend::new(dir)),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
