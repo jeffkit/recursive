@@ -13,8 +13,8 @@
 图结构（WHILE 语义见 plaita 087bdfe；「体 return = 下一轮 item = 节点输出」）：
 - gate_with_fix 子流程：跑门 → 绿则过；红则 fix（≤3 轮，prompt 喂 stdout 尾部）
 - 评审环：reviewer AGENTRUN → F.contains 判 VERDICT → NEEDS_FIX 喂回修复 ≤3 轮
-- 落地：GIT_PUBLISH main 模式；merged=False → failed-preserved（rebase 重落
-  是已知 TODO，v1 引擎的 land 分支待移移植）
+- 落地：GIT_PUBLISH main 模式；merged=False → worktree rebase 新 main 后重推
+  一次（rebase-retry，2026-10-01）；仍败 failed-preserved
 
 v2 与 v1 引擎的有意差异：
 - watchdog（journal 增长/后代活性）暂由 AGENTRUN timeout_secs 硬墙替代——
@@ -263,10 +263,42 @@ def self_improve_v2(INPUT):
     if pub.merged == True:
         return {"verdict": "committed", "via": "git-publish",
                 "note": pub.note}
-    wfp = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
-                    content=F.concat("merged=False\nnote: ", str(pub.note),
-                                     "\npush_note: ", str(pub.push_note)))
-    return {"verdict": "failed-preserved", "stage": "land", "why": pub.note,
+
+    # ── rebase-retry（2026-10-01 jeffkit 拍板；#65/#70 实证 ff 失败即弃单浪费）──
+    # ff 合并失败（main 已前进）→ worktree rebase 新 main → 删远端旧同名分支
+    # （rebase 后历史分叉，普通 push 会被拒；本地持有全部提交，删远端不丢东西，
+    # GIT_PUBLISH 会重新 -u 推）→ 重推一次。仍败则 failed-preserved 供人工。
+    land_rebase = CODE(id="land_rebase", lang="python",
+                       input={"wt": pre.worktree, "branch": pre.branch}, code=(
+        "import subprocess\n"
+        "\n"
+        "def run(input):\n"
+        "    def git(*a):\n"
+        "        return subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n"
+        "                              capture_output=True, text=True)\n"
+        "    git(\"fetch\", \"origin\")\n"
+        "    r = git(\"rebase\", \"origin/main\")\n"
+        "    if r.returncode != 0:\n"
+        "        git(\"rebase\", \"--abort\")\n"
+        "        return {\"ok\": False,\n"
+        "                \"why\": ((r.stderr or \"\") + (r.stdout or \"\"))[-400:]}\n"
+        "    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n"
+        "    return {\"ok\": True}\n"))
+    if land_rebase.ok == False:
+        wfp2 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+                         content=F.concat("rebase conflict: ", land_rebase.why))
+        return {"verdict": "failed-preserved", "stage": "land",
+                "why": F.concat("rebase conflict: ", land_rebase.why)}
+    pub2 = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
+                       commit_message=F.concat("self-improve: ", goal),
+                       merge_mode="main", main_clone=repo, base_branch="main")
+    if pub2.merged == True:
+        return {"verdict": "committed", "via": "git-publish-retry",
+                "note": pub2.note}
+    wfp3 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+                     content=F.concat("retry merged=False\nnote: ", str(pub2.note),
+                                      "\npush_note: ", str(pub2.push_note)))
+    return {"verdict": "failed-preserved", "stage": "land", "why": pub2.note,
             "preserved": True}
 
 

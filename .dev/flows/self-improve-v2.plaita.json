@@ -190,7 +190,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n19",
+   "next": "_n23",
    "timeout": "",
    "source_line": 87,
    "timeout_handler": {
@@ -218,7 +218,7 @@
    },
    "branches": [
     {
-     "name": "_n19",
+     "name": "_n23",
      "condition": {
       "field": "$NODE.pre.ok",
       "operator": "eq",
@@ -227,7 +227,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n19",
+     "next": "_n23",
      "is_default": false
     },
     {
@@ -429,7 +429,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n18",
+   "next": "_n22",
    "timeout": "",
    "source_line": 102,
    "timeout_handler": {
@@ -457,7 +457,7 @@
    },
    "branches": [
     {
-     "name": "_n18",
+     "name": "_n22",
      "condition": {
       "field": "$NODE.chg.any",
       "operator": "eq",
@@ -466,7 +466,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n18",
+     "next": "_n22",
      "is_default": false
     },
     {
@@ -931,7 +931,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n17",
+   "next": "_n21",
    "timeout": "",
    "source_line": 115,
    "timeout_handler": {
@@ -959,7 +959,7 @@
    },
    "branches": [
     {
-     "name": "_n17",
+     "name": "_n21",
      "condition": {
       "field": "$NODE.g1.passed",
       "operator": "eq",
@@ -968,7 +968,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n17",
+     "next": "_n21",
      "is_default": false
     },
     {
@@ -1433,7 +1433,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n16",
+   "next": "_n20",
    "timeout": "",
    "source_line": 122,
    "timeout_handler": {
@@ -1461,7 +1461,7 @@
    },
    "branches": [
     {
-     "name": "_n16",
+     "name": "_n20",
      "condition": {
       "field": "$NODE.g2.passed",
       "operator": "eq",
@@ -1470,7 +1470,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n16",
+     "next": "_n20",
      "is_default": false
     },
     {
@@ -1935,7 +1935,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n15",
+   "next": "_n19",
    "timeout": "",
    "source_line": 128,
    "timeout_handler": {
@@ -1963,7 +1963,7 @@
    },
    "branches": [
     {
-     "name": "_n15",
+     "name": "_n19",
      "condition": {
       "field": "$NODE.g3.passed",
       "operator": "eq",
@@ -1972,7 +1972,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n15",
+     "next": "_n19",
      "is_default": false
     },
     {
@@ -2049,7 +2049,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n10",
+   "next": "_n14",
    "timeout": "",
    "source_line": 148,
    "timeout_handler": {
@@ -2077,7 +2077,7 @@
    },
    "branches": [
     {
-     "name": "_n10",
+     "name": "_n14",
      "condition": {
       "field": "$F.contains($NODE.rev1.text, \"VERDICT:PASS\")",
       "operator": "ne",
@@ -2086,7 +2086,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n10",
+     "next": "_n14",
      "is_default": false
     },
     {
@@ -2143,7 +2143,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n9",
+   "next": "_n13",
    "timeout": "",
    "source_line": 171,
    "timeout_handler": {
@@ -2171,7 +2171,7 @@
    },
    "branches": [
     {
-     "name": "_n9",
+     "name": "_n13",
      "condition": {
       "field": "$NODE.pub.merged",
       "operator": "eq",
@@ -2180,20 +2180,20 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n9",
+     "next": "_n13",
      "is_default": false
     },
     {
-     "name": "wfp",
+     "name": "land_rebase",
      "condition": null,
      "priority": 0,
      "label": "false",
      "desc": "false",
-     "next": "wfp",
+     "next": "land_rebase",
      "is_default": true
     }
    ],
-   "else_next": "wfp",
+   "else_next": "land_rebase",
    "condition": {
     "field": "$NODE.pub.merged",
     "operator": "eq",
@@ -2201,13 +2201,198 @@
    }
   },
   {
-   "id": "wfp",
+   "id": "land_rebase",
    "name": null,
    "desc": null,
    "output": null,
    "next": "_n8",
    "timeout": "",
-   "source_line": 174,
+   "source_line": 179,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "language": "python",
+   "code": "import subprocess\n\ndef run(input):\n    def git(*a):\n        return subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n                              capture_output=True, text=True)\n    git(\"fetch\", \"origin\")\n    r = git(\"rebase\", \"origin/main\")\n    if r.returncode != 0:\n        git(\"rebase\", \"--abort\")\n        return {\"ok\": False,\n                \"why\": ((r.stderr or \"\") + (r.stdout or \"\"))[-400:]}\n    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n    return {\"ok\": True}\n",
+   "input": {
+    "wt": "$NODE.pre.worktree",
+    "branch": "$NODE.pre.branch"
+   },
+   "sandbox_backend": "subprocess"
+  },
+  {
+   "id": "_n8",
+   "name": null,
+   "desc": null,
+   "output": null,
+   "next": "wfp2",
+   "timeout": "",
+   "source_line": 195,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "output_type": {
+    "data_type": "string",
+    "name": "branch_name",
+    "label": null,
+    "desc": null,
+    "is_required": false,
+    "default_value": null,
+    "item_type": null,
+    "children": []
+   },
+   "branches": [
+    {
+     "name": "wfp2",
+     "condition": {
+      "field": "$NODE.land_rebase.ok",
+      "operator": "eq",
+      "value": false
+     },
+     "priority": 0,
+     "label": "true",
+     "desc": "true",
+     "next": "wfp2",
+     "is_default": false
+    },
+    {
+     "name": "pub2",
+     "condition": null,
+     "priority": 0,
+     "label": "false",
+     "desc": "false",
+     "next": "pub2",
+     "is_default": true
+    }
+   ],
+   "else_next": "pub2",
+   "condition": {
+    "field": "$NODE.land_rebase.ok",
+    "operator": "eq",
+    "value": false
+   }
+  },
+  {
+   "id": "pub2",
+   "name": null,
+   "desc": null,
+   "output": null,
+   "next": "_n9",
+   "timeout": "",
+   "source_line": 200,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "worktree_dir": "$NODE.pre.worktree",
+   "branch_name": "$NODE.pre.branch",
+   "commit_message": "$F.concat(\"self-improve: \", $NODE.goal)",
+   "plan_file": null,
+   "issue_number": null,
+   "merge_mode": "main",
+   "main_clone": "$NODE.repo",
+   "base_branch": "main",
+   "dry_run": false,
+   "timeout_secs": 300
+  },
+  {
+   "id": "_n9",
+   "name": null,
+   "desc": null,
+   "output": null,
+   "next": "_n11",
+   "timeout": "",
+   "source_line": 203,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "output_type": {
+    "data_type": "string",
+    "name": "branch_name",
+    "label": null,
+    "desc": null,
+    "is_required": false,
+    "default_value": null,
+    "item_type": null,
+    "children": []
+   },
+   "branches": [
+    {
+     "name": "_n11",
+     "condition": {
+      "field": "$NODE.pub2.merged",
+      "operator": "eq",
+      "value": true
+     },
+     "priority": 0,
+     "label": "true",
+     "desc": "true",
+     "next": "_n11",
+     "is_default": false
+    },
+    {
+     "name": "wfp3",
+     "condition": null,
+     "priority": 0,
+     "label": "false",
+     "desc": "false",
+     "next": "wfp3",
+     "is_default": true
+    }
+   ],
+   "else_next": "wfp3",
+   "condition": {
+    "field": "$NODE.pub2.merged",
+    "operator": "eq",
+    "value": true
+   }
+  },
+  {
+   "id": "wfp3",
+   "name": null,
+   "desc": null,
+   "output": null,
+   "next": "_n10",
+   "timeout": "",
+   "source_line": 206,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2222,24 +2407,24 @@
     "retryTimes": 0
    },
    "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
-   "content": "$F.concat(\"merged=False\\nnote: \", $F.concat($NODE.pub.note), \"\\npush_note: \", $F.concat($NODE.pub.push_note))",
+   "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
    "json": false,
    "indent": 2,
    "workspace_root": null
   },
   {
-   "id": "_n8",
+   "id": "_n10",
    "name": null,
    "desc": null,
    "output": {
     "verdict": "failed-preserved",
     "stage": "land",
-    "why": "$NODE.pub.note",
+    "why": "$NODE.pub2.note",
     "preserved": true
    },
    "next": null,
    "timeout": "",
-   "source_line": 177,
+   "source_line": 209,
    "timeout_handler": {
     "strategy": "abort",
     "defaultValue": null,
@@ -2257,7 +2442,90 @@
    "error": null
   },
   {
-   "id": "_n9",
+   "id": "_n11",
+   "name": null,
+   "desc": null,
+   "output": {
+    "verdict": "committed",
+    "via": "git-publish-retry",
+    "note": "$NODE.pub2.note"
+   },
+   "next": null,
+   "timeout": "",
+   "source_line": 204,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "result_type": "success",
+   "error": null
+  },
+  {
+   "id": "wfp2",
+   "name": null,
+   "desc": null,
+   "output": null,
+   "next": "_n12",
+   "timeout": "",
+   "source_line": 196,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
+   "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)",
+   "json": false,
+   "indent": 2,
+   "workspace_root": null
+  },
+  {
+   "id": "_n12",
+   "name": null,
+   "desc": null,
+   "output": {
+    "verdict": "failed-preserved",
+    "stage": "land",
+    "why": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)"
+   },
+   "next": null,
+   "timeout": "",
+   "source_line": 198,
+   "timeout_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null
+   },
+   "error_handler": {
+    "strategy": "abort",
+    "defaultValue": null,
+    "code": -9527,
+    "message": null,
+    "retryTimes": 0
+   },
+   "result_type": "success",
+   "error": null
+  },
+  {
+   "id": "_n13",
    "name": null,
    "desc": null,
    "output": {
@@ -2285,7 +2553,7 @@
    "error": null
   },
   {
-   "id": "_n10",
+   "id": "_n14",
    "name": null,
    "desc": null,
    "output": null,
@@ -2351,7 +2619,7 @@
    "name": null,
    "desc": null,
    "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
-   "next": "_n13",
+   "next": "_n17",
    "timeout": "",
    "source_line": 154,
    "timeout_handler": {
@@ -2371,7 +2639,7 @@
    "upstream_output": []
   },
   {
-   "id": "_n13",
+   "id": "_n17",
    "name": null,
    "desc": null,
    "output": null,
@@ -2403,7 +2671,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n11",
+   "next": "_n15",
    "timeout": "",
    "source_line": 159,
    "timeout_handler": {
@@ -2427,7 +2695,7 @@
    "dry_run": false
   },
   {
-   "id": "_n11",
+   "id": "_n15",
    "name": null,
    "desc": null,
    "output": null,
@@ -2493,7 +2761,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n12",
+   "next": "_n16",
    "timeout": "",
    "source_line": 162,
    "timeout_handler": {
@@ -2516,7 +2784,7 @@
    "workspace_root": null
   },
   {
-   "id": "_n12",
+   "id": "_n16",
    "name": null,
    "desc": null,
    "output": {
@@ -2548,7 +2816,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n14",
+   "next": "_n18",
    "timeout": "",
    "source_line": 150,
    "timeout_handler": {
@@ -2571,7 +2839,7 @@
    "workspace_root": null
   },
   {
-   "id": "_n14",
+   "id": "_n18",
    "name": null,
    "desc": null,
    "output": {
@@ -2599,7 +2867,7 @@
    "error": null
   },
   {
-   "id": "_n15",
+   "id": "_n19",
    "name": null,
    "desc": null,
    "output": {
@@ -2628,7 +2896,7 @@
    "error": null
   },
   {
-   "id": "_n16",
+   "id": "_n20",
    "name": null,
    "desc": null,
    "output": {
@@ -2657,7 +2925,7 @@
    "error": null
   },
   {
-   "id": "_n17",
+   "id": "_n21",
    "name": null,
    "desc": null,
    "output": {
@@ -2686,7 +2954,7 @@
    "error": null
   },
   {
-   "id": "_n18",
+   "id": "_n22",
    "name": null,
    "desc": null,
    "output": {
@@ -2715,11 +2983,11 @@
    "error": null
   },
   {
-   "id": "_n19",
+   "id": "_n23",
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n21",
+   "next": "_n25",
    "timeout": "",
    "source_line": 93,
    "timeout_handler": {
@@ -2747,7 +3015,7 @@
    },
    "branches": [
     {
-     "name": "_n21",
+     "name": "_n25",
      "condition": {
       "field": "$F.contains($F.concat($F.or($NODE.pre.why, \"\")), \"disk\")",
       "operator": "ne",
@@ -2756,7 +3024,7 @@
      "priority": 0,
      "label": "true",
      "desc": "true",
-     "next": "_n21",
+     "next": "_n25",
      "is_default": false
     },
     {
@@ -2781,7 +3049,7 @@
    "name": null,
    "desc": null,
    "output": null,
-   "next": "_n20",
+   "next": "_n24",
    "timeout": "",
    "source_line": 95,
    "timeout_handler": {
@@ -2804,7 +3072,7 @@
    "workspace_root": null
   },
   {
-   "id": "_n20",
+   "id": "_n24",
    "name": null,
    "desc": null,
    "output": {
@@ -2832,7 +3100,7 @@
    "error": null
   },
   {
-   "id": "_n21",
+   "id": "_n25",
    "name": null,
    "desc": null,
    "output": {
