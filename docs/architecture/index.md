@@ -51,4 +51,4 @@ drill into what you need.
 
 * [Skills System](skills.md) - skill discovery, injection modes, SKILL.md format
 * [Sessions](sessions.md) - session persistence, transcript JSONL, lifecycle
-* [Invariants](invariants.md) - the eight invariants every change must respect
+* [Invariants](invariants.md) - the ten invariants every change must respect
