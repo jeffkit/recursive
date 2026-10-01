@@ -29,6 +29,11 @@ use crate::llm::ToolSpec;
 /// Maximum bytes of stdout/stderr to capture per job.
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 
+/// Default grace period for subprocess graceful shutdown (SIGTERM → wait →
+/// SIGKILL). Lives here (not in `mcp`) so `acp` can use it without depending
+/// on the `mcp` feature — it is a plain duration constant, not MCP logic.
+pub const DEFAULT_KILL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Maximum bytes of a watched file to surface in a single event-watch wake.
 /// Keeps the injected prompt bounded; remaining bytes wake on the next poll.
 pub(crate) const WATCH_CHUNK_BYTES: usize = 16 * 1024;

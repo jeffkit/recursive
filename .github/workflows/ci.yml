@@ -60,6 +60,28 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+  feature-matrix:
+    name: feature matrix (no-default-features)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "mcp", "http", "cli", "web_fetch", "anthropic", "skill-hub", "web_search"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check + clippy (${{ matrix.features || 'bare' }})
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo check --lib --no-default-features
+            cargo clippy --lib --no-default-features -- -D warnings
+          else
+            cargo check --lib --no-default-features --features ${{ matrix.features }}
+            cargo clippy --lib --no-default-features --features ${{ matrix.features }} -- -D warnings
+          fi
+
   supply-chain:
     name: supply-chain (cargo audit + machete)
     runs-on: ubuntu-latest

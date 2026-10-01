@@ -955,6 +955,13 @@ pub fn build_standard_tools_with_transport_opt(
     bg_manager: Option<Arc<tokio::sync::Mutex<super::run_background::BackgroundJobManager>>>,
     disable_host_exec: bool,
 ) -> ToolRegistry {
+    // Only consumed when the `web_search` feature is enabled.
+    #[cfg(not(feature = "web_search"))]
+    let _ = (
+        &web_search_provider,
+        &web_search_api_key,
+        &web_search_jina_key,
+    );
     let bg_manager = bg_manager.unwrap_or_else(|| {
         Arc::new(tokio::sync::Mutex::new(
             super::run_background::BackgroundJobManager::new(),
