@@ -492,6 +492,13 @@ impl Config {
             Err(_) => true,
         };
 
+        let allow_tools = std::env::var("RECURSIVE_ALLOW_TOOLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let allow_bypass_permissions = std::env::var("RECURSIVE_ALLOW_BYPASS_PERMISSIONS")
             .ok()
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
@@ -639,7 +646,7 @@ impl Config {
             max_budget_usd: None,
             extra_dirs: file_extra_dirs,
             extra_readonly_dirs: file_extra_readonly_dirs,
-            allow_tools: Vec::new(),
+            allow_tools,
             context_window_override: None,
             subagent_max_depth,
             subagent_enabled,
@@ -987,6 +994,36 @@ mod tests {
                 std::env::set_var("RECURSIVE_MAX_STEPS", v);
             } else {
                 std::env::remove_var("RECURSIVE_MAX_STEPS");
+            }
+        }
+    }
+
+    #[test]
+    fn allow_tools_from_env() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let orig = std::env::var("RECURSIVE_ALLOW_TOOLS").ok();
+        // SAFETY: env lock held; serialises global env mutations.
+        unsafe {
+            std::env::set_var("RECURSIVE_ALLOW_TOOLS", "Read, Write ,Bash");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.allow_tools, vec!["Read", "Write", "Bash"]);
+        unsafe {
+            std::env::set_var("RECURSIVE_ALLOW_TOOLS", "  ");
+        }
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.allow_tools.is_empty(),
+            "blank value must mean no narrowing"
+        );
+        // SAFETY: env lock still held.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RECURSIVE_ALLOW_TOOLS", v),
+                None => std::env::remove_var("RECURSIVE_ALLOW_TOOLS"),
             }
         }
     }
