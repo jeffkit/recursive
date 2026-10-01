@@ -176,7 +176,20 @@ def self_improve_v2(INPUT):
         "Only stop once fmt + clippy + test are all green by your own hand.\"\"\")\n"
         "    if resumed:\n"
         "        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。\\n\")\n"
-        "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp)}\n"))
+        "    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n"
+        "    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n"
+        "    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n"
+        "    last_sid = \"\"\n"
+        "    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n"
+        "    if sroot and resumed:\n"
+        "        cands = []\n"
+        "        for root, dirs, files in os.walk(sroot):\n"
+        "            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n"
+        "                cands.append((os.path.getmtime(root), os.path.basename(root)))\n"
+        "        if cands:\n"
+        "            cands.sort()\n"
+        "            last_sid = cands[-1][1]\n"
+        "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp), \"last_sid\": last_sid}\n"))
     if pre.ok == False:
         # 磁盘守卫等环境性失败 → retry-later：keeper 不消费、自动重派（写回
         # failure-context 无意义——现场还没建）。worktree add 等持久性失败仍走
@@ -190,7 +203,11 @@ def self_improve_v2(INPUT):
         return {"verdict": "failed-preserved", "stage": "preflight", "why": pre.why}
 
     # ── agent 实现（AGENTRUN 库节点；headless 约束在系统提示词里）──
-    impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=7200)
+    # session=pre.last_sid：续跑且找到既往会话时走 resume（L2，agent 带全量
+    # 上下文接着干）；全新 run / 无会话时为空串，AGENTRUN 自然退化 run 形态，
+    # 单节点无分支。
+    impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=7200,
+                    session=pre.last_sid)
     chg = CHILD(input={"wt": pre.worktree}, flow=has_changes)
     if chg.any == False:
         return {"verdict": "skip-commit", "stage": "commit",

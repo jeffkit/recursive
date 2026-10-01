@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,17 @@ def main() -> int:
 
     sys.path.insert(0, str(FLOWS_DIR))
     setup_env_injection()
+
+    # L2 会话续跑（2026-10-01）：会话存储指到 run 工件外的 per-issue 持久目录
+    # ——默认 <workspace>/.recursive/sessions 会随终态回收 rmtree worktree 一起
+    # 消失，impl 超时后重试就无从 resume。以 run_id 的 issue 号为键（artifact
+    # 根 = ~/.issue-keeper/pipeline/recursive-<n>/，keeper 侧已持久）。
+    m = re.match(r"pipeline-(\d+)-", run_dir.name)
+    if m:
+        sessions_root = (Path.home() / ".issue-keeper" / "pipeline"
+                         / f"recursive-{m.group(1)}" / "sessions")
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        os.environ["RECURSIVE_SESSIONS_DIR"] = str(sessions_root)
 
     from plaita.core.flow import Flow
     from plaita.node import register_code_node

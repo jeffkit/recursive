@@ -49,7 +49,14 @@ def _eval(node, execution, attr, default=""):
 
 def _route_agent(self, execution):
     prompt = _eval(self, execution, "prompt")
-    CALLS.append(("agentrun", self.id, prompt[:48]))
+    sid = ""
+    try:
+        raw_sid = getattr(self, "session", None)
+        if raw_sid is not None:
+            sid = str(execution.evaluate(raw_sid) or "")
+    except Exception:
+        sid = ""
+    CALLS.append(("agentrun", self.id, prompt[:48], sid))
     if prompt.startswith("#"):                     # impl：goal 文本
         text = AGENT_SCRIPT.get("impl", "")
         if text == "@WRITE":
@@ -215,9 +222,57 @@ def s8_磁盘守卫_retry_later():
     assert v["verdict"] == "retry-later" and v.get("stage") == "preflight", v
 
 
+def _fake_session_store(tmp_root: Path, sid: str) -> Path:
+    """伪造持久会话存储：<root>/<slug>/<sid>/transcript.jsonl。"""
+    store = tmp_root / "sessions"
+    d = store / "some-workspace-slug" / sid
+    d.mkdir(parents=True)
+    (d / "transcript.jsonl").write_text("{}\n")
+    return store
+
+
+def s9_续跑找到会话_impl带sid():
+    """继承分支 + 持久会话存储里有会话 → impl 的 session 参数 = 最新 sid。"""
+    import plaita.node.code as pcode
+    repo, root = make_repo(legacy_branch="v2-pipeline-77-999999")
+    store = _fake_session_store(root, "agui-olderold")   # 先创建 = 更旧
+    (store / "some-workspace-slug" / "agui-cafecafe").mkdir(parents=True)
+    (store / "some-workspace-slug" / "agui-cafecafe" / "transcript.jsonl").write_text("{}\n")
+    pcode.SUBPROCESS_ENV_EXTRA["RECURSIVE_SESSIONS_DIR"] = str(store)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    try:
+        v = run_flow(repo, root)
+    finally:
+        pcode.SUBPROCESS_ENV_EXTRA.pop("RECURSIVE_SESSIONS_DIR", None)
+    assert v["verdict"] == "committed", v
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert impl_calls and impl_calls[0][3] == "agui-cafecafe", \
+        f"impl 应拿到最新会话 id: {impl_calls}"
+
+
+def s10_全新run会话存储存在但不取():
+    """非续跑（无继承分支）时即使会话存储有历史也不 resume（fresh 语义）。"""
+    import plaita.node.code as pcode
+    repo, root = make_repo()
+    store = _fake_session_store(root, "agui-cafecafe")
+    pcode.SUBPROCESS_ENV_EXTRA["RECURSIVE_SESSIONS_DIR"] = str(store)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    try:
+        v = run_flow(repo, root)
+    finally:
+        pcode.SUBPROCESS_ENV_EXTRA.pop("RECURSIVE_SESSIONS_DIR", None)
+    assert v["verdict"] == "committed", v
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert impl_calls and impl_calls[0][3] == "", \
+        f"全新 run 不应带 session: {impl_calls}"
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
-             s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later]
+             s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
+             s9_续跑找到会话_impl带sid, s10_全新run会话存储存在但不取]
 
 if __name__ == "__main__":
     _patch()
