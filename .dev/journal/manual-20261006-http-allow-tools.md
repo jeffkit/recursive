@@ -8,6 +8,12 @@
 - Root cause: `Cmd::Loop` 分支在 `build_tools` 后调用 `tools.retain_tools(&config.allow_tools)`（main.rs:2089），而 `Cmd::Http` 分支从未调用，导致启动 registry（进而 `/tools`、`/run`、`/sessions/*` 的 `session_tool_registry()`）不受收窄。
 - Fix: 在 HTTP 分支注册 subagent 工具之后执行同一收窄（放最后，避免 subagent `agent` 工具先被裁掉/留下不一致状态；与 CLI 顺序一致：先注册、再裁剪）。
 - Tests added: `http_entry_applies_allow_tools_narrowing`（src/http/mod.rs，源码级断言 HTTP 分支包含 retain_tools 调用）。
+  > Rebase 修订（2026-10-06，reconcile commit `28087b6`）：该源码级断言已被替换为
+  > `config_from_env_reads_allow_tools` + `session_rebind_reapplies_allow_tools_in_container_tier`，
+  > 对齐 main `b3f54fe` 的 choke-point 设计（HTTP 分支的收窄由
+  > `finish_tool_surface` + `apply_operator_allow_list` 承担，源码级断言不再盯着
+  > 字面 `retain_tools` 调用；`rebind_per_session_registry` 保持纯重建，
+  > allow-list 重放在 `session_tool_registry` 唯一收口）。
 - Verification:
   - 手动复现：`RECURSIVE_ALLOW_TOOLS=Skill,HttpCall recursive http` → `GET /tools` 返回仅 `Skill`（HttpCall 尚未实现，忽略，正确）。
   - `cargo test -p recursive-cli` 125 passed；`cargo test -p recursive-agent --lib` 全绿。
