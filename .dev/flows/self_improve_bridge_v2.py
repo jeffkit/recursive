@@ -129,10 +129,16 @@ def main() -> int:
         def on_node_end(self, flow, node, result=None, error=None, exception=None, **kw):
             self.tracker(flow, node, result)
 
+    # ⚠️ FlowExecution.run 是 @classmethod：在实例上调 ex.run(...) 会经 cls(...)
+    # 另建全新 execution，构造器里的 callback_handlers 被静默丢弃——StepTracker
+    # 不触发（currentStep 恒 start、node_timings 恒空）、ex.context 恒空（nodes-dump
+    # 恒空的根因）。实例化后必须走 clean()+execute() 才能吃到 handler（2026-10-01，
+    # 最小 flow 实验实证 fired=[] vs 修后三节点全触发）。
     ex = FlowExecution(callback_handlers=[_Adapter(StepTracker(state_path))])
     verdict = None
     try:
-        result = ex.run(fl, params={
+        ex.clean()
+        result = ex.execute(fl, params={
             "goal": goal, "repo": args.repo, "run_dir": str(run_dir),
             "agent": args.agent, "reviewer": args.reviewer,
         })

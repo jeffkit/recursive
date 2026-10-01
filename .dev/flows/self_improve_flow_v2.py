@@ -45,13 +45,28 @@ JAIL = "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import 
 
 @childflow()
 def has_changes(INPUT):
-    """工作区是否有待提交改动（impl/fix 后的落门前置判断）。"""
+    """是否有待落地的改动（impl/fix 后的落门前置判断）。
+
+    两类都算：① worktree 未提交改动（git status）；② 分支领先 main 的已提交
+    （断点续跑继承的 WIP 快照提交，#61 实证：被 429 杀掉的前一轮工作完整躺在
+    WIP 提交里，旧版只看 status → 假 skip-commit → 不过门禁、不推远端、
+    issue 被消费后工作滞留本地分支）。继承工作照走三门+评审+GIT_PUBLISH，
+    验证不过自然 failed-preserved。
+    """
     ch = CODE(id="has_changes", lang="python", input={"wt": INPUT.wt}, code=(
         "import subprocess\n"
         "def run(input):\n"
-        "    st = subprocess.run([\"git\", \"-C\", input[\"wt\"], \"status\", \"--porcelain\"],\n"
-        "                        capture_output=True, text=True)\n"
-        "    return {\"any\": bool(st.stdout.strip())}\n"))
+        "    def git(*a):\n"
+        "        r = subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n"
+        "                            capture_output=True, text=True)\n"
+        "        return r.stdout.strip()\n"
+        "    dirty = bool(git(\"status\", \"--porcelain\"))\n"
+        "    ahead = 0\n"
+        "    try:\n"
+        "        ahead = int(git(\"rev-list\", \"--count\", \"main..HEAD\") or 0)\n"
+        "    except ValueError:\n"
+        "        ahead = 0\n"
+        "    return {\"any\": dirty or ahead > 0}\n"))
     return {"any": ch.any}
 
 
@@ -133,16 +148,22 @@ def self_improve_v2(INPUT):
         "    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n"
         "              if br is not None else [])\n"
         "    if cands:\n"
-        "        newest, newest_t = None, -1.0\n"
-        "        for c in cands:\n"
-        "            t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n"
-        "                               capture_output=True, text=True)\n"
-        "            try:\n"
-        "                ct = float(t.stdout.strip())\n"
-        "            except ValueError:\n"
-        "                continue\n"
-        "            if ct > newest_t:\n"
-        "                newest, newest_t = c, ct\n"
+        "        # canonical 分支（pipeline/issue-N，GIT_PUBLISH 推的门禁通过版）\n"
+        "        # 优先于 v2-*/wip-* 按新度拣选——#70 实证：被否决的朴素变体（25e41f9）\n"
+        "        # 比 canonical 新 30 分钟，纯按 %ct 会继承错误基线。\n"
+        "        canon = \"pipeline/issue-\" + issue_no\n"
+        "        newest = canon if canon in cands else None\n"
+        "        if newest is None:\n"
+        "            newest_t = -1.0\n"
+        "            for c in cands:\n"
+        "                t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n"
+        "                                   capture_output=True, text=True)\n"
+        "                try:\n"
+        "                    ct = float(t.stdout.strip())\n"
+        "                except ValueError:\n"
+        "                    continue\n"
+        "                if ct > newest_t:\n"
+        "                    newest, newest_t = c, ct\n"
         "        if newest:\n"
         "            base_ref = newest\n"
         "            branch = \"v2-\" + rd.name + \"-cont\"\n"
@@ -229,7 +250,9 @@ def self_improve_v2(INPUT):
     # UNAVAILABLE / 修后仍不过均 failed-preserved 并落盘评审原文。
     review_prompt = (
         "You are an independent reviewer (different provider). In the current "
-        "workspace, run `git diff HEAD` to see the full change, and Read any "
+        "workspace, run `git diff main` to see the full change (three-dot is not "
+        "needed; this covers both uncommitted edits and commits inherited from a "
+        "resumed run, which `git diff HEAD` would miss), and Read any "
         "source files you need to cross-check claims.\n"
         "Review for correctness, regressions and contract violations.\n"
         'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
