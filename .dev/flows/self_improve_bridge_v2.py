@@ -37,20 +37,46 @@ def setup_env_injection() -> None:
 
 
 class StepTracker:
-    """on_node_end 回调：把 currentStep 写进 state.json（fail-open）。"""
+    """on_node_start/on_node_end 回调：currentStep + 逐节点耗时画像（fail-open）。
+
+    node_timings[node_id] = {"total"/"runs"/"last"}——跨调用累计（修复环、评审环
+    同一节点多轮各计一次），供「哪个环节最耗时」的数据回答。
+    """
 
     def __init__(self, state_path: Path):
         self.state_path = state_path
+        self._starts: dict[str, float] = {}
 
-    def __call__(self, flow, node, result=None, exc=None):
+    def _merge(self, mutate) -> None:
         try:
             st = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
-            st.setdefault("status", "running")
-            st["currentStep"] = node.id
+            mutate(st)
+            st["status"] = st.get("status", "running")
             st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             self.state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))
         except Exception:
             pass
+
+    def on_node_start(self, flow, node, **kwargs) -> None:
+        self._starts[node.id] = time.time()
+
+    def on_node_end(self, flow, node, result=None, exc=None, error=None, exception=None, **kwargs):
+        t0 = self._starts.pop(node.id, None)
+        dur = round(time.time() - t0, 1) if t0 else None
+
+        def mut(st):
+            st["currentStep"] = node.id
+            if dur is not None:
+                t = st.setdefault("node_timings", {})
+                e = t.setdefault(node.id, {"total": 0.0, "runs": 0})
+                e["total"] = round(e["total"] + dur, 1)
+                e["runs"] += 1
+                e["last"] = dur
+
+        self._merge(mut)
+
+    def __call__(self, flow, node, result=None, exc=None):
+        self.on_node_end(flow, node, result=result, exc=exc)
 
 
 def main() -> int:
@@ -95,6 +121,9 @@ def main() -> int:
     class _Adapter(FlowCallback):
         def __init__(self, tracker):
             self.tracker = tracker
+
+        def on_node_start(self, flow, node, **kw):
+            self.tracker.on_node_start(flow, node)
 
         def on_node_end(self, flow, node, result=None, error=None, exception=None, **kw):
             self.tracker(flow, node, result)
