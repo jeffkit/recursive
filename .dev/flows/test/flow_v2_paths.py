@@ -36,14 +36,14 @@ PUBLISH_RESULT = {"pushed": True, "merged": True, "note": "stub", "push_note": "
 
 
 def _eval(node, execution, attr, default=""):
-    """节点属性存的是未求值表达式（$NODE.xxx）——先 evaluate 再用。"""
+    """节点属性存的是未求值表达式（$NODE.xxx）——先 evaluate 再用。
+
+    求值失败必须抛（2026-10-01 #49 教训：吞异常回退原文会掩盖坏表达式，
+    harness 假绿、生产 KeyError）。"""
     raw = getattr(node, attr, None)
     if raw is None:
         return default
-    try:
-        v = execution.evaluate(raw)
-    except Exception:
-        v = raw
+    v = execution.evaluate(raw)
     return default if v is None else str(v)
 
 
@@ -269,10 +269,36 @@ def s10_全新run会话存储存在但不取():
         f"全新 run 不应带 session: {impl_calls}"
 
 
+def s18_全部prompt表达式可解析():
+    """$F.concat 常量含转义引号时 pyparsing 匹配失败→静默回退 variable→
+    KeyError '$F'（49 实证）。编译期不炸、执行期才炸，harness 桩曾吞异常
+    掩盖——本场景对全图 prompt/CONTENT 类表达式做真实求值。"""
+    from plaita.core.expression_parser import ExpressionParser
+    import self_improve_flow_v2 as m
+    ep = ExpressionParser()
+    ctx = {"$NODE": {k: {"out": "x", "text": "x", "stdout": "x", "stderr": "x",
+                          "passed": False, "gate": "g", "err": "x"}
+                      for k in ("g1", "g1b", "g2", "g2b", "g3", "g3b",
+                                "impl", "rev1", "rev2", "pre", "pub")}}
+    ctx["$NODE"].update({"pre": {"worktree": "/wt", "branch": "b", "baseline": "h",
+                                  "sys_prompt": "s", "last_sid": "", "ok": True, "why": ""}})
+    bad = []
+    for n in m.self_improve_v2.nodes:
+        for attr in ("prompt", "content"):
+            raw = getattr(n, attr, None)
+            if isinstance(raw, str) and raw.startswith("$"):
+                try:
+                    ep.evaluate(raw, ctx)
+                except Exception as e:
+                    bad.append(f"{n.id}.{attr}: {str(e)[:60]}")
+    assert not bad, "不可解析表达式: " + "; ".join(bad)
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
-             s9_续跑找到会话_impl带sid, s10_全新run会话存储存在但不取]
+             s9_续跑找到会话_impl带sid, s10_全新run会话存储存在但不取,
+             s18_全部prompt表达式可解析]
 
 if __name__ == "__main__":
     _patch()
@@ -290,3 +316,5 @@ if __name__ == "__main__":
             print(f"  ERROR {s.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(SCENARIOS)-len(failed)}/{len(SCENARIOS)} passed")
     sys.exit(1 if failed else 0)
+
+

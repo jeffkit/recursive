@@ -215,7 +215,10 @@ def self_improve_v2(INPUT):
 
     # ── 门禁 ×3（gate_once 单发子流程 + 主层修复环：首检→AGENTRUN 修→复检定论）──
     # 修复环放主层的原因：childflow 表达式上下文没有 F（59/69 实证 KeyError），
-    # 详见 gate_once docstring。fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死
+    # 详见 gate_once docstring。提示词常量禁止内部双引号：$F.concat 的
+    # 常量参数含转义引号时 pyparsing 函数调用匹配失败、静默回退 variable、
+    # KeyError（49 实证 _n9）——强调用大写，不用引号。
+    # fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死
     # 实证：impl 不跑 fmt、fix-loop LLM 手改源码救不动）。cargo fmt --all 幂等且
     # 秒级：可解析即绿、格式化结果随提交走；解析错误才红并交 fix-loop 修语法。
     # 不用 --check：apply 后 check 恒过，纯冗余；也不用 && 链——GATE 对单字符串
@@ -229,7 +232,7 @@ def self_improve_v2(INPUT):
                       "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The "fmt" check failed. Edit the source files to fix every '
+                'The fmt check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo fmt --all` yourself to verify "
                 "before stopping.\nFix the source, never silence with #[allow]."
                 "\n--- output tail ---\n", g1.out),
@@ -247,7 +250,7 @@ def self_improve_v2(INPUT):
                       "timeout_secs": 1200, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The "clippy" check failed. Edit the source files to fix every '
+                'The clippy check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo clippy --workspace --all-targets "
                 "--all-features -- -D warnings` yourself to verify before stopping."
                 "\nFix the source, never silence with #[allow]."
@@ -266,7 +269,7 @@ def self_improve_v2(INPUT):
                       "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
     if g3.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The "cargo test" check failed. Edit the source files to fix every '
+                'The cargo test check failed. Edit the source files to fix every '
                 "failing test below, then re-run `cargo test --workspace` yourself "
                 "to verify before stopping."
                 "\nFix the source, never silence with #[allow]."
