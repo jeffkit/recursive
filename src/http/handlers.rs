@@ -85,8 +85,10 @@ pub(super) fn inject_environment_segment(
 /// frontend-neutral helper the CLI uses (`apply_context_management`).
 ///
 /// `/agui` builds through [`build_session_runtime_parts`] (same context
-/// management) plus the provider / wall-timeout / storage setters here —
-/// its runtime assembly lives in `super::agui`, away from the axum types.
+/// management); the provider / wall-timeout / storage / streaming setters
+/// are layered on in `super::agui::build_agui_runtime` — fed from
+/// `AppState` here, so every channel stays on the same budget. Its runtime
+/// assembly lives in `super::agui`, away from the axum types.
 ///
 /// Callers add what is genuinely request-specific on top of the returned
 /// builder (`seed_transcript` for `/agui` resume, then `build()`).
@@ -1412,19 +1414,21 @@ pub(super) async fn agui_run(
         )
     })?;
 
-    // ── Transport-free prepare: resume/interrupt state machine ─────────
-    let prepared = super::agui::prepare_run(super::agui::AguiRunInput {
-        workspace: &state.config.workspace,
-        input: &input,
-    })
-    .map_err(agui_prepare_error_response)?;
-
     // ── Per-thread run fence (issue #57 §④) ─────────────────────────────
     // At most one in-flight run per thread. Mobile retries / double
     // submits used to run two drivers concurrently against one transcript
     // (measured lost-update); refuse the second run instead of queueing
     // it — a queued duplicate would run the same prompt twice. The guard
     // is released when the driver task finishes (or on unwind).
+    //
+    // Ordering invariant (restored from main's monolith): the fence MUST
+    // close BEFORE `prepare_run` touches disk. The resume branch of
+    // `prepare_run` rewrites the persisted transcript
+    // (`apply_resume_tool_results`) and consumes the open-interrupt store
+    // (`clear_open_interrupts`); fencing first means a duplicate POST that
+    // races the tail of an in-flight run is refused with 409 while the
+    // thread's on-disk state is still untouched — not after its resume
+    // payload was already spliced in and the interrupts cleared.
     let run_guard = state
         .host
         .try_begin_run(crate::agui_session::thread_session_key(&input.thread_id))
@@ -1441,6 +1445,14 @@ pub(super) async fn agui_run(
                 }),
             )
         })?;
+
+    // ── Transport-free prepare: resume/interrupt state machine ─────────
+    // (Runs after the fence above — see the ordering invariant there.)
+    let prepared = super::agui::prepare_run(super::agui::AguiRunInput {
+        workspace: &state.config.workspace,
+        input: &input,
+    })
+    .map_err(agui_prepare_error_response)?;
 
     // Acquire a semaphore permit to limit concurrent runs.
     // Goal-H J2: /agui stays on the never-wait contract (`try_acquire_run`),
@@ -1494,6 +1506,8 @@ pub(super) async fn agui_run(
             interrupt_before: input.interrupt_before.as_deref().unwrap_or(&[]),
             client_tools: &input.tools,
             model: state.config.model.clone(),
+            wall_timeout_secs: state.config.wall_timeout_secs,
+            storage: state.storage.clone(),
         },
     )
     .map_err(|e| {
@@ -1742,4 +1756,1501 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # TYPE recursive_rate_limits_rejected_total counter\n\
          recursive_rate_limits_rejected_total {rate_limits_rejected}\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::AgentEvent;
+    use crate::http::SseEvent;
+
+    /// Goal-393: `build_session_runtime` must install the same context
+    /// management the CLI gets — compactor (auto threshold from the model),
+    /// microcompactor (opt-in), transcript cap (env). Asserted at the
+    /// builder level: `AgentRuntime` deliberately has no public accessors.
+    #[test]
+    fn build_session_runtime_installs_compactor_and_transcript_cap() {
+        // The env matrix itself lives in
+        // `src/runtime/context_management.rs` (single merged test — env is
+        // process-global). Here: one representative configuration.
+        let saved_threshold = std::env::var("RECURSIVE_COMPACT_THRESHOLD").ok();
+        let saved_cap = std::env::var("RECURSIVE_MAX_TRANSCRIPT_CHARS").ok();
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", "7777");
+        std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", "99999");
+
+        let config = crate::config::Config::from_env().expect("config");
+        let state = crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(0),
+                crate::http::AdmissionGate::new(
+                    1,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        let builder = build_session_runtime(
+            &state,
+            ToolRegistry::default(),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+        );
+        let compactor = builder.compactor_for_test().expect("compactor installed");
+        assert_eq!(compactor.threshold_chars, 7777);
+        assert_eq!(builder.max_transcript_chars_for_test(), Some(99999));
+
+        if let Some(v) = saved_threshold {
+            std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", v);
+        } else {
+            std::env::remove_var("RECURSIVE_COMPACT_THRESHOLD");
+        }
+        if let Some(v) = saved_cap {
+            std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", v);
+        } else {
+            std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
+        }
+    }
+
+    // ── SDK Phase B: tool_progress forwarder ─────────────────────────────
+
+    /// Verify that the stateful forwarder logic correctly emits ToolProgress
+    /// after ToolResult with the right tool_name.  We simulate the forwarder's
+    /// HashMap bookkeeping without spinning up a full Tokio task.
+    #[test]
+    fn tool_progress_emitted_after_tool_result() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut tool_start_times: HashMap<String, Instant> = HashMap::new();
+        let mut emitted: Vec<SseEvent> = Vec::new();
+
+        // Simulate ToolCall arrival
+        let call_event = AgentEvent::ToolCall {
+            name: "Bash".to_string(),
+            id: "tc-1".to_string(),
+            arguments: "{}".to_string(),
+            step: 0,
+        };
+        if let AgentEvent::ToolCall { id, .. } = &call_event {
+            tool_start_times.insert(id.clone(), Instant::now());
+        }
+        if let Some(ev) = map_agent_event(&call_event) {
+            emitted.push(ev);
+        }
+
+        // Simulate ToolResult arrival (no sleep needed — elapsed_ms ≥ 0)
+        let result_event = AgentEvent::ToolResult {
+            id: "tc-1".to_string(),
+            name: "Bash".to_string(),
+            output: "ok".to_string(),
+            step: 0,
+            is_error: false,
+        };
+        if let Some(ev) = map_agent_event(&result_event) {
+            emitted.push(ev);
+        }
+        if let AgentEvent::ToolResult { id, name, .. } = &result_event {
+            let elapsed_ms = tool_start_times
+                .remove(id)
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            emitted.push(SseEvent::ToolProgress {
+                tool_use_id: id.clone(),
+                tool_name: name.clone(),
+                elapsed_ms,
+            });
+        }
+
+        // Expect: ToolCall, ToolResult, ToolProgress
+        assert_eq!(emitted.len(), 3, "expected 3 events");
+        assert!(matches!(emitted[0], SseEvent::ToolCall { .. }));
+        assert!(matches!(emitted[1], SseEvent::ToolResult { .. }));
+        let SseEvent::ToolProgress {
+            tool_use_id,
+            tool_name,
+            elapsed_ms,
+        } = &emitted[2]
+        else {
+            panic!("third event should be ToolProgress");
+        };
+        assert_eq!(tool_use_id, "tc-1");
+        assert_eq!(tool_name, "Bash");
+        let _ = elapsed_ms; // ≥ 0 is trivially true for u64
+    }
+
+    /// Verify that tool_start_times does NOT grow if a ToolResult arrives
+    /// without a matching ToolCall (e.g. replayed events).
+    #[test]
+    fn tool_progress_elapsed_is_zero_for_unmatched_result() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let mut tool_start_times: HashMap<String, Instant> = HashMap::new();
+
+        let result_event = AgentEvent::ToolResult {
+            id: "tc-orphan".to_string(),
+            name: "Read".to_string(),
+            output: "data".to_string(),
+            step: 0,
+            is_error: false,
+        };
+        let elapsed_ms = if let AgentEvent::ToolResult { id, .. } = &result_event {
+            tool_start_times
+                .remove(id)
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0)
+        } else {
+            unreachable!()
+        };
+        // No panic; elapsed defaults to 0 when no matching ToolCall.
+        assert_eq!(elapsed_ms, 0);
+    }
+
+    /// Goal-268 + Goal-H J2: /agui must respect run_semaphore. The
+    /// handler uses `try_acquire_run` (J2) so a saturated (0-permit)
+    /// semaphore returns 503 SERVICE_UNAVAILABLE **immediately** rather
+    /// than blocking forever on `acquire_owned().await`. A 0-permit
+    /// `Semaphore` is the natural test fixture — no `close()` workaround
+    /// needed (the previous form tested a *closed* semaphore, which is a
+    /// different code path inside `try_acquire_owned`).
+    #[tokio::test]
+    async fn agui_run_respects_run_semaphore() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tokio::sync::Semaphore;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+
+        // 0-permit admission gate: every `try_acquire_run` call
+        // returns `TryAcquireError::NoPermits` immediately.
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::from_semaphore(
+                Arc::new(Semaphore::new(0)),
+                Duration::ZERO,
+                Arc::clone(&metrics.runs_waiting),
+                Arc::clone(&metrics.runs_in_flight),
+            ),
+        ));
+
+        let state = Arc::new(crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host,
+            event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let body = serde_json::json!({
+            "threadId": "t1",
+            "runId": "r1",
+            "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+        });
+        let (status, _err) = agui_run(State(state), Json(body))
+            .await
+            .expect_err("expected SERVICE_UNAVAILABLE");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Goal-280: clear_goal returns 409 when runtime busy ────────────
+
+    /// Simulate a busy runtime (mutex held by an in-flight turn) and
+    /// verify `session_clear_goal` returns 409 with Retry-After: 5.
+    /// Then release the lock and verify the next call returns 200.
+    ///
+    /// Goal-313: the handler now returns `Result<Json<...>, ApiError>`
+    /// instead of `Response` directly. We convert via
+    /// `axum::response::IntoResponse` so the same assertions (status,
+    /// headers, body) still work.
+    #[tokio::test]
+    async fn clear_goal_returns_409_when_runtime_busy() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
+
+        let session_id = "test-busy-session".to_string();
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        let session = SessionState {
+            id: session_id.clone(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            prompt_tokens: Arc::new(AtomicU64::new(0)),
+            completion_tokens: Arc::new(AtomicU64::new(0)),
+        };
+
+        let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
+        let state = Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            host,
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        // Acquire the runtime mutex to simulate a busy runtime.
+        let guard = runtime_arc.lock().await;
+
+        // Call the handler while the mutex is held → should get 409
+        // (Result::Err(ApiError::conflict(...).with_retry_after(5))).
+        let resp = session_clear_goal(State(state.clone()), Path(session_id.clone()))
+            .await
+            .into_response();
+        let status = resp.status();
+        assert_eq!(status, StatusCode::CONFLICT, "expected 409 Conflict");
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header missing")
+            .to_str()
+            .unwrap();
+        assert_eq!(retry_after, "5", "expected Retry-After: 5");
+
+        // Drop the guard and retry → should get 200.
+        drop(guard);
+        let resp = session_clear_goal(State(state), Path(session_id))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
+    }
+
+    /// Helper: build a minimal AppState with one session for handler unit tests.
+    async fn test_app_state_with_session(
+        session_id: &str,
+    ) -> (
+        Arc<AppState>,
+        Arc<tokio::sync::Mutex<crate::runtime::AgentRuntime>>,
+    ) {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        let session = SessionState {
+            id: session_id.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: Some("old".into()),
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            prompt_tokens: Arc::new(AtomicU64::new(0)),
+            completion_tokens: Arc::new(AtomicU64::new(0)),
+        };
+        let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
+        let state = Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            host,
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+        (state, runtime_arc)
+    }
+
+    #[tokio::test]
+    async fn get_session_status_idle_vs_plan_pending() {
+        let sid = "test-plan-status";
+        let (state, _) = test_app_state_with_session(sid).await;
+
+        let idle = match get_session(State(state.clone()), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("get_session idle"),
+        };
+        assert_eq!(idle.status, "idle");
+        assert!(idle.pending_plan.is_none());
+
+        // Set pending plan via the gate.
+        {
+            let sessions_lock = state.host.sessions();
+            let sessions = sessions_lock.read().await;
+            let session = sessions.get(sid).unwrap();
+            *session.plan_approval_gate.pending_plan.write().unwrap() = Some("do the thing".into());
+        }
+        let pending = match get_session(State(state), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("get_session pending"),
+        };
+        assert_eq!(pending.status, "plan_pending_approval");
+        assert_eq!(pending.pending_plan.as_deref(), Some("do the thing"));
+    }
+
+    #[tokio::test]
+    async fn get_session_busy_runtime_returns_empty_messages() {
+        let sid = "test-busy-get";
+        let (state, runtime_arc) = test_app_state_with_session(sid).await;
+        let _guard = runtime_arc.lock().await;
+        let detail = match get_session(State(state), Path(sid.to_string())).await {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("busy get_session must still 200"),
+        };
+        assert!(
+            detail.messages.is_empty(),
+            "busy runtime must fall back to empty messages"
+        );
+        assert_eq!(detail.status, "idle");
+    }
+
+    #[tokio::test]
+    async fn patch_session_empty_title_clears() {
+        let sid = "test-patch-title";
+        let (state, _) = test_app_state_with_session(sid).await;
+
+        let cleared = match patch_session(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest {
+                title: Some("".into()),
+            }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch empty title"),
+        };
+        assert!(cleared.title.is_none(), "empty title must clear to None");
+
+        let set = match patch_session(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest {
+                title: Some("new".into()),
+            }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch new title"),
+        };
+        assert_eq!(set.title.as_deref(), Some("new"));
+
+        // Omitting title must leave existing value unchanged.
+        let keep = match patch_session(
+            State(state),
+            Path(sid.to_string()),
+            Json(PatchSessionRequest { title: None }),
+        )
+        .await
+        {
+            Ok(Json(v)) => v,
+            Err(_) => panic!("patch omit title"),
+        };
+        assert_eq!(keep.title.as_deref(), Some("new"));
+    }
+
+    /// Goal-292: metrics_handler output includes sessions_active and
+    /// rate_limits_rejected.
+    #[tokio::test]
+    async fn metrics_handler_includes_new_fields() {
+        use crate::http::Metrics;
+        use crate::tools::ToolRegistry;
+        use std::sync::atomic::AtomicU64;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Metrics {
+            sessions_active: AtomicU64::new(3),
+            rate_limits_rejected: AtomicU64::new(42),
+            ..Metrics::default()
+        };
+        let state = Arc::new(AppState {
+            metrics: Arc::new(metrics),
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+        let output = metrics_handler(State(state)).await;
+        assert!(
+            output.contains("recursive_sessions_active 3"),
+            "output should contain sessions_active: {output}"
+        );
+        assert!(
+            output.contains("recursive_rate_limits_rejected_total 42"),
+            "output should contain rate_limits_rejected_total: {output}"
+        );
+        // Goal 398: queue gauge is always exposed (0 when nothing waits).
+        assert!(
+            output.contains("recursive_runs_waiting 0"),
+            "output should contain runs_waiting gauge: {output}"
+        );
+    }
+
+    /// Goal-392: the two new gauges are always exposed.
+    #[tokio::test]
+    async fn metrics_handler_includes_gauges() {
+        use crate::http::Metrics;
+        use crate::tools::ToolRegistry;
+        use std::sync::atomic::AtomicU64;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Metrics {
+            runs_in_flight: Arc::new(AtomicU64::new(7)),
+            ..Metrics::default()
+        };
+        let state = Arc::new(AppState {
+            metrics: Arc::new(metrics),
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+        let output = metrics_handler(State(state)).await;
+        assert!(
+            output.contains("recursive_runs_in_flight 7"),
+            "output should contain runs_in_flight: {output}"
+        );
+        assert!(
+            output.contains("recursive_transcript_bytes_total 0"),
+            "output should contain transcript_bytes_total (empty host): {output}"
+        );
+        assert!(
+            output.contains("recursive_transcript_bytes_skipped 0"),
+            "output should contain transcript_bytes_skipped (empty host): {output}"
+        );
+    }
+
+    /// Goal-292: sessions_active increments on create_session and
+    /// decrements on delete_session.
+    #[tokio::test]
+    async fn sessions_active_tracks_session_lifecycle() {
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]));
+        let metrics = Arc::new(crate::http::Metrics::default());
+
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: metrics.clone(),
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        let auth = crate::http::auth::AuthConfig::default();
+        let limiter = state.rate_limiter.clone();
+        let app = crate::http::build_router_with_auth_and_rate_limit(state, auth, limiter);
+
+        // Initially sessions_active is 0.
+        assert_eq!(
+            metrics.sessions_active.load(Ordering::Relaxed),
+            0,
+            "sessions_active should start at 0"
+        );
+
+        // Create a session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"session_name":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "expected 201 Created from POST /sessions"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let created: CreateSessionResponse =
+            serde_json::from_slice(&body).expect("valid CreateSessionResponse");
+        let session_id = created.id;
+
+        // sessions_active should now be 1.
+        assert_eq!(
+            metrics.sessions_active.load(Ordering::Relaxed),
+            1,
+            "sessions_active should increment to 1 after create"
+        );
+
+        // Delete the session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "expected 204 No Content from DELETE /sessions/:id"
+        );
+
+        // sessions_active should be back to 0.
+        assert_eq!(
+            metrics.sessions_active.load(Ordering::Relaxed),
+            0,
+            "sessions_active should decrement to 0 after delete"
+        );
+    }
+
+    // ── G298: OpenAPI spec sync ───────────────────────────────────────
+
+    /// Verify that `build_openapi_spec()` correctly describes the
+    /// `SessionDetailResponse` schema with all the fields added in
+    /// G293, G294, G295, G296, etc.
+    #[test]
+    fn openapi_session_detail_has_complete_schema() {
+        let spec = super::super::build_openapi_spec();
+        let props = &spec["components"]["schemas"]["SessionDetailResponse"]["properties"];
+
+        // Fields from the original (G-pre) spec.
+        assert!(props.get("id").is_some(), "id missing");
+        assert!(props.get("created_at").is_some(), "created_at missing");
+        assert!(props.get("messages").is_some(), "messages missing");
+
+        // Fields added by G293-G296 that the goal explicitly requires.
+        assert!(
+            props.get("prompt_tokens").is_some(),
+            "prompt_tokens missing"
+        );
+        assert!(
+            props.get("completion_tokens").is_some(),
+            "completion_tokens missing"
+        );
+        assert!(props.get("status").is_some(), "status missing");
+        assert!(props.get("todos").is_some(), "todos missing");
+        assert!(props.get("goal").is_some(), "goal missing");
+
+        // Remaining fields: title, pending_plan, first_prompt, last_prompt.
+        assert!(props.get("title").is_some(), "title missing");
+        assert!(props.get("pending_plan").is_some(), "pending_plan missing");
+        assert!(props.get("first_prompt").is_some(), "first_prompt missing");
+        assert!(props.get("last_prompt").is_some(), "last_prompt missing");
+
+        // Verify we have at least 10 properties total.
+        let obj = props.as_object().expect("properties is an object");
+        assert!(
+            obj.len() >= 10,
+            "SessionDetailResponse should have ≥10 properties, got {}",
+            obj.len()
+        );
+    }
+
+    /// Verify `SessionInfo` schema includes `message_count` and `title`.
+    #[test]
+    fn openapi_session_info_has_message_count_and_title() {
+        let spec = super::super::build_openapi_spec();
+        let props = &spec["components"]["schemas"]["SessionInfo"]["properties"];
+
+        assert!(props.get("id").is_some(), "id missing");
+        assert!(props.get("created_at").is_some(), "created_at missing");
+        assert!(
+            props.get("message_count").is_some(),
+            "message_count missing"
+        );
+        assert!(props.get("title").is_some(), "title missing");
+    }
+
+    /// Verify the `/metrics` path exists and mentions the two G292
+    /// metrics in its description.
+    #[test]
+    fn openapi_metrics_path_documents_new_metrics() {
+        let spec = super::super::build_openapi_spec();
+        let description = spec["paths"]["/metrics"]["get"]["description"]
+            .as_str()
+            .expect("metrics path description is a string");
+
+        assert!(
+            description.contains("recursive_sessions_active"),
+            "metrics description should mention recursive_sessions_active: {description}"
+        );
+        assert!(
+            description.contains("recursive_rate_limits_rejected_total"),
+            "metrics description should mention recursive_rate_limits_rejected_total: {description}"
+        );
+    }
+
+    // ── Goal-303: sort GET /sessions results by created_at ───────────
+
+    /// Verify that sorting SessionInfo by `created_at` yields
+    /// chronological order (oldest first).
+    #[test]
+    fn list_sessions_sort_is_chronological() {
+        let mut infos = [
+            SessionInfo {
+                id: "c".into(),
+                created_at: "2026-01-03T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+            SessionInfo {
+                id: "a".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+            SessionInfo {
+                id: "b".into(),
+                created_at: "2026-01-02T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+        ];
+        infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        assert_eq!(infos[0].id, "a");
+        assert_eq!(infos[1].id, "b");
+        assert_eq!(infos[2].id, "c");
+    }
+
+    /// Verify that sessions created in the same second are tie-broken
+    /// by `id` so the sort remains fully deterministic.
+    #[test]
+    fn list_sessions_same_second_tiebreak_by_id() {
+        let mut infos = [
+            SessionInfo {
+                id: "z".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+            SessionInfo {
+                id: "a".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                message_count: 0,
+                title: None,
+            },
+        ];
+        infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        assert_eq!(infos[0].id, "a");
+        assert_eq!(infos[1].id, "z");
+    }
+
+    // ── Goal-312: skill_index injection into system prompt ──────────
+
+    /// Verify the skill catalog is produced as a `system-reminder` and is
+    /// NOT inlined into the static system prompt (it ships per-turn via
+    /// `skill_reminder`, keeping the `system` field cacheable).
+    #[test]
+    fn skill_reminder_produced_and_not_inlined() {
+        let skills = vec![crate::skills::Skill {
+            name: "rust-patch-discipline".to_string(),
+            description: "V4A patch format rules".to_string(),
+            path: std::path::PathBuf::from("/tmp/skills/rust-patch-discipline/SKILL.md"),
+            mode: crate::skills::SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: None,
+        }];
+
+        let idx = crate::skills::skill_index(&skills);
+        assert!(!idx.is_empty(), "skill_index should not be empty");
+        assert!(
+            idx.contains("Available skills"),
+            "skill_index should contain header"
+        );
+        assert!(
+            idx.contains("rust-patch-discipline"),
+            "skill_index should list skill names"
+        );
+
+        // The catalog ships as a system-reminder block.
+        let reminder = crate::skills::skill_reminder(&skills);
+        assert!(reminder.contains("<system-reminder>"), "reminder wrapper");
+        assert!(
+            reminder.contains("Available skills"),
+            "reminder should contain header"
+        );
+        assert!(
+            reminder.contains("rust-patch-discipline"),
+            "reminder should contain skill name"
+        );
+
+        // The static system prompt must NOT inline it.
+        let base_prompt = "You are a helpful agent.";
+        let assembled =
+            crate::assemble_system_prompt(base_prompt, std::path::Path::new(""), &skills, false)
+                .into_full();
+        assert!(
+            !assembled.contains("Available skills"),
+            "system prompt must not inline skill catalog: {assembled}"
+        );
+    }
+
+    /// skill_index returns empty string when no skills are present,
+    /// so injection is a no-op (no spurious newlines).
+    #[test]
+    fn system_prompt_unchanged_when_no_skills() {
+        let skills: Vec<crate::skills::Skill> = vec![];
+        let idx = crate::skills::skill_index(&skills);
+        assert!(idx.is_empty(), "empty skills should produce empty index");
+
+        let base_prompt = "You are a helpful agent.";
+        let mut sp = base_prompt.to_string();
+        if !idx.is_empty() {
+            sp.push('\n');
+            sp.push_str(&idx);
+        }
+        // The prompt should be unchanged.
+        assert_eq!(sp, base_prompt);
+    }
+
+    // ── parse_permission_mode ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_permission_mode_all_variants() {
+        assert_eq!(parse_permission_mode("auto", false), PermissionMode::Auto);
+        assert_eq!(parse_permission_mode("AUTO", true), PermissionMode::Auto);
+        assert_eq!(
+            parse_permission_mode("strict", false),
+            PermissionMode::Strict
+        );
+        assert_eq!(
+            parse_permission_mode("bypass", true),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            parse_permission_mode("bypass_permissions", true),
+            PermissionMode::BypassPermissions
+        );
+        // Bypass rejected when allow_bypass=false → Default (kills match-guard mutant).
+        assert_eq!(
+            parse_permission_mode("bypass", false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("bypass_permissions", false),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("default", true),
+            PermissionMode::Default
+        );
+        assert_eq!(
+            parse_permission_mode("unknown", true),
+            PermissionMode::Default
+        );
+    }
+
+    // ── map_agent_event / sse_message_from_canonical ────────────────────────
+
+    #[test]
+    fn map_agent_event_tool_result_success_flag() {
+        let ok = AgentEvent::ToolResult {
+            id: "tc-1".into(),
+            name: "Bash".into(),
+            output: "ok".into(),
+            step: 0,
+            is_error: false,
+        };
+        let err = AgentEvent::ToolResult {
+            id: "tc-2".into(),
+            name: "Bash".into(),
+            output: "fail".into(),
+            step: 0,
+            is_error: true,
+        };
+        match map_agent_event(&ok) {
+            Some(SseEvent::ToolResult { success, .. }) => assert!(success),
+            other => panic!("expected ToolResult success=true, got {other:?}"),
+        }
+        match map_agent_event(&err) {
+            Some(SseEvent::ToolResult { success, .. }) => assert!(!success),
+            other => panic!("expected ToolResult success=false, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_suppresses_non_sse_variants() {
+        // Latency / Usage / AssistantText have no SSE equivalent.
+        assert!(map_agent_event(&AgentEvent::Latency { step: 0, llm_ms: 1 }).is_none());
+        assert!(map_agent_event(&AgentEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            step: 0,
+        })
+        .is_none());
+        assert!(map_agent_event(&AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 0
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn map_agent_event_forwards_goal_loop_events() {
+        // kills delete-match-arm on GoalContinuing / GoalAchieved
+        match map_agent_event(&AgentEvent::GoalContinuing {
+            reason: "still working".into(),
+            turns: 3,
+        }) {
+            Some(SseEvent::GoalContinuing { reason, turns }) => {
+                assert_eq!(reason, "still working");
+                assert_eq!(turns, 3);
+            }
+            other => panic!("expected GoalContinuing, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::GoalAchieved {
+            condition: "tests pass".into(),
+            turns: 5,
+        }) {
+            Some(SseEvent::GoalAchieved { condition, turns }) => {
+                assert_eq!(condition, "tests pass");
+                assert_eq!(turns, 5);
+            }
+            other => panic!("expected GoalAchieved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_agent_event_forwards_core_sse_arms() {
+        // kills delete-match-arm on PartialToken / ToolCall / TurnFinished / PlanProposed
+        match map_agent_event(&AgentEvent::PartialToken {
+            text: "tok".into(),
+            step: 2,
+        }) {
+            Some(SseEvent::PartialMessage { text, step }) => {
+                assert_eq!(text, "tok");
+                assert_eq!(step, 2);
+            }
+            other => panic!("expected PartialMessage, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::ToolCall {
+            name: "Bash".into(),
+            id: "tc-1".into(),
+            arguments: "{}".into(),
+            step: 1,
+        }) {
+            Some(SseEvent::ToolCall { name, step }) => {
+                assert_eq!(name, "Bash");
+                assert_eq!(step, 1);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::TurnFinished {
+            reason: "no_more_tool_calls".into(),
+            steps: 4,
+        }) {
+            Some(SseEvent::Done {
+                finish_reason,
+                total_steps,
+            }) => {
+                assert_eq!(finish_reason, "no_more_tool_calls");
+                assert_eq!(total_steps, 4);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::PlanProposed {
+            plan_text: "do X".into(),
+            tool_calls: vec![],
+        }) {
+            Some(SseEvent::PlanProposed { plan }) => assert_eq!(plan, "do X"),
+            other => panic!("expected PlanProposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_message_from_canonical_filters_system_tool_and_empty() {
+        assert!(
+            sse_message_from_canonical(&crate::message::Message::system("seed")).is_none(),
+            "system messages must be filtered"
+        );
+        let mut tool = crate::message::Message::user("unused");
+        tool.role = crate::message::Role::Tool;
+        tool.tool_call_id = Some("tc-1".into());
+        assert!(
+            sse_message_from_canonical(&tool).is_none(),
+            "tool messages must be filtered"
+        );
+        assert!(
+            sse_message_from_canonical(&crate::message::Message::assistant("")).is_none(),
+            "empty assistant with no tool_calls must be None"
+        );
+        match sse_message_from_canonical(&crate::message::Message::assistant("hello")) {
+            Some(SseEvent::Message { role, content }) => {
+                assert_eq!(role, "assistant");
+                assert!(!content.is_empty());
+            }
+            other => panic!("expected Message event, got {other:?}"),
+        }
+        match sse_message_from_canonical(&crate::message::Message::user("hi")) {
+            Some(SseEvent::Message { role, .. }) => assert_eq!(role, "user"),
+            other => panic!("expected user Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_message_from_canonical_emits_tool_use_without_text() {
+        // kills early-empty return before tool_calls loop / ToolUse arm delete
+        let msg = crate::message::Message::assistant_with_tool_calls(
+            "",
+            vec![crate::llm::ToolCall {
+                id: "tc-9".into(),
+                name: "Read".into(),
+                arguments: serde_json::json!({"path":"a.rs"}),
+            }],
+        );
+        match sse_message_from_canonical(&msg) {
+            Some(SseEvent::Message { role, content }) => {
+                assert_eq!(role, "assistant");
+                assert!(
+                    content.iter().any(|b| matches!(
+                        b,
+                        SseContentBlock::ToolUse { id, name, .. }
+                            if id == "tc-9" && name == "Read"
+                    )),
+                    "expected ToolUse block, got {content:?}"
+                );
+            }
+            other => panic!("expected Message with ToolUse, got {other:?}"),
+        }
+    }
+
+    // ── format_timestamp ────────────────────────────────────────────────────
+
+    #[test]
+    fn format_timestamp_unix_epoch_is_1970() {
+        let ts = format_timestamp(SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            &ts[..10],
+            "1970-01-01",
+            "epoch date must be 1970-01-01; got {ts}"
+        );
+        assert_eq!(
+            &ts[11..19],
+            "00:00:00",
+            "epoch time must be 00:00:00; got {ts}"
+        );
+        assert!(ts.ends_with('Z'), "must end with Z; got {ts}");
+    }
+
+    #[test]
+    fn format_timestamp_known_date() {
+        // 2026-07-06T00:00:00Z = 20640 days * 86400 sec = 1_783_296_000 seconds
+        let secs = 1_783_296_000u64;
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let ts = format_timestamp(t);
+        assert_eq!(&ts[..10], "2026-07-06", "expected 2026-07-06; got {ts}");
+        assert_eq!(&ts[11..19], "00:00:00", "time part must be zero; got {ts}");
+    }
+
+    #[test]
+    fn format_timestamp_time_parts_in_range() {
+        // 2026-07-06T13:45:30Z
+        let secs: u64 = 1_783_296_000 + 13 * 3600 + 45 * 60 + 30;
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let ts = format_timestamp(t);
+        assert_eq!(&ts[11..13], "13", "hours mismatch; got {ts}");
+        assert_eq!(&ts[14..16], "45", "minutes mismatch; got {ts}");
+        assert_eq!(&ts[17..19], "30", "seconds mismatch; got {ts}");
+    }
+
+    // ── Issue #62: agui non-resume seeding (through HTTP) ─────────────
+
+    /// End-to-end issue #62 acceptance: two turns on the same thread where
+    /// the second turn carries the FULL `messages` array (no resume). The
+    /// provider must see turn-one history in its request — multi-turn
+    /// context works without any tool side effect.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_non_resume_turn_seeds_full_messages_history() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+
+        let _env = crate::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        std::env::set_var("RECURSIVE_HOME", home.path());
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            crate::llm::Completion {
+                content: "the codename is bluebird".into(),
+                ..Default::default()
+            },
+            crate::llm::Completion {
+                content: "i remember: bluebird".into(),
+                ..Default::default()
+            },
+        ]));
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: provider.clone(),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-agui-seed-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let app = crate::http::build_router_with_auth_and_rate_limit(
+            state,
+            crate::http::auth::AuthConfig::default(),
+            crate::http::RateLimiter::new(100, 1.0),
+        );
+
+        let post = |body: serde_json::Value| {
+            app.clone().oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let drain = |resp: axum::response::Response| async move {
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20).await;
+        };
+
+        // Turn 1: single user message.
+        drain(
+            post(serde_json::json!({
+                "threadId": "bluebird-thread",
+                "runId": "r1",
+                "messages": [
+                    {"id": "m1", "role": "user", "content": "the codename is bluebird, remember it"}
+                ],
+            }))
+            .await
+            .unwrap(),
+        )
+        .await;
+
+        // Turn 2: full history, no resume — the standard AG-UI client shape.
+        drain(
+            post(serde_json::json!({
+                "threadId": "bluebird-thread",
+                "runId": "r2",
+                "messages": [
+                    {"id": "m1", "role": "user", "content": "the codename is bluebird, remember it"},
+                    {"id": "m2", "role": "assistant", "content": "the codename is bluebird"},
+                    {"id": "m3", "role": "user", "content": "what was the codename?"}
+                ],
+            }))
+            .await
+            .unwrap(),
+        )
+        .await;
+
+        let calls = provider.calls();
+        assert!(
+            calls.len() >= 2,
+            "expected ≥2 provider calls, got {}",
+            calls.len()
+        );
+        let turn2 = &calls[1];
+        let flat: Vec<(&crate::message::Role, &str)> = turn2
+            .iter()
+            .map(|m| (&m.role, m.content.as_str()))
+            .collect();
+        assert!(
+            flat.iter().any(|(r, c)| {
+                matches!(r, crate::message::Role::User)
+                    && c.contains("codename is bluebird, remember it")
+            }),
+            "turn-2 provider request must contain turn-1 history; got {flat:?}"
+        );
+        // The goal message must appear exactly once (not duplicated by seeding).
+        let goal_count = flat
+            .iter()
+            .filter(|(_, c)| *c == "what was the codename?")
+            .count();
+        assert_eq!(goal_count, 1, "goal must appear exactly once; got {flat:?}");
+        // Invariant #8: no tool roles in the seeded request at all.
+        assert!(
+            !turn2
+                .iter()
+                .any(|m| matches!(m.role, crate::message::Role::Tool)),
+            "no tool-role messages expected"
+        );
+
+        std::env::remove_var("RECURSIVE_WORKSPACE");
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+    }
+
+    // ── Issue #66: token streaming + cancellation ────────────────────────
+
+    /// POST /agui/{thread_id}/cancel cancels the registered token; an
+    /// unknown (or already-finished) thread is an idempotent 200 with
+    /// `"cancelled": false`.
+    #[tokio::test]
+    async fn agui_cancel_cancels_registered_thread_and_is_idempotent() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = Arc::new(crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-cancel-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .agui_active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("t-cancel".into(), token.clone());
+
+        let Json(res) = agui_cancel(State(Arc::clone(&state)), Path("t-cancel".into())).await;
+        assert_eq!(res["status"], "interrupted");
+        assert_eq!(res["cancelled"], true);
+        assert!(token.is_cancelled(), "registered token must be cancelled");
+
+        let Json(res) = agui_cancel(State(state), Path("no-such-thread".into())).await;
+        assert_eq!(res["cancelled"], false, "unknown thread stays idempotent");
+    }
+
+    /// Dropping the wrapped SSE body (client disconnect) must cancel the
+    /// run token; polling through the wrapper still forwards events.
+    #[tokio::test]
+    async fn agui_sse_drop_cancels_run_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        // `Ready` (not an async block): the wrapper's Stream impl requires
+        // `S: Unpin`, which `Once<Ready<_>>` satisfies the same way the
+        // production stream (map over an unbounded receiver) does.
+        let inner = futures_util::stream::once(futures_util::future::ready(Ok::<_, Infallible>(
+            Event::default().data("x"),
+        )));
+        let mut guarded = CancelOnDrop {
+            inner,
+            token: Some(token.clone()),
+        };
+        // File scope imports tokio_stream::StreamExt; disambiguate.
+        assert!(
+            futures_util::StreamExt::next(&mut guarded).await.is_some(),
+            "wrapper must forward items"
+        );
+        assert!(!token.is_cancelled());
+        drop(guarded);
+        assert!(
+            token.is_cancelled(),
+            "dropping the SSE body cancels the run"
+        );
+    }
+
+    /// Issue #66 §3.2 end-to-end: a chunked provider must reach the wire as
+    /// multiple `TextMessageContent` frames whose concatenation carries the
+    /// answer EXACTLY once (the finalising `AssistantText` must not
+    /// duplicate it), and the stream must end with `RunFinished`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_streams_token_deltas_without_duplicating_final_text() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+
+        let _env = crate::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        std::env::set_var("RECURSIVE_HOME", home.path());
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(
+            MockProvider::new(vec![crate::llm::Completion {
+                content: "abcdefgh".into(),
+                ..Default::default()
+            }])
+            .with_stream_chunk_chars(3),
+        );
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-stream-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let app = crate::http::build_router_with_auth_and_rate_limit(
+            state,
+            crate::http::auth::AuthConfig::default(),
+            crate::http::RateLimiter::new(100, 1.0),
+        );
+
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "threadId": "stream-th",
+                            "runId": "r-stream",
+                            "messages": [
+                                {"id": "m1", "role": "user", "content": "hi"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+
+        let mut deltas = String::new();
+        let mut saw_run_finished = false;
+        let mut content_frames = 0usize;
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("TextMessageContent") => {
+                    content_frames += 1;
+                    deltas.push_str(v["delta"].as_str().unwrap_or_default());
+                }
+                Some("RunFinished") => saw_run_finished = true,
+                _ => {}
+            }
+        }
+        assert!(
+            content_frames >= 2,
+            "chunked provider must yield multiple content frames, got {content_frames}"
+        );
+        assert_eq!(
+            deltas, "abcdefgh",
+            "deltas must carry the answer exactly once — no duplicated final message"
+        );
+        assert!(saw_run_finished, "stream must end with RunFinished");
+
+        std::env::remove_var("RECURSIVE_WORKSPACE");
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+    }
 }

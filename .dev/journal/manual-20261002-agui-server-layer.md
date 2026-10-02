@@ -37,6 +37,19 @@ uncompiled code), and the 8 AG-UI unit tests existed in **both** files.
    the implementation in `agui.rs`; `handlers.rs` keeps only the
    through-HTTP regression (`agui_non_resume_turn_seeds_full_messages_history`,
    issue #62).
+   **CORRECTION (NEEDS_FIX round 2, 2026-10-02):** the second sentence was
+   wrong and masked a coverage hole — the merge had in fact deleted main's
+   whole `handlers.rs` `#[cfg(test)]` module (39 tests), keeping only a
+   subset in `agui.rs`. #66 anti-double-render + cancel tests, the #62
+   through-HTTP regression, `agui_run_respects_run_semaphore`,
+   `parse_permission_mode_all_variants`, `sse_message_from_canonical_*`,
+   `format_timestamp_*`, the `tool_progress_*` forwarder tests, the
+   handler-behaviour tests (get/patch/clear_goal/metrics/sessions_active/
+   openapi/list-sort/skill-reminder) and `build_session_runtime_installs_
+   compactor_and_transcript_cap` had **no equivalent anywhere**. All are now
+   restored: AG-UI unit pieces sit in `agui.rs` (converter dedup, thread-key
+   properties), everything else in a rebuilt `handlers.rs::tests` module —
+   32 tests there, 18 in `agui.rs`.
 3. **Clippy fixes in `agui.rs` tests**: redundant field names
    (`interrupt_before: interrupt_before`) and `clippy::await_holding_lock`
    on the two `pinned_home()` + `.await` tests (same
@@ -45,6 +58,10 @@ uncompiled code), and the 8 AG-UI unit tests existed in **both** files.
    wire flow, interrupt/resume round-trip, testing strategy — plus an index
    entry in `docs/architecture/index.md` and a README section (previously
    `grep agui README.md` → nothing).
+   **CORRECTION (NEEDS_FIX round 2):** the index entry had NOT actually
+   landed in `docs/architecture/index.md` (only `agui.md` + README existed).
+   The "Other Concepts" section now links `agui.md`; `tests/docs_living_paths.rs`
+   passes.
 
 ## Acceptance criteria vs reality
 
@@ -145,3 +162,37 @@ Gates after resolution: `cargo test --workspace` 3,827 passed / 0 failed
 (58 suites, incl. `agui_e2e` 8/8 with the three #57 native-session tests);
 `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean;
 `cargo fmt --all -- --check` clean.
+
+## NEEDS_FIX resolution round 2 (2026-10-02) — reviewer's three regressions
+
+The cross-check confirmed the extraction itself was faithful but caught three
+regressions the first resolution missed:
+
+1. **`/agui` lost the Goal-399 wall-clock budget.** The layered
+   `build_agui_runtime` chain applied only `.llm(..).streaming(true)`, so
+   `kernel.wall_timeout_secs` stayed 0 and `RECURSIVE_HTTP_WALL_TIMEOUT_SECS`
+   stopped capping AG-UI runs (main's `build_session_runtime` applied
+   `.wall_timeout_secs(..)` + `.storage(..)` to every channel). Fix:
+   `AguiRuntimeDeps` gained `wall_timeout_secs` + `storage`, fed from
+   `state.config` / `state.storage` in the adapter, and the chain now applies
+   `.wall_timeout_secs(deps.wall_timeout_secs).storage(deps.storage)`. Pinned
+   by `build_agui_runtime_applies_wall_timeout_to_kernel` (agui.rs).
+2. **Fence/resume ordering inversion.** The adapter called `prepare_run`
+   (whose resume branch rewrites the transcript via `apply_resume_tool_results`
+   and consumes `.interrupts.json` via `clear_open_interrupts`) BEFORE
+   `try_begin_run`, so a duplicate POST racing an in-flight run got 409 only
+   after its payload was spliced in and the interrupts cleared — the retry
+   then 400'd on "no open interrupts". Fix: the fence moved before
+   `prepare_run`, restoring main's refuse-with-state-untouched semantics;
+   the ordering invariant is documented at the fence.
+3. **Test-coverage loss + false journal claim** — see the CORRECTION notes on
+   items 2 and 4 above: main's 39-test `handlers.rs` module had been deleted
+   with only 13 partially-different tests landing in `agui.rs`. All missing
+   tests are restored (`handlers.rs::tests` 32 + `agui.rs` 18); the journal
+   now states the actual final counts instead of the earlier false claim.
+   Plus the doc-only item: `docs/architecture/index.md` now links `agui.md`.
+
+Gates after round 2: `cargo test --workspace` green (lib 2,450; `http::`
+includes the restored 32-test handlers module; `http::agui` 18);
+`cargo clippy --all-targets --all-features -- -D warnings` clean;
+`cargo fmt --all` applied.

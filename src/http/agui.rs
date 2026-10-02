@@ -791,6 +791,15 @@ pub(crate) struct AguiRuntimeDeps<'a> {
     /// model the REST endpoints use keeps every channel's thresholds
     /// identical.
     pub model: String,
+    /// Goal 399: wall-clock budget in seconds (`config.wall_timeout_secs`
+    /// at the HTTP layer). Main's monolith applied it via
+    /// `build_session_runtime`; the layer must keep applying it or AG-UI
+    /// runs lose the `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` cap entirely.
+    pub wall_timeout_secs: u64,
+    /// Goal 396: shared transcript persistence backend
+    /// (`AppState.storage` at the HTTP layer) — the same setter
+    /// `build_session_runtime` applies for REST sessions.
+    pub storage: Arc<dyn crate::storage::StorageBackend>,
     /// Transcript seed from [`prepare_run`] (`Some` on resume / history
     /// seeding).
     pub seed_transcript: Option<Vec<crate::message::Message>>,
@@ -866,6 +875,14 @@ pub(crate) fn build_agui_runtime(
         &deps.model,
     )
     .llm(deps.llm)
+    // Goal 399: the same wall-clock budget the REST endpoints apply
+    // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into
+    // `config` at server startup). Exceeding it finishes with
+    // FinishReason::WallClockExceeded — data, not an error (invariant #7).
+    .wall_timeout_secs(deps.wall_timeout_secs)
+    // Goal 396: the host layer persists transcripts through the same
+    // storage backend on teardown; the kernel keeps the identical Arc.
+    .storage(deps.storage)
     // Issue #66 §3.2: token-level streaming — RunCore only builds the
     // partial-token forwarder when `streaming` is set. The converter above
     // frames `PartialToken` deltas into TextMessageStart/Content/End and
@@ -1388,6 +1405,106 @@ mod tests {
         save_open_interrupts(dir, interrupts);
     }
 
+    // ── converter: #66 anti-double-render ────────────────────────────────
+
+    /// Issue #66 §3.2: once a step streamed `PartialToken` deltas, the
+    /// finalising `AssistantText` must NOT re-emit the same text as a second
+    /// message — clients would render the answer twice. Exact match → only
+    /// `TextMessageEnd`; extended match → the unsent remainder is flushed
+    /// into the SAME message, then it is closed.
+    #[test]
+    fn agui_streamed_step_finalises_without_duplicating_text() {
+        use agui_protocol as ag;
+
+        // Exact match (the normal case: providers deliver every token).
+        let mut conv = AguiConverter::new();
+        let mut deltas = String::new();
+        for chunk in ["你", "好，", "世", "界"] {
+            for ev in conv.convert(&AgentEvent::PartialToken {
+                text: chunk.into(),
+                step: 0,
+            }) {
+                if let ag::Event::TextMessageContent(c) = ev {
+                    deltas.push_str(&c.delta);
+                }
+            }
+        }
+        assert_eq!(deltas, "你好，世界");
+        let tail = conv.convert(&AgentEvent::AssistantText {
+            text: deltas,
+            step: 0,
+        });
+        assert_eq!(tail.len(), 1, "exact-match final must only close: {tail:?}");
+        assert!(matches!(tail[0], ag::Event::TextMessageEnd(_)));
+
+        // Remainder: the final text extends what was already streamed.
+        let mut conv = AguiConverter::new();
+        let _ = conv.convert(&AgentEvent::PartialToken {
+            text: "Hel".into(),
+            step: 0,
+        });
+        let tail = conv.convert(&AgentEvent::AssistantText {
+            text: "Hello".into(),
+            step: 0,
+        });
+        assert_eq!(tail.len(), 2, "remainder + end expected: {tail:?}");
+        assert!(matches!(&tail[0], ag::Event::TextMessageContent(c) if c.delta == "lo"));
+        assert!(matches!(tail[1], ag::Event::TextMessageEnd(_)));
+    }
+
+    /// Issue #66 §3.2 fallback: deltas that diverge from the final text
+    /// (misbehaving provider) keep the historical full-message emission so
+    /// no text is lost — the streamed message is closed, then a fresh
+    /// Start/Content/End carries the final text.
+    #[test]
+    fn agui_divergent_final_text_falls_back_to_full_message() {
+        use agui_protocol as ag;
+        let mut conv = AguiConverter::new();
+        let _ = conv.convert(&AgentEvent::PartialToken {
+            text: "abc".into(),
+            step: 0,
+        });
+        let tail = conv.convert(&AgentEvent::AssistantText {
+            text: "xyz".into(),
+            step: 0,
+        });
+        assert_eq!(tail.len(), 4, "{tail:?}");
+        assert!(matches!(tail[0], ag::Event::TextMessageEnd(_)));
+        assert!(matches!(tail[1], ag::Event::TextMessageStart(_)));
+        assert!(matches!(&tail[2], ag::Event::TextMessageContent(c) if c.delta == "xyz"));
+        assert!(matches!(tail[3], ag::Event::TextMessageEnd(_)));
+    }
+
+    // ── thread-id mapping properties (live blake3 mapping) ───────────────
+
+    #[test]
+    fn thread_session_key_is_a_safe_directory_and_chain_id() {
+        for thread in [
+            "abc-123",
+            "a/b:c",
+            "..",
+            ".hidden",
+            "tenantA/user1/conv1",
+            "",
+        ] {
+            let key = crate::agui_session::thread_session_key(thread);
+            assert!(key.starts_with("agui-"), "prefix required; got {key}");
+            assert!(!key.contains('/'), "no path separators; got {key}");
+            assert!(!key.contains(".."), "no traversal sequences; got {key}");
+            assert!(!key.starts_with('.'), "no hidden dirs; got {key}");
+            assert!(!key.is_empty());
+        }
+    }
+
+    #[test]
+    fn distinct_thread_ids_never_share_a_session_directory() {
+        // The exact collision pair from the issue report: under the old
+        // sanitiser both mapped to "tenantA-user1-conv1".
+        let a = crate::agui_session::thread_session_key("tenantA/user1/conv1");
+        let b = crate::agui_session::thread_session_key("tenantA/user1-conv1");
+        assert_ne!(a, b, "distinct (tenant, user, conv) ids must not collide");
+    }
+
     // ── converter ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1717,6 +1834,10 @@ mod tests {
             interrupt_before,
             client_tools,
             model: "mock".into(),
+            wall_timeout_secs: 0,
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-test-{}", std::process::id())),
+            )),
         }
     }
 
@@ -1826,6 +1947,26 @@ mod tests {
         assert!(
             transcript.iter().any(|m| m.content == "prior turn"),
             "seed transcript must be present, got {transcript:?}"
+        );
+    }
+
+    /// Goal 399: the wall-clock budget fed via `AguiRuntimeDeps` must reach
+    /// the kernel — the review regression was `build_agui_runtime` dropping
+    /// main's `.wall_timeout_secs(state.config.wall_timeout_secs)` so
+    /// `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` stopped capping AG-UI runs.
+    #[test]
+    fn build_agui_runtime_applies_wall_timeout_to_kernel() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut deps = runtime_deps(ToolRegistry::local(), &[], &[]);
+        deps.wall_timeout_secs = 4242;
+        let (runtime, _) = build_agui_runtime(ws.path(), "t-wall", deps).expect("runtime builds");
+        // `AgentKernel.wall_timeout_secs` is `pub(crate)` — this unit test
+        // sits inside the crate, so the direct read is the honest pin.
+        assert_eq!(
+            runtime.kernel().wall_timeout_secs,
+            4242,
+            "wall-clock budget must reach the kernel, got {}",
+            runtime.kernel().wall_timeout_secs
         );
     }
 }

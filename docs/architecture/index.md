@@ -51,4 +51,5 @@ drill into what you need.
 
 * [Skills System](skills.md) - skill discovery, injection modes, SKILL.md format
 * [Sessions](sessions.md) - session persistence, transcript JSONL, lifecycle
+* [AG-UI](agui.md) - frontend protocol layer: protocol/client crates, transport-free server session layer, thin HTTP adapter
 * [Invariants](invariants.md) - the eight invariants every change must respect

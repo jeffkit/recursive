@@ -45,6 +45,18 @@ flow-v2 test updates, `manual-20261002-skillsource-trait.md`.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
 - `cargo fmt --all -- --check` — clean (post-merge autofix committed separately).
 
+**CORRECTION (NEEDS_FIX round 2, 2026-10-02):** the numbers above were green
+but the suite *set* was silently thinner than main's: the merge had dropped
+main's 39-test `handlers.rs` test module, keeping only 13 in `agui.rs`
+(#66 anti-double-render/cancel tests, `agui_run_respects_run_semaphore`,
+the #62 through-HTTP regression, `parse_permission_mode_all_variants`,
+`sse_message_from_canonical_*`, `format_timestamp_*`, `tool_progress_*`,
+and several handler tests had no equivalent anywhere). Round 2 restored them
+(32 in `handlers.rs::tests`, 18 in `agui.rs`) and fixed the two behaviour
+regressions this merge also introduced (`/agui` wall-clock budget dropped
+from the `build_agui_runtime` chain; resume state machine ran before the
+per-thread fence). Details in `manual-20261002-agui-server-layer.md`.
+
 ## Verification of "no phantom deletions"
 
 - `pub trait SkillSource` present at `src/skills.rs:217`; `LoadSkill::from_source`
