@@ -1,6 +1,5 @@
 //! HTTP handler functions for the agent API.
 
-use async_trait::async_trait;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -80,10 +79,16 @@ pub(super) fn inject_environment_segment(
 }
 
 /// Goal-393: the one place where HTTP session runtimes get built. Every
-/// build point (`POST /run`, `POST /sessions`, session fork, `/agui`) goes
+/// build point (`POST /run`, `POST /sessions`, session fork) goes
 /// through here so the channels cannot drift apart — the compactor /
 /// microcompactor / transcript-cap assembly comes from the same
 /// frontend-neutral helper the CLI uses (`apply_context_management`).
+///
+/// `/agui` builds through [`build_session_runtime_parts`] (same context
+/// management); the provider / wall-timeout / storage / streaming setters
+/// are layered on in `super::agui::build_agui_runtime` — fed from
+/// `AppState` here, so every channel stays on the same budget. Its runtime
+/// assembly lives in `super::agui`, away from the axum types.
 ///
 /// Callers add what is genuinely request-specific on top of the returned
 /// builder (`seed_transcript` for `/agui` resume, then `build()`).
@@ -95,27 +100,75 @@ fn build_session_runtime(
     max_steps: usize,
 ) -> AgentRuntimeBuilder {
     crate::runtime::apply_context_management(
-        AgentRuntimeBuilder::new()
-            .llm(state.provider.clone())
-            .tools(tool_registry)
-            .system_prompt(system_prompt)
-            .prompt_segments(prompt_segments)
-            .max_steps(max_steps)
-            // Goal 399: safe wall-clock budget for HTTP sessions
-            // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
-            // into state.config at server startup). Exceeding it finishes
-            // with WallClockExceeded.
-            .wall_timeout_secs(state.config.wall_timeout_secs)
-            // Goal 396: the host layer persists this session's transcript
-            // through the same storage backend on teardown (DELETE / idle
-            // eviction / graceful shutdown) — not per turn.
-            .storage(state.storage.clone()),
+        build_session_runtime_parts(
+            tool_registry,
+            system_prompt,
+            prompt_segments,
+            max_steps,
+            &state.config.model,
+        )
+        .llm(state.provider.clone())
+        // Goal 399: safe wall-clock budget for HTTP sessions
+        // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
+        // into state.config at server startup). Exceeding it finishes
+        // with WallClockExceeded.
+        .wall_timeout_secs(state.config.wall_timeout_secs)
+        // Goal 396: the host layer persists this session's transcript
+        // through the same storage backend on teardown (DELETE / idle
+        // eviction / graceful shutdown) — not per turn.
+        .storage(state.storage.clone())
+        // Issue #66 §3.2: token-level streaming for every HTTP entry
+        // point (/sessions, /runs, /agui). RunCore only builds the
+        // partial-token forwarder when `streaming` is set, so before
+        // this an AG-UI answer arrived as ONE TextMessageContent frame
+        // and `/sessions/:id/events` never emitted `partial_message`.
+        // Consumers are ready: the AguiConverter frames PartialToken
+        // deltas into TextMessageStart/Content/End, and both SDKs treat
+        // `partial_message`/`stream_event` as fire-hose-only — their
+        // final result still aggregates from the complete `message`
+        // events.
+        .streaming(true),
         &state.config,
     )
 }
 
+/// Provider-agnostic core of [`build_session_runtime`]: context management
+/// only. The AG-UI layer (`super::agui::build_agui_runtime`) layers the
+/// provider and wall-clock budget on top, keeping its runtime build free of
+/// `AppState`.
+pub(super) fn build_session_runtime_parts(
+    tool_registry: ToolRegistry,
+    system_prompt: String,
+    prompt_segments: crate::system_prompt::PromptSegments,
+    max_steps: usize,
+    model: &str,
+) -> AgentRuntimeBuilder {
+    // `apply_context_management` only reads `config.model` (auto compaction
+    // thresholds); a minimal stub carrying exactly that model keeps the
+    // AG-UI build path independent of `AppState` while producing thresholds
+    // identical to `/run` and `/sessions` — they all pass the SAME model
+    // (`state.config.model`) in, so the channels cannot drift apart.
+    let config = crate::config::Config {
+        workspace: std::path::PathBuf::from("."),
+        model: model.to_string(),
+        ..crate::http::test_config_stub()
+    };
+    crate::runtime::apply_context_management(
+        AgentRuntimeBuilder::new()
+            .tools(tool_registry)
+            .system_prompt(system_prompt)
+            .prompt_segments(prompt_segments)
+            .max_steps(max_steps),
+        &config,
+    )
+}
+
 /// Update metrics after a successful agent run.
-fn record_run_success(metrics: &super::Metrics, steps: usize, usage: &crate::llm::TokenUsage) {
+pub(super) fn record_run_success(
+    metrics: &super::Metrics,
+    steps: usize,
+    usage: &crate::llm::TokenUsage,
+) {
     metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
     metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
     metrics
@@ -130,7 +183,7 @@ fn record_run_success(metrics: &super::Metrics, steps: usize, usage: &crate::llm
 }
 
 /// Update metrics after a failed agent run.
-fn record_run_failed(metrics: &super::Metrics) {
+pub(super) fn record_run_failed(metrics: &super::Metrics) {
     metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
 }
@@ -1330,235 +1383,15 @@ fn sse_message_from_canonical(msg: &crate::message::Message) -> Option<SseEvent>
     })
 }
 
-// ── AG-UI endpoint ───────────────────────────────────────────────────────
-
-/// State machine that the AG-UI converter uses to coordinate
-/// `TextMessageStart/Content/End` framing across multiple AgentEvents.
-///
-/// We open a TextMessage on the first `AssistantText`/`PartialToken` we see
-/// after every "neutral" point (run start, after `TextMessageEnd`, after
-/// tool-call events) and close it explicitly when we emit a fully-formed
-/// `AssistantText`, when a `ToolCall` arrives, or when the run finishes.
-#[derive(Default)]
-struct AguiConverter {
-    /// `Some(message_id)` when a TextMessageStart has been emitted but no
-    /// TextMessageEnd yet. Used as the `messageId` for streaming
-    /// `PartialToken` deltas and as the `parentMessageId` for tool calls.
-    open_message_id: Option<String>,
-    /// Last fully-emitted (or currently-open) assistant message id. Used as
-    /// the `parent_message_id` on ToolCallStart even after the message has
-    /// been closed, so a client can attribute the tool call back to the
-    /// triggering assistant turn.
-    last_assistant_message_id: Option<String>,
-}
-
-impl AguiConverter {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Translate one [`AgentEvent`] into zero or more AG-UI events,
-    /// updating internal framing state as a side effect.
-    fn convert(&mut self, ev: &AgentEvent) -> Vec<agui_protocol::Event> {
-        use agui_protocol as ag;
-        let mut out = Vec::new();
-        match ev {
-            AgentEvent::AssistantText { text, .. } => {
-                // Close any in-flight streamed message first.
-                if let Some(id) = self.open_message_id.take() {
-                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                        message_id: id,
-                        base: ag::BaseEvent::default(),
-                    }));
-                }
-                let id = uuid::Uuid::new_v4().to_string();
-                out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
-                    message_id: id.clone(),
-                    role: Some("assistant".into()),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
-                    message_id: id.clone(),
-                    delta: text.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                    message_id: id.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                self.last_assistant_message_id = Some(id);
-                self.open_message_id = None;
-            }
-            AgentEvent::PartialToken { text, .. } => {
-                let id = if let Some(id) = self.open_message_id.clone() {
-                    id
-                } else {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    out.push(ag::Event::TextMessageStart(ag::TextMessageStart {
-                        message_id: id.clone(),
-                        role: Some("assistant".into()),
-                        base: ag::BaseEvent::default(),
-                    }));
-                    self.open_message_id = Some(id.clone());
-                    self.last_assistant_message_id = Some(id.clone());
-                    id
-                };
-                out.push(ag::Event::TextMessageContent(ag::TextMessageContent {
-                    message_id: id,
-                    delta: text.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            AgentEvent::ToolCall {
-                id,
-                name,
-                arguments,
-                ..
-            } => {
-                // Close any in-flight streamed assistant message first; the
-                // assistant turn is "done" the moment a tool call lands.
-                if let Some(open) = self.open_message_id.take() {
-                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                        message_id: open,
-                        base: ag::BaseEvent::default(),
-                    }));
-                }
-                out.push(ag::Event::ToolCallStart(ag::ToolCallStart {
-                    tool_call_id: id.clone(),
-                    tool_call_name: name.clone(),
-                    parent_message_id: self.last_assistant_message_id.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::ToolCallArgs(ag::ToolCallArgs {
-                    tool_call_id: id.clone(),
-                    delta: arguments.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-                out.push(ag::Event::ToolCallEnd(ag::ToolCallEnd {
-                    tool_call_id: id.clone(),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            AgentEvent::ToolResult { id, output, .. } => {
-                // AG-UI requires a `messageId` on ToolCallResult; reuse the
-                // most recent assistant message id as the conversational
-                // anchor (mirrors what OpenAI's tool message shape does).
-                let message_id = self
-                    .last_assistant_message_id
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                out.push(ag::Event::ToolCallResult(ag::ToolCallResult {
-                    tool_call_id: id.clone(),
-                    message_id,
-                    content: output.clone(),
-                    role: Some("tool".into()),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            AgentEvent::TurnFinished { .. } => {
-                // Close any in-flight streamed message before signalling
-                // run completion to the client.
-                if let Some(open) = self.open_message_id.take() {
-                    out.push(ag::Event::TextMessageEnd(ag::TextMessageEnd {
-                        message_id: open,
-                        base: ag::BaseEvent::default(),
-                    }));
-                }
-                // Actual RunFinished is emitted by the caller (it knows
-                // the thread/run ids); we just flush state here.
-            }
-            // Hook lifecycle events: forward as Custom so AG-UI clients can
-            // render hook progress and system messages in real time.
-            AgentEvent::HookStarted {
-                hook_event,
-                hook_name,
-                status_message,
-                ..
-            } => {
-                out.push(ag::Event::Custom(ag::Custom {
-                    name: "agui-tui/hook_started".into(),
-                    value: serde_json::json!({
-                        "hookEvent": hook_event,
-                        "hookName": hook_name,
-                        "statusMessage": status_message,
-                    }),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            AgentEvent::HookProgress {
-                hook_event,
-                hook_name,
-                last_line,
-                ..
-            } => {
-                out.push(ag::Event::Custom(ag::Custom {
-                    name: "agui-tui/hook_progress".into(),
-                    value: serde_json::json!({
-                        "hookEvent": hook_event,
-                        "hookName": hook_name,
-                        "lastLine": last_line,
-                    }),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            AgentEvent::HookFinished {
-                hook_event,
-                hook_name,
-                outcome,
-                duration_ms,
-                ..
-            } => {
-                out.push(ag::Event::Custom(ag::Custom {
-                    name: "agui-tui/hook_finished".into(),
-                    value: serde_json::json!({
-                        "hookEvent": hook_event,
-                        "hookName": hook_name,
-                        "outcome": outcome,
-                        "durationMs": duration_ms,
-                    }),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            AgentEvent::HookSystemMessage { text, .. } => {
-                out.push(ag::Event::Custom(ag::Custom {
-                    name: "agui-tui/hook_system_message".into(),
-                    value: serde_json::json!({ "text": text }),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            // Task checklist updates: forward so clients can render live todo state.
-            AgentEvent::TodoUpdated { todos, .. } => {
-                out.push(ag::Event::Custom(ag::Custom {
-                    name: "agui-tui/todo_updated".into(),
-                    value: serde_json::json!({ "todos": todos }),
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-            // checkpoint_post is emitted directly by the driver task (not via
-            // AguiConverter) after RunFinished so it lands last.
-            // heartbeat is emitted as an SSE comment at the HTTP layer.
-            // permission_request and file_artifact require new AgentEvent variants
-            // (tracked as g141/g140) before they can be mapped here.
-            // Other variants (Latency, Usage, Compacted, PlanProposed,
-            // PlanConfirmed, PlanRejected, etc.) have no AG-UI standard
-            // equivalent and are intentionally dropped.
-            _ => {}
-        }
-        out
-    }
-}
-
-/// Stateless wrapper: maps a single [`AgentEvent`] to AG-UI events
-/// using a fresh converter. Useful in tests; production code uses
-/// [`AguiConverter::convert`] directly so framing state survives
-/// across the whole run.
-#[cfg(test)]
-fn agui_events_for(ev: &AgentEvent) -> Vec<agui_protocol::Event> {
-    AguiConverter::new().convert(ev)
-}
-
 /// POST /agui — drive an agent run via the AG-UI protocol and stream
 /// AG-UI events back as SSE.
+///
+/// Thin HTTP adapter (Issue #56): parse the JSON body, map transport-free
+/// prepare/admission errors onto status codes, assemble the request-specific
+/// inputs, then hand off to `super::agui` (`build_agui_runtime` +
+/// `spawn_agui_run`) and frame the resulting event stream as SSE. All
+/// session / persistence / protocol state machine logic lives in
+/// `super::agui` and is unit-tested there without an HTTP server.
 pub(super) async fn agui_run(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -1581,218 +1414,45 @@ pub(super) async fn agui_run(
         )
     })?;
 
-    // ── Resume handling ──────────────────────────────────────────────────
-    // If `input.resume` is present and non-empty, process the interrupt
-    // resolutions before building the runtime.
-    let resume_items: Vec<ag::Resume> = input.resume.unwrap_or_default();
-
-    // Derive the user goal: prefer the last user message, else fall back
-    // to the first context item value. Resume turns must NOT re-append the
-    // original user message (the seeded transcript already contains it plus
-    // the injected tool result; a duplicate makes the model re-issue the
-    // same tool call), so a neutral continuation directive is used instead.
-    let goal = if resume_items.is_empty() {
-        input
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| m.content.clone())
-            .or_else(|| input.context.first().map(|c| c.value.clone()))
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        status: "error".into(),
-                        error: "RunAgentInput must contain at least one user \
-                                message or a non-empty context item"
-                            .into(),
-                    }),
-                )
-            })?
-    } else {
-        "[frontend tool result received] 客户端工具结果已注入对话，请基于该结果继续回答用户最初的问题。".to_string()
-    };
-    let mut seed_transcript: Option<Vec<crate::message::Message>> = None;
-
-    if resume_items.is_empty() {
-        // Issue #62: standard AG-UI clients resend the FULL `messages`
-        // array every turn and expect the agent to see the whole history.
-        // Seed it so multi-turn context works without tool side effects.
-        // (Tool-related messages are skipped inside — invariant #8.)
-        // The LAST user message is dropped from the seed: it becomes the
-        // `goal` and `runtime.run()` re-appends it as a fresh user turn —
-        // seeding it too would duplicate it (the resume branch notes a
-        // duplicate makes the model re-issue the same request).
-        let goal_user_idx = input.messages.iter().rposition(|m| {
-            m.role == "user" && m.content.as_deref().is_some_and(|c| !c.trim().is_empty())
-        });
-        let seeded = input
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| Some(*i) != goal_user_idx)
-            .map(|(_, m)| m)
-            .collect::<Vec<_>>();
-        let seeded = agui_seed_from_messages(&seeded);
-        if !seeded.is_empty() {
-            seed_transcript = Some(seeded);
-        }
-    }
-
-    if !resume_items.is_empty() {
-        let session_dir =
-            agui_session_dir(&state.config.workspace, &input.thread_id).ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        status: "error".into(),
-                        error: "cannot resolve session directory for resume".into(),
-                    }),
-                )
-            })?;
-
-        if !session_dir.join("transcript.jsonl").is_file() {
-            return Err((
-                StatusCode::BAD_REQUEST,
+    // ── Per-thread run fence (issue #57 §④) ─────────────────────────────
+    // At most one in-flight run per thread. Mobile retries / double
+    // submits used to run two drivers concurrently against one transcript
+    // (measured lost-update); refuse the second run instead of queueing
+    // it — a queued duplicate would run the same prompt twice. The guard
+    // is released when the driver task finishes (or on unwind).
+    //
+    // Ordering invariant (restored from main's monolith): the fence MUST
+    // close BEFORE `prepare_run` touches disk. The resume branch of
+    // `prepare_run` rewrites the persisted transcript
+    // (`apply_resume_tool_results`) and consumes the open-interrupt store
+    // (`clear_open_interrupts`); fencing first means a duplicate POST that
+    // races the tail of an in-flight run is refused with 409 while the
+    // thread's on-disk state is still untouched — not after its resume
+    // payload was already spliced in and the interrupts cleared.
+    let run_guard = state
+        .host
+        .try_begin_run(crate::agui_session::thread_session_key(&input.thread_id))
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
                 Json(ErrorResponse {
                     status: "error".into(),
                     error: format!(
-                        "no prior run found for thread '{}'; cannot resume",
+                        "a run is already active for thread '{}'; \
+                         wait for it to finish before starting another",
                         input.thread_id
                     ),
                 }),
-            ));
-        }
+            )
+        })?;
 
-        // Load open interrupts from session metadata.
-        let open_interrupts = load_open_interrupts(&session_dir);
-        if open_interrupts.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    status: "error".into(),
-                    error: format!(
-                        "thread '{}' has no open interrupts; nothing to resume",
-                        input.thread_id
-                    ),
-                }),
-            ));
-        }
-
-        // Spec rule 3: a single resume must address EVERY open interrupt.
-        let resume_ids: std::collections::HashSet<String> = resume_items
-            .iter()
-            .map(|r| r.interrupt_id.clone())
-            .collect();
-        for open_int in &open_interrupts {
-            if !resume_ids.contains(&open_int.interrupt_id) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        status: "error".into(),
-                        error: format!(
-                            "resume must cover all open interrupts; missing '{}'",
-                            open_int.interrupt_id
-                        ),
-                    }),
-                ));
-            }
-        }
-
-        // Load the transcript from the session. The AG-UI run persists one
-        // `Message` JSON per line (see the write side in the driver task).
-        let transcript_path = session_dir.join("transcript.jsonl");
-        let loaded_messages: Vec<crate::message::Message> =
-            std::fs::read_to_string(&transcript_path)
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            status: "error".into(),
-                            error: format!("failed to load session transcript: {e}"),
-                        }),
-                    )
-                })?
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-
-        // Build an index of resume items by interrupt_id.
-        let resume_by_id: std::collections::HashMap<&str, &ag::Resume> = resume_items
-            .iter()
-            .map(|r| (r.interrupt_id.as_str(), r))
-            .collect();
-
-        // For each resolved interrupt, find the matching tool result in the
-        // transcript and replace/inject the content. The tool was denied by
-        // the TestInterruptHook, so we look for the tool result whose
-        // `tool_call_id` matches the interrupt's bound tool_call_id.
-        let mut modified = loaded_messages;
-        for open_int in &open_interrupts {
-            let Some(resume) = resume_by_id.get(open_int.interrupt_id.as_str()) else {
-                continue;
-            };
-            let tool_call_id = &open_int.tool_call_id;
-
-            if resume.status == ag::ResumeStatus::Cancelled {
-                // For cancelled interrupts, inject a sentinel tool result.
-                let sentinel = crate::message::Message::tool_result(
-                    tool_call_id,
-                    "[interrupt cancelled by user]",
-                );
-                modified.push(sentinel);
-            } else if let Some(ref payload) = resume.payload {
-                // Resolved: replace the denied tool result content with the
-                // resume payload, or inject a new tool result if none exists.
-                let payload_str = serde_json::to_string(payload).unwrap_or_default();
-                let replaced = modified.iter_mut().any(|msg| {
-                    if msg.tool_call_id.as_deref() == Some(tool_call_id.as_str()) {
-                        msg.content = payload_str.clone();
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if !replaced {
-                    // No existing tool result found — inject one.
-                    modified.push(crate::message::Message::tool_result(
-                        tool_call_id,
-                        &payload_str,
-                    ));
-                }
-            }
-        }
-
-        // Clear the open interrupts now that they've been consumed.
-        clear_open_interrupts(&session_dir);
-
-        seed_transcript = Some(modified);
-    }
-
-    // ── Interrupt-before check (spec rule 4) ────────────────────────────
-    // If the thread has open interrupts and no resume is provided, reject.
-    if resume_items.is_empty() {
-        if let Some(session_dir) = agui_session_dir(&state.config.workspace, &input.thread_id) {
-            let open = load_open_interrupts(&session_dir);
-            if !open.is_empty() {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        status: "error".into(),
-                        error: format!(
-                            "thread '{}' has {} open interrupt(s); \
-                             must provide resume to continue",
-                            input.thread_id,
-                            open.len()
-                        ),
-                    }),
-                ));
-            }
-        }
-    }
+    // ── Transport-free prepare: resume/interrupt state machine ─────────
+    // (Runs after the fence above — see the ordering invariant there.)
+    let prepared = super::agui::prepare_run(super::agui::AguiRunInput {
+        workspace: &state.config.workspace,
+        input: &input,
+    })
+    .map_err(agui_prepare_error_response)?;
 
     // Acquire a semaphore permit to limit concurrent runs.
     // Goal-H J2: /agui stays on the never-wait contract (`try_acquire_run`),
@@ -1800,7 +1460,11 @@ pub(super) async fn agui_run(
     // awaiting indefinitely, which would hang every /agui request when the
     // pool is full). Goal 398 routes it through the same admission gate as
     // the REST endpoints; only the waiting policy differs (none).
-    let _permit = state.host.admission().try_acquire_run().map_err(|_| {
+    // Issue #66: the permit now moves into the driver task — the run keeps
+    // its admission slot (and `runs_in_flight` stays truthful) until the run
+    // actually finishes, instead of releasing it when the handler returns
+    // while the agent keeps running in the background.
+    let permit = state.host.admission().try_acquire_run().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -1818,28 +1482,8 @@ pub(super) async fn agui_run(
         &state.skills,
         state.config.subagent_enabled,
     );
-    let system_prompt = assembled_system_prompt.full;
-    let prompt_segments = assembled_system_prompt.segments;
 
-    // If interrupt_before is set, install a test-only permission hook on a
-    // clone of the registry so matching tools are denied. The driver task
-    // later checks if any tool was denied and emits an interrupt RunFinished.
-    let interrupt_hook: Option<Arc<TestInterruptHook>> =
-        input.interrupt_before.as_ref().map(|names| {
-            Arc::new(TestInterruptHook {
-                interrupt_before: names.clone(),
-                interrupted_tool_call_id: std::sync::Mutex::new(None),
-                interrupted_tool_name: std::sync::Mutex::new(None),
-                interrupted_arguments: std::sync::Mutex::new(None),
-            })
-        });
-
-    // ── AG-UI client tools: register stubs + install deny hook ────────
-    let agui_tools = input.tools.clone();
-    let client_tool_names: std::collections::HashSet<String> =
-        agui_tools.iter().map(|t| t.name.clone()).collect();
-
-    let mut tool_registry = state.session_tool_registry().await.map_err(|e| {
+    let tool_registry = state.session_tool_registry().await.map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -1848,49 +1492,25 @@ pub(super) async fn agui_run(
             }),
         )
     })?;
-    for t in &agui_tools {
-        tool_registry = tool_registry.register(Arc::new(ClientToolStub {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            parameters: t.parameters.clone(),
-        }));
-    }
 
-    // Client tools take the permission-hook slot; `interrupt_before` is a
-    // test-only facility and is ignored when client tools are present.
-    let client_hook: Option<Arc<ClientToolHook>> = if client_tool_names.is_empty() {
-        None
-    } else {
-        Some(Arc::new(ClientToolHook {
-            names: client_tool_names,
-            denied: std::sync::Mutex::new(None),
-        }))
-    };
-    if let Some(ref client_hook_ref) = client_hook {
-        let hook: Arc<ClientToolHook> = client_hook_ref.clone();
-        tool_registry.set_permission_hook(hook);
-    }
-    if client_hook.is_none() {
-        if let Some(ref test_hook_ref) = interrupt_hook {
-            let hook: Arc<TestInterruptHook> = test_hook_ref.clone();
-            tool_registry.set_permission_hook(hook);
-        }
-    }
-
-    let mut runtime_builder = build_session_runtime(
-        &state,
-        tool_registry,
-        system_prompt,
-        prompt_segments,
-        state.config.max_steps,
-    );
-
-    // Seed the transcript if we're resuming.
-    if let Some(seed) = seed_transcript {
-        runtime_builder = runtime_builder.seed_transcript(seed);
-    }
-
-    let mut runtime = runtime_builder.build().map_err(|e| {
+    let (runtime, hooks) = super::agui::build_agui_runtime(
+        &state.config.workspace,
+        &input.thread_id,
+        super::agui::AguiRuntimeDeps {
+            llm: state.provider.clone(),
+            tool_registry,
+            system_prompt: assembled_system_prompt.full,
+            prompt_segments: assembled_system_prompt.segments,
+            max_steps: state.config.max_steps,
+            seed_transcript: prepared.seed_transcript,
+            interrupt_before: input.interrupt_before.as_deref().unwrap_or(&[]),
+            client_tools: &input.tools,
+            model: state.config.model.clone(),
+            wall_timeout_secs: state.config.wall_timeout_secs,
+            storage: state.storage.clone(),
+        },
+    )
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1900,570 +1520,156 @@ pub(super) async fn agui_run(
         )
     })?;
 
-    // Route the permission hook into the runtime's TurnContext: client
-    // tools must be denied at dispatch so they surface as interrupts.
-    if let Some(ref hook) = client_hook {
-        runtime.set_permission_hook(hook.clone());
-    } else if let Some(ref hook) = interrupt_hook {
-        runtime.set_permission_hook(hook.clone());
-    }
-
-    // Wire per-turn workspace checkpoints. The AG-UI thread is the
-    // natural session boundary, so we use a sanitised version of the
-    // thread_id as the checkpoint chain id. Failures (no git on PATH,
-    // bad workspace path, etc.) only log a warning — the run still
-    // proceeds without checkpoints.
-    if let Ok(repo) = crate::ShadowRepo::open(&state.config.workspace) {
-        let session_id = sanitize_thread_id_for_session(&input.thread_id);
-        if let Ok(session_dir) = crate::user_sessions_dir(&state.config.workspace) {
-            let log_dir = session_dir.join(format!("agui-{session_id}"));
-            let _ = std::fs::create_dir_all(&log_dir);
-            let log_path = log_dir.join("checkpoints.jsonl");
-            let touched = runtime.kernel().tools().touched_files();
-            if let Err(e) =
-                runtime.enable_checkpoints(Arc::new(repo), session_id, log_path, touched)
-            {
-                tracing::warn!("agui: enable_checkpoints failed, continuing without: {e}");
-            }
-        }
-    } else {
-        tracing::debug!("agui: shadow git unavailable, no per-turn checkpoints");
-    }
-
-    let (sink, mut event_rx) = ChannelSink::new();
-    runtime.set_event_sink(Arc::new(sink));
-
-    // Channel that carries fully-converted AG-UI Events to the SSE stream.
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<ag::Event>();
-    let thread_id = input.thread_id.clone();
-    let run_id = input.run_id.clone();
-
-    // Emit RunStarted up front so clients can render the run shell
-    // before the first model token arrives.
-    let _ = sse_tx.send(ag::Event::RunStarted(ag::RunStarted {
-        thread_id: thread_id.clone(),
-        run_id: run_id.clone(),
-        base: ag::BaseEvent::default(),
-    }));
-
-    // Converter task: forward AgentEvents → AG-UI Events. Owns the
-    // AguiConverter so framing state survives across the whole run.
-    // It does NOT emit RunFinished — the driver task does that after
-    // it can also surface the optional checkpoint_post Custom event.
-    let conv_tx = sse_tx.clone();
-    let converter_handle = tokio::spawn(async move {
-        let mut conv = AguiConverter::new();
-        while let Some(agent_event) = event_rx.recv().await {
-            for ev in conv.convert(&agent_event) {
-                if conv_tx.send(ev).is_err() {
-                    return;
-                }
-            }
-        }
-    });
-
-    // Drive the agent on a background task so the response stream can
-    // flush bytes to the client incrementally. Order of events emitted
-    // by the driver after run() returns:
-    //   1. Wait for the converter to drain all AgentEvents.
-    //   2. If a checkpoint id was produced, emit
-    //      Custom("agui-tui/checkpoint_post").
-    //   3. Emit RunFinished — always last.
-    let metrics = state.metrics.clone();
-    // Capture the thread/run ids and interrupt hook for the driver task.
-    let drv_thread = thread_id.clone();
-    let drv_run = run_id.clone();
-    let drv_interrupt_hook = interrupt_hook.clone();
-    let drv_client_hook = client_hook.clone();
-    let drv_client_tools = agui_tools.clone();
-    let drv_workspace = state.config.workspace.clone();
-
-    let driver_handle = tokio::spawn(async move {
-        let outcome = runtime.run(&goal).await;
-
-        // Locate the interrupted tool call after the run:
-        // - test hook: transcript contains the fixed deny marker
-        // - client tools: transcript contains CLIENT_TOOL_DENY_PREFIX
-        // Both markers land in the Tool-role message that the registry
-        // writes for a denied call, and carry the real tool_call_id.
-        let find_denied_tool_call = |transcript: &[crate::message::Message], marker: &str| {
-            transcript
-                .iter()
-                .rev()
-                .find(|msg| msg.role == crate::message::Role::Tool && msg.content.contains(marker))
-                .and_then(|msg| msg.tool_call_id.clone())
-        };
-
-        let client_denied: Option<(String, String)> = drv_client_hook.as_ref().and_then(|h| {
-            let guard = h.denied.lock().unwrap_or_else(|e| e.into_inner());
-            guard.clone()
-        });
-        let test_was_interrupted = drv_interrupt_hook
-            .as_ref()
-            .and_then(|hook| {
-                hook.interrupted_tool_name
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()
-            })
-            .is_some();
-        // Replace the sink so the converter task's recv() sees a closed
-        // channel and exits cleanly.
-        runtime.set_event_sink(Arc::new(NullSink));
-
-        // Snapshot what we need from the outcome before metrics consume it.
-        let (checkpoint_id, finished_turn): (Option<String>, Option<usize>) = match &outcome {
-            Ok(o) => (
-                o.checkpoint_id.as_ref().map(|c| c.0.clone()),
-                runtime.turn_index().checked_sub(1),
-            ),
-            Err(_) => (None, None),
-        };
-
-        match &outcome {
-            Ok(o) => record_run_success(&metrics, o.steps, &o.total_usage),
-            Err(_) => record_run_failed(&metrics),
-        }
-
-        // Persist the transcript so a later `resume` (client-tool result
-        // round-trip) can load and seed it. Format: one Message JSON per
-        // line — the resume loader reads the same shape.
-        if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
-            let _ = std::fs::create_dir_all(&session_dir);
-            let mut lines = String::new();
-            for m in runtime.transcript() {
-                if let Ok(v) = serde_json::to_string(m) {
-                    lines.push_str(&v);
-                    lines.push('\n');
-                }
-            }
-            let path = session_dir.join("transcript.jsonl");
-            if let Err(e) = std::fs::write(&path, lines) {
-                tracing::warn!("agui: transcript persist failed: {e}");
-            }
-        }
-
-        // Interrupt details for whichever mechanism fired. `parameters`
-        // carries the client tool's input schema so the frontend knows how
-        // to execute it; `args` echoes the model's arguments.
-        let interrupt_details: Option<AguiInterruptDetail> =
-            if let Some((name, args)) = client_denied {
-                let transcript = runtime.transcript();
-                find_denied_tool_call(transcript, CLIENT_TOOL_DENY_PREFIX).map(|tc_id| {
-                    let parameters = drv_client_tools
-                        .iter()
-                        .find(|t| t.name == name)
-                        .map(|t| t.parameters.clone())
-                        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
-                    AguiInterruptDetail::Client {
-                        tool_call_id: tc_id,
-                        tool_name: name,
-                        parameters,
-                        args: serde_json::Value::String(args),
-                    }
-                })
-            } else if test_was_interrupted {
-                let transcript = runtime.transcript();
-                let denied_tool_name = drv_interrupt_hook.as_ref().and_then(|h| {
-                    h.interrupted_tool_name
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                });
-                find_denied_tool_call(transcript, "test interrupt trigger").map(|tc_id| {
-                    AguiInterruptDetail::Test {
-                        tool_call_id: tc_id,
-                        tool_name: denied_tool_name.unwrap_or_else(|| "unknown".into()),
-                    }
-                })
-            } else {
-                None
-            };
-
-        // Wait for the converter task to translate the last AgentEvent
-        // before we emit anything else, so checkpoint_post and
-        // RunFinished are guaranteed to arrive last.
-        let _ = converter_handle.await;
-
-        // Issue #31 §B: the AG-UI run's environment dies with the run —
-        // on success AND error (the outcome match above already recorded
-        // metrics; teardown is unconditional here, before RunFinished is
-        // emitted, so the SSE stream stays the last observer).
-        runtime.destroy_environment().await;
-
-        if let (Some(cp), Some(turn)) = (checkpoint_id, finished_turn) {
-            let _ = sse_tx.send(ag::Event::Custom(ag::Custom {
-                name: "agui-tui/checkpoint_post".into(),
-                value: serde_json::json!({
-                    "turn": turn,
-                    "postId": cp,
-                }),
-                base: ag::BaseEvent::default(),
-            }));
-        }
-
-        // Emit RunFinished — with Interrupt outcome if a test trigger or a
-        // client-tool call fired.
-        if let Some(detail) = interrupt_details {
-            let (tc_id, _tc_name, response_schema, metadata, message) = match detail {
-                AguiInterruptDetail::Test {
-                    tool_call_id,
-                    tool_name,
-                } => (
-                    tool_call_id,
-                    tool_name.clone(),
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": { "approved": { "type": "boolean" } }
-                    }),
-                    serde_json::json!({ "testTrigger": true, "toolName": tool_name }),
-                    format!("Test interrupt: tool '{tool_name}' needs user input to proceed"),
-                ),
-                AguiInterruptDetail::Client {
-                    tool_call_id,
-                    tool_name,
-                    parameters,
-                    args,
-                } => (
-                    tool_call_id,
-                    tool_name.clone(),
-                    parameters,
-                    serde_json::json!({ "frontendTool": true, "toolName": tool_name, "args": args }),
-                    format!("Frontend tool '{tool_name}' needs client execution to proceed"),
-                ),
-            };
-            let tool_call_id = tc_id.clone();
-            let interrupt_message = message.clone();
-
-            // Build the interrupt and persist it.
-            let interrupt_id = uuid::Uuid::new_v4().to_string();
-            let open_interrupt = OpenInterrupt {
-                interrupt_id: interrupt_id.clone(),
-                tool_call_id: tool_call_id.clone(),
-                reason: "tool_call".into(),
-                message: Some(interrupt_message.clone()),
-                created_at: crate::session::chrono_lite_now(),
-            };
-
-            // Persist before emitting (crash safety).
-            if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
-                let _ = std::fs::create_dir_all(&session_dir);
-                save_open_interrupts(&session_dir, std::slice::from_ref(&open_interrupt));
-
-                // Emit StateSnapshot and MessagesSnapshot before RunFinished
-                // per spec requirement (snapshots must precede the interrupting
-                // RunFinished event).
-                if let Ok(state_val) = serde_json::to_value(runtime.transcript()) {
-                    let _ = sse_tx.send(ag::Event::StateSnapshot(ag::StateSnapshot {
-                        snapshot: state_val,
-                        base: ag::BaseEvent::default(),
-                    }));
-                }
-                let messages_json: Vec<serde_json::Value> = runtime
-                    .transcript()
-                    .iter()
-                    .filter_map(|m| serde_json::to_value(m).ok())
-                    .collect();
-                let _ = sse_tx.send(ag::Event::MessagesSnapshot(ag::MessagesSnapshot {
-                    messages: messages_json,
-                    base: ag::BaseEvent::default(),
-                }));
-            }
-
-            let _ = sse_tx.send(ag::Event::RunFinished(ag::RunFinished {
-                thread_id: drv_thread,
-                run_id: drv_run,
-                outcome: Some(ag::RunFinishedOutcome::Interrupt {
-                    interrupts: vec![ag::Interrupt {
-                        id: interrupt_id,
-                        reason: "tool_call".into(),
-                        message: Some(interrupt_message),
-                        tool_call_id: Some(tool_call_id),
-                        response_schema: Some(response_schema),
-                        expires_at: None,
-                        metadata: Some(metadata),
-                    }],
-                }),
-                result: None,
-                base: ag::BaseEvent::default(),
-            }));
-        } else {
-            // Report the run's real outcome. When runtime.run() returned
-            // Err (LLM failure, tool failure, provider down, ...), the
-            // RunFinished must carry an Error outcome so the client can
-            // distinguish a failed run from a successful one with no
-            // result — otherwise the failure is silently swallowed at
-            // the SSE boundary. `code` is reserved for a follow-up goal
-            // that maps Error::Cancelled / RateLimited / etc. to codes.
-            let (run_outcome, result_msg) = match &outcome {
-                Ok(o) => (
-                    ag::RunFinishedOutcome::Success,
-                    o.final_text.clone().map(serde_json::Value::String),
-                ),
-                Err(e) => (
-                    ag::RunFinishedOutcome::Error {
-                        message: e.to_string(),
-                        code: None,
-                    },
-                    None,
-                ),
-            };
-            let _ = sse_tx.send(ag::Event::RunFinished(ag::RunFinished {
-                thread_id: drv_thread,
-                run_id: drv_run,
-                outcome: Some(run_outcome),
-                result: result_msg,
-                base: ag::BaseEvent::default(),
-            }));
-        }
-    });
-
-    // Monitor the driver task so panics are surfaced in logs rather than
-    // silently swallowed by the dropped JoinHandle.
-    tokio::spawn(async move {
-        if let Err(e) = driver_handle.await {
-            tracing::error!("agui: driver task panicked: {e}");
-        }
-    });
+    let run_cancel = tokio_util::sync::CancellationToken::new();
+    let sse_rx = super::agui::spawn_agui_run(
+        runtime,
+        prepared.goal,
+        super::agui::AguiRunContext {
+            thread_id: input.thread_id.clone(),
+            run_id: input.run_id.clone(),
+            client_tools: input.tools.clone(),
+            hooks,
+            workspace: state.config.workspace.clone(),
+            metrics: state.metrics.clone(),
+            model: state.config.model.clone(),
+            provider: state.config.provider_type.clone(),
+            preset: state.config.preset.clone(),
+            cancel: run_cancel.clone(),
+            permit,
+            run_guard,
+            active_runs: Arc::clone(&state.agui_active_runs),
+        },
+    );
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx).map(|ev| {
         let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
         Ok::<_, Infallible>(Event::default().data(data))
     });
 
-    Ok(Sse::new(stream))
+    // Issue #66 §3.3 (approach A, AG-UI ecosystem convention): when the
+    // client disconnects, hyper drops this response body — the wrapper's
+    // `Drop` then cancels the run token. Normal completion drops it too,
+    // but by then `runtime.run()` has returned and the token is inert.
+    //
+    // The 30s keep-alive bounds how long a disconnect can go unnoticed:
+    // hyper only notices a dead socket on a write attempt, and a silent
+    // tool-execution stretch would otherwise delay the cancel until the
+    // next event. (axum emits the idle comment itself, so the stream still
+    // ends the moment the driver drops `sse_tx` after RunFinished —
+    // unlike a merged heartbeat interval, which would never end.)
+    Ok(Sse::new(CancelOnDrop {
+        inner: stream,
+        token: Some(run_cancel),
+    })
+    .keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("heartbeat"),
+    ))
 }
 
-/// Map an arbitrary AG-UI thread id onto a checkpoint session id that
-/// satisfies `validate_session_id` in the checkpoint module
-/// (alphanumerics + `-` `_` `.`, no leading dot, no `..`, no path
-/// separators). Disallowed chars become `-`.
-fn sanitize_thread_id_for_session(thread: &str) -> String {
-    let mut out: String = thread
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
+/// SSE body wrapper that cancels an in-flight AG-UI run when the response
+/// stream is dropped (client disconnect). Issue #66 §3.3 approach A.
+struct CancelOnDrop<S> {
+    inner: S,
+    token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl<S> futures_util::Stream for CancelOnDrop<S>
+where
+    S: futures_util::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for CancelOnDrop<S> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            // Normal completion also drops the body — by then the driver has
+            // finished `runtime.run()` and the token already fired, so only a
+            // still-live token means the client actually went away.
+            if !token.is_cancelled() {
+                tracing::info!(
+                    target: "recursive::http",
+                    "agui: SSE stream dropped — cancelling in-flight run"
+                );
+                token.cancel();
             }
-        })
-        .collect();
-    // Drop a leading dot so we don't produce a hidden dir.
-    while out.starts_with('.') {
-        out.replace_range(..1, "-");
+        }
     }
-    // Collapse `..` so we don't produce ref-traversal sequences.
-    while out.contains("..") {
-        out = out.replace("..", "-.");
-    }
-    if out.is_empty() {
-        out.push_str("default");
-    }
-    out
 }
 
-/// Map AG-UI `input.messages` into a seed transcript for a NON-resume run.
+/// POST /agui/:thread_id/cancel — cancel the in-flight AG-UI run for a
+/// thread. Issue #66 §3.3 approach B (explicit endpoint fallback): stream
+/// drop (approach A) cannot fire when a network partition keeps the TCP
+/// connection half-open, so clients get a direct stop button.
 ///
-/// Standard AG-UI clients (CopilotKit, `@ag-ui/client`) send the FULL
-/// `messages` array on every turn and expect the agent to see all of it —
-/// the server keeps no other per-thread context. We map plain-text
-/// user/assistant messages verbatim. Tool-related messages (`tool`-role
-/// results, and assistant messages carrying `tool_calls`) are SKIPPED
-/// wholesale: seeding either half without its pair would orphan a tool
-/// result or a tool call and violate invariant #8 (HTTP 400 from the
-/// provider).
-fn agui_seed_from_messages(msgs: &[&agui_protocol::Message]) -> Vec<crate::message::Message> {
-    msgs.iter()
-        .filter(|m| m.tool_call_id.is_none() && m.tool_calls.is_none())
-        .filter_map(|m| {
-            let content = m.content.clone()?.trim().to_string();
-            if content.is_empty() {
-                return None;
-            }
-            match m.role.as_str() {
-                "user" => Some(crate::message::Message::user(content)),
-                "assistant" => Some(crate::message::Message::assistant(content)),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-// ── AG-UI Interrupt/Resume helpers ──────────────────────────────────────
-
-/// Path to the JSONL session directory for an AG-UI thread.
-fn agui_session_dir(workspace: &std::path::Path, thread_id: &str) -> Option<std::path::PathBuf> {
-    let session_id = sanitize_thread_id_for_session(thread_id);
-    crate::user_sessions_dir(workspace)
-        .ok()
-        .map(|d| d.join(format!("agui-{session_id}")))
-}
-
-/// Which interrupt mechanism fired during an AG-UI run.
-#[derive(Debug, Clone)]
-enum AguiInterruptDetail {
-    Test {
-        tool_call_id: String,
-        tool_name: String,
-    },
-    Client {
-        tool_call_id: String,
-        tool_name: String,
-        parameters: serde_json::Value,
-        args: serde_json::Value,
-    },
-}
-
-/// One open interrupt persisted in the session metadata.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct OpenInterrupt {
-    pub interrupt_id: String,
-    pub tool_call_id: String,
-    pub reason: String,
-    pub message: Option<String>,
-    pub created_at: String,
-}
-
-/// Load open interrupts from session metadata.
-fn load_open_interrupts(session_dir: &std::path::Path) -> Vec<OpenInterrupt> {
-    let path = session_dir.join(".interrupts.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
-    };
-    serde_json::from_slice(&bytes).unwrap_or_default()
-}
-
-/// Save open interrupts to session metadata. Written atomically before
-/// emitting RunFinished with Interrupt outcome.
-fn save_open_interrupts(session_dir: &std::path::Path, interrupts: &[OpenInterrupt]) {
-    if let Ok(json) = serde_json::to_string_pretty(interrupts) {
-        let path = session_dir.join(".interrupts.json");
-        let _ = std::fs::create_dir_all(session_dir);
-        crate::atomic::atomic_write(&path, json.as_bytes()).ok();
+/// Idempotent like `session_interrupt`: an unknown thread or an
+/// already-finished run answers `200 OK` with `"cancelled": false` —
+/// stopping something that already stopped is not an error.
+pub(super) async fn agui_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(thread_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let token = state
+        .agui_active_runs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&thread_id)
+        .cloned();
+    let cancelled = token.is_some();
+    if let Some(token) = token {
+        tracing::info!(
+            target: "recursive::http",
+            thread_id = %thread_id,
+            "agui: explicit cancel requested"
+        );
+        token.cancel();
     }
+    Json(serde_json::json!({
+        "status": "interrupted",
+        "thread_id": thread_id,
+        "cancelled": cancelled,
+    }))
 }
 
-/// Clear open interrupts (called after a successful resume that consumed
-/// all pending interrupts).
-fn clear_open_interrupts(session_dir: &std::path::Path) {
-    let path = session_dir.join(".interrupts.json");
-    let _ = std::fs::remove_file(&path);
-}
-
-/// Test-only permission hook: denies tools whose names appear in
-/// `interrupt_before`, records the first such denial as an 'interrupt'.
-/// This is the test-only trigger — the real permission_pipeline.Ask
-/// integration is g325.
-struct TestInterruptHook {
-    interrupt_before: Vec<String>,
-    /// Set to the first tool_call_id that was denied (if any).
-    interrupted_tool_call_id: std::sync::Mutex<Option<String>>,
-    /// Set to the name of the first tool that was denied.
-    interrupted_tool_name: std::sync::Mutex<Option<String>>,
-    /// Set to the arguments of the first tool that was denied.
-    interrupted_arguments: std::sync::Mutex<Option<serde_json::Value>>,
-}
-
-// ── AG-UI client tools bridge ────────────────────────────────────────
-// `RunAgentInput.tools` are frontend-owned functions (CopilotKit
-// useCopilotAction etc.). We register server-side stubs so the model can
-// call them, and a permission hook that denies the call before dispatch —
-// the deny produces an interrupt whose payload is the tool result the
-// frontend sends back via `input.resume` (docs/copilot-agent-plan.md M2-1).
-
-pub(crate) const CLIENT_TOOL_DENY_PREFIX: &str = "[frontend tool]";
-
-struct ClientToolStub {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-}
-
-#[async_trait::async_trait]
-impl crate::tools::Tool for ClientToolStub {
-    fn spec(&self) -> crate::llm::chat::ToolSpec {
-        crate::llm::chat::ToolSpec {
-            name: self.name.clone(),
-            description: self.description.clone(),
-            parameters: self.parameters.clone(),
-        }
-    }
-    async fn execute(&self, _arguments: serde_json::Value) -> crate::error::Result<String> {
-        // Defensive fallback: ClientToolHook denies client tools before
-        // dispatch, so execute() should never run.
-        Ok(format!(
-            "{} {} not executed server-side",
-            CLIENT_TOOL_DENY_PREFIX, self.name
-        ))
-    }
-}
-
-struct ClientToolHook {
-    names: std::collections::HashSet<String>,
-    /// First denied call: (tool_name, args_json). The tool_call_id is not
-    /// known at check() time; the driver locates it by scanning the
-    /// transcript for the deny-reason marker.
-    denied: std::sync::Mutex<Option<(String, String)>>,
-}
-
-#[async_trait::async_trait]
-impl crate::tools::PermissionHook for ClientToolHook {
-    async fn check(
-        &self,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> crate::agent::PermissionDecision {
-        if !self.names.contains(name) {
-            return crate::agent::PermissionDecision::Allow;
-        }
-        {
-            let mut slot = self.denied.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = Some((name.to_string(), args.to_string()));
-            }
-        }
-        crate::agent::PermissionDecision::Deny(format!(
-            "{} {} awaiting client execution",
-            CLIENT_TOOL_DENY_PREFIX, name
-        ))
-    }
-}
-
-#[async_trait::async_trait]
-#[async_trait]
-impl crate::tools::PermissionHook for TestInterruptHook {
-    async fn check(
-        &self,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> crate::agent::PermissionDecision {
-        if self
-            .interrupted_tool_call_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
-            // Already interrupted — don't deny further tools.
-            return crate::agent::PermissionDecision::Allow;
-        }
-        if self.interrupt_before.iter().any(|n| n == name) {
-            // Record the interrupt — the tool_call_id is synthetic because
-            // the actual tool_call hasn't been assigned an id yet at this
-            // point. The drive task will capture the real id from the stream.
-            *self
-                .interrupted_tool_name
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
-            *self
-                .interrupted_arguments
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(args.clone());
-            return crate::agent::PermissionDecision::Deny(
-                "test interrupt trigger — tool blocked by interrupt_before".into(),
-            );
-        }
-        crate::agent::PermissionDecision::Allow
+/// Map a transport-free [`super::agui::PrepareAguiError`] onto its HTTP
+/// status + body.
+fn agui_prepare_error_response(
+    e: super::agui::PrepareAguiError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match e {
+        super::agui::PrepareAguiError::InterruptBeforeConflict { thread_id, open } => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: format!(
+                    "thread '{thread_id}' has {open} open interrupt(s); \
+                     must provide resume to continue"
+                ),
+            }),
+        ),
+        super::agui::PrepareAguiError::BadRequest(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: msg,
+            }),
+        ),
+        super::agui::PrepareAguiError::Internal(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: msg,
+            }),
+        ),
     }
 }
 
@@ -2597,6 +1803,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let builder = build_session_runtime(
@@ -2620,20 +1827,6 @@ mod tests {
         } else {
             std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
         }
-    }
-
-    #[test]
-    fn agui_events_for_assistant_text_emits_start_content_end() {
-        use agui_protocol as ag;
-        let ev = AgentEvent::AssistantText {
-            text: "hi".into(),
-            step: 0,
-        };
-        let out = agui_events_for(&ev);
-        assert_eq!(out.len(), 3, "got {out:?}");
-        assert!(matches!(out[0], ag::Event::TextMessageStart(_)));
-        assert!(matches!(out[1], ag::Event::TextMessageContent(_)));
-        assert!(matches!(out[2], ag::Event::TextMessageEnd(_)));
     }
 
     // ── SDK Phase B: tool_progress forwarder ─────────────────────────────
@@ -2732,18 +1925,16 @@ mod tests {
     }
 
     /// Goal-268 + Goal-H J2: /agui must respect run_semaphore. The
-    /// handler uses `try_acquire_owned` (J2) so a saturated (0-
-    /// permit) semaphore returns 503 SERVICE_UNAVAILABLE
-    /// **immediately** rather than blocking forever on
-    /// `acquire_owned().await`. A 0-permit `Semaphore` is the
-    /// natural test fixture — no `close()` workaround needed
-    /// (the previous form tested a *closed* semaphore, which is
-    /// a different code path inside `try_acquire_owned`).
+    /// handler uses `try_acquire_run` (J2) so a saturated (0-permit)
+    /// semaphore returns 503 SERVICE_UNAVAILABLE **immediately** rather
+    /// than blocking forever on `acquire_owned().await`. A 0-permit
+    /// `Semaphore` is the natural test fixture — no `close()` workaround
+    /// needed (the previous form tested a *closed* semaphore, which is a
+    /// different code path inside `try_acquire_owned`).
     #[tokio::test]
     async fn agui_run_respects_run_semaphore() {
         use crate::llm::MockProvider;
         use crate::tools::ToolRegistry;
-        use std::sync::Arc;
         use tokio::sync::Semaphore;
 
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
@@ -2778,6 +1969,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let body = serde_json::json!({
@@ -2825,7 +2017,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             title: None,
             runtime: runtime_arc.clone(),
-            plan_approval_gate: Default::default(),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active_ms: Arc::new(AtomicU64::new(0)),
@@ -2859,6 +2051,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -2912,7 +2105,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             title: Some("old".into()),
             runtime: runtime_arc.clone(),
-            plan_approval_gate: Default::default(),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active_ms: Arc::new(AtomicU64::new(0)),
@@ -2945,6 +2138,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         (state, runtime_arc)
     }
@@ -3077,6 +2271,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -3130,6 +2325,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -3182,6 +2378,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let auth = crate::http::auth::AuthConfig::default();
@@ -3258,7 +2455,7 @@ mod tests {
     /// G293, G294, G295, G296, etc.
     #[test]
     fn openapi_session_detail_has_complete_schema() {
-        let spec = super::build_openapi_spec();
+        let spec = super::super::build_openapi_spec();
         let props = &spec["components"]["schemas"]["SessionDetailResponse"]["properties"];
 
         // Fields from the original (G-pre) spec.
@@ -3297,7 +2494,7 @@ mod tests {
     /// Verify `SessionInfo` schema includes `message_count` and `title`.
     #[test]
     fn openapi_session_info_has_message_count_and_title() {
-        let spec = super::build_openapi_spec();
+        let spec = super::super::build_openapi_spec();
         let props = &spec["components"]["schemas"]["SessionInfo"]["properties"];
 
         assert!(props.get("id").is_some(), "id missing");
@@ -3313,7 +2510,7 @@ mod tests {
     /// metrics in its description.
     #[test]
     fn openapi_metrics_path_documents_new_metrics() {
-        let spec = super::build_openapi_spec();
+        let spec = super::super::build_openapi_spec();
         let description = spec["paths"]["/metrics"]["get"]["description"]
             .as_str()
             .expect("metrics path description is a string");
@@ -3671,48 +2868,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agui_events_for_partial_token_then_tool_call_closes_stream() {
-        use agui_protocol as ag;
-        // Use AguiConverter directly so open_message_id state spans events.
-        let mut conv = AguiConverter::new();
-        let t1 = conv.convert(&AgentEvent::PartialToken {
-            text: "a".into(),
-            step: 0,
-        });
-        assert_eq!(t1.len(), 2, "Start+Content expected: {t1:?}");
-        assert!(matches!(t1[0], ag::Event::TextMessageStart(_)));
-        assert!(matches!(t1[1], ag::Event::TextMessageContent(_)));
-        let t2 = conv.convert(&AgentEvent::PartialToken {
-            text: "b".into(),
-            step: 0,
-        });
-        assert_eq!(t2.len(), 1, "Content-only expected: {t2:?}");
-        assert!(matches!(t2[0], ag::Event::TextMessageContent(_)));
-        let t3 = conv.convert(&AgentEvent::ToolCall {
-            id: "tc-1".into(),
-            name: "Bash".into(),
-            arguments: "{}".into(),
-            step: 0,
-        });
-        assert!(
-            t3.iter().any(|e| matches!(e, ag::Event::TextMessageEnd(_))),
-            "ToolCall must close open text stream: {t3:?}"
-        );
-        assert!(
-            t3.iter().any(|e| matches!(e, ag::Event::ToolCallStart(_))),
-            "ToolCall must emit ToolCallStart: {t3:?}"
-        );
-        assert!(
-            t3.iter().any(|e| matches!(e, ag::Event::ToolCallArgs(_))),
-            "ToolCall must emit ToolCallArgs: {t3:?}"
-        );
-        assert!(
-            t3.iter().any(|e| matches!(e, ag::Event::ToolCallEnd(_))),
-            "ToolCall must emit ToolCallEnd: {t3:?}"
-        );
-    }
-
     // ── format_timestamp ────────────────────────────────────────────────────
 
     #[test]
@@ -3752,90 +2907,7 @@ mod tests {
         assert_eq!(&ts[17..19], "30", "seconds mismatch; got {ts}");
     }
 
-    // ── sanitize_thread_id_for_session ──────────────────────────────────────
-
-    #[test]
-    fn sanitize_thread_id_valid_passthrough() {
-        assert_eq!(sanitize_thread_id_for_session("abc-123"), "abc-123");
-        assert_eq!(sanitize_thread_id_for_session("foo_bar.baz"), "foo_bar.baz");
-    }
-
-    #[test]
-    fn sanitize_thread_id_replaces_special_chars() {
-        let out = sanitize_thread_id_for_session("a/b:c");
-        assert!(!out.contains('/'), "slash must be replaced");
-        assert!(!out.contains(':'), "colon must be replaced");
-    }
-
-    #[test]
-    fn sanitize_thread_id_leading_dot_replaced() {
-        let out = sanitize_thread_id_for_session(".hidden");
-        assert!(
-            !out.starts_with('.'),
-            "leading dot must be replaced; got {out}"
-        );
-    }
-
-    #[test]
-    fn sanitize_thread_id_double_dot_collapsed() {
-        let out = sanitize_thread_id_for_session("a..b");
-        assert!(
-            !out.contains(".."),
-            "double dot must be collapsed; got {out}"
-        );
-    }
-
-    #[test]
-    fn sanitize_thread_id_empty_becomes_default() {
-        assert_eq!(sanitize_thread_id_for_session(""), "default");
-    }
-
-    // ── Issue #62: agui non-resume seeding ─────────────────────────────
-
-    /// Unit-level: tool-related messages are skipped (invariant #8 —
-    /// seeding an assistant tool_call or a tool result without its pair
-    /// orphans the other half and gets HTTP 400 from the provider), and
-    /// plain user/assistant text passes through in order.
-    #[test]
-    fn agui_seed_from_messages_skips_tool_roles_and_maps_text() {
-        use agui_protocol as ag;
-        let mk = |role: &str, content: Option<&str>| ag::Message {
-            id: format!("m-{role}"),
-            role: role.into(),
-            content: content.map(Into::into),
-            name: None,
-            tool_call_id: None,
-            tool_calls: None,
-        };
-        let mut tool_result = mk("tool", Some("result"));
-        tool_result.tool_call_id = Some("tc-1".into());
-        let mut assistant_with_calls = mk("assistant", Some("calling"));
-        assistant_with_calls.tool_calls = Some(serde_json::json!([]));
-
-        let msgs: Vec<ag::Message> = vec![
-            mk("user", Some("turn one")),
-            assistant_with_calls,
-            tool_result,
-            mk("assistant", Some("answer one")),
-            mk("user", Some("turn two")),
-            mk("user", None),          // empty content → dropped
-            mk("system", Some("sys")), // non-user/assistant → dropped
-        ];
-        let msgs: Vec<&ag::Message> = msgs.iter().collect();
-        let seed = agui_seed_from_messages(&msgs);
-        let rendered: Vec<(crate::message::Role, String)> =
-            seed.into_iter().map(|m| (m.role, m.content)).collect();
-        use crate::message::Role;
-        assert_eq!(
-            rendered,
-            vec![
-                (Role::User, "turn one".into()),
-                (Role::Assistant, "answer one".into()),
-                (Role::User, "turn two".into()),
-            ],
-            "tool roles / empty / system messages must be skipped, rest mapped in order"
-        );
-    }
+    // ── Issue #62: agui non-resume seeding (through HTTP) ─────────────
 
     /// End-to-end issue #62 acceptance: two turns on the same thread where
     /// the second turn carries the FULL `messages` array (no resume). The
@@ -3853,6 +2925,7 @@ mod tests {
         let home = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
         std::env::set_var("RECURSIVE_HOME", home.path());
+        let saved_sessions_dir = std::env::var_os("RECURSIVE_SESSIONS_DIR");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
@@ -3893,6 +2966,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("recursive-agui-seed-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let app = crate::http::build_router_with_auth_and_rate_limit(
             state,
@@ -3975,6 +3049,210 @@ mod tests {
                 .any(|m| matches!(m.role, crate::message::Role::Tool)),
             "no tool-role messages expected"
         );
+
+        std::env::remove_var("RECURSIVE_WORKSPACE");
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        if let Some(v) = saved_sessions_dir {
+            std::env::set_var("RECURSIVE_SESSIONS_DIR", v);
+        }
+    }
+
+    // ── Issue #66: token streaming + cancellation ────────────────────────
+
+    /// POST /agui/{thread_id}/cancel cancels the registered token; an
+    /// unknown (or already-finished) thread is an idempotent 200 with
+    /// `"cancelled": false`.
+    #[tokio::test]
+    async fn agui_cancel_cancels_registered_thread_and_is_idempotent() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = Arc::new(crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-cancel-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .agui_active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("t-cancel".into(), token.clone());
+
+        let Json(res) = agui_cancel(State(Arc::clone(&state)), Path("t-cancel".into())).await;
+        assert_eq!(res["status"], "interrupted");
+        assert_eq!(res["cancelled"], true);
+        assert!(token.is_cancelled(), "registered token must be cancelled");
+
+        let Json(res) = agui_cancel(State(state), Path("no-such-thread".into())).await;
+        assert_eq!(res["cancelled"], false, "unknown thread stays idempotent");
+    }
+
+    /// Dropping the wrapped SSE body (client disconnect) must cancel the
+    /// run token; polling through the wrapper still forwards events.
+    #[tokio::test]
+    async fn agui_sse_drop_cancels_run_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        // `Ready` (not an async block): the wrapper's Stream impl requires
+        // `S: Unpin`, which `Once<Ready<_>>` satisfies the same way the
+        // production stream (map over an unbounded receiver) does.
+        let inner = futures_util::stream::once(futures_util::future::ready(Ok::<_, Infallible>(
+            Event::default().data("x"),
+        )));
+        let mut guarded = CancelOnDrop {
+            inner,
+            token: Some(token.clone()),
+        };
+        // File scope imports tokio_stream::StreamExt; disambiguate.
+        assert!(
+            futures_util::StreamExt::next(&mut guarded).await.is_some(),
+            "wrapper must forward items"
+        );
+        assert!(!token.is_cancelled());
+        drop(guarded);
+        assert!(
+            token.is_cancelled(),
+            "dropping the SSE body cancels the run"
+        );
+    }
+
+    /// Issue #66 §3.2 end-to-end: a chunked provider must reach the wire as
+    /// multiple `TextMessageContent` frames whose concatenation carries the
+    /// answer EXACTLY once (the finalising `AssistantText` must not
+    /// duplicate it), and the stream must end with `RunFinished`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_streams_token_deltas_without_duplicating_final_text() {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+        use tower::ServiceExt;
+
+        let _env = crate::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        std::env::set_var("RECURSIVE_HOME", home.path());
+        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
+        let config = crate::config::Config::from_env().unwrap();
+        let provider = Arc::new(
+            MockProvider::new(vec![crate::llm::Completion {
+                content: "abcdefgh".into(),
+                ..Default::default()
+            }])
+            .with_stream_chunk_chars(3),
+        );
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-agui-stream-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+        let app = crate::http::build_router_with_auth_and_rate_limit(
+            state,
+            crate::http::auth::AuthConfig::default(),
+            crate::http::RateLimiter::new(100, 1.0),
+        );
+
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "threadId": "stream-th",
+                            "runId": "r-stream",
+                            "messages": [
+                                {"id": "m1", "role": "user", "content": "hi"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+
+        let mut deltas = String::new();
+        let mut saw_run_finished = false;
+        let mut content_frames = 0usize;
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("TextMessageContent") => {
+                    content_frames += 1;
+                    deltas.push_str(v["delta"].as_str().unwrap_or_default());
+                }
+                Some("RunFinished") => saw_run_finished = true,
+                _ => {}
+            }
+        }
+        assert!(
+            content_frames >= 2,
+            "chunked provider must yield multiple content frames, got {content_frames}"
+        );
+        assert_eq!(
+            deltas, "abcdefgh",
+            "deltas must carry the answer exactly once — no duplicated final message"
+        );
+        assert!(saw_run_finished, "stream must end with RunFinished");
 
         std::env::remove_var("RECURSIVE_WORKSPACE");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");

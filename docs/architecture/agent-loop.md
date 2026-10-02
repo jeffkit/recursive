@@ -49,7 +49,7 @@ When the transcript grows large, `AgentRuntime` calls `Compactor` to:
 2. Replace old messages with a compacted stub.
 3. **Tool-call ↔ tool-result pairing must be preserved** (Invariant #8).
 
-`Compactor` lives in `src/compact.rs`. It uses a structured JSON output schema
+`Compactor` lives in `src/compact/` (see `src/compact/mod.rs`). It uses a structured JSON output schema
 so the LLM returns machine-readable fields.
 
 ## Tool Dispatch Safety
@@ -66,7 +66,7 @@ rather than panicking.
 ## Related Concepts
 
 - [Overview](overview.md) — component map
-- [Invariants](invariants.md) — all eight invariants
+- [Invariants](invariants.md) — all ten invariants
 - [Layer 0 Injection](layer0-injection.md) — how system prompt is built before each run
 - [Sessions](sessions.md) — how transcripts are persisted
 - [Providers Overview](providers/index.md) — what ChatProvider::complete returns

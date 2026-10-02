@@ -5,6 +5,7 @@
 //! endpoint that executes the agent with a given goal, session management
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
+mod agui;
 mod auth;
 mod cold_load;
 #[cfg(test)]
@@ -23,9 +24,9 @@ pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
-    agui_run, create_session, delete_session, fork_session, get_session, health, list_sessions,
-    list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session, run_agent,
-    send_session_message, session_clear_goal, session_events, session_interrupt,
+    agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
+    list_sessions, list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session,
+    run_agent, send_session_message, session_clear_goal, session_events, session_interrupt,
     session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
@@ -378,6 +379,14 @@ pub struct AppState {
     /// Goal 397 cold-load reads this same backend to restore sessions after a
     /// restart (`cold_load::get_or_load_session`).
     pub storage: Arc<dyn StorageBackend>,
+    /// Issue #66: cancellation tokens for in-flight `/agui` runs, keyed by
+    /// AG-UI thread id. `agui_run` inserts a fresh token before spawning its
+    /// driver task and removes the entry on completion; the disconnect guard
+    /// on the SSE body and `POST /agui/{thread_id}/cancel` both cancel it.
+    /// AG-UI runs have no `SessionState` row, so they cannot reuse the
+    /// per-session `interrupt_token` slot.
+    pub agui_active_runs:
+        Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -440,8 +449,68 @@ impl AppState {
     /// handle-clone of the shared startup registry (previous behaviour).
     /// Issue #31 §C: Result-shaped — container creation failure is a
     /// per-session error mapped by handlers to 503/500, not a process exit.
+    ///
+    /// Issue #65: the surface contracts (operator allow-list, coordinator
+    /// pruning) are re-applied here because the container tier rebuilds the
+    /// registry from scratch — filtering only the startup registry would
+    /// silently hand rebuilt sessions the full toolset again. On the clone
+    /// path this is an idempotent re-filter. (MCP tools are still lost on a
+    /// container rebuild — the provider builds a fresh local registry —
+    /// which stays a documented container-tier gap, not a silent contract
+    /// violation.)
     pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
-        rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await
+        let mut registry =
+            rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await?;
+        crate::coordinator::filter_registry(&mut registry);
+        if !self.config.allow_tools.is_empty() {
+            registry.retain_tools(&self.config.allow_tools);
+        }
+        Ok(registry)
+    }
+}
+
+/// Minimal `Config` for build paths that only need the model name
+/// (auto compaction thresholds). Values mirror safe defaults; the shared
+/// HTTP runtime assembly uses it to stay independent of `AppState`.
+/// Every field of `Config` must be listed here, so a newly added field
+/// breaks compilation instead of silently defaulting.
+pub(crate) fn test_config_stub() -> crate::config::Config {
+    crate::config::Config {
+        workspace: std::path::PathBuf::from("."),
+        api_base: String::new(),
+        api_key: None,
+        model: String::new(),
+        provider_type: "openai".into(),
+        preset: None,
+        max_steps: 32,
+        max_tokens: 65536,
+        temperature: 0.2,
+        system_prompt: String::new(),
+        retry_max: 2,
+        retry_initial_backoff_secs: 1,
+        retry_max_backoff_secs: 8,
+        shell_timeout_secs: 300,
+        headless: false,
+        memory_summary_limit: 5,
+        thinking_budget: None,
+        session_name: None,
+        max_budget_usd: None,
+        extra_dirs: Vec::new(),
+        extra_readonly_dirs: Vec::new(),
+        allow_tools: Vec::new(),
+        context_window_override: None,
+        subagent_max_depth: 2,
+        subagent_enabled: false,
+        allow_bypass_permissions: false,
+        max_search_rounds: 3,
+        stuck_window: 10,
+        stuck_error_rate: 0.8,
+        max_concurrent_runs: 8,
+        goal_eval_transcript_tail: 12,
+        web_search_provider: None,
+        web_search_api_key: None,
+        web_search_jina_key: None,
+        wall_timeout_secs: 0,
     }
 }
 
@@ -699,6 +768,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
+        .route("/agui/{thread_id}/cancel", post(agui_cancel))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .layer(axum::middleware::from_fn_with_state(
             (limiter.clone(), state_arc.metrics.clone()),
@@ -978,6 +1048,34 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             }
                         },
                         "400": { "description": "Invalid AG-UI RunAgentInput" }
+                    }
+                }
+            },
+            "/agui/{thread_id}/cancel": {
+                "post": {
+                    "summary": "Cancel the in-flight AG-UI run for a thread",
+                    "description": "Issue #66 §3.3: asks the run to stop. The kernel exits \
+                        with FinishReason::Cancelled at the next step boundary or mid-LLM-call; \
+                        the driver then persists the partial transcript and emits RunFinished \
+                        with an Error outcome carrying code \"cancelled\". The SSE body also \
+                        cancels its run automatically when the client disconnects. Idempotent: \
+                        an unknown (or already-finished) thread answers 200 with \
+                        \"cancelled\": false.",
+                    "parameters": [{
+                        "name": "thread_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Cancel requested (or nothing to cancel)",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -1617,6 +1715,47 @@ mod goal_396_persistence_tests {
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Issue #65: `session_tool_registry` is the choke point every handler
+    /// builds sessions from, so the operator allow-list must hold there —
+    /// including on a registry that arrives unfiltered (the container tier
+    /// rebuilds one from scratch per session; the clone path re-filters
+    /// idempotently).
+    #[tokio::test]
+    async fn session_tool_registry_applies_allow_tools() {
+        let host = test_host(0);
+        let storage: Arc<dyn StorageBackend> = RecordingStorage::new();
+        let mut config = test_config();
+        config.allow_tools = vec!["Read".into()];
+        let state = AppState {
+            tools: vec![],
+            tool_registry: crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host,
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        let registry = state.session_tool_registry().await.expect("registry");
+        assert!(
+            registry.find_by_name("Read").is_some(),
+            "allow-listed tools must survive"
+        );
+        for dropped in ["Write", "Edit", "Bash", "TodoWrite"] {
+            assert!(
+                registry.find_by_name(dropped).is_none(),
+                "{dropped} is outside RECURSIVE_ALLOW_TOOLS and must not leak \
+                 into per-session registries"
+            );
         }
     }
 
@@ -1767,6 +1906,83 @@ mod goal_403_http_sandbox_entry {
             "HTTP entry must build its tool registry through cli::builder::build_tools \
              (which dispatches RECURSIVE_SANDBOX=container to ContainerToolSetProvider), \
              not a local-only registry"
+        );
+    }
+
+    /// Issues #70 / #65: the base registry alone is not enough — the HTTP
+    /// entry must run the shared cross-cutting tail (`finish_tool_surface`)
+    /// so MCP tools (#70) and the coordinator / allow-list pruning (#65)
+    /// land on the registry that backs `/tools` and every session.
+    #[test]
+    fn http_entry_applies_the_shared_tool_surface_tail() {
+        let src = include_str!("../../crates/recursive-cli/src/main.rs");
+        let http_block = src
+            .split("Cmd::Http { addr } => {")
+            .nth(1)
+            .expect("HTTP entry block must exist")
+            .split("Cmd::Run { goal } => {")
+            .next()
+            .expect("HTTP entry block must be terminated by the Run arm");
+        assert!(
+            http_block.contains("finish_tool_surface"),
+            "HTTP entry must run cli::builder::finish_tool_surface on top of \
+             build_tools — a base-only registry silently drops MCP tools \
+             (#70) and ignores RECURSIVE_ALLOW_TOOLS (#65)"
+        );
+        assert!(
+            http_block.contains("apply_operator_allow_list"),
+            "HTTP entry must apply the operator allow-list AFTER sub-agent \
+             registration — tools registered post-prune (agent/send_message/\
+             list_workers) would otherwise escape RECURSIVE_ALLOW_TOOLS (#65)"
+        );
+    }
+
+    /// Issue #69: `RECURSIVE_ALLOW_TOOLS` must reach `config.allow_tools`
+    /// even when only the env var is set. The CLI path is covered by clap's
+    /// `env = "RECURSIVE_ALLOW_TOOLS"` injection; this pins the
+    /// `Config::from_env` read that serves non-clap embedders (TUI preset
+    /// config, HTTP session rebuilds).
+    #[test]
+    fn config_from_env_reads_allow_tools() {
+        let src = include_str!("../config.rs");
+        let from_env = src
+            .split("pub fn from_env() -> Result<Self> {")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn ").next())
+            .expect("Config::from_env must exist");
+        assert!(
+            from_env.contains("RECURSIVE_ALLOW_TOOLS"),
+            "Config::from_env must read RECURSIVE_ALLOW_TOOLS so the operator \
+             allow-list applies to non-clap embedders (issue #69)"
+        );
+    }
+
+    #[test]
+    fn session_rebind_reapplies_allow_tools_in_container_tier() {
+        // Issue #69: the container tier rebuilds the registry per session.
+        // Main's choke point for this is `session_tool_registry` (applies
+        // coordinator pruning + the operator allow-list after every rebind);
+        // `rebind_per_session_registry` itself must stay a pure rebuild.
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let rebind_block = src
+            .split("async fn rebind_per_session_registry")
+            .nth(1)
+            .and_then(|rest| rest.split("impl AppState").next())
+            .expect("rebind_per_session_registry must exist");
+        assert!(
+            !rebind_block.contains("retain_tools"),
+            "rebind_per_session_registry is a rebuild helper — the allow-list \
+             must stay in session_tool_registry, not duplicated here"
+        );
+        let session_block = src
+            .split("pub async fn session_tool_registry")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .expect("session_tool_registry must exist");
+        assert!(
+            session_block.contains("retain_tools(&self.config.allow_tools)"),
+            "session_tool_registry must reapply allow_tools narrowing to the \
+             per-session (container-rebuilt) registry"
         );
     }
 

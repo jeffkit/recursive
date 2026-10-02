@@ -192,6 +192,99 @@ impl SessionWriter {
         })
     }
 
+    /// Create a new session in an explicit directory (issue #57).
+    ///
+    /// Unlike [`SessionWriter::create_with_tools`] — which derives the
+    /// directory from the workspace slug + timestamp — this places the
+    /// session at `session_dir` and uses the directory's file name as
+    /// the session id. Callers that need a stable, caller-chosen
+    /// session id (AG-UI threads) use this; everything else (`.meta.json`
+    /// creation, `SessionLock`) behaves exactly like `create_with_tools`.
+    pub fn create_at(
+        session_dir: &Path,
+        goal: &str,
+        model: &str,
+        provider: &str,
+        preset: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let session_id = session_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "session_dir must have a file name",
+                )
+            })?;
+
+        std::fs::create_dir_all(session_dir)?;
+
+        let lock = SessionLock::acquire(session_dir)?;
+
+        let jsonl_path = session_dir.join("transcript.jsonl");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)?;
+
+        let now = chrono_lite_now();
+        let meta = SessionMeta {
+            schema_version: super::SUPPORTED_SESSION_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            goal: goal.to_string(),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            message_count: 0,
+            status: SessionStatus::Active,
+            tool_registry_hash: None,
+            first_prompt: None,
+            last_prompt: None,
+            cost: None,
+            preset: preset.map(|s| s.to_string()),
+            name: None,
+        };
+        let meta_path = session_dir.join(".meta.json");
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        crate::atomic::atomic_write(&meta_path, meta_json.as_bytes())?;
+
+        Ok(Self {
+            session_id,
+            session_dir: session_dir.to_path_buf(),
+            writer: BufWriter::new(file),
+            message_count: 0,
+            last_uuid: None,
+            cumulative_usage: UsageMeta::default(),
+            first_prompt: None,
+            last_prompt: None,
+            _lock: Some(lock),
+            name: None,
+        })
+    }
+
+    /// Open a session directory for appending, creating it (and its
+    /// initial `.meta.json`) on first use (issue #57).
+    ///
+    /// This is the entry point for persisters that address a session by
+    /// a stable id rather than a timestamped directory: first call
+    /// behaves like [`SessionWriter::create_at`], later calls like
+    /// [`SessionWriter::open_existing`].
+    pub fn open_or_create(
+        session_dir: &Path,
+        goal: &str,
+        model: &str,
+        provider: &str,
+        preset: Option<&str>,
+    ) -> std::io::Result<Self> {
+        if session_dir.join(".meta.json").is_file() {
+            Self::open_existing(session_dir)
+        } else {
+            Self::create_at(session_dir, goal, model, provider, preset)
+        }
+    }
+
     /// Re-open an existing session directory for appending.
     ///
     /// Reads the existing `.meta.json` to recover `message_count`,
@@ -467,6 +560,43 @@ impl SessionWriter {
         self.name = Some(name.into());
     }
 
+    /// Feed run-level token usage into the writer's cumulative total
+    /// without attaching it to a specific transcript entry.
+    ///
+    /// Callers that only know a run's total usage after the fact (the
+    /// AG-UI driver, issue #57) use this instead of passing `usage` to
+    /// [`SessionWriter::append`]; `finish()` folds it into
+    /// `.meta.json`'s `cost` like per-message usage.
+    pub fn add_usage(&mut self, usage: &UsageMeta) {
+        self.cumulative_usage.accumulate(usage);
+    }
+
+    /// Update `model` / `provider` / `preset` in `.meta.json` to the
+    /// identity that produced the latest activity.
+    ///
+    /// Sessions addressed by a stable id (AG-UI threads) can be served
+    /// by different model configs over their lifetime; cost pricing
+    /// and `resume` read the model from meta, so it must track the
+    /// most recent run rather than the one that created the session.
+    pub fn update_identity(&mut self, model: &str, provider: &str, preset: Option<&str>) {
+        let meta_path = self.session_dir.join(".meta.json");
+        let Ok(bytes) = std::fs::read(&meta_path) else {
+            return;
+        };
+        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+            return;
+        };
+        if meta.model == model && meta.provider == provider && meta.preset.as_deref() == preset {
+            return;
+        }
+        meta.model = model.to_string();
+        meta.provider = provider.to_string();
+        meta.preset = preset.map(|s| s.to_string());
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
+        }
+    }
+
     /// Return the session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -603,6 +733,81 @@ mod tests {
             "two sessions created in the same second must not share a directory"
         );
         assert_ne!(w1.session_id(), w2.session_id());
+    }
+
+    #[test]
+    fn open_or_create_is_create_on_first_call_then_open() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-stable-id");
+
+        let mut writer =
+            SessionWriter::open_or_create(&dir, "thread goal", "deepseek-chat", "deepseek", None)
+                .unwrap();
+        assert_eq!(writer.session_id(), "agui-stable-id");
+        writer.append(&Message::user("first"), None, None).unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+        // Release the per-session lock before reopening — a live writer
+        // refuses a second one (SessionLockBusy).
+        drop(writer);
+        let meta1 = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta1.session_id, "agui-stable-id");
+        assert_eq!(meta1.goal, "thread goal");
+        assert_eq!(meta1.message_count, 1);
+
+        // Second call reopens: created_at sticky, message_count continues.
+        let mut writer2 =
+            SessionWriter::open_or_create(&dir, "ignored", "deepseek-chat", "deepseek", None)
+                .unwrap();
+        writer2
+            .append(&Message::user("second"), None, None)
+            .unwrap();
+        writer2.finish(SessionStatus::Completed).unwrap();
+        let meta2 = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta2.created_at, meta1.created_at);
+        assert_eq!(meta2.message_count, 2);
+        assert_eq!(meta2.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn add_usage_lands_in_meta_cost_on_finish() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-usage");
+
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        writer
+            .append(&Message::assistant("reply"), None, None)
+            .unwrap();
+        writer.add_usage(&UsageMeta {
+            input_tokens: 30,
+            output_tokens: 12,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+        });
+        writer.finish(SessionStatus::Completed).unwrap();
+
+        let cost = SessionReader::load_meta(&dir).unwrap().cost.unwrap();
+        assert_eq!(cost.total_input_tokens, 30);
+        assert_eq!(cost.total_output_tokens, 12);
+    }
+
+    #[test]
+    fn update_identity_rewrites_model_provider_preset() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-identity");
+
+        let mut writer =
+            SessionWriter::open_or_create(&dir, "goal", "old-model", "old-provider", None).unwrap();
+        writer.append(&Message::user("hi"), None, None).unwrap();
+        writer.update_identity("new-model", "new-provider", Some("deepseek"));
+        writer.finish(SessionStatus::Completed).unwrap();
+
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.model, "new-model");
+        assert_eq!(meta.provider, "new-provider");
+        assert_eq!(meta.preset.as_deref(), Some("deepseek"));
+        // Session content untouched by the identity rewrite.
+        assert_eq!(meta.message_count, 1);
     }
 
     #[test]

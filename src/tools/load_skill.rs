@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
-use crate::skills::Skill;
+use crate::skills::{Skill, SkillSource, StaticSkillSource};
 use crate::tools::Tool;
 
 /// Maximum depth for dependency resolution.
@@ -28,15 +28,23 @@ const MAX_DEPTH: usize = 3;
 
 /// Tool to load a skill's SKILL.md body content, or a specific ref document,
 /// or a named section.
+///
+/// Skills come from a [`SkillSource`] rather than a hard-coded `Vec<Skill>`:
+/// the registry wires [`StaticSkillSource`] (the historical in-process
+/// catalog), while other backends (e.g. HTTP-fetched catalogs) can serve the
+/// same interface without touching this tool.
 pub struct LoadSkill {
-    skills: Arc<Vec<Skill>>,
+    source: Arc<dyn SkillSource>,
 }
 
 impl LoadSkill {
     pub fn new(skills: Vec<Skill>) -> Self {
-        Self {
-            skills: Arc::new(skills),
-        }
+        Self::from_source(Arc::new(StaticSkillSource::new(skills)))
+    }
+
+    /// Build the tool on top of an arbitrary skill source.
+    pub fn from_source(source: Arc<dyn SkillSource>) -> Self {
+        Self { source }
     }
 
     /// Resolve dependencies for a skill, returning a list of (name, body) pairs
@@ -75,21 +83,17 @@ impl LoadSkill {
             }
 
             // Find the dependency skill (case-insensitive)
-            let dep_skill = self
-                .skills
-                .iter()
-                .find(|s| s.name.to_lowercase() == dep_name.to_lowercase())
-                .ok_or_else(|| Error::Tool {
-                    name: "Skill".into(),
-                    call_id: None,
-                    message: format!(
-                        "dependency '{}' not found (required by '{}')",
-                        dep_name, skill.name
-                    ),
-                })?;
+            let dep_skill = self.source.find(dep_name).ok_or_else(|| Error::Tool {
+                name: "Skill".into(),
+                call_id: None,
+                message: format!(
+                    "dependency '{}' not found (required by '{}')",
+                    dep_name, skill.name
+                ),
+            })?;
 
             // Recursively resolve the dependency's own dependencies first
-            let sub_deps = self.resolve_deps(dep_skill, visited, depth + 1)?;
+            let sub_deps = self.resolve_deps(&dep_skill, visited, depth + 1)?;
             deps.extend(sub_deps);
 
             // Read the dependency's body (content-first, path fallback)
@@ -165,15 +169,11 @@ impl Tool for LoadSkill {
             })?;
 
         // Case-insensitive search
-        let skill = self
-            .skills
-            .iter()
-            .find(|s| s.name.to_lowercase() == name.to_lowercase())
-            .ok_or_else(|| Error::Tool {
-                name: "Skill".into(),
-                call_id: None,
-                message: format!("skill not found: {name}"),
-            })?;
+        let skill = self.source.find(name).ok_or_else(|| Error::Tool {
+            name: "Skill".into(),
+            call_id: None,
+            message: format!("skill not found: {name}"),
+        })?;
 
         // Check if a specific ref is requested
         if let Some(ref_name) = arguments["ref"].as_str() {
@@ -248,7 +248,7 @@ impl Tool for LoadSkill {
 
             // Apply param substitution to section content if params provided
             let provided_params = arguments["params"].as_object();
-            let resolved = resolve_params(skill, provided_params)?;
+            let resolved = resolve_params(&skill, provided_params)?;
 
             let rendered = if resolved.is_empty() {
                 section.content.clone()
@@ -265,7 +265,7 @@ impl Tool for LoadSkill {
             // (e.g. `bash ${SKILL_DIR}/scripts/lint.sh`). Ref documents
             // are returned as-is and never receive this substitution —
             // they may legitimately contain literal `${...}` text.
-            let rendered = substitute_skill_dir(&rendered, skill);
+            let rendered = substitute_skill_dir(&rendered, &skill);
 
             return Ok(rendered);
         }
@@ -289,7 +289,7 @@ impl Tool for LoadSkill {
 
         // Resolve params and perform template substitution
         let provided_params = arguments["params"].as_object();
-        let resolved = resolve_params(skill, provided_params)?;
+        let resolved = resolve_params(&skill, provided_params)?;
 
         // Perform template substitution: replace {{key}} with value
         let rendered = if resolved.is_empty() {
@@ -306,12 +306,12 @@ impl Tool for LoadSkill {
         // for the requested skill's body only. Dependency bodies are not
         // recursed into here — they will get their own substitution when
         // they are loaded by a future `Skill` call (do not recurse).
-        let rendered = substitute_skill_dir(&rendered, skill);
+        let rendered = substitute_skill_dir(&rendered, &skill);
 
         // Resolve dependencies (if any)
         let mut visited = HashSet::new();
         visited.insert(skill.name.to_lowercase());
-        let deps = self.resolve_deps(skill, &mut visited, 1)?;
+        let deps = self.resolve_deps(&skill, &mut visited, 1)?;
 
         if deps.is_empty() {
             return Ok(rendered);
@@ -1563,5 +1563,98 @@ mod tests {
             result.unwrap(),
             "Run /virtual/skills/remote-doc/scripts/lint.sh"
         );
+    }
+
+    // --- Goal #76: LoadSkill over a custom SkillSource ---
+
+    /// A source that reads its catalog from memory the tool cannot reach any
+    /// other way — proves `LoadSkill` consults the source per call.
+    struct SharedCatalogSource {
+        skills: Arc<std::sync::Mutex<Vec<Skill>>>,
+    }
+    impl crate::skills::SkillSource for SharedCatalogSource {
+        fn skills(&self) -> Vec<Skill> {
+            self.skills.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn load_skill_serves_from_a_custom_trait_object_source() {
+        let skill = crate::skills::skill_from_content(
+            "tenant-skill",
+            "---\nname: tenant-skill\ndescription: Per-tenant catalog\n---\n\nTenant body.",
+            vec![],
+        );
+        let catalog = Arc::new(std::sync::Mutex::new(vec![skill]));
+        let source: Arc<dyn crate::skills::SkillSource> = Arc::new(SharedCatalogSource {
+            skills: Arc::clone(&catalog),
+        });
+        let tool = LoadSkill::from_source(Arc::clone(&source));
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "TENANT-SKILL"})));
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap(), "Tenant body.");
+
+        // The lookup went through the trait object: mutate the shared catalog
+        // and the tool's answer changes with it. (`skills()` returns a clone,
+        // so the mutation must go through the source's interior Mutex.)
+        catalog.lock().unwrap().clear();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "tenant-skill"})));
+        assert!(result.is_err(), "empty catalog must surface as not-found");
+    }
+
+    #[test]
+    fn load_skill_dependency_resolves_through_the_source() {
+        let dep = crate::skills::skill_from_content(
+            "tenant-base",
+            "---\nname: tenant-base\ndescription: d\n---\n\nBase body",
+            vec![],
+        );
+        let main_skill = crate::skills::skill_from_content(
+            "tenant-main",
+            "---\nname: tenant-main\ndescription: d\ndepends_on: tenant-base\n---\n\nMain body",
+            vec![],
+        );
+        let tool = LoadSkill::from_source(Arc::new(SharedCatalogSource {
+            skills: Arc::new(std::sync::Mutex::new(vec![dep, main_skill])),
+        }));
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "tenant-main"})));
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            result.unwrap(),
+            "=== Dependency: tenant-base ===\nBase body\n\n=== Skill: tenant-main ===\nMain body"
+        );
+    }
+
+    #[test]
+    fn load_skill_ref_resolves_through_the_source() {
+        let skill = crate::skills::skill_from_content(
+            "tenant-doc",
+            "---\nname: tenant-doc\ndescription: d\n---\n\nBody",
+            vec![crate::skills::SkillRef {
+                name: "api-spec".to_string(),
+                path: PathBuf::from("/virtual/skills/tenant-doc/refs/api-spec.md"),
+                content: Some("# API Spec\n\nInline.".to_string()),
+            }],
+        );
+        let tool = LoadSkill::from_source(Arc::new(SharedCatalogSource {
+            skills: Arc::new(std::sync::Mutex::new(vec![skill])),
+        }));
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"name": "tenant-doc", "ref": "API-SPEC"})));
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(result.unwrap(), "# API Spec\n\nInline.");
     }
 }

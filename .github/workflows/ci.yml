@@ -60,6 +60,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+  # Feature-matrix guards: the lib must build and pass clippy with no
+  # default features and with each optional feature in isolation, so a
+  # feature-gated item can never strand its callers (54/63/65/74).
   feature-matrix:
     name: feature matrix (no-default-features)
     runs-on: ubuntu-latest

@@ -237,6 +237,7 @@ pub fn sample_state() -> AppState {
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
         storage: test_storage_dir(),
+        agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -264,6 +265,7 @@ pub fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
         storage: test_storage_dir(),
+        agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -305,5 +307,6 @@ pub fn sample_state_with_storage(
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
         storage,
+        agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
     }
 }

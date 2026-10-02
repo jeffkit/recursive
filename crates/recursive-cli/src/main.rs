@@ -247,6 +247,7 @@ enum Cmd {
         workspace: PathBuf,
     },
     /// Start as an ACP (Agent Client Protocol) server (stdio transport).
+    #[cfg(feature = "acp")]
     Acp,
     /// Start the HTTP API server.
     #[cfg(feature = "http")]
@@ -614,9 +615,20 @@ async fn main() -> anyhow::Result<()> {
     // roots already loaded from [sandbox] extra_dirs in config.toml so the
     // two sources compose.
     merge_extra_dirs(&mut config.extra_dirs, &cli.add_dir);
-    // --allow-tools: restrict agent to a subset of tools.
-    if let Some(ref allow) = cli.allow_tools {
-        config.allow_tools = allow.split(',').map(|s| s.trim().to_string()).collect();
+    // --allow-tools: restrict agent to a subset of tools. The flag overwrites
+    // whatever `Config::from_env` read from RECURSIVE_ALLOW_TOOLS — but the
+    // clap `env = "RECURSIVE_ALLOW_TOOLS"` injection also lands in
+    // `cli.allow_tools`, so both sources converge to the same parsed value
+    // when only the env var is set. Always re-split for a uniform shape.
+    if cli.allow_tools.is_some() {
+        config.allow_tools = cli
+            .allow_tools
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     // --output-format: supersedes --json and --stream. Default JSON shapes
     // match Claude Code (`json` = one result object, `stream-json` = NDJSON).
@@ -706,6 +718,7 @@ async fn main() -> anyhow::Result<()> {
             config.workspace = workspace;
             run_mcp_server_stdio(config, cli.mcp_config).await
         }
+        #[cfg(feature = "acp")]
         Cmd::Acp => {
             // ACP server: stdio JSON-RPC transport for Agent Client Protocol.
             tracing::info!("starting ACP v1 server on stdio");
@@ -752,6 +765,17 @@ async fn main() -> anyhow::Result<()> {
             config.max_steps = http_max_steps;
             config.wall_timeout_secs = http_wall_timeout_secs;
             let (tools, _) = cli::builder::build_tools(&config, None).await;
+            // Issues #70 / #65: HTTP is an agent-loop channel like run/loop,
+            // so it must go through the same cross-cutting surface wiring —
+            // MCP registration, touched-files collector, coordinator pruning.
+            // Skipping any of these made `recursive http` silently drift: no
+            // `mcp__*` business tools (#70) and RECURSIVE_ALLOW_TOOLS ignored
+            // (#65). Elicitation stays `None`: headless HTTP has no host to
+            // answer elicitation requests, so `UrlElicitationRequired`
+            // surfaces as a tool error instead of blocking forever.
+            let tools =
+                cli::builder::finish_tool_surface(tools, &config, cli.mcp_config.clone(), None)
+                    .await;
             // Build the LLM provider from config
             let api_key = config.require_api_key()?;
             let retry = RetryPolicy {
@@ -768,7 +792,7 @@ async fn main() -> anyhow::Result<()> {
             // Wrapped in a one-shot filled slot (never refreshed — the token
             // is server-lifetime), preserving static-token semantics.
             let http_shutdown = shutdown_signal();
-            let tools = recursive::register_subagent_if_enabled(
+            let mut tools = recursive::register_subagent_if_enabled(
                 tools,
                 &config,
                 provider.clone(),
@@ -776,6 +800,11 @@ async fn main() -> anyhow::Result<()> {
                     http_shutdown.clone(),
                 )))),
             );
+            // Issue #65: the operator allow-list is the last word — applied
+            // after sub-agent registration so /tools is exactly the allowed
+            // set (sub-agent tools register post-prune and would otherwise
+            // escape it).
+            cli::builder::apply_operator_allow_list(&mut tools, &config);
             let tool_infos: Vec<recursive::http::ToolInfo> = tools
                 .specs()
                 .into_iter()
@@ -851,6 +880,12 @@ async fn main() -> anyhow::Result<()> {
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
                 storage,
+                // Issue #66: registry of cancellation tokens for in-flight
+                // /agui runs, keyed by thread id (SSE disconnect guard +
+                // POST /agui/{thread_id}/cancel both cancel through it).
+                agui_active_runs: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the
@@ -2085,9 +2120,9 @@ async fn run_loop(
     cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation))
         .await;
     tools.register_mut(Arc::new(ScheduleWakeup::new(wakeup_slot.clone())));
-    if !config.allow_tools.is_empty() {
-        tools.retain_tools(&config.allow_tools);
-    }
+    // The operator allow-list is NOT applied here — it is applied once, as
+    // the last assembly step, after sub-agent registration (issue #65), so
+    // the advertised surface is exactly the allowed set.
 
     // Build LLM provider
     let api_key = config.require_api_key()?;
@@ -2109,6 +2144,11 @@ async fn run_loop(
             shutdown.clone(),
         )))),
     );
+    // Issue #65: the operator allow-list is the last word — applied after
+    // sub-agent registration so the loop's surface is exactly the allowed set
+    // (previously the early retain ran before `agent`/`send_message`/
+    // `list_workers` registered, letting them escape the list).
+    cli::builder::apply_operator_allow_list(&mut tools, &config);
     let skills = cli::builder::discover_loaded_skills(&config);
     let assembled = recursive::assemble_system_prompt(
         &config.system_prompt,

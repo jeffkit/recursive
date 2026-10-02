@@ -34,6 +34,7 @@ pub mod estimate_tokens;
 pub mod facts;
 pub mod fs;
 pub mod glob;
+pub mod http_call;
 #[cfg(feature = "skill-hub")]
 pub mod install_skill;
 pub mod load_skill;
@@ -141,6 +142,8 @@ pub use shell::RunShell;
 pub use stop_loop::StopLoop;
 pub use watch_file::WatchFile;
 
+#[cfg(feature = "web_fetch")]
+pub use http_call::{EndpointRegistry, EndpointSpec, HttpCall};
 #[cfg(feature = "coordinator-mode")]
 pub use task_create::TaskCreateTool;
 #[cfg(feature = "coordinator-mode")]

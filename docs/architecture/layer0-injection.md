@@ -10,9 +10,10 @@ timestamp: 2026-06-30T12:15:00Z
 
 `src/system_prompt.rs::assemble_system_prompt` is the single maintenance point
 for the "common" system-prompt structure. Every agent-loop entry point — CLI
-`run` / `do` (`cli/builder.rs::build_runtime`), CLI `loop`
-(`main.rs::run_loop`), HTTP API (`src/http/handlers.rs`), and TUI
-(`recursive-tui/src/runtime_builder.rs`) — calls it with a channel-prepared
+`run` / `do` (`crates/recursive-cli/src/cli/builder.rs::build_runtime`), CLI
+`loop` (`crates/recursive-cli/src/main.rs::run_loop`), HTTP API
+(`src/http/handlers.rs`), and TUI
+(`crates/recursive-tui/src/runtime_builder.rs`) — calls it with a channel-prepared
 base and gets back the full prompt. Channels only differ in how they source
 the base (e.g. CLI `--append-system-prompt`, HTTP `append_system_prompt`
 request field), which they fold into `base` before calling. MCP server mode

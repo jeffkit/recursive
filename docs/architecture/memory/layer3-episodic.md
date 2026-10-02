@@ -52,7 +52,7 @@ Key actions: edited src/permissions.rs, added 12 tests.
 
 ## Relationship to Compaction
 
-When a transcript grows too large, `Compactor` (in `src/compact.rs`) summarises
+When a transcript grows too large, `Compactor` (in `src/compact/`) summarises
 it. The compacted summary captures `kept_facts` and `next_steps` — essentially
 a manual episodic record written into the running session.
 

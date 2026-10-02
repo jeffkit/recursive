@@ -1,3 +1,6 @@
+# ⚠️ DEPRECATED 2026-10-01（jeffkit 拍板 v1 退役）：本文件属 v1 厚引擎世代，
+# 不再维护、不再接新修复；现行实现 = self_improve_bridge_v2.py + self_improve_flow_v2.py
+# （codeflow 库节点版，keeper 接单与自迭代共用）。保留仅为历史对照与回滚取证。
 #!/usr/bin/env python3
 """self-improve 的 plaita bridge：解析 launch-flow 同款参数 → 准备 run 目录 →
 本地执行 self-improve.plaita.json → 维护 supervisor 兼容的 state.json → 写 RESULT。

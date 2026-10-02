@@ -11,7 +11,7 @@ name = "recursive"
 path = "src/main.rs"
 
 [dependencies]
-recursive = { package = "recursive-agent", version = "=0.8.3", path = "../..", default-features = false, features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub"] }
+recursive = { package = "recursive-agent", version = "=0.8.3", path = "../..", default-features = false, features = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub", "acp"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 anyhow = "1"
@@ -30,7 +30,7 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = t
 tracing-opentelemetry = { version = "0.28", optional = true }
 
 [features]
-default = ["web_search", "http"]
+default = ["web_search", "http", "acp"]
 # Forwarding features: the `[dependencies]` line unconditionally enables
 # `recursive/web_search` and `recursive/http`, so these features are always-on
 # in the CLI binary. Declaring them here (a) satisfies `unexpected_cfgs` for
@@ -41,6 +41,7 @@ default = ["web_search", "http"]
 # move the corresponding entry out of the `[dependencies]` `features` list.
 web_search = ["recursive/web_search"]
 http = ["recursive/http"]
+acp = ["recursive/acp"]
 cloud-runtime = ["recursive/cloud-runtime"]
 e2b-sandbox = ["recursive/e2b-sandbox"]
 weixin = ["recursive/weixin"]

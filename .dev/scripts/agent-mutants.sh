@@ -35,7 +35,7 @@ CRATE="recursive-agent"
 # Feature set: enable test-utils so test helpers compile, plus common
 # optional features that unlock more code paths / mutant candidates.
 # weixin is excluded here (UI-only, no agent-kernel logic under test).
-FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,coordinator-mode"
+FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,acp,coordinator-mode"
 
 # Default: parallel copy mode. --jobs N runs N cargo build/test jobs
 # concurrently; JOBS>1 drops --in-place (parallel in-place mutation would

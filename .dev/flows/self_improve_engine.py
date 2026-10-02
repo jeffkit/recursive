@@ -1,3 +1,6 @@
+# ⚠️ DEPRECATED 2026-10-01（jeffkit 拍板 v1 退役）：本文件属 v1 厚引擎世代，
+# 不再维护、不再接新修复；现行实现 = self_improve_bridge_v2.py + self_improve_flow_v2.py
+# （codeflow 库节点版，keeper 接单与自迭代共用）。保留仅为历史对照与回滚取证。
 #!/usr/bin/env python3
 """self-improve engine — `.dev/flows/self-improve.flow.js`（flowcast）的 Python 忠实移植。
 

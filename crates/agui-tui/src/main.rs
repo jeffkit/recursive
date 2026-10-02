@@ -162,6 +162,12 @@ async fn handle_command(
 ) {
     match cmd {
         Command::Quit => {
+            // Issue #66: dropping the stream alone leaves the server-side run
+            // burning tokens in its background driver — ask the server to
+            // cancel it (best-effort; a missing server must not block exit).
+            if let Err(e) = client.cancel(&app.state.thread_id).await {
+                tracing::debug!("cancel on quit failed (server gone?): {e}");
+            }
             // Drop any in-flight stream so the receiver-side task exits.
             *current_rx = None;
         }

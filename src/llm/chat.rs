@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::message::Message;
+use crate::message::{Message, ToolCall};
 
 /// A single streamed delta emitted by a provider during a streaming LLM call.
 ///
@@ -167,15 +167,6 @@ pub struct ToolSpec {
     pub description: String,
     /// JSON Schema object describing the tool's input.
     pub parameters: Value,
-}
-
-/// A structured request to invoke one of the registered tools.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    /// Raw JSON arguments as produced by the model.
-    pub arguments: Value,
 }
 
 /// Request for a structured JSON response conforming to a JSON schema.

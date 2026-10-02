@@ -105,6 +105,7 @@ mod v050_integration {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-v050-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
