@@ -380,6 +380,8 @@ mod tests {
             state: None,
             interrupt_before: None,
             forwarded_props: None,
+            system_prompt: None,
+            append_system_prompt: None,
         };
         let v = serde_json::to_value(&input).unwrap();
         assert_eq!(v["threadId"], "t");
@@ -416,6 +418,8 @@ mod tests {
             state: None,
             interrupt_before: Some(vec!["Bash".into(), "Write".into()]),
             forwarded_props: None,
+            system_prompt: None,
+            append_system_prompt: None,
         };
         let v = serde_json::to_value(&input).unwrap();
         assert_eq!(v["resume"][0]["interruptId"], "i-1");

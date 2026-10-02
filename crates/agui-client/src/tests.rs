@@ -36,6 +36,8 @@ fn dummy_input() -> RunAgentInput {
         state: None,
         interrupt_before: None,
         forwarded_props: None,
+        system_prompt: None,
+        append_system_prompt: None,
     }
 }
 

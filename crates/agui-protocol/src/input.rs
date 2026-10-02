@@ -31,6 +31,19 @@ pub struct RunAgentInput {
     pub interrupt_before: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_props: Option<Value>,
+    /// Issue #68: per-request system prompt. Replaces the process-level
+    /// `RECURSIVE_SYSTEM_PROMPT` base for this run only. Servers that
+    /// honour it keep assembling their own project context / skill index
+    /// on top, so this is a *business* prompt, never end-user input.
+    /// `forwardedProps.systemPrompt` is accepted as an alias for clients
+    /// that can only ship opaque app data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Issue #68: appended after the effective base prompt instead of
+    /// replacing it. Ignored when `system_prompt` is also provided
+    /// (same precedence as the REST channels).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_system_prompt: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]

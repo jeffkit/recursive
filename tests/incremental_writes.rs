@@ -28,15 +28,56 @@ fn workspace() -> std::path::PathBuf {
 struct HomePin {
     _dir: tempfile::TempDir,
     _pin: PinnedRecursiveHome,
+    /// `RECURSIVE_SESSIONS_DIR` is a hard override that beats
+    /// `RECURSIVE_HOME`; without pinning it, a host-level value
+    /// routes sessions into a shared directory and cross-test
+    /// transcripts bleed into every assertion.
+    _sessions: PinnedSessionsDir,
 }
 
 impl HomePin {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let pin = PinnedRecursiveHome::new(dir.path());
+        let sessions = PinnedSessionsDir::new(dir.path().join("sessions"), &pin);
         Self {
             _dir: dir,
             _pin: pin,
+            _sessions: sessions,
+        }
+    }
+}
+
+/// Guard that redirects `RECURSIVE_SESSIONS_DIR` for its lifetime.
+/// Borrows the `PinnedRecursiveHome` to prove the global env lock is
+/// already held (that guard must be created first).
+struct PinnedSessionsDir {
+    prev: Option<std::ffi::OsString>,
+    _pin: std::marker::PhantomData<fn() -> PinnedRecursiveHome>,
+}
+
+impl PinnedSessionsDir {
+    fn new(path: std::path::PathBuf, _held: &PinnedRecursiveHome) -> Self {
+        let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        // SAFETY: the env lock is held by `_held`.
+        unsafe {
+            std::env::set_var("RECURSIVE_SESSIONS_DIR", path.as_os_str());
+        }
+        Self {
+            prev,
+            _pin: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for PinnedSessionsDir {
+    fn drop(&mut self) {
+        // SAFETY: still under the env lock held by the paired HomePin.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+            }
         }
     }
 }

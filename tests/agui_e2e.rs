@@ -182,6 +182,8 @@ fn input_with(thread: &str, run: &str, messages: Vec<Message>) -> RunAgentInput 
         state: None,
         interrupt_before: None,
         forwarded_props: None,
+        system_prompt: None,
+        append_system_prompt: None,
     }
 }
 
@@ -479,6 +481,71 @@ async fn agui_endpoint_multiple_runs_no_checkpoint_post() {
     }
 }
 
+/// Issue #68 acceptance: two threads on the same process, each sending a
+/// different per-request `system_prompt`, must each see their own prompt
+/// in the provider request (per-request isolation, no cross-talk).
+#[tokio::test]
+async fn agui_per_request_system_prompt_isolated_per_thread() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    let provider = Arc::new(MockProvider::new(vec![
+        Completion {
+            content: "alpha ack".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "beta ack".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ]));
+
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider.clone()).await;
+    let client = AguiClient::new(endpoint);
+
+    let mut alpha = input_with("tenant-alpha", "a-0", vec![user_msg("u1", "hi")]);
+    alpha.system_prompt = Some("ALPHA PROMPT".into());
+    let mut beta = input_with("tenant-beta", "b-0", vec![user_msg("u1", "hi")]);
+    // forwardedProps alias carries the beta prompt.
+    beta.forwarded_props = Some(serde_json::json!({"systemPrompt": "BETA PROMPT"}));
+
+    for input in [alpha, beta] {
+        let mut rx = client.run(input).await.expect("run");
+        while rx.recv().await.is_some() {}
+    }
+
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 2, "expected two provider calls");
+    let sys_of = |call: &[recursive::message::Message]| {
+        call.iter()
+            .find(|m| m.role == recursive::message::Role::System)
+            .map(|m| m.content.clone())
+            .expect("system message present")
+    };
+    let (sys_a, sys_b) = (sys_of(&calls[0]), sys_of(&calls[1]));
+    assert!(
+        sys_a.contains("ALPHA PROMPT") && !sys_a.contains("BETA PROMPT"),
+        "thread alpha must see only its own prompt; got: {sys_a}"
+    );
+    assert!(
+        sys_b.contains("BETA PROMPT") && !sys_b.contains("ALPHA PROMPT"),
+        "thread beta must see only its own prompt; got: {sys_b}"
+    );
+    // Server-owned default prompt text from the fixture ("You are a test
+    // assistant.") must NOT leak into either override.
+    assert!(
+        !sys_a.contains("You are a test assistant.")
+            && !sys_b.contains("You are a test assistant."),
+        "per-request prompt replaces the process-level one; got: {sys_a} / {sys_b}"
+    );
+}
+
 fn event_name(ev: &Event) -> &'static str {
     match ev {
         Event::RunStarted(_) => "RunStarted",
@@ -769,7 +836,10 @@ async fn agui_interrupt_resume_round_trips_through_the_native_session() {
         state: None,
         interrupt_before: None,
         forwarded_props: None,
+        system_prompt: None,
+        append_system_prompt: None,
     };
+
     let mut rx = client.run(input).await.expect("run 1");
     let mut interrupt_id = String::new();
     while let Some(ev) = rx.recv().await {
@@ -826,7 +896,10 @@ async fn agui_interrupt_resume_round_trips_through_the_native_session() {
         state: None,
         interrupt_before: None,
         forwarded_props: None,
+        system_prompt: None,
+        append_system_prompt: None,
     };
+
     let mut rx2 = client.run(resume_input).await.expect("resume run");
     while let Some(ev) = rx2.recv().await {
         if let Event::RunFinished(f) = ev {

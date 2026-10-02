@@ -191,6 +191,8 @@ async fn handle_command(
                 state: None,
                 interrupt_before: None,
                 forwarded_props: None,
+                system_prompt: None,
+                append_system_prompt: None,
             };
             start_run(client, app, current_rx, input).await;
         }
@@ -210,6 +212,8 @@ async fn handle_command(
                 state: None,
                 interrupt_before: None,
                 forwarded_props: None,
+                system_prompt: None,
+                append_system_prompt: None,
             };
             start_run(client, app, current_rx, input).await;
         }

@@ -1528,10 +1528,55 @@ pub(super) async fn agui_run(
         )
     })?;
 
+    // Issue #68: per-request system prompt. Priority: explicit
+    // `systemPrompt` field > `forwardedProps.systemPrompt` (the standard
+    // AG-UI slot for app data) > process-level `state.config.system_prompt`;
+    // `appendSystemPrompt` (either form) appends instead of replacing and
+    // is ignored when a replace-level prompt was given — the same fallback
+    // chain the REST channels (`/run`, `/sessions`) already implement.
+    // This is *business/tenant* configuration (the caller is the C-end
+    // integrator), not end-user input; `assemble_system_prompt` still
+    // appends project context + the coordinator note on top, and the skill
+    // catalog ships per-turn as a system-reminder, so the server-owned
+    // prompt parts cannot be overridden from the request body.
+    let request_prompt = input
+        .system_prompt
+        .clone()
+        .or_else(|| forwarded_props_str(&input, "systemPrompt"))
+        .or_else(|| {
+            input
+                .state
+                .as_ref()
+                .and_then(|s| s.get("systemPrompt"))
+                .and_then(|v| v.as_str().map(str::to_string))
+        });
+    let request_append = input
+        .append_system_prompt
+        .clone()
+        .or_else(|| forwarded_props_str(&input, "appendSystemPrompt"))
+        .or_else(|| {
+            input
+                .state
+                .as_ref()
+                .and_then(|s| s.get("appendSystemPrompt"))
+                .and_then(|v| v.as_str().map(str::to_string))
+        });
+    let base_prompt = match request_prompt {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            let mut p = state.config.system_prompt.clone();
+            if let Some(extra) = request_append {
+                p.push('\n');
+                p.push_str(&extra);
+            }
+            p
+        }
+    };
+
     // Common system-prompt assembly: project context + skill index +
     // coordinator/sub_agent note (when enabled).
     let assembled_system_prompt = crate::assemble_system_prompt(
-        &state.config.system_prompt,
+        &base_prompt,
         &state.config.workspace,
         &state.skills,
         state.config.subagent_enabled,
@@ -1546,6 +1591,14 @@ pub(super) async fn agui_run(
             }),
         )
     })?;
+    // Issue #31 §2: inject the `<environment>` segment only when the
+    // session's transport is a real sandbox (non-local capabilities) —
+    // same parity the REST channels apply.
+    let (system_prompt, prompt_segments) = inject_environment_segment(
+        assembled_system_prompt.full,
+        assembled_system_prompt.segments,
+        &tool_registry,
+    );
 
     let (runtime, hooks) = super::agui::build_agui_runtime(
         &state.config.workspace,
@@ -1553,8 +1606,8 @@ pub(super) async fn agui_run(
         super::agui::AguiRuntimeDeps {
             llm: state.provider.clone(),
             tool_registry,
-            system_prompt: assembled_system_prompt.full,
-            prompt_segments: assembled_system_prompt.segments,
+            system_prompt,
+            prompt_segments,
             max_steps: state.config.max_steps,
             seed_transcript: prepared.seed_transcript,
             interrupt_before: input.interrupt_before.as_deref().unwrap_or(&[]),
@@ -1621,6 +1674,18 @@ pub(super) async fn agui_run(
             .interval(Duration::from_secs(30))
             .text("heartbeat"),
     ))
+}
+
+/// Read a string field out of `input.forwardedProps` (issue #68) — the
+/// AG-UI-spec slot for app-provided data, which the server previously
+/// parsed and dropped.
+fn forwarded_props_str(input: &agui_protocol::RunAgentInput, key: &str) -> Option<String> {
+    input
+        .forwarded_props
+        .as_ref()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// SSE body wrapper that cancels an in-flight AG-UI run when the response
@@ -2091,6 +2156,370 @@ mod tests {
             .await
             .expect_err("expected SERVICE_UNAVAILABLE");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Issue #68: /agui per-request system prompt ────────────────────
+
+    /// Shared fixture for the issue-#68 acceptance tests: a full AppState
+    /// with a MockProvider that records the messages it was shown, wired
+    /// through the real router so `POST /agui` is exercised end-to-end.
+    /// `config_system_prompt` becomes the process-level fallback prompt.
+    ///
+    /// Returns (base_url, provider, workspace_dir). The caller must keep
+    /// the workspace tempdir alive for the duration of the test.
+    /// (clippy::await_holding_lock: the std env guard spans the two
+    /// `TcpListener::bind`-adjacent awaits inside this test helper; the
+    /// lock is a std Mutex held by the same-crate test task only.)
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_prompt_fixture(
+        config_system_prompt: &str,
+    ) -> (url::Url, Arc<crate::llm::MockProvider>, tempfile::TempDir) {
+        let _env = crate::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        std::env::set_var("RECURSIVE_HOME", home.path());
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
+
+        let config = crate::config::Config::from_env().expect("config");
+        // from_env builds the process-level prompt from the default
+        // template + memory layers; pin the *base* we assert against by
+        // overwriting it after construction (same as the handler reads it).
+        let mut config = config;
+        config.system_prompt =
+            format!("{config_system_prompt}\n\n---\n\n# Memory summary\n\n- process-level marker");
+
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            crate::llm::Completion::default(),
+        ]));
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let state = AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: provider.clone(),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics,
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(100, 1.0),
+            skills: vec![],
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-agui-prompt-test-{}", std::process::id())),
+            )),
+        };
+        let app = crate::http::build_router_with_auth_and_rate_limit(
+            state,
+            crate::http::auth::AuthConfig::default(),
+            crate::http::RateLimiter::new(100, 1.0),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let base = url::Url::parse(&format!("http://{addr}")).expect("base url");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (base, provider, ws)
+    }
+
+    /// POST one /agui run and drain the SSE body.
+    async fn agui_post(base: &url::Url, body: serde_json::Value) {
+        let client = reqwest::Client::new();
+        let url = base.join("agui").expect("agui url");
+        let resp = client
+            .post(url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .expect("post /agui");
+        assert!(resp.status().is_success(), "POST /agui failed: {resp:?}");
+        let _ = resp.bytes().await.expect("sse body");
+    }
+
+    /// The system message the provider received for the single run.
+    fn assert_system_msg(provider: &crate::llm::MockProvider) -> String {
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1, "expected exactly one provider call");
+        calls[0]
+            .iter()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.content.clone())
+            .expect("provider request must carry a system message")
+    }
+
+    /// Acceptance 1a: `systemPrompt` on the request body overrides the
+    /// process-level prompt.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_explicit_system_prompt_overrides_process_level() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-PROMPT-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-a",
+                "runId": "r1",
+                "systemPrompt": "TENANT-A CUSTOM PROMPT",
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("TENANT-A CUSTOM PROMPT"),
+            "explicit systemPrompt must reach the provider; got: {sys}"
+        );
+        assert!(
+            !sys.contains("PROCESS-LEVEL-PROMPT-MARKER"),
+            "process-level prompt must be fully replaced, not appended; got: {sys}"
+        );
+    }
+
+    /// Acceptance 1b: `forwardedProps.systemPrompt` — the standard AG-UI
+    /// slot for app data, previously parsed and dropped — also overrides.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_forwarded_props_system_prompt_overrides_process_level() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-PROMPT-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-b",
+                "runId": "r1",
+                "forwardedProps": {"systemPrompt": "TENANT-B FORWARDED PROMPT"},
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("TENANT-B FORWARDED PROMPT"),
+            "forwardedProps.systemPrompt must reach the provider; got: {sys}"
+        );
+        assert!(
+            !sys.contains("PROCESS-LEVEL-PROMPT-MARKER"),
+            "process-level prompt must be replaced; got: {sys}"
+        );
+    }
+
+    /// Acceptance 1c: `state.systemPrompt` is the last override slot.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_state_system_prompt_overrides_process_level() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-PROMPT-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-c",
+                "runId": "r1",
+                "state": {"systemPrompt": "TENANT-C STATE PROMPT"},
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("TENANT-C STATE PROMPT"),
+            "state.systemPrompt must reach the provider; got: {sys}"
+        );
+    }
+
+    /// Acceptance 1d: no prompt in the request → process-level prompt,
+    /// byte-identical to the pre-#68 behaviour (plus the assembled
+    /// layers the handler always appends).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_without_request_prompt_falls_back_to_process_level() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-FALLBACK-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-d",
+                "runId": "r1",
+                "forwardedProps": {"someAppData": {"unrelated": true}},
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("PROCESS-LEVEL-FALLBACK-MARKER"),
+            "no request prompt → process-level prompt must be used; got: {sys}"
+        );
+        assert!(
+            !sys.contains("someAppData"),
+            "unrelated forwardedProps must not leak into the prompt; got: {sys}"
+        );
+    }
+
+    /// Acceptance 1e: `appendSystemPrompt` appends to the process-level
+    /// prompt instead of replacing it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_append_system_prompt_appends_to_process_level() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-FALLBACK-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-e",
+                "runId": "r1",
+                "appendSystemPrompt": "EXTRA APPENDED RULES",
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("PROCESS-LEVEL-FALLBACK-MARKER"),
+            "append keeps the process-level base; got: {sys}"
+        );
+        assert!(
+            sys.contains("EXTRA APPENDED RULES"),
+            "appended text must be present; got: {sys}"
+        );
+        // Append lands at the very end of the base (after the memory
+        // layers folded in at config build time) — identical to the
+        // `/run` / `/sessions` append semantics.
+        let append_pos = sys.find("EXTRA APPENDED RULES").expect("append present");
+        let layer_pos = sys
+            .find("process-level marker")
+            .expect("base memory layer present");
+        assert!(
+            append_pos > layer_pos,
+            "append must come after the base prompt content"
+        );
+    }
+
+    /// Acceptance 2: two threads, different prompts, same process — each
+    /// run's provider request carries its OWN prompt (per-request
+    /// isolation, no cross-talk through the shared config).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_two_threads_different_prompts_are_isolated() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-PROMPT-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "tenant-alpha",
+                "runId": "r1",
+                "systemPrompt": "ALPHA PROMPT",
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "tenant-beta",
+                "runId": "r2",
+                "systemPrompt": "BETA PROMPT",
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "expected two provider calls");
+        let sys_of = |call: &[crate::message::Message]| {
+            call.iter()
+                .find(|m| m.role == Role::System)
+                .map(|m| m.content.clone())
+                .expect("system message")
+        };
+        let (sys_a, sys_b) = (sys_of(&calls[0]), sys_of(&calls[1]));
+        assert!(
+            sys_a.contains("ALPHA PROMPT") && !sys_a.contains("BETA PROMPT"),
+            "thread alpha must see only its own prompt; got: {sys_a}"
+        );
+        assert!(
+            sys_b.contains("BETA PROMPT") && !sys_b.contains("ALPHA PROMPT"),
+            "thread beta must see only its own prompt; got: {sys_b}"
+        );
+    }
+
+    /// Acceptance 3: the server-owned suffix that `assemble_system_prompt`
+    /// appends (project-context rules; skills ship per-turn as a reminder,
+    /// represented here by the memory-layer text) must survive a
+    /// request-level prompt override.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn agui_request_prompt_cannot_drop_server_owned_segments() {
+        // Plant an AGENTS.md in the workspace so prepend_project_context
+        // contributes its `# Project context` segment.
+        let (base, provider, ws) = agui_prompt_fixture("PROCESS-LEVEL-PROMPT-MARKER").await;
+        std::fs::write(
+            ws.path().join("AGENTS.md"),
+            "PROJECT CONTEXT SENTINEL FROM AGENTS MD",
+        )
+        .expect("write AGENTS.md");
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-g",
+                "runId": "r1",
+                "systemPrompt": "TENANT-G CUSTOM PROMPT",
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("TENANT-G CUSTOM PROMPT"),
+            "override must apply; got: {sys}"
+        );
+        assert!(
+            sys.contains("PROJECT CONTEXT SENTINEL FROM AGENTS MD"),
+            "server-assembled project context must survive the override; got: {sys}"
+        );
+        // The process-level config text was REPLACED (that is the point of
+        // the override) — assert the tenant prompt sits where the base was.
+        assert!(
+            sys.find("# Project context").is_some(),
+            "project-context header must be present; got: {sys}"
+        );
+    }
+
+    /// Protocol level: unknown-tolerance is preserved — a payload WITHOUT
+    /// the new fields round-trips exactly as before, and `systemPrompt`
+    /// serialises as camelCase.
+    #[test]
+    fn run_agent_input_prompt_fields_camel_case_and_backward_compatible() {
+        use agui_protocol::RunAgentInput;
+        let old = serde_json::json!({
+            "threadId": "t",
+            "runId": "r",
+            "messages": [],
+            "tools": [],
+            "context": [],
+        });
+        let parsed: RunAgentInput = serde_json::from_value(old.clone()).expect("old payload");
+        assert!(parsed.system_prompt.is_none());
+        assert!(parsed.append_system_prompt.is_none());
+        // Round-trip: no new keys appear when unset (byte-compat serialise).
+        let back = serde_json::to_value(&parsed).expect("serialise");
+        assert_eq!(back, old, "unset prompt fields must not appear");
+        // New fields serialise camelCase.
+        let with_prompt: RunAgentInput = serde_json::from_value(serde_json::json!({
+            "threadId": "t", "runId": "r",
+            "messages": [], "tools": [], "context": [],
+            "systemPrompt": "s", "appendSystemPrompt": "a",
+        }))
+        .expect("new payload");
+        assert_eq!(with_prompt.system_prompt.as_deref(), Some("s"));
+        assert_eq!(with_prompt.append_system_prompt.as_deref(), Some("a"));
     }
 
     // ── Goal-280: clear_goal returns 409 when runtime busy ────────────
@@ -3159,7 +3588,6 @@ mod tests {
                 .any(|m| matches!(m.role, crate::message::Role::Tool)),
             "no tool-role messages expected"
         );
-
         std::env::remove_var("RECURSIVE_WORKSPACE");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");
         if let Some(v) = saved_sessions_dir {
@@ -3266,7 +3694,6 @@ mod tests {
         let home = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
         std::env::set_var("RECURSIVE_HOME", home.path());
-        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
@@ -3363,8 +3790,5 @@ mod tests {
             "deltas must carry the answer exactly once — no duplicated final message"
         );
         assert!(saw_run_finished, "stream must end with RunFinished");
-
-        std::env::remove_var("RECURSIVE_WORKSPACE");
-        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
     }
 }
