@@ -386,10 +386,7 @@ impl HttpSkillSource {
     /// operators get a precise error instead of a panic at startup.
     pub fn new(url: impl Into<String>, allowed_hosts: Option<Vec<String>>) -> Self {
         let url = url.into();
-        let config_error = match Self::validate(&url, allowed_hosts.as_deref()) {
-            Ok(()) => None,
-            Err(e) => Some(e),
-        };
+        let config_error = Self::validate(&url, allowed_hosts.as_deref()).err();
         Self {
             url,
             allowed_hosts,
@@ -457,8 +454,7 @@ impl HttpSkillSource {
             return Err(err.clone());
         }
         let body = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(fetch_remote_index(&self.url, self.timeout))
+            tokio::runtime::Handle::current().block_on(fetch_remote_index(&self.url, self.timeout))
         })?;
         let index: RemoteSkillIndex = serde_json::from_slice(&body)
             .map_err(|e| HttpSkillSourceError::Parse(format!("invalid skill index JSON: {e}")))?;
@@ -484,16 +480,12 @@ async fn fetch_remote_index(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| HttpSkillSourceError::Request(format!("failed to build client: {e}")))?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            // Strip the request URL — the error text can surface in logs far
-            // from the operator config.
-            let e = e.without_url();
-            HttpSkillSourceError::Request(format!("request failed: {e}"))
-        })?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        // Strip the request URL — the error text can surface in logs far
+        // from the operator config.
+        let e = e.without_url();
+        HttpSkillSourceError::Request(format!("request failed: {e}"))
+    })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(HttpSkillSourceError::Request(format!(
@@ -2800,24 +2792,28 @@ mod tests {
 
     #[test]
     fn http_skill_source_allowlist_is_case_and_trailing_dot_insensitive() {
-        fn guard(url: &str, entry: &str) -> bool {
-            // Only the config gate is exercised — no network. A *matching*
-            // pair proceeds to the network path, which fails with Request
-            // (connection refused / DNS); any Disallowed means the gate
-            // rejected it.
-            !matches!(
-                HttpSkillSource::new(url, Some(vec![entry.to_string()])).load_skills(),
+        // Only the config gate is exercised — no network, no runtime.
+        fn disallowed(url: &str, entry: &str) -> bool {
+            matches!(
+                HttpSkillSource::validate(url, Some(&[entry.to_string()])),
                 Err(HttpSkillSourceError::Disallowed(_))
             )
         }
-        assert!(guard("https://SKILLS.Example.COM./x.json", "skills.example.com"));
-        assert!(guard("https://skills.example.com/x.json", "SKILLS.EXAMPLE.COM"));
-        assert!(guard(
+        // Match: case-insensitive both sides, trailing dot, default port.
+        assert!(!disallowed(
+            "https://SKILLS.Example.COM./x.json",
+            "skills.example.com"
+        ));
+        assert!(!disallowed(
+            "https://skills.example.com/x.json",
+            "SKILLS.EXAMPLE.COM"
+        ));
+        assert!(!disallowed(
             "https://skills.example.com:443/x.json",
             "skills.example.com"
         ));
         // A non-default port makes it a different origin.
-        assert!(!guard(
+        assert!(disallowed(
             "https://skills.example.com:8443/x.json",
             "skills.example.com"
         ));
@@ -2858,34 +2854,43 @@ mod tests {
             stream.flush().unwrap();
         });
 
-        // The https-only gate only allows https URLs, so the loopback mock is
-        // driven through the parse path via a loaded source built by hand:
-        // construct with an https URL (passes the gate), then point the fetch
-        // at the mock by overriding the internal URL through a
-        // same-shape test double — simplest honest seam is to replicate
-        // load_skills' fetch+parse against the mock and assert the mapping.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Drive the same request the source would make (plain http client,
-        // no TLS, loopback mock) and reuse the parsing via skill_from_content
-        // semantics by calling load_skills on a source whose config gate is
-        // bypassed for the test: we test `parse_index` behavior through the
-        // public parse result instead — build the source against the https
-        // URL form of the mock to prove the gate rejects it, and validate
-        // the entry→Skill mapping with the standalone mapping helper.
+        // Full fetch+parse round-trip against the loopback mock. The https
+        // gate itself is pinned by the construction-time tests above, so the
+        // request here goes straight to the shared fetch helper (plain http,
+        // loopback — no TLS in tests).
+        let body = super::fetch_remote_index(
+            &format!("http://{addr}/index.json"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("loopback mock must serve the index");
         handle.join().ok();
 
-        // The mapping layer (entry → content-backed Skill) pinned directly:
-        let skills = super::skills_from_remote_entries(vec![
+        let index: super::RemoteSkillIndex =
+            serde_json::from_slice(&body).expect("mock body must be valid index JSON");
+
+        // The mapping layer (entry → content-backed Skill):
+        let skills = super::skills_from_remote_entries(index.skills);
+        assert_eq!(skills.len(), 2, "duplicate + blank names dropped");
+        let pdf = skills.iter().find(|s| s.name == "pdf").unwrap();
+        assert_eq!(pdf.description, "PDF handling");
+        assert_eq!(extract_skill_body(pdf.body.as_deref().unwrap()), "PDF body");
+        let sql = skills.iter().find(|s| s.name == "sql").unwrap();
+        // description injected as frontmatter when content has none
+        assert_eq!(sql.description, "SQL helper");
+        assert_eq!(
+            extract_skill_body(sql.body.as_deref().unwrap()),
+            "## Usage\n\nRun queries."
+        );
+        assert!(sql.body.is_some(), "remote skills must be content-backed");
+        assert!(pdf.refs.is_empty() && pdf.scripts.is_empty());
+
+        // Mapping edge cases (duplicate keep-first, blank-name skip):
+        let mapped = super::skills_from_remote_entries(vec![
             super::RemoteSkillEntry {
                 name: "pdf".into(),
-                content: "---\nname: pdf\ndescription: PDF handling\n---\n\nPDF body".into(),
+                content: "first".into(),
                 description: None,
-            },
-            super::RemoteSkillEntry {
-                name: "sql".into(),
-                content: "## Usage\n\nRun queries.".into(),
-                description: Some("SQL helper".into()),
             },
             super::RemoteSkillEntry {
                 name: "pdf".into(),
@@ -2898,22 +2903,11 @@ mod tests {
                 description: None,
             },
         ]);
-        assert_eq!(skills.len(), 2, "duplicate + blank names dropped");
-        let pdf = skills.iter().find(|s| s.name == "pdf").unwrap();
-        assert_eq!(pdf.description, "PDF handling");
+        assert_eq!(mapped.len(), 1, "duplicate + blank names dropped");
         assert_eq!(
-            extract_skill_body(pdf.body.as_deref().unwrap()),
-            "PDF body"
+            extract_skill_body(mapped[0].body.as_deref().unwrap()),
+            "first"
         );
-        let sql = skills.iter().find(|s| s.name == "sql").unwrap();
-        // description injected as frontmatter when content has none
-        assert_eq!(sql.description, "SQL helper");
-        assert_eq!(
-            extract_skill_body(sql.body.as_deref().unwrap()),
-            "## Usage\n\nRun queries."
-        );
-        assert!(sql.body.is_some(), "remote skills must be content-backed");
-        assert!(pdf.refs.is_empty() && pdf.scripts.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2993,16 +2987,19 @@ mod tests {
             std::time::Duration::from_secs(2),
         )
         .await;
-        assert!(err.is_err(), "dead endpoint must error");
+        assert!(
+            matches!(err, Err(HttpSkillSourceError::Request(_))),
+            "dead endpoint must yield a Request error: {err:?}"
+        );
 
-        // The SkillSource::skills degradation contract: Request errors (any
-        // I/O failure) map to an empty catalog, never a panic. Drive it via
-        // the same error value shape.
-        let skills: Vec<Skill> = match err {
-            Err(_) => Vec::new(),
-            Ok(_) => unreachable!("dead endpoint cannot produce Ok"),
-        };
-        assert!(skills.is_empty());
+        // The SkillSource::skills degradation contract: I/O failure maps to
+        // an empty catalog, never a panic. Drive it through the real impl —
+        // a source configured for the dead endpoint has no config error, so
+        // skills() exercises the full fetch → fail → degrade path.
+        let source = HttpSkillSource::new(format!("https://{addr}/index.json"), None);
+        assert!(source.config_error.is_none());
+        let skills: Vec<Skill> = source.skills();
+        assert!(skills.is_empty(), "degraded source must serve no skills");
     }
 
     #[test]
@@ -3013,7 +3010,10 @@ mod tests {
         );
         let debug = format!("{source:?}");
         assert!(debug.contains("HttpSkillSource"), "{debug}");
-        assert_eq!(source.allowed_hosts(), Some(&["skills.example.com".to_string()][..]));
+        assert_eq!(
+            source.allowed_hosts(),
+            Some(&["skills.example.com".to_string()][..])
+        );
 
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<HttpSkillSource>();
