@@ -27,13 +27,29 @@ plus a CI feature-matrix guard so it cannot rot again.
   `cargo clippy --lib --no-default-features [features] -- -D warnings`.
 
 ## Tests added
-None (build/CI-guard fix; the guard itself is the test surface).
+- `src/session/writer.rs::create_in_same_second_gets_distinct_dirs` —
+  regression pin for the session-id collision fix (second `create` within the
+  same second must get its own directory, not silently reuse the first's
+  transcript).
 
 ## Notes
 - README:38-39 promise is now true again (bare kernel builds, clippy-clean);
   no README change needed.
 - Verified locally: all 8 combos `cargo check` + `clippy -D warnings` green;
   full `cargo clippy --all-targets --all-features -D warnings` green;
-  `cargo test --workspace` 47 result lines, 0 failures; `cargo fmt --check` ok.
+  `cargo test --workspace` green across repeated runs; `cargo fmt --check` ok.
+- Continuation pass (2026-10-02): full-suite `cargo test --workspace` exposed
+  3–4 `incremental_writes` / `resume_by_id` failures that were NOT caused by
+  the feature fix but by `RECURSIVE_SESSIONS_DIR` (hard override, Goal-H J1)
+  leaking the pipeline env into every writer + same-second session-id
+  collisions. Fixed the same way main did in 4e4ab6b6:
+  - `src/session/writer.rs` — session ids get a random 8-hex suffix when the
+    timestamped directory already exists (real product bug: silent merge of
+    two sessions created in the same second);
+  - `src/test_util.rs` — `PinnedRecursiveHome` / `IsolatedWorkspace` also pin
+    `RECURSIVE_SESSIONS_DIR` under the same `env_lock`;
+  - `tests/resume_by_id.rs` — `SessionEnvGuard` pins both vars;
+  - `src/config.rs` — `from_env_injects_memory_and_scratchpad_layers` pins
+    `RECURSIVE_SESSIONS_DIR` for its span (episodic recent-N window).
 - Long-term follow-ups stay in #53/#54 (make acp/schema optional so the bare
   kernel is actually minimal, not just compilable).

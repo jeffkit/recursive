@@ -50,6 +50,7 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 pub struct PinnedRecursiveHome {
     _guard: MutexGuard<'static, ()>,
     prev: Option<std::ffi::OsString>,
+    prev_sessions_dir: Option<std::ffi::OsString>,
 }
 
 impl PinnedRecursiveHome {
@@ -61,9 +62,21 @@ impl PinnedRecursiveHome {
         unsafe {
             std::env::set_var("RECURSIVE_HOME", path.as_ref().as_os_str());
         }
+        // `RECURSIVE_SESSIONS_DIR` is a HARD override in
+        // `paths::user_sessions_dir` that beats `RECURSIVE_HOME`
+        // (Goal-H J1). A value leaked from the surrounding process
+        // (CI harness, dev shell) would defeat this guard's isolation
+        // by redirecting every session write into one shared tree, so
+        // pin it out of the way for the guard's lifetime.
+        let prev_sessions_dir = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        // SAFETY: env lock held (see above).
+        unsafe {
+            std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        }
         Self {
             _guard: guard,
             prev,
+            prev_sessions_dir,
         }
     }
 }
@@ -75,6 +88,10 @@ impl Drop for PinnedRecursiveHome {
             match self.prev.take() {
                 Some(v) => std::env::set_var("RECURSIVE_HOME", v),
                 None => std::env::remove_var("RECURSIVE_HOME"),
+            }
+            match self.prev_sessions_dir.take() {
+                Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
             }
         }
     }
@@ -249,7 +266,8 @@ impl Drop for PinnedTeamsDir {
 }
 
 /// One-stop helper: a workspace tempdir paired with a `RECURSIVE_HOME`
-/// pinned at a sibling tempdir, both alive for the bundle's lifetime.
+/// pinned at a sibling tempdir and `RECURSIVE_SESSIONS_DIR` pinned inside
+/// that home, all alive for the bundle's lifetime.
 ///
 /// Use this in any test that calls into code which resolves paths via
 /// `crate::paths::user_*` (e.g. `ShadowRepo::open`, `SessionWriter`,
@@ -257,19 +275,26 @@ impl Drop for PinnedTeamsDir {
 /// `RECURSIVE_HOME` or `HOME` to *their* tempdirs (and then drop them)
 /// can corrupt path resolution mid-test.
 ///
+/// The `RECURSIVE_SESSIONS_DIR` pin is required since Goal-H J1: that
+/// variable is a *hard* override that beats `RECURSIVE_HOME`, so a value
+/// inherited from the surrounding environment (e2e harnesses, self-improve
+/// pipelines) would silently redirect every `SessionWriter` into one
+/// shared root shared with unrelated runs. Pinning it inside the isolated
+/// home keeps `user_sessions_dir` fully hermetic.
+///
 /// `path()` returns the workspace dir — the part the test usually
 /// wants. Drop order: workspace tempdir → home tempdir → env unpin
 /// (releases the global env lock last).
 pub struct IsolatedWorkspace {
     workspace: tempfile::TempDir,
     _home: tempfile::TempDir,
-    _pin: PinnedRecursiveHome,
+    _pin: SessionEnvPins,
 }
 
 impl IsolatedWorkspace {
     pub fn new() -> Self {
         let home = tempfile::tempdir().expect("home tempdir");
-        let pin = PinnedRecursiveHome::new(home.path());
+        let pin = SessionEnvPins::new(home.path());
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         Self {
             workspace,
@@ -286,6 +311,51 @@ impl IsolatedWorkspace {
 impl Default for IsolatedWorkspace {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pin `RECURSIVE_HOME` and `RECURSIVE_SESSIONS_DIR` under a single
+/// `env_lock` acquisition (the lock is not re-entrant, so both variables
+/// must be set by one guard). Restores both on drop.
+struct SessionEnvPins {
+    _guard: MutexGuard<'static, ()>,
+    prev_home: Option<std::ffi::OsString>,
+    prev_sessions: Option<std::ffi::OsString>,
+}
+
+impl SessionEnvPins {
+    fn new(home: impl AsRef<std::path::Path>) -> Self {
+        let guard = env_lock();
+        let home = home.as_ref();
+        let prev_home = std::env::var_os("RECURSIVE_HOME");
+        let prev_sessions = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        // SAFETY: `set_var` is process-global; we hold the env lock so
+        // no other test mutates env concurrently.
+        unsafe {
+            std::env::set_var("RECURSIVE_HOME", home.as_os_str());
+            std::env::set_var("RECURSIVE_SESSIONS_DIR", home.join("sessions").as_os_str());
+        }
+        Self {
+            _guard: guard,
+            prev_home,
+            prev_sessions,
+        }
+    }
+}
+
+impl Drop for SessionEnvPins {
+    fn drop(&mut self) {
+        // SAFETY: still hold the env lock until `_guard` drops after this.
+        unsafe {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+                None => std::env::remove_var("RECURSIVE_HOME"),
+            }
+            match self.prev_sessions.take() {
+                Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+            }
+        }
     }
 }
 

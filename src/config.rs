@@ -3115,6 +3115,20 @@ api_key = "sk-from-file"
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
 
+        // RECURSIVE_SESSIONS_DIR (Goal-H J1) is a hard override that beats
+        // RECURSIVE_HOME; an ambient value (e2e / pipeline env) would point
+        // episodic_recall_summary at a shared root and push this test's
+        // session out of the recent-N window. Pin it for this span — the
+        // env lock is already held above.
+        let prev_sessions = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        // SAFETY: env lock is held via `_env_lock`.
+        unsafe {
+            std::env::set_var(
+                "RECURSIVE_SESSIONS_DIR",
+                tmp.path().join("sessions").as_os_str(),
+            );
+        }
+
         let ws = tempfile::tempdir().expect("workspace");
         let mem_path = crate::tools::memory::memory_path(ws.path());
         if let Some(parent) = mem_path.parent() {
@@ -3229,6 +3243,13 @@ api_key = "sk-from-file"
         match orig_ws {
             Some(v) => std::env::set_var("RECURSIVE_WORKSPACE", v),
             None => std::env::remove_var("RECURSIVE_WORKSPACE"),
+        }
+        // SAFETY: env lock is still held via `_env_lock`.
+        unsafe {
+            match prev_sessions {
+                Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
+            }
         }
     }
 }
