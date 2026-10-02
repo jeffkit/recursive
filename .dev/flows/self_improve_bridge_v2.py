@@ -43,6 +43,7 @@ class StepTracker:
 
     node_timings[node_id] = {"total"/"runs"/"last"}——跨调用累计（修复环、评审环
     同一节点多轮各计一次），供「哪个环节最耗时」的数据回答。
+    v3 宿主另经 note_retry 落 node_retries 契约（值守判读重试次数）。
     """
 
     def __init__(self, state_path: Path):
@@ -75,6 +76,14 @@ class StepTracker:
                 e["runs"] += 1
                 e["last"] = dur
 
+        self._merge(mut)
+
+    def note_retry(self, node_id: str, count: int, why: str) -> None:
+        """v3 宿主：节点重试留痕（§5 契约：值守判读 node_retries）。"""
+        def mut(st):
+            t = st.setdefault("node_retries", {})
+            t[node_id] = {"count": count, "last_error": why[:200]}
+            st["last_failed_node"] = node_id
         self._merge(mut)
 
     def __call__(self, flow, node, result=None, exc=None):
@@ -146,25 +155,56 @@ def main() -> int:
     # 不触发（currentStep 恒 start、node_timings 恒空）、ex.context 恒空（nodes-dump
     # 恒空的根因）。实例化后必须走 clean()+execute() 才能吃到 handler（2026-10-01，
     # 最小 flow 实验实证 fired=[] vs 修后三节点全触发）。
-    ex = FlowExecution(callback_handlers=[_Adapter(StepTracker(state_path))])
-    verdict = None
-    try:
-        ex.clean()
-        result = ex.execute(fl, params={
-            "goal": goal, "repo": args.repo, "run_dir": str(run_dir),
-            "agent": args.agent, "reviewer": args.reviewer,
-        })
-        verdict = _verdict_of(result)
-    except Exception as e:  # 引擎级失败也要落 verdict，supervisor 才有终态
-        verdict = {"verdict": "engine_error", "why": f"{type(e).__name__}: {e}"[:500]}
-        (run_dir / "engine-error.log").write_text(str(e))
-    finally:
-        try:  # 节点结果全量落盘（调试/观测两用）
-            nodes = dict(ex.context).get("$NODE") or {}
+    handlers = [_Adapter(StepTracker(state_path))]
+    try:  # Langfuse 全链观测（§6 净增）：env 缺失时 fail-open
+        if os.environ.get("LANGFUSE_HOST"):
+            from plaita.obs import LangfuseCallback
+            handlers.append(LangfuseCallback())
+    except Exception:
+        pass
+
+    use_v3 = (not args.dry_run) and os.environ.get("RECURSIVE_HOST_V3") == "1" and m
+    nodes = None
+    if use_v3:
+        # v3 本地分布式宿主（DESIGN-local-distributed-host.md v2）：DISTRIBUTED
+        # 逐节点推进 + checkpoint 落 keeper 工件根 + 节点异常自动重试（超时类
+        # 除外）。checkpoint 跨派发可续（per-issue 单槽），终态不落盘。
+        from plaita.core.errors import FlowErrorException  # noqa: F401  宿主内捕获
+        issue_root = Path.home() / ".issue-keeper" / "pipeline" / f"recursive-{m.group(1)}"
+        verdict, nodes = run_host_v3(
+            flow_obj=fl,
+            handler_specs=[(StepTracker, state_path)],
+            params={"goal": goal, "repo": args.repo, "run_dir": str(run_dir),
+                    "agent": args.agent, "reviewer": args.reviewer},
+            issue_root=issue_root, run_dir=run_dir, state_path=state_path,
+            max_node_retries=int(os.environ.get("RECURSIVE_NODE_RETRIES", "1")),
+            deadline=os.environ.get("RECURSIVE_RUN_DEADLINE"),
+            langfuse=os.environ.get("LANGFUSE_HOST", "") != "")
+        verdict = _verdict_of(verdict)
+        try:
             (run_dir / "nodes-dump.json").write_text(
                 json.dumps(nodes, ensure_ascii=False, indent=1, default=str))
         except Exception:
             pass
+    else:
+        ex = FlowExecution(callback_handlers=handlers)
+        try:
+            ex.clean()
+            result = ex.execute(fl, params={
+                "goal": goal, "repo": args.repo, "run_dir": str(run_dir),
+                "agent": args.agent, "reviewer": args.reviewer,
+            })
+            verdict = _verdict_of(result)
+        except Exception as e:  # 引擎级失败也要落 verdict，supervisor 才有终态
+            verdict = {"verdict": "engine_error", "why": f"{type(e).__name__}: {e}"[:500]}
+            (run_dir / "engine-error.log").write_text(str(e))
+        finally:
+            try:  # 节点结果全量落盘（调试/观测两用）
+                nodes = dict(ex.context).get("$NODE") or {}
+                (run_dir / "nodes-dump.json").write_text(
+                    json.dumps(nodes, ensure_ascii=False, indent=1, default=str))
+            except Exception:
+                pass
     st = json.loads(state_path.read_text())
     st["status"] = "completed"
     st["verdict"] = verdict
@@ -198,6 +238,147 @@ def main() -> int:
             pass
     print(json.dumps(verdict, ensure_ascii=False))
     return 0 if verdict.get("verdict") in ("committed", "skip-commit") else 1
+
+
+# ═══ v3 本地分布式宿主（DESIGN-local-distributed-host.md v2 §2/§3/§4）═══════
+
+def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: Path,
+                state_path: Path, max_node_retries: int = 1,
+                deadline: str | None = None, langfuse: bool = False,
+                max_run_secs: int = 8 * 3600):
+    """v3 宿主循环：DISTRIBUTED 逐节点推进 + per-issue checkpoint + 节点异常重试。
+
+    可导入（harness s11-s17 直驱生产循环）。返回 (verdict_dict, nodes_dict)。
+    语义要点：fresh 首调必传 params（D1）；终态不落 checkpoint（R1/D2）；
+    worktree 闸（O2：被回收则丢弃 checkpoint 走 L1）；超时类异常不原地重试
+    （D4）；双宿主 flock（D6）；run 级 deadline 预算墙（O3/O5）。
+    """
+    import fcntl
+    import hashlib
+    from datetime import datetime
+    from importlib.metadata import version as _md_version
+    from plaita.core.callback import FlowCallback
+    from plaita.core.errors import FlowErrorException
+    from plaita.core.executor import FlowExecution
+
+    ckpt = issue_root / "checkpoint.json"
+    lock_path = run_dir / "host.lock"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    def _flow_hash() -> str:
+        try:
+            pv, nv = _md_version("plaita"), _md_version("plaita-nodes")
+        except Exception:
+            pv = nv = "?"
+        graph = "|".join(f"{n.id}:{n.node_type}:{getattr(n, 'next', None)}"
+                         for n in sorted(flow_obj.nodes, key=lambda x: x.id))
+        return hashlib.sha256(
+            f"{flow_obj.flow_id}|{graph}|{pv}|{nv}".encode()).hexdigest()[:16]
+
+    def _ckpt_save(ctx: dict, step_id: str) -> None:
+        tmp = ckpt.with_suffix(f".tmp-{os.getpid()}")          # tmp 掺 pid（D6）
+        tmp.write_text(json.dumps({
+            "flow_id": flow_obj.flow_id, "flow_hash": _flow_hash(),
+            "run_id": run_dir.name, "saved_at": time.time(),
+            "last_node": step_id, "context": ctx,
+        }, ensure_ascii=False, default=str))
+        tmp.rename(ckpt)                                        # 原子替换
+
+    def _ckpt_load() -> dict | None:
+        try:
+            raw = json.loads(ckpt.read_text())
+        except Exception:
+            return None                                          # 损坏/缺失 → L1
+        if raw.get("flow_hash") != _flow_hash():
+            return None                                          # 版本闸 → L1
+        if not (run_dir / "worktree").exists():
+            return None                                          # worktree 闸 → L1（O2）
+        return raw.get("context")
+
+    class _Adapter(FlowCallback):
+        def __init__(self, tracker, lf):
+            self.tracker = tracker
+            self.lf = lf
+
+        def on_node_start(self, flow, node, **kw):
+            self.tracker.on_node_start(flow, node)
+
+        def on_node_end(self, flow, node, result=None, error=None, exception=None, **kw):
+            self.tracker(flow, node, result)
+
+    def _handlers():
+        hs = []
+        for spec, arg in handler_specs:
+            t = spec(arg) if callable(spec) else spec
+            hs.append(_Adapter(t, langfuse))
+        if langfuse:
+            try:
+                hs.append(LangfuseCallback())
+            except Exception:
+                pass                                             # fail-open
+        return hs
+
+    def _tracker():
+        return StepTracker(state_path)
+
+    dl = float(deadline) if deadline else time.time() + max_run_secs
+    node_retries: dict[str, int] = {}
+    saved = _ckpt_load()
+    ex = FlowExecution(callback_handlers=_handlers())
+    nodes: dict = {}
+    verdict: dict = {}
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 双宿主设防（D6）
+        except BlockingIOError:
+            return {"verdict": "retry-later", "stage": "host",
+                    "why": "another v3 host holds host.lock"}, {}
+        while True:
+            if time.time() > dl:                                 # 预算墙（O3/O5）
+                verdict = {"verdict": "engine_error",
+                           "why": "run deadline exceeded (v3 host)",
+                           "node_retry_exhausted": True}
+                break
+            try:
+                if saved is not None:
+                    r = ex.run_distributed(flow_obj, saved_context=saved)
+                else:
+                    r = ex.run_distributed(flow_obj, params=params)  # fresh 必传（D1）
+            except FlowErrorException as e:
+                nid = (saved or {}).get("last_node") or "unknown"
+                why = str(e)[:200]
+                if "timed out after" in why:                     # 超时类不重试（D4）
+                    raise
+                node_retries[nid] = node_retries.get(nid, 0) + 1
+                if node_retries[nid] > max_node_retries:
+                    verdict = {"verdict": "engine_error",
+                               "why": f"node retries exhausted at {nid}: {why}",
+                               "node_retry_exhausted": True}
+                    break
+                _tracker().note_retry(nid, node_retries[nid], why)
+                saved = _ckpt_load()                             # last-success 断点
+                continue
+            saved = r.get("context")
+            if r.get("is_end"):                                  # 终态先于落盘判断（R1/D2）
+                ckpt.unlink(missing_ok=True)                     # ★ 终态删 checkpoint
+                nodes = dict(saved or {}).get("$NODE") or {}
+                v = (nodes or {}).get("_output") or r.get("result")
+                verdict = v if isinstance(v, dict) else {"verdict": "unknown",
+                                                          "raw": str(v)[:400]}
+                break
+            if r.get("is_suspend"):                              # v2 无 EventNode（D7 防御）
+                verdict = {"verdict": "engine_error",
+                           "why": "unexpected suspend (v2 has no EventNode)"}
+                break
+            _ckpt_save(saved, r.get("id") or "")
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(lock_fd)
+    return verdict, nodes
 
 
 def _verdict_of(result: Any) -> dict:
