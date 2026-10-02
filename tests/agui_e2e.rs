@@ -538,12 +538,16 @@ async fn agui_run_persists_a_listable_native_session() {
 
     // 1. The consumer chain from the issue report: SessionReader::list_sessions
     //    (sessions list, episodic_recall, resume picker) must see the thread.
+    //    Match the exact thread key: a bare `agui-` prefix would happily
+    //    pick up a sibling thread's session slug sharing the store.
     let listed = SessionReader::list_sessions(workspace.path()).expect("list sessions");
     let dir = listed
         .iter()
         .find(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().starts_with("agui-"))
+                .map(|n| {
+                    n.to_string_lossy() == recursive::agui_session::thread_session_key("vis-thread")
+                })
                 .unwrap_or(false)
         })
         .expect("AG-UI thread must be visible to SessionReader::list_sessions")
@@ -783,6 +787,7 @@ async fn agui_interrupt_resume_round_trips_through_the_native_session() {
 
     // The interrupted run is persisted as a session with status
     // Interrupted and the open interrupt next to the transcript.
+    // (Exact-key match so a sibling thread's slug can't satisfy the find.)
     let listed = SessionReader::list_sessions(workspace.path()).expect("list sessions");
     let dir = listed
         .iter()
@@ -796,7 +801,11 @@ async fn agui_interrupt_resume_round_trips_through_the_native_session() {
         .expect("round-trip session dir")
         .clone();
     let meta = SessionReader::load_meta(&dir).expect("meta after run 1");
-    assert_eq!(meta.status, SessionStatus::Interrupted);
+    assert_eq!(
+        meta.status,
+        SessionStatus::Interrupted,
+        "run 1 must persist as Interrupted"
+    );
     let interrupts: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join(".interrupts.json")).expect("interrupts"))
             .expect("interrupts parse");

@@ -1691,7 +1691,9 @@ pub async fn kill_gracefully(
 }
 
 /// Default grace period for MCP subprocess shutdown (5 seconds).
-pub const DEFAULT_KILL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+/// Defined in `tools::run_background` so non-MCP callers (e.g. `acp`) can use
+/// it without the `mcp` feature.
+pub use crate::tools::run_background::DEFAULT_KILL_GRACE_PERIOD;
 
 // ---------------------------------------------------------------------------
 // MCP tool routing (S2-E17)

@@ -175,7 +175,7 @@ impl AcpSession {
             {
                 use tokio::time::timeout;
 
-                let grace = crate::mcp::DEFAULT_KILL_GRACE_PERIOD;
+                let grace = crate::tools::run_background::DEFAULT_KILL_GRACE_PERIOD;
                 tracing::info!(server_pid = pid, "AcpSession: killing MCP child process");
 
                 // Send SIGTERM via std::process::Command::new("kill").

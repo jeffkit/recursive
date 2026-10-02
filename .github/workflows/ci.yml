@@ -60,12 +60,30 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
-      # Feature-gate guards: the lib must build with no features at all and
-      # with a minimal adapter set — `acp` must stay optional (#54).
-      - name: Check --no-default-features (lib)
-        run: cargo check --no-default-features --lib
-      - name: Check --no-default-features --features http (lib)
-        run: cargo check --no-default-features --features http --lib
+  # Feature-matrix guards: the lib must build and pass clippy with no
+  # default features and with each optional feature in isolation, so a
+  # feature-gated item can never strand its callers (54/63/65/74).
+  feature-matrix:
+    name: feature matrix (no-default-features)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "mcp", "http", "cli", "web_fetch", "anthropic", "skill-hub", "web_search"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check + clippy (${{ matrix.features || 'bare' }})
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo check --lib --no-default-features
+            cargo clippy --lib --no-default-features -- -D warnings
+          else
+            cargo check --lib --no-default-features --features ${{ matrix.features }}
+            cargo clippy --lib --no-default-features --features ${{ matrix.features }} -- -D warnings
+          fi
 
   supply-chain:
     name: supply-chain (cargo audit + machete)

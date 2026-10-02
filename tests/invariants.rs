@@ -1,4 +1,4 @@
-// Invariant guard tests — automated checks for the 8 invariants in
+// Invariant guard tests — automated checks for the 10 invariants in
 // .dev/AGENTS.md.
 //
 // Each module below corresponds to one or more invariants:
@@ -8,6 +8,10 @@
 //   finish_reason_data:       #7 (finish reasons are data, not errors)
 //   tool_call_pairing:        #8 (tool-call ↔ tool-result pairing)
 //   dep_justification:        #6 (no new deps without justification)
+//   invariant_registry:       #9 (new tool → new file) + #10 (new provider
+//                             → new file + trait), plus the numbering guard
+//                             that keeps .dev/AGENTS.md and
+//                             docs/architecture/invariants.md in sync.
 //
 //   #5 (no unwrap/expect) is covered by clippy::unwrap_used deny (Goal 224).
 //
@@ -17,6 +21,8 @@
 mod dep_justification;
 #[path = "invariants/finish_reason_data.rs"]
 mod finish_reason_data;
+#[path = "invariants/invariant_registry.rs"]
+mod invariant_registry;
 #[path = "invariants/loop_size_orthogonality.rs"]
 mod loop_size_orthogonality;
 #[path = "invariants/sandbox.rs"]

@@ -1,29 +1,34 @@
 ---
 type: Architecture
-title: The Eight Invariants
-description: The eight inviolable rules every change to Recursive must respect. Drawn from .dev/AGENTS.md. Violations cause rollback in the self-improve loop.
+title: The Ten Invariants
+description: The ten inviolable rules every change to Recursive must respect. Drawn from .dev/AGENTS.md. Violations cause rollback in the self-improve loop.
 tags: [invariants, architecture, rules, self-improve]
 timestamp: 2026-06-18T10:00:00Z
 ---
 
-# The Eight Invariants
+# The Ten Invariants
 
 These rules are enforced by the self-improve loop. A change that violates any
 invariant will be rolled back. Read `.dev/AGENTS.md` for the full text.
 
+The (number → title) mapping below is kept in sync with the numbered list in
+`.dev/AGENTS.md` by the guard test `tests/invariants/invariant_registry.rs`.
+If you renumber the invariants, update both documents (and the test) together.
+
 ## Invariant #1 — Agent Loop Stays Small
 
-> New capabilities go in **tools**, not in `AgentRuntime::run` (previously `Agent::run`).
-> The main loop is a pure dispatch loop. If/else branching inside it is a red flag.
+> New capabilities go in **tools**, not in the agent loop. The main loop is a
+> pure dispatch loop. If/else branching inside `run_inner` is a red flag.
 
 Impact: [Agent Loop](agent-loop.md), [Tools Overview](tools/index.md)
 
-## Invariant #2 — Error Variants Live in error.rs
+## Invariant #2 — Orthogonality
 
-> New error types go in `src/error.rs`. **Never `unwrap()` or `expect()` in product code.**
-> Tests may use `unwrap()`.
+> Tools must not depend on LLM internals; providers must not depend on tools.
 
-## Invariant #3 — Sandbox via resolve_within
+Impact: [Tools Overview](tools/index.md), [Providers Overview](providers/index.md)
+
+## Invariant #3 — Sandbox
 
 > All filesystem and shell tools MUST pass user-supplied paths through
 > `tools::resolve_within(workspace, path)`. Paths that escape the workspace
@@ -31,27 +36,25 @@ Impact: [Agent Loop](agent-loop.md), [Tools Overview](tools/index.md)
 
 Impact: [Filesystem Tools](tools/filesystem.md), [Shell Tool](tools/shell.md)
 
-## Invariant #4 — New Tool → New File
+## Invariant #4 — Tests Are Non-Negotiable
 
-> A new tool gets a new file under `src/tools/<name>.rs`. It is registered
-> in `src/tools/mod.rs` and `build_standard_tools`. No tool logic goes
-> directly into `runtime.rs`, `kernel.rs`, or `agent/`.
+> Every new public function / tool / provider gets unit tests in the same
+> file (`#[cfg(test)] mod tests`).
 
-## Invariant #5 — No unwrap() in Product Code
+## Invariant #5 — No `unwrap()` / `expect()` in Non-Test Code
 
-> (See Invariant #2.) Specifically: never use `unwrap()` or `expect()` on
-> `Result` or `Option` in any non-test code path.
+> Never use `unwrap()` or `expect()` on `Result` or `Option` in any non-test
+> code path. Return `Result` instead. Enforced by `clippy::unwrap_used` deny.
+> New error variants go in `src/error.rs`.
 
-## Invariant #6 — New Provider → New File + Trait
+## Invariant #6 — No New Dependencies Without Justification
 
-> A new LLM provider gets a new file under `src/llm/<name>.rs` that
-> implements `ChatProvider`. No provider logic in the agent or runtime.
-
-Impact: [Providers Overview](providers/index.md)
+> State the reason in the journal entry. Prefer std + what's already in
+> `Cargo.toml`.
 
 ## Invariant #7 — Finish Reasons Are Data, Not Errors
 
-> `AgentRuntime::run` returns `Ok(AgentOutcome { finish: FinishReason })` for
+> `AgentRuntime::run` returns `Ok(RuntimeOutcome { finish_reason })` for
 > **all** termination modes, including `BudgetExceeded`, `Stuck`, and
 > `TranscriptLimit`. The transcript is **always saved** before returning.
 >
@@ -75,20 +78,38 @@ Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md)
 
 Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md)
 
+## Invariant #9 — New Tool → New File
+
+> A new tool gets a new file under `src/tools/<name>.rs`. It is registered
+> in `src/tools/mod.rs` and the standard tool builder. No tool logic goes
+> directly into `runtime.rs`, `kernel.rs`, or `agent/`.
+
+Impact: [Tools Overview](tools/index.md)
+
+## Invariant #10 — New Provider → New File + Trait
+
+> A new LLM provider gets a new file under `src/llm/<name>.rs` that
+> implements `ChatProvider`. No provider logic in the agent, runtime,
+> or kernel.
+
+Impact: [Providers Overview](providers/index.md)
+
 ---
 
 ## Quick Reference
 
 | # | Rule | Key files |
 |---|------|-----------|
-| 1 | Loop stays small — tools, not branches | `src/runtime.rs`, `src/kernel.rs` |
-| 2 | Errors in error.rs, no unwrap | `src/error.rs` |
+| 1 | Loop stays small — tools, not branches | `src/run_core.rs`, `src/kernel.rs` |
+| 2 | Orthogonality | `src/tools/`, `src/llm/` |
 | 3 | Sandbox via resolve_within | `src/tools/dispatch.rs` |
-| 4 | New tool → new file | `src/tools/` |
-| 5 | No unwrap in product code | (everywhere) |
-| 6 | New provider → new file | `src/llm/` |
+| 4 | Tests are non-negotiable | `tests/invariants/test_coverage.rs` |
+| 5 | No unwrap in product code | `src/error.rs` (variants) |
+| 6 | No new dependencies without justification | `tests/invariants/dep_justification.rs` |
 | 7 | Finish reasons are data | `src/agent/types.rs`, `src/runtime.rs` |
 | 8 | Tool-call ↔ result pairing | `src/compact/`, `src/session/` |
+| 9 | New tool → new file | `src/tools/` |
+| 10 | New provider → new file | `src/llm/` |
 
 ## Related Concepts
 

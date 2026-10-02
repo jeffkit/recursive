@@ -214,6 +214,33 @@ def main() -> int:
                 pass
     st = json.loads(state_path.read_text())
     st["status"] = "completed"
+    # ── 完成回评（committed/skip-commit，2026-10-02）─────────────────────
+    # v2 flow 没有 github_comment 节点，此前每个成功 run 都吃 reaper 的
+    # 「请人工查看」兜底（看起来像错误，实为成功）——bridge 在此直接发
+    # 真实完成回评并置 comment_posted=True，reaper 即跳过兜底。
+    if m and not args.dry_run and verdict.get("verdict") in ("committed", "skip-commit"):
+        try:
+            issue_no = m.group(1)
+            repo_full = "jeffkit/" + Path(args.repo).name
+            if verdict.get("verdict") == "committed":
+                body = ("<!-- issue-keeper-bot -->\n[issue-pipeline] 已合入 main："
+                        f"{goal[:200]}\n（管线 committed：impl→三门→评审通过→落地"
+                        f"；落地方式 {verdict.get('via', 'git-publish')}）")
+            else:
+                body = ("<!-- issue-keeper-bot -->\n[issue-pipeline] 本单核对后"
+                        "无需代码改动（agent 未产生变更），关闭处理。")
+            bf = run_dir / "reply.md"
+            bf.write_text(body, encoding="utf-8")
+            r = subprocess.run(["gh", "issue", "comment", issue_no, "-R", repo_full,
+                                "--body-file", str(bf)],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                verdict["comment_posted"] = True
+                bf.unlink(missing_ok=True)
+            else:
+                (run_dir / "reply-error.log").write_text(r.stderr or r.stdout or "")
+        except Exception as e:
+            (run_dir / "reply-error.log").write_text(f"{type(e).__name__}: {e}\n")
     st["verdict"] = verdict
     st["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))

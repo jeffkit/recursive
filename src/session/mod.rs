@@ -354,8 +354,10 @@ pub(crate) fn chrono_lite_now() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-// Used by `http` handlers and unit tests; dead in minimal builds.
-#[allow(dead_code)]
+// Used by `http` handlers and unit tests; dead in minimal builds, so the
+// allow is feature-scoped to keep `--no-default-features` warning-free
+// without hiding genuinely-dead code elsewhere.
+#[cfg_attr(not(feature = "http"), allow(dead_code))]
 pub(crate) fn epoch_day_to_ymd(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

@@ -66,7 +66,7 @@ rather than panicking.
 ## Related Concepts
 
 - [Overview](overview.md) — component map
-- [Invariants](invariants.md) — all eight invariants
+- [Invariants](invariants.md) — all ten invariants
 - [Layer 0 Injection](layer0-injection.md) — how system prompt is built before each run
 - [Sessions](sessions.md) — how transcripts are persisted
 - [Providers Overview](providers/index.md) — what ChatProvider::complete returns

@@ -348,6 +348,7 @@ impl AgentKernel {
                 prompt_segments: None, // Goal-396: preserved on TurnOutcome via TurnContext
                 static_breakdown,
                 last_prompt_tokens: 0,
+                pending_step_usage: None,
                 consecutive_compact_failures: 0,
                 wall_timeout_secs,
                 wall_start: if wall_timeout_secs > 0 {

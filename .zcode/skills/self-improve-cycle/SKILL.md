@@ -187,7 +187,7 @@ Pick 3-4 per cycle. Rotate across cycles to avoid blind spots. Each angle's
 sub-agent prompt should demand file:line evidence + fix direction.
 
 ### Always-relevant angles
-- **Architecture invariants** — do the 8 invariants still hold? Any erosion?
+- **Architecture invariants** — do the 10 invariants still hold? Any erosion?
   (read `.dev/AGENTS.md`, verify each in code)
 - **Test coverage gaps** — critical paths with zero/paper-thin tests?
 - **Error handling consistency** — swallowed errors, blanket 500s, missing context

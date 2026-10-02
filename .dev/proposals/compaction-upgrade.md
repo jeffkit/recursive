@@ -36,7 +36,7 @@ targets large-scale / long-session commercial use:
   ≤300-word vague summary, contributing to recompaction.
 
 This proposal upgrades compaction to a **multi-layer, cache-aware,
-observability-driven** system while preserving Recursive's 8 invariants and
+observability-driven** system while preserving Recursive's 10 invariants and
 the "small kernel" discipline (no new branches in `run_inner`).
 
 ## 2. Design Principles

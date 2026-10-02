@@ -2116,6 +2116,13 @@ async fn run_loop(
         None
     };
 
+    // SIGTERM/SIGINT watchdog: the shutdown token (below) makes the kernel
+    // drain the current step at the next boundary, but a step parked inside a
+    // long tool execution cannot be interrupted. If the graceful drain hasn't
+    // finished within the grace window, exit hard — the transcript is flushed
+    // per message, so every completed step is already on disk.
+    cli::interrupt::spawn_term_watchdog(shutdown.clone());
+
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
         session_writer.as_ref().map(|w| {
             let session_dir = w
@@ -2273,6 +2280,11 @@ async fn run_loop(
         &config.model,
     );
 
+    // SIGTERM/SIGINT: the loop was interrupted by a signal — exit non-zero
+    // (128+SIGTERM) so the caller sees it did not run to completion.
+    if shutdown.is_cancelled() {
+        std::process::exit(cli::interrupt::TERM_EXIT_CODE);
+    }
     if let Some(last) = outcomes.last() {
         return cli::output::exit_for_finish(&last.finish_reason, last.steps);
     }
@@ -2327,6 +2339,13 @@ async fn run_once(
     } else {
         None
     };
+
+    // SIGTERM/SIGINT watchdog: the shutdown token (below) makes the kernel
+    // drain the current step at the next boundary, but a step parked inside a
+    // long tool execution cannot be interrupted. If the graceful drain hasn't
+    // finished within the grace window, exit hard — the transcript is flushed
+    // per message, so every completed step is already on disk.
+    cli::interrupt::spawn_term_watchdog(shutdown.clone());
 
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
         session_writer.as_ref().map(|w| {
@@ -2661,6 +2680,12 @@ async fn run_once(
                 &path,
             )?;
         }
+    }
+    // SIGTERM/SIGINT: the run was interrupted by a signal. Everything is
+    // already finalized and flushed; exit non-zero (128+SIGTERM) so the
+    // caller sees the goal did not run to completion.
+    if shutdown.is_cancelled() {
+        std::process::exit(cli::interrupt::TERM_EXIT_CODE);
     }
     cli::output::exit_for_finish(&outcome.finish_reason, outcome.steps)
 }

@@ -29,12 +29,17 @@ before editing `src/`.**
 
 ## Before touching code (源码 invariants)
 
-Read `.dev/AGENTS.md` for the full list. Especially:
-- **#1** Agent loop stays small — don't branch inside `src/run_core.rs::RunCore::run_inner`.
-- **#3** Sandbox — all fs/shell tools go through `tools::resolve_within`.
-- **#5** No `unwrap()`/`expect()` in non-test code.
-- **#7** Finish reasons are data, not errors.
-- **#8** Tool-call ↔ tool-result pairing must be preserved.
+The full numbered list of invariants lives in `.dev/AGENTS.md` ("Invariants
+(DO NOT BREAK)") — that file is the single source of truth; do not keep
+numbered copies here. Guarded by `tests/invariants/invariant_registry.rs`.
+In short:
+- Agent loop stays small — don't branch inside `src/run_core.rs::RunCore::run_inner`.
+- Sandbox — all fs/shell tools go through `tools::resolve_within`.
+- No `unwrap()`/`expect()` in non-test code.
+- Finish reasons are data, not errors.
+- Tool-call ↔ tool-result pairing must be preserved.
+- Orthogonality, tests-first, no unjustified deps, new tool → new file,
+  new provider → new file + trait.
 
 New capabilities belong in tools (`src/tools/`) or providers (`src/llm/`),
 **never** as a branch in `run_inner`. The legacy `src/agent.rs` was split into
