@@ -214,6 +214,14 @@ impl AgentRuntimeBuilder {
         self.kernel_builder.max_transcript_chars_for_test()
     }
 
+    /// Inspect the skill catalog a builder chain installed (tests only) —
+    /// the kernel serves this list as the per-turn skill reminder and the
+    /// Globs-mode injector.
+    #[cfg(test)]
+    pub(crate) fn skills_for_test(&self) -> &[crate::skills::Skill] {
+        &self.skills
+    }
+
     /// Goal 396: inject a storage backend, forwarded to the kernel builder
     /// (same forwarding pattern as `compactor`). The HTTP host layer shares
     /// the same `Arc` and persists transcripts on session close/eviction —

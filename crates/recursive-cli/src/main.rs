@@ -837,12 +837,16 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("skills: WARN: {e}"),
             }
             // The startup registry registered LoadSkill over the
-            // directory-discovered catalog only; when service-level sources
-            // delivered skills, re-register the tool over the merged list so
-            // `Skill` can load a remote skill without any local file.
-            // (Registry register replaces by tool name, so this is a swap,
-            // not a duplicate.)
-            if !skills.is_empty() && tools.find_by_name("Skill").is_some() {
+            // directory-discovered catalog only; align it with the merged
+            // list so `Skill` can load a remote skill without any local
+            // file. `register` replaces by tool name, so this is a swap,
+            // not a duplicate. Guards:
+            // - absent tool + non-empty allow-list → leave absent: the
+            //   allow-list already ran (issue #65) and must stay the last
+            //   word; re-adding here would resurrect a filtered tool.
+            if !skills.is_empty()
+                && (tools.find_by_name("Skill").is_some() || config.allow_tools.is_empty())
+            {
                 tools = tools.register(std::sync::Arc::new(
                     recursive::tools::load_skill::LoadSkill::new(skills.clone()),
                 ));

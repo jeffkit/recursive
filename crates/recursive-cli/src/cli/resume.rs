@@ -422,9 +422,9 @@ pub(crate) async fn run_resumed(
                     None
                 }
             }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // SIGTERM/SIGINT watchdog (same contract as run_once): bound how long a
     // signal-interrupted run may keep draining before the process force-exits.

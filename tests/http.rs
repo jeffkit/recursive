@@ -4274,6 +4274,110 @@ mod http_tests {
         assert_eq!(arr[1]["name"], "rollback");
     }
 
+    // ── #74 拆单 3/3: /skills endpoint (service-level skill sources) ─────────
+
+    #[tokio::test]
+    async fn skills_endpoint_reports_source_content_vs_filesystem() {
+        // Content-backed skill = the shape a service-level SkillSource
+        // delivers (`skill_from_content`: in-memory body, /virtual path) —
+        // the "never lands on disk" contract surfaced as `source: "content"`.
+        let content_backed = recursive::skills::skill_from_content(
+            "remote-skill",
+            "---\nname: remote-skill\ndescription: from the wire\nmode: trigger\ntriggers: deploy\n---\n\nDeploy checklist.",
+            Vec::new(),
+        );
+        // Filesystem-backed skill = directory discovery (body: None).
+        let fs_backed = recursive::skills::Skill {
+            name: "local-skill".to_string(),
+            description: "discovered on disk".to_string(),
+            path: std::path::PathBuf::from("/tmp/skills/local-skill/SKILL.md"),
+            mode: recursive::skills::SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: None,
+        };
+        let mut state = sample_state();
+        state.skills = vec![content_backed, fs_backed];
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let skills: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = skills.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let remote = arr
+            .iter()
+            .find(|s| s["name"] == "remote-skill")
+            .expect("content-backed skill must be listed");
+        assert_eq!(remote["source"], "content");
+        assert_eq!(remote["mode"], "trigger");
+        assert_eq!(remote["description"], "from the wire");
+        let local = arr
+            .iter()
+            .find(|s| s["name"] == "local-skill")
+            .expect("filesystem skill must be listed");
+        assert_eq!(local["source"], "filesystem");
+        assert_eq!(local["mode"], "manual");
+    }
+
+    #[tokio::test]
+    async fn skills_endpoint_returns_empty_array_without_skills() {
+        let app = build_router(sample_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let skills: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(skills.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skills_endpoint_lists_skills_in_openapi_spec() {
+        let app = build_router(sample_state());
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            spec["paths"]["/skills"]["get"].is_object(),
+            "/skills must be documented in the OpenAPI spec"
+        );
+        assert!(
+            spec["components"]["schemas"]["SkillInfo"].is_object(),
+            "SkillInfo schema must be present"
+        );
+    }
+
     // ── fork_session ─────────────────────────────────────────────────────────
 
     #[tokio::test]

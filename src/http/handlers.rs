@@ -107,6 +107,11 @@ fn build_session_runtime(
             max_steps,
             &state.config.model,
         )
+        // #74 拆单 3/3: the merged skill catalog (directory + service-level
+        // SkillSource entries) rides into the kernel, which ships it as the
+        // per-turn `<system-reminder>` — without this the catalog is
+        // computed at startup but never reaches any run's context.
+        .skills(state.skills.clone())
         .llm(state.provider.clone())
         // Goal 399: safe wall-clock budget for HTTP sessions
         // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
@@ -1070,7 +1075,7 @@ pub(super) async fn list_slash_commands(
 
 /// One skill as advertised by `GET /skills`.
 #[derive(serde::Serialize)]
-pub struct SkillInfo {
+pub(crate) struct SkillInfo {
     pub name: String,
     pub description: String,
     pub mode: String,
@@ -1088,24 +1093,31 @@ pub struct SkillInfo {
 #[cfg_attr(test, mutants::skip)]
 pub(super) async fn list_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillInfo>> {
     use crate::skills::SkillMode;
-    Json(state
-        .skills
-        .iter()
-        .map(|s| SkillInfo {
-            name: s.name.clone(),
-            description: s.description.clone(),
-            mode: match s.mode {
-                SkillMode::Always => "always",
-                SkillMode::Trigger => "trigger",
-                SkillMode::Globs => "globs",
-                SkillMode::Manual => "manual",
-            }
-            .to_string(),
-            refs: s.refs.len(),
-            sections: s.sections.len(),
-            source: if s.body.is_some() { "content" } else { "filesystem" }.to_string(),
-        })
-        .collect())
+    Json(
+        state
+            .skills
+            .iter()
+            .map(|s| SkillInfo {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                mode: match s.mode {
+                    SkillMode::Always => "always",
+                    SkillMode::Trigger => "trigger",
+                    SkillMode::Globs => "globs",
+                    SkillMode::Manual => "manual",
+                }
+                .to_string(),
+                refs: s.refs.len(),
+                sections: s.sections.len(),
+                source: if s.body.is_some() {
+                    "content"
+                } else {
+                    "filesystem"
+                }
+                .to_string(),
+            })
+            .collect(),
+    )
 }
 
 /// POST /sessions/:id/messages — send a message in a session.
@@ -1550,6 +1562,7 @@ pub(super) async fn agui_run(
             model: state.config.model.clone(),
             wall_timeout_secs: state.config.wall_timeout_secs,
             storage: state.storage.clone(),
+            skills: state.skills.clone(),
         },
     )
     .map_err(|e| {
@@ -1869,6 +1882,61 @@ mod tests {
         } else {
             std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
         }
+    }
+
+    /// #74 拆单 3/3: `build_session_runtime` must hand the merged skill
+    /// catalog (`AppState.skills` — directory + service-level SkillSource
+    /// entries) to the runtime; the kernel ships it as the per-turn
+    /// `<system-reminder>` and drives Globs-mode injection from it.
+    /// Without the wiring the catalog is computed at startup but never
+    /// reaches any run's context.
+    #[test]
+    fn build_session_runtime_installs_the_skill_catalog() {
+        let config = crate::config::Config::from_env().expect("config");
+        let state = crate::http::AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(0),
+                crate::http::AdmissionGate::new(
+                    1,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![crate::skills::skill_from_content(
+                "remote-skill",
+                "---\nname: remote-skill\ndescription: from the wire\n---\n\nBody",
+                Vec::new(),
+            )],
+            storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir()
+                    .join(format!("recursive-handlers-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        };
+
+        let builder = build_session_runtime(
+            &state,
+            ToolRegistry::default(),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+        );
+        let skills = builder.skills_for_test();
+        assert_eq!(skills.len(), 1, "catalog must ride into the runtime");
+        assert_eq!(skills[0].name, "remote-skill");
+        assert!(
+            skills[0].body.is_some(),
+            "service-level skills stay content-backed (never on disk)"
+        );
     }
 
     // ── SDK Phase B: tool_progress forwarder ─────────────────────────────

@@ -796,6 +796,10 @@ pub(crate) struct AguiRuntimeDeps<'a> {
     /// `build_session_runtime`; the layer must keep applying it or AG-UI
     /// runs lose the `RECURSIVE_HTTP_WALL_TIMEOUT_SECS` cap entirely.
     pub wall_timeout_secs: u64,
+    /// #74 拆单 3/3: merged skill catalog (`AppState.skills`) — the kernel
+    /// ships it as the per-turn `<system-reminder>`; without it the
+    /// AG-UI channel never sees the skill index.
+    pub skills: Vec<crate::skills::Skill>,
     /// Goal 396: shared transcript persistence backend
     /// (`AppState.storage` at the HTTP layer) — the same setter
     /// `build_session_runtime` applies for REST sessions.
@@ -874,6 +878,8 @@ pub(crate) fn build_agui_runtime(
         deps.max_steps,
         &deps.model,
     )
+    // #74 拆单 3/3: same per-turn skill reminder the REST endpoints get.
+    .skills(deps.skills)
     .llm(deps.llm)
     // Goal 399: the same wall-clock budget the REST endpoints apply
     // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into
@@ -1838,6 +1844,7 @@ mod tests {
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-agui-test-{}", std::process::id())),
             )),
+            skills: Vec::new(),
         }
     }
 

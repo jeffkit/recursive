@@ -778,13 +778,19 @@ mod tests {
     // ── skills_from_http_sources (issue #74 拆单 3/3) ────────────────────
 
     /// Unset / blank RECURSIVE_SKILL_SOURCE_URL is a no-op: empty catalog,
-    /// no network.
+    /// no network. Each half is scoped: ENV_LOCK is a non-reentrant
+    /// std Mutex, so a second `EnvGuard::set` while the first guard is
+    /// still alive self-deadlocks the whole test binary.
     #[test]
     fn skills_from_http_sources_unset_or_blank_is_empty() {
-        let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_URL", None)]);
-        assert!(skills_from_http_sources().unwrap().is_empty());
-        let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_URL", Some("   "))]);
-        assert!(skills_from_http_sources().unwrap().is_empty());
+        {
+            let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_URL", None)]);
+            assert!(skills_from_http_sources().unwrap().is_empty());
+        }
+        {
+            let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_URL", Some("   "))]);
+            assert!(skills_from_http_sources().unwrap().is_empty());
+        }
     }
 
     /// A configured URL failing the https-only gate surfaces a descriptive
@@ -803,60 +809,37 @@ mod tests {
         );
     }
 
-    /// End-to-end through the service-level entry: a live endpoint delivers
-    /// a skill that arrives content-backed (in-memory body, virtual path,
-    /// in-memory refs) with no local file involved.
+    /// End-to-end through the service-level entry: an https endpoint that
+    /// refuses the connection surfaces as a propagated `Err` — the fetch
+    /// really left the process (loopback, no disk involved), and the http
+    /// serve entry's WARN-and-degrade contract has something to act on.
+    ///
+    /// The full fetch+mapping happy path lives in `src/skills.rs`
+    /// (`http_skill_source_fetches_and_parses_the_index`): the https-only
+    /// gate deliberately blocks plain-http loopback mocks at the source
+    /// constructor, and the lib's test seam (`fetch_remote_index`) is not
+    /// reachable from this crate.
     ///
     /// `#[tokio::test(flavor = "multi_thread")]` (not `#[test]`):
     /// `HttpSkillSource::load_skills` re-enters `Handle::current()`, which
     /// panics outside a runtime — and `block_in_place` additionally requires
-    /// a multi-thread runtime. Mirrors the http_skill_source_* tests in
-    /// `src/skills.rs`.
+    /// a multi-thread runtime.
     #[tokio::test(flavor = "multi_thread")]
-    async fn skills_from_http_sources_loads_content_first_skills() {
-        let body = serde_json::json!({
-            "skills": [{
-                "name": "http-skill",
-                "content": "---\nname: http-skill\ndescription: from the wire\nmode: trigger\ntriggers: deploy\n---\n\nDeploy checklist.",
-                "description": null
-            }]
-        })
-        .to_string();
-
+    async fn skills_from_http_sources_propagates_request_failure() {
+        // Bind-then-drop: a port nothing listens on. Connect fails fast
+        // (ECONNREFUSED), no 10s connect timeout.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let srv = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.flush();
-            }
-        });
+        drop(listener);
 
         let _env = EnvGuard::set(&[(
             "RECURSIVE_SKILL_SOURCE_URL",
-            Some(format!("http://{addr}/skills.json").as_str()),
+            Some(format!("https://{addr}/skills.json").as_str()),
         )]);
-        let skills = skills_from_http_sources().unwrap();
-        srv.join().unwrap();
-
-        assert_eq!(skills.len(), 1, "exactly one skill delivered");
-        let s = &skills[0];
-        assert_eq!(s.name, "http-skill");
-        assert_eq!(s.description, "from the wire");
-        assert_eq!(s.mode, recursive::SkillMode::Trigger);
-        assert!(s.body.is_some(), "content-first: body must be in memory");
+        let err = skills_from_http_sources().unwrap_err();
         assert!(
-            s.path.starts_with("/virtual/skills/http-skill"),
-            "synthetic path, no real file: {}",
-            s.path.display()
+            err.contains("request failed") || err.contains("error"),
+            "a dead endpoint must surface as a request error: {err}"
         );
     }
 

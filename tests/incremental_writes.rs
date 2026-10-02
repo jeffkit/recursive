@@ -556,22 +556,20 @@ async fn assistant_rows_carry_per_step_usage() {
     let home = HomePin::new();
     let sw = make_session(&home);
 
-    let llm = Arc::new(MockProvider::new(vec![
-        Completion {
-            content: "step one".into(),
-            tool_calls: vec![],
-            finish_reason: Some("stop".into()),
-            usage: Some(recursive::llm::TokenUsage {
-                prompt_tokens: 100,
-                completion_tokens: 10,
-                total_tokens: 110,
-                cache_hit_tokens: 0,
-                cache_miss_tokens: 0,
-                reasoning_tokens: 0,
-            }),
-            reasoning_content: None,
-        },
-    ]));
+    let llm = Arc::new(MockProvider::new(vec![Completion {
+        content: "step one".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: Some(recursive::llm::TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            total_tokens: 110,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        }),
+        reasoning_content: None,
+    }]));
     let sink = make_persistence_composite(&sw);
     let mut rt = AgentRuntime::builder()
         .llm(llm)
