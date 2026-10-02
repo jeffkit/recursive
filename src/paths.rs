@@ -132,7 +132,7 @@ pub fn legacy_paths_in_workspace(workspace: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::PinnedRecursiveHome;
+    use crate::test_util::{env_lock, PinnedRecursiveHome, PinnedRecursiveHomeNoLock};
 
     #[test]
     fn user_data_dir_honors_env_override() {
@@ -152,6 +152,10 @@ mod tests {
         // user_workspace_dir is **not** called (which would
         // canonicalize the path and crash on the empty
         // /tmp/recursive-test-fixed fixture).
+        // The var is process-global: hold the env lock so concurrent
+        // session tests don't observe this transient override (and so
+        // an inherited pipeline value can't race in mid-assert).
+        let _guard = env_lock();
         let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
         std::env::set_var("RECURSIVE_SESSIONS_DIR", "/tmp/explicit-sessions");
         let dir = user_sessions_dir(Path::new("/tmp/recursive-test-fixed")).unwrap();
@@ -226,9 +230,11 @@ mod tests {
     #[test]
     fn user_sessions_dir_creates_dir_when_absent() {
         // kills `delete ! in user_sessions_dir` line 67
+        let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        let _g = PinnedRecursiveHome::new(home.path());
-        // Ensure RECURSIVE_SESSIONS_DIR is not set
+        let _g = PinnedRecursiveHomeNoLock::new(home.path(), &_guard);
+        // Ensure RECURSIVE_SESSIONS_DIR is not set — it is a hard override
+        // that would beat the pinned home below.
         let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");
 

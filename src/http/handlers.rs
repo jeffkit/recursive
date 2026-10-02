@@ -2925,6 +2925,7 @@ mod tests {
         let home = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
         std::env::set_var("RECURSIVE_HOME", home.path());
+        let saved_sessions_dir = std::env::var_os("RECURSIVE_SESSIONS_DIR");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
@@ -3051,6 +3052,9 @@ mod tests {
 
         std::env::remove_var("RECURSIVE_WORKSPACE");
         std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        if let Some(v) = saved_sessions_dir {
+            std::env::set_var("RECURSIVE_SESSIONS_DIR", v);
+        }
     }
 
     // ── Issue #66: token streaming + cancellation ────────────────────────
