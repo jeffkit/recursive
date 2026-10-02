@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -366,7 +367,9 @@ def s12_v3_崩溃恢复_断点续走():
 
 
 def s13_v3_节点异常自动重试():
-    """impl 首抛一次 → 宿主按节点重试 → committed（@RAISE 哨兵，非 gate 红）。"""
+    """impl 首抛一次 → 宿主按节点重试 → committed（@RAISE 哨兵，非 gate 红）；
+    node_retries 必须记在**失败节点** impl 名下（2026-10-02 归因修订：
+    旧实现取 saved.last_node=最后一个成功节点，留痕记错名下误导排查）。"""
     repo, root = make_repo()
     _REPO_HOLDER[0] = repo
     issue_root, run_dir, state_path = _v3_setup(repo, root)
@@ -375,6 +378,13 @@ def s13_v3_节点异常自动重试():
     v, _ = _drive_v3(issue_root, run_dir, state_path)
     assert v.get("verdict") == "committed", v
     assert len([c for c in CALLS if c[1] == "impl"]) == 2, "impl 应恰好执行两次"
+    st = json.loads(state_path.read_text())
+    nr = st.get("node_retries") or {}
+    assert "impl" in nr, f"node_retries 应记失败节点 impl: {nr}"
+    assert "unknown" not in nr, f"归因不得落在 unknown: {nr}"
+    assert "pre" not in nr, f"归因不得落在最后成功节点 pre: {nr}"
+    assert nr["impl"]["count"] == 1, f"impl 重试计数应为 1: {nr}"
+    assert st.get("last_failed_node") == "impl", f"last_failed_node 应为 impl: {st.get('last_failed_node')}"
 
 
 def s14_v3_重试耗尽_engine_error():
@@ -429,6 +439,121 @@ def s17_v3_worktree闸():
     assert v.get("verdict") == "committed", v
 
 
+def s19_v3_跨派发续走_旧worktree幸存():
+    """跨派发断点续跑（2026-10-02 O2 修订）：首派 impl 崩成 engine_error（kill -9
+    形态：不经 main() 终态回收，旧 run_dir/worktree 幸存）→ keeper 重派新 run_id
+    → 新 run_dir。checkpoint 记录的 worktree_path 幸存 → 从断点续走，后续节点
+    在**旧 worktree** 干活，不在新 run_dir 重建 L1。设计矩阵「进程崩溃/断电 →
+    checkpoint + worktree 在 → 续走」的跨派发形态（旧实现结构性不可达）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root = root / "artifact"
+    issue_root.mkdir(parents=True)
+    run_old = root / "pipeline-77-crashed"
+    run_old.mkdir(parents=True)
+    v, _ = _drive_v3(issue_root, run_old, run_old / "state.json",
+                     scripts={"agent": {"impl": "@RAISE"}})
+    assert v.get("verdict") == "engine_error", v
+    old_wt = run_old / "worktree"
+    assert old_wt.is_dir(), "崩溃形态下旧 worktree 应幸存（无人回收）"
+    ck = json.loads((issue_root / "checkpoint.json").read_text())
+    assert ck.get("worktree_path") == str(old_wt), f"worktree_path 字段: {ck.get('worktree_path')}"
+    assert ck.get("ckpt_run_dir") == str(run_old), f"ckpt_run_dir 字段: {ck.get('ckpt_run_dir')}"
+    # 重派：新 run_id → 新 run_dir（keeper v2_bridge.py:91 每派必新）
+    run_new = root / "pipeline-77-redispatch"
+    run_new.mkdir(parents=True)
+    AGENT_SCRIPT.update({"impl": "@WRITE"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_new, run_new / "state.json")
+    assert v.get("verdict") == "committed", v
+    # 判据一：新 run_dir 未走 L1（从未重建 worktree）
+    assert not (run_new / "worktree").exists(), "不应走 L1 在新 run_dir 重建 worktree"
+    # 判据二：活儿落在旧 worktree——终态已把它 WIP 快照进 wip-<旧run> 分支后
+    # 回收（宿主终态补回收，防 8-12G/棵泄漏），故查分支内容而非文件本体
+    r = subprocess.run(["git", "-C", str(repo), "show",
+                        "wip-pipeline-77-crashed:impl_change.txt"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, \
+        f"impl 应在旧 worktree 落改动（wip 快照里应有 impl_change.txt）: {r.stderr[:200]}"
+    assert not old_wt.exists(), "终态应回收旧 worktree（防 8-12G/棵泄漏）"
+
+
+def s20_v3_跨派发_旧worktree已被清_丢弃走L1():
+    """checkpoint 在但其 worktree_path 已被清理（终态回收/手工清盘）→ 丢弃
+    checkpoint 走完整 L1，在新 run_dir 重建（O2 假绿防御的跨派发形态，
+    旧实现 s17 语义的保持）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root = root / "artifact"
+    issue_root.mkdir(parents=True)
+    run_old = root / "pipeline-77-crashed"
+    run_old.mkdir(parents=True)
+    v, _ = _drive_v3(issue_root, run_old, run_old / "state.json",
+                     scripts={"agent": {"impl": "@RAISE"}})
+    assert v.get("verdict") == "engine_error", v
+    old_wt = run_old / "worktree"
+    assert old_wt.is_dir()
+    shutil.rmtree(old_wt)                       # 模拟旧 run 被终态回收/手工清理
+    run_new = root / "pipeline-77-redispatch"
+    run_new.mkdir(parents=True)
+    AGENT_SCRIPT.update({"impl": "@WRITE"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_new, run_new / "state.json")
+    assert v.get("verdict") == "committed", v
+    assert (run_new / "worktree" / "impl_change.txt").exists(), \
+        "旧 worktree 已清必须走 L1 重建（不得续死路径假绿）"
+
+
+def s21_v3_双宿主互斥_per_issue锁():
+    """同 issue 双宿主（不同 run_id → 不同 run_dir）并发：先到者持
+    issue_root/host.lock，后到者必须 retry-later 且不执行任何节点。
+    旧实现锁在 run_dir/host.lock——两宿主各锁各的文件互不互斥，
+    B 照样开跑双写 per-issue 资源（红）。"""
+    import fcntl
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root = root / "artifact"
+    issue_root.mkdir(parents=True)
+    run_a = root / "pipeline-77-hostA"
+    run_a.mkdir(parents=True)
+    run_b = root / "pipeline-77-hostB"
+    run_b.mkdir(parents=True)
+    fd = os.open(str(issue_root / "host.lock"), os.O_CREAT | os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # 模拟宿主 A 正在 impl 中
+        AGENT_SCRIPT.update({"impl": "@RAISE"})          # B 若溜进来自会炸出 engine_error
+        v_b, _ = _drive_v3(issue_root, run_b, run_b / "state.json")
+        assert v_b.get("verdict") == "retry-later" and v_b.get("stage") == "host", \
+            f"后到宿主必须 retry-later: {v_b}"
+        assert not [c for c in CALLS if c[0] == "agentrun"], "B 不得执行任何节点"
+        assert not (run_b / "host.lock").exists(), "run_dir 下不得再建 host.lock（契约修订）"
+    finally:
+        os.close(fd)                                     # 关 fd 即释放 flock
+
+
+def s22_v3_旧格式checkpoint_回退run_dir闸():
+    """旧格式（无 worktree_path 字段）checkpoint：闸回退检查本进程
+    run_dir/worktree——与修复前行为逐字一致（同 run_dir 续跑零回归；
+    跨派发场景旧格式 checkpoint 本就该被弃，不受此回退影响）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    v, _ = _drive_v3(issue_root, run_dir, state_path,
+                     scripts={"agent": {"impl": "@RAISE"}})
+    assert v.get("verdict") == "engine_error" and v.get("node_retry_exhausted"), v
+    ck = issue_root / "checkpoint.json"
+    raw = json.loads(ck.read_text())
+    raw.pop("worktree_path", None)
+    raw.pop("ckpt_run_dir", None)
+    ck.write_text(json.dumps(raw, ensure_ascii=False))   # 降级为旧格式
+    AGENT_SCRIPT.update({"impl": "@WRITE"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert len(impl_calls) == 1, f"旧格式应按原闸续走（impl 恰一次）: {len(impl_calls)}"
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
@@ -437,7 +562,9 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
              s13_v3_节点异常自动重试, s14_v3_重试耗尽_engine_error,
              s15_v3_checkpoint不可信家族, s16_v3_终态不落checkpoint,
-             s17_v3_worktree闸]
+             s17_v3_worktree闸,
+             s19_v3_跨派发续走_旧worktree幸存, s20_v3_跨派发_旧worktree已被清_丢弃走L1,
+             s21_v3_双宿主互斥_per_issue锁, s22_v3_旧格式checkpoint_回退run_dir闸]
 
 if __name__ == "__main__":
     _patch()

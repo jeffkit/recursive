@@ -1,7 +1,8 @@
 # DESIGN: v2 本地分布式宿主（v3）——节点级断点续跑，不经 console
 
-Status: DRAFT v2（四路交叉评审后修订；评审意见以 [D*/R*/O*/T*] 编号并入正文）
-Date: 2026-10-01
+Status: DRAFT v2.2（2026-10-02 Track D 修订：D6 锁位置 / O2 跨派发续跑 / 重试归因；
+      增量修订处均带「v2.2」标记，其余原文不动）
+Date: 2026-10-01（v2.2 修订 2026-10-02）
 Author: 值守 agent
 评审: 架构×1 / 重试语义×1 / 运维契约×1 / 测试策略×1（全部 APPROVE-WITH-CHANGES，
       本版已吸收全部 P0/P1；意见原文与编号见文末 §11）
@@ -41,7 +42,7 @@ v2 的图里**一个 EventNode 都没有**（不需要事件挂起）；console 
 
 ```python
 CKPT = ISSUE_ROOT / "checkpoint.json"        # ← keeper 工件根（§4），非 run_dir
-LOCK = run_dir / "host.lock"
+LOCK = ISSUE_ROOT / "host.lock"              # v2.2 修订：per-issue（原 run_dir 形同虚设）
 
 def _ckpt_save(ctx: dict, step_id: str):
     tmp = CKPT.with_suffix(f".tmp-{os.getpid()}")     # tmp 掺 pid（D6）
@@ -52,6 +53,10 @@ def _ckpt_save(ctx: dict, step_id: str):
         "saved_at": time.time(),
         "last_node": step_id,
         "context": ctx,
+        # v2.2 新增：记录这份 context 实际所属的 run/worktree（续跑轮
+        # $INPUT.run_dir 仍是首派 run_dir）。worktree_path 权威来源
+        # $NODE.pre.worktree，缺失按 $INPUT.run_dir/worktree 推导。
+        "ckpt_run_dir": ..., "worktree_path": ...,   # 跨派发续跑闸（O2 v2.2）
     }))
     tmp.rename(CKPT)                                  # 原子替换
 
@@ -129,12 +134,22 @@ finally:
   与 L2 sessions 已有的先例完全同构）。**per-issue 单槽**：新派发发现
   checkpoint 即续（内嵌 run_id 仅作审计）。
 - **恢复三重闸**（`_ckpt_load`）：存在 且 flow 指纹一致 且 **worktree 存在**。
-- **组合顺序不变量（O2，P0）**：跨派发恢复**必须先 L1 重建 worktree
-  （wip 分支），再按 checkpoint 跳节点**——终态回收会 rmtree worktree，
-  只续 checkpoint 不重建 worktree = 在已删除的路径上跑门禁 = paths 条件门
-  静默跳过 = 假绿落地。实现上：checkpoint 命中但 worktree 缺失 → 丢弃
-  checkpoint 走完整 L1 路径（preflight 节点本就做 worktree add）。二者是
-  叠加关系不是二选一。
+  v2.2 修订：worktree 闸查 checkpoint **记录的** `worktree_path`（跨派发可达）；
+  旧格式（无该字段）回退检查本进程 `run_dir/worktree`（原行为，零回归）。
+- **组合顺序不变量（O2，P0；v2.2 兑现跨派发半边）**：跨派发恢复**必须先 L1
+  重建 worktree（wip 分支），再按 checkpoint 跳节点**——终态回收会 rmtree
+  worktree，只续 checkpoint 不重建 worktree = 在已删除的路径上跑门禁 = paths
+  条件门静默跳过 = 假绿落地。实现上：checkpoint 命中但 worktree 缺失 → 丢弃
+  checkpoint 走完整 L1 路径（preflight 节点本就做 worktree add）。二者是叠加
+  关系不是二选一。**v2.2 实现语义**：原实现闸查本进程 run_dir/worktree，而
+  重派必换 run_id → 新 run_dir 必无 worktree → 「进程崩溃 → 续走」矩阵行
+  结构性不可达（checkpoint 入口即弃，永远 L1）。修复 = checkpoint 新增
+  `worktree_path` 字段，闸查记录路径：崩溃场景旧 run_dir 幸存（keeper reaper
+  只 killpg + 清 run.lock，从不清 `.flowcast/runs/<run_id>`；唯一 rmtree 在
+  bridge 终态段，进程死了自然不执行）→ 续跑在旧 worktree 上继续；树已被清
+  （终态回收/手工）→ 照旧丢弃走 L1。续跑终态由宿主补回收旧 worktree（main()
+  终态回收只看本进程 run_dir；WIP 快照后 rmtree，非终态不回收以保 checkpoint
+  可续）。harness s19（跨派发续走）/s20（树已清走 L1）/s22（旧格式回退）。
 - **flow_hash = 图结构指纹**（flow_id + 节点 id 集 + 边表；D8/开放问题 D3
   采纳），并附 `plaita_version`/`plaita_nodes_version`（D8：节点结果 schema
   漂移的假绿风险）。不一致 → 丢弃 → L1。
@@ -148,7 +163,7 @@ finally:
 | 节点**异常**（AGENTRUN 崩、CODE 异常、发布异常） | v3 宿主原地重试（每节点 1 次），成功节点跳过 |
 | 业务红（门禁红/评审否决） | flow 图内修复环（原有，不属宿主） |
 | impl 超时/被杀（节点内损失） | keeper 重派 → L1（代码）+ L2（会话 resume）；宿主不原地重试（D4） |
-| 进程崩溃/断电（图中断） | v3 checkpoint（工件根）+ worktree 在 → 续走 |
+| 进程崩溃/断电（图中断） | v3 checkpoint（工件根）+ worktree 在 → 续走（v2.2 兑现：闸查 worktree_path，跨派发可达；s19） |
 | keeper 终态回收后重派 | checkpoint 丢弃（worktree 闸）→ L1 完整路径 |
 | flow/plaita 版本漂移 | flow_hash/版本闸 → 丢弃 → L1 |
 | 宿主进程被 kill -9 / KeyboardInterrupt（R8） | 无收尾——靠盘上 checkpoint + keeper 重派（写明，接受） |
@@ -156,10 +171,19 @@ finally:
 
 ## 5. 契约（keeper 侧改动收敛为一个字段 + 一个已修 bug）
 
-- **state.json/RESULT 契约不变**；run_dir 新增 `host.lock`；
+- **state.json/RESULT 契约不变**；~~run_dir 新增 `host.lock`~~ **v2.2 修订：
+  host.lock 在 per-issue 工件根**（`ISSUE_ROOT/host.lock`）——原 run_dir 位置
+  形同虚设：每次派发（含重派）run_id 必不同（keeper v2_bridge.py:91），双宿主
+  各锁各的 run_dir 互不互斥，而被保护的 checkpoint/sessions/续跑 worktree 全是
+  per-issue 资源（harness s21 实证）。语义不变：后到者 retry-later；flock 随
+  进程死自动释放；⚠️ 持锁期间不得 unlink 锁文件（换 inode = 互斥失效），
+  keeper 收尾只清 run.lock、永不触碰 host.lock。run_dir 下不再创建 host.lock；
 - **node_retries 留痕契约**（T7/O6 落地）：`state.json.node_retries[node_id] =
   {count, last_error}`，StepTracker 增加 `note_retry`；`currentStep` 语义补充
-  `<node>#attempt2` 后缀；
+  `<node>#attempt2` 后缀；**v2.2 修订：node_id 归因修复**——原实现取
+  `saved.last_node`，但 saved 是 plaita context（无该键），计数自上线起恒记
+  "unknown" 名下；现按 异常链 `__cause__.node`（raise 点本体）→ on_node_start
+  流水 → checkpoint 反推 三级归因（harness s13 断言）；
 - **台账 extra**：`node_retry_exhausted: true`（宿主重试耗尽）→ keeper 见标记
   跳过 engine_error 自动重派直接升级（O3 的预算墙另见 §8）；
 - **keeper 已修 bug（评审 O3 发现，先行落地 929088e）**：engine_error 自动
@@ -200,6 +224,11 @@ childflow 在 DISTRIBUTED 下整段 NORMAL 跑完）。修订集（~13 场景）
   L1 → 不复现 `$NODE` 表 verdict；
 - **s17 worktree 闸**（O2）：checkpoint 命中但 worktree 已被终态回收删除 →
   丢弃 → L1 → 不假绿；
+- **v2.2 新增 s19-s22**：s19 跨派发续走（崩溃形态旧 worktree 幸存 → 新 run_id
+  从断点续走、活落旧树、终态回收旧树）；s20 跨派发树已清 → 丢弃走 L1；
+  s21 双宿主互斥（per-issue host.lock，后到者 retry-later 且零节点执行）；
+  s22 旧格式 checkpoint 回退 run_dir 闸（同 run_dir 续跑零回归）；
+  s13 补 node_retries 归因断言（键=失败节点 impl，非 unknown）；
 - **新增廉价冒烟**：真 bridge `--dry-run` + `RECURSIVE_HOST_V3=1`（无桩），
   断言 verdict/checkpoint/state 契约（T5）。
 

@@ -282,10 +282,11 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
                 max_run_secs: int = 8 * 3600):
     """v3 宿主循环：DISTRIBUTED 逐节点推进 + per-issue checkpoint + 节点异常重试。
 
-    可导入（harness s11-s17 直驱生产循环）。返回 (verdict_dict, nodes_dict)。
+    可导入（harness s11-s22 直驱生产循环）。返回 (verdict_dict, nodes_dict)。
     语义要点：fresh 首调必传 params（D1）；终态不落 checkpoint（R1/D2）；
-    worktree 闸（O2：被回收则丢弃 checkpoint 走 L1）；超时类异常不原地重试
-    （D4）；双宿主 flock（D6）；run 级 deadline 预算墙（O3/O5）。
+    worktree 闸（O2 v2.2：查 checkpoint 记录的 worktree_path，跨派发可达，
+    旧格式回退本进程 run_dir/worktree）；超时类异常不原地重试（D4）；
+    双宿主 flock（D6 v2.2：锁在 per-issue 目录）；run 级 deadline 预算墙（O3/O5）。
     """
     import fcntl
     import hashlib
@@ -296,7 +297,17 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
     from plaita.core.executor import FlowExecution
 
     ckpt = issue_root / "checkpoint.json"
-    lock_path = run_dir / "host.lock"
+    # D6 修订（2026-10-02）：锁必须落在 per-issue 目录。原 run_dir/host.lock 对
+    # 「同 issue 双宿主」形同虚设——每次派发（含重派）run_id 必不同（keeper
+    # v2_bridge.py:91），各宿主锁的是各自 run_dir 里的不同文件、互不互斥；而被
+    # 保护的 checkpoint.json / sessions / 续跑 worktree 全是 per-issue 资源
+    # （harness s21 实证：旧实现 B 宿主在 A 持锁期间照常开跑）。
+    # 语义不变：flock 随进程死自动释放；后到者 verdict=retry-later。
+    # ⚠️ 持锁期间任何人不得 unlink 锁文件（unlink 换 inode = 互斥失效的经典
+    # 竞态）——keeper 收尾只清自己的 run.lock（PIPELINE_LOCK_NAME，keeper.py:996），
+    # 与本文件同目录不同名，永不触碰 host.lock。
+    lock_path = issue_root / "host.lock"
+    issue_root.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     def _flow_hash() -> str:
@@ -310,13 +321,32 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
             f"{flow_obj.flow_id}|{graph}|{pv}|{nv}".encode()).hexdigest()[:16]
 
     def _ckpt_save(ctx: dict, step_id: str) -> None:
+        # O2 v2.2（2026-10-02）：worktree_path / ckpt_run_dir 记录的是「这份
+        # context 实际所属的 run/worktree」，不是本进程的 run_dir——续跑轮的
+        # $INPUT.run_dir 仍是首派 run_dir（plaita 恢复只还原 context 不重注
+        # params，strategies.py:217-222），后续节点继续在旧 worktree 干活，
+        # 跨派发恢复闸据此判 worktree 是否幸存。权威来源是 $NODE.pre.worktree
+        # （preflight 是 worktree 的产出者，即便其代码改了落点也跟得准）；
+        # 缺失时按 $INPUT.run_dir/worktree 推导（本 flow 二者恒等，flow_v2
+        # preflight:120）。旧字段（本 run_id）仍保留作审计。
+        inp = (ctx or {}).get("$INPUT") or {}
+        ckpt_rd = str(inp.get("run_dir") or run_dir)
+        nd = (ctx or {}).get("$NODE") or {}
+        pre_out = nd.get("pre") if isinstance(nd.get("pre"), dict) else {}
+        wt = pre_out.get("worktree") or str(Path(ckpt_rd) / "worktree")
         tmp = ckpt.with_suffix(f".tmp-{os.getpid()}")          # tmp 掺 pid（D6）
         tmp.write_text(json.dumps({
             "flow_id": flow_obj.flow_id, "flow_hash": _flow_hash(),
             "run_id": run_dir.name, "saved_at": time.time(),
             "last_node": step_id, "context": ctx,
+            "ckpt_run_dir": ckpt_rd, "worktree_path": wt,      # 跨派发续跑闸（O2 v2.2）
         }, ensure_ascii=False, default=str))
         tmp.rename(ckpt)                                        # 原子替换
+
+    # 续跑实际使用的 worktree（_ckpt_load 命中时回填）：≠ 本进程 run_dir/worktree
+    # 时，终态由宿主补回收（main() 的终态回收只看本进程 run_dir，管不到旧 run_dir
+    # 里那棵——无人清就是 8-12G/棵的永久泄漏）。
+    resumed_wt: list[str | None] = [None]
 
     def _ckpt_load() -> dict | None:
         try:
@@ -325,9 +355,22 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
             return None                                          # 损坏/缺失 → L1
         if raw.get("flow_hash") != _flow_hash():
             return None                                          # 版本闸 → L1
-        if not (run_dir / "worktree").exists():
+        # worktree 闸（O2 v2.2，2026-10-02）：查 checkpoint **记录的** worktree，
+        # 而非本进程 run_dir/worktree——旧实现查后者，而重派必换 run_id → 新
+        # run_dir 必无 worktree → checkpoint 入口即弃，设计矩阵「进程崩溃/
+        # 断电 → checkpoint + worktree 在 → 续走」结构性不可达（永远走 L1，
+        # harness s19 修复前红实证）。旧格式无 worktree_path 字段 → 回退检查
+        # 本进程 run_dir/worktree（原行为逐字保留：同 run_dir 续跑零回归 s22；
+        # 跨派发场景旧格式本就该被弃，行为与修复前一致）。
+        wt = raw.get("worktree_path") or str(run_dir / "worktree")
+        if not Path(wt).exists():
             return None                                          # worktree 闸 → L1（O2）
+        resumed_wt[0] = wt
         return raw.get("context")
+
+    # 最近一次 on_node_start 的节点 id（闭包可变容器；StepTracker 契约不动，
+    # 回调本就流经每个节点开始事件——s13 归因修复的数据源之一）。
+    last_started: dict = {"id": None}
 
     class _Adapter(FlowCallback):
         def __init__(self, tracker, lf):
@@ -335,10 +378,59 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
             self.lf = lf
 
         def on_node_start(self, flow, node, **kw):
+            last_started["id"] = getattr(node, "id", None) or last_started["id"]
             self.tracker.on_node_start(flow, node)
 
         def on_node_end(self, flow, node, result=None, error=None, exception=None, **kw):
             self.tracker(flow, node, result)
+
+    def _failed_node_id(e: BaseException) -> str | None:
+        """从异常链提取失败节点 id（任务 3 归因修订，2026-10-02）。
+
+        依据：分布式模式把一切异常归一化为 FlowErrorException(str(e)) 且原始
+        异常链在 __cause__（plaita _error_normalization.py raise_distributed_error
+        `raise FlowErrorException(str(e)) from e`）；节点 abort 抛的
+        NodeExecutionError 自带失败节点本体（errors.py:131-134，runner.py:140-143
+        `NodeExecutionError(message, node=node)`）。归一化后的 FlowErrorException
+        自身 node 恒为 None，不可用。取 node.id 优先、node.name 兜底（state.json
+        契约按节点 id 留痕）。"""
+        for exc in (getattr(e, "__cause__", None), e):
+            n = getattr(exc, "node", None)
+            nid = getattr(n, "id", None) or getattr(n, "name", None)
+            if nid:
+                return str(nid)
+        return None
+
+    def _recycle_resumed_worktree(verdict: dict) -> None:
+        """终态回收续跑所用的旧 run_dir worktree（O2 v2.2 伴生，2026-10-02）。
+
+        续跑轮干活的 worktree 在 checkpoint 记录的旧路径；main() 的终态回收只看
+        本进程 run_dir/worktree（续跑场景必为空转），旧树无人清 = 每次崩溃恢复
+        终态泄漏 8-12G（failed-preserved 堆积拖根盘的 #59 级事故源）。与 main()
+        同款：先 WIP 快照（提交对象进主仓共享库、分支引用保可达）再 rmtree，
+        best-effort 不吃 RESULT。非终态（engine_error 保留 checkpoint 待续）**
+        不回收**——回收了 checkpoint 就成了死据。"""
+        wt = resumed_wt[0]
+        if not wt or Path(wt) == run_dir / "worktree":
+            return
+        try:
+            w = Path(wt)
+            if w.is_dir():
+                subprocess.run(["git", "-C", str(w), "add", "-A"],
+                               capture_output=True, timeout=120)
+                subprocess.run(["git", "-C", str(w), "commit", "-m",
+                                f"WIP: {w.parent.name} (resume terminal {verdict.get('verdict')})"],
+                               capture_output=True, timeout=120)
+                subprocess.run(["git", "-C", str(w), "branch", "-f",
+                                f"wip-{w.parent.name}"],
+                               capture_output=True, timeout=30)
+                shutil.rmtree(w, ignore_errors=True)
+        except Exception as e:
+            try:
+                (run_dir / "recovery-error.log").write_text(
+                    f"{type(e).__name__}: {e}\n")
+            except Exception:
+                pass
 
     def _handlers():
         hs = []
@@ -380,7 +472,19 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
                 else:
                     r = ex.run_distributed(flow_obj, params=params)  # fresh 必传（D1）
             except FlowErrorException as e:
-                nid = (saved or {}).get("last_node") or "unknown"
+                # 失败节点归因（任务 3，2026-10-02）：原实现 `(saved or {}).get(
+                # "last_node")` 恒为 None——saved 是 plaita context（键为
+                # $INPUT/$NODE/…，checkpoint 文件里的 last_node 字段不在其中），
+                # 重试计数自上线起全部记在 "unknown" 名下（s13 修复前红实证）。
+                # 归因优先级：__cause__.node（raise 点本体，最可靠）→
+                # on_node_start 流水（宿主自记的最近开始节点）→ checkpoint 文件
+                # 的 last_node（最后成功节点，设计 O7b 的原意兜底）。
+                try:
+                    ck_last = json.loads(ckpt.read_text()).get("last_node")
+                except Exception:
+                    ck_last = None
+                nid = (_failed_node_id(e) or last_started["id"]
+                       or ck_last or "unknown")
                 why = str(e)[:200]
                 if "timed out after" in why:                     # 超时类不重试（D4）
                     raise
@@ -400,6 +504,7 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
                 v = (nodes or {}).get("_output") or r.get("result")
                 verdict = v if isinstance(v, dict) else {"verdict": "unknown",
                                                           "raw": str(v)[:400]}
+                _recycle_resumed_worktree(verdict)               # 旧 run_dir 的树在此补回收
                 break
             if r.get("is_suspend"):                              # v2 无 EventNode（D7 防御）
                 verdict = {"verdict": "engine_error",
