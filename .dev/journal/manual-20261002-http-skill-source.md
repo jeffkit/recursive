@@ -57,3 +57,24 @@ Goal: #74 拆单 2/3，depends-on #76（SkillSource trait + StaticSkillSource）
 - `cargo test --workspace`：3832 passed / 0 failed（lib 2463）。
 - `cargo clippy --all-targets --all-features -- -D warnings`：clean。
 - `cargo fmt --all`：applied，`--check` clean。
+
+## NEEDS_FIX resolution：merge main，消除 phantom deletions
+独立 review 打回（VERDICT:NEEDS_FIX）：分支自 `fafac9eb` 分叉后 main 前进到
+`cd9b5755`（#56 AG-UI 分层 + session-id 同秒碰撞修复 + test_util pin），
+`git diff main` 携带 −2732 行本分支从未触碰的 phantom deletions——即
+AGENTS.md 已知失败模式 #2。
+
+修复：`git merge main`（对齐 pipeline-56 在 `b921b56d` 的做法）。两支改动
+文件集完全不相交（本支仅 `src/skills.rs` / `src/lib.rs` / 本 journal），
+'ort' 策略零冲突合并。合并后核验：
+
+- `git diff main` 收缩为 3 文件：`src/skills.rs` +627、`src/lib.rs` +5、
+  本 journal +59，无任何删除。
+- `src/http/handlers.rs` 与 main byte-identical（分层版 3256 行）；
+  `src/http/agui.rs` / `writer.rs` 碰撞回归测试 / `test_util.rs` pin 全部在位。
+
+合并后重跑（旧 Tests 数字是 stale-base 树上跑的，作废）：
+- `cargo test --workspace`：全部 ok，0 failed（lib 2475，含
+  `http_skill_source_*` 11 项与 `create_in_same_second_gets_distinct_dirs`）。
+- `cargo clippy --all-targets --all-features -- -D warnings`：clean。
+- `cargo fmt --all -- --check`：clean。
