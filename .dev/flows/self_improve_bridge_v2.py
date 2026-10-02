@@ -169,18 +169,25 @@ def main() -> int:
         # v3 本地分布式宿主（DESIGN-local-distributed-host.md v2）：DISTRIBUTED
         # 逐节点推进 + checkpoint 落 keeper 工件根 + 节点异常自动重试（超时类
         # 除外）。checkpoint 跨派发可续（per-issue 单槽），终态不落盘。
-        from plaita.core.errors import FlowErrorException  # noqa: F401  宿主内捕获
+        # ⚠️ 异常必须落 engine-error.log + RESULT（10-02 三连秒败无痕的教训：
+        # v3 分支崩溃若不兜底，bridge 无声死亡、stderr 空、无从排查）。
         issue_root = Path.home() / ".issue-keeper" / "pipeline" / f"recursive-{m.group(1)}"
-        verdict, nodes = run_host_v3(
-            flow_obj=fl,
-            handler_specs=[(StepTracker, state_path)],
-            params={"goal": goal, "repo": args.repo, "run_dir": str(run_dir),
-                    "agent": args.agent, "reviewer": args.reviewer},
-            issue_root=issue_root, run_dir=run_dir, state_path=state_path,
-            max_node_retries=int(os.environ.get("RECURSIVE_NODE_RETRIES", "1")),
-            deadline=os.environ.get("RECURSIVE_RUN_DEADLINE"),
-            langfuse=os.environ.get("LANGFUSE_HOST", "") != "")
-        verdict = _verdict_of(verdict)
+        try:
+            verdict, nodes = run_host_v3(
+                flow_obj=fl,
+                handler_specs=[(StepTracker, state_path)],
+                params={"goal": goal, "repo": args.repo, "run_dir": str(run_dir),
+                        "agent": args.agent, "reviewer": args.reviewer},
+                issue_root=issue_root, run_dir=run_dir, state_path=state_path,
+                max_node_retries=int(os.environ.get("RECURSIVE_NODE_RETRIES", "1")),
+                deadline=os.environ.get("RECURSIVE_RUN_DEADLINE"),
+                langfuse=os.environ.get("LANGFUSE_HOST", "") != "")
+            verdict = _verdict_of(verdict)
+        except Exception as e:
+            verdict = {"verdict": "engine_error", "why": f"v3 host: {type(e).__name__}: {e}"[:500]}
+            (run_dir / "engine-error.log").write_text(
+                f"{type(e).__name__}: {e}\n")
+        nodes = nodes if isinstance(nodes, dict) else {}
         try:
             (run_dir / "nodes-dump.json").write_text(
                 json.dumps(nodes, ensure_ascii=False, indent=1, default=str))
