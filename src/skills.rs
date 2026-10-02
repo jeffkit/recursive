@@ -205,6 +205,67 @@ pub fn skill_from_content(name: &str, content: &str, refs: Vec<SkillRef>) -> Ski
     }
 }
 
+/// Where a session's skill catalog comes from.
+///
+/// The historical behavior — a fixed, in-process list of skills — is
+/// [`StaticSkillSource`]: every [`Skill`] endorses its own backing, either a
+/// file on disk (`path`, `body: None`, from [`discover_skills`]) or
+/// in-memory content (`body: Some`, from [`skill_from_content`] — the
+/// content-addressed backing for remote/tenant-configured skills, Goal 64).
+/// Follow-up goals can serve the same interface from other backends (e.g.
+/// HTTP) without touching `LoadSkill` or the registry.
+pub trait SkillSource: Send + Sync {
+    /// Snapshot of all skills known to this source.
+    ///
+    /// Called at prompt-build time (index rendering, injection). Returns an
+    /// owned `Vec` so implementations may compute or aggregate freely.
+    fn skills(&self) -> Vec<Skill>;
+
+    /// Case-insensitive lookup by skill name.
+    ///
+    /// Matching mirrors `LoadSkill`'s historical behavior (`to_lowercase` on
+    /// both sides). Default: linear scan over [`SkillSource::skills`];
+    /// implementations with larger catalogs may override.
+    fn find(&self, name: &str) -> Option<Skill> {
+        let lower = name.to_lowercase();
+        self.skills()
+            .into_iter()
+            .find(|s| s.name.to_lowercase() == lower)
+    }
+}
+
+/// A [`SkillSource`] backed by a fixed, in-process skill list.
+///
+/// Skills may be file-backed (from [`discover_skills`]) or content-backed
+/// ([`skill_from_content`]); the source is agnostic — each [`Skill`] names
+/// its own backing via `body` / `path`.
+#[derive(Debug, Clone, Default)]
+pub struct StaticSkillSource {
+    skills: Vec<Skill>,
+}
+
+impl StaticSkillSource {
+    /// Build a source from an already-assembled catalog (e.g. the output of
+    /// [`discover_skills`] plus any [`skill_from_content`] entries).
+    pub fn new(skills: Vec<Skill>) -> Self {
+        Self { skills }
+    }
+}
+
+impl SkillSource for StaticSkillSource {
+    fn skills(&self) -> Vec<Skill> {
+        self.skills.clone()
+    }
+
+    fn find(&self, name: &str) -> Option<Skill> {
+        let lower = name.to_lowercase();
+        self.skills
+            .iter()
+            .find(|s| s.name.to_lowercase() == lower)
+            .cloned()
+    }
+}
+
 /// Parse named sections from a skill's body content.
 ///
 /// Sections are delimited by `## Section Name` headings (level-2 markdown).
@@ -613,6 +674,21 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
     result
 }
 
+/// Select skills for injection from a [`SkillSource`] (convenience overload
+/// of [`skills_for_injection`]).
+pub fn skills_for_injection_from_source(
+    source: &dyn SkillSource,
+    goal: &str,
+) -> Vec<(String, String)> {
+    skills_for_injection(&source.skills(), goal)
+}
+
+/// Render the skill index for a [`SkillSource`] (convenience overload of
+/// [`skill_index`]).
+pub fn skill_index_from_source(source: &dyn SkillSource) -> String {
+    skill_index(&source.skills())
+}
+
 /// Extract the body of a SKILL.md file, stripping YAML frontmatter if present.
 pub fn extract_skill_body(content: &str) -> &str {
     extract_body(content)
@@ -817,6 +893,139 @@ where
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Arc;
+
+    // --- Goal #76: SkillSource trait + StaticSkillSource ---
+
+    #[test]
+    fn static_skill_source_round_trips_the_catalog() {
+        let file_backed = {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("disk-skill");
+            fs::create_dir(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: disk-skill\ndescription: d\n---\n\nDisk body",
+            )
+            .unwrap();
+            discover_skills(&[tmp.path().to_path_buf()]).remove(0)
+        };
+        let content_backed = skill_from_content(
+            "remote-skill",
+            "---\nname: remote-skill\ndescription: r\n---\n\nRemote body",
+            vec![],
+        );
+
+        let source = StaticSkillSource::new(vec![file_backed.clone(), content_backed.clone()]);
+        assert_eq!(source.skills().len(), 2);
+        // skills() hands out owned clones — mutating one must not touch the source.
+        let mut snapshot = source.skills();
+        snapshot.clear();
+        assert_eq!(source.skills().len(), 2, "skills() must return a fresh Vec");
+        assert_eq!(source.skills()[0].name, file_backed.name);
+        assert_eq!(source.skills()[1].name, content_backed.name);
+    }
+
+    #[test]
+    fn static_skill_source_find_is_case_insensitive() {
+        let skill = skill_from_content(
+            "mixed-case-skill",
+            "---\nname: mixed-case-skill\n---\n\nBody",
+            vec![],
+        );
+        let source = StaticSkillSource::new(vec![skill]);
+
+        assert!(source.find("MIXED-CASE-SKILL").is_some());
+        assert!(source.find("Mixed-Case-Skill").is_some());
+        assert!(source.find("mixed-case-skill").is_some());
+        assert!(source.find("nope").is_none());
+    }
+
+    #[test]
+    fn skill_source_is_object_safe_and_find_defaults_to_linear_scan() {
+        // A custom backend (the future HttpSkillSource) only needs `skills()`;
+        // `find` must work through `dyn SkillSource` with the default impl.
+        struct CountingSource {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl SkillSource for CountingSource {
+            fn skills(&self) -> Vec<Skill> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![skill_from_content(
+                    "only-skill",
+                    "---\nname: only-skill\n---\n\nBody",
+                    vec![],
+                )]
+            }
+        }
+
+        let source: Arc<dyn SkillSource> = Arc::new(CountingSource {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let found = source
+            .find("ONLY-SKILL")
+            .expect("default find must scan skills()");
+        assert_eq!(found.name, "only-skill");
+        assert!(source.find("missing").is_none());
+        assert_eq!(
+            source.skills().len(),
+            1,
+            "dyn dispatch must reach the custom backend"
+        );
+    }
+
+    #[test]
+    fn content_backed_skills_flow_through_the_source() {
+        let skill = skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: Remote\n---\n\nRemote body",
+            vec![],
+        );
+        let source = StaticSkillSource::new(vec![skill]);
+        let found = source
+            .find("remote-doc")
+            .expect("content-backed skill must be findable");
+        assert!(
+            found.body.is_some(),
+            "content backing must survive the source round-trip"
+        );
+        assert_eq!(
+            extract_skill_body(found.body.as_deref().unwrap()),
+            "Remote body"
+        );
+    }
+
+    #[test]
+    fn injection_and_index_helpers_accept_a_source() {
+        let manual = skill_from_content(
+            "manual-doc",
+            "---\nname: manual-doc\ndescription: m\n---\n\nManual body",
+            vec![],
+        );
+        let always = skill_from_content(
+            "always-doc",
+            "---\nname: always-doc\ndescription: a\nmode: always\n---\n\nAlways body",
+            vec![],
+        );
+        let source = StaticSkillSource::new(vec![manual, always]);
+
+        let injected = skills_for_injection_from_source(&source, "anything");
+        assert_eq!(injected.len(), 1, "only mode: always auto-injects");
+        assert_eq!(
+            injected[0],
+            ("always-doc".to_string(), "Always body".to_string())
+        );
+
+        let idx = skill_index_from_source(&source);
+        assert!(
+            idx.contains("- manual-doc: m"),
+            "index must list manual skills: {idx}"
+        );
+        assert!(
+            idx.contains("- [always] always-doc: a"),
+            "index must tag always skills: {idx}"
+        );
+    }
 
     #[test]
     fn discover_skills_parses_frontmatter() {

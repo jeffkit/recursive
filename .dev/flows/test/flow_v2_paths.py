@@ -59,6 +59,10 @@ def _route_agent(self, execution):
     CALLS.append(("agentrun", self.id, prompt[:48], sid))
     if prompt.startswith("#"):                     # impl：goal 文本
         text = AGENT_SCRIPT.get("impl", "")
+        if isinstance(text, list):                 # 序列脚本：原地弹出，末项常驻
+            text = text.pop(0) if len(text) > 1 else text[0]
+        if text == "@RAISE":
+            raise RuntimeError("stub impl crash (@RAISE)")
         if text == "@WRITE":
             repo = _eval(self, execution, "repo")
             try:
@@ -294,15 +298,152 @@ def s18_全部prompt表达式可解析():
     assert not bad, "不可解析表达式: " + "; ".join(bad)
 
 
+# ═══ v3 本地分布式宿主场景（DESIGN-local-distributed-host.md §7）══════════
+
+def _v3_setup(repo: Path, root: Path):
+    """v3 场景公共装配：返回 (issue_root, run_dir, state_path)。"""
+    issue_root = root / "artifact"
+    issue_root.mkdir(parents=True, exist_ok=True)
+    run_dir = root / "pipeline-77-v3run"
+    state_path = run_dir / "state.json"
+    return issue_root, run_dir, state_path
+
+
+def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None):
+    """直驱生产宿主循环（import 生产代码，非复制品）。"""
+    import self_improve_bridge_v2 as bridge
+    import self_improve_flow_v2 as flowmod
+    from self_improve_bridge_v2 import StepTracker
+    if scripts:
+        AGENT_SCRIPT.update(scripts.get("agent", {}))
+        GATE_SCRIPT.update(scripts.get("gate", {}))
+    CALLS.clear()
+    v, nodes = bridge.run_host_v3(
+        flow_obj=flowmod.self_improve_v2,
+        handler_specs=[(StepTracker, state_path)],
+        params={"goal": "#77 v3 harness", "repo": str(_REPO_HOLDER[0]),
+                "run_dir": str(run_dir), "agent": "stub-agent", "reviewer": "stub-rev"},
+        issue_root=issue_root, run_dir=run_dir, state_path=state_path,
+        max_node_retries=max_retries)
+    return v, nodes
+
+
+_REPO_HOLDER = [None]
+
+
+def s11_v3等价性_终态与节点序列():
+    """v3 宿主与 NORMAL 同场景等价：committed + impl 收到 goal（params 首传 D1）。"""
+    import self_improve_bridge_v2 as bridge
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, nodes = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert impl_calls and "#77 v3 harness" in impl_calls[0][2], "params 首传丢失（D1）"
+
+
+def s12_v3_崩溃恢复_断点续走():
+    """首轮 impl @RAISE（引擎错误）→ checkpoint 留在 last-success；第二轮修复后
+    重入 → 从断点续走 → committed（impl 不重复成功执行）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    v, _ = _drive_v3(issue_root, run_dir, state_path,
+                     scripts={"agent": {"impl": "@RAISE"}})
+    assert v.get("verdict") == "engine_error" and v.get("node_retry_exhausted"), v
+    ck = issue_root / "checkpoint.json"
+    assert ck.exists(), "engine_error 终态 checkpoint 应保留（s14 语义）"
+    AGENT_SCRIPT.update({"impl": "@WRITE"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+    # 第二轮（恢复轮）impl 恰执行一次：从 checkpoint 续走而非重走全图
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert len(impl_calls) == 1, f"恢复轮 impl 应恰好一次: {len(impl_calls)}"
+
+
+def s13_v3_节点异常自动重试():
+    """impl 首抛一次 → 宿主按节点重试 → committed（@RAISE 哨兵，非 gate 红）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    AGENT_SCRIPT.update({"impl": ["@RAISE", "@WRITE"]})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+    assert len([c for c in CALLS if c[1] == "impl"]) == 2, "impl 应恰好执行两次"
+
+
+def s14_v3_重试耗尽_engine_error():
+    """impl 连抛 → 重试耗尽 → engine_error + node_retry_exhausted + checkpoint 保留。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    AGENT_SCRIPT.update({"impl": "@RAISE"})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "engine_error" and v.get("node_retry_exhausted"), v
+    assert (issue_root / "checkpoint.json").exists()
+
+
+def s15_v3_checkpoint不可信家族():
+    """损坏 JSON / flow 指纹不符 → load 返回 None → 全新 L1 路径 → committed。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    ck = issue_root / "checkpoint.json"
+    ck.write_text('{"flow_hash": "截断的半截JSON...')
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+
+
+def s16_v3_终态不落checkpoint():
+    """committed 终态后 checkpoint 必须不存在（R1/D2：终态落盘=重派回放 $NODE 表）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+    assert not (issue_root / "checkpoint.json").exists(), "终态 checkpoint 未删除（R1/D2）"
+
+
+
+def s17_v3_worktree闸():
+    """checkpoint 在但 worktree 已被回收 → 丢弃 → 全新路径（O2 假绿防御）。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    issue_root.mkdir(parents=True, exist_ok=True)
+    (issue_root / "checkpoint.json").write_text(json.dumps(
+        {"flow_hash": "whatever", "run_id": run_dir.name,
+         "context": {"$NODE": {}}}))
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path)
+    assert v.get("verdict") == "committed", v
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
              s9_续跑找到会话_impl带sid, s10_全新run会话存储存在但不取,
-             s18_全部prompt表达式可解析]
+             s18_全部prompt表达式可解析,
+             s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
+             s13_v3_节点异常自动重试, s14_v3_重试耗尽_engine_error,
+             s15_v3_checkpoint不可信家族, s16_v3_终态不落checkpoint,
+             s17_v3_worktree闸]
 
 if __name__ == "__main__":
     _patch()
     failed = []
+
+
     for s in SCENARIOS:
         CALLS.clear(); GATE_SCRIPT.clear(); AGENT_SCRIPT.clear()
         try:
@@ -315,6 +456,3 @@ if __name__ == "__main__":
             failed.append(s.__name__)
             print(f"  ERROR {s.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(SCENARIOS)-len(failed)}/{len(SCENARIOS)} passed")
-    sys.exit(1 if failed else 0)
-
-

@@ -1098,9 +1098,16 @@ pub(crate) fn spawn_agui_run(
             Err(_) => (None, None),
         };
 
+        // Issue #66: a cancelled run did not complete — count it as failed
+        // rather than inflating `agent_runs_success` (matches the RunFinished
+        // Error outcome with code "cancelled" the client receives below).
+        let cancelled = matches!(
+            &outcome,
+            Ok(o) if matches!(o.finish_reason, crate::agent::FinishReason::Cancelled)
+        );
         match &outcome {
-            Ok(o) => super::handlers::record_run_success(&metrics, o.steps, &o.total_usage),
-            Err(_) => super::handlers::record_run_failed(&metrics),
+            Ok(o) if !cancelled => super::handlers::record_run_success(&metrics, o.steps, &o.total_usage),
+            _ => super::handlers::record_run_failed(&metrics),
         }
 
         // Persist the run into the thread's native session (issue #57):
@@ -1291,9 +1298,17 @@ pub(crate) fn spawn_agui_run(
             // RunFinished must carry an Error outcome so the client can
             // distinguish a failed run from a successful one with no
             // result — otherwise the failure is silently swallowed at
-            // the SSE boundary. `code` is reserved for a follow-up goal
-            // that maps Error::Cancelled / RateLimited / etc. to codes.
+            // the SSE boundary. Issue #66: a cancelled run (disconnect or
+            // explicit cancel) is reported with code "cancelled" instead of
+            // masquerading as Success.
             let (run_outcome, result_msg) = match &outcome {
+                Ok(o) if matches!(o.finish_reason, crate::agent::FinishReason::Cancelled) => (
+                    ag::RunFinishedOutcome::Error {
+                        message: "run cancelled by client".into(),
+                        code: Some("cancelled".into()),
+                    },
+                    None,
+                ),
                 Ok(o) => (
                     ag::RunFinishedOutcome::Success,
                     o.final_text.clone().map(serde_json::Value::String),

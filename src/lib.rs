@@ -133,7 +133,7 @@ pub use session::{
 };
 pub use skills::{
     discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
-    SkillScript, SkillSection,
+    SkillScript, SkillSection, SkillSource, StaticSkillSource,
 };
 #[cfg(feature = "cloud-runtime")]
 pub use storage::RedisSessionStore;
