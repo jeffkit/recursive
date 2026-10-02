@@ -806,8 +806,14 @@ mod tests {
     /// End-to-end through the service-level entry: a live endpoint delivers
     /// a skill that arrives content-backed (in-memory body, virtual path,
     /// in-memory refs) with no local file involved.
-    #[test]
-    fn skills_from_http_sources_loads_content_first_skills() {
+    ///
+    /// `#[tokio::test(flavor = "multi_thread")]` (not `#[test]`):
+    /// `HttpSkillSource::load_skills` re-enters `Handle::current()`, which
+    /// panics outside a runtime — and `block_in_place` additionally requires
+    /// a multi-thread runtime. Mirrors the http_skill_source_* tests in
+    /// `src/skills.rs`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skills_from_http_sources_loads_content_first_skills() {
         let body = serde_json::json!({
             "skills": [{
                 "name": "http-skill",
