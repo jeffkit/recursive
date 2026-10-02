@@ -175,6 +175,12 @@ pub(crate) struct RunCore<'a> {
     /// by [`Compactor::should_compact`] intra-turn. `0` means "no reading
     /// yet" (first step, or provider never reports usage).
     pub(crate) last_prompt_tokens: u32,
+    /// Usage reported by the most recent LLM call (`None` when the provider
+    /// did not report usage). Consumed by the next assistant
+    /// `push_message` so the incrementally-persisted transcript row carries
+    /// the usage of the call that produced it. Per-step values sum to the
+    /// same turn total that used to ride on the last assistant row.
+    pub(crate) pending_step_usage: Option<crate::session::UsageMeta>,
     /// Goal-331: consecutive proactive compaction failures. Resets to 0 on
     /// any successful compaction (including `Ok(None)` when transcript too
     /// short is **not** a failure — only actual `Err` from the provider or
@@ -198,20 +204,49 @@ impl<'a> RunCore<'a> {
         }
     }
 
+    /// Push a message onto the transcript and announce it as
+    /// [`AgentEvent::MessageAppended`] in the same breath, so persistence
+    /// sinks (SessionPersistenceSink) write the row to `transcript.jsonl`
+    /// immediately instead of waiting for the turn to end. A process killed
+    /// mid-turn (SIGKILL / SIGTERM force-exit) therefore keeps every already
+    /// completed step's messages, not just those that survived to turn end.
+    ///
+    /// Per-step LLM usage (`pending_step_usage`) rides on the assistant
+    /// message produced by that call — mirroring the on-disk contract that
+    /// assistant rows carry usage — and is consumed here so it can never
+    /// leak onto a later row.
     fn push_message(&mut self, msg: Message) {
+        let usage = if matches!(msg.role, crate::message::Role::Assistant) {
+            self.pending_step_usage.take()
+        } else {
+            None
+        };
+        self.emit(AgentEvent::MessageAppended {
+            message: msg.clone(),
+            usage,
+        });
         Arc::make_mut(&mut self.messages).push(msg);
     }
 
-    /// Attach `reasoning_content` to the last message in the transcript, if present.
-    ///
-    /// Called immediately after `push_message` on any path that produces reasoning
-    /// tokens (both the no-tool-calls path and the tool-calls path share this logic).
-    fn attach_reasoning_content(&mut self, reasoning: Option<String>) {
-        if reasoning.is_some() {
-            if let Some(msg) = Arc::make_mut(&mut self.messages).last_mut() {
-                msg.reasoning_content = reasoning;
-            }
-        }
+    /// Push a tool-result message and announce it, attaching the call's
+    /// [`AuditMeta`](crate::tools::AuditMeta) when present
+    /// (`MessageAppendedWithAudit`, Goal 153). The audit record must ride on
+    /// the push-time event — unlike assistant messages, tool rows would
+    /// otherwise lose their audit field entirely once `emit_turn_messages`
+    /// stopped re-emitting the turn batch.
+    fn push_tool_result(&mut self, msg: Message, audit: Option<crate::tools::AuditMeta>) {
+        let event = match audit {
+            Some(audit) => AgentEvent::MessageAppendedWithAudit {
+                message: msg.clone(),
+                audit,
+            },
+            None => AgentEvent::MessageAppended {
+                message: msg.clone(),
+                usage: None,
+            },
+        };
+        self.emit(event);
+        Arc::make_mut(&mut self.messages).push(msg);
     }
 
     /// Goal-328: emit the [`AgentEvent::ContextBreakdown`] event for `step`.
@@ -306,6 +341,10 @@ impl<'a> RunCore<'a> {
             }
             *total_usage = total_usage.accumulate(u);
             self.last_prompt_tokens = u.prompt_tokens;
+            // Real-time persistence: stage this call's usage so the assistant
+            // message pushed right after the step carries it on the
+            // `MessageAppended` event (and thus in its transcript.jsonl row).
+            self.pending_step_usage = Some(crate::session::UsageMeta::from_token_usage(&u));
             self.emit(AgentEvent::Usage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
@@ -323,6 +362,9 @@ impl<'a> RunCore<'a> {
         } else {
             // Provider did not report usage — emit a best-effort estimate
             // so the TUI context gauge still updates on every turn.
+            // No usage is staged: the assistant row will carry none, matching
+            // the un-accumulated `total_usage` on this path.
+            self.pending_step_usage = None;
             let estimated_input = estimate_prompt_tokens(&self.messages);
             let output_len = completion.content.len()
                 + completion.reasoning_content.as_ref().map_or(0, |s| s.len());
@@ -414,7 +456,10 @@ impl<'a> RunCore<'a> {
                     step,
                     is_error,
                 });
-                self.push_message(Message::tool_result(o.id.clone(), o.result.clone()));
+                self.push_tool_result(
+                    Message::tool_result(o.id.clone(), o.result.clone()),
+                    o.audit.clone(),
+                );
             }
             let finish = FinishReason::PermissionDenialLimit;
             self.emit(AgentEvent::TurnFinished {
@@ -447,10 +492,13 @@ impl<'a> RunCore<'a> {
                 step,
                 is_error,
             });
-            if let Some(a) = audit {
+            if let Some(a) = &audit {
                 tool_audits.insert((self.turn, id.clone()), a.clone());
             }
-            self.push_message(Message::tool_result(id.clone(), result.clone()));
+            self.push_tool_result(
+                Message::tool_result(id.clone(), result.clone()),
+                audit.clone(),
+            );
 
             // Sliding-window stuck detection: track whether each tool call
             // was an error. Triggers when the error rate in the last
@@ -510,6 +558,20 @@ impl<'a> RunCore<'a> {
         None
     }
 
+    /// Push the assistant message that requested this step's tool batch
+    /// (content + tool_calls + reasoning) and announce it to persistence
+    /// sinks. Reasoning is attached before the push so the push-time
+    /// `MessageAppended` event — and the transcript row it produces —
+    /// carries it.
+    fn push_assistant_tool_call_message(&mut self, completion: &Completion) {
+        let mut msg = Message::assistant_with_tool_calls(
+            completion.content.clone(),
+            completion.tool_calls.clone(),
+        );
+        msg.reasoning_content = completion.reasoning_content.clone();
+        self.push_message(msg);
+    }
+
     /// Finalise a step whose LLM completion carried no tool calls. Pushes
     /// the assistant message + reasoning onto the transcript, classifies
     /// the finish reason (`ProviderStop` for non-`stop`/`end_turn`
@@ -525,8 +587,11 @@ impl<'a> RunCore<'a> {
         if !completion.tool_calls.is_empty() {
             return None;
         }
-        self.push_message(Message::assistant(completion.content.clone()));
-        self.attach_reasoning_content(completion.reasoning_content.clone());
+        // Reasoning is attached before the push so the push-time
+        // `MessageAppended` event (and transcript row) carries it.
+        let mut msg = Message::assistant(completion.content.clone());
+        msg.reasoning_content = completion.reasoning_content.clone();
+        self.push_message(msg);
         let finish = match completion.finish_reason.as_deref() {
             Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r.to_string()),
             _ => FinishReason::NoMoreToolCalls,
@@ -759,8 +824,11 @@ impl<'a> RunCore<'a> {
         total_usage: TokenUsage,
         tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
     ) -> RunInnerOutcome {
-        self.push_message(Message::assistant(completion.content.clone()));
-        self.attach_reasoning_content(completion.reasoning_content.clone());
+        // Reasoning attached before the push so the push-time
+        // `MessageAppended` event carries it.
+        let mut msg = Message::assistant(completion.content.clone());
+        msg.reasoning_content = completion.reasoning_content.clone();
+        self.push_message(msg);
         self.make_cancelled_outcome(
             step,
             Some(completion.content), // partial reply becomes final_message
@@ -986,6 +1054,17 @@ impl<'a> RunCore<'a> {
                     summary_chars,
                     step,
                 });
+                // The summary is inserted at index 0 by `apply_to_transcript`
+                // (never routed through `push_message`), so announce it here —
+                // otherwise it would never reach persistence sinks and the
+                // transcript would silently lose the compaction boundary's
+                // summary row.
+                if let Some(summary) = self.messages.first().filter(|m| m.is_compaction_summary) {
+                    self.emit(AgentEvent::MessageAppended {
+                        message: summary.clone(),
+                        usage: None,
+                    });
+                }
             }
             Ok(None) => {
                 // Transcript too short to compact — not a failure, leave counter unchanged.
@@ -1336,11 +1415,7 @@ impl<'a> RunCore<'a> {
                 ));
             }
 
-            self.push_message(Message::assistant_with_tool_calls(
-                completion.content.clone(),
-                completion.tool_calls.clone(),
-            ));
-            self.attach_reasoning_content(completion.reasoning_content.clone());
+            self.push_assistant_tool_call_message(&completion);
 
             for call in &completion.tool_calls {
                 self.emit(AgentEvent::ToolCall {
@@ -1610,7 +1685,7 @@ mod tests {
     }
 
     // Helper: build a minimal RunCore suitable for testing methods that only
-    // touch `messages` (e.g. `attach_reasoning_content`).
+    // touch `messages`.
     fn make_test_core<'a>(
         messages: Vec<Message>,
         hooks: &'a crate::hooks::HookRegistry,
@@ -1640,53 +1715,11 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            pending_step_usage: None,
             consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
         }
-    }
-
-    #[test]
-    fn attach_reasoning_content_sets_last_message_when_some() {
-        let hooks = crate::hooks::HookRegistry::new();
-        let mut core = make_test_core(vec![Message::assistant("response".to_string())], &hooks);
-
-        core.attach_reasoning_content(Some("I thought carefully about this.".to_string()));
-
-        assert_eq!(
-            core.messages.last().unwrap().reasoning_content.as_deref(),
-            Some("I thought carefully about this."),
-            "reasoning_content should be set on the last message"
-        );
-    }
-
-    #[test]
-    fn attach_reasoning_content_does_not_modify_when_none() {
-        let hooks = crate::hooks::HookRegistry::new();
-        let mut core = make_test_core(vec![Message::assistant("response".to_string())], &hooks);
-
-        core.attach_reasoning_content(None);
-
-        assert!(
-            core.messages.last().unwrap().reasoning_content.is_none(),
-            "reasoning_content should remain None when called with None"
-        );
-    }
-
-    #[test]
-    fn attach_reasoning_content_preserves_existing_content_when_none() {
-        let hooks = crate::hooks::HookRegistry::new();
-        let mut msg = Message::assistant("response".to_string());
-        msg.reasoning_content = Some("prior thinking".to_string());
-        let mut core = make_test_core(vec![msg], &hooks);
-
-        core.attach_reasoning_content(None);
-
-        assert_eq!(
-            core.messages.last().unwrap().reasoning_content.as_deref(),
-            Some("prior thinking"),
-            "calling with None should not overwrite existing reasoning_content"
-        );
     }
 
     // ========================================================================
@@ -1809,6 +1842,7 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            pending_step_usage: None,
             consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
@@ -2691,6 +2725,7 @@ mod tests {
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
             last_prompt_tokens: 0,
+            pending_step_usage: None,
             consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,

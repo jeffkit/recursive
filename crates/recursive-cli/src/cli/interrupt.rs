@@ -211,6 +211,48 @@ where
     }
 }
 
+// ── Single-shot surface watchdog (SIGTERM prompt-exit) ─────────────────
+
+/// How long a single-shot surface (`run` / `loop`) may keep draining after a
+/// shutdown signal before it is force-exited. The shutdown token makes the
+/// kernel end the turn at the next step boundary (and abort a parked LLM
+/// call), but a step parked inside a long tool execution cannot be
+/// interrupted; the grace bounds how long we tolerate that. The transcript is
+/// flushed per message, so force-exiting loses at most the in-flight step.
+pub(crate) const TERM_DRAIN_GRACE_SECS: u64 = 10;
+
+/// Exit status used when a shutdown signal forces (or completed) the exit:
+/// 128 + SIGTERM(15), the conventional "killed by SIGTERM" code. Non-zero so
+/// supervisors that sent the signal see the run did not finish its goal.
+pub(crate) const TERM_EXIT_CODE: i32 = 128 + 15;
+
+/// Wait for `token` (fired by the first SIGTERM/SIGINT), then allow
+/// `grace_secs` for the runtime to drain the current step and finalize the
+/// session. Returns `true` when the grace period elapsed — the caller should
+/// force-exit — and never returns `false` (the drain path simply continues
+/// past this future in production; tests drive it with short grace values).
+pub(crate) async fn term_watchdog_expired(token: CancellationToken, grace_secs: u64) -> bool {
+    token.cancelled().await;
+    tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+    true
+}
+
+/// Arm the force-exit watchdog for a single-shot surface: once the shutdown
+/// token fires, give the runtime [`TERM_DRAIN_GRACE_SECS`] to drain; if the
+/// grace elapses, exit hard with [`TERM_EXIT_CODE`]. Everything appended
+/// before the exit is already on disk (per-message flush), so the forced
+/// exit loses at most the in-flight step's partial state.
+pub(crate) fn spawn_term_watchdog(token: CancellationToken) {
+    tokio::spawn(async move {
+        if term_watchdog_expired(token, TERM_DRAIN_GRACE_SECS).await {
+            eprintln!(
+                "shutdown: drain grace period ({TERM_DRAIN_GRACE_SECS}s) elapsed; forcing exit"
+            );
+            std::process::exit(TERM_EXIT_CODE);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +464,55 @@ mod tests {
             .await
             .expect("the supervisor must exit after a quit")
             .expect("supervisor task must not panic");
+    }
+
+    // -- term watchdog -----------------------------------------------------
+
+    /// The watchdog only starts its grace clock after the token fires: a
+    /// live token means `term_watchdog_expired` stays pending.
+    #[tokio::test]
+    async fn term_watchdog_stays_pending_until_token_fires() {
+        let token = CancellationToken::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            term_watchdog_expired(token.clone(), 0),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "watchdog must not expire while the shutdown token is live"
+        );
+        token.cancel();
+    }
+
+    /// Once the token has fired, the watchdog reports expiry after the grace
+    /// period — with grace 0 that is immediate.
+    #[tokio::test]
+    async fn term_watchdog_expires_after_grace_once_cancelled() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let expired = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            term_watchdog_expired(token, 0),
+        )
+        .await
+        .expect("cancelled token + zero grace must expire promptly");
+        assert!(expired, "expiry must be reported as true");
+    }
+
+    /// A cancelled token with a real grace window stays pending for at least
+    /// the grace duration before reporting expiry.
+    #[tokio::test]
+    async fn term_watchdog_respects_the_grace_window() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let started = std::time::Instant::now();
+        let expired = term_watchdog_expired(token, 1).await;
+        assert!(expired);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "watchdog must wait out the grace window, waited {:?}",
+            started.elapsed()
+        );
     }
 }

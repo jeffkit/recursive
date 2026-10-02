@@ -696,55 +696,18 @@ impl AgentRuntime {
         Ok(turn_outcome)
     }
 
-    /// Append new kernel messages to the transcript and emit `MessageAppended`
-    /// (or `MessageAppendedWithAudit`) for each, then flush the deferred
-    /// `TurnFinished` event.
+    /// Incorporate the kernel's new messages into the wrapper transcript and
+    /// flush the deferred `TurnFinished` event.
+    ///
+    /// Since the real-time persistence change, `RunCore` emits
+    /// `MessageAppended` / `MessageAppendedWithAudit` at push time (per ReAct
+    /// step), so persistence sinks already wrote every committed message to
+    /// `transcript.jsonl` while the turn was running. This method therefore
+    /// only extends the canonical transcript and releases the `TurnFinished`
+    /// event the forwarder withheld — preserving the SDK ordering guarantee
+    /// (TurnFinished strictly after every MessageAppended).
     async fn emit_turn_messages(&mut self, outcome: &crate::kernel::TurnOutcome) {
-        let new_messages = &outcome.new_messages;
-        let turn_usage = crate::session::UsageMeta::from_token_usage(&outcome.usage);
-        let mut tool_audits = outcome.tool_audits.clone();
-        // Token usage belongs only on the last assistant message of the turn —
-        // attaching it to every assistant message would cause consumers to
-        // multiply-count tokens.
-        let last_assistant_idx = new_messages
-            .iter()
-            .rposition(|m| matches!(m.role, crate::message::Role::Assistant));
-        Arc::make_mut(&mut self.transcript).extend(new_messages.iter().cloned());
-        for (idx, msg) in new_messages.iter().enumerate() {
-            let event = if msg.role == crate::message::Role::Tool {
-                if let Some(tcid) = &msg.tool_call_id {
-                    if let Some(audit) = tool_audits.remove(&(outcome.turn, tcid.clone())) {
-                        AgentEvent::MessageAppendedWithAudit {
-                            message: msg.clone(),
-                            audit,
-                        }
-                    } else {
-                        AgentEvent::MessageAppended {
-                            message: msg.clone(),
-                            usage: None,
-                        }
-                    }
-                } else {
-                    AgentEvent::MessageAppended {
-                        message: msg.clone(),
-                        usage: None,
-                    }
-                }
-            } else {
-                let usage = if matches!(msg.role, crate::message::Role::Assistant)
-                    && Some(idx) == last_assistant_idx
-                {
-                    Some(turn_usage.clone())
-                } else {
-                    None
-                };
-                AgentEvent::MessageAppended {
-                    message: msg.clone(),
-                    usage,
-                }
-            };
-            self.event_sink.emit(event).await;
-        }
+        Arc::make_mut(&mut self.transcript).extend(outcome.new_messages.iter().cloned());
         // Emit TurnFinished after all messages are on the wire (SDK ordering guarantee).
         if let Some(ev) = self.deferred_turn_finished.take() {
             self.event_sink.emit(ev).await;

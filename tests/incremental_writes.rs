@@ -412,3 +412,182 @@ async fn resume_after_crash_orphan_visible() {
         "unexpected tool result in orphan transcript"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 7 (real-time persistence): rows land on disk DURING the turn
+// ---------------------------------------------------------------------------
+
+/// While the turn is still running — parked inside a tool execution — the
+/// transcript file on disk must already contain the user message and the
+/// assistant message that requested the tool call. Before the real-time
+/// persistence fix, kernel messages were batched until `emit_turn_messages`
+/// ran at turn end, so a process killed mid-turn (SIGKILL, or SIGTERM
+/// force-exit) lost every step of the turn.
+#[tokio::test]
+async fn messages_persisted_while_turn_still_running() {
+    use recursive::tools::ToolRegistry;
+    use recursive::Tool;
+
+    let home = HomePin::new();
+    let sw = make_session(&home);
+
+    // A tool that signals when it starts and blocks until released.
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    struct Gate {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for Gate {
+        fn spec(&self) -> recursive::llm::ToolSpec {
+            recursive::llm::ToolSpec {
+                name: "gate_tool".into(),
+                description: "blocks until released".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> recursive::error::Result<String> {
+            let _ = self.started.send(());
+            let mut rx = self.release.clone();
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok("released".into())
+        }
+    }
+
+    let llm = Arc::new(MockProvider::new(vec![
+        Completion {
+            content: "calling the gate".into(),
+            tool_calls: vec![ToolCall {
+                id: "gate_call_1".into(),
+                name: "gate_tool".into(),
+                arguments: json!({}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        simple_completion("after the gate"),
+    ]));
+    let reg = ToolRegistry::local().register(Arc::new(Gate {
+        started: started_tx,
+        release: release_rx,
+    }));
+    let sink = make_persistence_composite(&sw);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .tools(reg)
+        .event_sink(sink)
+        .build()
+        .unwrap();
+
+    let run = tokio::spawn(async move { rt.run("walk through the gate").await });
+
+    // Wait until the gate tool is executing (the assistant message that
+    // requested it has been pushed by then).
+    tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+        .await
+        .expect("gate tool must start within 5s")
+        .expect("started channel open");
+
+    // THE regression: while the turn is still parked inside the tool, the
+    // flushed transcript already holds the user + assistant(tool_calls) rows.
+    // Poll briefly so the push-time event has traversed the forwarder task.
+    let jsonl_path = get_session_dir(&sw).join("transcript.jsonl");
+    let mid_run = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&jsonl_path) {
+                if content.contains("calling the gate") {
+                    break content;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("assistant row must be flushed to disk mid-turn");
+    assert!(
+        mid_run.contains("walk through the gate"),
+        "user row must be on disk mid-turn"
+    );
+    assert!(
+        mid_run.contains("\"gate_call_1\""),
+        "assistant tool_call must be on disk mid-turn"
+    );
+
+    // Release the gate; the turn finishes normally.
+    let _ = release_tx.send(true);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("turn must finish after release")
+        .expect("run task must not panic")
+        .expect("run must succeed");
+    assert_eq!(outcome.steps, 2);
+
+    // Exactly 4 rows — user, assistant(tool_calls), tool result, assistant
+    // final. Guards against double-writing rows now that the kernel emits
+    // MessageAppended incrementally: emit_turn_messages must not re-emit.
+    let transcript = load_messages_from(&sw);
+    let contents: Vec<&str> = transcript.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        transcript.len(),
+        4,
+        "exactly one row per committed message, got {contents:?}"
+    );
+    assert_eq!(transcript[2].role, Role::Tool);
+    assert_eq!(transcript[2].tool_call_id.as_deref(), Some("gate_call_1"));
+    assert_eq!(transcript[3].content, "after the gate");
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: per-step usage on assistant rows
+// ---------------------------------------------------------------------------
+
+/// With real-time persistence, usage is attached per assistant message (the
+/// LLM call that produced it) instead of the whole turn's total riding on the
+/// last row. Per-row values must sum to the same total, and non-assistant
+/// rows carry no usage.
+#[tokio::test]
+async fn assistant_rows_carry_per_step_usage() {
+    let home = HomePin::new();
+    let sw = make_session(&home);
+
+    let llm = Arc::new(MockProvider::new(vec![
+        Completion {
+            content: "step one".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(recursive::llm::TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 0,
+                reasoning_tokens: 0,
+            }),
+            reasoning_content: None,
+        },
+    ]));
+    let sink = make_persistence_composite(&sw);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .event_sink(sink)
+        .build()
+        .unwrap();
+    rt.run("hi").await.unwrap();
+    drop(rt);
+
+    let entries = SessionReader::load_transcript(&get_session_dir(&sw)).unwrap();
+    assert_eq!(entries.len(), 2, "user + assistant");
+    assert!(entries[0].usage.is_none(), "user row carries no usage");
+    let usage = entries[1]
+        .usage
+        .as_ref()
+        .expect("assistant row carries the usage of its LLM call");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.output_tokens, 10);
+}

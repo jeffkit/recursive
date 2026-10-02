@@ -422,9 +422,13 @@ pub(crate) async fn run_resumed(
                     None
                 }
             }
-        } else {
-            None
-        };
+    } else {
+        None
+    };
+
+    // SIGTERM/SIGINT watchdog (same contract as run_once): bound how long a
+    // signal-interrupted run may keep draining before the process force-exits.
+    super::interrupt::spawn_term_watchdog(shutdown.clone());
 
     let cost_tracker: Option<std::sync::Mutex<recursive::cost::CostTracker>> = if session {
         match session_writer.as_ref() {
@@ -673,6 +677,11 @@ pub(crate) async fn run_resumed(
                 &path,
             )?;
         }
+    }
+    // SIGTERM/SIGINT: the run was interrupted by a signal — exit non-zero
+    // (128+SIGTERM) so the caller sees it did not run to completion.
+    if shutdown.is_cancelled() {
+        std::process::exit(super::interrupt::TERM_EXIT_CODE);
     }
     exit_for_finish(&outcome.finish_reason, outcome.steps)
 }
