@@ -59,9 +59,16 @@ pub fn user_workspace_dir(workspace: &Path) -> Result<PathBuf> {
 /// integrations that need to know exactly where the binary writes
 /// a session for a given workspace, without going through the
 /// user-data + workspace-hash layout.
+///
+/// An empty override is treated as unset: it carries no destination,
+/// and honoring it would scatter sessions into a CWD-relative `""`
+/// root (exactly the leak that put `var-folders-*` transcript dirs
+/// into the repo via an inherited-but-empty pipeline env).
 pub fn user_sessions_dir(workspace: &Path) -> Result<PathBuf> {
     if let Some(custom) = std::env::var_os("RECURSIVE_SESSIONS_DIR") {
-        return Ok(PathBuf::from(custom));
+        if !custom.is_empty() {
+            return Ok(PathBuf::from(custom));
+        }
     }
     let dir = user_workspace_dir(workspace)?.join("sessions");
     if !dir.exists() {
@@ -132,7 +139,7 @@ pub fn legacy_paths_in_workspace(workspace: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{env_lock, PinnedRecursiveHome, PinnedRecursiveHomeNoLock};
+    use crate::test_util::{env_lock, PinnedRecursiveHome};
 
     #[test]
     fn user_data_dir_honors_env_override() {
@@ -160,6 +167,14 @@ mod tests {
         std::env::set_var("RECURSIVE_SESSIONS_DIR", "/tmp/explicit-sessions");
         let dir = user_sessions_dir(Path::new("/tmp/recursive-test-fixed")).unwrap();
         assert_eq!(dir, PathBuf::from("/tmp/explicit-sessions"));
+        // Empty override carries no destination — treated as unset so a
+        // leaked-but-empty pipeline var can't scatter sessions CWD-relative.
+        std::env::set_var("RECURSIVE_SESSIONS_DIR", "");
+        let empty = user_sessions_dir(Path::new("/tmp/recursive-test-fixed")).unwrap();
+        assert!(
+            empty.ends_with("sessions"),
+            "empty override must fall through to the default layout, got: {empty:?}"
+        );
         match prev {
             Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
             None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),

@@ -2179,6 +2179,17 @@ mod tests {
         let home = tempfile::tempdir().expect("home tempdir");
         std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
         std::env::set_var("RECURSIVE_HOME", home.path());
+        // The env guard is released when this helper RETURNS — before the
+        // caller's `agui_post` drives the actual HTTP run — so nothing here
+        // can keep `RECURSIVE_SESSIONS_DIR` pinned for the run itself. Pin
+        // it to an isolated root explicitly: an inherited (or empty)
+        // override makes `user_sessions_dir` resolve CWD-relative and
+        // session transcripts leak into the repo (the `var-folders-*` /
+        // `agui-*` artifact dirs this fixture once committed).
+        std::env::set_var(
+            "RECURSIVE_SESSIONS_DIR",
+            home.path().join("agui-prompt-sessions"),
+        );
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1");
