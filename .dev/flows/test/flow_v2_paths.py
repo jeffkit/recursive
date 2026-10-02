@@ -228,11 +228,13 @@ def s8_磁盘守卫_retry_later():
 
 
 def _fake_session_store(tmp_root: Path, sid: str) -> Path:
-    """伪造持久会话存储：<root>/<slug>/<sid>/transcript.jsonl。"""
+    """伪造持久会话存储：<root>/<slug>/<sid>/transcript.jsonl。
+
+    transcript 需 >300B：生产扫描会过滤 <300B 的 stub（68 防御）。"""
     store = tmp_root / "sessions"
     d = store / "some-workspace-slug" / sid
     d.mkdir(parents=True)
-    (d / "transcript.jsonl").write_text("{}\n")
+    (d / "transcript.jsonl").write_text("x" * 512 + "\n")
     return store
 
 
