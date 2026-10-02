@@ -243,8 +243,11 @@ def s9_续跑找到会话_impl带sid():
     import plaita.node.code as pcode
     repo, root = make_repo(legacy_branch="v2-pipeline-77-999999")
     store = _fake_session_store(root, "agui-olderold")   # 先创建 = 更旧
-    (store / "some-workspace-slug" / "agui-cafecafe").mkdir(parents=True)
-    (store / "some-workspace-slug" / "agui-cafecafe" / "transcript.jsonl").write_text("{}\n")
+    cf = store / "some-workspace-slug" / "agui-cafecafe"
+    cf.mkdir(parents=True)
+    (cf / "transcript.jsonl").write_text("x" * 512 + "\n")
+    import os as _os
+    _os.utime(cf, (time.time() + 100, time.time() + 100))  # 显式更新 mtime = 最新
     pcode.SUBPROCESS_ENV_EXTRA["RECURSIVE_SESSIONS_DIR"] = str(store)
     AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
     GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
