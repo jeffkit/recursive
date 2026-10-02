@@ -230,13 +230,16 @@ mod tests {
     #[test]
     fn user_sessions_dir_creates_dir_when_absent() {
         // kills `delete ! in user_sessions_dir` line 67
-        let _guard = env_lock();
+        //
+        // `PinnedRecursiveHome::new` already acquires the global env lock
+        // and (per Goal-H J1) pins `RECURSIVE_SESSIONS_DIR` out of the way
+        // for its lifetime — which is exactly the isolation this test
+        // needs. The lock is a std Mutex and NOT re-entrant: taking
+        // `env_lock()` again here self-deadlocks the moment the test runs
+        // while any other thread holds (or waits on) the lock.
         let home = tempfile::tempdir().unwrap();
-        let _g = PinnedRecursiveHomeNoLock::new(home.path(), &_guard);
-        // Ensure RECURSIVE_SESSIONS_DIR is not set — it is a hard override
-        // that would beat the pinned home below.
-        let prev = std::env::var_os("RECURSIVE_SESSIONS_DIR");
-        std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        let _g = PinnedRecursiveHome::new(home.path());
+        // `RECURSIVE_SESSIONS_DIR` is guaranteed unset by the guard above.
 
         let workspace = tempfile::tempdir().unwrap();
         let sessions = user_sessions_dir(workspace.path()).unwrap();
@@ -248,11 +251,12 @@ mod tests {
             sessions.ends_with("sessions"),
             "path must end with 'sessions', got: {sessions:?}"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
-            None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
-        }
+        // The created dir lives under the pinned home, not some inherited
+        // override root.
+        assert!(
+            sessions.starts_with(home.path()),
+            "sessions dir must resolve under the pinned RECURSIVE_HOME, got: {sessions:?}"
+        );
     }
 
     // ── user_shadow_git_dir / user_scratchpad_path path components ───────────
