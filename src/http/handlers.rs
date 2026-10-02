@@ -1527,11 +1527,10 @@ pub(super) async fn agui_run(
         },
     );
 
-    let stream =
-        tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx).map(|ev| {
-            let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
-            Ok::<_, Infallible>(Event::default().data(data))
-        });
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(sse_rx).map(|ev| {
+        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into());
+        Ok::<_, Infallible>(Event::default().data(data))
+    });
 
     // Issue #66 §3.3 (approach A, AG-UI ecosystem convention): when the
     // client disconnects, hyper drops this response body — the wrapper's

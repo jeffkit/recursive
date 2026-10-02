@@ -1106,7 +1106,9 @@ pub(crate) fn spawn_agui_run(
             Ok(o) if matches!(o.finish_reason, crate::agent::FinishReason::Cancelled)
         );
         match &outcome {
-            Ok(o) if !cancelled => super::handlers::record_run_success(&metrics, o.steps, &o.total_usage),
+            Ok(o) if !cancelled => {
+                super::handlers::record_run_success(&metrics, o.steps, &o.total_usage)
+            }
             _ => super::handlers::record_run_failed(&metrics),
         }
 
