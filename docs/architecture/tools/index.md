@@ -33,8 +33,8 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 | `Bash` | `RunShell` | `src/tools/shell.rs` |
 | `Grep` | `SearchFiles` | `src/tools/search.rs` |
 | `Glob` | `GlobTool` | `src/tools/glob.rs` |
-| `run_background` | `RunBackground` | `src/tools/run_background.rs` |
-| `check_background` | `CheckBackground` | `src/tools/run_background.rs` |
+| `run_background` | `RunBackground` | `src/tasks/run_background.rs` |
+| `check_background` | `CheckBackground` | `src/tasks/run_background.rs` |
 
 ## Memory
 

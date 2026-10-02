@@ -22,9 +22,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::run_background::{BackgroundJobManager, LoopControl};
-use super::{SessionToolState, Tool};
 use crate::error::Result;
 use crate::llm::ToolSpec;
+use crate::tools::{SessionToolState, Tool};
 
 /// The `stop_loop` tool: agent-initiated loop shutdown.
 #[derive(Clone)]

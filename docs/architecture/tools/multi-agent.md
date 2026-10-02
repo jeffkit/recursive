@@ -56,7 +56,7 @@ so the `agent` tool (spawner) and `send_message` tool (continuer) share one tabl
 
 ## Team Tools
 
-- **Source**: `src/tools/team_create.rs`, `src/tools/team_delete.rs`
+- **Source**: `src/tasks/team_create.rs`, `src/tasks/team_delete.rs`
 - **Purpose**: Create/delete a named team of agents that share a mailbox.
 
 ## Task Management

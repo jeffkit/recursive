@@ -14,6 +14,14 @@
 //! restart.  If a task is still running when the process exits, its
 //! output is lost.  The spec explicitly calls this out as acceptable
 //! for Phase D.
+//!
+//! # Sub-modules
+//!
+//! The session-and-task-domain tools live here too (issue #81, split out of
+//! the flat `src/tools/` directory): `task_*` / `team_*` coordinator tools,
+//! plus the loop/wakeup/background trio (`run_background` + `check_background`,
+//! `schedule_wakeup`, `watch_file`, `stop_loop`). `src/tools/mod.rs` keeps
+//! `pub use` re-exports so existing paths keep resolving.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,6 +30,27 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+pub mod run_background;
+pub mod schedule_wakeup;
+pub mod stop_loop;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_create;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_get;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_list;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_output;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_stop;
+#[cfg(feature = "coordinator-mode")]
+pub mod task_update;
+#[cfg(feature = "coordinator-mode")]
+pub mod team_create;
+#[cfg(feature = "coordinator-mode")]
+pub mod team_delete;
+pub mod watch_file;
 
 // ---------------------------------------------------------------------------
 // TaskStatus
@@ -96,7 +125,7 @@ pub struct TaskState {
     /// Failed / Stopped). Uses `notify_one()` so a completion that happens
     /// while a waiter is mid-turn is not lost — the next `.notified()` poll
     /// consumes the stored permit. Mirrors the `BackgroundJobManager` pattern
-    /// in `src/tools/run_background.rs`. Used by `task_output(block=true)`
+    /// in `src/tasks/run_background.rs`. Used by `task_output(block=true)`
     /// to wait event-driven instead of busy-polling.
     pub completed_notify: Arc<Notify>,
 }

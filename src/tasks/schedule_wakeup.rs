@@ -9,9 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::Tool;
 use crate::error::Result;
 use crate::llm::ToolSpec;
+use crate::tools::Tool;
 
 /// Shared slot where the tool writes a wakeup request.
 pub type WakeupSlot = Arc<Mutex<Option<WakeupRequest>>>;

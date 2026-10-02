@@ -42,7 +42,7 @@ const MUST_HAVE_TESTS: &[&str] = &[
     "src/tools/load_skill.rs",
     "src/tools/todo.rs",
     "src/tools/facts.rs",
-    "src/tools/run_background.rs",
+    "src/tasks/run_background.rs",
     "src/tools/checkpoint.rs",
     "src/tools/episodic_recall.rs",
     "src/tools/web_fetch.rs",
@@ -50,7 +50,7 @@ const MUST_HAVE_TESTS: &[&str] = &[
     "src/tools/tool_search.rs",
     "src/tools/plan_mode.rs",
     "src/session/mod.rs",
-    "src/tasks.rs",
+    "src/tasks/mod.rs",
     "src/skills.rs",
 ];
 

@@ -10,12 +10,12 @@ timestamp: 2026-06-18T10:00:00Z
 
 | Tool | Source | Description |
 |------|--------|-------------|
-| `task_create` | `src/tools/task_create.rs` | Create a new task and assign to an agent |
-| `task_get` | `src/tools/task_get.rs` | Get task status and metadata |
-| `task_list` | `src/tools/task_list.rs` | List all tasks (optionally filtered by status) |
-| `task_update` | `src/tools/task_update.rs` | Update task metadata or notes |
-| `task_stop` | `src/tools/task_stop.rs` | Cancel a running task |
-| `task_output` | `src/tools/task_output.rs` | Retrieve task output/result |
+| `task_create` | `src/tasks/task_create.rs` | Create a new task and assign to an agent |
+| `task_get` | `src/tasks/task_get.rs` | Get task status and metadata |
+| `task_list` | `src/tasks/task_list.rs` | List all tasks (optionally filtered by status) |
+| `task_update` | `src/tasks/task_update.rs` | Update task metadata or notes |
+| `task_stop` | `src/tasks/task_stop.rs` | Cancel a running task |
+| `task_output` | `src/tasks/task_output.rs` | Retrieve task output/result |
 
 ## Task Lifecycle
 

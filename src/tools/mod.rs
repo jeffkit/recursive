@@ -44,38 +44,45 @@ pub mod plan_mode;
 pub mod policy;
 pub mod policy_sandbox;
 pub mod registry;
-pub mod run_background;
-pub mod schedule_wakeup;
 pub mod search;
 pub mod send_message;
 pub mod shell;
-pub mod stop_loop;
-#[cfg(feature = "coordinator-mode")]
-pub mod task_create;
-#[cfg(feature = "coordinator-mode")]
-pub mod task_get;
-#[cfg(feature = "coordinator-mode")]
-pub mod task_list;
-#[cfg(feature = "coordinator-mode")]
-pub mod task_output;
-#[cfg(feature = "coordinator-mode")]
-pub mod task_stop;
-#[cfg(feature = "coordinator-mode")]
-pub mod task_update;
-#[cfg(feature = "coordinator-mode")]
-pub mod team_create;
-#[cfg(feature = "coordinator-mode")]
-pub mod team_delete;
 pub mod todo;
 pub mod tool_kind;
 pub mod tool_search;
 pub mod transport;
 pub(crate) mod url_guard;
-pub mod watch_file;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 #[cfg(feature = "web_search")]
 pub mod web_search;
+
+// ── Re-exports from the session/task domain (src/tasks/, issue #81) ────────
+//
+// The task_*/team_*/loop/background tools moved to `src/tasks/` — keep the
+// module paths (`crate::tools::run_background`, …) resolving for external
+// callers. Pure re-exports, no behavior.
+
+pub use crate::tasks::run_background;
+pub use crate::tasks::schedule_wakeup;
+pub use crate::tasks::stop_loop;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::task_create;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::task_get;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::task_list;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::task_output;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::task_stop;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::task_update;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::team_create;
+#[cfg(feature = "coordinator-mode")]
+pub use crate::tasks::team_delete;
+pub use crate::tasks::watch_file;
 
 // ── Re-exports from registry ────────────────────────────────────────────────
 
@@ -140,10 +147,6 @@ pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
 pub use shell::RunShell;
 pub use stop_loop::StopLoop;
-pub use watch_file::WatchFile;
-
-#[cfg(feature = "web_fetch")]
-pub use http_call::{EndpointRegistry, EndpointSpec, HttpCall};
 #[cfg(feature = "coordinator-mode")]
 pub use task_create::TaskCreateTool;
 #[cfg(feature = "coordinator-mode")]
@@ -160,6 +163,10 @@ pub use task_update::TaskUpdateTool;
 pub use team_create::TeamCreateTool;
 #[cfg(feature = "coordinator-mode")]
 pub use team_delete::TeamDeleteTool;
+pub use watch_file::WatchFile;
+
+#[cfg(feature = "web_fetch")]
+pub use http_call::{EndpointRegistry, EndpointSpec, HttpCall};
 pub use todo::{TodoItem, TodoStatus, TodoWriteTool};
 pub use tool_search::{DeferredCatalog, ToolSearchTool, TOOL_SEARCH_TOOL_NAME};
 pub use transport::{

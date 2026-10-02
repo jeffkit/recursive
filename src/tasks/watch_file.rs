@@ -7,7 +7,7 @@
 //! something new to read.
 //!
 //! The watched file must live inside the workspace sandbox (resolved via
-//! [`super::resolve_within`]). The watch state lives on the shared
+//! [`crate::tools::resolve_within`]). The watch state lives on the shared
 //! [`BackgroundJobManager`] so the arbiter — which already holds that
 //! manager — can poll it without a new shared slot.
 
@@ -18,9 +18,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::run_background::BackgroundJobManager;
-use super::{resolve_within, SessionToolState, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::{resolve_within, SessionToolState, Tool};
 
 /// The `watch_file` tool: register a file for event-driven wakes.
 #[derive(Clone)]

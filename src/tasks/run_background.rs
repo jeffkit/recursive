@@ -21,10 +21,9 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
-use super::resolve_within;
-use super::{SessionToolState, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::{resolve_within, SessionToolState, Tool};
 
 /// Maximum bytes of stdout/stderr to capture per job.
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
@@ -302,7 +301,7 @@ pub struct RunBackground {
     /// executes via `transport.exec_shell` (container tier) instead of the
     /// host `/bin/sh` — so background jobs live inside the session's
     /// sandbox and die with it (`ToolTransport::destroy`).
-    transport: Option<Arc<dyn super::transport::ToolTransport>>,
+    transport: Option<Arc<dyn crate::tools::transport::ToolTransport>>,
 }
 
 impl RunBackground {
@@ -315,7 +314,10 @@ impl RunBackground {
     }
 
     /// Bind execution to a shared transport (Goal 403 / issue #31 §3).
-    pub fn with_transport(mut self, transport: Arc<dyn super::transport::ToolTransport>) -> Self {
+    pub fn with_transport(
+        mut self,
+        transport: Arc<dyn crate::tools::transport::ToolTransport>,
+    ) -> Self {
         self.transport = Some(transport);
         self
     }
