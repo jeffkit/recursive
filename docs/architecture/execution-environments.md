@@ -64,7 +64,8 @@ instead of hard-coding assumptions.
 
 | Capability | none | policy | container | microvm (E2B) |
 |---|---|---|---|---|
-| `network` | true | restricted by policy | opt-in (`RECURSIVE_SANDBOX_NETWORK`) | opt-in via `RECURSIVE_SANDBOX_NETWORK` (host-side startup gate; the `base` template itself has outbound — use a custom no-egress template for untrusted workloads) |
+| `network` | true | restricted by policy | opt-in (`RECURSIVE_SANDBOX_NETWORK=on`) | opt-in via `RECURSIVE_SANDBOX_NETWORK=on` (host-side startup gate; the `base` template itself has outbound — use a custom no-egress template for untrusted workloads) |
+| inherited env | yes — `Bash`/`run_background` children inherit the host env | yes — commands still run via the host shell | **no** — the in-container env is exactly the tool call's explicit `env` pairs (`K=V` prefix); host env (credentials included) never enters the sandbox | **no** — same contract: only explicit `env` pairs reach the VM |
 | `persistent` | true | true | true | true (sandbox lives for the session; TTL renewed) |
 | `path_root` | *(empty = host-resolved paths)* | host | `/workspace` (bind mount) | `/workspace` (fixed; created at sandbox start; empty unless the agent writes into it — the host workspace is **not** pre-uploaded) |
 | `user` | none | host user | `1000:1000`, non-root | probed via `whoami` |
@@ -199,8 +200,10 @@ in-sandbox environment solely from that slice (an explicit `K=V`
 prefix). Host credentials such as `RECURSIVE_E2B_API_KEY` therefore
 never enter the sandbox. The `none` tier (`LocalTransport`)
 **intentionally** inherits the host environment — that is the local
-tier's design, not a defect. Regression test:
-`tests/issue51_sandbox_env_inheritance.rs`.
+tier's design, not a defect. The `Bash` tool's `env` argument schema
+(`src/tools/shell.rs`) states this per-tier contract; the test
+`env_schema_description_matches_per_tier_reality` pins the wording.
+Regression test: `tests/issue51_sandbox_env_inheritance.rs`.
 
 ## Density & default-tier rationale
 

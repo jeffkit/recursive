@@ -144,6 +144,51 @@ impl AguiClient {
 
         Ok(rx)
     }
+
+    /// Cancel the in-flight run for `thread_id` (recursive `POST
+    /// /agui/{thread_id}/cancel`, issue #66 §3.3). The server answers
+    /// idempotently — an unknown or already-finished thread reports
+    /// `"cancelled": false` — so this never errors on a race with normal
+    /// completion.
+    pub async fn cancel(&self, thread_id: &str) -> Result<CancelInfo, ClientError> {
+        // Thread id is a path segment: {endpoint}/{thread_id}/cancel.
+        let mut url = self.endpoint.clone();
+        let base = self.endpoint.path().trim_end_matches('/');
+        url.set_path(&format!("{base}/{thread_id}/cancel"));
+
+        let resp = self.http.post(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
+        Ok(CancelInfo {
+            cancelled: body
+                .get("cancelled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            thread_id: body
+                .get("threadId")
+                .or_else(|| body.get("thread_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(thread_id)
+                .to_string(),
+        })
+    }
+}
+
+/// Server response for [`AguiClient::cancel`].
+#[derive(Debug, Clone)]
+pub struct CancelInfo {
+    /// `true` when a live run was found and asked to stop; `false` when
+    /// there was nothing to cancel (idempotent answer).
+    pub cancelled: bool,
+    /// Echoed thread id.
+    pub thread_id: String,
 }
 
 /// Decode an SSE byte stream into [`Event`]s and forward them on `tx`.

@@ -1,8 +1,10 @@
 # DESIGN: v2 本地分布式宿主（v3）——节点级断点续跑，不经 console
 
-Status: DRAFT v1（待 jeffkit 评审）
+Status: DRAFT v2（四路交叉评审后修订；评审意见以 [D*/R*/O*/T*] 编号并入正文）
 Date: 2026-10-01
 Author: 值守 agent
+评审: 架构×1 / 重试语义×1 / 运维契约×1 / 测试策略×1（全部 APPROVE-WITH-CHANGES，
+      本版已吸收全部 P0/P1；意见原文与编号见文末 §11）
 关联: issue-keeper `docs/DESIGN-console-execution.md`（L3/console 路线，本文是其本地替代方案）
 
 ---
@@ -10,182 +12,241 @@ Author: 值守 agent
 ## 0. 一句话
 
 给 v2 换一个**本地宿主循环**：用 plaita 现成的 DISTRIBUTED 策略逐节点驱动，
-checkpoint 落 run 目录；节点失败自动重试一次（G1 语义在本地宿主下天然成立，
-见 §3）；Langfuse 全链观测顺手接上。keeper 侧零改动，console 迁移（worker
-四件套）不再是我的前置依赖。
+checkpoint 落 keeper 工件根（跨派发可续）；节点异常自动重试（v2.1 修订：仅
+异常类失败，业务红不在此列——§3）；Langfuse 全链观测接上。keeper 派发链
+仅增一个 `engine_env` 透传字段（照 agent/reviewer 先例），reaper 语义不动。
 
 ## 1. 背景与动机
 
 - v2 现状：bridge 内 `FlowExecution.execute()`（NORMAL 策略）一口气跑完，
   节点间无断点——图重走时 impl 前段已完成的门禁/评审段全部重付。
 - L1（wip 分支代码续跑）与 L2（`recursive resume <sid>` 会话续跑）已落地，
-  但只覆盖**节点内**损失（impl 的代码与会话）；**节点间**的重付（已绿的
-  三门、已过的评审段在重跑时再执行一遍）没有解。
-- plaita 的 DISTRIBUTED 策略（`core/strategies.py:208`）是现成的：宿主逐节点
-  驱动、checkpoint 是宿主手里的 context dict、EventNode 可挂起。console 的
-  `local_executor.py` 就是它的一个宿主（checkpoint 存 SQLite）。
-- 2026-10-01 最小实验（/tmp/dist_demo.py，plaita 912f7df 顺带修了
-  codeflow EVENT 的 eventType 别名 bug）实证：同一条 flow 在本地以
-  DISTRIBUTED 逐节点推进 + 进程崩溃后从落盘 checkpoint 恢复 + 事件挂起/
-  恢复，全部工作，零 plaita 核心改动。
+  但只覆盖**节点内**损失；**节点间**的重付没有解。
+- plaita 的 DISTRIBUTED 策略（`core/strategies.py:208`）是现成的。2026-10-01
+  最小实验（`test/dist_demo.py`，plaita 912f7df 顺带修了 codeflow EVENT 的
+  eventType 别名 bug）实证：逐节点推进 + 进程崩溃后从落盘 checkpoint 恢复 +
+  事件挂起/恢复，全部工作，零 plaita 核心改动。
 
 ### 为什么不是 console（L3 路线降级为可选）
 
-| v2 的实际需要 | console 提供？ |
-|---|---|
-| 节点间 checkpoint + 崩溃恢复 | 策略层提供，宿主循环 40 行自建 |
-| 失败节点重试语义（G1） | **没有**（flow_worker 终态短路 error——P0 验收主缺口） |
-| 进程清场（G3 四件套） | **没有**（P0 验收 3/4 FAIL） |
-| EventNode 事件挂起 | v2 图里一个 EventNode 都没有 |
-| Web UI / executions 列表 | 有——但值守走 state.json 轮询已工作，Langfuse UI 可补 |
+v2 的图里**一个 EventNode 都没有**（不需要事件挂起）；console 对 v2 的独有
+价值（UI、事件挂起、executions API）用不上，而 v2 需要的 G1/G3 它也没有
+（P0 验收实证）。本地宿主绕开 worker 四件套直接拿节点级断点。
 
-结论：console 对 v2 的独有价值（UI、事件挂起）用不上，缺的（G1/G3）
-它也没有。本地宿主绕开 worker 四件套直接拿节点级断点。
+## 2. 架构：bridge 进程内的宿主循环
 
-## 2. 架构
-
-bridge 进程内的宿主循环，替换 `self_improve_bridge_v2.py` 里的
-`ex.clean(); ex.execute(fl, params)`（NORMAL 一口气）：
+替换 `self_improve_bridge_v2.py` 的 `ex.clean(); ex.execute(fl, params)`。
+**v2.1 修订要点**（吸收 D1/T5/O7 的 params 遗漏、D6 的并发防护、R1/D2 的
+终态 checkpoint 陷阱、D3/R2/T2 的重试计数、D4 的超时类失败）：
 
 ```python
-CKPT = run_dir / "checkpoint.json"
+CKPT = ISSUE_ROOT / "checkpoint.json"        # ← keeper 工件根（§4），非 run_dir
+LOCK = run_dir / "host.lock"
 
 def _ckpt_save(ctx: dict, step_id: str):
-    tmp = CKPT.with_suffix(".tmp")
+    tmp = CKPT.with_suffix(f".tmp-{os.getpid()}")     # tmp 掺 pid（D6）
     tmp.write_text(json.dumps({
         "flow_id": fl.flow_id,
-        "flow_hash": _flow_hash(fl),        # flow 定义指纹（§4）
+        "flow_hash": _flow_hash(fl),                  # 图结构指纹（§4，D8）
+        "run_id": run_dir.name,
         "saved_at": time.time(),
         "last_node": step_id,
-        "context": ctx,                     # DISTRIBUTED 输出的完整 context
+        "context": ctx,
     }))
-    tmp.rename(CKPT)                        # 原子替换
+    tmp.rename(CKPT)                                  # 原子替换
 
-def _ckpt_load() -> dict | None:
-    ...  # 存在且 flow_hash 一致才返回；否则 None（回退 L1 路径）
+host_fd = os.open(LOCK, os.O_CREAT | os.O_RDONLY)
+try:
+    fcntl.flock(host_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # 双宿主设防（D6）
+except BlockingIOError:
+    print(json.dumps({"verdict": "retry-later", "stage": "host",
+                      "why": "another host holds host.lock"}))
+    return 0
 
+params = {"goal": goal, "repo": repo, "run_dir": str(run_dir),
+          "agent": agent, "reviewer": reviewer}        # ← fresh 必传（D1/T5）
 ex = FlowExecution(callback_handlers=[_Adapter(StepTracker(state_path)),
                                       LangfuseCallback()])          # §6
-result = None
-saved = _ckpt_load()
-node_failures = 0
+saved = _ckpt_load()                                  # §4：位置/版本/worktree 三重闸
+node_retries: dict[str, int] = {}                     # 按节点计数（D3/R2/T2）
 while True:
     try:
         r = (ex.run_distributed(fl, saved_context=saved) if saved
-             else ex.run_distributed(fl))
-    except FlowErrorException as e:                          # 节点失败（§3）
-        node_failures += 1
-        if node_failures > MAX_NODE_RETRIES:                 # 默认 1
-            raise                                            # → engine_error 老路
-        saved = _ckpt_load()                                 # last success 断点
-        _tracker_note(f"node retry #{node_failures} at {e}") # state.json 留痕
+             else ex.run_distributed(fl, params=params))
+    except FlowErrorException as e:                   # 仅异常类失败（§3）
+        nid = _last_node_hint(e, saved)               # 归一化丢节点身份→从 checkpoint 反推（O7b）
+        if _is_timeout_class(e) or node_retries.get(nid, 0) >= MAX_NODE_RETRIES:
+            raise                                     # 超时类/预算尽 → engine_error 老路（D4）
+        node_retries[nid] = node_retries.get(nid, 0) + 1
+        _tracker_note_retry(nid, node_retries[nid])   # state.json 留痕（§5，T7/O6）
+        saved = _ckpt_load()                          # last-success 断点
         continue
-    _ckpt_save(r["context"], r.get("id"))
-    saved = r["context"]
+    if r.get("is_suspend"):                           # 防御分支（D7）：v2 无 EventNode，
+        raise _HostError("unexpected suspend")        #   挂起=图被改，别白烧重试
     if r.get("is_end"):
+        CKPT.unlink(missing_ok=True)                  # 终态不落 checkpoint（R1/D2）★
         result = r["result"]
         break
+    _ckpt_save(r["context"], r.get("id"))
+    saved = r["context"]
+finally:
+    fcntl.flock(host_fd, fcntl.LOCK_UN)
 ```
 
-## 3. G1 失败节点重试：本地宿主下是"免费"的
+> ★ 终态 checkpoint 是评审抓出的最深陷阱：若终态（含 failed-preserved/
+> retry-later）也落盘，keeper 重派会从 End 节点"续走"→ `_get_next_from_last`
+> 返回 None → 把整张 `$NODE` 表当 verdict 返回 → 契约破坏且 L1 被永久挡住
+> （R1/D2，P0×2 独立发现）。终态一律删 checkpoint，交给 L1 矩阵。
 
-console 的 G1 难点（设计稿 §G1：`flow_worker.py:272` 把 error 当终态短路、
-拦住 resume）在本地宿主下不存在，因为我们**自己就是那个循环**：
+## 3. G1 重试语义：v2.1 修订口径
 
-1. 节点失败时 `NodeRunner.run_node` 在 `context.update_node_result` **之前**
-   抛出（`core/runner.py:205-220`）——失败节点在 context 里**没有条目**，
-   `last_node_id` 仍指上一个成功节点；
-2. 宿主捕获 `FlowErrorException` 后照常保存 checkpoint（此刻它就是
-   "停在最后一个成功节点"的合法断点）；
-3. `run_distributed(saved_context=...)` 的 continue 路径经
-   `_get_next_from_last`（`strategies.py:268-284`）解析出**下一个节点 = 刚
-   失败的那个** → 原地重执行。已成功节点（impl、已绿的三门）不再执行；
-4. continue 守卫（`strategies.py:252` 的 pending 拦截）只作用于挂起中的
-   EventNode——v2 无 EventNode，不受影响（demo 实证）。
+**机制成立**（评审核实）：节点失败在 `context.update_node_result` 之前抛出
+（`runner.py:205-222`）→ 失败节点无 context 条目、`last_node_id` 仍指上一个
+成功节点；宿主保存的 checkpoint 即"停在最后成功节点"的合法断点；continue
+经 `_get_next_from_last`（`strategies.py:268-288`）解析出**刚失败的那个节点**
+原地重执行。continue 守卫（`strategies.py:252`）只拦 EventNode——v2 无。
 
-即：**错误放行 + continue 步进**的语义不需要改 plaita 任何代码，纯宿主侧
-捕获-保存-续传。策略层零改动 = 不背 plaita 版本升级的兼容包袱。
+**边界修订**（吸收 R3/T1——原稿把"业务红"错划进宿主重试）：
 
-重试策略（宿主政策，可配）：每节点最多自动重试 1 次（`MAX_NODE_RETRIES=1`，
-env `RECURSIVE_NODE_RETRIES`），重试仍败 → 向上抛 → bridge 走既有
-engine_error 收尾（WIP 快照 + RESULT），checkpoint 保留供 keeper reopen 后
-继续（重派时先续 checkpoint，无 checkpoint 才走 L1）。
+| 失败类型 | 例子 | 宿主重试？ |
+|---|---|---|
+| **异常类**（会 raise） | AGENTRUN 的 AgentRunError（CLI 崩/非零退出/被杀）、CODE python 异常、GIT_PUBLISH/WRITEFILE/preflight 异常 | **是**（G1 覆盖面） |
+| **业务红**（正常返回 False） | GATE 红门（`gate.py:90` 返回结构化结果，从不 raise）、评审 NEEDS_FIX | **否**——走 flow 图内修复环/failed-preserved，与 NORMAL 时代相同 |
+| **超时类** | impl 撞 7200s 墙 | **否**——确定性信号，原地重试=再烧 2h（D4）；直接 engine_error，由 keeper 层重派走 L1+L2 |
+| **协议类** | ResumeError、unmatched branch（图坏了） | **否**——与节点失败共用异常出口（R7），按 above 归入不重试类（`_is_timeout_class` 同款判别扩展） |
 
-## 4. checkpoint 设计
+回调生命周期（R5/D7/T3）：每次节点失败 `_raise_distributed_error` 会 fire
+`on_flow_end(error)`、而续传不再 fire `on_flow_start`——宿主**在终态显式补
+`on_flow_end`**，并声明重试后的 Langfuse span 语义 = 同 trace 内分段（接受
+一个 ERROR 根 + 后续段，或宿主层面按重试轮次分 trace——实现时二选一，
+测试断言事件序列，见 s13）。
 
-- **位置**：`<run_dir>/checkpoint.json`（run_dir 已是 keeper 工件根，随
-  终态保留；不进 worktree——回收 rmtree 伤不到它）。
-- **schema**：`{flow_id, flow_hash, saved_at, last_node, context}`。
-- **flow_hash**：flow 定义内容指纹（sha256 of `self_improve_flow_v2.py`
-  源码）。不一致（flow 升级后重派）→ 丢弃 checkpoint 回退 L1——context 里
-  的节点结果对新图不再可信，宁可重走也不续错。
-- **原子写**：tmp + rename。
-- **与 L1/L2 的组合矩阵**（谁在什么场景兜底）：
+## 4. checkpoint 设计（v2.1：位置与组合顺序是本版最大的修正）
+
+- **位置 = keeper 工件根 `~/.issue-keeper/pipeline/recursive-<n>/checkpoint.json`**
+  （O1/T4：原稿放 run_dir 是结构性不可达——keeper 重派生成新 run_id，新
+  run_dir 里永远查不到旧 checkpoint；工件根按 issue 稳定、reaper 从不清理。
+  与 L2 sessions 已有的先例完全同构）。**per-issue 单槽**：新派发发现
+  checkpoint 即续（内嵌 run_id 仅作审计）。
+- **恢复三重闸**（`_ckpt_load`）：存在 且 flow 指纹一致 且 **worktree 存在**。
+- **组合顺序不变量（O2，P0）**：跨派发恢复**必须先 L1 重建 worktree
+  （wip 分支），再按 checkpoint 跳节点**——终态回收会 rmtree worktree，
+  只续 checkpoint 不重建 worktree = 在已删除的路径上跑门禁 = paths 条件门
+  静默跳过 = 假绿落地。实现上：checkpoint 命中但 worktree 缺失 → 丢弃
+  checkpoint 走完整 L1 路径（preflight 节点本就做 worktree add）。二者是
+  叠加关系不是二选一。
+- **flow_hash = 图结构指纹**（flow_id + 节点 id 集 + 边表；D8/开放问题 D3
+  采纳），并附 `plaita_version`/`plaita_nodes_version`（D8：节点结果 schema
+  漂移的假绿风险）。不一致 → 丢弃 → L1。
+- **损坏鲁棒**（T6）：`_ckpt_load` 对 JSON 截断/损坏返回 None（吞异常落
+  recovery-error.log），与 flow_hash 不符同轨 → L1。
+
+**组合矩阵（v2.1 修订）**：
 
 | 场景 | 兜底层 |
 |---|---|
-| 节点失败（门禁红、评审 NEEDS_FIX 后挂） | **v3 宿主**：原地重试，成功节点跳过 |
-| keeper 重派（同 run 无 checkpoint） | L1：wip 分支基线继承 |
-| impl 超时/被杀（节点内损失） | L1（代码）+ L2（会话 resume） |
-| 进程崩溃/断电（图中断） | v3 checkpoint（磁盘上）→ 重派续走 |
-| checkpoint 与 flow 版本不符 | 丢弃 → L1 |
+| 节点**异常**（AGENTRUN 崩、CODE 异常、发布异常） | v3 宿主原地重试（每节点 1 次），成功节点跳过 |
+| 业务红（门禁红/评审否决） | flow 图内修复环（原有，不属宿主） |
+| impl 超时/被杀（节点内损失） | keeper 重派 → L1（代码）+ L2（会话 resume）；宿主不原地重试（D4） |
+| 进程崩溃/断电（图中断） | v3 checkpoint（工件根）+ worktree 在 → 续走 |
+| keeper 终态回收后重派 | checkpoint 丢弃（worktree 闸）→ L1 完整路径 |
+| flow/plaita 版本漂移 | flow_hash/版本闸 → 丢弃 → L1 |
+| 宿主进程被 kill -9 / KeyboardInterrupt（R8） | 无收尾——靠盘上 checkpoint + keeper 重派（写明，接受） |
+| 双宿主并发 | host.lock → 后到者 retry-later 退出（D6） |
 
-## 5. 契约不变量（keeper 与值守零改动）
+## 5. 契约（keeper 侧改动收敛为一个字段 + 一个已修 bug）
 
-- `state.json`（status/currentStep/verdict/node_timings）与 RESULT 行契约
-  不变——reaper 语义、台账、兜底评论全部不动；
-- StepTracker 照常挂 callback_handlers（DISTRIBUTED 下 on_node_start/end
-  照发，且可加 suspend/resume 钩子留痕）；
-- run_dir 布局只新增 `checkpoint.json` 一个文件；
-- v1/v2 的 L1 基线继承、L2 会话存储逻辑不变。
+- **state.json/RESULT 契约不变**；run_dir 新增 `host.lock`；
+- **node_retries 留痕契约**（T7/O6 落地）：`state.json.node_retries[node_id] =
+  {count, last_error}`，StepTracker 增加 `note_retry`；`currentStep` 语义补充
+  `<node>#attempt2` 后缀；
+- **台账 extra**：`node_retry_exhausted: true`（宿主重试耗尽）→ keeper 见标记
+  跳过 engine_error 自动重派直接升级（O3 的预算墙另见 §8）；
+- **keeper 已修 bug（评审 O3 发现，先行落地 929088e）**：engine_error 自动
+  重试 off-by-one——台账终态行在计数前已落、决策又 +1 → 首败即升级、
+  重试分支自 e2129da 起零触发（日志实证 0/24）。修复=决策直接用 trailing
+  计数。**此修复是本方案叠加数学的前提**；
+- **dispatch 链新增 `engine_env` 透传**（O4）：`PipelineRepoConfig.engine_env:
+  dict` → payload → `v2_bridge` 的 `subprocess.run(env={**os.environ,
+  **engine_env})`——照 agent/reviewer 字段先例（config.py:313 → keeper.py:1609
+  → v2_bridge.py:97）。**灰度口径修订**（O4）：env 是 per-repo 旋钮，灰度=
+  recursive 整仓开（日限/在途闸兜底），不做 per-issue。
 
-## 6. Langfuse 接线（净增观测）
+## 6. Langfuse 接线（净增观测 + 生命周期归宿主）
 
-`plaita.obs.LangfuseCallback`（obs.py:94，有单测）加入 callback_handlers：
-trace id = execution_id，覆盖 agent 内部循环、token 用量、节点 span。
-`LANGFUSE_*` env 已经在 SUBPROCESS_ENV_EXTRA 注入白名单里，bridge 进程
-自身读环境即可，无需新配置。此前 v2 只有 state.json 探针、没有 trace——
-本次一并补上（可事后在 Langfuse UI 里回放每单全链）。
+`plaita.obs.LangfuseCallback` 加入 callback_handlers（LANGFUSE_* env 已在
+bridge 注入链）。生命周期语义（R5/D7/T3）：DISTRIBUTED 下成功 End 不触发
+`on_flow_end`、节点失败触发 error 版——**宿主在终态（成功或耗尽）显式补
+`on_flow_end`**；重试轮次的 trace 分段策略在实现时定死并写进 s13 断言。
 
-## 7. 测试计划（harness 扩展，三过纪律不变）
+## 7. 测试计划（v2.1：按 T1/R3 推翻重写 s13/s14）
 
-`test/flow_v2_paths.py` 新增场景（复用桩替身 + 真 git fixture）：
+桩机制经核实两策略一致（`NodeRunner.run_node → Node.execute` 类级替换拦得到；
+childflow 在 DISTRIBUTED 下整段 NORMAL 跑完）。修订集（~13 场景）：
 
-- s11 宿主逐节点推进等价性：同一 flow 场景 s1 在 v3 宿主下终态一致、
-  节点执行序列一致；
-- s12 崩溃恢复：第 N 步后丢实例 → 新 FlowExecution + 落盘 checkpoint 续走
-  → 终态 committed；
-- s13 节点失败自动重试：gate 首红（脚本序列 [1,0]）→ 宿主重试 → committed，
-  且断言失败前的节点**未重复执行**（桩调用计数）；
-- s14 重试耗尽：双红 [1,1] → engine_error 且 checkpoint 保留；
-- s15 flow_hash 不符：checkpoint 残留 + flow 改动 → 丢弃 → 走 L1 路径。
+- **s11 等价性**：s1+s2 两条在宿主循环下终态 dict 与 CALLS 序列一致，且
+  impl 收到 goal/repo（兼验 params 首传，D1/T5）；**全部场景挂生产 handlers**
+  （StepTracker + 离线 LangfuseCallback，T3）；
+- **s12 崩溃恢复（升级）**：两个 bridge 子进程——第一个 kill -9 于
+  checkpoint.json 出现后（N 固定选**修复环中段**：首门红+fix 完成后复检前，
+  必穿 last_branch 还原，T8），第二个同参重入 → 续走 → committed；
+- **s13/s14 推翻重写（T1/R3）**：桩加 `@RAISE` 哨兵（`_route_agent` 抛异常
+  模拟 CLI 崩溃）——s13 = impl 抛一次 → 宿主重试 → committed，断言失败前
+  节点未重复执行 + 回调事件序列；s14 = 连抛 → engine_error + checkpoint
+  保留 + `node_retry_exhausted` 落台账；gate 红类失败已由 s2-s5 覆盖，勿混；
+- **s15 扩为 checkpoint 不可信家族**（T6）：flow_hash 不符 / JSON 截断损坏 /
+  遗留 .tmp → 同一断言（load 返回 None → 全新 L1 → committed）；
+- **s16 终态后重派**（R1/D2）：committed 终态后 checkpoint 已删 → 重派走
+  L1 → 不复现 `$NODE` 表 verdict；
+- **s17 worktree 闸**（O2）：checkpoint 命中但 worktree 已被终态回收删除 →
+  丢弃 → L1 → 不假绿；
+- **新增廉价冒烟**：真 bridge `--dry-run` + `RECURSIVE_HOST_V3=1`（无桩），
+  断言 verdict/checkpoint/state 契约（T5）。
 
-## 8. 灰度与回滚
+## 8. 预算墙与三口时钟（O3/O5）
 
-- 开关：env `RECURSIVE_HOST_V3=1`（bridge 读取；keeper 的
-  `pipeline_repos.jeffkit/recursive` 可经 `agent_env`/setup 注入，或先手动
-  在 daemon env 加）——默认关，NORMAL 原路；
-- 首批 canary：#68 派发时开（它是最大的单，收益最直观）；
-- 回滚 = 关 env，零迁移成本（checkpoint 文件留盘无害）。
+三口独立时钟现状：keeper `pipeline_timeout_secs`（8h，killpg 整组、timed_out
+路径**直接消费无自动重试**）、v2_bridge `V2_TIMEOUT_SECS`（8h）、v3 宿主
+重试预算（隐含 ≥ Σ节点预算×2）。**不变量**：`pipeline_timeout_secs ≥
+Σ(节点预算)×(1+MAX_NODE_RETRIES) + 固定开销`；宿主在每次节点执行与重试前
+检查**run 级 deadline**（dispatch payload 注入 epoch，engine_env 同链路），
+不足该节点预算即快速失败。impl 4h + 门禁环 + 评审环逼近 8h 的组合由 deadline
+显式拦截而非靠 keeper 杀进程的 timed_out 路径（那条路无重试且只有兜底评论）。
 
-## 9. 工作量
+## 9. 工作量（v2.1 修订后）
 
 | 项 | 估时 |
 |---|---|
-| 宿主循环 + checkpoint I/O + 重试政策 | ~2h |
-| LangfuseCallback 接线 + env 核验 | ~0.5h |
-| harness s11-s15 | ~2h |
-| 三过 + 灰度观察 | 半个班次 |
-| **合计** | **~0.5 天编码 + 1 个观察班次** |
+| 宿主循环（含 flock/三重闸/按节点重试/超时类判别/deadline） | ~3h |
+| Langfuse 接线 + 生命周期 | ~0.5h |
+| `engine_env` 透传（keeper config/keeper/v2_bridge 三点 + 测试） | ~1h |
+| harness s11-s17 + 生产 handlers 接入 | ~3h |
+| 三过 + canary（recursive 整仓开 env） | 1 个观察班次 |
+| **合计** | **~0.8 天编码 + 1 个观察班次** |
 
-## 10. 开放问题（留评审）
+## 10. 开放问题（v2.1 更新）
 
-- D1 `MAX_NODE_RETRIES=1` 是否合适？与 keeper 层 engine_error 自动重试
-  （连续 2 次升级）叠加后，单节点最多被执行 2×2=4 次——是否需要在
-  state.json 暴露 node_retries 计数给值守判读？（我倾向暴露）
-- D2 checkpoint 里是否要记 `impl` 的 session_id 快照？（现状 preflight 每
-  次扫 sessions 目录取最新——够用，但记下来可在「多会话并存」时消歧）
-- D3 flow_hash 用源码 sha256 会让「注释级改动」也失效 checkpoint——是否
-  放宽为图结构指纹（flow_id + 节点 id 集）？（我倾向后者）
-- D4 后续若 console 仍要迁（worker 四件套修完后），本宿主的 checkpoint
-  schema 是否向 console 的 SQLite 记录看齐以便平移？（可后置）
+- D1 node_retries 已升级为验收项（§5 契约）——值守判读口径待班次演练；
+- D2 checkpoint 是否记 impl session_id：暂缓（preflight 扫描已够用，多会话
+  并存场景出现再议）；
+- D3 ~~flow_hash 口径~~ → 已采纳图结构指纹 + 版本号（§4）；
+- D4 console schema 平移：仍后置；
+- **D5（新）WorkspaceLease**：checkpoint 恢复还原同一 execution_id → 撞死
+  进程的文件租约（TTL≈2h）→ SandboxLeaseError 空转（架构评审 D5）。选型：
+  (a) 恢复前按 holder `hostname:pid` 存活探测、可证死则抢占；(b) 崩溃恢复轮
+  换 execution_id（Langfuse trace 断链代价）；(c) 文档写明 TTL 停滞窗口供
+  值守 runbook。**倾向 (a)**，实现代价 ~20 行；
+- **D6（新）keeper 自动重试修复（929088e）与 v3 宿主重试的叠加**：宿主重试
+  是节点级、keeper 是派发级，二者语义正交；但 `node_retry_exhausted` 标记
+  的消费行为（跳过自动重派）需在 keeper reaper 加一个 if——这打破了 §5
+  「零改动」？否：该标记走台账 extra，reaper 判断是既有升级路径的前置过滤，
+  实现时连同 O3 修复合入。
+
+## 11. 评审记录
+
+四路交叉评审（架构 / 重试语义 / 运维契约 / 测试策略），全部
+APPROVE-WITH-CHANGES，共 32 条意见（D1-D8 / R1-R8 / O1-O8 / T1-T8）。
+本版已吸收全部 P0×5（params 遗漏 D1/T5/O7、终态 checkpoint 陷阱 R1/D2、
+checkpoint 位置不可达 O1/T4、组合顺序假绿 O2、测试空洞 T1/R3）与全部 P1；
+P2 中 T6/T8/R7/R8 已并入正文，其余（含 keeper 自动重试死分支的生产修复
+929088e）随实现落地。意见全文见值守会话记录。

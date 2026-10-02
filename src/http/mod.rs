@@ -5,6 +5,7 @@
 //! endpoint that executes the agent with a given goal, session management
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
+mod agui;
 mod auth;
 mod cold_load;
 #[cfg(test)]
@@ -23,9 +24,9 @@ pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
-    agui_run, create_session, delete_session, fork_session, get_session, health, list_sessions,
-    list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session, run_agent,
-    send_session_message, session_clear_goal, session_events, session_interrupt,
+    agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
+    list_sessions, list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session,
+    run_agent, send_session_message, session_clear_goal, session_events, session_interrupt,
     session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
@@ -378,6 +379,14 @@ pub struct AppState {
     /// Goal 397 cold-load reads this same backend to restore sessions after a
     /// restart (`cold_load::get_or_load_session`).
     pub storage: Arc<dyn StorageBackend>,
+    /// Issue #66: cancellation tokens for in-flight `/agui` runs, keyed by
+    /// AG-UI thread id. `agui_run` inserts a fresh token before spawning its
+    /// driver task and removes the entry on completion; the disconnect guard
+    /// on the SSE body and `POST /agui/{thread_id}/cancel` both cancel it.
+    /// AG-UI runs have no `SessionState` row, so they cannot reuse the
+    /// per-session `interrupt_token` slot.
+    pub agui_active_runs:
+        Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -457,6 +466,51 @@ impl AppState {
             registry.retain_tools(&self.config.allow_tools);
         }
         Ok(registry)
+    }
+}
+
+/// Minimal `Config` for build paths that only need the model name
+/// (auto compaction thresholds). Values mirror safe defaults; the shared
+/// HTTP runtime assembly uses it to stay independent of `AppState`.
+/// Every field of `Config` must be listed here, so a newly added field
+/// breaks compilation instead of silently defaulting.
+pub(crate) fn test_config_stub() -> crate::config::Config {
+    crate::config::Config {
+        workspace: std::path::PathBuf::from("."),
+        api_base: String::new(),
+        api_key: None,
+        model: String::new(),
+        provider_type: "openai".into(),
+        preset: None,
+        max_steps: 32,
+        max_tokens: 65536,
+        temperature: 0.2,
+        system_prompt: String::new(),
+        retry_max: 2,
+        retry_initial_backoff_secs: 1,
+        retry_max_backoff_secs: 8,
+        shell_timeout_secs: 300,
+        headless: false,
+        memory_summary_limit: 5,
+        thinking_budget: None,
+        session_name: None,
+        max_budget_usd: None,
+        extra_dirs: Vec::new(),
+        extra_readonly_dirs: Vec::new(),
+        allow_tools: Vec::new(),
+        context_window_override: None,
+        subagent_max_depth: 2,
+        subagent_enabled: false,
+        allow_bypass_permissions: false,
+        max_search_rounds: 3,
+        stuck_window: 10,
+        stuck_error_rate: 0.8,
+        max_concurrent_runs: 8,
+        goal_eval_transcript_tail: 12,
+        web_search_provider: None,
+        web_search_api_key: None,
+        web_search_jina_key: None,
+        wall_timeout_secs: 0,
     }
 }
 
@@ -714,6 +768,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/slash-commands", get(list_slash_commands))
         .route("/agui", post(agui_run))
+        .route("/agui/{thread_id}/cancel", post(agui_cancel))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .layer(axum::middleware::from_fn_with_state(
             (limiter.clone(), state_arc.metrics.clone()),
@@ -993,6 +1048,34 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             }
                         },
                         "400": { "description": "Invalid AG-UI RunAgentInput" }
+                    }
+                }
+            },
+            "/agui/{thread_id}/cancel": {
+                "post": {
+                    "summary": "Cancel the in-flight AG-UI run for a thread",
+                    "description": "Issue #66 §3.3: asks the run to stop. The kernel exits \
+                        with FinishReason::Cancelled at the next step boundary or mid-LLM-call; \
+                        the driver then persists the partial transcript and emits RunFinished \
+                        with an Error outcome carrying code \"cancelled\". The SSE body also \
+                        cancels its run automatically when the client disconnects. Idempotent: \
+                        an unknown (or already-finished) thread answers 200 with \
+                        \"cancelled\": false.",
+                    "parameters": [{
+                        "name": "thread_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Cancel requested (or nothing to cancel)",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -1632,6 +1715,7 @@ mod goal_396_persistence_tests {
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1658,6 +1742,7 @@ mod goal_396_persistence_tests {
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let registry = state.session_tool_registry().await.expect("registry");

@@ -193,3 +193,39 @@ async fn client_endpoint_returns_url() {
     let client = AguiClient::new(endpoint.clone());
     assert_eq!(client.endpoint(), &endpoint);
 }
+
+#[tokio::test]
+async fn client_cancel_posts_to_thread_cancel_path_and_parses_reply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agui/t-42/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "interrupted",
+            "threadId": "t-42",
+            "cancelled": true,
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/agui", server.uri()).parse().unwrap();
+    let client = AguiClient::new(endpoint);
+    let info = client.cancel("t-42").await.expect("cancel ok");
+    assert!(info.cancelled);
+    assert_eq!(info.thread_id, "t-42");
+
+    // Idempotent answer: nothing to cancel still succeeds with false.
+    let server2 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/agui/gone/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "interrupted",
+            "threadId": "gone",
+            "cancelled": false,
+        })))
+        .mount(&server2)
+        .await;
+    let endpoint2 = format!("{}/agui", server2.uri()).parse().unwrap();
+    let client2 = AguiClient::new(endpoint2);
+    let info2 = client2.cancel("gone").await.expect("cancel ok");
+    assert!(!info2.cancelled);
+}

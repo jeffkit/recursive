@@ -420,6 +420,16 @@ The terminal UI is in `crates/recursive-tui/`. For an experience-level
 comparison against fake-cc (Claude Code-style baseline), see
 [docs/tui-fake-cc-gap.md](docs/tui-fake-cc-gap.md).
 
+## AG-UI (frontend protocol)
+
+`POST /agui` exposes agent runs to frontend clients (CopilotKit, `@ag-ui/client`)
+over the AG-UI protocol: request a run with a `RunAgentInput` JSON body, consume
+the SSE event stream (`RunStarted` … `RunFinished`). Frontend-owned tools,
+interrupts, and resume round-trips are supported. See
+[docs/architecture/agui.md](docs/architecture/agui.md) for the layer map
+(`crates/agui-protocol` / `agui-client` / `agui-tui` + the transport-free
+server session layer in `src/http/agui.rs`).
+
 ## Self-Improving Agents
 
 Recursive develops itself. The same kernel you embed above is the one that

@@ -176,6 +176,11 @@ def self_improve_v2(INPUT):
         "Only stop once fmt + clippy + test are all green by your own hand.\"\"\")\n"
         "    if resumed:\n"
         "        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。\\n\")\n"
+        "        import glob as _glob\n"
+        "        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', 'review-failure.log')))\n"
+        "        if _rf:\n"
+        "            _latest = max(_rf, key=os.path.getmtime)\n"
+        "            sp.write_text(sp.read_text() + \"\\n\\n# 评审反馈（上轮 review-failure.log，逐条解决其中的回归/意见；已通过部分不要动）\\n\\n\" + open(_latest, encoding='utf-8', errors='replace').read()[:6000] + \"\\n\")\n"
         "    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n"
         "    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n"
         "    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n"
@@ -215,7 +220,10 @@ def self_improve_v2(INPUT):
 
     # ── 门禁 ×3（gate_once 单发子流程 + 主层修复环：首检→AGENTRUN 修→复检定论）──
     # 修复环放主层的原因：childflow 表达式上下文没有 F（59/69 实证 KeyError），
-    # 详见 gate_once docstring。fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死
+    # 详见 gate_once docstring。提示词常量禁止内部双引号：$F.concat 的
+    # 常量参数含转义引号时 pyparsing 函数调用匹配失败、静默回退 variable、
+    # KeyError（49 实证 _n9）——强调用大写，不用引号。
+    # fmt 门用 apply 模式（#70/#67/#61/#64/#65 五连死
     # 实证：impl 不跑 fmt、fix-loop LLM 手改源码救不动）。cargo fmt --all 幂等且
     # 秒级：可解析即绿、格式化结果随提交走；解析错误才红并交 fix-loop 修语法。
     # 不用 --check：apply 后 check 恒过，纯冗余；也不用 && 链——GATE 对单字符串
@@ -229,7 +237,7 @@ def self_improve_v2(INPUT):
                       "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The "fmt" check failed. Edit the source files to fix every '
+                'The fmt check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo fmt --all` yourself to verify "
                 "before stopping.\nFix the source, never silence with #[allow]."
                 "\n--- output tail ---\n", g1.out),
@@ -247,7 +255,7 @@ def self_improve_v2(INPUT):
                       "timeout_secs": 1200, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The "clippy" check failed. Edit the source files to fix every '
+                'The clippy check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo clippy --workspace --all-targets "
                 "--all-features -- -D warnings` yourself to verify before stopping."
                 "\nFix the source, never silence with #[allow]."
@@ -266,7 +274,7 @@ def self_improve_v2(INPUT):
                       "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
     if g3.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The "cargo test" check failed. Edit the source files to fix every '
+                'The cargo test check failed. Edit the source files to fix every '
                 "failing test below, then re-run `cargo test --workspace` yourself "
                 "to verify before stopping."
                 "\nFix the source, never silence with #[allow]."
@@ -298,7 +306,7 @@ def self_improve_v2(INPUT):
     # 节点 id 按赋值名派生且全局唯一（跨分支也算重复，64dfd7d/61294d0 两次实证）——
     # 评审段赋值名一律带序号：rev1/rev2/wfr/wfr2。
     rev1 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                    timeout_secs=3600)
+                    timeout_secs=5400)
     if F.contains(rev1.text, "VERDICT:PASS") != True:
         if F.contains(rev1.text, "VERDICT:NEEDS_FIX") != True:
             wfr = WRITEFILE(path=F.concat(run_dir, "/review-unavailable.log"),
@@ -311,7 +319,7 @@ def self_improve_v2(INPUT):
             "\n\n--- reviewer feedback ---\n", rev1.text)
         AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
         rev2 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
-                        timeout_secs=3600)
+                        timeout_secs=5400)
         if F.contains(rev2.text, "VERDICT:PASS") != True:
             wfr2 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
                              content=rev2.text)

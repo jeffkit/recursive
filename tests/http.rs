@@ -120,6 +120,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         });
 
         let response = app
@@ -179,6 +180,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let app = build_router(state);
 
@@ -467,6 +469,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let app = build_router(state);
 
@@ -546,6 +549,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let app = build_router(state);
 
@@ -632,6 +636,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let app = build_router(state);
 
@@ -846,6 +851,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         // Create a session.
@@ -1209,6 +1215,7 @@ mod http_tests {
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
             storage: storage.clone(),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         // Create a session.
@@ -1332,6 +1339,7 @@ mod http_tests {
         // Swap in the recording backend (fixture uses a plain one).
         let state = AppState {
             storage: storage.clone(),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             ..state
         };
 
@@ -4242,6 +4250,7 @@ mod http_tests {
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let app = build_router(state);
         let resp = app

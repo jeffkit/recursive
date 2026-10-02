@@ -132,8 +132,9 @@ pub use session::{
     TruncateStats,
 };
 pub use skills::{
-    discover_skills, skill_index, skills_for_injection, Skill, SkillMode, SkillParam, SkillRef,
-    SkillScript, SkillSection,
+    discover_skills, skill_index, skills_for_injection, HttpSkillSource, HttpSkillSourceError,
+    Skill, SkillMode, SkillParam, SkillRef, SkillScript, SkillSection, SkillSource,
+    StaticSkillSource,
 };
 #[cfg(feature = "cloud-runtime")]
 pub use storage::RedisSessionStore;

@@ -89,7 +89,7 @@ impl Tool for RunShell {
                     },
                     "env": {
                         "type": "object",
-                        "description": "Optional extra env vars set for this command only. Values must be strings; non-string values are rejected. These add to (or override) the inherited env.",
+                        "description": "Optional extra env vars set for this command only. Values must be strings; non-string values are rejected. Local tiers (RECURSIVE_SANDBOX unset / none / policy) add these to (or override) the inherited host env. Sandboxed tiers (container / microvm) have no inherited env — only these explicitly passed variables exist inside the sandbox; host env (credentials included) is never forwarded.",
                         "additionalProperties": {
                             "type": "string"
                         }
@@ -308,9 +308,20 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Tool { .. }));
 
-        let pid_str = std::fs::read_to_string(&marker)
-            .expect("child should have written its PID before exec");
+        // The child may legitimately still be writing the marker when the
+        // 150 ms timeout fires (host under load: fork+exec+echo alone can
+        // exceed it), so poll briefly for the file instead of reading it
+        // once — a missing file at t=0 is a scheduling race, not an orphan.
+        let mut pid_str = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::fs::read_to_string(&marker) {
+                pid_str = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let pid: i32 = pid_str
+            .expect("child should have written its PID before exec")
             .trim()
             .parse()
             .expect("PID file should contain a number");
@@ -492,5 +503,35 @@ mod tests {
             .unwrap();
         assert!(out.contains("exit: 0"));
         assert!(out.contains("hello"));
+    }
+
+    // Issue #49②: the `env` arg description sent to the model must match
+    // the actual per-tier behaviour. It must NOT claim a blanket
+    // "inherited env" (false in the container/microvm tiers, where
+    // `env_pairs` starts empty — see `.dev/AGENTS.md` invariant #3 and
+    // tests/issue51_sandbox_env_inheritance.rs); it must state both the
+    // local-tier inheritance and the sandbox-tier non-inheritance.
+    #[test]
+    fn env_schema_description_matches_per_tier_reality() {
+        let tmp = TempDir::new().unwrap();
+        let params = RunShell::new(tmp.path()).spec().parameters;
+        let desc = params["properties"]["env"]["description"]
+            .as_str()
+            .expect("env property must carry a description");
+
+        assert!(
+            !desc.contains("the inherited env"),
+            "env description must not blanket-claim an inherited env \
+             (false for container/microvm tiers): {desc}"
+        );
+        assert!(
+            desc.contains("inherited host env"),
+            "env description must state that LOCAL tiers inherit the host env: {desc}"
+        );
+        assert!(
+            desc.contains("no inherited env") || desc.contains("never forwarded"),
+            "env description must state that SANDBOX tiers do not inherit \
+             host env: {desc}"
+        );
     }
 }

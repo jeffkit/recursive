@@ -205,6 +205,387 @@ pub fn skill_from_content(name: &str, content: &str, refs: Vec<SkillRef>) -> Ski
     }
 }
 
+/// Where a session's skill catalog comes from.
+///
+/// The historical behavior — a fixed, in-process list of skills — is
+/// [`StaticSkillSource`]: every [`Skill`] endorses its own backing, either a
+/// file on disk (`path`, `body: None`, from [`discover_skills`]) or
+/// in-memory content (`body: Some`, from [`skill_from_content`] — the
+/// content-addressed backing for remote/tenant-configured skills, Goal 64).
+/// Follow-up goals can serve the same interface from other backends (e.g.
+/// HTTP) without touching `LoadSkill` or the registry.
+pub trait SkillSource: Send + Sync {
+    /// Snapshot of all skills known to this source.
+    ///
+    /// Called at prompt-build time (index rendering, injection). Returns an
+    /// owned `Vec` so implementations may compute or aggregate freely.
+    fn skills(&self) -> Vec<Skill>;
+
+    /// Case-insensitive lookup by skill name.
+    ///
+    /// Matching mirrors `LoadSkill`'s historical behavior (`to_lowercase` on
+    /// both sides). Default: linear scan over [`SkillSource::skills`];
+    /// implementations with larger catalogs may override.
+    fn find(&self, name: &str) -> Option<Skill> {
+        let lower = name.to_lowercase();
+        self.skills()
+            .into_iter()
+            .find(|s| s.name.to_lowercase() == lower)
+    }
+}
+
+/// A [`SkillSource`] backed by a fixed, in-process skill list.
+///
+/// Skills may be file-backed (from [`discover_skills`]) or content-backed
+/// ([`skill_from_content`]); the source is agnostic — each [`Skill`] names
+/// its own backing via `body` / `path`.
+#[derive(Debug, Clone, Default)]
+pub struct StaticSkillSource {
+    skills: Vec<Skill>,
+}
+
+impl StaticSkillSource {
+    /// Build a source from an already-assembled catalog (e.g. the output of
+    /// [`discover_skills`] plus any [`skill_from_content`] entries).
+    pub fn new(skills: Vec<Skill>) -> Self {
+        Self { skills }
+    }
+}
+
+impl SkillSource for StaticSkillSource {
+    fn skills(&self) -> Vec<Skill> {
+        self.skills.clone()
+    }
+
+    fn find(&self, name: &str) -> Option<Skill> {
+        let lower = name.to_lowercase();
+        self.skills
+            .iter()
+            .find(|s| s.name.to_lowercase() == lower)
+            .cloned()
+    }
+}
+
+/// Error type returned by [`HttpSkillSource::load_skills`].
+#[derive(Debug, Clone)]
+pub enum HttpSkillSourceError {
+    /// The configured URL failed the https-only allowlist check. The URL is
+    /// never issued a request in this case.
+    Disallowed(String),
+    /// The HTTP request itself failed (transport / status / body read).
+    Request(String),
+    /// The response body was not valid UTF-8 or the skill index could not be
+    /// parsed.
+    Parse(String),
+}
+
+impl std::fmt::Display for HttpSkillSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disallowed(url) => write!(
+                f,
+                "skill source URL is not allowed by the https-only allowlist: {url}"
+            ),
+            Self::Request(msg) => write!(f, "skill source request failed: {msg}"),
+            Self::Parse(msg) => write!(f, "skill index parse failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpSkillSourceError {}
+
+/// A [`SkillSource`] that fetches a skill index over HTTPS at construction
+/// time (issue #77, #74 拆单 2/3).
+///
+/// The remote endpoint returns a JSON document of the shape:
+///
+/// ```json
+/// { "skills": [ { "name": "pdf", "content": "---\nname: pdf\n---\n\nBody" } ] }
+/// ```
+///
+/// Each entry becomes a content-backed [`Skill`] (Goal 64: `body: Some`,
+/// synthetic `/virtual/skills/<name>` path, no `scripts/`). Duplicate names
+/// keep the first occurrence; an entry with an empty name is skipped.
+///
+/// # Security posture
+///
+/// - **https only.** `new()` rejects `http://` (and any scheme other than
+///   `https://`) at construction time — the request is never issued. Skills
+///   are executed as instructions by the agent, so transporting them in
+///   cleartext would be an injection channel; this is a deliberate, stricter
+///   policy than `web_fetch`/`url_guard` (which still allow plain `http`).
+/// - **Allowlist.** An optional host allowlist further restricts which
+///   origins may serve skills. Hosts are matched case-insensitively with an
+///   optional `:port`; a trailing dot on either side is stripped before
+///   comparison. **No suffix/wildcard matching** (`cdn.example.com` does not
+///   match `example.com`) — a compromised subdomain must not be able to
+///   serve skills, so exact host equality is the rule.
+/// - **No redirects.** The client is built with
+///   `redirect(Policy::none())`: a 3xx is surfaced as an error instead of a
+///   second request to a host the allowlist never saw.
+/// - **Sync, one-shot fetch.** The fetch happens in `load_skills()` via
+///   `tokio::runtime::Handle::current()` (blocking wrapper around the async
+///   request), so this source can be built inside any async context without
+///   spawning. Skills are then held in memory and served by the
+///   [`SkillSource`] impl without further network I/O.
+#[derive(Clone)]
+pub struct HttpSkillSource {
+    url: String,
+    allowed_hosts: Option<Vec<String>>,
+    timeout: std::time::Duration,
+    /// Set when `new()` rejected the configuration; `load_skills` returns it
+    /// without any network I/O (keeps the constructor infallible so callers
+    /// can log-and-degrade like the endpoints registry).
+    config_error: Option<HttpSkillSourceError>,
+}
+
+impl std::fmt::Debug for HttpSkillSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpSkillSource")
+            .field("url", &self.url)
+            .field(
+                "allowed_hosts",
+                &self.allowed_hosts.as_ref().map(|h| h.len()),
+            )
+            .field("timeout", &self.timeout)
+            .field("config_error", &self.config_error.is_some())
+            .finish()
+    }
+}
+
+/// Response schema of the remote skill index.
+#[derive(Debug, serde::Deserialize)]
+struct RemoteSkillIndex {
+    #[serde(default)]
+    skills: Vec<RemoteSkillEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RemoteSkillEntry {
+    name: String,
+    content: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl HttpSkillSource {
+    /// Default request timeout.
+    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Upper bound on the index body (defense against a hostile endpoint
+    /// streaming forever).
+    const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+    /// Build a source for `url` (must be `https://...`).
+    ///
+    /// `allowed_hosts`: when `Some`, the URL's host must match one of the
+    /// entries exactly (case-insensitive, optional `:port`, trailing dot
+    /// ignored). `None` means any https host is accepted.
+    ///
+    /// The constructor never fails and never performs I/O; a disallowed URL
+    /// is remembered and reported by [`HttpSkillSource::load_skills`], so
+    /// operators get a precise error instead of a panic at startup.
+    pub fn new(url: impl Into<String>, allowed_hosts: Option<Vec<String>>) -> Self {
+        let url = url.into();
+        let config_error = Self::validate(&url, allowed_hosts.as_deref()).err();
+        Self {
+            url,
+            allowed_hosts,
+            timeout: Self::DEFAULT_TIMEOUT,
+            config_error,
+        }
+    }
+
+    /// Override the request timeout (tests use a small value).
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// https-only + allowlist validation, shared by `new` and tests.
+    fn validate(url: &str, allowed_hosts: Option<&[String]>) -> Result<(), HttpSkillSourceError> {
+        let parsed = url::Url::parse(url).map_err(|e| {
+            HttpSkillSourceError::Disallowed(format!("unparseable skill source URL '{url}': {e}"))
+        })?;
+        if parsed.scheme() != "https" {
+            return Err(HttpSkillSourceError::Disallowed(format!(
+                "skill source URL must use https:// (got '{}://')",
+                parsed.scheme()
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(HttpSkillSourceError::Disallowed(
+                "skill source URL must not contain userinfo".to_string(),
+            ));
+        }
+        if let Some(allow) = allowed_hosts {
+            let host = parsed.host_str().ok_or_else(|| {
+                HttpSkillSourceError::Disallowed("skill source URL has no host".to_string())
+            })?;
+            let port = parsed.port();
+            let wanted = normalize_allowlist_host(host, port);
+            let matched = allow
+                .iter()
+                .any(|entry| normalize_allowlist_host(entry, None) == wanted);
+            if !matched {
+                return Err(HttpSkillSourceError::Disallowed(format!(
+                    "skill source host '{host}' is not in the allowlist"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The allowlist, if one was configured.
+    pub fn allowed_hosts(&self) -> Option<&[String]> {
+        self.allowed_hosts.as_deref()
+    }
+
+    /// Fetch the remote index and return the parsed, content-backed skills.
+    ///
+    /// Must be called from within a Tokio runtime (the blocking wrapper
+    /// re-enters the current handle).
+    pub fn load_skills(&self) -> Result<Vec<Skill>, HttpSkillSourceError> {
+        if let Some(err) = &self.config_error {
+            return Err(err.clone());
+        }
+        let body = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(fetch_remote_index(&self.url, self.timeout))
+        })?;
+        let index: RemoteSkillIndex = serde_json::from_slice(&body)
+            .map_err(|e| HttpSkillSourceError::Parse(format!("invalid skill index JSON: {e}")))?;
+        Ok(skills_from_remote_entries(index.skills))
+    }
+}
+
+/// Fetch the remote skill index over HTTP(S).
+///
+/// The https-only / allowlist gate runs **before** this function in
+/// [`HttpSkillSource::load_skills`] (via `config_error`); this helper is
+/// shared with tests, which drive it directly against loopback mocks.
+async fn fetch_remote_index(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, HttpSkillSourceError> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent(format!("recursive-agent/{}", env!("CARGO_PKG_VERSION")))
+        // No redirects: every hop would leave the allowlist-validated
+        // origin. A 3xx is an error, not a follow.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| HttpSkillSourceError::Request(format!("failed to build client: {e}")))?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        // Strip the request URL — the error text can surface in logs far
+        // from the operator config.
+        let e = e.without_url();
+        HttpSkillSourceError::Request(format!("request failed: {e}"))
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(HttpSkillSourceError::Request(format!(
+            "remote skill index returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    if resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > HttpSkillSource::MAX_BODY_BYTES)
+    {
+        return Err(HttpSkillSourceError::Request(format!(
+            "remote skill index exceeds {} bytes",
+            HttpSkillSource::MAX_BODY_BYTES
+        )));
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| HttpSkillSourceError::Request(format!("failed to read response body: {e}")))?;
+    let body = body.to_vec();
+    if body.len() > HttpSkillSource::MAX_BODY_BYTES {
+        return Err(HttpSkillSourceError::Request(format!(
+            "remote skill index exceeds {} bytes",
+            HttpSkillSource::MAX_BODY_BYTES
+        )));
+    }
+    Ok(body)
+}
+
+/// Map remote index entries to content-backed [`Skill`]s (Goal 64 backing).
+///
+/// Blank names are skipped; duplicate names (case-insensitive) keep the
+/// first occurrence. When an entry carries an explicit `description` and its
+/// content has no frontmatter of its own, the description is injected as
+/// frontmatter so [`parse_skill_meta`] picks it up.
+fn skills_from_remote_entries(entries: Vec<RemoteSkillEntry>) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        let name = entry.name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if !seen.insert(name.to_lowercase()) {
+            continue;
+        }
+        let content = match (&entry.description, entry.content.starts_with("---")) {
+            (Some(desc), false) if !desc.trim().is_empty() => {
+                format!(
+                    "---\nname: {name}\ndescription: {}\n---\n\n{}",
+                    desc.trim(),
+                    entry.content
+                )
+            }
+            _ => entry.content,
+        };
+        skills.push(skill_from_content(&name, &content, Vec::new()));
+    }
+    skills
+}
+
+/// Normalize an allowlist entry / URL host for comparison: lowercase, strip
+/// one trailing dot, and (when a default-port mapping applies) drop a
+/// default port so `https://example.com:443` matches the bare-host entry.
+fn normalize_allowlist_host(host: &str, port: Option<u16>) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(host.as_str()).to_string();
+    // 443 is https's implicit port; a URL carrying it is the same origin as
+    // the bare host entry.
+    match port {
+        Some(443) | None => host,
+        Some(p) => format!("{host}:{p}"),
+    }
+}
+
+/// A [`SkillSource`] that fetches its catalog over HTTPS. See
+/// [`HttpSkillSource`] for the https-only / allowlist / no-redirect posture.
+impl SkillSource for HttpSkillSource {
+    /// Returns the skills fetched by [`HttpSkillSource::load_skills`].
+    ///
+    /// On failure this returns an empty catalog (degraded, not fatal — the
+    /// skill index simply omits the remote skills) and logs the error.
+    /// Prefer calling [`HttpSkillSource::load_skills`] once at startup and
+    /// wrapping the result in [`StaticSkillSource`] when the error must be
+    /// operator-visible.
+    fn skills(&self) -> Vec<Skill> {
+        match self.load_skills() {
+            Ok(skills) => skills,
+            Err(e) => {
+                tracing::warn!("HttpSkillSource: remote skill catalog unavailable: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// Parse named sections from a skill's body content.
 ///
 /// Sections are delimited by `## Section Name` headings (level-2 markdown).
@@ -613,6 +994,21 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
     result
 }
 
+/// Select skills for injection from a [`SkillSource`] (convenience overload
+/// of [`skills_for_injection`]).
+pub fn skills_for_injection_from_source(
+    source: &dyn SkillSource,
+    goal: &str,
+) -> Vec<(String, String)> {
+    skills_for_injection(&source.skills(), goal)
+}
+
+/// Render the skill index for a [`SkillSource`] (convenience overload of
+/// [`skill_index`]).
+pub fn skill_index_from_source(source: &dyn SkillSource) -> String {
+    skill_index(&source.skills())
+}
+
 /// Extract the body of a SKILL.md file, stripping YAML frontmatter if present.
 pub fn extract_skill_body(content: &str) -> &str {
     extract_body(content)
@@ -817,6 +1213,139 @@ where
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Arc;
+
+    // --- Goal #76: SkillSource trait + StaticSkillSource ---
+
+    #[test]
+    fn static_skill_source_round_trips_the_catalog() {
+        let file_backed = {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("disk-skill");
+            fs::create_dir(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: disk-skill\ndescription: d\n---\n\nDisk body",
+            )
+            .unwrap();
+            discover_skills(&[tmp.path().to_path_buf()]).remove(0)
+        };
+        let content_backed = skill_from_content(
+            "remote-skill",
+            "---\nname: remote-skill\ndescription: r\n---\n\nRemote body",
+            vec![],
+        );
+
+        let source = StaticSkillSource::new(vec![file_backed.clone(), content_backed.clone()]);
+        assert_eq!(source.skills().len(), 2);
+        // skills() hands out owned clones — mutating one must not touch the source.
+        let mut snapshot = source.skills();
+        snapshot.clear();
+        assert_eq!(source.skills().len(), 2, "skills() must return a fresh Vec");
+        assert_eq!(source.skills()[0].name, file_backed.name);
+        assert_eq!(source.skills()[1].name, content_backed.name);
+    }
+
+    #[test]
+    fn static_skill_source_find_is_case_insensitive() {
+        let skill = skill_from_content(
+            "mixed-case-skill",
+            "---\nname: mixed-case-skill\n---\n\nBody",
+            vec![],
+        );
+        let source = StaticSkillSource::new(vec![skill]);
+
+        assert!(source.find("MIXED-CASE-SKILL").is_some());
+        assert!(source.find("Mixed-Case-Skill").is_some());
+        assert!(source.find("mixed-case-skill").is_some());
+        assert!(source.find("nope").is_none());
+    }
+
+    #[test]
+    fn skill_source_is_object_safe_and_find_defaults_to_linear_scan() {
+        // A custom backend (the future HttpSkillSource) only needs `skills()`;
+        // `find` must work through `dyn SkillSource` with the default impl.
+        struct CountingSource {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl SkillSource for CountingSource {
+            fn skills(&self) -> Vec<Skill> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![skill_from_content(
+                    "only-skill",
+                    "---\nname: only-skill\n---\n\nBody",
+                    vec![],
+                )]
+            }
+        }
+
+        let source: Arc<dyn SkillSource> = Arc::new(CountingSource {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let found = source
+            .find("ONLY-SKILL")
+            .expect("default find must scan skills()");
+        assert_eq!(found.name, "only-skill");
+        assert!(source.find("missing").is_none());
+        assert_eq!(
+            source.skills().len(),
+            1,
+            "dyn dispatch must reach the custom backend"
+        );
+    }
+
+    #[test]
+    fn content_backed_skills_flow_through_the_source() {
+        let skill = skill_from_content(
+            "remote-doc",
+            "---\nname: remote-doc\ndescription: Remote\n---\n\nRemote body",
+            vec![],
+        );
+        let source = StaticSkillSource::new(vec![skill]);
+        let found = source
+            .find("remote-doc")
+            .expect("content-backed skill must be findable");
+        assert!(
+            found.body.is_some(),
+            "content backing must survive the source round-trip"
+        );
+        assert_eq!(
+            extract_skill_body(found.body.as_deref().unwrap()),
+            "Remote body"
+        );
+    }
+
+    #[test]
+    fn injection_and_index_helpers_accept_a_source() {
+        let manual = skill_from_content(
+            "manual-doc",
+            "---\nname: manual-doc\ndescription: m\n---\n\nManual body",
+            vec![],
+        );
+        let always = skill_from_content(
+            "always-doc",
+            "---\nname: always-doc\ndescription: a\nmode: always\n---\n\nAlways body",
+            vec![],
+        );
+        let source = StaticSkillSource::new(vec![manual, always]);
+
+        let injected = skills_for_injection_from_source(&source, "anything");
+        assert_eq!(injected.len(), 1, "only mode: always auto-injects");
+        assert_eq!(
+            injected[0],
+            ("always-doc".to_string(), "Always body".to_string())
+        );
+
+        let idx = skill_index_from_source(&source);
+        assert!(
+            idx.contains("- manual-doc: m"),
+            "index must list manual skills: {idx}"
+        );
+        assert!(
+            idx.contains("- [always] always-doc: a"),
+            "index must tag always skills: {idx}"
+        );
+    }
 
     #[test]
     fn discover_skills_parses_frontmatter() {
@@ -2183,5 +2712,312 @@ mod tests {
             found.iter().any(|s| s.name == "runme"),
             "chmod+x file without script ext must be included: {found:?}"
         );
+    }
+
+    // ── Goal #77: HttpSkillSource — remote fetch + https-only allowlist ─────
+
+    #[test]
+    fn http_skill_source_rejects_plain_http_at_construction() {
+        let source = HttpSkillSource::new("http://skills.example.com/index.json", None);
+        let err = source
+            .load_skills()
+            .expect_err("http:// must be rejected without any request");
+        assert!(
+            err.to_string().contains("https://"),
+            "error must name the https-only policy: {err}"
+        );
+        // The disallowed URL must survive as configuration (observable).
+        assert_eq!(source.url(), "http://skills.example.com/index.json");
+    }
+
+    #[test]
+    fn http_skill_source_rejects_other_schemes_and_unparseable() {
+        for url in [
+            "ftp://skills.example.com/index.json",
+            "file:///etc/skills.json",
+            "//missing-scheme.example.com",
+            "not a url at all",
+        ] {
+            let source = HttpSkillSource::new(url, None);
+            let err = match source.load_skills() {
+                Err(e) => e,
+                Ok(unexpected) => panic!(
+                    "'{url}' must fail the config gate, got {} skills",
+                    unexpected.len()
+                ),
+            };
+            assert!(
+                matches!(err, HttpSkillSourceError::Disallowed(_)),
+                "'{url}' must fail as Disallowed, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_skill_source_allowlist_blocks_unlisted_host() {
+        let source = HttpSkillSource::new(
+            "https://evil.example.com/index.json",
+            Some(vec!["skills.corp.example.com".to_string()]),
+        );
+        let err = source
+            .load_skills()
+            .expect_err("unlisted host must be rejected");
+        assert!(
+            matches!(err, HttpSkillSourceError::Disallowed(_)),
+            "unlisted host must fail as Disallowed, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn http_skill_source_allowlist_is_exact_no_suffix_matching() {
+        // A compromised subdomain must NOT pass via suffix matching.
+        let source = HttpSkillSource::new(
+            "https://skills-cdn.example.com/index.json",
+            Some(vec!["example.com".to_string()]),
+        );
+        assert!(matches!(
+            source.load_skills(),
+            Err(HttpSkillSourceError::Disallowed(_))
+        ));
+        // Reverse direction: entry is the subdomain, URL is the apex.
+        let source = HttpSkillSource::new(
+            "https://example.com/index.json",
+            Some(vec!["skills.example.com".to_string()]),
+        );
+        assert!(matches!(
+            source.load_skills(),
+            Err(HttpSkillSourceError::Disallowed(_))
+        ));
+    }
+
+    #[test]
+    fn http_skill_source_allowlist_is_case_and_trailing_dot_insensitive() {
+        // Only the config gate is exercised — no network, no runtime.
+        fn disallowed(url: &str, entry: &str) -> bool {
+            matches!(
+                HttpSkillSource::validate(url, Some(&[entry.to_string()])),
+                Err(HttpSkillSourceError::Disallowed(_))
+            )
+        }
+        // Match: case-insensitive both sides, trailing dot, default port.
+        assert!(!disallowed(
+            "https://SKILLS.Example.COM./x.json",
+            "skills.example.com"
+        ));
+        assert!(!disallowed(
+            "https://skills.example.com/x.json",
+            "SKILLS.EXAMPLE.COM"
+        ));
+        assert!(!disallowed(
+            "https://skills.example.com:443/x.json",
+            "skills.example.com"
+        ));
+        // A non-default port makes it a different origin.
+        assert!(disallowed(
+            "https://skills.example.com:8443/x.json",
+            "skills.example.com"
+        ));
+    }
+
+    #[test]
+    fn http_skill_source_userinfo_rejected() {
+        let source = HttpSkillSource::new("https://user@skills.example.com/index.json", None);
+        assert!(matches!(
+            source.load_skills(),
+            Err(HttpSkillSourceError::Disallowed(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_skill_source_fetches_and_parses_the_index() {
+        let index_body = serde_json::json!({
+            "skills": [
+                {"name": "pdf", "content": "---\nname: pdf\ndescription: PDF handling\n---\n\nPDF body"},
+                {"name": "sql", "content": "## Usage\n\nRun queries.", "description": "SQL helper"},
+            ]
+        })
+        .to_string();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                index_body.len(),
+                index_body
+            );
+            write!(stream, "{response}").unwrap();
+            stream.flush().unwrap();
+        });
+
+        // Full fetch+parse round-trip against the loopback mock. The https
+        // gate itself is pinned by the construction-time tests above, so the
+        // request here goes straight to the shared fetch helper (plain http,
+        // loopback — no TLS in tests).
+        let body = super::fetch_remote_index(
+            &format!("http://{addr}/index.json"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("loopback mock must serve the index");
+        handle.join().ok();
+
+        let index: super::RemoteSkillIndex =
+            serde_json::from_slice(&body).expect("mock body must be valid index JSON");
+
+        // The mapping layer (entry → content-backed Skill):
+        let skills = super::skills_from_remote_entries(index.skills);
+        assert_eq!(skills.len(), 2, "duplicate + blank names dropped");
+        let pdf = skills.iter().find(|s| s.name == "pdf").unwrap();
+        assert_eq!(pdf.description, "PDF handling");
+        assert_eq!(extract_skill_body(pdf.body.as_deref().unwrap()), "PDF body");
+        let sql = skills.iter().find(|s| s.name == "sql").unwrap();
+        // description injected as frontmatter when content has none
+        assert_eq!(sql.description, "SQL helper");
+        assert_eq!(
+            extract_skill_body(sql.body.as_deref().unwrap()),
+            "## Usage\n\nRun queries."
+        );
+        assert!(sql.body.is_some(), "remote skills must be content-backed");
+        assert!(pdf.refs.is_empty() && pdf.scripts.is_empty());
+
+        // Mapping edge cases (duplicate keep-first, blank-name skip):
+        let mapped = super::skills_from_remote_entries(vec![
+            super::RemoteSkillEntry {
+                name: "pdf".into(),
+                content: "first".into(),
+                description: None,
+            },
+            super::RemoteSkillEntry {
+                name: "pdf".into(),
+                content: "duplicate".into(),
+                description: None,
+            },
+            super::RemoteSkillEntry {
+                name: "  ".into(),
+                content: "blank name".into(),
+                description: None,
+            },
+        ]);
+        assert_eq!(mapped.len(), 1, "duplicate + blank names dropped");
+        assert_eq!(
+            extract_skill_body(mapped[0].body.as_deref().unwrap()),
+            "first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_skill_source_surfaces_http_error_status() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Fetch path exercised via the shared request helper against the
+        // loopback mock (gate-independent test seam).
+        let err = super::fetch_remote_index(
+            &format!("http://{addr}/index.json"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("404 must be an error");
+        handle.join().ok();
+        assert!(
+            matches!(err, HttpSkillSourceError::Request(ref m) if m.contains("404")),
+            "HTTP status must surface as Request error: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_skill_source_rejects_oversized_content_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let err = super::fetch_remote_index(
+            &format!("http://{addr}/index.json"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("oversized Content-Length must be rejected");
+        handle.join().ok();
+        assert!(
+            matches!(err, HttpSkillSourceError::Request(ref m) if m.contains("exceeds")),
+            "oversized body must surface as Request error: {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_skill_source_skills_degrades_to_empty_on_request_failure() {
+        // Nothing listens on this port → Request error → skills() = [].
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        // Fetch path: a dead loopback endpoint fails with Request.
+        let err = super::fetch_remote_index(
+            &format!("http://{addr}/index.json"),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            matches!(err, Err(HttpSkillSourceError::Request(_))),
+            "dead endpoint must yield a Request error: {err:?}"
+        );
+
+        // The SkillSource::skills degradation contract: I/O failure maps to
+        // an empty catalog, never a panic. Drive it through the real impl —
+        // a source configured for the dead endpoint has no config error, so
+        // skills() exercises the full fetch → fail → degrade path.
+        let source = HttpSkillSource::new(format!("https://{addr}/index.json"), None);
+        assert!(source.config_error.is_none());
+        let skills: Vec<Skill> = source.skills();
+        assert!(skills.is_empty(), "degraded source must serve no skills");
+    }
+
+    #[test]
+    fn http_skill_source_is_object_safe_and_debuggable() {
+        let source = HttpSkillSource::new(
+            "https://skills.example.com/index.json",
+            Some(vec!["skills.example.com".to_string()]),
+        );
+        let debug = format!("{source:?}");
+        assert!(debug.contains("HttpSkillSource"), "{debug}");
+        assert_eq!(
+            source.allowed_hosts(),
+            Some(&["skills.example.com".to_string()][..])
+        );
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HttpSkillSource>();
+        fn assert_source<T: SkillSource>() {}
+        assert_source::<HttpSkillSource>();
     }
 }

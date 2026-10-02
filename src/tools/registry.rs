@@ -1132,7 +1132,9 @@ pub fn build_standard_tools_with_transport_opt(
     }
 
     if !skills.is_empty() {
-        registry = registry.register(Arc::new(super::load_skill::LoadSkill::new(skills.to_vec())));
+        registry = registry.register(Arc::new(super::load_skill::LoadSkill::from_source(
+            Arc::new(crate::skills::StaticSkillSource::new(skills.to_vec())),
+        )));
     }
 
     // Register ACP client FS tools (S2-E20).
