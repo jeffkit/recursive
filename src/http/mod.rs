@@ -19,15 +19,15 @@ mod rate_limit;
 pub use crate::session_host::SessionHost;
 pub use crate::session_host::{AcquireError, AdmissionGate, RunPermit};
 pub use auth::{AuthConfig, JwtConfig, ENV_AUTH_JWT_SECRET, ENV_AUTH_KEYS};
-pub use handlers::map_agent_event;
+pub use handlers::{map_agent_event, SkillInfo};
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
     agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
-    list_sessions, list_slash_commands, list_tools, metrics_handler, openapi_spec, patch_session,
-    run_agent, send_session_message, session_clear_goal, session_events, session_interrupt,
-    session_plan_confirm, session_plan_reject, session_set_goal,
+    list_sessions, list_skills, list_slash_commands, list_tools, metrics_handler, openapi_spec,
+    patch_session, run_agent, send_session_message, session_clear_goal, session_events,
+    session_interrupt, session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
 
@@ -767,6 +767,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/interrupt", post(session_interrupt))
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/slash-commands", get(list_slash_commands))
+        .route("/skills", get(list_skills))
         .route("/agui", post(agui_run))
         .route("/agui/{thread_id}/cancel", post(agui_cancel))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
@@ -1114,10 +1115,50 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         }
                     }
                 }
+            },
+            "/skills": {
+                "get": {
+                    "summary": "List loaded skills",
+                    "description": "Returns every skill the server loaded: filesystem-discovered \
+                        ones (`source: \"filesystem\"`) and service-level source-delivered ones \
+                        (`source: \"content\"` — RECURSIVE_SKILL_SOURCE_URL, never written to disk).",
+                    "responses": {
+                        "200": {
+                            "description": "Array of skill descriptors",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/SkillInfo" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         "components": {
             "schemas": {
+                "SkillInfo": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["always", "trigger", "globs", "manual"]
+                        },
+                        "refs": { "type": "integer" },
+                        "sections": { "type": "integer" },
+                        "source": {
+                            "type": "string",
+                            "enum": ["content", "filesystem"],
+                            "description": "content = service-level source, never on disk; filesystem = directory discovery."
+                        }
+                    },
+                    "required": ["name", "description", "mode", "refs", "sections", "source"]
+                },
                 "ToolInfo": {
                     "type": "object",
                     "properties": {

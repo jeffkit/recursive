@@ -816,8 +816,37 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             let slash_commands: Vec<recursive::http::SlashCommandInfo> = Vec::new();
             // Goal-312: discover skills for skill_index injection into
-            // the system prompt of every HTTP API run.
-            let skills = cli::builder::discover_loaded_skills(&config);
+            // the system prompt of every HTTP API run. #74 拆单 3/3:
+            // service-level SkillSource entries (RECURSIVE_SKILL_SOURCE_URL,
+            // comma-separated) load content-first on top of the
+            // directory-discovered catalog; skills delivered this way never
+            // touch the local disk. A source failure degrades to a WARN —
+            // directory skills keep working (same log-and-degrade posture
+            // as the MCP registration above).
+            let mut skills = cli::builder::discover_loaded_skills(&config);
+            match cli::builder::skills_from_http_sources() {
+                Ok(mut src_skills) => {
+                    if !src_skills.is_empty() {
+                        eprintln!(
+                            "skills: loaded {} skill(s) via service-level SkillSource",
+                            src_skills.len()
+                        );
+                        skills.append(&mut src_skills);
+                    }
+                }
+                Err(e) => eprintln!("skills: WARN: {e}"),
+            }
+            // The startup registry registered LoadSkill over the
+            // directory-discovered catalog only; when service-level sources
+            // delivered skills, re-register the tool over the merged list so
+            // `Skill` can load a remote skill without any local file.
+            // (Registry register replaces by tool name, so this is a swap,
+            // not a duplicate.)
+            if !skills.is_empty() && tools.find_by_name("Skill").is_some() {
+                tools = tools.register(std::sync::Arc::new(
+                    recursive::tools::load_skill::LoadSkill::new(skills.clone()),
+                ));
+            }
             let session_ttl_secs: u64 = std::env::var("RECURSIVE_SESSION_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())

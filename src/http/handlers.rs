@@ -1066,6 +1066,48 @@ pub(super) async fn list_slash_commands(
     Json((*state.slash_commands).clone())
 }
 
+// ── #74 拆单 3/3: service-level skill sources ─────────────────────────────
+
+/// One skill as advertised by `GET /skills`.
+#[derive(serde::Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub mode: String,
+    pub refs: usize,
+    pub sections: usize,
+    /// Where the skill came from: `content` = service-level (never lands on
+    /// disk), `filesystem` = directory discovery.
+    pub source: String,
+}
+
+/// GET /skills — list every skill the server loaded, including those
+/// delivered via service-level skill sources (`RECURSIVE_SKILL_SOURCE_URL`).
+/// Lets an external harness confirm injected skills are live without any
+/// local file writes.
+#[cfg_attr(test, mutants::skip)]
+pub(super) async fn list_skills(State(state): State<Arc<AppState>>) -> Json<Vec<SkillInfo>> {
+    use crate::skills::SkillMode;
+    Json(state
+        .skills
+        .iter()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            mode: match s.mode {
+                SkillMode::Always => "always",
+                SkillMode::Trigger => "trigger",
+                SkillMode::Globs => "globs",
+                SkillMode::Manual => "manual",
+            }
+            .to_string(),
+            refs: s.refs.len(),
+            sections: s.sections.len(),
+            source: if s.body.is_some() { "content" } else { "filesystem" }.to_string(),
+        })
+        .collect())
+}
+
 /// POST /sessions/:id/messages — send a message in a session.
 pub(super) async fn send_session_message(
     State(state): State<Arc<AppState>>,

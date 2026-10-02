@@ -522,6 +522,30 @@ pub(crate) fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
+/// Load skills from service-level HTTP [`recursive::HttpSkillSource`]s.
+///
+/// `RECURSIVE_SKILL_SOURCE_URL` holds one or more comma-separated endpoint
+/// URLs; each must answer with the JSON skill-index shape
+/// (`{"skills": [{"name", "content", "description"?}]}`) enforced by
+/// [`recursive::HttpSkillSource`]. The returned skills are content-backed
+/// (in-memory `body`, `/virtual/skills/<name>` synthetic path) — nothing is
+/// written to or read from the local filesystem.
+///
+/// Errors from any URL abort the whole load (`Err`): the caller decides
+/// whether that is fatal or a log-and-degrade.
+pub(crate) fn skills_from_http_sources() -> Result<Vec<Skill>, String> {
+    let raw = std::env::var("RECURSIVE_SKILL_SOURCE_URL").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut skills = Vec::new();
+    for url in raw.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+        let source = recursive::HttpSkillSource::new(url, None);
+        skills.extend(source.load_skills().map_err(|e| e.to_string())?);
+    }
+    Ok(skills)
+}
+
 /// Append auto-loaded skill bodies to the assembled system prompt.
 ///
 /// Injects `=== Skill: <name> (auto-loaded) ===` blocks until the running
@@ -750,6 +774,85 @@ pub(crate) async fn build_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── skills_from_http_sources (issue #74 拆单 3/3) ────────────────────
+
+    /// Unset / blank RECURSIVE_SKILL_SOURCE_URL is a no-op: empty catalog,
+    /// no network.
+    #[test]
+    fn skills_from_http_sources_unset_or_blank_is_empty() {
+        let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_URL", None)]);
+        assert!(skills_from_http_sources().unwrap().is_empty());
+        let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_URL", Some("   "))]);
+        assert!(skills_from_http_sources().unwrap().is_empty());
+    }
+
+    /// A configured URL failing the https-only gate surfaces a descriptive
+    /// error (the http serve entry prints WARN and continues with
+    /// directory-discovered skills).
+    #[test]
+    fn skills_from_http_sources_plain_http_url_errors() {
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_SKILL_SOURCE_URL",
+            Some("http://skills.example.com/index.json"),
+        )]);
+        let err = skills_from_http_sources().unwrap_err();
+        assert!(
+            err.contains("https://"),
+            "error must name the https-only policy: {err}"
+        );
+    }
+
+    /// End-to-end through the service-level entry: a live endpoint delivers
+    /// a skill that arrives content-backed (in-memory body, virtual path,
+    /// in-memory refs) with no local file involved.
+    #[test]
+    fn skills_from_http_sources_loads_content_first_skills() {
+        let body = serde_json::json!({
+            "skills": [{
+                "name": "http-skill",
+                "content": "---\nname: http-skill\ndescription: from the wire\nmode: trigger\ntriggers: deploy\n---\n\nDeploy checklist.",
+                "description": null
+            }]
+        })
+        .to_string();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_SKILL_SOURCE_URL",
+            Some(format!("http://{addr}/skills.json").as_str()),
+        )]);
+        let skills = skills_from_http_sources().unwrap();
+        srv.join().unwrap();
+
+        assert_eq!(skills.len(), 1, "exactly one skill delivered");
+        let s = &skills[0];
+        assert_eq!(s.name, "http-skill");
+        assert_eq!(s.description, "from the wire");
+        assert_eq!(s.mode, recursive::SkillMode::Trigger);
+        assert!(s.body.is_some(), "content-first: body must be in memory");
+        assert!(
+            s.path.starts_with("/virtual/skills/http-skill"),
+            "synthetic path, no real file: {}",
+            s.path.display()
+        );
+    }
 
     fn test_config() -> Config {
         Config {
