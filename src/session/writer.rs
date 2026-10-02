@@ -87,33 +87,60 @@ impl SessionWriter {
         preset: Option<&str>,
     ) -> std::io::Result<Self> {
         let slug = workspace_slug(workspace);
-        // The timestamp has 1-second granularity, so two sessions created
-        // for the same workspace within the same second (fast test suites,
-        // retry loops, parallel runs) would otherwise derive the SAME
-        // session_id and silently append to each other's transcript.jsonl.
-        // A short random suffix makes the id collision-proof; the readable
-        // `<timestamp>-<slug>` prefix is kept for sort order (sessions are
-        // listed by directory name) and substring matching (`recursive
-        // resume <id fragment>`).
-        let unique_suffix: String = Uuid::new_v4().simple().to_string()[..8].to_string();
-        let session_id = format!(
-            "{}-{}-{}",
-            super::filesystem_safe_timestamp(),
-            slug,
-            unique_suffix
-        );
         // Sessions live under the per-user data dir, not the project,
         // so they don't pollute the user's `git status`.
         let sessions_root = crate::paths::user_sessions_dir(workspace)
             .map_err(|e| std::io::Error::other(format!("user_sessions_dir: {e}")))?;
-        let session_dir = sessions_root.join(&slug).join(&session_id);
 
-        std::fs::create_dir_all(&session_dir)?;
-
-        // Acquire the per-session lock before opening any files for
-        // writing — guards against two `recursive resume <id>`
-        // invocations clobbering the same transcript.
-        let lock = SessionLock::acquire(&session_dir)?;
+        // `filesystem_safe_timestamp()` has 1-second resolution, so two
+        // sessions created in the same second on the same workspace would
+        // collide on one directory: `create_dir_all` silently reuses it and
+        // both writers append into the same `transcript.jsonl`. The
+        // sentinel lock cannot help — it only guards *concurrent* writers,
+        // not sequential reuse. Disambiguate with a short random suffix
+        // whenever the timestamped directory already exists (or is busy),
+        // so an existing session's transcript is never appended to.
+        let ts = super::filesystem_safe_timestamp();
+        let slug_dir = sessions_root.join(&slug);
+        let mut session_id = format!("{ts}-{slug}");
+        let mut session_dir = slug_dir.join(&session_id);
+        let mut lock = None;
+        for attempt in 0..8u32 {
+            session_id = match attempt {
+                0 => format!("{ts}-{slug}"),
+                _ => format!("{ts}-{slug}-{}", &Uuid::new_v4().simple().to_string()[..8]),
+            };
+            session_dir = slug_dir.join(&session_id);
+            if attempt > 0 || !session_dir.exists() {
+                std::fs::create_dir_all(&session_dir)?;
+            }
+            let candidate = session_dir.clone();
+            match SessionLock::acquire(&candidate) {
+                Ok(l) if attempt == 0 && session_dir.join("transcript.jsonl").is_file() => {
+                    // Pre-existing transcript: not an unused directory.
+                    // Release and try a suffixed one instead.
+                    drop(l);
+                    continue;
+                }
+                Ok(l) => {
+                    lock = Some(l);
+                    break;
+                }
+                Err(e) if attempt < 7 => {
+                    // Busy (live writer) or stale sentinel: either way the
+                    // timestamped name is taken — try a suffixed one.
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let lock = lock.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "could not allocate a unique session directory under {}",
+                sessions_root.display()
+            ))
+        })?;
 
         let jsonl_path = session_dir.join("transcript.jsonl");
         let file = std::fs::OpenOptions::new()
@@ -688,6 +715,25 @@ mod tests {
     use super::*;
     use crate::message::{Message, Role};
     use crate::session::SessionReader;
+
+    /// Regression: two `create` calls in the same second on the same
+    /// workspace must not share a directory (the timestamp has 1-second
+    /// resolution). The second create must get a distinct session dir.
+    #[test]
+    fn create_in_same_second_gets_distinct_dirs() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let w1 = SessionWriter::create(ws, "collision a", "gpt-4o", "openai").unwrap();
+        let w2 = SessionWriter::create(ws, "collision b", "gpt-4o", "openai").unwrap();
+
+        assert_ne!(
+            w1.session_dir(),
+            w2.session_dir(),
+            "two sessions created in the same second must not share a directory"
+        );
+        assert_ne!(w1.session_id(), w2.session_id());
+    }
 
     #[test]
     fn open_or_create_is_create_on_first_call_then_open() {

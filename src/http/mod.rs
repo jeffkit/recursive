@@ -5,6 +5,7 @@
 //! endpoint that executes the agent with a given goal, session management
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
+mod agui;
 mod auth;
 mod cold_load;
 #[cfg(test)]
@@ -465,6 +466,51 @@ impl AppState {
             registry.retain_tools(&self.config.allow_tools);
         }
         Ok(registry)
+    }
+}
+
+/// Minimal `Config` for build paths that only need the model name
+/// (auto compaction thresholds). Values mirror safe defaults; the shared
+/// HTTP runtime assembly uses it to stay independent of `AppState`.
+/// Every field of `Config` must be listed here, so a newly added field
+/// breaks compilation instead of silently defaulting.
+pub(crate) fn test_config_stub() -> crate::config::Config {
+    crate::config::Config {
+        workspace: std::path::PathBuf::from("."),
+        api_base: String::new(),
+        api_key: None,
+        model: String::new(),
+        provider_type: "openai".into(),
+        preset: None,
+        max_steps: 32,
+        max_tokens: 65536,
+        temperature: 0.2,
+        system_prompt: String::new(),
+        retry_max: 2,
+        retry_initial_backoff_secs: 1,
+        retry_max_backoff_secs: 8,
+        shell_timeout_secs: 300,
+        headless: false,
+        memory_summary_limit: 5,
+        thinking_budget: None,
+        session_name: None,
+        max_budget_usd: None,
+        extra_dirs: Vec::new(),
+        extra_readonly_dirs: Vec::new(),
+        allow_tools: Vec::new(),
+        context_window_override: None,
+        subagent_max_depth: 2,
+        subagent_enabled: false,
+        allow_bypass_permissions: false,
+        max_search_rounds: 3,
+        stuck_window: 10,
+        stuck_error_rate: 0.8,
+        max_concurrent_runs: 8,
+        goal_eval_transcript_tail: 12,
+        web_search_provider: None,
+        web_search_api_key: None,
+        web_search_jina_key: None,
+        wall_timeout_secs: 0,
     }
 }
 

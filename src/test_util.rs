@@ -50,6 +50,7 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
 pub struct PinnedRecursiveHome {
     _guard: MutexGuard<'static, ()>,
     prev: Option<std::ffi::OsString>,
+    prev_sessions_dir: Option<std::ffi::OsString>,
 }
 
 impl PinnedRecursiveHome {
@@ -61,9 +62,21 @@ impl PinnedRecursiveHome {
         unsafe {
             std::env::set_var("RECURSIVE_HOME", path.as_ref().as_os_str());
         }
+        // `RECURSIVE_SESSIONS_DIR` is a HARD override in
+        // `paths::user_sessions_dir` that beats `RECURSIVE_HOME`
+        // (Goal-H J1). A value leaked from the surrounding process
+        // (CI harness, dev shell) would defeat this guard's isolation
+        // by redirecting every session write into one shared tree, so
+        // pin it out of the way for the guard's lifetime.
+        let prev_sessions_dir = std::env::var_os("RECURSIVE_SESSIONS_DIR");
+        // SAFETY: env lock held (see above).
+        unsafe {
+            std::env::remove_var("RECURSIVE_SESSIONS_DIR");
+        }
         Self {
             _guard: guard,
             prev,
+            prev_sessions_dir,
         }
     }
 }
@@ -75,6 +88,10 @@ impl Drop for PinnedRecursiveHome {
             match self.prev.take() {
                 Some(v) => std::env::set_var("RECURSIVE_HOME", v),
                 None => std::env::remove_var("RECURSIVE_HOME"),
+            }
+            match self.prev_sessions_dir.take() {
+                Some(v) => std::env::set_var("RECURSIVE_SESSIONS_DIR", v),
+                None => std::env::remove_var("RECURSIVE_SESSIONS_DIR"),
             }
         }
     }
