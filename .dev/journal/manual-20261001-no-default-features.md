@@ -53,3 +53,27 @@ plus a CI feature-matrix guard so it cannot rot again.
     `RECURSIVE_SESSIONS_DIR` for its span (episodic recent-N window).
 - Long-term follow-ups stay in #53/#54 (make acp/schema optional so the bare
   kernel is actually minimal, not just compilable).
+- NEEDS_FIX resolution (2026-10-02, pipeline-55 continuation branch
+  `v2-pipeline-55-1002191734-cont`): independent review rejected the branch
+  because it was 66 commits behind `main` — `git diff main` read as wholesale
+  reverts of landed work (#56 agui_session/http::agui layering, #57 AG-UI
+  threads as native sessions, #66 cancel + streaming + run fence, #63/#65/#69
+  http_call/skills/allow-tools env, #59 living-docs + invariant-registry guard
+  tests). Resolution: merged `main` (a7104bdc) into the branch; conflicts only
+  in `.github/workflows/ci.yml` (kept this branch's stronger `feature-matrix`
+  job on top of main's two inline --no-default-features checks),
+  `src/session/mod.rs` (kept the feature-scoped `cfg_attr` allow from this
+  branch), `src/session/writer.rs` (kept main's #57 additions
+  `create_at`/`open_or_create`/`add_usage`/`update_identity` + tests alongside
+  this branch's collision guard). Reviewer nit: the duplicated
+  `#[async_trait::async_trait]` on `TestInterruptHook` does not exist on this
+  branch (single `#[async_trait]` at `src/http/agui.rs:389`, matching main);
+  verified with a workspace-wide scanner — no duplicated attribute anywhere
+  in `src/`. Post-merge gates all green: `cargo test --workspace` 58/58
+  result lines ok, clippy `--workspace --all-targets --all-features -D
+  warnings` clean, `fmt --check` clean, and all 8
+  `--no-default-features [features]` lib combos clippy-clean. `git diff main`
+  is now 7 files / +99 −10: the feature-matrix CI job, the
+  `DEFAULT_KILL_GRACE_PERIOD` move + re-export, the `epoch_day_to_ymd`
+  cfg_attr, the web_search param-consumption cfg, the session-id collision
+  guard, and the journal.
