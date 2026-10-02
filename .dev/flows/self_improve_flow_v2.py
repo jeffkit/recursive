@@ -27,6 +27,7 @@ v2 与 v1 引擎的有意差异：
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from plaita.dsl.codeflow import (
@@ -37,6 +38,8 @@ from plaita.dsl.codeflow import (
 # SUBPROCESS_ENV_EXTRA 注入，超时/取消走 killpg，见 plaita e13d296）。
 from plaita.node import register_code_node
 register_code_node(default_backend="subprocess")
+
+from plaita.dsl.ir_validate import validate_flow_ir
 
 JAIL = "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n"
 # 注意：code= 不能引用模块常量（codeflow 实锤坑），JAIL 只作文档；
@@ -370,6 +373,49 @@ def self_improve_v2(INPUT):
                                       "\npush_note: ", str(pub2.push_note)))
     return {"verdict": "failed-preserved", "stage": "land", "why": pub2.note,
             "preserved": True}
+
+
+# ── 部署不变量（import 期 fail-fast）────────────────────────────────────
+# 「childflow 禁 F」：childflow 子树的表达式上下文没有 F（可用根仅
+# INPUT/NODE/GLOBAL/PARENT/ENV/FLOW_ID）——#59/#69 实证 fix_prompt 的
+# F.concat 一进修复路径即 KeyError（见 gate_once docstring）。GATE 本体允许
+# 进 childflow（gate_once 只做单发执行），禁的是一切 $F.<fn>(...) 表达式，
+# 拼接/失败落盘等逻辑一律上提主层。
+# plaita v0.6.0 的 rules 钩子拿到原始 IR node dict（$F. 调用以字符串保留在
+# 字段里），这里按「字段内容」复检保留 IR（__plaita_ir__）；本模块被
+# bridge / JSON 导出 / 测试 harness 任何路径 import 时先拦下结构违规。
+_F_CALL_RE = re.compile(r"\bF\.[A-Za-z_]\w*\s*\(")
+_F_SCAN_SKIP_KEYS = {"type", "id", "name", "desc", "next", "else_next"}
+
+
+def _has_f_call(v) -> bool:
+    if isinstance(v, str):
+        return bool(_F_CALL_RE.search(v))
+    if isinstance(v, dict):
+        return any(_has_f_call(x) for x in v.values())
+    if isinstance(v, list):
+        return any(_has_f_call(x) for x in v)
+    return False
+
+
+def _no_f_expression_in_childflow(node, path, graph):
+    """部署规则：childflow 子树字段禁 $F.<fn>(...) 表达式（59/69 教训）。"""
+    if not graph.in_childflow_subtree():
+        return None
+    for k, v in node.items():
+        if k in _F_SCAN_SKIP_KEYS:
+            continue
+        if _has_f_call(v):
+            return (f"childflow 子树内字段 {k} 使用了 F.<fn>(...) 表达式——"
+                    "childflow 表达式上下文没有 F（59/69 教训），"
+                    "拼接逻辑请上提主层")
+    return None
+
+
+validate_flow_ir(
+    self_improve_v2.__plaita_ir__,
+    rules=[_no_f_expression_in_childflow],
+)
 
 
 if __name__ == "__main__":
