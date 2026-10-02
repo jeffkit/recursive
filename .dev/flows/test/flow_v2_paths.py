@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -315,8 +316,12 @@ def _v3_setup(repo: Path, root: Path):
     return issue_root, run_dir, state_path
 
 
-def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None):
-    """直驱生产宿主循环（import 生产代码，非复制品）。"""
+def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None,
+              extra_handlers=None):
+    """直驱生产宿主循环（import 生产代码，非复制品）。
+
+    extra_handlers：追加的裸 FlowCallback 实例（经宿主 _Adapter 包装分发，
+    流级事件 on_flow_end 依赖 Adapter 透传）。"""
     import self_improve_bridge_v2 as bridge
     import self_improve_flow_v2 as flowmod
     from self_improve_bridge_v2 import StepTracker
@@ -324,14 +329,71 @@ def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None):
         AGENT_SCRIPT.update(scripts.get("agent", {}))
         GATE_SCRIPT.update(scripts.get("gate", {}))
     CALLS.clear()
+    specs = [(StepTracker, state_path)]
+    specs += [(lambda _arg, h=h: h, None) for h in (extra_handlers or [])]
     v, nodes = bridge.run_host_v3(
         flow_obj=flowmod.self_improve_v2,
-        handler_specs=[(StepTracker, state_path)],
+        handler_specs=specs,
         params={"goal": "#77 v3 harness", "repo": str(_REPO_HOLDER[0]),
                 "run_dir": str(run_dir), "agent": "stub-agent", "reviewer": "stub-rev"},
         issue_root=issue_root, run_dir=run_dir, state_path=state_path,
         max_node_retries=max_retries)
     return v, nodes
+
+
+class _FlowEventProbe:
+    """录制型 stub handler（R1-2）：记录流级回调事件（不依赖真 Langfuse）。
+
+    events 形如 [("flow_start", flow_id, None/err), ("flow_end", flow_id, (result, error))]。
+    ⚠️ childflow（has_changes/gate_once）在 DISTRIBUTED 下整段 NORMAL 跑完，
+    会 fire 自己的流级事件（引擎既有行为）——根流断言一律按 flow_id 过滤。"""
+
+    def __init__(self):
+        self.events = []
+
+    def on_flow_start(self, flow, **kw):
+        self.events.append(("flow_start", getattr(flow, "flow_id", "?"), None))
+
+    def on_flow_end(self, flow, result=None, error=None, exception=None, **kw):
+        self.events.append(("flow_end", getattr(flow, "flow_id", "?"),
+                            (result, error)))
+
+
+def _run_bridge_main(run_id: str, repo: Path, root: Path, home_patched: bool = True):
+    """以真 bridge.main() 跑一次生产入口（sys.argv/env/Path.home 三重收口）。
+
+    Path.home 打到 tmp 根：main() 的 sessions_root 与 v3 issue_root 都按
+    Path.home() 拼（~/.issue-keeper/...），不收口会写进真 home 的生产工件区。
+    返回 (exit_code, run_dir, issue_root)。"""
+    import pathlib
+    from unittest import mock
+    import self_improve_bridge_v2 as bridge
+    saved_env = {k: os.environ.get(k) for k in
+                 ("RECURSIVE_HOST_V3", "LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY",
+                  "LANGFUSE_SECRET_KEY", "LANGFUSE_INIT_HOST")}
+    for k in ("LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
+              "LANGFUSE_INIT_HOST"):
+        os.environ.pop(k, None)
+    os.environ["RECURSIVE_HOST_V3"] = "1"
+    run_dir = repo / ".flowcast" / "runs" / run_id
+    issue_root = root / ".issue-keeper" / "pipeline" / f"recursive-{run_id.split('-')[1]}"
+    argv_old = sys.argv
+    sys.argv = ["self_improve_bridge_v2.py", "--goal-text",
+                f"#{run_id.split('-')[1]} harness main-driven",
+                "--repo", str(repo), "--run-id", run_id]
+    try:
+        ctx = mock.patch.object(pathlib.Path, "home", lambda: root) if home_patched \
+            else contextlib.nullcontext()
+        with ctx:
+            rc = bridge.main()
+    finally:
+        sys.argv = argv_old
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return rc, run_dir, issue_root
 
 
 _REPO_HOLDER = [None]
@@ -559,6 +621,151 @@ def s22_v3_旧格式checkpoint_回退run_dir闸():
     assert len(impl_calls) == 1, f"旧格式应按原闸续走（impl 恰一次）: {len(impl_calls)}"
 
 
+def s23_v3_engine_error_存活checkpoint_回收豁免与续走():
+    """R1-1（2026-10-02）：bridge main() 终态回收段对「engine_error + checkpoint
+    指向本 run」豁免 WIP+rmtree——v3 宿主对非终态意图保留 checkpoint（只有
+    is_end 才删），照旧删树则重派 _ckpt_load 的 worktree 闸必失败，checkpoint
+    沦为死据、永远 L1 全量（engine_error 可续设计落空）。
+    修复前红：round1 断言 worktree 幸存即失败（main 无差别回收已删树）。
+    全链闭合：豁免的树由重派续走终态时的 _recycle_resumed_worktree 收口。"""
+    import json as _json
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    AGENT_SCRIPT.update({"impl": "@RAISE"})
+    rc1, run1, issue_root = _run_bridge_main("pipeline-77-firstrun", repo, root)
+    assert rc1 == 1, f"engine_error 终态 exit 应为 1: {rc1}"
+    st = _json.loads((run1 / "state.json").read_text())
+    assert st["verdict"]["verdict"] == "engine_error", st["verdict"]
+    ck = json.loads((issue_root / "checkpoint.json").read_text())
+    assert ck.get("ckpt_run_dir") == str(run1), f"checkpoint 应指向本 run: {ck.get('ckpt_run_dir')}"
+    assert (run1 / "worktree").is_dir(), \
+        "engine_error+存活checkpoint 应豁免回收（worktree 幸存待续）"
+    assert (run1 / "worktree-preserved.log").exists(), "豁免应落标记文件供值守判读"
+    # 重派：新 run_id → 新 run_dir（keeper v2_bridge.py:91），checkpoint 续走
+    CALLS.clear()                                        # 只统计恢复轮的节点执行
+    AGENT_SCRIPT.update({"impl": "@WRITE"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    rc2, run2, _ = _run_bridge_main("pipeline-77-secondrun", repo, root)
+    assert rc2 == 0, f"续走终态 exit 应为 0: {rc2}"
+    st2 = _json.loads((run2 / "state.json").read_text())
+    assert st2["verdict"]["verdict"] == "committed", st2["verdict"]
+    assert not (run2 / "worktree").exists(), "续走不得在新 run_dir 重建 worktree（L1）"
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert len(impl_calls) == 1, f"恢复轮 impl 应恰好一次: {len(impl_calls)}"
+    assert not (run1 / "worktree").exists(), "续走终态应回收豁免的旧树（_recycle_resumed_worktree 收口）"
+    r = subprocess.run(["git", "-C", str(repo), "show",
+                        "wip-pipeline-77-firstrun:impl_change.txt"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"旧树改动应已 WIP 快照保可达: {r.stderr[:200]}"
+
+
+def s24_v3_回收豁免判定_checkpoint活性决策表():
+    """R1-1 豁免判定决策表（bridge._ckpt_keeps_worktree，main() 终态回收用）：
+    仅「可解析 + ckpt_run_dir 指向本 run」豁免；损坏/旧格式/指向别 run 一律
+    照旧回收。
+    可达性注记：经 flow 走出来的 engine_error 若发生在 pre 成功之后，checkpoint
+    必已被本 run 的 _ckpt_save 刷新为指向本 run——「不合格 checkpoint + 本
+    run_dir 有树」只出现在 pre 首步即炸（无树可回收）与手工/外部破坏 checkpoint
+    的形态，故本场景对判定函数做白盒决策表（同 s18 先例），照旧回收分支的
+    集成路径由 s16/s27（非 engine_error 终态回收）覆盖。"""
+    import self_improve_bridge_v2 as bridge
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="flowv2t-ck24-"))
+    run_dir = tmp / "pipeline-77-self"
+    ck = tmp / "checkpoint.json"
+    def _verdict_for(payload: str) -> str:
+        ck.write_text(payload)
+        return bridge._ckpt_keeps_worktree(ck, run_dir)
+    assert _verdict_for('{"flow_hash": "截断的半截JSON...') == "", "损坏 checkpoint 不得豁免"
+    assert _verdict_for(json.dumps({"flow_hash": "h", "run_id": "x",
+                                    "context": {}})) == "", "旧格式（无 ckpt_run_dir）保守照旧回收"
+    assert _verdict_for(json.dumps({"flow_hash": "h", "ckpt_run_dir": "/other/run",
+                                    "context": {}})) == "", "指向别 run 不得豁免"
+    keep = _verdict_for(json.dumps({"flow_hash": "h", "ckpt_run_dir": str(run_dir),
+                                    "last_node": "pre", "context": {}}))
+    assert keep, f"指向本 run 的存活 checkpoint 应豁免: {keep!r}"
+
+
+def s25_v3_正常终态_宿主补发on_flow_end恰一次():
+    """R1-2：DISTRIBUTED 正常 End 步引擎不 fire on_flow_end（strategies.py
+    _execute_current_node 只造 end output），trace 永不闭合——宿主在非异常
+    终态对全部 handlers 恰补发一次（result=终态 verdict，error 为空）。
+    修复前红： Adapter 不透传 + 宿主不补发 → probe 收不到任何 flow_end。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    probe = _FlowEventProbe()
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_dir, state_path, extra_handlers=[probe])
+    assert v.get("verdict") == "committed", v
+    import self_improve_flow_v2 as _fm
+    root_fid = _fm.self_improve_v2.flow_id
+    starts = [e for e in probe.events if e[0] == "flow_start" and e[1] == root_fid]
+    ends = [e for e in probe.events if e[0] == "flow_end" and e[1] == root_fid]
+    assert len(starts) == 1, f"根流 fresh 恰一次 on_flow_start: {starts}"
+    assert len(ends) == 1, f"正常终态应恰补发一次 on_flow_end: {ends}"
+    result, err = ends[0][2]
+    assert err is None, f"补发不应带 error: {ends[0]}"
+    assert isinstance(result, dict) and result.get("verdict") == "committed", \
+        f"补发 result 应为终态 verdict: {result!r}"
+
+
+def s26_v3_异常终态_on_flow_end恰为引擎版_宿主不重复():
+    """R1-2 反面：异常路径 run_distributed 统一出口 _raise_distributed_error
+    对每次失败步已 fire error 版 on_flow_end（_error_normalization.py:67）——
+    宿主不得再补（重复=Langfuse 根 span 二次 end）。impl 连抛两次（fresh +
+    重试）→ 恰 2 次、全部带 error。
+    修复前红：Adapter 不透传 → probe 收不到（0 次）；若宿主画蛇添足补发，
+    会出现无 error 的第 3 次，同样被本断言拦下。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    probe = _FlowEventProbe()
+    AGENT_SCRIPT.update({"impl": "@RAISE"})
+    v, _ = _drive_v3(issue_root, run_dir, state_path, extra_handlers=[probe])
+    assert v.get("verdict") == "engine_error" and v.get("node_retry_exhausted"), v
+    import self_improve_flow_v2 as _fm
+    root_fid = _fm.self_improve_v2.flow_id
+    ends = [e for e in probe.events if e[0] == "flow_end" and e[1] == root_fid]
+    assert len(ends) == 2, f"两次失败步引擎各 fire 一次，宿主不得增减: {ends}"
+    assert all(e[2][1] for e in ends), f"每次都应是引擎的 error 版: {ends}"
+
+
+def s27_v3_dryrun冒烟_真bridge无桩全图():
+    """R1-4（设计 §7 T5）：真 bridge `--dry-run` + `RECURSIVE_HOST_V3=1` 廉价
+    冒烟，无 harness 桩（子进程隔离，AgentRun/Gate/GitPublish 走节点自带
+    dry 分支；preflight/has_changes 仍真实执行）。
+    修复前红：use_v3 把 dry_run 排除在 v3 外 → 冒烟走 NORMAL，issue_root 下
+    不会出现 host.lock（v3 路径指纹），断言即败。
+    HOME 收口到 tmp：main() 按 Path.home() 拼 issue_root/sessions_root，
+    不收口会读写真 home 的生产工件区。"""
+    repo, root = make_repo()
+    child_env = {k: v for k, v in os.environ.items()
+                 if not k.startswith("LANGFUSE")}
+    child_env["HOME"] = str(root)                     # issue_root/sessions 收口
+    child_env["RECURSIVE_HOST_V3"] = "1"
+    flows_dir = Path(__file__).resolve().parent.parent
+    bridge_py = flows_dir / "self_improve_bridge_v2.py"
+    r = subprocess.run(
+        ["/opt/homebrew/bin/python3.13", str(bridge_py),
+         "--goal-text", "#77 dry-run v3 smoke", "--repo", str(repo),
+         "--run-id", "pipeline-77-drysmoke", "--dry-run"],
+        capture_output=True, text=True, timeout=300,
+        cwd=str(flows_dir), env=child_env)
+    assert r.returncode == 0, f"dry-run v3 冒烟应 exit 0: rc={r.returncode} " \
+        f"stderr={r.stderr[-400:]} stdout={r.stdout[-400:]}"
+    verdict = json.loads(r.stdout.strip().splitlines()[-1])
+    assert verdict["verdict"] == "skip-commit", f"dry impl 无改动应 skip-commit: {verdict}"
+    run_dir = repo / ".flowcast" / "runs" / "pipeline-77-drysmoke"
+    issue_root = root / ".issue-keeper" / "pipeline" / "recursive-77"
+    assert (issue_root / "host.lock").exists(), "v3 指纹：issue_root/host.lock 应存在"
+    assert not (issue_root / "checkpoint.json").exists(), "终态 checkpoint 应已删（is_end）"
+    assert not (run_dir / "worktree").exists(), "skip-commit 照旧回收 worktree"
+    st = json.loads((run_dir / "state.json").read_text())
+    assert st["status"] == "completed" and st.get("dry_run") is True, st
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
@@ -569,7 +776,12 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s15_v3_checkpoint不可信家族, s16_v3_终态不落checkpoint,
              s17_v3_worktree闸,
              s19_v3_跨派发续走_旧worktree幸存, s20_v3_跨派发_旧worktree已被清_丢弃走L1,
-             s21_v3_双宿主互斥_per_issue锁, s22_v3_旧格式checkpoint_回退run_dir闸]
+             s21_v3_双宿主互斥_per_issue锁, s22_v3_旧格式checkpoint_回退run_dir闸,
+             s23_v3_engine_error_存活checkpoint_回收豁免与续走,
+             s24_v3_回收豁免判定_checkpoint活性决策表,
+             s25_v3_正常终态_宿主补发on_flow_end恰一次,
+             s26_v3_异常终态_on_flow_end恰为引擎版_宿主不重复,
+             s27_v3_dryrun冒烟_真bridge无桩全图]
 
 if __name__ == "__main__":
     _patch()

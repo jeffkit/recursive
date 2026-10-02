@@ -90,6 +90,30 @@ class StepTracker:
         self.on_node_end(flow, node, result=result, exc=exc)
 
 
+def _ckpt_keeps_worktree(ckpt_path: Path, run_dir: Path) -> str:
+    """engine_error 终态回收豁免判定（v2.3，R1-1）。
+
+    返回豁免理由（真值=豁免，跳过该 run_dir 的 WIP+rmtree），空串=照旧回收。
+    仅「checkpoint 可解析 且 ckpt_run_dir 指向本 run」才豁免：
+    - 损坏/缺失 → 重派恢复本就不可达，保树无意义；
+    - 旧格式（无 ckpt_run_dir 字段）→ 证实不了这棵树的归属，且跨派发场景
+      旧 worktree 闸回退查的是新进程 run_dir/worktree、本就不认这棵树——
+      保守照旧回收，不为之冒 8-12G/棵的堆积风险；
+    - 指向别 run → 本 run_dir 的树与那份 checkpoint 无关，照旧回收。
+    豁免的树由重派续走终态时的 _recycle_resumed_worktree 收口（磁盘上界=
+    每 issue 至多多留一棵）。"""
+    try:
+        raw = json.loads(Path(ckpt_path).read_text())
+    except Exception:
+        return ""
+    ck = raw.get("ckpt_run_dir")
+    if not ck:
+        return ""
+    if Path(ck) != Path(run_dir):
+        return ""
+    return f"checkpoint 存活待续 (last_node={raw.get('last_node')}, run_id={raw.get('run_id')})"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
@@ -163,7 +187,15 @@ def main() -> int:
     except Exception:
         pass
 
-    use_v3 = (not args.dry_run) and os.environ.get("RECURSIVE_HOST_V3") == "1" and m
+    # v2.3（2026-10-02，R1-4）：dry_run 不再排除在 v3 外。核实结论：dry_run 经
+    # fl.global_context → context.setup_flow 拷进 $GLOBAL（plaita context.py:300-316），
+    # DISTRIBUTED fresh 与 NORMAL 走同一条 setup 路径，节点侧统一经
+    # get_global_variable("dry_run") 消费（agent_run/gate/git_publish 同款），
+    # 且 $GLOBAL 随 context.to_dict() 进 checkpoint、续跑原样带回——原排除使
+    # 设计 §7 的廉价冒烟（真 bridge --dry-run + HOST_V3=1）结构性走不到 v3。
+    # harness s27 冒烟实证 dry_run 全图在 v3 下 verdict/state/checkpoint 契约成立。
+    use_v3 = os.environ.get("RECURSIVE_HOST_V3") == "1" and m
+    ckpt_path = None                                     # v3 checkpoint 路径（回收豁免判定用）
     nodes = None
     if use_v3:
         # v3 本地分布式宿主（DESIGN-local-distributed-host.md v2）：DISTRIBUTED
@@ -172,6 +204,7 @@ def main() -> int:
         # ⚠️ 异常必须落 engine-error.log + RESULT（10-02 三连秒败无痕的教训：
         # v3 分支崩溃若不兜底，bridge 无声死亡、stderr 空、无从排查）。
         issue_root = Path.home() / ".issue-keeper" / "pipeline" / f"recursive-{m.group(1)}"
+        ckpt_path = issue_root / "checkpoint.json"
         try:
             verdict, nodes = run_host_v3(
                 flow_obj=fl,
@@ -253,17 +286,31 @@ def main() -> int:
     # 由 bridge 调用，天然满足；外部手工清理必须先核对 keeper 工件锁与台账。
     # ⚠️ 回收是 best-effort：任何异常都不得吃掉末尾的 RESULT 行（keeper 契约）
     # ——bc63d74 之前 NameError 让全部终态 run 变 exit=1 无 verdict 即此雷。
+    # ⚠️ v2.3 豁免（2026-10-02，R1-1）：engine_error 且 per-issue checkpoint
+    # 存活指向本 run 时跳过 WIP+rmtree——v3 宿主对非终态意图保留 checkpoint
+    # （只有 is_end 才删），这里照旧删树会让重派 _ckpt_load 的 worktree 闸
+    # 必失败：checkpoint 沦为死据、重派永远 L1 全量，engine_error 可续的
+    # 设计落空（修复前红实证 s23）。豁免落 worktree-preserved.log 供值守判读；
+    # 其余 verdict（committed/skip-commit/retry-later…）维持现状回收。
     try:
         wt = run_dir / "worktree"
         if wt.is_dir():
-            wip_branch = f"wip-{run_dir.name}"
-            subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True, timeout=120)
-            subprocess.run(["git", "-C", str(wt), "commit", "-m",
-                            f"WIP: {run_dir.name} (terminal {verdict.get('verdict')})"],
-                           capture_output=True, timeout=120)
-            subprocess.run(["git", "-C", str(wt), "branch", "-f", wip_branch],
-                           capture_output=True, timeout=30)
-            shutil.rmtree(wt, ignore_errors=True)
+            keep = ""
+            if verdict.get("verdict") == "engine_error" and ckpt_path is not None:
+                keep = _ckpt_keeps_worktree(ckpt_path, run_dir)
+            if keep:
+                (run_dir / "worktree-preserved.log").write_text(
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S')} engine_error 保树待续（v2.3 豁免）: "
+                    f"{keep}\n", encoding="utf-8")
+            else:
+                wip_branch = f"wip-{run_dir.name}"
+                subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True, timeout=120)
+                subprocess.run(["git", "-C", str(wt), "commit", "-m",
+                                f"WIP: {run_dir.name} (terminal {verdict.get('verdict')})"],
+                               capture_output=True, timeout=120)
+                subprocess.run(["git", "-C", str(wt), "branch", "-f", wip_branch],
+                               capture_output=True, timeout=30)
+                shutil.rmtree(wt, ignore_errors=True)
     except Exception as e:  # 快照失败只记日志，RESULT 照发
         try:
             (run_dir / "recovery-error.log").write_text(
@@ -384,6 +431,21 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
         def on_node_end(self, flow, node, result=None, error=None, exception=None, **kw):
             self.tracker(flow, node, result)
 
+        def on_flow_start(self, flow, **kw):
+            # v2.3（R1-2）：与 on_flow_end 同理透传（fresh 恰一次，续传引擎本就
+            # 不再 fire——设计 §3；StepTracker 无此方法即 no-op）
+            fwd = getattr(self.tracker, "on_flow_start", None)
+            if callable(fwd):
+                fwd(flow)
+
+        def on_flow_end(self, flow, result=None, error=None, exception=None, **kw):
+            # v2.3（R1-2）：流级事件透传给被包装者——StepTracker 无此方法即
+            # no-op；宿主终态补发经 ex.callback_manager 分发（含测试的录制型
+            # handler），不经此透传会全部落在 Adapter 空壳上。
+            fwd = getattr(self.tracker, "on_flow_end", None)
+            if callable(fwd):
+                fwd(flow, result=result, error=error, exception=exception)
+
     def _failed_node_id(e: BaseException) -> str | None:
         """从异常链提取失败节点 id（任务 3 归因修订，2026-10-02）。
 
@@ -447,12 +509,29 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
     def _tracker():
         return StepTracker(state_path)
 
+    def _fire_flow_end(result=None, error=None) -> None:
+        """宿主终态补发 on_flow_end（设计 §3/§6，R5/D7/T3；v2.3 R1-2 落地）。
+
+        DISTRIBUTED 正常 End 步引擎不 fire（strategies.py _execute_current_node
+        只造 end output），trace 永不闭合——宿主在**非异常终态**经
+        ex.callback_manager 对全部 handlers 补发（含 LangfuseCallback，其根
+        span 必须 end 才导出，obs.py:429-436）。异常终态不补：run_distributed
+        统一出口 _raise_distributed_error 已 fire error 版
+        （_error_normalization.py:67），补发=根 span 二次 end。fail-open，
+        观测不得吃掉 verdict。"""
+        try:
+            ex.callback_manager.on_flow_end(flow_obj, result=result, error=error)
+        except Exception:
+            pass
+
     dl = float(deadline) if deadline else time.time() + max_run_secs
     node_retries: dict[str, int] = {}
     saved = _ckpt_load()
     ex = FlowExecution(callback_handlers=_handlers())
     nodes: dict = {}
     verdict: dict = {}
+    any_step = False          # 本进程推进过≥1步（终态补发 on_flow_end 的前提）
+    engine_fired_end = False  # 最后一步经 FlowErrorException（引擎已 fire，宿主不得重复）
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDONLY)
     try:
         try:
@@ -465,13 +544,20 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
                 verdict = {"verdict": "engine_error",
                            "why": "run deadline exceeded (v3 host)",
                            "node_retry_exhausted": True}
+                if any_step and not engine_fired_end:            # 非异常终态 → 宿主补发
+                    _fire_flow_end(error={"code": -500, "message": verdict["why"]})
                 break
             try:
+                any_step = True
                 if saved is not None:
                     r = ex.run_distributed(flow_obj, saved_context=saved)
                 else:
                     r = ex.run_distributed(flow_obj, params=params)  # fresh 必传（D1）
+                engine_fired_end = False                         # 本步正常返回
             except FlowErrorException as e:
+                # 引擎对每次失败步已统一 fire on_flow_end(error)（_error_normalization）：
+                # 宿主此后只在非异常终态补发，异常终态不再补（R1-2 去重）
+                engine_fired_end = True
                 # 失败节点归因（任务 3，2026-10-02）：原实现 `(saved or {}).get(
                 # "last_node")` 恒为 None——saved 是 plaita context（键为
                 # $INPUT/$NODE/…，checkpoint 文件里的 last_node 字段不在其中），
@@ -504,11 +590,13 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
                 v = (nodes or {}).get("_output") or r.get("result")
                 verdict = v if isinstance(v, dict) else {"verdict": "unknown",
                                                           "raw": str(v)[:400]}
+                _fire_flow_end(result=verdict)                   # 正常 End 引擎不 fire，宿主补发（R1-2）
                 _recycle_resumed_worktree(verdict)               # 旧 run_dir 的树在此补回收
                 break
             if r.get("is_suspend"):                              # v2 无 EventNode（D7 防御）
                 verdict = {"verdict": "engine_error",
                            "why": "unexpected suspend (v2 has no EventNode)"}
+                _fire_flow_end(error={"code": -500, "message": verdict["why"]})
                 break
             _ckpt_save(saved, r.get("id") or "")
     finally:
