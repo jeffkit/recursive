@@ -1,3137 +1,1019 @@
 {
- "flow_id": "self-improve-v2",
- "version": null,
- "runtime": "python",
- "input_type": {
-  "data_type": "object",
-  "name": null,
-  "label": null,
-  "desc": null,
-  "is_required": false,
-  "default_value": null,
-  "item_type": null,
-  "children": {}
- },
- "output_type": null,
- "nodes": [
-  {
-   "id": "start",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "goal",
-   "timeout": "",
-   "source_line": null,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   }
+  "runtime": "python",
+  "flow_id": "self-improve-v2",
+  "inputType": {
+    "dataType": "object"
   },
-  {
-   "id": "goal",
-   "name": null,
-   "desc": null,
-   "output": "$INPUT.goal",
-   "next": "repo",
-   "timeout": "",
-   "source_line": 4,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "repo",
-   "name": null,
-   "desc": null,
-   "output": "$INPUT.repo",
-   "next": "run_dir",
-   "timeout": "",
-   "source_line": 5,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "run_dir",
-   "name": null,
-   "desc": null,
-   "output": "$INPUT.run_dir",
-   "next": "agent",
-   "timeout": "",
-   "source_line": 6,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "agent",
-   "name": null,
-   "desc": null,
-   "output": "$INPUT.agent",
-   "next": "reviewer",
-   "timeout": "",
-   "source_line": 7,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "reviewer",
-   "name": null,
-   "desc": null,
-   "output": "$INPUT.reviewer",
-   "next": "pre",
-   "timeout": "",
-   "source_line": 8,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "pre",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n1",
-   "timeout": "",
-   "source_line": 11,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "language": "python",
-   "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    out = subprocess.run([\"pgrep\", \"-f\", \"recursive.*--transcript-out\"],\n                         capture_output=True, text=True)\n    for pid in [int(x) for x in out.stdout.split() if x.isdigit()]:\n        try:\n            os.killpg(os.getpgid(pid), signal.SIGTERM)\n        except Exception:\n            pass\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True) if issue_no else None\n    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n              if br is not None else [])\n    if cands:\n        newest, newest_t = None, -1.0\n        for c in cands:\n            t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                               capture_output=True, text=True)\n            try:\n                ct = float(t.stdout.strip())\n            except ValueError:\n                continue\n            if ct > newest_t:\n                newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。\\n\")\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp)}\n",
-   "input": {
-    "repo": "$NODE.repo",
-    "run_dir": "$NODE.run_dir"
-   },
-   "sandbox_backend": "subprocess"
-  },
-  {
-   "id": "_n1",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n23",
-   "timeout": "",
-   "source_line": 87,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
+  "desc": "Self-improve v2：库节点为主，code 只做 preflight/has_changes",
+  "nodes": [
     {
-     "name": "_n23",
-     "condition": {
-      "field": "$NODE.pre.ok",
-      "operator": "eq",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n23",
-     "is_default": false
-    },
-    {
-     "name": "impl",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "impl",
-     "is_default": true
-    }
-   ],
-   "else_next": "impl",
-   "condition": {
-    "field": "$NODE.pre.ok",
-    "operator": "eq",
-    "value": false
-   }
-  },
-  {
-   "id": "impl",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "chg",
-   "timeout": "",
-   "source_line": 100,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "agent": "$NODE.agent",
-   "prompt": "$NODE.goal",
-   "repo": "$NODE.pre.worktree",
-   "timeout_secs": 7200,
-   "details": false,
-   "dry_run": false
-  },
-  {
-   "id": "chg",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n2",
-   "timeout": "",
-   "source_line": 101,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "input": {
-    "wt": "$NODE.pre.worktree"
-   },
-   "child_flow": {
-    "flow_id": null,
-    "version": null,
-    "runtime": "python",
-    "input_type": {
-     "data_type": "object",
-     "name": null,
-     "label": null,
-     "desc": null,
-     "is_required": false,
-     "default_value": null,
-     "item_type": null,
-     "children": {}
-    },
-    "output_type": null,
-    "nodes": [
-     {
+      "type": "start",
       "id": "start",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n2",
-      "timeout": "",
-      "source_line": null,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      }
-     },
-     {
-      "id": "_n2",
-      "name": null,
-      "desc": null,
-      "output": "工作区是否有待提交改动（impl/fix 后的落门前置判断）。",
-      "next": "ch",
-      "timeout": "",
-      "source_line": 3,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "ch",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n1",
-      "timeout": "",
-      "source_line": 4,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
+      "next": "goal"
+    },
+    {
+      "type": "assignment",
+      "id": "goal",
+      "output": "$INPUT.goal",
+      "next": "repo",
+      "source_line": 94
+    },
+    {
+      "type": "assignment",
+      "id": "repo",
+      "output": "$INPUT.repo",
+      "next": "run_dir",
+      "source_line": 95
+    },
+    {
+      "type": "assignment",
+      "id": "run_dir",
+      "output": "$INPUT.run_dir",
+      "next": "agent",
+      "source_line": 96
+    },
+    {
+      "type": "assignment",
+      "id": "agent",
+      "output": "$INPUT.agent",
+      "next": "reviewer",
+      "source_line": 97
+    },
+    {
+      "type": "assignment",
+      "id": "reviewer",
+      "output": "$INPUT.reviewer",
+      "next": "pre",
+      "source_line": 98
+    },
+    {
+      "type": "code",
+      "id": "pre",
       "language": "python",
-      "code": "import subprocess\ndef run(input):\n    st = subprocess.run([\"git\", \"-C\", input[\"wt\"], \"status\", \"--porcelain\"],\n                        capture_output=True, text=True)\n    return {\"any\": bool(st.stdout.strip())}\n",
+      "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    out = subprocess.run([\"pgrep\", \"-f\", \"recursive.*--transcript-out\"],\n                         capture_output=True, text=True)\n    for pid in [int(x) for x in out.stdout.split() if x.isdigit()]:\n        try:\n            os.killpg(os.getpgid(pid), signal.SIGTERM)\n        except Exception:\n            pass\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True) if issue_no else None\n    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n              if br is not None else [])\n    if cands:\n        # canonical 分支（pipeline/issue-N，GIT_PUBLISH 推的门禁通过版）\n        # 优先于 v2-*/wip-* 按新度拣选——#70 实证：被否决的朴素变体（25e41f9）\n        # 比 canonical 新 30 分钟，纯按 %ct 会继承错误基线。\n        canon = \"pipeline/issue-\" + issue_no\n        newest = canon if canon in cands else None\n        if newest is None:\n            newest_t = -1.0\n            for c in cands:\n                t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                                   capture_output=True, text=True)\n                try:\n                    ct = float(t.stdout.strip())\n                except ValueError:\n                    continue\n                if ct > newest_t:\n                    newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。\\n\")\n        import glob as _glob\n        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', 'review-failure.log')))\n        if _rf:\n            _latest = max(_rf, key=os.path.getmtime)\n            sp.write_text(sp.read_text() + \"\\n\\n# 评审反馈（上轮 review-failure.log，逐条解决其中的回归/意见；已通过部分不要动）\\n\\n\" + open(_latest, encoding='utf-8', errors='replace').read()[:6000] + \"\\n\")\n    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n    last_sid = \"\"\n    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n    if sroot and resumed:\n        cands = []\n        for root, dirs, files in os.walk(sroot):\n            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n                # 噪音过滤：var-folders tmp 工作区的空壳会话（code 沙箱副产物）\n                # 与 <300B 的 stub 都不配续跑（68 实证：选中即 resume 垃圾会话）\n                if \"var-folders-\" in root or \"-tmp\" in root:\n                    continue\n                _tp = os.path.join(root, \"transcript.jsonl\")\n                if os.path.exists(_tp) and os.path.getsize(_tp) < 300:\n                    continue\n                cands.append((os.path.getmtime(root), os.path.basename(root)))\n        if cands:\n            cands.sort()\n            last_sid = cands[-1][1]\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp), \"last_sid\": last_sid}\n",
       "input": {
-       "wt": "$INPUT.wt"
+        "repo": "$NODE.repo",
+        "run_dir": "$NODE.run_dir"
       },
-      "sandbox_backend": "subprocess"
-     },
-     {
-      "id": "_n1",
-      "name": null,
-      "desc": null,
-      "output": {
-       "any": "$NODE.ch.any"
-      },
-      "next": null,
-      "timeout": "",
-      "source_line": 10,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     }
-    ],
-    "author": "",
-    "desc": "",
-    "metadata": {},
-    "timeout": "",
-    "global_context": {},
-    "exposeEnv": []
-   }
-  },
-  {
-   "id": "_n2",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n22",
-   "timeout": "",
-   "source_line": 102,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n22",
-     "condition": {
-      "field": "$NODE.chg.any",
-      "operator": "eq",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n22",
-     "is_default": false
+      "next": "ok_eq_false",
+      "source_line": 101
     },
     {
-     "name": "g1",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "g1",
-     "is_default": true
-    }
-   ],
-   "else_next": "g1",
-   "condition": {
-    "field": "$NODE.chg.any",
-    "operator": "eq",
-    "value": false
-   }
-  },
-  {
-   "id": "g1",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n3",
-   "timeout": "",
-   "source_line": 112,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "input": {
-    "name": "fmt",
-    "cmd": "cargo fmt --all",
-    "timeout_secs": 120,
-    "wt": "$NODE.pre.worktree",
-    "agent": "$NODE.agent"
-   },
-   "child_flow": {
-    "flow_id": null,
-    "version": null,
-    "runtime": "python",
-    "input_type": {
-     "data_type": "object",
-     "name": null,
-     "label": null,
-     "desc": null,
-     "is_required": false,
-     "default_value": null,
-     "item_type": null,
-     "children": {}
-    },
-    "output_type": null,
-    "nodes": [
-     {
-      "id": "start",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n8",
-      "timeout": "",
-      "source_line": null,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      }
-     },
-     {
-      "id": "_n8",
-      "name": null,
-      "desc": null,
-      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n\n    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复\n    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue\n    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义\n    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘\n    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。\n    ",
-      "next": "run",
-      "timeout": "",
-      "source_line": 3,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "run",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n1",
-      "timeout": "",
-      "source_line": 14,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "command": "$INPUT.cmd",
-      "gate_name": "$INPUT.name",
-      "cwd": "$INPUT.wt",
-      "timeout_secs": "$INPUT.timeout_secs",
-      "max_retries": 0,
-      "dry_run": false
-     },
-     {
-      "id": "_n1",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n7",
-      "timeout": "",
-      "source_line": 16,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": {
-       "data_type": "string",
-       "name": "branch_name",
-       "label": null,
-       "desc": null,
-       "is_required": false,
-       "default_value": null,
-       "item_type": null,
-       "children": []
-      },
-      "branches": [
-       {
-        "name": "_n7",
-        "condition": {
-         "field": "$NODE.run.passed",
-         "operator": "eq",
-         "value": true
-        },
-        "priority": 0,
-        "label": "true",
-        "desc": "true",
-        "next": "_n7",
-        "is_default": false
-       },
-       {
-        "name": "fix_prompt",
-        "condition": null,
-        "priority": 0,
-        "label": "false",
-        "desc": "false",
-        "next": "fix_prompt",
-        "is_default": true
-       }
-      ],
-      "else_next": "fix_prompt",
+      "type": "if",
+      "id": "ok_eq_false",
       "condition": {
-       "field": "$NODE.run.passed",
-       "operator": "eq",
-       "value": true
-      }
-     },
-     {
-      "id": "fix_prompt",
-      "name": null,
-      "desc": null,
-      "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed. \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
-      "next": "_n6",
-      "timeout": "",
-      "source_line": 18,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+        "field": "$NODE.pre.ok",
+        "operator": "eq",
+        "value": false
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "_n6",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "run2",
-      "timeout": "",
-      "source_line": 24,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "agent": "$INPUT.agent",
-      "prompt": "$NODE.fix_prompt",
-      "repo": "$INPUT.wt",
+      "name": "pre.ok == False?",
+      "desc": "if pre.ok == False（第 208 行）",
+      "source_line": 208,
+      "next": "contains_str_why_or_disk",
+      "else_next": "impl"
+    },
+    {
+      "type": "agentrun",
+      "id": "impl",
+      "agent": "$NODE.agent",
+      "prompt": "$NODE.goal",
+      "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
-      "details": false,
-      "dry_run": false
-     },
-     {
-      "id": "run2",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n2",
-      "timeout": "",
-      "source_line": 26,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "session": "$NODE.pre.last_sid",
+      "next": "chg",
+      "source_line": 224
+    },
+    {
+      "type": "child",
+      "id": "chg",
+      "input": {
+        "wt": "$NODE.pre.worktree"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "是否有待落地的改动（impl/fix 后的落门前置判断）。\n\n    两类都算：① worktree 未提交改动（git status）；② 分支领先 main 的已提交\n    （断点续跑继承的 WIP 快照提交，#61 实证：被 429 杀掉的前一轮工作完整躺在\n    WIP 提交里，旧版只看 status → 假 skip-commit → 不过门禁、不推远端、\n    issue 被消费后工作滞留本地分支）。继承工作照走三门+评审+GIT_PUBLISH，\n    验证不过自然 failed-preserved。\n    ",
+            "next": "ch",
+            "name": "'是否有待落地的改动（impl/fix 后的落门前置判…",
+            "desc": "'是否有待落地的改动（impl/fix 后的落门前置判断）。\\n\\n 两类都算：① worktree 未提交改动（gi…",
+            "source_line": 51
+          },
+          {
+            "type": "code",
+            "id": "ch",
+            "language": "python",
+            "code": "import subprocess\ndef run(input):\n    def git(*a):\n        r = subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n                            capture_output=True, text=True)\n        return r.stdout.strip()\n    dirty = bool(git(\"status\", \"--porcelain\"))\n    ahead = 0\n    try:\n        ahead = int(git(\"rev-list\", \"--count\", \"main..HEAD\") or 0)\n    except ValueError:\n        ahead = 0\n    return {\"any\": dirty or ahead > 0}\n",
+            "input": {
+              "wt": "$INPUT.wt"
+            },
+            "next": "_n1",
+            "source_line": 59
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "any": "$NODE.ch.any"
+            },
+            "resultType": "success",
+            "name": "return {'any': ch.any}",
+            "desc": "return {'any': ch.any}（第 73 行）",
+            "source_line": 73
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
       },
-      "command": "$INPUT.cmd",
-      "gate_name": "$INPUT.name",
-      "cwd": "$INPUT.wt",
-      "timeout_secs": "$INPUT.timeout_secs",
-      "max_retries": 0,
-      "dry_run": false
-     },
-     {
-      "id": "_n2",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n5",
-      "timeout": "",
-      "source_line": 28,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": {
-       "data_type": "string",
-       "name": "branch_name",
-       "label": null,
-       "desc": null,
-       "is_required": false,
-       "default_value": null,
-       "item_type": null,
-       "children": []
-      },
-      "branches": [
-       {
-        "name": "_n5",
-        "condition": {
-         "field": "$NODE.run2.passed",
-         "operator": "eq",
-         "value": true
-        },
-        "priority": 0,
-        "label": "true",
-        "desc": "true",
-        "next": "_n5",
-        "is_default": false
-       },
-       {
-        "name": "_n4",
-        "condition": null,
-        "priority": 0,
-        "label": "false",
-        "desc": "false",
-        "next": "_n4",
-        "is_default": true
-       }
-      ],
-      "else_next": "_n4",
+      "next": "any_eq_false",
+      "source_line": 226
+    },
+    {
+      "type": "if",
+      "id": "any_eq_false",
       "condition": {
-       "field": "$NODE.run2.passed",
-       "operator": "eq",
-       "value": true
-      }
-     },
-     {
-      "id": "_n4",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n3",
-      "timeout": "",
-      "source_line": 30,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+        "field": "$NODE.chg.any",
+        "operator": "eq",
+        "value": false
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "path": "$F.concat($INPUT.wt, \"/../failure-gate-\", $INPUT.name, \".log\")",
-      "content": "$F.concat(\"cmd: \", $INPUT.cmd, \"\\n--- stdout ---\\n\", $NODE.run2.stdout, \"\\n--- stderr ---\\n\", $NODE.run2.stderr)",
-      "json": false,
-      "indent": 2,
-      "workspace_root": null
-     },
-     {
-      "id": "_n3",
-      "name": null,
-      "desc": null,
-      "output": {
-       "passed": false,
-       "gate": "$INPUT.name",
-       "out": "$NODE.run2.stdout"
-      },
-      "next": null,
-      "timeout": "",
-      "source_line": 33,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     },
-     {
-      "id": "_n5",
-      "name": null,
-      "desc": null,
-      "output": {
-       "passed": true,
-       "gate": "$INPUT.name"
-      },
-      "next": null,
-      "timeout": "",
-      "source_line": 29,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     },
-     {
-      "id": "_n7",
-      "name": null,
-      "desc": null,
-      "output": {
-       "passed": true,
-       "gate": "$INPUT.name"
-      },
-      "next": null,
-      "timeout": "",
-      "source_line": 17,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     }
-    ],
-    "author": "",
-    "desc": "",
-    "metadata": {},
-    "timeout": "",
-    "global_context": {},
-    "exposeEnv": []
-   }
-  },
-  {
-   "id": "_n3",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n21",
-   "timeout": "",
-   "source_line": 115,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n21",
-     "condition": {
-      "field": "$NODE.g1.passed",
-      "operator": "eq",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n21",
-     "is_default": false
+      "name": "chg.any == False?",
+      "desc": "if chg.any == False（第 227 行）",
+      "source_line": 227,
+      "next": "_n15",
+      "else_next": "g1"
     },
     {
-     "name": "g2",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "g2",
-     "is_default": true
-    }
-   ],
-   "else_next": "g2",
-   "condition": {
-    "field": "$NODE.g1.passed",
-    "operator": "eq",
-    "value": false
-   }
-  },
-  {
-   "id": "g2",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n4",
-   "timeout": "",
-   "source_line": 118,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "input": {
-    "name": "clippy",
-    "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-    "timeout_secs": 1200,
-    "wt": "$NODE.pre.worktree",
-    "agent": "$NODE.agent"
-   },
-   "child_flow": {
-    "flow_id": null,
-    "version": null,
-    "runtime": "python",
-    "input_type": {
-     "data_type": "object",
-     "name": null,
-     "label": null,
-     "desc": null,
-     "is_required": false,
-     "default_value": null,
-     "item_type": null,
-     "children": {}
+      "type": "child",
+      "id": "g1",
+      "input": {
+        "name": "fmt",
+        "cmd": "cargo fmt --all",
+        "timeout_secs": 120,
+        "wt": "$NODE.pre.worktree"
+      },
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "单发一道门（只包 GATE 本体，返回结果即走）。\n\n    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/\n    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，\n    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切\n    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。\n    ",
+            "next": "run",
+            "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
+            "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
+            "source_line": 78
+          },
+          {
+            "type": "gate",
+            "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.wt",
+            "timeout_secs": "$INPUT.timeout_secs",
+            "next": "_n1",
+            "source_line": 85
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "passed": "$NODE.run.passed",
+              "gate": "$INPUT.name",
+              "out": "$NODE.run.stdout",
+              "err": "$NODE.run.stderr"
+            },
+            "resultType": "success",
+            "name": "return {'passed': run.passe…",
+            "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
+            "source_line": 87
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
+      },
+      "next": "passed_eq_false",
+      "source_line": 246
     },
-    "output_type": null,
-    "nodes": [
-     {
-      "id": "start",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n8",
-      "timeout": "",
-      "source_line": null,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+    {
+      "type": "if",
+      "id": "passed_eq_false",
+      "condition": {
+        "field": "$NODE.g1.passed",
+        "operator": "eq",
+        "value": false
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      }
-     },
-     {
-      "id": "_n8",
-      "name": null,
-      "desc": null,
-      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n\n    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复\n    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue\n    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义\n    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘\n    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。\n    ",
-      "next": "run",
-      "timeout": "",
-      "source_line": 3,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "name": "g1.passed == False?",
+      "desc": "if g1.passed == False（第 248 行）",
+      "source_line": 248,
+      "next": "_n14",
+      "else_next": "g2"
+    },
+    {
+      "type": "child",
+      "id": "g2",
+      "input": {
+        "name": "clippy",
+        "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "timeout_secs": 1200,
+        "wt": "$NODE.pre.worktree"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "单发一道门（只包 GATE 本体，返回结果即走）。\n\n    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/\n    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，\n    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切\n    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。\n    ",
+            "next": "run",
+            "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
+            "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
+            "source_line": 78
+          },
+          {
+            "type": "gate",
+            "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.wt",
+            "timeout_secs": "$INPUT.timeout_secs",
+            "next": "_n1",
+            "source_line": 85
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "passed": "$NODE.run.passed",
+              "gate": "$INPUT.name",
+              "out": "$NODE.run.stdout",
+              "err": "$NODE.run.stderr"
+            },
+            "resultType": "success",
+            "name": "return {'passed': run.passe…",
+            "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
+            "source_line": 87
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
       },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "run",
-      "name": null,
-      "desc": null,
-      "output": null,
+      "next": "passed_eq_false_2",
+      "source_line": 263
+    },
+    {
+      "type": "if",
+      "id": "passed_eq_false_2",
+      "condition": {
+        "field": "$NODE.g2.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "name": "g2.passed == False?",
+      "desc": "if g2.passed == False（第 266 行）",
+      "source_line": 266,
+      "next": "_n11",
+      "else_next": "g3"
+    },
+    {
+      "type": "child",
+      "id": "g3",
+      "input": {
+        "name": "test",
+        "cmd": "cargo test --workspace",
+        "timeout_secs": 1800,
+        "wt": "$NODE.pre.worktree"
+      },
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "单发一道门（只包 GATE 本体，返回结果即走）。\n\n    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/\n    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，\n    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切\n    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。\n    ",
+            "next": "run",
+            "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
+            "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
+            "source_line": 78
+          },
+          {
+            "type": "gate",
+            "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.wt",
+            "timeout_secs": "$INPUT.timeout_secs",
+            "next": "_n1",
+            "source_line": 85
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "passed": "$NODE.run.passed",
+              "gate": "$INPUT.name",
+              "out": "$NODE.run.stdout",
+              "err": "$NODE.run.stderr"
+            },
+            "resultType": "success",
+            "name": "return {'passed': run.passe…",
+            "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
+            "source_line": 87
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
+      },
+      "next": "passed_eq_false_3",
+      "source_line": 283
+    },
+    {
+      "type": "if",
+      "id": "passed_eq_false_3",
+      "condition": {
+        "field": "$NODE.g3.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "name": "g3.passed == False?",
+      "desc": "if g3.passed == False（第 285 行）",
+      "source_line": 285,
+      "next": "_n9",
+      "else_next": "review_prompt"
+    },
+    {
+      "type": "assignment",
+      "id": "review_prompt",
+      "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff main` to see the full change (three-dot is not needed; this covers both uncommitted edits and commits inherited from a resumed run, which `git diff HEAD` would miss), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
+      "next": "rev1",
+      "source_line": 308
+    },
+    {
+      "type": "agentrun",
+      "id": "rev1",
+      "agent": "$NODE.reviewer",
+      "prompt": "$NODE.review_prompt",
+      "repo": "$NODE.pre.worktree",
+      "timeout_secs": 5400,
+      "next": "contains_text_verdict_pa",
+      "source_line": 318
+    },
+    {
+      "type": "if",
+      "id": "contains_text_verdict_pa",
+      "condition": {
+        "field": "$F.contains($NODE.rev1.text, \"VERDICT:PASS\")",
+        "operator": "ne",
+        "value": true
+      },
+      "name": "F.contains(rev1.text, 'VERD…",
+      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 320 行）",
+      "source_line": 320,
+      "next": "contains_text_verdict_ne",
+      "else_next": "pub"
+    },
+    {
+      "type": "git_publish",
+      "id": "pub",
+      "worktree_dir": "$NODE.pre.worktree",
+      "branch_name": "$NODE.pre.branch",
+      "commit_message": "$F.concat(\"self-improve: \", $NODE.goal)",
+      "merge_mode": "main",
+      "main_clone": "$NODE.repo",
+      "base_branch": "main",
+      "next": "merged_eq_true",
+      "source_line": 340
+    },
+    {
+      "type": "if",
+      "id": "merged_eq_true",
+      "condition": {
+        "field": "$NODE.pub.merged",
+        "operator": "eq",
+        "value": true
+      },
+      "name": "pub.merged == True?",
+      "desc": "if pub.merged == True（第 343 行）",
+      "source_line": 343,
+      "next": "_n4",
+      "else_next": "land_rebase"
+    },
+    {
+      "type": "code",
+      "id": "land_rebase",
+      "language": "python",
+      "code": "import subprocess\n\ndef run(input):\n    def git(*a):\n        return subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n                              capture_output=True, text=True)\n    git(\"fetch\", \"origin\")\n    r = git(\"rebase\", \"origin/main\")\n    if r.returncode != 0:\n        git(\"rebase\", \"--abort\")\n        return {\"ok\": False,\n                \"why\": ((r.stderr or \"\") + (r.stdout or \"\"))[-400:]}\n    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n    return {\"ok\": True}\n",
+      "input": {
+        "wt": "$NODE.pre.worktree",
+        "branch": "$NODE.pre.branch"
+      },
+      "next": "ok_eq_false_2",
+      "source_line": 351
+    },
+    {
+      "type": "if",
+      "id": "ok_eq_false_2",
+      "condition": {
+        "field": "$NODE.land_rebase.ok",
+        "operator": "eq",
+        "value": false
+      },
+      "name": "land_rebase.ok == False?",
+      "desc": "if land_rebase.ok == False（第 367 行）",
+      "source_line": 367,
+      "next": "wfp2",
+      "else_next": "pub2"
+    },
+    {
+      "type": "git_publish",
+      "id": "pub2",
+      "worktree_dir": "$NODE.pre.worktree",
+      "branch_name": "$NODE.pre.branch",
+      "commit_message": "$F.concat(\"self-improve: \", $NODE.goal)",
+      "merge_mode": "main",
+      "main_clone": "$NODE.repo",
+      "base_branch": "main",
+      "next": "merged_eq_true_2",
+      "source_line": 372
+    },
+    {
+      "type": "if",
+      "id": "merged_eq_true_2",
+      "condition": {
+        "field": "$NODE.pub2.merged",
+        "operator": "eq",
+        "value": true
+      },
+      "name": "pub2.merged == True?",
+      "desc": "if pub2.merged == True（第 375 行）",
+      "source_line": 375,
+      "next": "_n2",
+      "else_next": "wfp3"
+    },
+    {
+      "type": "writefile",
+      "id": "wfp3",
+      "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
+      "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
       "next": "_n1",
-      "timeout": "",
-      "source_line": 14,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "command": "$INPUT.cmd",
-      "gate_name": "$INPUT.name",
-      "cwd": "$INPUT.wt",
-      "timeout_secs": "$INPUT.timeout_secs",
-      "max_retries": 0,
-      "dry_run": false
-     },
-     {
+      "source_line": 378
+    },
+    {
+      "type": "end",
       "id": "_n1",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n7",
-      "timeout": "",
-      "source_line": 16,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "output": {
+        "verdict": "failed-preserved",
+        "stage": "land",
+        "why": "$NODE.pub2.note",
+        "preserved": true
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": {
-       "data_type": "string",
-       "name": "branch_name",
-       "label": null,
-       "desc": null,
-       "is_required": false,
-       "default_value": null,
-       "item_type": null,
-       "children": []
-      },
-      "branches": [
-       {
-        "name": "_n7",
-        "condition": {
-         "field": "$NODE.run.passed",
-         "operator": "eq",
-         "value": true
-        },
-        "priority": 0,
-        "label": "true",
-        "desc": "true",
-        "next": "_n7",
-        "is_default": false
-       },
-       {
-        "name": "fix_prompt",
-        "condition": null,
-        "priority": 0,
-        "label": "false",
-        "desc": "false",
-        "next": "fix_prompt",
-        "is_default": true
-       }
-      ],
-      "else_next": "fix_prompt",
-      "condition": {
-       "field": "$NODE.run.passed",
-       "operator": "eq",
-       "value": true
-      }
-     },
-     {
-      "id": "fix_prompt",
-      "name": null,
-      "desc": null,
-      "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed. \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
-      "next": "_n6",
-      "timeout": "",
-      "source_line": 18,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "_n6",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "run2",
-      "timeout": "",
-      "source_line": 24,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "agent": "$INPUT.agent",
-      "prompt": "$NODE.fix_prompt",
-      "repo": "$INPUT.wt",
-      "timeout_secs": 7200,
-      "details": false,
-      "dry_run": false
-     },
-     {
-      "id": "run2",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n2",
-      "timeout": "",
-      "source_line": 26,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "command": "$INPUT.cmd",
-      "gate_name": "$INPUT.name",
-      "cwd": "$INPUT.wt",
-      "timeout_secs": "$INPUT.timeout_secs",
-      "max_retries": 0,
-      "dry_run": false
-     },
-     {
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
+      "source_line": 381
+    },
+    {
+      "type": "end",
       "id": "_n2",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n5",
-      "timeout": "",
-      "source_line": 28,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "output": {
+        "verdict": "committed",
+        "via": "git-publish-retry",
+        "note": "$NODE.pub2.note"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": {
-       "data_type": "string",
-       "name": "branch_name",
-       "label": null,
-       "desc": null,
-       "is_required": false,
-       "default_value": null,
-       "item_type": null,
-       "children": []
-      },
-      "branches": [
-       {
-        "name": "_n5",
-        "condition": {
-         "field": "$NODE.run2.passed",
-         "operator": "eq",
-         "value": true
-        },
-        "priority": 0,
-        "label": "true",
-        "desc": "true",
-        "next": "_n5",
-        "is_default": false
-       },
-       {
-        "name": "_n4",
-        "condition": null,
-        "priority": 0,
-        "label": "false",
-        "desc": "false",
-        "next": "_n4",
-        "is_default": true
-       }
-      ],
-      "else_next": "_n4",
-      "condition": {
-       "field": "$NODE.run2.passed",
-       "operator": "eq",
-       "value": true
-      }
-     },
-     {
-      "id": "_n4",
-      "name": null,
-      "desc": null,
-      "output": null,
+      "resultType": "success",
+      "name": "return {'verdict': 'committ…",
+      "desc": "return {'verdict': 'committed', 'via': 'git-publish-retry',…",
+      "source_line": 376
+    },
+    {
+      "type": "writefile",
+      "id": "wfp2",
+      "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
+      "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)",
       "next": "_n3",
-      "timeout": "",
-      "source_line": 30,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "path": "$F.concat($INPUT.wt, \"/../failure-gate-\", $INPUT.name, \".log\")",
-      "content": "$F.concat(\"cmd: \", $INPUT.cmd, \"\\n--- stdout ---\\n\", $NODE.run2.stdout, \"\\n--- stderr ---\\n\", $NODE.run2.stderr)",
-      "json": false,
-      "indent": 2,
-      "workspace_root": null
-     },
-     {
+      "source_line": 368
+    },
+    {
+      "type": "end",
       "id": "_n3",
-      "name": null,
-      "desc": null,
       "output": {
-       "passed": false,
-       "gate": "$INPUT.name",
-       "out": "$NODE.run2.stdout"
+        "verdict": "failed-preserved",
+        "stage": "land",
+        "why": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)"
       },
-      "next": null,
-      "timeout": "",
-      "source_line": 33,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
+      "source_line": 370
+    },
+    {
+      "type": "end",
+      "id": "_n4",
+      "output": {
+        "verdict": "committed",
+        "via": "git-publish",
+        "note": "$NODE.pub.note"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
+      "resultType": "success",
+      "name": "return {'verdict': 'committ…",
+      "desc": "return {'verdict': 'committed', 'via': 'git-publish', 'note…",
+      "source_line": 344
+    },
+    {
+      "type": "if",
+      "id": "contains_text_verdict_ne",
+      "condition": {
+        "field": "$F.contains($NODE.rev1.text, \"VERDICT:NEEDS_FIX\")",
+        "operator": "ne",
+        "value": true
       },
-      "result_type": "success",
-      "error": null
-     },
-     {
+      "name": "F.contains(rev1.text, 'VERD…",
+      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 321 行）",
+      "source_line": 321,
+      "next": "wfr",
+      "else_next": "fix_prompt"
+    },
+    {
+      "type": "assignment",
+      "id": "fix_prompt",
+      "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
+      "next": "_n6",
+      "source_line": 326
+    },
+    {
+      "type": "agentrun",
+      "id": "_n6",
+      "agent": "$NODE.agent",
+      "prompt": "$NODE.fix_prompt",
+      "repo": "$NODE.pre.worktree",
+      "timeout_secs": 7200,
+      "next": "rev2",
+      "source_line": 330
+    },
+    {
+      "type": "agentrun",
+      "id": "rev2",
+      "agent": "$NODE.reviewer",
+      "prompt": "$NODE.review_prompt",
+      "repo": "$NODE.pre.worktree",
+      "timeout_secs": 5400,
+      "next": "contains_text_verdict_pa_2",
+      "source_line": 331
+    },
+    {
+      "type": "if",
+      "id": "contains_text_verdict_pa_2",
+      "condition": {
+        "field": "$F.contains($NODE.rev2.text, \"VERDICT:PASS\")",
+        "operator": "ne",
+        "value": true
+      },
+      "name": "F.contains(rev2.text, 'VERD…",
+      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 333 行）",
+      "source_line": 333,
+      "next": "wfr2",
+      "else_next": "pub"
+    },
+    {
+      "type": "writefile",
+      "id": "wfr2",
+      "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
+      "content": "$NODE.rev2.text",
+      "next": "_n5",
+      "source_line": 334
+    },
+    {
+      "type": "end",
       "id": "_n5",
-      "name": null,
-      "desc": null,
       "output": {
-       "passed": true,
-       "gate": "$INPUT.name"
+        "verdict": "failed-preserved",
+        "stage": "review",
+        "why": "review did not pass after one fix round"
       },
-      "next": null,
-      "timeout": "",
-      "source_line": 29,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     },
-     {
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
+      "source_line": 336
+    },
+    {
+      "type": "writefile",
+      "id": "wfr",
+      "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
+      "content": "$NODE.rev1.text",
+      "next": "_n7",
+      "source_line": 322
+    },
+    {
+      "type": "end",
       "id": "_n7",
-      "name": null,
-      "desc": null,
       "output": {
-       "passed": true,
-       "gate": "$INPUT.name"
+        "verdict": "failed-preserved",
+        "stage": "review",
+        "why": "reviewer UNAVAILABLE (no VERDICT line)"
       },
-      "next": null,
-      "timeout": "",
-      "source_line": 17,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     }
-    ],
-    "author": "",
-    "desc": "",
-    "metadata": {},
-    "timeout": "",
-    "global_context": {},
-    "exposeEnv": []
-   }
-  },
-  {
-   "id": "_n4",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n20",
-   "timeout": "",
-   "source_line": 122,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n20",
-     "condition": {
-      "field": "$NODE.g2.passed",
-      "operator": "eq",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n20",
-     "is_default": false
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
+      "source_line": 324
     },
     {
-     "name": "g3",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "g3",
-     "is_default": true
-    }
-   ],
-   "else_next": "g3",
-   "condition": {
-    "field": "$NODE.g2.passed",
-    "operator": "eq",
-    "value": false
-   }
-  },
-  {
-   "id": "g3",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n5",
-   "timeout": "",
-   "source_line": 125,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "input": {
-    "name": "test",
-    "cmd": "cargo test --workspace",
-    "timeout_secs": 1800,
-    "wt": "$NODE.pre.worktree",
-    "agent": "$NODE.agent"
-   },
-   "child_flow": {
-    "flow_id": null,
-    "version": null,
-    "runtime": "python",
-    "input_type": {
-     "data_type": "object",
-     "name": null,
-     "label": null,
-     "desc": null,
-     "is_required": false,
-     "default_value": null,
-     "item_type": null,
-     "children": {}
+      "type": "agentrun",
+      "id": "_n9",
+      "agent": "$NODE.agent",
+      "prompt": "$F.concat(\"The cargo test check failed. Edit the source files to fix every failing test below, then re-run `cargo test --workspace` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.g3.out)",
+      "repo": "$NODE.pre.worktree",
+      "timeout_secs": 7200,
+      "next": "g3b",
+      "source_line": 286
     },
-    "output_type": null,
-    "nodes": [
-     {
-      "id": "start",
-      "name": null,
-      "desc": null,
-      "output": null,
+    {
+      "type": "child",
+      "id": "g3b",
+      "input": {
+        "name": "test",
+        "cmd": "cargo test --workspace",
+        "timeout_secs": 1800,
+        "wt": "$NODE.pre.worktree"
+      },
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "单发一道门（只包 GATE 本体，返回结果即走）。\n\n    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/\n    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，\n    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切\n    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。\n    ",
+            "next": "run",
+            "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
+            "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
+            "source_line": 78
+          },
+          {
+            "type": "gate",
+            "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.wt",
+            "timeout_secs": "$INPUT.timeout_secs",
+            "next": "_n1",
+            "source_line": 85
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "passed": "$NODE.run.passed",
+              "gate": "$INPUT.name",
+              "out": "$NODE.run.stdout",
+              "err": "$NODE.run.stderr"
+            },
+            "resultType": "success",
+            "name": "return {'passed': run.passe…",
+            "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
+            "source_line": 87
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
+      },
+      "next": "passed_eq_false_4",
+      "source_line": 293
+    },
+    {
+      "type": "if",
+      "id": "passed_eq_false_4",
+      "condition": {
+        "field": "$NODE.g3b.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "name": "g3b.passed == False?",
+      "desc": "if g3b.passed == False（第 295 行）",
+      "source_line": 295,
+      "next": "wgf3",
+      "else_next": "review_prompt"
+    },
+    {
+      "type": "writefile",
+      "id": "wgf3",
+      "path": "$F.concat($NODE.run_dir, \"/failure-gate-test.log\")",
+      "content": "$F.concat(\"cmd: cargo test --workspace\\n--- stdout ---\\n\", $NODE.g3b.out, \"\\n--- stderr ---\\n\", $NODE.g3b.err)",
       "next": "_n8",
-      "timeout": "",
-      "source_line": null,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      }
-     },
-     {
+      "source_line": 296
+    },
+    {
+      "type": "end",
       "id": "_n8",
-      "name": null,
-      "desc": null,
-      "output": "跑一道门（GATE 库节点）→ 红则 AGENTRUN 修一轮 → 复检定论（线性，无循环）。\n\n    INPUT: name / cmd / timeout_secs / wt / agent\n    输出: {passed, gate, out?}\n\n    2026-09-30 弃用 WHILE 版：#70/#53/#67 三单实证「exhausted」假象——LLM 修复\n    实际已把现场救到可过（保全现场手动 cargo fmt 通过），但 WHILE+return-continue\n    的轮次控制流没有把「已修好」送出门禁就打满 max_iterations。线性两步语义\n    确定性与 while 无关：首检→修→复检，复检即终局。失败时门禁 stdout 落盘\n    failure-gate-<name>.log 供值守取证（此前 stdout 只活在 fix_prompt 里）。\n    ",
-      "next": "run",
-      "timeout": "",
-      "source_line": 3,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "output": {
+        "verdict": "failed-preserved",
+        "stage": "gates",
+        "gate": "$NODE.g3b.gate",
+        "out": "$NODE.g3b.out"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "run",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n1",
-      "timeout": "",
-      "source_line": 14,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "command": "$INPUT.cmd",
-      "gate_name": "$INPUT.name",
-      "cwd": "$INPUT.wt",
-      "timeout_secs": "$INPUT.timeout_secs",
-      "max_retries": 0,
-      "dry_run": false
-     },
-     {
-      "id": "_n1",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n7",
-      "timeout": "",
-      "source_line": 16,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": {
-       "data_type": "string",
-       "name": "branch_name",
-       "label": null,
-       "desc": null,
-       "is_required": false,
-       "default_value": null,
-       "item_type": null,
-       "children": []
-      },
-      "branches": [
-       {
-        "name": "_n7",
-        "condition": {
-         "field": "$NODE.run.passed",
-         "operator": "eq",
-         "value": true
-        },
-        "priority": 0,
-        "label": "true",
-        "desc": "true",
-        "next": "_n7",
-        "is_default": false
-       },
-       {
-        "name": "fix_prompt",
-        "condition": null,
-        "priority": 0,
-        "label": "false",
-        "desc": "false",
-        "next": "fix_prompt",
-        "is_default": true
-       }
-      ],
-      "else_next": "fix_prompt",
-      "condition": {
-       "field": "$NODE.run.passed",
-       "operator": "eq",
-       "value": true
-      }
-     },
-     {
-      "id": "fix_prompt",
-      "name": null,
-      "desc": null,
-      "output": "$F.concat(\"The \\\"\", $INPUT.name, \"\\\" check failed. \", \"Edit the source files to fix every error below, then re-run `\", $INPUT.cmd, \"` yourself to verify before stopping.\", \"\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.run.stdout)",
-      "next": "_n6",
-      "timeout": "",
-      "source_line": 18,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": null,
-      "upstream_output": []
-     },
-     {
-      "id": "_n6",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "run2",
-      "timeout": "",
-      "source_line": 24,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "agent": "$INPUT.agent",
-      "prompt": "$NODE.fix_prompt",
-      "repo": "$INPUT.wt",
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
+      "source_line": 299
+    },
+    {
+      "type": "agentrun",
+      "id": "_n11",
+      "agent": "$NODE.agent",
+      "prompt": "$F.concat(\"The clippy check failed. Edit the source files to fix every error below, then re-run `cargo clippy --workspace --all-targets --all-features -- -D warnings` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.g2.out)",
+      "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
-      "details": false,
-      "dry_run": false
-     },
-     {
-      "id": "run2",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n2",
-      "timeout": "",
-      "source_line": 26,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "next": "g2b",
+      "source_line": 267
+    },
+    {
+      "type": "child",
+      "id": "g2b",
+      "input": {
+        "name": "clippy",
+        "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "timeout_secs": 1200,
+        "wt": "$NODE.pre.worktree"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "单发一道门（只包 GATE 本体，返回结果即走）。\n\n    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/\n    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，\n    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切\n    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。\n    ",
+            "next": "run",
+            "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
+            "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
+            "source_line": 78
+          },
+          {
+            "type": "gate",
+            "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.wt",
+            "timeout_secs": "$INPUT.timeout_secs",
+            "next": "_n1",
+            "source_line": 85
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "passed": "$NODE.run.passed",
+              "gate": "$INPUT.name",
+              "out": "$NODE.run.stdout",
+              "err": "$NODE.run.stderr"
+            },
+            "resultType": "success",
+            "name": "return {'passed': run.passe…",
+            "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
+            "source_line": 87
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
       },
-      "command": "$INPUT.cmd",
-      "gate_name": "$INPUT.name",
-      "cwd": "$INPUT.wt",
-      "timeout_secs": "$INPUT.timeout_secs",
-      "max_retries": 0,
-      "dry_run": false
-     },
-     {
-      "id": "_n2",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n5",
-      "timeout": "",
-      "source_line": 28,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "output_type": {
-       "data_type": "string",
-       "name": "branch_name",
-       "label": null,
-       "desc": null,
-       "is_required": false,
-       "default_value": null,
-       "item_type": null,
-       "children": []
-      },
-      "branches": [
-       {
-        "name": "_n5",
-        "condition": {
-         "field": "$NODE.run2.passed",
-         "operator": "eq",
-         "value": true
-        },
-        "priority": 0,
-        "label": "true",
-        "desc": "true",
-        "next": "_n5",
-        "is_default": false
-       },
-       {
-        "name": "_n4",
-        "condition": null,
-        "priority": 0,
-        "label": "false",
-        "desc": "false",
-        "next": "_n4",
-        "is_default": true
-       }
-      ],
-      "else_next": "_n4",
+      "next": "passed_eq_false_5",
+      "source_line": 274
+    },
+    {
+      "type": "if",
+      "id": "passed_eq_false_5",
       "condition": {
-       "field": "$NODE.run2.passed",
-       "operator": "eq",
-       "value": true
-      }
-     },
-     {
-      "id": "_n4",
-      "name": null,
-      "desc": null,
-      "output": null,
-      "next": "_n3",
-      "timeout": "",
-      "source_line": 30,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+        "field": "$NODE.g2b.passed",
+        "operator": "eq",
+        "value": false
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "path": "$F.concat($INPUT.wt, \"/../failure-gate-\", $INPUT.name, \".log\")",
-      "content": "$F.concat(\"cmd: \", $INPUT.cmd, \"\\n--- stdout ---\\n\", $NODE.run2.stdout, \"\\n--- stderr ---\\n\", $NODE.run2.stderr)",
-      "json": false,
-      "indent": 2,
-      "workspace_root": null
-     },
-     {
-      "id": "_n3",
-      "name": null,
-      "desc": null,
+      "name": "g2b.passed == False?",
+      "desc": "if g2b.passed == False（第 277 行）",
+      "source_line": 277,
+      "next": "wgf2",
+      "else_next": "g3"
+    },
+    {
+      "type": "writefile",
+      "id": "wgf2",
+      "path": "$F.concat($NODE.run_dir, \"/failure-gate-clippy.log\")",
+      "content": "$F.concat(\"cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\\n--- stdout ---\\n\", $NODE.g2b.out, \"\\n--- stderr ---\\n\", $NODE.g2b.err)",
+      "next": "_n10",
+      "source_line": 278
+    },
+    {
+      "type": "end",
+      "id": "_n10",
       "output": {
-       "passed": false,
-       "gate": "$INPUT.name",
-       "out": "$NODE.run2.stdout"
+        "verdict": "failed-preserved",
+        "stage": "gates",
+        "gate": "$NODE.g2b.gate",
+        "out": "$NODE.g2b.out"
       },
-      "next": null,
-      "timeout": "",
-      "source_line": 33,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
+      "source_line": 281
+    },
+    {
+      "type": "agentrun",
+      "id": "_n14",
+      "agent": "$NODE.agent",
+      "prompt": "$F.concat(\"The fmt check failed. Edit the source files to fix every error below, then re-run `cargo fmt --all` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.g1.out)",
+      "repo": "$NODE.pre.worktree",
+      "timeout_secs": 7200,
+      "next": "g1b",
+      "source_line": 249
+    },
+    {
+      "type": "child",
+      "id": "g1b",
+      "input": {
+        "name": "fmt",
+        "cmd": "cargo fmt --all",
+        "timeout_secs": 120,
+        "wt": "$NODE.pre.worktree"
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
+      "childFlow": {
+        "runtime": "python",
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "_n2"
+          },
+          {
+            "type": "assignment",
+            "id": "_n2",
+            "output": "单发一道门（只包 GATE 本体，返回结果即走）。\n\n    ⚠️ childflow 表达式上下文没有 F（可用根仅 INPUT/NODE/GLOBAL/PARENT/ENV/\n    FLOW_ID——59/69 实证：fix_prompt 的 F.concat 一进修复路径即 KeyError，\n    fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切\n    需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。\n    ",
+            "next": "run",
+            "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
+            "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
+            "source_line": 78
+          },
+          {
+            "type": "gate",
+            "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.wt",
+            "timeout_secs": "$INPUT.timeout_secs",
+            "next": "_n1",
+            "source_line": 85
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "passed": "$NODE.run.passed",
+              "gate": "$INPUT.name",
+              "out": "$NODE.run.stdout",
+              "err": "$NODE.run.stderr"
+            },
+            "resultType": "success",
+            "name": "return {'passed': run.passe…",
+            "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
+            "source_line": 87
+          }
+        ],
+        "inputType": {
+          "dataType": "object"
+        }
       },
-      "result_type": "success",
-      "error": null
-     },
-     {
-      "id": "_n5",
-      "name": null,
-      "desc": null,
+      "next": "_n12",
+      "source_line": 255
+    },
+    {
+      "type": "if",
+      "id": "_n12",
+      "condition": {
+        "field": "$NODE.g1b.passed",
+        "operator": "eq",
+        "value": false
+      },
+      "name": "g1b.passed == False?",
+      "desc": "if g1b.passed == False（第 257 行）",
+      "source_line": 257,
+      "next": "wgf1",
+      "else_next": "g2"
+    },
+    {
+      "type": "writefile",
+      "id": "wgf1",
+      "path": "$F.concat($NODE.run_dir, \"/failure-gate-fmt.log\")",
+      "content": "$F.concat(\"cmd: cargo fmt --all\\n--- stdout ---\\n\", $NODE.g1b.out, \"\\n--- stderr ---\\n\", $NODE.g1b.err)",
+      "next": "_n13",
+      "source_line": 258
+    },
+    {
+      "type": "end",
+      "id": "_n13",
       "output": {
-       "passed": true,
-       "gate": "$INPUT.name"
+        "verdict": "failed-preserved",
+        "stage": "gates",
+        "gate": "$NODE.g1b.gate",
+        "out": "$NODE.g1b.out"
       },
-      "next": null,
-      "timeout": "",
-      "source_line": 29,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
-      },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
-      },
-      "result_type": "success",
-      "error": null
-     },
-     {
-      "id": "_n7",
-      "name": null,
-      "desc": null,
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
+      "source_line": 261
+    },
+    {
+      "type": "end",
+      "id": "_n15",
       "output": {
-       "passed": true,
-       "gate": "$INPUT.name"
+        "verdict": "skip-commit",
+        "stage": "commit",
+        "why": "agent made no changes",
+        "impl_text": "$NODE.impl.text"
       },
-      "next": null,
-      "timeout": "",
-      "source_line": 17,
-      "timeout_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null
+      "resultType": "success",
+      "name": "return {'verdict': 'skip-co…",
+      "desc": "return {'verdict': 'skip-commit', 'stage': 'commit', 'why':…",
+      "source_line": 228
+    },
+    {
+      "type": "if",
+      "id": "contains_str_why_or_disk",
+      "condition": {
+        "field": "$F.contains($F.concat($F.or($NODE.pre.why, \"\")), \"disk\")",
+        "operator": "truthy",
+        "value": true
       },
-      "error_handler": {
-       "strategy": "abort",
-       "defaultValue": null,
-       "code": -9527,
-       "message": null,
-       "retryTimes": 0
+      "name": "F.contains(str(pre.why or '…",
+      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 214 行）",
+      "source_line": 214,
+      "next": "_n17",
+      "else_next": "wf"
+    },
+    {
+      "type": "writefile",
+      "id": "wf",
+      "path": "$F.concat($NODE.run_dir, \"/failure-context.md\")",
+      "content": "$F.concat(\"## preflight failed\\n\\nreason: \", $NODE.pre.why)",
+      "next": "_n16",
+      "source_line": 216
+    },
+    {
+      "type": "end",
+      "id": "_n16",
+      "output": {
+        "verdict": "failed-preserved",
+        "stage": "preflight",
+        "why": "$NODE.pre.why"
       },
-      "result_type": "success",
-      "error": null
-     }
-    ],
-    "author": "",
-    "desc": "",
-    "metadata": {},
-    "timeout": "",
-    "global_context": {},
-    "exposeEnv": []
-   }
-  },
-  {
-   "id": "_n5",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n19",
-   "timeout": "",
-   "source_line": 128,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n19",
-     "condition": {
-      "field": "$NODE.g3.passed",
-      "operator": "eq",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n19",
-     "is_default": false
+      "resultType": "success",
+      "name": "return {'verdict': 'failed-…",
+      "desc": "return {'verdict': 'failed-preserved', 'stage': 'preflight'…",
+      "source_line": 218
     },
     {
-     "name": "review_prompt",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "review_prompt",
-     "is_default": true
+      "type": "end",
+      "id": "_n17",
+      "output": {
+        "verdict": "retry-later",
+        "stage": "preflight",
+        "why": "$NODE.pre.why"
+      },
+      "resultType": "success",
+      "name": "return {'verdict': 'retry-l…",
+      "desc": "return {'verdict': 'retry-later', 'stage': 'preflight', 'wh…",
+      "source_line": 215
     }
-   ],
-   "else_next": "review_prompt",
-   "condition": {
-    "field": "$NODE.g3.passed",
-    "operator": "eq",
-    "value": false
-   }
-  },
-  {
-   "id": "review_prompt",
-   "name": null,
-   "desc": null,
-   "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff HEAD` to see the full change, and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
-   "next": "rev1",
-   "timeout": "",
-   "source_line": 138,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "rev1",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n6",
-   "timeout": "",
-   "source_line": 146,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "agent": "$NODE.reviewer",
-   "prompt": "$NODE.review_prompt",
-   "repo": "$NODE.pre.worktree",
-   "timeout_secs": 3600,
-   "details": false,
-   "dry_run": false
-  },
-  {
-   "id": "_n6",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n14",
-   "timeout": "",
-   "source_line": 148,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n14",
-     "condition": {
-      "field": "$F.contains($NODE.rev1.text, \"VERDICT:PASS\")",
-      "operator": "ne",
-      "value": true
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n14",
-     "is_default": false
-    },
-    {
-     "name": "pub",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "pub",
-     "is_default": true
-    }
-   ],
-   "else_next": "pub",
-   "condition": {
-    "field": "$F.contains($NODE.rev1.text, \"VERDICT:PASS\")",
-    "operator": "ne",
-    "value": true
-   }
-  },
-  {
-   "id": "pub",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n7",
-   "timeout": "",
-   "source_line": 168,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "worktree_dir": "$NODE.pre.worktree",
-   "branch_name": "$NODE.pre.branch",
-   "commit_message": "$F.concat(\"self-improve: \", $NODE.goal)",
-   "plan_file": null,
-   "issue_number": null,
-   "merge_mode": "main",
-   "main_clone": "$NODE.repo",
-   "base_branch": "main",
-   "dry_run": false,
-   "timeout_secs": 300
-  },
-  {
-   "id": "_n7",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n13",
-   "timeout": "",
-   "source_line": 171,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n13",
-     "condition": {
-      "field": "$NODE.pub.merged",
-      "operator": "eq",
-      "value": true
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n13",
-     "is_default": false
-    },
-    {
-     "name": "land_rebase",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "land_rebase",
-     "is_default": true
-    }
-   ],
-   "else_next": "land_rebase",
-   "condition": {
-    "field": "$NODE.pub.merged",
-    "operator": "eq",
-    "value": true
-   }
-  },
-  {
-   "id": "land_rebase",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n8",
-   "timeout": "",
-   "source_line": 179,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "language": "python",
-   "code": "import subprocess\n\ndef run(input):\n    def git(*a):\n        return subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n                              capture_output=True, text=True)\n    git(\"fetch\", \"origin\")\n    r = git(\"rebase\", \"origin/main\")\n    if r.returncode != 0:\n        git(\"rebase\", \"--abort\")\n        return {\"ok\": False,\n                \"why\": ((r.stderr or \"\") + (r.stdout or \"\"))[-400:]}\n    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n    return {\"ok\": True}\n",
-   "input": {
-    "wt": "$NODE.pre.worktree",
-    "branch": "$NODE.pre.branch"
-   },
-   "sandbox_backend": "subprocess"
-  },
-  {
-   "id": "_n8",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "wfp2",
-   "timeout": "",
-   "source_line": 195,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "wfp2",
-     "condition": {
-      "field": "$NODE.land_rebase.ok",
-      "operator": "eq",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "wfp2",
-     "is_default": false
-    },
-    {
-     "name": "pub2",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "pub2",
-     "is_default": true
-    }
-   ],
-   "else_next": "pub2",
-   "condition": {
-    "field": "$NODE.land_rebase.ok",
-    "operator": "eq",
-    "value": false
-   }
-  },
-  {
-   "id": "pub2",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n9",
-   "timeout": "",
-   "source_line": 200,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "worktree_dir": "$NODE.pre.worktree",
-   "branch_name": "$NODE.pre.branch",
-   "commit_message": "$F.concat(\"self-improve: \", $NODE.goal)",
-   "plan_file": null,
-   "issue_number": null,
-   "merge_mode": "main",
-   "main_clone": "$NODE.repo",
-   "base_branch": "main",
-   "dry_run": false,
-   "timeout_secs": 300
-  },
-  {
-   "id": "_n9",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n11",
-   "timeout": "",
-   "source_line": 203,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n11",
-     "condition": {
-      "field": "$NODE.pub2.merged",
-      "operator": "eq",
-      "value": true
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n11",
-     "is_default": false
-    },
-    {
-     "name": "wfp3",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "wfp3",
-     "is_default": true
-    }
-   ],
-   "else_next": "wfp3",
-   "condition": {
-    "field": "$NODE.pub2.merged",
-    "operator": "eq",
-    "value": true
-   }
-  },
-  {
-   "id": "wfp3",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n10",
-   "timeout": "",
-   "source_line": 206,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
-   "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
-   "json": false,
-   "indent": 2,
-   "workspace_root": null
-  },
-  {
-   "id": "_n10",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "land",
-    "why": "$NODE.pub2.note",
-    "preserved": true
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 209,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n11",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "committed",
-    "via": "git-publish-retry",
-    "note": "$NODE.pub2.note"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 204,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "wfp2",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n12",
-   "timeout": "",
-   "source_line": 196,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
-   "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)",
-   "json": false,
-   "indent": 2,
-   "workspace_root": null
-  },
-  {
-   "id": "_n12",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "land",
-    "why": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 198,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n13",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "committed",
-    "via": "git-publish",
-    "note": "$NODE.pub.note"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 172,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n14",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "wfr",
-   "timeout": "",
-   "source_line": 149,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "wfr",
-     "condition": {
-      "field": "$F.contains($NODE.rev1.text, \"VERDICT:NEEDS_FIX\")",
-      "operator": "ne",
-      "value": true
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "wfr",
-     "is_default": false
-    },
-    {
-     "name": "fix_prompt",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "fix_prompt",
-     "is_default": true
-    }
-   ],
-   "else_next": "fix_prompt",
-   "condition": {
-    "field": "$F.contains($NODE.rev1.text, \"VERDICT:NEEDS_FIX\")",
-    "operator": "ne",
-    "value": true
-   }
-  },
-  {
-   "id": "fix_prompt",
-   "name": null,
-   "desc": null,
-   "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
-   "next": "_n17",
-   "timeout": "",
-   "source_line": 154,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": null,
-   "upstream_output": []
-  },
-  {
-   "id": "_n17",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "rev2",
-   "timeout": "",
-   "source_line": 158,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "agent": "$NODE.agent",
-   "prompt": "$NODE.fix_prompt",
-   "repo": "$NODE.pre.worktree",
-   "timeout_secs": 7200,
-   "details": false,
-   "dry_run": false
-  },
-  {
-   "id": "rev2",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n15",
-   "timeout": "",
-   "source_line": 159,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "agent": "$NODE.reviewer",
-   "prompt": "$NODE.review_prompt",
-   "repo": "$NODE.pre.worktree",
-   "timeout_secs": 3600,
-   "details": false,
-   "dry_run": false
-  },
-  {
-   "id": "_n15",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "wfr2",
-   "timeout": "",
-   "source_line": 161,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "wfr2",
-     "condition": {
-      "field": "$F.contains($NODE.rev2.text, \"VERDICT:PASS\")",
-      "operator": "ne",
-      "value": true
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "wfr2",
-     "is_default": false
-    },
-    {
-     "name": "pub",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "pub",
-     "is_default": true
-    }
-   ],
-   "else_next": "pub",
-   "condition": {
-    "field": "$F.contains($NODE.rev2.text, \"VERDICT:PASS\")",
-    "operator": "ne",
-    "value": true
-   }
-  },
-  {
-   "id": "wfr2",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n16",
-   "timeout": "",
-   "source_line": 162,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
-   "content": "$NODE.rev2.text",
-   "json": false,
-   "indent": 2,
-   "workspace_root": null
-  },
-  {
-   "id": "_n16",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "review",
-    "why": "review did not pass after one fix round"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 164,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "wfr",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n18",
-   "timeout": "",
-   "source_line": 150,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
-   "content": "$NODE.rev1.text",
-   "json": false,
-   "indent": 2,
-   "workspace_root": null
-  },
-  {
-   "id": "_n18",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "review",
-    "why": "reviewer UNAVAILABLE (no VERDICT line)"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 152,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n19",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "gates",
-    "gate": "$NODE.g3.gate",
-    "out": "$NODE.g3.out"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 129,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n20",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "gates",
-    "gate": "$NODE.g2.gate",
-    "out": "$NODE.g2.out"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 123,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n21",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "gates",
-    "gate": "$NODE.g1.gate",
-    "out": "$NODE.g1.out"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 116,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n22",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "skip-commit",
-    "stage": "commit",
-    "why": "agent made no changes",
-    "impl_text": "$NODE.impl.text"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 103,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n23",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n25",
-   "timeout": "",
-   "source_line": 93,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "output_type": {
-    "data_type": "string",
-    "name": "branch_name",
-    "label": null,
-    "desc": null,
-    "is_required": false,
-    "default_value": null,
-    "item_type": null,
-    "children": []
-   },
-   "branches": [
-    {
-     "name": "_n25",
-     "condition": {
-      "field": "$F.contains($F.concat($F.or($NODE.pre.why, \"\")), \"disk\")",
-      "operator": "ne",
-      "value": false
-     },
-     "priority": 0,
-     "label": "true",
-     "desc": "true",
-     "next": "_n25",
-     "is_default": false
-    },
-    {
-     "name": "wf",
-     "condition": null,
-     "priority": 0,
-     "label": "false",
-     "desc": "false",
-     "next": "wf",
-     "is_default": true
-    }
-   ],
-   "else_next": "wf",
-   "condition": {
-    "field": "$F.contains($F.concat($F.or($NODE.pre.why, \"\")), \"disk\")",
-    "operator": "ne",
-    "value": false
-   }
-  },
-  {
-   "id": "wf",
-   "name": null,
-   "desc": null,
-   "output": null,
-   "next": "_n24",
-   "timeout": "",
-   "source_line": 95,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "path": "$F.concat($NODE.run_dir, \"/failure-context.md\")",
-   "content": "$F.concat(\"## preflight failed\\n\\nreason: \", $NODE.pre.why)",
-   "json": false,
-   "indent": 2,
-   "workspace_root": null
-  },
-  {
-   "id": "_n24",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "failed-preserved",
-    "stage": "preflight",
-    "why": "$NODE.pre.why"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 97,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  },
-  {
-   "id": "_n25",
-   "name": null,
-   "desc": null,
-   "output": {
-    "verdict": "retry-later",
-    "stage": "preflight",
-    "why": "$NODE.pre.why"
-   },
-   "next": null,
-   "timeout": "",
-   "source_line": 94,
-   "timeout_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null
-   },
-   "error_handler": {
-    "strategy": "abort",
-    "defaultValue": null,
-    "code": -9527,
-    "message": null,
-    "retryTimes": 0
-   },
-   "result_type": "success",
-   "error": null
-  }
- ],
- "author": "",
- "desc": "Self-improve v2：库节点为主，code 只做 preflight/has_changes",
- "metadata": {},
- "timeout": "",
- "global_context": {},
- "exposeEnv": []
+  ]
 }
