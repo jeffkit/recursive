@@ -431,9 +431,20 @@ validate_flow_ir(
 )
 
 
+# CHILD 节点 id → @childflow 源函数名（compile_v2 算子流程行号偏移用）。
+CHILDFLOW_BY_NODE = {
+    "chg": "has_changes",
+    "g1": "gate_once", "g2": "gate_once", "g3": "gate_once",
+    "g1b": "gate_once", "g2b": "gate_once", "g3b": "gate_once",
+}
+
+
 if __name__ == "__main__":
-    fl = self_improve_v2
-    out = Path(__file__).with_name("self-improve-v2.plaita.json")
-    out.write_text(json.dumps(fl.model_dump(by_alias=True, mode="json"),
-                              ensure_ascii=False, indent=1))
-    print(f"compiled -> {out}")
+    # 正典序列化走 compile_v2（console 发布 definition 形态，byte-stable）——
+    # 直接 model_dump(by_alias=True) 的 snake_case 全量展开已被 #84 拍板废弃，
+    # 别再让产物在两种格式间翻面。
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, str(Path(__file__).with_name("compile_v2.py"))])
+    raise SystemExit(r.returncode)

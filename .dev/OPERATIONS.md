@@ -456,11 +456,32 @@ Operational notes:
   returns). `console_zombie_secs` eventually reaps the orphan; the durable
   fix (anchor-first + client-supplied execution_id) is deferred to the G5/G6
   protocol owners.
-- **Compiled-artifact caveat**: `self-improve-v2.plaita.json` regenerated via
-  the in-repo script (`python3 self_improve_flow_v2.py`) now serializes
-  `input_type`/`output_type`/`global_context` in snake_case — the committed
-  artifact (console 1.0.0 chore, e03e0f5e) is camelCase, i.e. produced by a
-  different (console-publish) serializer. The two load interchangeably
-  (parse validator normalizes legacy camel keys), but pick ONE canonical
-  producer before the next artifact sync, or every sync is a 3000-line
-  format flip. Pending on the G-series console-publish owners.
+- **Compiled artifact (canonical producer, #84 decision 2026-10-03)**:
+  `.dev/flows/compile_v2.py` is THE producer of
+  `self-improve-v2.plaita.json`. It serializes the compiled IR in the
+  console-publish definition shape (`type` first key, nulls dropped,
+  bookkeeping defaults stripped, `inputType`/`resultType`/`childFlow` alias
+  keys, `source_line` as absolute source-file line numbers) — the same shape
+  the published console version carries, so artifact diffs are semantic
+  only. Never hand-edit the JSON and never regenerate it with a bare
+  `Flow.model_dump()` (snake_case full expansion) — that flips every sync
+  back into a 3000-line format diff.
+
+  - Rebuild after editing `self_improve_flow_v2.py`:
+    `python3 .dev/flows/self_improve_flow_v2.py` (forwards to `compile_v2.py`).
+  - Byte-stable check (no writes): `python3 .dev/flows/compile_v2.py --check`
+    — exits non-zero with a diff if the committed artifact lags the source.
+    CI/lint-style habit: run it before dispatching pipeline work.
+  - Byte-stability guarantee: two consecutive rebuilds produce identical
+    bytes (no timestamps, fixed key order, node order = compile order).
+    A rebuild that changes bytes without a source change means the console
+    serializer rules drifted — stop and reconcile before syncing.
+  - Console publishing (G-series): the runtime truth for `engine=v2-console`
+    dispatch is the definition published on the console (kept immutable per
+    version). After landing source changes, publish a new console version
+    whose definition equals the in-repo artifact byte-for-byte
+    (`compile_v2.py` output pasted/imported into the console version) —
+    don't re-serialize from the canvas editor, which would re-flip the
+    format. Until that publish happens, console-dispatched runs keep
+    executing the previous definition (artifact lag is then real; check
+    with `--check` before blaming the flow).
