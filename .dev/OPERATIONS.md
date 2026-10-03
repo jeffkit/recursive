@@ -456,3 +456,11 @@ Operational notes:
   returns). `console_zombie_secs` eventually reaps the orphan; the durable
   fix (anchor-first + client-supplied execution_id) is deferred to the G5/G6
   protocol owners.
+- **Compiled-artifact caveat**: `self-improve-v2.plaita.json` regenerated via
+  the in-repo script (`python3 self_improve_flow_v2.py`) now serializes
+  `input_type`/`output_type`/`global_context` in snake_case — the committed
+  artifact (console 1.0.0 chore, e03e0f5e) is camelCase, i.e. produced by a
+  different (console-publish) serializer. The two load interchangeably
+  (parse validator normalizes legacy camel keys), but pick ONE canonical
+  producer before the next artifact sync, or every sync is a 3000-line
+  format flip. Pending on the G-series console-publish owners.
