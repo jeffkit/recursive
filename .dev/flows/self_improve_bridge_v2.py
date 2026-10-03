@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 REPO_DEFAULT = "/Users/kong/projects/infra4agent/recursive"
@@ -30,6 +31,15 @@ FLOWS_DIR = Path(__file__).resolve().parent
 
 # code 沙箱 env 白名单外按前缀放行（v1 同款）
 ENV_PREFIXES = ("DEEPSEEK_", "GLM_", "MINIMAX_", "RECURSIVE_", "LANGFUSE_")
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """tmp+rename 原子替换（checkpoint 同款，D6）：崩溃瞬间目录里要么旧全文
+    要么新全文，永不截断 JSON。tmp 掺 pid+uuid——同 pid 多线程写同一文件时
+    rename 不再互吞对方 tmp 抛 FileNotFoundError。"""
+    tmp = path.with_suffix(f".tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1))
+    tmp.replace(path)
 
 
 def setup_env_injection() -> None:
@@ -51,14 +61,23 @@ class StepTracker:
         self._starts: dict[str, float] = {}
 
     def _merge(self, mutate) -> None:
+        # #108：state.json 是 supervisor/keeper 值守判读的契约文件，裸
+        # write_text 在崩溃瞬间会留下截断 JSON 直接打炸下游 json.loads——
+        # 换 checkpoint 同款 tmp+rename 原子替换（读旧/写新二选一，永不半截）；
+        # 失败至少留一行 stderr，静默吞异常会让状态停在旧值误导值守。
         try:
-            st = json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
+            try:
+                st = json.loads(self.state_path.read_text()) \
+                    if self.state_path.exists() else {}
+            except ValueError:                       # 含 UnicodeDecodeError 子类
+                st = {}     # 半截残留（旧版崩溃遗留/外力破坏）→ 丢弃重建，本次写自愈
             mutate(st)
             st["status"] = st.get("status", "running")
             st["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            self.state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))
-        except Exception:
-            pass
+            _atomic_write_json(self.state_path, st)
+        except Exception as e:
+            print(f"[state-tracker] state.json merge failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
     def on_node_start(self, flow, node, **kwargs) -> None:
         self._starts[node.id] = time.time()
@@ -154,12 +173,12 @@ def main() -> int:
     if args.dry_run:
         fl.global_context["dry_run"] = True
 
-    state_path.write_text(json.dumps({
+    _atomic_write_json(state_path, {
         "status": "running", "currentStep": "start", "verdict": None,
         "run_id": args.run_id, "repo": args.repo,
         "dry_run": bool(args.dry_run),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }, ensure_ascii=False, indent=1))
+    })
 
     from plaita.core.callback import FlowCallback
     from plaita.core.executor import FlowExecution
@@ -278,7 +297,7 @@ def main() -> int:
             (run_dir / "reply-error.log").write_text(f"{type(e).__name__}: {e}\n")
     st["verdict"] = verdict
     st["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    state_path.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+    _atomic_write_json(state_path, st)
     # 终态统一回收（2026-10-01，替代仅成功终态回收版）：所有终态先做 WIP 快照
     # （未提交改动 commit 到本地分支 wip-<run目录名>，提交对象进主仓共享库、
     # 分支引用保可达），再删 worktree。每 run 的 worktree+冷 target 可达 8-12G，

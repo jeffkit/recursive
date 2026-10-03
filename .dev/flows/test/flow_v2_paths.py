@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -766,6 +768,69 @@ def s27_v3_dryrun冒烟_真bridge无桩全图():
     assert st["status"] == "completed" and st.get("dry_run") is True, st
 
 
+def s28_state_json原子写_永不截断():
+    """#108：state.json 是值守契约文件，裸 write_text 在崩溃瞬间留截断 JSON
+    打炸下游 json.loads——所有写路径必须走 tmp+rename 原子替换；写失败必须
+    至少 log 一行（静默吞异常=状态停旧值误导值守）。"""
+    import self_improve_bridge_v2 as bridge
+    tmp = Path(tempfile.mkdtemp(prefix="flowv2t-state28-"))
+    # 1) 原子写基本契约：落盘即合法 JSON + 无 tmp 残留
+    sp = tmp / "run" / "state.json"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    t = bridge.StepTracker(sp)
+    t._merge(lambda st: st.update(currentStep="pre"))
+    st = json.loads(sp.read_text())                      # 截断则此处即炸
+    assert st["currentStep"] == "pre" and st["status"] == "running", st
+    assert list(tmp.glob("state.json.tmp-*")) == [], "tmp 残留（rename 未发生）"
+    # 2) 读改写保字段：已有字段不丢（终态写依赖 verdict/started_at 存续）
+    t._merge(lambda st: st.update(node_retries={"impl": {"count": 1}}))
+    st = json.loads(sp.read_text())
+    assert st["currentStep"] == "pre" and st["node_retries"]["impl"]["count"] == 1, st
+    # 3) 崩溃注入形态：目录里留半个截断文件（SIGKILL 落在 write 中间的产物），
+    #    下一次 merge 必须原样覆盖为新全文——不得解析半截 JSON 也不得抛
+    sp.write_text('{"status": "runn')
+    t._merge(lambda st: st.update(currentStep="impl"))
+    st = json.loads(sp.read_text())
+    assert st["currentStep"] == "impl" and st["status"] == "running", st
+    assert list(tmp.glob("state.json.tmp-*")) == [], "tmp 残留（rename 未发生）"
+    # 4) 静默吞异常禁令：写失败至少留一行 stderr（值守排查线索）
+    sp2 = tmp / "run2" / "state.json"                    # 父目录不存在 → 写必炸
+    t2 = bridge.StepTracker(sp2)
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        t2._merge(lambda st: st.update(currentStep="impl"))
+    assert "state.json merge failed" in buf.getvalue(), \
+        f"写失败应 log 到 stderr: {buf.getvalue()!r}"
+    # 4b) 并发互斥：tmp 名掺 uuid——同 pid 多线程同文件并发 merge 也不互吞
+    # 对方 tmp（评审反馈 #2 实测 pid 独串版两线程丢约半数 merge）
+    import threading
+    sp3 = tmp / "run3" / "state.json"
+    sp3.parent.mkdir(parents=True, exist_ok=True)
+    t3 = bridge.StepTracker(sp3)
+    errs: list[str] = []
+    def _hammer(n):
+        for i in range(200):
+            try:
+                t3._merge(lambda st, n=n, i=i: st.update({f"k{n}-{i}": True}))
+            except Exception as e:
+                errs.append(f"{type(e).__name__}: {e}")
+    ths = [threading.Thread(target=_hammer, args=(n,)) for n in range(4)]
+    for th in ths: th.start()
+    for th in ths: th.join()
+    st = json.loads(sp3.read_text())
+    assert not errs, f"并发 merge 不应失败: {errs[:3]}"
+    assert sum(1 for k in st if k.startswith("k")) >= 100, \
+        f"并发 merge 丢失过多（tmp 互吞?）: keys={sum(1 for k in st if k.startswith('k'))}"
+    assert list(tmp.glob("state.json.tmp-*")) == [], "tmp 残留（rename 未发生）"
+    # 5) 生产源码禁令：state.json 契约的写入点不得再有裸 write_text
+    src = (FLOWS_DIR / "self_improve_bridge_v2.py").read_text()
+    for m in re.finditer(r"^\s*(.*)write_text\(", src, re.M):
+        line = m.group(1)
+        assert "state_path" not in line, f"state.json 不得裸 write_text: {line.strip()}"
+    # 6) main() 终态原子写可见：契约函数被生产路径引用
+    assert "_atomic_write_json(state_path" in src, "main() 初写/终态应走原子写"
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
@@ -781,7 +846,8 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s24_v3_回收豁免判定_checkpoint活性决策表,
              s25_v3_正常终态_宿主补发on_flow_end恰一次,
              s26_v3_异常终态_on_flow_end恰为引擎版_宿主不重复,
-             s27_v3_dryrun冒烟_真bridge无桩全图]
+             s27_v3_dryrun冒烟_真bridge无桩全图,
+             s28_state_json原子写_永不截断]
 
 if __name__ == "__main__":
     _patch()
