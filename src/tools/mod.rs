@@ -13,7 +13,6 @@ pub mod checkpoint;
 pub mod client_fs;
 #[cfg(feature = "cloud-runtime")]
 pub mod container_provider;
-pub mod count_lines;
 #[cfg(feature = "cloud-runtime")]
 pub use container_provider::ContainerToolSetProvider;
 #[cfg(feature = "cloud-runtime")]
@@ -29,22 +28,17 @@ pub mod e2b_provider;
 pub use e2b_provider::E2bToolSetProvider;
 pub mod edit;
 pub mod elicitation;
-pub mod episodic_recall;
-pub mod estimate_tokens;
-pub mod facts;
 pub mod fs;
 pub mod glob;
 pub mod http_call;
 #[cfg(feature = "skill-hub")]
 pub mod install_skill;
 pub mod load_skill;
-pub mod memory;
 pub mod permission_pipeline;
 pub mod plan_mode;
 pub mod policy;
 pub mod policy_sandbox;
 pub mod registry;
-pub mod search;
 pub mod send_message;
 pub mod shell;
 pub mod todo;
@@ -83,6 +77,20 @@ pub use crate::tasks::team_create;
 #[cfg(feature = "coordinator-mode")]
 pub use crate::tasks::team_delete;
 pub use crate::tasks::watch_file;
+
+// ── Re-exports from the knowledge/retrieval domain (src/knowledge/, issue #80)
+//
+// The facts/memory/episodic-recall tools plus the read-only inspection
+// helpers (`estimate_tokens`, `count_lines`, `search`) moved to
+// `src/knowledge/` — keep the module paths (`crate::tools::facts`, …)
+// resolving for external callers. Pure re-exports, no behavior.
+
+pub use crate::knowledge::count_lines;
+pub use crate::knowledge::episodic_recall;
+pub use crate::knowledge::estimate_tokens;
+pub use crate::knowledge::facts;
+pub use crate::knowledge::memory;
+pub use crate::knowledge::search;
 
 // ── Re-exports from registry ────────────────────────────────────────────────
 

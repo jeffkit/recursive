@@ -28,7 +28,7 @@ Anthropic-compatible translation path (e.g. Bedrock).
   (call site ~L800). MCP tools with third-party schemas are covered by this.
 - For tool authors: keep the top level of your schema to
   `type` / `properties` / `required` only; put combinators *inside* the
-  specific property. See `src/tools/estimate_tokens.rs` — its schema once
+  specific property. See `src/knowledge/estimate_tokens.rs` — its schema once
   violated this rule and was the direct cause of #15 (since fixed).
 
 **Regression tests.** `src/llm/anthropic.rs:1993-2057` (top-level combinators

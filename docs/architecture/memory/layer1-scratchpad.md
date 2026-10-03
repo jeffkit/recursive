@@ -34,7 +34,7 @@ Format:
 | `scratchpad_list` | — list all keys with truncated values |
 | `working_memory` | convenience wrapper (read/write combined) |
 
-All tools are in `src/tools/memory.rs`.
+All tools are in `src/knowledge/memory.rs`.
 
 ## Injection into System Prompt
 

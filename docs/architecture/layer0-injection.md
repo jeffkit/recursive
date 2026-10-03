@@ -62,7 +62,7 @@ channel-specific suffix, not part of the common assembly.
 | `project.md` | 8 KB | `MAX_MEMORY_FILE_SIZE` |
 | `AGENTS.md` | 16 KB | `MAX_PROJECT_CONTEXT_SIZE` |
 | `CLAUDE.md` | 16 KB | `MAX_PROJECT_CONTEXT_SIZE` |
-| Facts summary | token budget | `src/tools/facts.rs::facts_summary()` |
+| Facts summary | token budget | `src/knowledge/facts.rs::facts_summary()` |
 
 Files that exceed their cap are truncated with a `[…truncated]` marker.
 
@@ -78,8 +78,8 @@ Files that exceed their cap are truncated with a `[…truncated]` marker.
 | `register_subagent_if_enabled()` | `src/multi.rs` | Register the `Agent` tool when `config.subagent_enabled` (called by every channel) |
 | `default_system_prompt()` | `src/config.rs` | Hardcoded working principles |
 | `skill_index()` | `src/skills.rs` | One-line summary per available skill |
-| `facts_summary()` | `src/tools/facts.rs` | Recent facts as bullet list |
-| `episodic_recall_summary()` | `src/tools/episodic_recall.rs` | Last session summary |
+| `facts_summary()` | `src/knowledge/facts.rs` | Recent facts as bullet list |
+| `episodic_recall_summary()` | `src/knowledge/episodic_recall.rs` | Last session summary |
 
 ## Adding a New Layer 0 Source
 

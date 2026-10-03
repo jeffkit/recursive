@@ -43,7 +43,7 @@ Each line is a fact record:
 | `forget_fact` | `id` | Mark a fact as superseded / deleted |
 | `update_fact` | `id`, `text` | Update an existing fact |
 
-All tools live in `src/tools/facts.rs`. `facts_summary()` in the same file
+All tools live in `src/knowledge/facts.rs`. `facts_summary()` in the same file
 generates the injected bullet list.
 
 ## Search Backends

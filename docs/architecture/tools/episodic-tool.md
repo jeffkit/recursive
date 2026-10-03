@@ -9,7 +9,7 @@ timestamp: 2026-06-18T10:00:00Z
 # Episodic Tool
 
 - **Rust struct**: `EpisodicRecall`
-- **Source**: `src/tools/episodic_recall.rs`
+- **Source**: `src/knowledge/episodic_recall.rs`
 - **Registered name**: `episodic_recall`
 
 ## Args

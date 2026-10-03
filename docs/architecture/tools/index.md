@@ -21,7 +21,7 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 | `Read` | `ReadFile` | `src/tools/fs.rs` |
 | `Write` | `WriteFile` | `src/tools/fs.rs` |
 | `Edit` | `EditTool` | `src/tools/edit.rs` |
-| `count_lines` | `CountLines` | `src/tools/count_lines.rs` |
+| `count_lines` | `CountLines` | `src/knowledge/count_lines.rs` |
 
 ## Shell & Search
 
@@ -31,7 +31,7 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 | Tool | Rust struct | Source |
 |------|------------|--------|
 | `Bash` | `RunShell` | `src/tools/shell.rs` |
-| `Grep` | `SearchFiles` | `src/tools/search.rs` |
+| `Grep` | `SearchFiles` | `src/knowledge/search.rs` |
 | `Glob` | `GlobTool` | `src/tools/glob.rs` |
 | `run_background` | `RunBackground` | `src/tasks/run_background.rs` |
 | `check_background` | `CheckBackground` | `src/tasks/run_background.rs` |
@@ -60,7 +60,7 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 
 | Tool | Rust struct | Source |
 |------|------------|--------|
-| `estimate_tokens` | `EstimateTokens` | `src/tools/estimate_tokens.rs` |
+| `estimate_tokens` | `EstimateTokens` | `src/knowledge/estimate_tokens.rs` |
 | `TodoWrite` | `TodoWriteTool` | `src/tools/todo.rs` |
 | `tool_search` | `ToolSearchTool` | `src/tools/tool_search.rs` |
 

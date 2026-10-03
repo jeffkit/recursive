@@ -38,7 +38,7 @@ Session metadata lives in `.meta.json`:
 |------|-------------|
 | `episodic_recall` | Search past sessions by keyword/date range; returns relevant excerpts |
 
-`episodic_recall_summary()` in `src/tools/episodic_recall.rs` generates a
+`episodic_recall_summary()` in `src/knowledge/episodic_recall.rs` generates a
 brief summary of the most recent session for system prompt injection.
 
 ## System Prompt Injection

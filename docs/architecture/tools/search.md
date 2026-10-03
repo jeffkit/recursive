@@ -10,7 +10,7 @@ timestamp: 2026-06-18T10:00:00Z
 
 ## Grep (`SearchFiles`)
 
-- **Source**: `src/tools/search.rs`
+- **Source**: `src/knowledge/search.rs`
 - **Args**: `pattern` (regex), `path` (optional scope), `case_insensitive`, `include` (glob filter)
 - **Returns**: Matching lines with file path and line number
 

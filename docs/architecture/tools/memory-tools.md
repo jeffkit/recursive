@@ -1,14 +1,14 @@
 ---
 type: Architecture
 title: Memory Tools — remember, recall, forget, scratchpad
-description: Layer 1 working memory tools (scratchpad KV) and legacy note-store tools (remember/recall/forget). All in src/tools/memory.rs.
+description: Layer 1 working memory tools (scratchpad KV) and legacy note-store tools (remember/recall/forget). All in src/knowledge/memory.rs.
 tags: [tools, memory, scratchpad, layer1]
 timestamp: 2026-06-18T10:00:00Z
 ---
 
 # Memory Tools
 
-All tools live in `src/tools/memory.rs`.
+All tools live in `src/knowledge/memory.rs`.
 
 ## Legacy Note Store (remember / recall / forget)
 

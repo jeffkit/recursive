@@ -8,7 +8,7 @@ timestamp: 2026-06-18T10:00:00Z
 
 # Facts Tools
 
-Source: `src/tools/facts.rs`.
+Source: `src/knowledge/facts.rs`.
 Backed by [Layer 2 — Semantic Facts](../memory/layer2-facts.md).
 
 ## Tool API

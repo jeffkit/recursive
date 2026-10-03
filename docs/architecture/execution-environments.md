@@ -177,7 +177,7 @@ of a prompt injection):**
 - MCP tools — out-of-process, host network.
 - `task_*` / `team_*` — coordinator-mode dispatch.
 - `estimate_tokens` — reads host files directly (`tokio::fs::read_to_string`,
-  `src/tools/estimate_tokens.rs`) without going through the shared
+  `src/knowledge/estimate_tokens.rs`) without going through the shared
   transport: a host-side read channel in the container/microvm tiers (its
   `path` argument can point at host files that were never written inside
   the sandbox).
