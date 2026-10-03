@@ -8,11 +8,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::resolve_within;
-use super::Tool;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::resolve_within;
 use crate::tools::tool_kind::ToolKind;
+use crate::tools::Tool;
 
 /// Hard ceiling for the LLM-supplied `max_output_bytes` arg. Generous
 /// enough for a full `cargo build` diagnostic dump, small enough that a
@@ -25,10 +25,10 @@ pub struct RunShell {
     pub timeout: Duration,
     pub max_output_bytes: usize,
     /// Goal 403: I/O backend for command execution. Defaults to
-    /// [`super::transport::LocalTransport`] (byte-identical to the
+    /// [`crate::tools::transport::LocalTransport`] (byte-identical to the
     /// pre-transport behaviour); a container transport routes commands
     /// into the sandbox environment instead of the host shell.
-    pub transport: std::sync::Arc<dyn super::transport::ToolTransport>,
+    pub transport: std::sync::Arc<dyn crate::tools::transport::ToolTransport>,
 }
 
 impl RunShell {
@@ -37,7 +37,7 @@ impl RunShell {
             root: root.into(),
             timeout: Duration::from_secs(300),
             max_output_bytes: 128 * 1024,
-            transport: std::sync::Arc::new(super::transport::LocalTransport),
+            transport: std::sync::Arc::new(crate::tools::transport::LocalTransport),
         }
     }
 
@@ -51,7 +51,7 @@ impl RunShell {
     /// container transports map them into the environment.
     pub fn with_transport(
         mut self,
-        transport: std::sync::Arc<dyn super::transport::ToolTransport>,
+        transport: std::sync::Arc<dyn crate::tools::transport::ToolTransport>,
     ) -> Self {
         self.transport = transport;
         self
@@ -158,7 +158,7 @@ impl Tool for RunShell {
             .map_err(|e| Error::Tool {
                 name: "Bash".into(),
                 call_id: None,
-                message: super::fs::transport_io_error(&cwd, &e),
+                message: crate::tools::fs::transport_io_error(&cwd, &e),
             })?;
 
         // Goal 400/403: the transport's structural classification is the
@@ -172,16 +172,16 @@ impl Tool for RunShell {
                 name: "Bash".into(),
                 call_id: None,
                 message: match failure {
-                    super::transport::TransportFailure::Environment => format!(
+                    crate::tools::transport::TransportFailure::Environment => format!(
                         "environment failure (sandbox container died or was killed; \
                          not a command bug): cwd={}",
                         cwd.display()
                     ),
-                    super::transport::TransportFailure::Retryable => format!(
+                    crate::tools::transport::TransportFailure::Retryable => format!(
                         "retryable: transient sandbox transport failure: cwd={}",
                         cwd.display()
                     ),
-                    super::transport::TransportFailure::Tool => format!(
+                    crate::tools::transport::TransportFailure::Tool => format!(
                         "sandbox transport rejected the invocation: cwd={}",
                         cwd.display()
                     ),

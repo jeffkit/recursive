@@ -46,7 +46,7 @@ fn data_tenancy_row_no_longer_claims_sandbox_per_session_for_microvm_http() {
 
 #[test]
 fn e2b_provider_module_comment_matches_actual_lifecycle() {
-    let src = include_str!("../src/tools/e2b_provider.rs");
+    let src = include_str!("../src/tools/transport_layer/e2b_provider.rs");
     let header: String = src.lines().take(30).collect::<Vec<_>>().join("\n");
     assert!(
         !header.contains("Each session lazily creates one E2B sandbox"),

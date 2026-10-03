@@ -25,33 +25,60 @@ fn read(rel: &str) -> String {
 
 // ── Invariant #9: new tool → new file under src/tools/ ─────────────────────
 
-/// Every `*.rs` file in `src/tools/` that declares `impl Tool` (or a Tool
-/// impl block) must be declared as a module in `src/tools/mod.rs`. This is
-/// the mechanical core of "new tool → new file, registered in mod.rs".
+/// Every `*.rs` file under `src/tools/` (top-level or nested) that declares
+/// `impl Tool` (or a Tool impl block) must be declared as a module: a
+/// top-level file in `src/tools/mod.rs`, a nested file in its directory's
+/// `mod.rs`, and the directory itself in `src/tools/mod.rs`. This is the
+/// mechanical core of "new tool → new file, registered in mod.rs" — since
+/// issues #80–#82 the flat directory was split into domain submodules
+/// (`execution/`, `transport_layer/`, `policy_domain/`).
 #[test]
 fn tool_files_are_registered_in_mod_rs() {
+    let tools_dir = workspace_root().join("src/tools");
     let mod_rs = read("src/tools/mod.rs");
-    let dir = workspace_root().join("src/tools");
-    let entries =
-        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("src/tools must be listable: {e}"));
     let mut checked = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".rs") || name == "mod.rs" {
-            continue;
+    let mut stack = vec![tools_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{} must be listable: {e}", dir.display()))
+            .flatten()
+        {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                // A domain submodule must be declared in src/tools/mod.rs
+                // (this covers tasks/ and knowledge/ via `crate::` modules
+                // only if they live under tools/ — nested dirs here are
+                // declared in tools/mod.rs).
+                if mod_rs.contains(&format!("mod {name};")) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !name.ends_with(".rs") || name == "mod.rs" {
+                continue;
+            }
+            let stem = name.trim_end_matches(".rs");
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} must be readable: {e}", name));
+            if !content.contains("Tool for") && !content.contains("impl Tool") {
+                continue; // helper modules without tool impls are fine
+            }
+            let declaring_mod = if dir == tools_dir {
+                mod_rs.clone()
+            } else {
+                let dir_mod = dir.join("mod.rs");
+                std::fs::read_to_string(&dir_mod)
+                    .unwrap_or_else(|e| panic!("{} must be readable: {e}", dir_mod.display()))
+            };
+            assert!(
+                declaring_mod.contains(&format!("mod {stem};")),
+                "invariant #9 violation: {} implements a Tool but is not \
+                 declared in its mod.rs",
+                path.strip_prefix(&tools_dir).unwrap_or(&path).display()
+            );
+            checked += 1;
         }
-        let stem = name.trim_end_matches(".rs");
-        let content = std::fs::read_to_string(entry.path())
-            .unwrap_or_else(|e| panic!("{} must be readable: {e}", name));
-        if !content.contains("Tool for") && !content.contains("impl Tool") {
-            continue; // helper modules without tool impls are fine
-        }
-        assert!(
-            mod_rs.contains(&format!("mod {stem};")),
-            "invariant #9 violation: src/tools/{name} implements a Tool but is not \
-             declared in src/tools/mod.rs"
-        );
-        checked += 1;
     }
     assert!(
         checked >= 20,

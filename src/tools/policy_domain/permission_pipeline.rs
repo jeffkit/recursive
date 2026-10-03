@@ -36,7 +36,8 @@ use crate::error::{Error, Result};
 use crate::permissions::{DecisionReason, Permission, PermissionMode};
 
 use super::policy_sandbox::PolicyConfig;
-use super::{AuditMeta, ToolRegistry};
+use crate::tools::audit::AuditMeta;
+use crate::tools::ToolRegistry;
 
 // ── Outcome type ──────────────────────────────────────────────────────────
 

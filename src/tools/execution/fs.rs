@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::transport::ToolTransport;
-use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::tool_kind::ToolKind;
+use crate::tools::transport::ToolTransport;
+use crate::tools::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 
 // ---------------------------------------------------------------------------
 // ReadFileState — shared between ReadFile, EditTool, and WriteFile
@@ -209,7 +209,7 @@ impl ReadFile {
             session_roots: None,
             max_bytes: 256 * 1024,
             read_state: None,
-            transport: Arc::new(super::transport::LocalTransport),
+            transport: Arc::new(crate::tools::transport::LocalTransport),
         }
     }
 
@@ -458,7 +458,7 @@ impl WriteFile {
             extra_roots: Vec::new(),
             session_roots: None,
             read_state: None,
-            transport: Arc::new(super::transport::LocalTransport),
+            transport: Arc::new(crate::tools::transport::LocalTransport),
         }
     }
 

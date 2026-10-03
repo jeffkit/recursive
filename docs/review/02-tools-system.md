@@ -76,7 +76,7 @@ cmd.current_dir(&self.workspace);
 
 ### C-3: `SshTransport::exec_shell` — env key 未转义拼入远程命令
 
-**位置**: `src/tools/transport.rs:334-344`
+**位置**: `src/tools/transport_layer/transport.rs:334-344`
 
 ```rust
 for (key, val) in env {
@@ -105,7 +105,7 @@ if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
 
 ### M-1: `policy_sandbox.rs` 是空壳安全层 — 从未被 shell 工具调用
 
-**位置**: `src/tools/shell.rs`, `src/tools/run_background.rs`, `src/tools/policy_sandbox.rs`
+**位置**: `src/tools/execution/shell.rs`, `src/tools/run_background.rs`, `src/tools/policy_domain/policy_sandbox.rs`
 
 `PolicyConfig::check_shell` 和 `check_fs_path` 在测试 (`tool_set_provider.rs:174-176`) 之外，**没有任何 shell 工具在执行前调用它们**。`RunShell::execute` 接收命令字符串后直接 `spawn`，根本不检查 policy。`PolicyConfig::default_restrictive()` 里定义的 `rm -rf /` 等规则，只有在 entry-point 主动 `.with_policy()` 并且工具自己主动查询时才生效——但工具代码里没有这个逻辑。
 
@@ -117,7 +117,7 @@ if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
 
 ### M-2: `transport.rs` 的 `expect()` 违反 Invariant #5
 
-**位置**: `src/tools/transport.rs:188-189, 349-350, 436-437`
+**位置**: `src/tools/transport_layer/transport.rs:188-189, 349-350, 436-437`
 
 ```rust
 let mut stdout = child.stdout.take().expect("stdout piped");
@@ -239,7 +239,7 @@ let poll_cmd = format!(
 
 ### N-4: `docker_sandbox.rs` 无 exec 退出码追踪
 
-**位置**: `src/tools/docker_sandbox.rs:86-135`
+**位置**: `src/tools/transport_layer/docker_sandbox.rs:86-135`
 
 `DockerShellTool::exec_command` 只返回 stdout+stderr 的合并文本，丢弃了 exec 的退出码。与 `RunShell` 的输出格式（`exit: N\n--- stdout ---\n...`）不一致，且调用方无法区分命令成功和失败。
 
@@ -263,7 +263,7 @@ std::env::current_dir()
 
 ### N-7: `SshTransport` 禁用了 `StrictHostKeyChecking`，且丢弃 known_hosts
 
-**位置**: `src/tools/transport.rs:158-160`
+**位置**: `src/tools/transport_layer/transport.rs:158-160`
 
 ```rust
 cmd.arg("-o").arg("StrictHostKeyChecking=no");

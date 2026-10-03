@@ -13,11 +13,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::transport::{retryable_prefix, ToolTransport, WalkOptions};
-use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::tool_kind::ToolKind;
+use crate::tools::transport::{retryable_prefix, ToolTransport, WalkOptions};
+use crate::tools::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 
 const MAX_RESULTS: usize = 200;
 
@@ -108,7 +108,7 @@ impl GlobTool {
             root: root.into(),
             extra_roots: Vec::new(),
             session_roots: None,
-            transport: Arc::new(super::transport::LocalTransport),
+            transport: Arc::new(crate::tools::transport::LocalTransport),
         }
     }
 
@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl super::super::transport::ToolTransport for MemoryTransport {
+    impl crate::tools::transport::ToolTransport for MemoryTransport {
         async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             self.files
                 .get(path)
@@ -561,19 +561,19 @@ mod tests {
         async fn list_dir(
             &self,
             _path: &Path,
-        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+        ) -> std::io::Result<Vec<crate::tools::transport::DirEntry>> {
             Err(std::io::Error::other("unsupported"))
         }
         async fn walk(
             &self,
             root: &Path,
-            _opts: &super::super::transport::WalkOptions,
-        ) -> std::io::Result<Vec<super::super::transport::WalkEntry>> {
+            _opts: &crate::tools::transport::WalkOptions,
+        ) -> std::io::Result<Vec<crate::tools::transport::WalkEntry>> {
             Ok(self
                 .files
                 .keys()
                 .filter(|p| p.starts_with(root) && *p != root)
-                .map(|p| super::super::transport::WalkEntry {
+                .map(|p| crate::tools::transport::WalkEntry {
                     path: p.strip_prefix(root).unwrap().to_path_buf(),
                     is_file: true,
                     size: 0,
@@ -590,7 +590,7 @@ mod tests {
             _env: &[(String, String)],
             _timeout: std::time::Duration,
             _max_output_bytes: usize,
-        ) -> std::io::Result<super::super::transport::ExecResult> {
+        ) -> std::io::Result<crate::tools::transport::ExecResult> {
             Err(std::io::Error::other("unsupported"))
         }
     }
@@ -600,7 +600,7 @@ mod tests {
     struct TimedOutWalkTransport;
 
     #[async_trait]
-    impl super::super::transport::ToolTransport for TimedOutWalkTransport {
+    impl crate::tools::transport::ToolTransport for TimedOutWalkTransport {
         async fn read_file(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
             Err(std::io::Error::other("unsupported"))
         }
@@ -610,14 +610,14 @@ mod tests {
         async fn list_dir(
             &self,
             _path: &Path,
-        ) -> std::io::Result<Vec<super::super::transport::DirEntry>> {
+        ) -> std::io::Result<Vec<crate::tools::transport::DirEntry>> {
             Err(std::io::Error::other("unsupported"))
         }
         async fn walk(
             &self,
             _root: &Path,
-            _opts: &super::super::transport::WalkOptions,
-        ) -> std::io::Result<Vec<super::super::transport::WalkEntry>> {
+            _opts: &crate::tools::transport::WalkOptions,
+        ) -> std::io::Result<Vec<crate::tools::transport::WalkEntry>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "environment unreachable",
@@ -633,7 +633,7 @@ mod tests {
             _env: &[(String, String)],
             _timeout: std::time::Duration,
             _max_output_bytes: usize,
-        ) -> std::io::Result<super::super::transport::ExecResult> {
+        ) -> std::io::Result<crate::tools::transport::ExecResult> {
             Err(std::io::Error::other("unsupported"))
         }
     }

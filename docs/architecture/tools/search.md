@@ -16,7 +16,7 @@ timestamp: 2026-06-18T10:00:00Z
 
 ## Glob (`GlobTool`)
 
-- **Source**: `src/tools/glob.rs`
+- **Source**: `src/tools/execution/glob.rs`
 - **Args**: `pattern` (glob, e.g. `**/*.rs`), `path` (optional root)
 - **Returns**: List of matching file paths sorted by modification time
 

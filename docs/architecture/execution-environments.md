@@ -34,10 +34,10 @@ are four tiers, selected by the `RECURSIVE_SANDBOX` environment variable.
 
 | Tier | Isolation | Entry (env) | Feature | Provider / transport |
 |------|-----------|-------------|---------|----------------------|
-| none (default) | none — host user | *(unset)* or `none` | — | `LocalTransport` (`src/tools/transport.rs`) |
-| policy | in-process path+shell policy (L1) | `RECURSIVE_SANDBOX=policy` | — | `PolicyToolSetProvider` (`src/tools/policy_sandbox.rs`) |
-| container | Docker container, non-root, caps dropped (L2) | `RECURSIVE_SANDBOX=container` | `cloud-runtime` | `ContainerToolSetProvider` + `ContainerTransport` (`src/tools/container_*.rs`) |
-| microvm | E2B Firecracker microVM (L3, hardware-isolated) | `RECURSIVE_SANDBOX=microvm` | `e2b-sandbox` | `E2bToolSetProvider` + `E2bTransport` (`src/tools/e2b_provider.rs`) |
+| none (default) | none — host user | *(unset)* or `none` | — | `LocalTransport` (`src/tools/transport_layer/transport.rs`) |
+| policy | in-process path+shell policy (L1) | `RECURSIVE_SANDBOX=policy` | — | `PolicyToolSetProvider` (`src/tools/policy_domain/policy_sandbox.rs`) |
+| container | Docker container, non-root, caps dropped (L2) | `RECURSIVE_SANDBOX=container` | `cloud-runtime` | `ContainerToolSetProvider` + `ContainerTransport` (`src/tools/transport_layer/container_*.rs`) |
+| microvm | E2B Firecracker microVM (L3, hardware-isolated) | `RECURSIVE_SANDBOX=microvm` | `e2b-sandbox` | `E2bToolSetProvider` + `E2bTransport` (`src/tools/transport_layer/e2b_provider.rs`) |
 
 All non-`none` tiers are **fatal on setup failure** (exit 2, clear message):
 Recursive never silently falls back to local execution — a sandbox that
@@ -192,16 +192,16 @@ Non-goals and the next-milestone candidates below.
 
 Sandboxed tiers (`policy` / `container` / `microvm`) do **not** inherit
 host environment variables in shell exec. `RunShell::execute`
-(`src/tools/shell.rs`) starts `env_pairs` as an empty `Vec` and only
+(`src/tools/execution/shell.rs`) starts `env_pairs` as an empty `Vec` and only
 appends pairs the tool call explicitly passes in its `env` argument;
-`ContainerTransport::exec_shell` (`src/tools/container_transport.rs`)
-and `E2bTransport::exec_shell` (`src/tools/e2b_provider.rs`) build the
+`ContainerTransport::exec_shell` (`src/tools/transport_layer/container_transport.rs`)
+and `E2bTransport::exec_shell` (`src/tools/transport_layer/e2b_provider.rs`) build the
 in-sandbox environment solely from that slice (an explicit `K=V`
 prefix). Host credentials such as `RECURSIVE_E2B_API_KEY` therefore
 never enter the sandbox. The `none` tier (`LocalTransport`)
 **intentionally** inherits the host environment — that is the local
 tier's design, not a defect. The `Bash` tool's `env` argument schema
-(`src/tools/shell.rs`) states this per-tier contract; the test
+(`src/tools/execution/shell.rs`) states this per-tier contract; the test
 `env_schema_description_matches_per_tier_reality` pins the wording.
 Regression test: `tests/issue51_sandbox_env_inheritance.rs`.
 

@@ -18,9 +18,9 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 
 | Tool | Rust struct | Source |
 |------|------------|--------|
-| `Read` | `ReadFile` | `src/tools/fs.rs` |
-| `Write` | `WriteFile` | `src/tools/fs.rs` |
-| `Edit` | `EditTool` | `src/tools/edit.rs` |
+| `Read` | `ReadFile` | `src/tools/execution/fs.rs` |
+| `Write` | `WriteFile` | `src/tools/execution/fs.rs` |
+| `Edit` | `EditTool` | `src/tools/execution/edit.rs` |
 | `count_lines` | `CountLines` | `src/knowledge/count_lines.rs` |
 
 ## Shell & Search
@@ -30,9 +30,9 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 
 | Tool | Rust struct | Source |
 |------|------------|--------|
-| `Bash` | `RunShell` | `src/tools/shell.rs` |
+| `Bash` | `RunShell` | `src/tools/execution/shell.rs` |
 | `Grep` | `SearchFiles` | `src/knowledge/search.rs` |
-| `Glob` | `GlobTool` | `src/tools/glob.rs` |
+| `Glob` | `GlobTool` | `src/tools/execution/glob.rs` |
 | `run_background` | `RunBackground` | `src/tasks/run_background.rs` |
 | `check_background` | `CheckBackground` | `src/tasks/run_background.rs` |
 

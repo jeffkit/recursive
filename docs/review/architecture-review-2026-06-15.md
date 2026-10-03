@@ -100,7 +100,7 @@ clippy clean 表明 Invariant #5（No `unwrap()`/`expect()` in non-test code）�
 - **修复**: 显式返回 `StatusCode::CONFLICT` 并附带 retry 失败原因；或拆为 async 任务，在 runtime 空闲时执行 clear。
 
 ### NEW-PERM-15 — `with_policy` 但 `permissions=None` 时跳过 safety check
-- **位置**: `src/tools/permission_pipeline.rs:89-260` + `src/permissions/mod.rs:317-330`（与 06-10 NEW-PERM-2 同问题，未修）
+- **位置**: `src/tools/policy_domain/permission_pipeline.rs:89-260` + `src/permissions/mod.rs:317-330`（与 06-10 NEW-PERM-2 同问题，未修）
 - **现象**: 当 `tool_registry.with_policy(policy)` 被调用但 `permissions` 仍是 `None`（即未调用 `with_permissions`），pipeline 的 safety check (`is_destructive_path` 等) 不被触发，但 policy 中的 allow/deny 列表**仍生效**。这是一个"配置错误的静默降级"。
 - **影响**: 部署者以为开了 policy 就所有 protection 都到位，结果 safety check 仍是默认 Deny 的命名路径子集（如 `.git/hooks`、`.env`）未被检测 — 上次 review 已识别，本轮确认仍未修。
 - **修复**: pipeline 启动时检测 `permissions.is_some() || policy.is_some()` 必须同时满足，否则记 WARN 日志并返回 `ToolRejected`。

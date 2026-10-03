@@ -9,7 +9,7 @@ timestamp: 2026-06-18T10:00:00Z
 # Shell Tool — Bash
 
 - **Rust struct**: `RunShell`
-- **Source**: `src/tools/shell.rs`
+- **Source**: `src/tools/execution/shell.rs`
 - **Registered name**: `Bash`
 
 ## Args
@@ -28,8 +28,8 @@ Unlike file tools, shell commands are **not** path-restricted by `resolve_within
 are technically possible, but agent working principles say not to do so.
 
 For stricter isolation, two sandbox backends are available:
-- `src/tools/docker_sandbox.rs` — Docker-based isolation
-- `src/tools/e2b_provider.rs` — E2B cloud sandbox
+- `src/tools/transport_layer/docker_sandbox.rs` — Docker-based isolation
+- `src/tools/transport_layer/e2b_provider.rs` — E2B cloud sandbox
 
 ## Timeout
 

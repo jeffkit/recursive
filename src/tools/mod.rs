@@ -8,48 +8,71 @@
 pub mod a2a;
 pub mod agent;
 pub mod agent_defs;
-pub mod audit;
 pub mod checkpoint;
 pub mod client_fs;
-#[cfg(feature = "cloud-runtime")]
-pub mod container_provider;
-#[cfg(feature = "cloud-runtime")]
-pub use container_provider::ContainerToolSetProvider;
-#[cfg(feature = "cloud-runtime")]
-pub mod container_transport;
 pub mod dispatch;
-#[cfg(feature = "cloud-runtime")]
-pub mod docker_provider;
-#[cfg(feature = "cloud-runtime")]
-pub mod docker_sandbox;
-#[cfg(feature = "e2b-sandbox")]
-pub mod e2b_provider;
-#[cfg(feature = "e2b-sandbox")]
-pub use e2b_provider::E2bToolSetProvider;
-pub mod edit;
 pub mod elicitation;
-pub mod fs;
-pub mod glob;
 pub mod http_call;
 #[cfg(feature = "skill-hub")]
 pub mod install_skill;
 pub mod load_skill;
-pub mod permission_pipeline;
 pub mod plan_mode;
-pub mod policy;
-pub mod policy_sandbox;
 pub mod registry;
 pub mod send_message;
-pub mod shell;
 pub mod todo;
 pub mod tool_kind;
 pub mod tool_search;
-pub mod transport;
-pub(crate) mod url_guard;
 #[cfg(feature = "web_fetch")]
 pub mod web_fetch;
 #[cfg(feature = "web_search")]
 pub mod web_search;
+
+// ── Execution domain (src/tools/execution/, issue #82) ─────────────────────
+//
+// The shell/edit/fs/glob tools moved to `src/tools/execution/` — keep the
+// module paths (`crate::tools::shell`, …) resolving for external callers.
+// Pure re-exports, no behavior.
+
+pub mod execution;
+pub use execution::edit;
+pub use execution::fs;
+pub use execution::glob;
+pub use execution::shell;
+
+// ── Transport layer (src/tools/transport_layer/, issue #82) ────────────────
+//
+// The transport trait and the container/docker/e2b providers moved to
+// `src/tools/transport_layer/` — keep the module paths
+// (`crate::tools::transport`, …) resolving for external callers. Pure
+// re-exports, no behavior.
+
+pub mod transport_layer;
+#[cfg(feature = "cloud-runtime")]
+pub use container_provider::ContainerToolSetProvider;
+#[cfg(feature = "e2b-sandbox")]
+pub use e2b_provider::E2bToolSetProvider;
+#[cfg(feature = "cloud-runtime")]
+pub use transport_layer::container_provider;
+#[cfg(feature = "cloud-runtime")]
+pub use transport_layer::container_transport;
+#[cfg(feature = "cloud-runtime")]
+pub use transport_layer::docker_provider;
+#[cfg(feature = "cloud-runtime")]
+pub use transport_layer::docker_sandbox;
+#[cfg(feature = "e2b-sandbox")]
+pub use transport_layer::e2b_provider;
+pub use transport_layer::transport;
+
+// ── Policy domain (src/tools/policy_domain/, issue #82) ────────────────────
+//
+// The permission pipeline, L1 policy sandbox, audit metadata and SSRF URL
+// guard moved to `src/tools/policy_domain/` — keep the module paths
+// (`crate::tools::audit`, …) resolving for external callers. Pure
+// re-exports, no behavior.
+
+pub mod policy_domain;
+pub(crate) use policy_domain::url_guard;
+pub use policy_domain::{audit, permission_pipeline, policy, policy_sandbox};
 
 // ── Re-exports from the session/task domain (src/tasks/, issue #81) ────────
 //

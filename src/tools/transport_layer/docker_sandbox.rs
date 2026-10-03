@@ -1,7 +1,7 @@
 //! Docker-backed shell tool for L2 container sandbox.
 //!
 //! [`DockerShellTool`] implements the [`Tool`] trait with the same `run_shell`
-//! name and argument schema as [`super::RunShell`], but executes commands
+//! name and argument schema as [`crate::tools::shell::RunShell`], but executes commands
 //! inside a Docker container instead of the host process. The workspace
 //! directory is bind-mounted into the container so file IO is shared.
 //!
@@ -17,12 +17,12 @@ use bollard::Docker;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use super::Tool;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::tools::Tool;
 use crate::tools::ToolSideEffect;
 
-/// Docker-backed replacement for [`super::RunShell`].
+/// Docker-backed replacement for [`crate::tools::shell::RunShell`].
 ///
 /// Each instance owns one container that is cleaned up on `Drop`.
 /// Commands run as `sh -c <command>` inside the container at `/workspace`.

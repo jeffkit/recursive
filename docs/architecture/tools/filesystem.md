@@ -10,21 +10,21 @@ timestamp: 2026-06-18T10:00:00Z
 
 ## Read (`ReadFile`)
 
-- **Source**: `src/tools/fs.rs`
+- **Source**: `src/tools/execution/fs.rs`
 - **Args**: `path` (workspace-relative), optional `offset` (line number), `limit` (line count)
 - **Returns**: File content with line numbers, or an error if outside workspace
 - **State**: Shares `ReadFileState` with `Edit` to enable optimistic edit locking
 
 ## Write (`WriteFile`)
 
-- **Source**: `src/tools/fs.rs`
+- **Source**: `src/tools/execution/fs.rs`
 - **Args**: `path`, `content`
 - **Behaviour**: Creates parent dirs; overwrites existing file. Use for **new files** only.
   For existing files, prefer `Edit` (see AGENTS.md conventions).
 
 ## Edit (`EditTool`)
 
-- **Source**: `src/tools/edit.rs`
+- **Source**: `src/tools/execution/edit.rs`
 - **Args**: `path`, `old_string`, `new_string`, optional `replace_all`
 - **Behaviour**: Exact string replacement. Fails if `old_string` is not unique.
   Uses `ReadFileState` to detect stale-read conflicts.

@@ -26,14 +26,14 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::transport::ToolTransport;
-use super::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::fs::{
     get_file_mtime, read_via_transport_or_empty, transport_io_error, ReadFileState,
 };
 use crate::tools::tool_kind::ToolKind;
+use crate::tools::transport::ToolTransport;
+use crate::tools::{resolve_within_any, AccessTier, SessionToolState, SharedSandboxRoots, Tool};
 
 /// Maximum on-disk size of a file the Edit tool will touch, in bytes. Prevents
 /// OOM from reading multi-GB files into memory. Aligned with fake-cc's
@@ -64,7 +64,7 @@ impl EditTool {
             extra_roots: Vec::new(),
             session_roots: None,
             read_state: None,
-            transport: Arc::new(super::transport::LocalTransport),
+            transport: Arc::new(crate::tools::transport::LocalTransport),
         }
     }
 

@@ -35,11 +35,11 @@
 | **C-1** | 核心 audit 错位 | ✅ 已修 | HashMap 查表（review 已确认） |
 | **SEC-001** | WebFetch SSRF | ✅ 已修 | `src/tools/web_fetch.rs:50-88` `validate_url` + `is_private_ip`（RFC 1918/loopback/link-local/169.254/IMDS） |
 | **SEC-001 (回归)** | **a2a_call SSRF** | ❌ **仍漂** | `src/tools/a2a.rs` 无 IP 过滤（漂 3 轮 review） |
-| **SEC-002** | `sh -c` 注入（shell.rs） | ⚠️ 仍用 sh -c | `src/tools/shell.rs:126` 但 `kill_on_drop(true)` + Docker 沙箱隔离（commit `81290b1`） |
+| **SEC-002** | `sh -c` 注入（shell.rs） | ⚠️ 仍用 sh -c | `src/tools/execution/shell.rs:126` 但 `kill_on_drop(true)` + Docker 沙箱隔离（commit `81290b1`） |
 | **SEC-002 (旧)** | run_skill_script 注入 | ✅ 已无 | `run_skill_script.rs` 已被 `install_skill.rs` + `load_skill.rs` 替代 |
 | **SEC-003** | HTTP 默认无认证 | ✅ 已修 | `src/http/auth.rs:69-71` 空 keys 返回 `false`；`INSECURE_OK` 仅 debug build 生效（commit `81290b1`） |
 | **SEC-007** | Hook `updated_input` 替换 | ✅ 安全洞消失 | parsed 后丢弃，SEC-007 不可利用；功能也丢失（视为"设计消除"） |
-| **SEC-008** | Policy sandbox 孤岛 | ✅ 已修 | `src/tools/permission_pipeline.rs` 7 阶段编排器；policy/hook/safety 接入调用链 |
+| **SEC-008** | Policy sandbox 孤岛 | ✅ 已修 | `src/tools/policy_domain/permission_pipeline.rs` 7 阶段编排器；policy/hook/safety 接入调用链 |
 | **B1** | 请求体无大小限制 | ✅ 已修 | `src/http/mod.rs:602` `.layer(DefaultBodyLimit::max(1MB))` |
 | **C1-storage** | session_lock TOCTOU | ✅ 已修 | `OpenOptions::create_new(true)`（`session/lifecycle.rs:211`） |
 | **C2-storage** | .meta.json 原子写 | ✅ 已修 | `src/atomic.rs` 统一 `atomic_write`（f.sync_all + dir.sync_all）+ `atomic_write_async` |
@@ -82,7 +82,7 @@
 | `compact/` 模块化 | `src/compact/{mod,micro,prompt,reinject,retry}.rs`（CHANGELOG 0.8.1） |
 | `SessionLifecycle` 锁层次 | `docs/INTERNALS.md` 220 行新文档（PR #9, commit `0541da4`） |
 | `RunShell` timeout 杀子进程 | `kill_on_drop(true)` + `start_kill`（P0-A, commit `81290b1`） |
-| `RunShell` LLM 可调 `max_output_bytes` | `src/tools/shell.rs`（P3-3, commit `a9a7129`） |
+| `RunShell` LLM 可调 `max_output_bytes` | `src/tools/execution/shell.rs`（P3-3, commit `a9a7129`） |
 | `with_tools` 改 self.clone() | `src/kernel.rs`（P3-4, commit `a9a7129`） |
 | `INSECURE_OK` 仅 debug build | `src/http/auth.rs`（P0-B, commit `81290b1`） |
 | `Multi::MemoryEntry` 单调 seq | commit `70b96ac`（P3-2） |
