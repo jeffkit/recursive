@@ -18,7 +18,9 @@ pub struct OrphanToolCall {
     pub tool_name: String,
     /// BLAKE3 of canonical JSON of the call arguments (for drift detection).
     pub args_hash: String,
-    /// Side-effect class, determined from the current registry (valid because
-    /// `recursive resume` validates the registry hash before calling this).
+    /// Side-effect class, determined from the current registry. Falls back
+    /// to `External` when the tool is no longer registered (registry
+    /// drifted since the session was saved) so `redo` always shows the
+    /// conservative warning.
     pub side_effect_at_call: crate::tools::ToolSideEffect,
 }

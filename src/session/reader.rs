@@ -129,6 +129,21 @@ impl SessionReader {
         Ok((entries, index))
     }
 
+    /// Collect the tool names referenced by any assistant `tool_calls` in
+    /// the transcript (post-compaction tail, same window the resume seed
+    /// and orphan scan see). Used by the resume path to classify tool
+    /// drift as "all referenced tools still exist" vs "some vanished".
+    pub fn load_referenced_tool_names(session_dir: &Path) -> std::io::Result<Vec<String>> {
+        let entries = Self::load_transcript(session_dir)?;
+        let mut names = std::collections::BTreeSet::new();
+        for e in &entries {
+            for tc in &e.tool_calls {
+                names.insert(tc.name.clone());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
     /// Load the transcript and convert each `TranscriptEntry` to a
     /// runtime [`Message`]. Persistence-only fields (`id`,
     /// `parent_id`, `uuid`, `parent_uuid`, `timestamp`, `usage`)
@@ -155,7 +170,9 @@ impl SessionReader {
     ///
     /// `registry` is used to determine `side_effect_at_call` for orphans
     /// (their `AuditMeta` was never written because the process died before
-    /// the call returned).
+    /// the call returned). Tools missing from the current registry fall back
+    /// to `External`; callers that need to distinguish "known read-only"
+    /// from "not registered" can check `registry.get(name).is_some()`.
     pub fn scan_orphan_tool_calls(
         session_dir: &Path,
         registry: &crate::tools::ToolRegistry,
@@ -690,6 +707,68 @@ mod tests {
         );
         assert_eq!(orphans[0].tool_call_id, "tc-orphan");
         assert_eq!(orphans[0].tool_name, "Read");
+    }
+
+    #[test]
+    fn load_referenced_tool_names_collects_every_assistant_call() {
+        use crate::message::Message;
+        use crate::session::{SessionStatus, SessionWriter};
+
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
+
+        let mut a1 = Message::assistant("one".to_string());
+        a1.tool_calls = vec![crate::llm::ToolCall {
+            id: "c1".to_string(),
+            name: "Bash".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        let mut a2 = Message::assistant("two".to_string());
+        a2.tool_calls = vec![
+            crate::llm::ToolCall {
+                id: "c2".to_string(),
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            crate::llm::ToolCall {
+                id: "c3".to_string(),
+                name: "Read".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        w.append(&Message::user("go".to_string()), None, None)
+            .unwrap();
+        w.append(&a1, None, None).unwrap();
+        w.append(&a2, None, None).unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let names = SessionReader::load_referenced_tool_names(w.session_dir()).unwrap();
+        assert_eq!(
+            names,
+            vec!["Bash".to_string(), "Read".to_string()],
+            "must be deduplicated and sorted"
+        );
+    }
+
+    #[test]
+    fn load_referenced_tool_names_empty_without_tool_calls() {
+        use crate::message::Message;
+        use crate::session::{SessionStatus, SessionWriter};
+
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
+        w.append(&Message::user("hi".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("hello".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let names = SessionReader::load_referenced_tool_names(w.session_dir()).unwrap();
+        assert!(
+            names.is_empty(),
+            "no tool_calls → empty list, got {names:?}"
+        );
     }
 
     // Goal: TUI resume / session show should display the full conversation,

@@ -185,12 +185,20 @@ fn resolve_resume_message(message: Option<String>) -> String {
 /// (positional `session`, `--from-file`, neither) was provided,
 /// validates the tool-registry hash, then opens the existing
 /// session for appending and resumes the run.
+///
+/// `allow_tool_drift`: resume even when the recorded `tool_registry_hash`
+/// no longer matches the current tool set. The mismatch degrades to a
+/// warning — old tool calls in the seed are history text for the model,
+/// and only an explicit `--orphans=redo` of a tool that no longer exists
+/// is refused. Without the flag the mismatch keeps its hard-fail
+/// behaviour (upgrade-safety for unattended callers).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_resume(
     config: recursive::config::Config,
     session: Option<String>,
     from_file: Option<PathBuf>,
     orphans_flag: Option<String>,
+    allow_tool_drift: bool,
     message: Option<String>,
     max_transcript_chars: Option<usize>,
     transcript_out: Option<PathBuf>,
@@ -205,20 +213,50 @@ pub(crate) async fn cmd_resume(
     eprintln!("session: resuming from {}", session_dir.display());
 
     // Load meta and validate the tool-registry hash up front (before
-    // building the runtime). If the hash mismatches, abort with the
-    // same error string the legacy SessionFile path used.
+    // building the runtime). A mismatch is a hard error unless
+    // --allow-tool-drift is given, in which case it degrades to a
+    // warning plus a drift report; --orphans=redo of a tool that no
+    // longer exists still refuses below.
     let meta = recursive::session::SessionReader::load_meta(&session_dir)
         .with_context(|| format!("reading .meta.json for session {}", session_dir.display()))?;
     let (tools, _) = build_tools(&config, None).await;
     let specs = tools.specs();
     let current_hash = recursive::session::hash_tool_specs(&specs);
+    let mut registry_drifted = false;
     match &meta.tool_registry_hash {
         Some(stored) if stored != &current_hash => {
-            anyhow::bail!(
-                "tool registry hash mismatch: session has '{stored}', current is \
-                 '{current_hash}'. Tools have changed since the session was saved; \
-                 cannot resume."
-            );
+            if allow_tool_drift {
+                registry_drifted = true;
+                eprintln!(
+                    "warning: tool registry hash mismatch for session {}: \
+                     session has '{stored}', current is '{current_hash}'. \
+                     Tools have changed since the session was saved; \
+                     resuming anyway (--allow-tool-drift).",
+                    session_dir.display()
+                );
+                let referenced =
+                    recursive::session::SessionReader::load_referenced_tool_names(&session_dir)?;
+                let vanished: Vec<&str> = referenced
+                    .iter()
+                    .map(|n| n.as_str())
+                    .filter(|n| tools.get(n).is_none())
+                    .collect();
+                if vanished.is_empty() {
+                    eprintln!("warning: all tools referenced by the transcript still exist.");
+                } else {
+                    eprintln!(
+                        "warning: tools referenced by the transcript but no longer \
+                         registered: {}",
+                        vanished.join(", ")
+                    );
+                }
+            } else {
+                anyhow::bail!(
+                    "tool registry hash mismatch: session has '{stored}', current is \
+                     '{current_hash}'. Tools have changed since the session was saved; \
+                     cannot resume. Re-run with --allow-tool-drift to resume anyway."
+                );
+            }
         }
         Some(_) => {} // matches → continue
         None => {
@@ -279,6 +317,26 @@ pub(crate) async fn cmd_resume(
                 // the model will handle as "no result yet" context.
             }
             OrphanPolicy::Redo => {
+                // A redo re-executes the call with the *current* registry.
+                // When the registry drifted and the orphan's tool vanished,
+                // redo would dispatch into `UnknownTool` errors forever —
+                // that combination stays a hard error even under
+                // --allow-tool-drift (skip/ask remain available).
+                if registry_drifted {
+                    let missing: Vec<&str> = orphans
+                        .iter()
+                        .map(|o| o.tool_name.as_str())
+                        .filter(|n| tools.get(n).is_none())
+                        .collect();
+                    if !missing.is_empty() {
+                        anyhow::bail!(
+                            "cannot resume with --orphans=redo: tool(s) {} no longer \
+                             exist in the current registry (tool registry drifted). \
+                             Use --orphans=skip or --orphans=ask instead.",
+                            missing.join(", ")
+                        );
+                    }
+                }
                 // Warn if any are External — unsafe to auto-redo.
                 for o in &orphans {
                     if o.side_effect_at_call == recursive::tools::ToolSideEffect::External {
@@ -955,6 +1013,7 @@ mod tests {
             None,
             Some(missing),
             None,
+            false,
             None,
             None,
             None,
@@ -982,6 +1041,7 @@ mod tests {
             None,
             Some(sdir),
             None,
+            false,
             None,
             None,
             None,
@@ -997,6 +1057,45 @@ mod tests {
         assert!(
             err.to_string().contains("tool registry hash mismatch"),
             "a drifted tool set must be rejected: {err}"
+        );
+        assert!(
+            err.to_string().contains("--allow-tool-drift"),
+            "the error must name the escape hatch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_resume_allow_tool_drift_degrades_mismatch_to_warning() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let sdir = ws.path().join("sess-drift");
+        std::fs::create_dir_all(&sdir).unwrap();
+        write_session_meta(&sdir, Some("definitely-not-the-current-hash".into()));
+
+        // With allow_tool_drift=true the hash mismatch must NOT abort. The
+        // next observable failure is the missing transcript, which carries
+        // a different message entirely.
+        let err = cmd_resume(
+            cfg,
+            None,
+            Some(sdir),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.to_string().contains("hash mismatch"),
+            "a drifted hash + --allow-tool-drift must not be rejected: {err}"
         );
     }
 
@@ -1016,6 +1115,7 @@ mod tests {
             None,
             Some(sdir),
             None,
+            false,
             None,
             None,
             None,

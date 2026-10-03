@@ -1,9 +1,12 @@
 //! `recursive resume` surfaces that `main()`/`resume.rs` gate on predicates.
 //!
-//! Pins four user-visible behaviours that only appear when the real binary runs:
+//! Pins user-visible behaviours that only appear when the real binary runs:
 //!
 //! * the orphan-tool-call block runs at all (`if !orphans.is_empty()`),
 //! * only *External*-classified orphans get the re-execution warning,
+//! * a drifted `tool_registry_hash` hard-fails without `--allow-tool-drift`
+//!   and degrades to a warning (+ vanished-tool report) with it; redo of a
+//!   vanished tool still refuses,
 //! * a JSON-output, non-headless resume serves host `control_request` frames
 //!   (the `json_mode && !config.headless` control bridge),
 //! * `--session-out` is written only for a *non*-clean finish.
@@ -107,10 +110,21 @@ impl Rig {
     /// A JSONL session directory. `tool_calls` is the assistant entry's tool
     /// call list; an unanswered call is an orphan. No `tool_registry_hash` is
     /// recorded, so the resume only warns about the pre-g151 record.
+    /// `tool_hash`, when given, is written as the session's recorded hash —
+    /// pass a bogus string to simulate post-upgrade registry drift.
     fn session_dir(&self, id: &str, tool_names: &[&str]) -> PathBuf {
+        self.session_dir_with_hash(id, tool_names, None)
+    }
+
+    fn session_dir_with_hash(
+        &self,
+        id: &str,
+        tool_names: &[&str],
+        tool_hash: Option<&str>,
+    ) -> PathBuf {
         let dir = self.home.path().join("sessions").join(id);
         std::fs::create_dir_all(&dir).expect("mkdir session dir");
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "session_id": id,
             "goal": "g",
             "model": "test-model",
@@ -119,6 +133,9 @@ impl Rig {
             "updated_at": "2026-01-01T00:00:00Z",
             "message_count": 2,
         });
+        if let Some(h) = tool_hash {
+            meta["tool_registry_hash"] = serde_json::json!(h);
+        }
         std::fs::write(
             dir.join(".meta.json"),
             serde_json::to_vec(&meta).expect("meta"),
@@ -211,6 +228,125 @@ fn resume_args(dir: &Path, globals: &[&str], extra: &[&str]) -> Vec<String> {
 
 fn as_refs(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
+}
+
+// ── tool-registry drift (--allow-tool-drift) ───────────────────────────────
+
+#[test]
+fn resume_still_refuses_a_drifted_registry_without_the_flag() {
+    let rig = Rig::new();
+    let dir = rig.session_dir_with_hash("sess-drift-hard", &[], Some("bogus-old-hash"));
+
+    let out = rig.run(&as_refs(&resume_args(&dir, &[], &[])), None);
+    let stderr = stderr_of(&out);
+
+    assert!(!out.status.success(), "drifted hash must fail the resume");
+    assert!(
+        stderr.contains("tool registry hash mismatch"),
+        "the mismatch must be named, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--allow-tool-drift"),
+        "the error must point at the escape hatch, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn resume_allow_tool_drift_degrades_mismatch_to_a_warning() {
+    let rig = Rig::new();
+    let dir = rig.session_dir_with_hash("sess-drift-ok", &[], Some("bogus-old-hash"));
+
+    let out = rig.run(
+        &as_refs(&resume_args(&dir, &[], &["--allow-tool-drift"])),
+        None,
+    );
+    let stderr = stderr_of(&out);
+
+    assert!(
+        out.status.success(),
+        "--allow-tool-drift must let the resume proceed: {:?}",
+        stderr
+    );
+    assert!(
+        stderr.contains("tool registry hash mismatch"),
+        "the mismatch must still be surfaced as a warning, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("resuming anyway"),
+        "the warning must say the resume proceeds, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn resume_allow_tool_drift_reports_vanished_referenced_tools() {
+    let rig = Rig::new();
+    // The transcript references a tool that cannot exist in any registry.
+    // The orphan itself still follows the normal orphan policy, so pass
+    // `--orphans skip` to isolate the drift behaviour under test.
+    let dir = rig.session_dir_with_hash(
+        "sess-drift-vanished",
+        &["TotallyVanishedTool"],
+        Some("bogus-old-hash"),
+    );
+
+    let out = rig.run(
+        &as_refs(&resume_args(
+            &dir,
+            &[],
+            &["--allow-tool-drift", "--orphans", "skip"],
+        )),
+        None,
+    );
+    let stderr = stderr_of(&out);
+
+    assert!(
+        out.status.success(),
+        "drift + skipped orphan must resume: {:?}",
+        stderr
+    );
+    assert!(
+        stderr.contains("no longer"),
+        "the drift report must name vanished tools, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("TotallyVanishedTool"),
+        "the vanished tool must be named, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn resume_redo_of_a_vanished_tool_refuses_even_with_allow_tool_drift() {
+    let rig = Rig::new();
+    let dir = rig.session_dir_with_hash(
+        "sess-drift-redo",
+        &["TotallyVanishedTool"],
+        Some("bogus-old-hash"),
+    );
+
+    let out = rig.run(
+        &as_refs(&resume_args(
+            &dir,
+            &[],
+            &["--allow-tool-drift", "--orphans", "redo"],
+        )),
+        None,
+    );
+    let stderr = stderr_of(&out);
+
+    assert!(
+        !out.status.success(),
+        "redo of a tool that no longer exists must fail even with \
+         --allow-tool-drift: {:?}",
+        stderr
+    );
+    assert!(
+        stderr.contains("no longer"),
+        "the refusal must name the missing tool(s), got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--orphans=skip"),
+        "the refusal must point at a workable alternative, got:\n{stderr}"
+    );
 }
 
 // ── orphan handling ────────────────────────────────────────────────────────

@@ -319,6 +319,13 @@ enum Cmd {
         /// On non-TTY (CI) the default is abort.
         #[arg(long, value_name = "POLICY")]
         orphans: Option<String>,
+        /// Resume even when the session's recorded tool-registry hash no
+        /// longer matches the current tool set (upgrade, mcp.json edit,
+        /// skill registration change). The mismatch is downgraded to a
+        /// warning; only a redo of an orphan whose tool has vanished
+        /// still refuses.
+        #[arg(long, default_value_t = false)]
+        allow_tool_drift: bool,
         /// The next user message to append to the resumed session
         /// (multi-turn converse). If omitted, a synthetic
         /// "Continue from where you left off." message is appended so
@@ -656,6 +663,7 @@ async fn main() -> anyhow::Result<()> {
                     session: resume_val,
                     from_file: None,
                     orphans: None,
+                    allow_tool_drift: false,
                     message: cli.prompt,
                 }
             } else if cli.continue_session {
@@ -663,6 +671,7 @@ async fn main() -> anyhow::Result<()> {
                     session: None,
                     from_file: None,
                     orphans: None,
+                    allow_tool_drift: false,
                     message: cli.prompt,
                 }
             } else if let Some(prompt) = cli.prompt {
@@ -1079,6 +1088,7 @@ async fn main() -> anyhow::Result<()> {
             session,
             from_file,
             orphans,
+            allow_tool_drift,
             message,
         } => {
             cli::resume::cmd_resume(
@@ -1086,6 +1096,7 @@ async fn main() -> anyhow::Result<()> {
                 session,
                 from_file,
                 orphans,
+                allow_tool_drift,
                 message,
                 cli.max_transcript_chars,
                 cli.transcript_out,
