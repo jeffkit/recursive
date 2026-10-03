@@ -427,3 +427,32 @@ but are no longer maintained:
 
 These files are kept for historical reference but should NOT be updated
 or relied upon for current state.
+
+## 11. Engine-error semantics & impl budget (2026-10-03)
+
+With the v3 host (RECURSIVE_HOST_V3=1), an `engine_error` terminal is no
+longer a full loss — the per-issue checkpoint + worktree survive terminal
+recycle (checkpoint-activity exemption), so keeper re-dispatch resumes from
+the last successful node and the impl agent resumes its session (L2).
+Timeout-class failures (impl hitting its AGENTRUN wall) behave the same way:
+no in-place retry (D4), but the redeploy continues where it left off.
+
+Operational notes:
+
+- **Force a full L1 restart** for an issue: delete
+  `~/.issue-keeper/pipeline/recursive-<n>/checkpoint.json` before the next
+  dispatch. (The worktree-exemption only protects runs referenced by a live
+  checkpoint; removing it restores the legacy discard path.)
+- **Impl budget** is configurable: keeper injects `RECURSIVE_IMPL_TIMEOUT`
+  (seconds) via engine_env; the flow falls back to 7200 (2h). Raise it for
+  repos whose impl legitimately outgrows 2h (10-03 evidence: timed-out impls
+  were still actively compiling after 566 transcript turns — productive, not
+  stuck). The keeper-side run budget (`pipeline_timeout_secs`, default 8h in
+  production config) remains the outer wall; the v3 host winds down
+  gracefully 300s before it via the injected `RECURSIVE_RUN_DEADLINE`.
+- **Known window (console dispatch mode only)**: if the POST
+  /api/executions times out after the server committed, keeper's re-dispatch
+  creates a second execution (the in-flight anchor is written after the POST
+  returns). `console_zombie_secs` eventually reaps the orphan; the durable
+  fix (anchor-first + client-supplied execution_id) is deferred to the G5/G6
+  protocol owners.

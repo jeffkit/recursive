@@ -96,6 +96,12 @@ def self_improve_v2(INPUT):
     run_dir = INPUT.run_dir
     agent = INPUT.agent
     reviewer = INPUT.reviewer
+    # impl 预算（秒）：bridge 经 RECURSIVE_IMPL_TIMEOUT 注入，缺省 2h 硬墙。
+    # 10-03 实证：#78/#68 的 impl 撞墙时转录仍在活跃推进（566 轮 rustc 编译），
+    # 属合法长活被截断而非卡死——拉长预算比多轮 engine_error 重派省（重派本身
+    # 幂等续跑，但每轮吃 reaper 周期与台账噪音）。旧 checkpoint 无此键 → or 7200
+    # 兜底，续跑零回归。
+    impl_timeout = INPUT.impl_timeout_secs or 7200
 
     # ── preflight（唯一复杂 code 节点）──
     pre = CODE(id="preflight", lang="python", input={"repo": repo, "run_dir": run_dir}, code=(
@@ -221,7 +227,7 @@ def self_improve_v2(INPUT):
     # session=pre.last_sid：续跑且找到既往会话时走 resume（L2，agent 带全量
     # 上下文接着干）；全新 run / 无会话时为空串，AGENTRUN 自然退化 run 形态，
     # 单节点无分支。
-    impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=7200,
+    impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
                     session=pre.last_sid)
     chg = CHILD(input={"wt": pre.worktree}, flow=has_changes)
     if chg.any == False:

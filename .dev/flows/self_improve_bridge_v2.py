@@ -210,7 +210,8 @@ def main() -> int:
                 flow_obj=fl,
                 handler_specs=[(StepTracker, state_path)],
                 params={"goal": goal, "repo": args.repo, "run_dir": str(run_dir),
-                        "agent": args.agent, "reviewer": args.reviewer},
+                        "agent": args.agent, "reviewer": args.reviewer,
+                        "impl_timeout_secs": int(os.environ.get("RECURSIVE_IMPL_TIMEOUT", "7200"))},
                 issue_root=issue_root, run_dir=run_dir, state_path=state_path,
                 max_node_retries=int(os.environ.get("RECURSIVE_NODE_RETRIES", "1")),
                 deadline=os.environ.get("RECURSIVE_RUN_DEADLINE"),
@@ -233,6 +234,7 @@ def main() -> int:
             result = ex.execute(fl, params={
                 "goal": goal, "repo": args.repo, "run_dir": str(run_dir),
                 "agent": args.agent, "reviewer": args.reviewer,
+                "impl_timeout_secs": int(os.environ.get("RECURSIVE_IMPL_TIMEOUT", "7200")),
             })
             verdict = _verdict_of(result)
         except Exception as e:  # 引擎级失败也要落 verdict，supervisor 才有终态
