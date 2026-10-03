@@ -270,6 +270,52 @@ impl Tool for EnterPlanModeTool {
 // ExitPlanModeTool
 // ---------------------------------------------------------------------------
 
+/// Why an approval wait ended without a reviewer decision (issue #48).
+///
+/// The wait has three concurrent escape hatches — reviewer decision,
+/// wall-clock timeout, interrupt token — and each failure path needs a
+/// distinct user-facing reason string (finish is data, invariant #7: the
+/// reason reaches the model as the tool result, not as an Err).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    /// The surface's interrupt token fired (REPL Ctrl-C mid-review).
+    Cancelled,
+    /// The bounded wait (issue #47④) expired with no reviewer decision.
+    TimedOut,
+}
+
+/// Outcome of racing the reviewer decision against the interrupt token.
+///
+/// `Cancelled` is a marker, not a fabricated [`PlanApprovalResult`]: the
+/// caller must convert it via [`ExitPlanModeTool::reject_with`] so the
+/// rejection goes through [`PlanApprovalGate::reject`] and `pending_plan`
+/// is cleared (the timeout path's cleanup contract).
+enum WaitOutcome {
+    /// The reviewer decided before the token fired.
+    Decision(PlanApprovalResult),
+    /// The interrupt token fired; caller routes through `gate.reject()`.
+    Cancelled,
+}
+
+impl CancelReason {
+    fn message(self, limit: Option<std::time::Duration>) -> String {
+        match self {
+            // ASCII only: this reason is injected into the model transcript,
+            // where raw control characters have burned the OpenAI API before.
+            CancelReason::Cancelled => {
+                "plan approval cancelled: interrupt received while waiting for reviewer decision"
+                    .to_string()
+            }
+            CancelReason::TimedOut => match limit {
+                Some(limit) => {
+                    format!("plan approval timed out after {limit:?}: no reviewer decision")
+                }
+                None => "plan approval timed out: no reviewer decision".to_string(),
+            },
+        }
+    }
+}
+
 /// Tool that exits plan mode and presents the agent's plan for human review.
 ///
 /// Execution **blocks** until the human reviewer calls
@@ -286,6 +332,13 @@ pub struct ExitPlanModeTool {
     /// wait-forever semantics for TUI / HTTP; REPL sets a finite bound so
     /// an approval nobody answers still ends the turn (finish is data, #7).
     approval_wait_timeout: Option<std::time::Duration>,
+    /// Optional cancellation token (issue #48 / Goal 409). Cancelled when the
+    /// surface's interrupt fires (REPL Ctrl-C), this ends the approval wait
+    /// immediately as a rejection — closing the last uncancellable await: the
+    /// between-step token probes cannot fire while the turn is parked inside
+    /// this tool's `wait_for_approval`, so without the token even a
+    /// wait-forever host (TUI / SDK) could not be interrupted mid-review.
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ExitPlanModeTool {
@@ -299,6 +352,7 @@ impl ExitPlanModeTool {
             event_sink,
             permissions: None,
             approval_wait_timeout: None,
+            cancellation_token: None,
         }
     }
 
@@ -310,11 +364,55 @@ impl ExitPlanModeTool {
         self
     }
 
+    /// Make the approval wait cancellable (issue #48 / Goal 409). When the
+    /// token is cancelled while a plan is pending review, the wait ends
+    /// immediately as a rejection instead of parking until the timeout (or
+    /// forever on wait-forever hosts). The rejection routes through
+    /// [`PlanApprovalGate::reject`] so `pending_plan` is cleared — the same
+    /// cleanup contract as the timeout branch.
+    pub fn with_cancellation_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
     /// Attach a permissions config so the tool can validate that the plan
     /// covers tools in `Plan` mode.
     pub fn with_permissions(mut self, permissions: Arc<PermissionsConfig>) -> Self {
         self.permissions = Some(permissions);
         self
+    }
+
+    /// Race the reviewer decision against the interrupt token.
+    ///
+    /// A `notified()`-based loop can miss a cancel that lands between polls,
+    /// but `CancellationToken::cancelled()` is permit-based, so a signal that
+    /// arrives before the select is registered is still observed.
+    ///
+    /// Returns a marker instead of fabricating a `Rejected` result so the
+    /// caller can route the cancel through [`Self::reject_with`] — every
+    /// non-decision exit must clear `pending_plan` via `gate.reject()`.
+    async fn wait_cancellable(
+        wait: impl std::future::Future<Output = PlanApprovalResult>,
+        token: &tokio_util::sync::CancellationToken,
+    ) -> WaitOutcome {
+        tokio::select! {
+            result = wait => WaitOutcome::Decision(result),
+            _ = token.cancelled() => WaitOutcome::Cancelled,
+        }
+    }
+
+    /// End the wait without a reviewer decision: write the rejection through
+    /// [`PlanApprovalGate::reject`] so `pending_plan` is cleared (otherwise a
+    /// later compaction would re-inject a plan that is no longer awaiting
+    /// approval) and surface the outcome as data, not an Err (invariant #7).
+    fn reject_with(
+        &self,
+        reason: CancelReason,
+        limit: Option<std::time::Duration>,
+    ) -> PlanApprovalResult {
+        let message = reason.message(limit);
+        self.gate.reject(message.clone());
+        PlanApprovalResult::Rejected { reason: message }
     }
 }
 
@@ -378,24 +476,39 @@ impl Tool for ExitPlanModeTool {
             })
             .await;
 
-        // Block until the human makes a decision (bounded when the host set
-        // an approval wait timeout — issue #47④; a timed-out wait surfaces
-        // as a rejection so the turn can finish).
-        // No lock is held across this await (see PlanApprovalGate::wait_for_approval).
-        let result = match self.approval_wait_timeout {
-            Some(limit) => match tokio::time::timeout(limit, self.gate.wait_for_approval()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    // Route through gate.reject() so `pending_plan` is
-                    // cleared — otherwise a later compaction would re-inject
-                    // a plan that is no longer awaiting approval.
-                    let reason =
-                        format!("plan approval timed out after {limit:?}: no reviewer decision");
-                    self.gate.reject(reason.clone());
-                    PlanApprovalResult::Rejected { reason }
+        // Block until the human makes a decision. Three escape hatches race
+        // on the same await (no lock is held across it — see
+        // PlanApprovalGate::wait_for_approval):
+        //   1. the reviewer decides (approve / reject) — normal path;
+        //   2. the bounded wait expires (issue #47④) — surfaces as rejection;
+        //   3. the interrupt token fires (issue #48 / Goal 409) — Ctrl-C
+        //      must end the wait immediately; the between-step cancel probes
+        //      cannot fire while the turn is parked inside this await.
+        // Every non-decision path routes through gate.reject() so
+        // `pending_plan` is cleared — otherwise a later compaction would
+        // re-inject a plan that is no longer awaiting approval.
+        let wait = self.gate.wait_for_approval();
+        let result = match (self.approval_wait_timeout, self.cancellation_token.as_ref()) {
+            (Some(limit), Some(token)) => {
+                match tokio::time::timeout(limit, Self::wait_cancellable(wait, token)).await {
+                    Ok(WaitOutcome::Decision(result)) => result,
+                    Ok(WaitOutcome::Cancelled) => {
+                        Self::reject_with(self, CancelReason::Cancelled, None)
+                    }
+                    Err(_) => Self::reject_with(self, CancelReason::TimedOut, Some(limit)),
                 }
+            }
+            (None, Some(token)) => {
+                tokio::select! {
+                    result = wait => result,
+                    _ = token.cancelled() => Self::reject_with(self, CancelReason::Cancelled, None),
+                }
+            }
+            (Some(limit), None) => match tokio::time::timeout(limit, wait).await {
+                Ok(result) => result,
+                Err(_) => Self::reject_with(self, CancelReason::TimedOut, Some(limit)),
             },
-            None => self.gate.wait_for_approval().await,
+            (None, None) => wait.await,
         };
 
         match result {
@@ -932,5 +1045,130 @@ mod tests {
             Some("plan v2"),
             "pending_plan should reflect the latest plan text"
         );
+    }
+
+    // -- Issue #48 / Goal 409: the approval wait is cancellable --------------
+
+    /// A cancelled interrupt token must end the wait immediately as a
+    /// rejection (data, not Err) even with NO timeout installed — this is
+    /// the wait-forever host (TUI / SDK) rescue path.
+    #[tokio::test]
+    async fn cancelled_token_ends_wait_forever_approval_immediately() {
+        let gate = make_gate();
+        let token = tokio_util::sync::CancellationToken::new();
+        let tool = ExitPlanModeTool::new(gate.clone(), Arc::new(NullSink))
+            .with_cancellation_token(token.clone());
+
+        // Cancel before the wait starts: the select must observe the
+        // pre-existing permit, not miss it.
+        token.cancel();
+
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({ "plan": "do the thing" }))
+            .await
+            .expect("execute must return (finish is data, not Err)");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "cancelled wait must not park: took {:?}",
+            start.elapsed()
+        );
+        assert!(out.contains("\"approved\":false"), "got: {out}");
+        assert!(out.contains("cancelled"), "got: {out}");
+        assert!(
+            gate.pending_plan().is_none(),
+            "cancel must clear pending_plan so compaction cannot re-inject the plan"
+        );
+    }
+
+    /// A cancel that lands *while* the wait is in flight (the real Ctrl-C
+    /// timing) must also end it immediately.
+    #[tokio::test]
+    async fn mid_wait_cancel_ends_approval_wait() {
+        let gate = make_gate();
+        let token = tokio_util::sync::CancellationToken::new();
+        let tool = Arc::new(
+            ExitPlanModeTool::new(gate.clone(), Arc::new(NullSink))
+                .with_cancellation_token(token.clone()),
+        );
+
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({ "plan": "do the thing" }))
+            .await
+            .expect("execute must return");
+        canceller.await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "mid-wait cancel must end the wait: took {:?}",
+            start.elapsed()
+        );
+        assert!(out.contains("\"approved\":false"), "got: {out}");
+        assert!(out.contains("cancelled"), "got: {out}");
+        assert!(gate.pending_plan().is_none());
+    }
+
+    /// With BOTH a timeout and a token installed (the REPL shape), a cancel
+    /// that fires before the timeout must win — Ctrl-C must not have to wait
+    /// out the 300s bound.
+    #[tokio::test]
+    async fn cancel_wins_over_timeout_in_repl_shape() {
+        let gate = make_gate();
+        let token = tokio_util::sync::CancellationToken::new();
+        let tool = ExitPlanModeTool::new(gate.clone(), Arc::new(NullSink))
+            .with_approval_wait_timeout(std::time::Duration::from_secs(60))
+            .with_cancellation_token(token.clone());
+
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({ "plan": "do the thing" }))
+            .await
+            .expect("execute must return");
+        canceller.await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "cancel must beat the 60s timeout: took {:?}",
+            start.elapsed()
+        );
+        assert!(out.contains("\"approved\":false"), "got: {out}");
+        assert!(out.contains("cancelled"), "got: {out}");
+        assert!(
+            gate.pending_plan().is_none(),
+            "cancel must clear pending_plan (gate.reject() path) so compaction cannot re-inject a plan that is no longer awaiting approval"
+        );
+    }
+
+    /// The reviewer path still wins when the token is armed but never
+    /// cancelled — the token must not break normal approvals.
+    #[tokio::test]
+    async fn armed_token_does_not_block_reviewer_approval() {
+        let gate = make_gate();
+        let token = tokio_util::sync::CancellationToken::new();
+        let tool = Arc::new(
+            ExitPlanModeTool::new(gate.clone(), Arc::new(NullSink)).with_cancellation_token(token),
+        );
+
+        let gate_clone = gate.clone();
+        let approve_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            gate_clone.approve();
+        });
+
+        let out = tool
+            .execute(serde_json::json!({ "plan": "do the thing" }))
+            .await
+            .expect("execute must return");
+        approve_handle.await.unwrap();
+        assert!(out.contains("\"approved\":true"), "got: {out}");
     }
 }

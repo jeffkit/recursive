@@ -2694,6 +2694,25 @@ async fn run_once(
     cli::output::exit_for_finish(&outcome.finish_reason, outcome.steps)
 }
 
+/// Issue #48 / Goal 409: REPL plan-approval wait bound, env-tunable.
+///
+/// `RECURSIVE_PLAN_APPROVAL_TIMEOUT_SECS` — unset/blank keeps the #47④
+/// default of 300s; `0` restores wait-forever semantics (safe now that the
+/// interrupt token cancels the wait); any other value is the bound in
+/// seconds. A non-numeric value falls back to the default rather than
+/// failing REPL startup (the bound is a safety net, not a feature flag).
+fn plan_approval_timeout_secs() -> Option<u64> {
+    const DEFAULT_SECS: u64 = 300;
+    match std::env::var("RECURSIVE_PLAN_APPROVAL_TIMEOUT_SECS") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(secs),
+            Err(_) => Some(DEFAULT_SECS),
+        },
+        _ => Some(DEFAULT_SECS),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn repl(
     config: Config,
@@ -2789,8 +2808,13 @@ async fn repl(
 
         // Fresh ChannelSink per turn; swap back to NullSink when done.
         // Issue #47④: bound the REPL's plan-approval wait so an unanswered
-        // exit_plan_mode review cannot park the turn forever.
-        runtime.set_approval_wait_timeout_secs(300);
+        // exit_plan_mode review cannot park the turn forever. Env-tunable
+        // (issue #48 / Goal 409): RECURSIVE_PLAN_APPROVAL_TIMEOUT_SECS,
+        // 0 restores wait-forever (the interrupt token still rescues it).
+        match plan_approval_timeout_secs() {
+            Some(secs) => runtime.set_approval_wait_timeout_secs(secs),
+            None => runtime.clear_approval_wait_timeout(),
+        }
         let (sink, event_rx) = ChannelSink::new();
         runtime.set_event_sink(Arc::new(sink));
 
@@ -2802,7 +2826,10 @@ async fn repl(
 
         // Install this turn's token (kernel step boundary + non-streaming LLM
         // select) and mirror it into the agent tool's slot for parallel
-        // workers. `end_turn` runs on every exit path below.
+        // workers. Issue #48 / Goal 409: the same token now also arms the
+        // `exit_plan_mode` approval wait, so Ctrl-C ends a parked plan review
+        // immediately instead of after the timeout. `end_turn` runs on every
+        // exit path below.
         runtime.set_interrupt_token(interrupt.begin_turn());
         let outcome = runtime.run(goal.to_string()).await;
         interrupt.end_turn();
@@ -3574,6 +3601,65 @@ mod tests {
         };
         assert!(!has_tool_calls(&[]));
         assert!(has_tool_calls(std::slice::from_ref(&call)));
+    }
+
+    /// Issue #48 / Goal 409: the REPL plan-approval timeout is env-tunable.
+    /// One test owns the env var (parallel tests would race on it).
+    #[test]
+    fn plan_approval_timeout_env_default_override_and_zero_disables() {
+        let var = "RECURSIVE_PLAN_APPROVAL_TIMEOUT_SECS";
+        let saved = std::env::var(var).ok();
+
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_eq!(
+            plan_approval_timeout_secs(),
+            Some(300),
+            "unset keeps the #47④ 300s default"
+        );
+
+        unsafe {
+            std::env::set_var(var, "0");
+        }
+        assert_eq!(
+            plan_approval_timeout_secs(),
+            None,
+            "0 restores wait-forever (the interrupt token still rescues it)"
+        );
+
+        unsafe {
+            std::env::set_var(var, "45");
+        }
+        assert_eq!(plan_approval_timeout_secs(), Some(45));
+
+        unsafe {
+            std::env::set_var(var, " 120 ");
+        }
+        assert_eq!(plan_approval_timeout_secs(), Some(120), "trim before parse");
+
+        unsafe {
+            std::env::set_var(var, "banana");
+        }
+        assert_eq!(
+            plan_approval_timeout_secs(),
+            Some(300),
+            "garbage falls back to the default instead of failing REPL startup"
+        );
+
+        unsafe {
+            std::env::set_var(var, "");
+        }
+        assert_eq!(
+            plan_approval_timeout_secs(),
+            Some(300),
+            "blank counts as unset"
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var(var, v) },
+            None => unsafe { std::env::remove_var(var) },
+        }
     }
 
     #[test]

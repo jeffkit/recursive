@@ -1338,6 +1338,99 @@ async fn approval_timeout_lets_turn_finish_with_rejection() {
     );
 }
 
+/// Issue #48 / Goal 409 acceptance: the full-turn shape of the REPL bug.
+///
+/// The REPL builds once, then per turn: `set_approval_wait_timeout_secs` →
+/// `set_event_sink` → `set_interrupt_token(per-turn token)` → `run()`. A
+/// model that calls `exit_plan_mode` must NOT park the turn when the
+/// interrupt token fires mid-review: the run returns with
+/// `FinishReason::Cancelled`, the transcript holds the tool result
+/// (`"approved":false … cancelled`), and `pending_plan` is cleared.
+///
+/// This is the test gap the original #48 report called out — the earlier
+/// coverage only pinned "the default registry has no plan tools" and "the
+/// timeout rejects", not "the token reaches the wait through the sink swap".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_token_cancels_plan_approval_mid_turn() {
+    use recursive::event::{EventSink, NullSink};
+    use recursive::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME;
+
+    let script = vec![
+        Completion {
+            content: "proposing a plan".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: EXIT_PLAN_MODE_TOOL_NAME.into(),
+                arguments: json!({"plan": "I will write a file"}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        // Never reached — the turn ends as Cancelled inside the tool await.
+        Completion {
+            content: "unreachable".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let tools = ToolRegistry::new(Arc::new(recursive::tools::LocalTransport));
+    let mut runtime = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(script)))
+        .tools(tools)
+        .system_prompt("test")
+        .max_steps(5)
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+
+    // The REPL per-turn wiring, in the REPL's exact order. No timeout here:
+    // the token alone must be able to end the wait (wait-forever host).
+    runtime.set_event_sink(Arc::new(NullSink) as Arc<dyn EventSink>);
+    let turn_token = tokio_util::sync::CancellationToken::new();
+    runtime.set_interrupt_token(turn_token.clone());
+
+    // Ctrl-C lands while the model is parked inside exit_plan_mode.
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        turn_token.cancel();
+    });
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.run("go"))
+        .await
+        .expect("turn must return on Ctrl-C (issue #48: it used to park forever)")
+        .unwrap();
+    canceller.await.unwrap();
+
+    assert_eq!(
+        outcome.finish_reason,
+        FinishReason::Cancelled,
+        "the turn must be recorded as Cancelled, got {:?}",
+        outcome.finish_reason
+    );
+
+    let tool_msgs: Vec<&Message> = runtime
+        .transcript()
+        .iter()
+        .filter(|m| m.role == recursive::message::Role::Tool)
+        .collect();
+    assert_eq!(tool_msgs.len(), 1, "one tool result (exit_plan_mode)");
+    assert!(
+        tool_msgs[0].content.contains("\"approved\":false")
+            && tool_msgs[0].content.contains("cancelled"),
+        "exit_plan_mode result must be a token rejection: {}",
+        tool_msgs[0].content
+    );
+    assert_eq!(
+        runtime.plan_approval_gate().pending_plan(),
+        None,
+        "cancelled approval must clear pending_plan"
+    );
+}
+
 // ============================================================================
 // Goal-317: Memory + skill loading pipeline integration test
 //

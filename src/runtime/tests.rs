@@ -1841,6 +1841,117 @@ async fn set_event_sink_respects_a_filtered_exit_plan_mode() {
     );
 }
 
+// ── Issue #48 / Goal 409: the interrupt token reaches the approval wait ──
+
+/// Regression for issue #48: `set_event_sink` must carry the per-turn
+/// interrupt token onto the re-registered `ExitPlanModeTool`. Without the
+/// mirror, the REPL's per-turn sink swap replaces the token-carrying tool
+/// with a tokenless one and Ctrl-C cannot end a parked plan review.
+///
+/// Observable at the tool level: dispatch the registered `exit_plan_mode`
+/// after `set_interrupt_token` + `set_event_sink` (the exact REPL order) and
+/// cancel the runtime's kernel token mid-wait — the tool must return a
+/// rejected result immediately, and `pending_plan` must be cleared.
+#[tokio::test]
+async fn set_event_sink_preserves_the_interrupt_token_on_exit_plan_mode() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+
+    // The exact REPL per-turn order: token first, then the sink swap.
+    let token = tokio_util::sync::CancellationToken::new();
+    rt.set_interrupt_token(token.clone());
+    let (sink, _rx) = crate::event::ChannelSink::new();
+    rt.set_event_sink(Arc::new(sink));
+
+    let plan_tool = rt
+        .kernel
+        .tools()
+        .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+        .expect("plan tool present (interactive registry, no filter)");
+    let token_clone = token.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token_clone.cancel();
+    });
+
+    let start = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        plan_tool.execute(json!({ "plan": "p" })),
+    )
+    .await
+    .expect("approval wait must not park past the cancel")
+    .expect("execute returns Ok (finish is data)");
+    canceller.await.unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "Ctrl-C must end the wait immediately, took {start:?}"
+    );
+    assert!(out.contains("\"approved\":false"), "got: {out}");
+    assert!(out.contains("cancelled"), "got: {out}");
+    assert!(
+        rt.plan_approval_gate().pending_plan().is_none(),
+        "cancelled wait must clear pending_plan (no compaction resurrection)"
+    );
+}
+
+/// `set_approval_wait_timeout_secs` / `clear_approval_wait_timeout` must also
+/// refresh the registered tool (the REPL reads the env once per turn; the
+/// timeout only takes effect if the registered tool is rebuilt).
+#[tokio::test]
+async fn timeout_setter_and_clearer_refresh_the_registered_plan_tool() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+
+    rt.set_approval_wait_timeout_secs(1);
+    let plan_tool = rt
+        .kernel
+        .tools()
+        .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+        .expect("plan tool present");
+    let start = std::time::Instant::now();
+    let out = plan_tool
+        .execute(json!({ "plan": "p" }))
+        .await
+        .expect("bounded wait must return");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "1s timeout must bound the wait, took {start:?}"
+    );
+    assert!(out.contains("timed out"), "got: {out}");
+
+    // Clearing restores wait-forever semantics, but the token (installed
+    // after the clear) still rescues the wait — no uncancellable path.
+    rt.clear_approval_wait_timeout();
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_for_cancel = token.clone();
+    rt.set_interrupt_token(token);
+    let plan_tool = rt
+        .kernel
+        .tools()
+        .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+        .expect("plan tool present");
+    token_for_cancel.cancel();
+    let start = std::time::Instant::now();
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        plan_tool.execute(json!({ "plan": "p" })),
+    )
+    .await
+    .expect("wait-forever host must still be cancellable")
+    .expect("execute returns Ok");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(out.contains("cancelled"), "got: {out}");
+}
+
 // ── is_context_window_exceeded ──────────────────────────────────────────
 
 #[test]

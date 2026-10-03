@@ -174,6 +174,12 @@ pub struct AgentRuntime {
     /// Issue #47④: optional bound on the `exit_plan_mode` approval wait for
     /// sink-swapping hosts (REPL). `None` keeps wait-forever semantics.
     approval_wait_timeout_secs: Option<u64>,
+    /// Issue #48 / Goal 409: the surface's per-turn interrupt token, mirrored
+    /// here so `set_event_sink` can re-register `ExitPlanModeTool` *with* the
+    /// token on every swap. Without the mirror, the REPL's per-turn
+    /// `set_event_sink` call would replace the token-carrying tool with a
+    /// tokenless one and the approval wait would become uncancellable again.
+    plan_approval_interrupt_token: Option<tokio_util::sync::CancellationToken>,
     /// Goal-202: pre-confirmation gate — shared with `RequestPlanModeTool`.
     /// `approve_plan_mode_request` / `reject_plan_mode_request` forward here.
     plan_mode_request_gate: Arc<PlanModeRequestGate>,
@@ -859,8 +865,21 @@ impl AgentRuntime {
     /// [`FinishReason::Cancelled`](crate::agent::FinishReason::Cancelled) at
     /// the next step boundary.  This method replaces any previously installed
     /// token — call it before each `run()` so a fresh token is in place.
+    ///
+    /// Issue #48 / Goal 409: the token is also mirrored onto the registered
+    /// `ExitPlanModeTool` (when present) so a plan-approval wait is
+    /// cancellable *inside* the await — the between-step cancel probes can
+    /// never fire while the turn is parked waiting for a reviewer decision.
+    /// Hosts that swap the event sink per turn (REPL) keep this property
+    /// because `set_event_sink` re-attaches the mirrored token on every
+    /// re-registration.
     pub fn set_interrupt_token(&mut self, token: tokio_util::sync::CancellationToken) {
+        self.plan_approval_interrupt_token = Some(token.clone());
         self.kernel.shutdown_token = Some(token);
+        // Re-register the plan tool so the new token reaches the approval
+        // wait. Presence-guarded like the sink fan-out above: never
+        // re-introduce a tool the surface filter dropped (issue #65).
+        self.refresh_plan_tool();
     }
 
     /// Set the session id used for tracing-span labels and turn log lines.
@@ -907,19 +926,11 @@ impl AgentRuntime {
         // Issue #47④: hosts that opt in (REPL) get a bounded approval wait
         // so an unanswered plan review cannot park the turn forever; TUI /
         // SDK hosts keep the default wait-forever semantics.
+        // Issue #48 / Goal 409: the per-turn interrupt token is re-attached
+        // on every re-registration so Ctrl-C can cancel the approval wait
+        // regardless of how many sink swaps happened this turn.
         // Issue #65: same presence guard — re-point, never re-introduce.
-        if self
-            .kernel
-            .tools()
-            .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
-            .is_some()
-        {
-            let mut tool = ExitPlanModeTool::new(self.plan_approval_gate.clone(), sink);
-            if let Some(secs) = self.approval_wait_timeout_secs {
-                tool = tool.with_approval_wait_timeout(std::time::Duration::from_secs(secs));
-            }
-            self.kernel.tools_mut().register_mut(Arc::new(tool));
-        }
+        self.refresh_plan_tool();
     }
 
     /// Enable a bounded approval wait for `exit_plan_mode` when the event
@@ -927,6 +938,38 @@ impl AgentRuntime {
     /// rejected ("plan approval timed out") so the turn can finish (#7).
     pub fn set_approval_wait_timeout_secs(&mut self, secs: u64) {
         self.approval_wait_timeout_secs = Some(secs);
+        self.refresh_plan_tool();
+    }
+
+    /// Remove the bounded approval wait, restoring wait-forever semantics
+    /// (issue #48 / Goal 409: `RECURSIVE_PLAN_APPROVAL_TIMEOUT_SECS=0`).
+    /// The interrupt token, if installed, still cancels the wait.
+    pub fn clear_approval_wait_timeout(&mut self) {
+        self.approval_wait_timeout_secs = None;
+        self.refresh_plan_tool();
+    }
+
+    /// Re-register `ExitPlanModeTool` from the current timeout / interrupt
+    /// token / sink state. Presence-guarded (issue #65): never re-introduces
+    /// a tool the surface filter dropped.
+    fn refresh_plan_tool(&mut self) {
+        if self
+            .kernel
+            .tools()
+            .find_by_name(crate::tools::plan_mode::EXIT_PLAN_MODE_TOOL_NAME)
+            .is_none()
+        {
+            return;
+        }
+        let mut tool =
+            ExitPlanModeTool::new(self.plan_approval_gate.clone(), self.event_sink.clone());
+        if let Some(secs) = self.approval_wait_timeout_secs {
+            tool = tool.with_approval_wait_timeout(std::time::Duration::from_secs(secs));
+        }
+        if let Some(token) = self.plan_approval_interrupt_token.clone() {
+            tool = tool.with_cancellation_token(token);
+        }
+        self.kernel.tools_mut().register_mut(Arc::new(tool));
     }
 
     /// Swap the event sink **without** re-registering any sink-dependent tools.

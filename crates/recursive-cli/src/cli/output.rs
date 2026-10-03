@@ -304,6 +304,11 @@ pub(crate) async fn stream_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
 ///   - on `PlanProposed`: print the plan, ask "Approve plan? [y/n]: ", read stdin,
 ///     and call `gate.approve()` or `gate.reject(&reason)`.
 ///   - on `PlanConfirmed` / `PlanRejected`: print a note.
+///
+/// Issue #48 / Goal 409: until that dialog exists, the plan-approval wait is
+/// the one await where the REPL looks frozen while it is actually waiting on
+/// a reviewer that cannot answer. Print a hint so the "fake hang" is
+/// distinguishable from a real one (Ctrl-C now ends the wait).
 pub(crate) async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -312,6 +317,13 @@ pub(crate) async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEven
             }
             AgentEvent::ToolCall { ref name, .. } => {
                 eprintln!("  ↳ {name}");
+            }
+            AgentEvent::PlanProposed { ref plan_text, .. } => {
+                println!("[plan] proposed: {plan_text}");
+                eprintln!(
+                    "[plan] waiting for plan approval — no reviewer is attached in repl; \
+Ctrl-C to cancel the wait (use tui/http surfaces to approve or reject)"
+                );
             }
             _ => {}
         }
