@@ -313,9 +313,11 @@ def self_improve_v2(INPUT):
     # UNAVAILABLE / 修后仍不过均 failed-preserved 并落盘评审原文。
     review_prompt = (
         "You are an independent reviewer (different provider). In the current "
-        "workspace, run `git diff main` to see the full change (three-dot is not "
-        "needed; this covers both uncommitted edits and commits inherited from a "
-        "resumed run, which `git diff HEAD` would miss), and Read any "
+        "workspace, run `git diff $(git merge-base main HEAD)` to see the full "
+        "change (relative to the branch point: covers both uncommitted edits and "
+        "commits inherited from a resumed run, while excluding main-side commits "
+        "that landed after this branch was cut — plain `git diff main` would show "
+        "those as inverted deletions and waste your attention), and Read any "
         "source files you need to cross-check claims.\n"
         "Review for correctness, regressions and contract violations.\n"
         'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
