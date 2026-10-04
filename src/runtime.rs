@@ -1452,13 +1452,37 @@ impl AgentRuntime {
     ///   because `execute_kernel_turn` folds the attempt's committed messages
     ///   back into the transcript; a turn that already answered is never
     ///   replayed (`AgentRuntime::retry_is_safe`).
+    ///
+    /// Loop turns run without the per-step retry (issue #100): the loop retry
+    /// re-drives the turn from the failed step, so nesting the two budgets
+    /// would only multiply the worst case (`step_retry × loop_retry` calls and
+    /// both backoff schedules) for the same recovery. The kernel's policy is
+    /// restored when the loop ends.
     pub async fn run_loop(
         &mut self,
         initial_goal: impl Into<String>,
         wakeup_slot: &crate::tools::WakeupSlot,
     ) -> Result<Vec<RuntimeOutcome>> {
+        let step_retry = std::mem::replace(
+            &mut self.kernel.step_retry,
+            crate::llm::RetryPolicy {
+                max_retries: 0,
+                ..Default::default()
+            },
+        );
+        let result = self.run_loop_inner(initial_goal.into(), wakeup_slot).await;
+        self.kernel.step_retry = step_retry;
+        result
+    }
+
+    /// Body of [`Self::run_loop`], run with the per-step retry disabled.
+    async fn run_loop_inner(
+        &mut self,
+        initial_goal: String,
+        wakeup_slot: &crate::tools::WakeupSlot,
+    ) -> Result<Vec<RuntimeOutcome>> {
         let mut outcomes = Vec::new();
-        let mut next_goal = initial_goal.into();
+        let mut next_goal = initial_goal;
 
         loop {
             let outcome = match self.run_turn_with_retry(&next_goal).await {

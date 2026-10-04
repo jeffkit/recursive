@@ -1221,7 +1221,22 @@ pub(super) async fn send_session_message(
         tx.clone()
     };
 
-    // Lock the runtime for this turn (serializes concurrent requests per session).
+    // Per-session run fence (issue #96): at most one in-flight turn per
+    // session. Before this fence, a mobile timeout-retry would first consume
+    // a global admission permit, then queue on the runtime Mutex, then re-run
+    // the same prompt — double LLM spend, and enough retries parked the whole
+    // pool as waiters. Refuse the duplicate with 409 *before* it touches a
+    // permit, so a retry never occupies a global run slot.
+    let _run_guard = state
+        .host
+        .try_begin_run(format!("session:{id}"))
+        .ok_or_else(|| {
+            ApiError::conflict(format!(
+                "a run is already active for session '{id}'; \
+                 wait for it to finish before sending another message"
+            ))
+            .with_retry_after(5)
+        })?;
 
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
@@ -1231,6 +1246,9 @@ pub(super) async fn send_session_message(
         .acquire_run()
         .await
         .map_err(|e| admission_error(e, &state.host.admission()))?;
+    // Lock the runtime for this turn. The fence above already serializes the
+    // session path, so this lock is uncontended for concurrent same-session
+    // requests (it still guards against cross-path holders, e.g. triggers).
     let mut runtime = runtime_arc.lock().await;
 
     // Goal-170: install a fresh cancellation token so `POST .../interrupt`
@@ -2804,6 +2822,84 @@ mod tests {
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         (state, runtime_arc)
+    }
+
+    // ── issue #96: sessions path fences concurrent runs ───────────────
+
+    /// A second POST for a session whose run is already in flight must be
+    /// refused with 409 + Retry-After immediately — it must not queue on the
+    /// runtime lock or consume a global admission permit while waiting.
+    #[tokio::test]
+    async fn send_session_message_fences_concurrent_run_with_409() {
+        use axum::response::IntoResponse;
+
+        let sid = "test-run-fence";
+        let (state, runtime_arc) = test_app_state_with_session(sid).await;
+
+        // Simulate the in-flight turn: hold the per-session fence and the
+        // runtime lock exactly as the first request does while its turn runs.
+        let fence = state
+            .host
+            .try_begin_run(format!("session:{sid}"))
+            .expect("first run acquires the fence");
+        let lock = runtime_arc.lock().await;
+
+        let resp = send_session_message(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(SessionMessageRequest {
+                content: "retry the same prompt".into(),
+                notify: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "duplicate POST must be fenced with 409"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .expect("Retry-After header missing")
+                .to_str()
+                .unwrap(),
+            "5"
+        );
+        assert_eq!(
+            state.host.admission().runs_in_flight(),
+            0,
+            "a fenced duplicate must not consume a global run slot"
+        );
+
+        drop(lock);
+        drop(fence);
+    }
+
+    /// The fence must be released when the handler returns, so the next turn
+    /// for the same session is not blocked (here the turn itself fails — the
+    /// mock has no scripted completions — which also covers the error path).
+    #[tokio::test]
+    async fn send_session_message_releases_fence_after_turn() {
+        let sid = "test-run-fence-release";
+        let (state, _) = test_app_state_with_session(sid).await;
+
+        let _ = send_session_message(
+            State(state.clone()),
+            Path(sid.to_string()),
+            Json(SessionMessageRequest {
+                content: "hello".into(),
+                notify: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            state.host.try_begin_run(format!("session:{sid}")).is_some(),
+            "the run fence must be free once the handler returns"
+        );
     }
 
     #[tokio::test]

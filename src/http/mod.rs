@@ -1041,6 +1041,14 @@ pub fn build_openapi_spec() -> serde_json::Value {
                                 }
                             }
                         },
+                        "409": {
+                            "description": "A run is already active for this session",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
                         "500": {
                             "description": "Internal server error",
                             "content": {
