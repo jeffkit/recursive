@@ -416,6 +416,26 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
     # 里那棵——无人清就是 8-12G/棵的永久泄漏）。
     resumed_wt: list[str | None] = [None]
 
+    def _refresh_identity(ctx):
+        """恢复轮刷新 agent/reviewer：定义「谁在跑」的参数跟随本次派发。
+
+        plaita 恢复只还原 context 不重注 params（strategies.py:217-222），
+        $NODE.agent/$INPUT.agent 会沿用首派时的值——切换模型/端点后恢复轮
+        仍以旧值起跑（2026-10-04 实证：GLM→DeepSeek 切档后整批 resume 因
+        checkpoint 固化的 glm53-flash 打向已耗尽配额秒死，node retries
+        exhausted）。其余 context 项（run_dir/worktree 锚点、时间戳等）保持
+        checkpoint 原值——worktree 锚点本就必须指旧 run。"""
+        if not isinstance(ctx, dict):
+            return ctx
+        for key in ("agent", "reviewer"):
+            val = params.get(key)
+            if not val:
+                continue
+            for holder in (ctx.get("$INPUT"), ctx.get("$NODE")):
+                if isinstance(holder, dict) and holder.get(key):
+                    holder[key] = val
+        return ctx
+
     def _ckpt_load() -> dict | None:
         try:
             raw = json.loads(ckpt.read_text())
@@ -434,7 +454,7 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
         if not Path(wt).exists():
             return None                                          # worktree 闸 → L1（O2）
         resumed_wt[0] = wt
-        return raw.get("context")
+        return _refresh_identity(raw.get("context"))
 
     # 最近一次 on_node_start 的节点 id（闭包可变容器；StepTracker 契约不动，
     # 回调本就流经每个节点开始事件——s13 归因修复的数据源之一）。

@@ -60,7 +60,8 @@ def _route_agent(self, execution):
             sid = str(execution.evaluate(raw_sid) or "")
     except Exception:
         sid = ""
-    CALLS.append(("agentrun", self.id, prompt[:48], sid))
+    agent_name = _eval(self, execution, "agent")   # s29：恢复轮 agent 刷新判据
+    CALLS.append(("agentrun", self.id, prompt[:48], sid, agent_name))
     if prompt.startswith("#"):                     # impl：goal 文本
         text = AGENT_SCRIPT.get("impl", "")
         if isinstance(text, list):                 # 序列脚本：原地弹出，末项常驻
@@ -319,11 +320,12 @@ def _v3_setup(repo: Path, root: Path):
 
 
 def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None,
-              extra_handlers=None):
+              extra_handlers=None, agent="stub-agent", reviewer="stub-rev"):
     """直驱生产宿主循环（import 生产代码，非复制品）。
 
     extra_handlers：追加的裸 FlowCallback 实例（经宿主 _Adapter 包装分发，
-    流级事件 on_flow_end 依赖 Adapter 透传）。"""
+    流级事件 on_flow_end 依赖 Adapter 透传）。
+    agent/reviewer：本次派发的身份参数（s29 用其验证恢复轮刷新语义）。"""
     import self_improve_bridge_v2 as bridge
     import self_improve_flow_v2 as flowmod
     from self_improve_bridge_v2 import StepTracker
@@ -337,7 +339,7 @@ def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None,
         flow_obj=flowmod.self_improve_v2,
         handler_specs=specs,
         params={"goal": "#77 v3 harness", "repo": str(_REPO_HOLDER[0]),
-                "run_dir": str(run_dir), "agent": "stub-agent", "reviewer": "stub-rev"},
+                "run_dir": str(run_dir), "agent": agent, "reviewer": reviewer},
         issue_root=issue_root, run_dir=run_dir, state_path=state_path,
         max_node_retries=max_retries)
     return v, nodes
@@ -831,6 +833,48 @@ def s28_state_json原子写_永不截断():
     assert "_atomic_write_json(state_path" in src, "main() 初写/终态应走原子写"
 
 
+def s29_v3_恢复轮刷新agent_reviewer():
+    """恢复轮以本次派发 params 刷新 agent/reviewer（2026-10-04 实证修复）。
+
+    plaita 恢复只还原 context 不重注 params：checkpoint 固化的旧 agent 会被
+    沿用——GLM→DeepSeek 切档后整批 resume 因旧 agent（glm53-flash）打向已
+    耗尽配额秒死（node retries exhausted）。宿主 _ckpt_load 命中时应以本次
+    派发值覆写 $INPUT/$NODE 的 agent/reviewer；worktree/run_dir 锚点保持原值。"""
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root = root / "artifact"
+    issue_root.mkdir(parents=True)
+    run_old = root / "pipeline-77-crashed"
+    run_old.mkdir(parents=True)
+    v, _ = _drive_v3(issue_root, run_old, run_old / "state.json",
+                     scripts={"agent": {"impl": "@RAISE"}},
+                     agent="old-model", reviewer="old-rev")
+    assert v.get("verdict") == "engine_error", v
+    ck = json.loads((issue_root / "checkpoint.json").read_text())
+    assert ck["context"]["$NODE"]["agent"] == "old-model", \
+        f"首派 checkpoint 应固化旧 agent: {ck['context']['$NODE'].get('agent')}"
+    old_wt = run_old / "worktree"
+    assert old_wt.is_dir(), "崩溃形态下旧 worktree 应幸存"
+    # 重派：新 run_dir + 新 agent/reviewer（旧 worktree 幸存 → 恢复轮续走）
+    run_new = root / "pipeline-77-redispatch"
+    run_new.mkdir(parents=True)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    v, _ = _drive_v3(issue_root, run_new, run_new / "state.json",
+                     agent="new-model", reviewer="new-rev")
+    assert v.get("verdict") == "committed", v
+    # 判据一：恢复轮 impl 以新 agent 起跑（不是 checkpoint 里的 old-model）
+    impl_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert impl_calls and impl_calls[-1][4] == "new-model", \
+        f"恢复轮 impl 应以新 agent 起跑: {impl_calls}"
+    # 判据二：评审节点以新 reviewer 起跑
+    rev_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "rev1"]
+    assert rev_calls and rev_calls[-1][4] == "new-rev", \
+        f"评审应以新 reviewer 起跑: {rev_calls}"
+    # 判据三：锚点不刷新——恢复轮仍在旧 worktree 干活（未被改写为 run_new）
+    assert not (run_new / "worktree").exists(), "不应走 L1 在新 run_dir 重建 worktree"
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
@@ -847,7 +891,8 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s25_v3_正常终态_宿主补发on_flow_end恰一次,
              s26_v3_异常终态_on_flow_end恰为引擎版_宿主不重复,
              s27_v3_dryrun冒烟_真bridge无桩全图,
-             s28_state_json原子写_永不截断]
+             s28_state_json原子写_永不截断,
+             s29_v3_恢复轮刷新agent_reviewer]
 
 if __name__ == "__main__":
     _patch()
