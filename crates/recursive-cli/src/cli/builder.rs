@@ -526,10 +526,21 @@ pub(crate) fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
 ///
 /// `RECURSIVE_SKILL_SOURCE_URL` holds one or more comma-separated endpoint
 /// URLs; each must answer with the JSON skill-index shape
-/// (`{"skills": [{"name", "content", "description"?}]}`) enforced by
-/// [`recursive::HttpSkillSource`]. The returned skills are content-backed
-/// (in-memory `body`, `/virtual/skills/<name>` synthetic path) — nothing is
-/// written to or read from the local filesystem.
+/// (`{"skills": [{"name", "content", "description"?, "version"?, "sha256"?}]}`)
+/// enforced by [`recursive::HttpSkillSource`]. The returned skills are
+/// content-backed (in-memory `body`, `/virtual/skills/<name>` synthetic path)
+/// — nothing is written to or read from the local filesystem.
+///
+/// Two optional hardening envs:
+/// - `RECURSIVE_SKILL_SOURCE_HOSTS` — comma-separated host allowlist (an
+///   optional `:port` is honoured). When set, every URL's host must match an
+///   entry exactly; unset/blank keeps the historical "any https host"
+///   behaviour.
+/// - `RECURSIVE_SKILL_SOURCE_SHA256` — comma-separated SHA-256 pins, one per
+///   URL positionally, over the exact index body. This is the operator-side
+///   trust anchor: a compromised skill host supplies both the content and any
+///   per-entry digest, so only an out-of-band body pin detects a swapped
+///   index. Unset/blank disables pinning.
 ///
 /// Errors from any URL abort the whole load (`Err`): the caller decides
 /// whether that is fatal or a log-and-degrade.
@@ -538,12 +549,60 @@ pub(crate) fn skills_from_http_sources() -> Result<Vec<Skill>, String> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
+    let urls: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .collect();
+    let pins = skill_source_sha256_pins();
+    if !pins.is_empty() && pins.len() != urls.len() {
+        return Err(format!(
+            "RECURSIVE_SKILL_SOURCE_SHA256 has {} pin(s) for {} URL(s); \
+             provide one comma-separated pin per URL (in URL order)",
+            pins.len(),
+            urls.len()
+        ));
+    }
+    let allowed_hosts = skill_source_allowed_hosts();
     let mut skills = Vec::new();
-    for url in raw.split(',').map(str::trim).filter(|u| !u.is_empty()) {
-        let source = recursive::HttpSkillSource::new(url, None);
+    for (i, url) in urls.iter().enumerate() {
+        let mut source = recursive::HttpSkillSource::new(*url, allowed_hosts.clone());
+        if let Some(pin) = pins.get(i) {
+            source = source.with_pinned_sha256(pin.clone());
+        }
         skills.extend(source.load_skills().map_err(|e| e.to_string())?);
     }
     Ok(skills)
+}
+
+/// Parse `RECURSIVE_SKILL_SOURCE_HOSTS`; unset/blank disables the allowlist.
+fn skill_source_allowed_hosts() -> Option<Vec<String>> {
+    let Ok(raw) = std::env::var("RECURSIVE_SKILL_SOURCE_HOSTS") else {
+        return None;
+    };
+    let hosts: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    if hosts.is_empty() {
+        None
+    } else {
+        Some(hosts)
+    }
+}
+
+/// Parse the positional `RECURSIVE_SKILL_SOURCE_SHA256` pins (may be empty).
+fn skill_source_sha256_pins() -> Vec<String> {
+    let Ok(raw) = std::env::var("RECURSIVE_SKILL_SOURCE_SHA256") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Append auto-loaded skill bodies to the assembled system prompt.
@@ -806,6 +865,74 @@ mod tests {
         assert!(
             err.contains("https://"),
             "error must name the https-only policy: {err}"
+        );
+    }
+
+    /// The production entry wires `RECURSIVE_SKILL_SOURCE_HOSTS` into the
+    /// source's allowlist: a URL whose host is not listed is rejected at the
+    /// config gate, before any request is issued.
+    #[test]
+    fn skills_from_http_sources_allowlist_blocks_unlisted_host() {
+        let _env = EnvGuard::set(&[
+            (
+                "RECURSIVE_SKILL_SOURCE_URL",
+                Some("https://evil.example.com/index.json"),
+            ),
+            (
+                "RECURSIVE_SKILL_SOURCE_HOSTS",
+                Some("skills.corp.example.com"),
+            ),
+            ("RECURSIVE_SKILL_SOURCE_SHA256", None),
+        ]);
+        let err = skills_from_http_sources().unwrap_err();
+        assert!(
+            err.contains("not in the allowlist"),
+            "unlisted host must be rejected by the allowlist: {err}"
+        );
+    }
+
+    /// A listed host clears the allowlist gate — the failure is then the
+    /// (dead) network endpoint, not a policy rejection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skills_from_http_sources_allowlist_admits_listed_host() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let _env = EnvGuard::set(&[
+            (
+                "RECURSIVE_SKILL_SOURCE_URL",
+                Some(format!("https://{addr}/skills.json").as_str()),
+            ),
+            (
+                "RECURSIVE_SKILL_SOURCE_HOSTS",
+                Some(format!("127.0.0.1:{}", addr.port()).as_str()),
+            ),
+            ("RECURSIVE_SKILL_SOURCE_SHA256", None),
+        ]);
+        let err = skills_from_http_sources().unwrap_err();
+        assert!(
+            !err.contains("allowlist"),
+            "a listed host must clear the allowlist gate: {err}"
+        );
+    }
+
+    /// Pins are positional (one per URL); a mismatch is caught before any
+    /// fetch so a typo can never silently leave a URL unpinned.
+    #[test]
+    fn skills_from_http_sources_pin_count_must_match_url_count() {
+        let _env = EnvGuard::set(&[
+            (
+                "RECURSIVE_SKILL_SOURCE_URL",
+                Some("https://a.example.com/index.json,https://b.example.com/index.json"),
+            ),
+            ("RECURSIVE_SKILL_SOURCE_HOSTS", None),
+            ("RECURSIVE_SKILL_SOURCE_SHA256", Some("deadbeef")),
+        ]);
+        let err = skills_from_http_sources().unwrap_err();
+        assert!(
+            err.contains("one comma-separated pin per URL"),
+            "a pin count mismatch must be rejected before any fetch: {err}"
         );
     }
 

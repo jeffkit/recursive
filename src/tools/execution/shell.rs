@@ -301,24 +301,36 @@ mod tests {
         // `exec` replaces the sh process with sleep, so the PID we
         // capture is the PID `start_kill` targets.
         let command = format!("echo $$ > {marker_str} && exec sleep 30");
-        let tool = RunShell::new(tmp.path()).with_timeout(Duration::from_millis(150));
-        let err = tool
-            .execute(json!({ "command": command }))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Tool { .. }));
+        let tool = RunShell::new(tmp.path()).with_timeout(Duration::from_millis(500));
 
-        // The child may legitimately still be writing the marker when the
-        // 150 ms timeout fires (host under load: fork+exec+echo alone can
-        // exceed it), so poll briefly for the file instead of reading it
-        // once — a missing file at t=0 is a scheduling race, not an orphan.
+        // The timeout window has to outlast `sh -c` startup (fork + exec +
+        // `echo`); on a loaded host it may not, in which case the child is
+        // killed before it can record its PID and the run is inconclusive —
+        // a missing marker is a scheduling race, not proof of an orphan.
+        // Retry the scenario a bounded number of times rather than reading
+        // that race as failure; a child that is killed before it ever runs
+        // never yields a PID and still fails the assertion below.
         let mut pid_str = None;
-        for _ in 0..50 {
-            if let Ok(s) = std::fs::read_to_string(&marker) {
-                pid_str = Some(s);
+        for _ in 0..5 {
+            let err = tool
+                .execute(json!({ "command": command.as_str() }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Tool { .. }));
+
+            // Poll briefly for the marker: the child writes it before the
+            // timeout can fire, so a missing file right after `execute`
+            // returned means this attempt was killed too early.
+            for _ in 0..20 {
+                if let Ok(s) = std::fs::read_to_string(&marker) {
+                    pid_str = Some(s);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if pid_str.is_some() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let pid: i32 = pid_str
             .expect("child should have written its PID before exec")

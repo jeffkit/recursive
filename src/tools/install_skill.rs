@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
-use crate::tools::Tool;
+use crate::tools::{resolve_within, Tool};
 
 // ── Skill-hub install side-channel types ─────────────────────────────────────
 
@@ -270,6 +270,12 @@ impl InstallSkill {
     }
 
     /// Extract a zip archive (already loaded in memory) to `dest_dir`.
+    ///
+    /// Every entry path is resolved through [`resolve_within`] against
+    /// `dest_dir`, so a hostile archive whose entry climbs out of the install
+    /// directory (`a/../../x`, an absolute path after the slug prefix is
+    /// stripped, …) is rejected instead of being written outside
+    /// `~/.recursive/skills/<slug>/`.
     fn extract_zip(data: &[u8], dest_dir: &std::path::Path) -> Result<()> {
         let cursor = Cursor::new(data);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| Error::Tool {
@@ -292,7 +298,14 @@ impl InstallSkill {
                 .map(|(_, rest)| rest)
                 .unwrap_or(&raw_name);
 
-            let out_path = dest_dir.join(relative);
+            // Containment gate: never `dest_dir.join` an unvalidated entry
+            // name. `resolve_within` rejects `..` escapes and absolute paths
+            // (both lexical and, for existing paths, symlink-aware).
+            let out_path = resolve_within(dest_dir, relative).map_err(|e| Error::Tool {
+                name: "install_skill".into(),
+                call_id: None,
+                message: format!("zip entry '{raw_name}' escapes the install directory: {e}"),
+            })?;
 
             if entry.is_dir() {
                 std::fs::create_dir_all(&out_path).map_err(|e| Error::Tool {
@@ -328,7 +341,20 @@ impl InstallSkill {
     }
 
     /// Resolve the install directory: `~/.recursive/skills/<slug>/`.
+    ///
+    /// The slug comes from remote search results, so it is not trusted: a
+    /// value carrying a path separator or a `..` component would relocate the
+    /// install root outside `~/.recursive/skills/` — which would also defeat
+    /// the entry-containment check in [`InstallSkill::extract_zip`], since
+    /// that only confines writes to `dest_dir`.
     fn install_dir(slug: &str) -> Result<PathBuf> {
+        if slug.is_empty() || slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+            return Err(Error::Tool {
+                name: "install_skill".into(),
+                call_id: None,
+                message: format!("unsafe skill slug '{slug}'"),
+            });
+        }
         let home = dirs::home_dir().ok_or_else(|| Error::Tool {
             name: "install_skill".into(),
             call_id: None,
@@ -514,6 +540,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn install_dir_rejects_slug_that_relocates_the_install_root() {
+        // The slug is remote-supplied; anything that climbs out of
+        // ~/.recursive/skills/ would also move extract_zip's containment root.
+        for slug in ["", "..", "../../etc", "a/b", "a\\b", "sub/.."] {
+            assert!(
+                InstallSkill::install_dir(slug).is_err(),
+                "slug '{slug}' must be rejected"
+            );
+        }
+    }
+
     /// Build a minimal in-memory zip with the given entries.
     fn make_zip(entries: &[(&str, &str)]) -> Vec<u8> {
         use std::io::Write;
@@ -623,5 +661,43 @@ mod tests {
 
         let output = std::fs::read_to_string(dest.path().join("SKILL.md")).unwrap();
         assert_eq!(output, "no slug here");
+    }
+
+    #[test]
+    fn extract_zip_rejects_parent_dir_traversal() {
+        // Hostile archive: the slug prefix is stripped, leaving
+        // "../../install_escape_poc.md" — one directory above the install root.
+        let data = make_zip(&[("my-skill/../../install_escape_poc.md", "pwned")]);
+        let dest = tempfile::TempDir::new().unwrap();
+        let slug_dir = dest.path().join("my-skill");
+        std::fs::create_dir_all(&slug_dir).unwrap();
+
+        let err = InstallSkill::extract_zip(&data, &slug_dir)
+            .expect_err("traversal entry must be rejected");
+        assert!(
+            err.to_string().contains("escapes the install directory"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dest.path().join("install_escape_poc.md").exists(),
+            "no file may be written outside the install directory"
+        );
+    }
+
+    #[test]
+    fn extract_zip_rejects_absolute_entry_after_strip() {
+        // "a//etc/escape" → split_once('/') leaves "/etc/escape" (absolute),
+        // which `Path::join` would treat as a root replacement.
+        let data = make_zip(&[("a//etc/install_escape_poc", "pwned")]);
+        let dest = tempfile::TempDir::new().unwrap();
+        let slug_dir = dest.path().join("my-skill");
+        std::fs::create_dir_all(&slug_dir).unwrap();
+
+        let err = InstallSkill::extract_zip(&data, &slug_dir)
+            .expect_err("absolute entry must be rejected");
+        assert!(
+            err.to_string().contains("escapes the install directory"),
+            "unexpected error: {err}"
+        );
     }
 }

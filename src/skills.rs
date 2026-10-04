@@ -277,6 +277,10 @@ pub enum HttpSkillSourceError {
     /// The response body was not valid UTF-8 or the skill index could not be
     /// parsed.
     Parse(String),
+    /// A SHA-256 check failed: either the pinned index digest or an entry's
+    /// declared `sha256` did not match the bytes served. Fail-closed — a
+    /// mismatch aborts the load instead of installing unverified instructions.
+    Integrity(String),
 }
 
 impl std::fmt::Display for HttpSkillSourceError {
@@ -288,6 +292,7 @@ impl std::fmt::Display for HttpSkillSourceError {
             ),
             Self::Request(msg) => write!(f, "skill source request failed: {msg}"),
             Self::Parse(msg) => write!(f, "skill index parse failed: {msg}"),
+            Self::Integrity(msg) => write!(f, "skill integrity check failed: {msg}"),
         }
     }
 }
@@ -328,11 +333,22 @@ impl std::error::Error for HttpSkillSourceError {}
 ///   request), so this source can be built inside any async context without
 ///   spawning. Skills are then held in memory and served by the
 ///   [`SkillSource`] impl without further network I/O.
+/// - **Integrity.** An index entry may declare a `sha256` digest for its
+///   `content`; a mismatch aborts the load
+///   ([`HttpSkillSourceError::Integrity`]) instead of serving unverified
+///   instructions. The operator may additionally pin the whole index body
+///   to an out-of-band digest with
+///   [`HttpSkillSource::with_pinned_sha256`] — the only anchor that survives
+///   a compromised skill host, since that host supplies both the content and
+///   any per-entry digest. Every loaded skill is recorded on the
+///   `recursive::skills::audit` log target (name / version / sha256 / source).
 #[derive(Clone)]
 pub struct HttpSkillSource {
     url: String,
     allowed_hosts: Option<Vec<String>>,
     timeout: std::time::Duration,
+    /// Optional out-of-band SHA-256 pin over the whole index body (hex).
+    pinned_sha256: Option<String>,
     /// Set when `new()` rejected the configuration; `load_skills` returns it
     /// without any network I/O (keeps the constructor infallible so callers
     /// can log-and-degrade like the endpoints registry).
@@ -348,6 +364,7 @@ impl std::fmt::Debug for HttpSkillSource {
                 &self.allowed_hosts.as_ref().map(|h| h.len()),
             )
             .field("timeout", &self.timeout)
+            .field("pinned_sha256", &self.pinned_sha256.is_some())
             .field("config_error", &self.config_error.is_some())
             .finish()
     }
@@ -366,6 +383,14 @@ struct RemoteSkillEntry {
     content: String,
     #[serde(default)]
     description: Option<String>,
+    /// Optional declared SHA-256 of `content` (hex, any case). When present
+    /// the served bytes must match exactly or the whole load fails closed.
+    #[serde(default)]
+    sha256: Option<String>,
+    /// Optional skill version, recorded in the audit log so an operator can
+    /// pin/roll back by pointing the source at a versioned index.
+    #[serde(default)]
+    version: Option<String>,
 }
 
 impl HttpSkillSource {
@@ -391,6 +416,7 @@ impl HttpSkillSource {
             url,
             allowed_hosts,
             timeout: Self::DEFAULT_TIMEOUT,
+            pinned_sha256: None,
             config_error,
         }
     }
@@ -398,6 +424,18 @@ impl HttpSkillSource {
     /// Override the request timeout (tests use a small value).
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Pin the fetched skill-index body to a SHA-256 digest (hex, any case).
+    ///
+    /// This is the operator-side trust anchor: even a compromised skill host
+    /// cannot change the served bytes without the check failing, since it
+    /// must be obtained out-of-band (release notes, checksum file). A
+    /// mismatch fails the load closed ([`HttpSkillSourceError::Integrity`])
+    /// rather than installing unverified instructions.
+    pub fn with_pinned_sha256(mut self, sha256_hex: impl Into<String>) -> Self {
+        self.pinned_sha256 = Some(sha256_hex.into());
         self
     }
 
@@ -456,9 +494,21 @@ impl HttpSkillSource {
         let body = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(fetch_remote_index(&self.url, self.timeout))
         })?;
-        let index: RemoteSkillIndex = serde_json::from_slice(&body)
+        self.load_skills_from_body(&body)
+    }
+
+    /// Verify the pin, parse the index and map its entries to skills.
+    ///
+    /// Split out of [`HttpSkillSource::load_skills`] so the
+    /// pin/parse/mapping layers are testable without a live TLS endpoint
+    /// (the fetch itself is covered by the `fetch_remote_index` tests).
+    fn load_skills_from_body(&self, body: &[u8]) -> Result<Vec<Skill>, HttpSkillSourceError> {
+        if let Some(pin) = &self.pinned_sha256 {
+            verify_sha256("skill index", body, pin)?;
+        }
+        let index: RemoteSkillIndex = serde_json::from_slice(body)
             .map_err(|e| HttpSkillSourceError::Parse(format!("invalid skill index JSON: {e}")))?;
-        Ok(skills_from_remote_entries(index.skills))
+        skills_from_remote_entries(index.skills, &self.url)
     }
 }
 
@@ -525,7 +575,15 @@ async fn fetch_remote_index(
 /// first occurrence. When an entry carries an explicit `description` and its
 /// content has no frontmatter of its own, the description is injected as
 /// frontmatter so [`parse_skill_meta`] picks it up.
-fn skills_from_remote_entries(entries: Vec<RemoteSkillEntry>) -> Vec<Skill> {
+///
+/// Integrity: when an entry declares a `sha256`, it must match the served
+/// `content` byte-for-byte or the whole load fails with
+/// [`HttpSkillSourceError::Integrity`]. `source_url` is only used to make the
+/// audit log line attributable.
+fn skills_from_remote_entries(
+    entries: Vec<RemoteSkillEntry>,
+    source_url: &str,
+) -> Result<Vec<Skill>, HttpSkillSourceError> {
     let mut skills = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in entries {
@@ -536,6 +594,25 @@ fn skills_from_remote_entries(entries: Vec<RemoteSkillEntry>) -> Vec<Skill> {
         if !seen.insert(name.to_lowercase()) {
             continue;
         }
+        let digest = sha256_hex(entry.content.as_bytes());
+        if let Some(declared) = entry.sha256.as_deref() {
+            verify_sha256(
+                &format!("skill '{name}'"),
+                entry.content.as_bytes(),
+                declared,
+            )?;
+        }
+        // Audit event: what was loaded, from where, and the exact content
+        // digest — so a compromised/rolled-back source is forensically
+        // visible and an operator can verify or pin a specific version.
+        tracing::info!(
+            target: "recursive::skills::audit",
+            skill = %name,
+            version = entry.version.as_deref().unwrap_or("-"),
+            sha256 = %digest,
+            source = %source_url,
+            "loaded remote skill"
+        );
         let content = match (&entry.description, entry.content.starts_with("---")) {
             (Some(desc), false) if !desc.trim().is_empty() => {
                 format!(
@@ -548,7 +625,29 @@ fn skills_from_remote_entries(entries: Vec<RemoteSkillEntry>) -> Vec<Skill> {
         };
         skills.push(skill_from_content(&name, &content, Vec::new()));
     }
-    skills
+    Ok(skills)
+}
+
+/// Lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Compare `bytes` against a declared SHA-256 digest (hex, any case,
+/// surrounding whitespace ignored). A mismatch is fail-closed.
+fn verify_sha256(what: &str, bytes: &[u8], declared: &str) -> Result<(), HttpSkillSourceError> {
+    let want = declared.trim().to_ascii_lowercase();
+    let got = sha256_hex(bytes);
+    if got != want {
+        return Err(HttpSkillSourceError::Integrity(format!(
+            "{what}: expected sha256 {want}, got {got}"
+        )));
+    }
+    Ok(())
 }
 
 /// Normalize an allowlist entry / URL host for comparison: lowercase, strip
@@ -2870,7 +2969,11 @@ mod tests {
             serde_json::from_slice(&body).expect("mock body must be valid index JSON");
 
         // The mapping layer (entry → content-backed Skill):
-        let skills = super::skills_from_remote_entries(index.skills);
+        let skills = super::skills_from_remote_entries(
+            index.skills,
+            "https://skills.example.com/index.json",
+        )
+        .expect("entries without a declared digest need no verification");
         assert_eq!(skills.len(), 2, "duplicate + blank names dropped");
         let pdf = skills.iter().find(|s| s.name == "pdf").unwrap();
         assert_eq!(pdf.description, "PDF handling");
@@ -2886,23 +2989,33 @@ mod tests {
         assert!(pdf.refs.is_empty() && pdf.scripts.is_empty());
 
         // Mapping edge cases (duplicate keep-first, blank-name skip):
-        let mapped = super::skills_from_remote_entries(vec![
-            super::RemoteSkillEntry {
-                name: "pdf".into(),
-                content: "first".into(),
-                description: None,
-            },
-            super::RemoteSkillEntry {
-                name: "pdf".into(),
-                content: "duplicate".into(),
-                description: None,
-            },
-            super::RemoteSkillEntry {
-                name: "  ".into(),
-                content: "blank name".into(),
-                description: None,
-            },
-        ]);
+        let mapped = super::skills_from_remote_entries(
+            vec![
+                super::RemoteSkillEntry {
+                    name: "pdf".into(),
+                    content: "first".into(),
+                    description: None,
+                    sha256: None,
+                    version: None,
+                },
+                super::RemoteSkillEntry {
+                    name: "pdf".into(),
+                    content: "duplicate".into(),
+                    description: None,
+                    sha256: None,
+                    version: None,
+                },
+                super::RemoteSkillEntry {
+                    name: "  ".into(),
+                    content: "blank name".into(),
+                    description: None,
+                    sha256: None,
+                    version: None,
+                },
+            ],
+            "https://skills.example.com/index.json",
+        )
+        .expect("no declared digests means nothing to verify");
         assert_eq!(mapped.len(), 1, "duplicate + blank names dropped");
         assert_eq!(
             extract_skill_body(mapped[0].body.as_deref().unwrap()),
@@ -3019,5 +3132,89 @@ mod tests {
         assert_send_sync::<HttpSkillSource>();
         fn assert_source<T: SkillSource>() {}
         assert_source::<HttpSkillSource>();
+    }
+
+    #[test]
+    fn http_skill_source_verifies_declared_entry_sha256() {
+        let content = "PDF body";
+        let digest = super::sha256_hex(content.as_bytes());
+        let entry = |content: &str, sha256: Option<String>| super::RemoteSkillEntry {
+            name: "pdf".into(),
+            content: content.to_string(),
+            description: None,
+            sha256,
+            version: Some("1.2.3".into()),
+        };
+
+        // A matching digest loads — uppercase hex and padding whitespace are
+        // tolerated so a hand-written manifest still verifies.
+        let ok = super::skills_from_remote_entries(
+            vec![entry(content, Some(format!(" {} ", digest.to_uppercase())))],
+            "https://skills.example.com/index.json",
+        )
+        .expect("a matching digest must load");
+        assert_eq!(ok.len(), 1);
+
+        // Tampered content with the old digest fails closed.
+        let err = super::skills_from_remote_entries(
+            vec![entry("tampered", Some(digest))],
+            "https://skills.example.com/index.json",
+        )
+        .expect_err("a digest mismatch must fail closed");
+        assert!(
+            matches!(err, HttpSkillSourceError::Integrity(_)),
+            "mismatch must be Integrity, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("sha256"),
+            "error must name the check: {err}"
+        );
+    }
+
+    #[test]
+    fn http_skill_source_pin_verifies_the_index_body() {
+        let body = br#"{"skills":[{"name":"pdf","content":"PDF body"}]}"#;
+
+        let pinned = HttpSkillSource::new("https://skills.example.com/index.json", None)
+            .with_pinned_sha256(super::sha256_hex(body));
+        let skills = pinned
+            .load_skills_from_body(body)
+            .expect("a matching pin must load the index");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "pdf");
+
+        // A body that drifts from the pin (a swapped index on a compromised
+        // host) never reaches the mapping layer.
+        let pinned = HttpSkillSource::new("https://skills.example.com/index.json", None)
+            .with_pinned_sha256("00");
+        let err = pinned
+            .load_skills_from_body(body)
+            .expect_err("a pin mismatch must fail closed");
+        assert!(
+            matches!(err, HttpSkillSourceError::Integrity(ref m) if m.contains("skill index")),
+            "pin mismatch must be Integrity, got {err:?}"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn http_skill_source_logs_a_loaded_skill_audit_event() {
+        let content = "PDF body";
+        super::skills_from_remote_entries(
+            vec![super::RemoteSkillEntry {
+                name: "pdf".into(),
+                content: content.into(),
+                description: None,
+                sha256: Some(super::sha256_hex(content.as_bytes())),
+                version: Some("1.2.3".into()),
+            }],
+            "https://skills.example.com/index.json",
+        )
+        .expect("entry loads");
+
+        assert!(logs_contain("loaded remote skill"));
+        assert!(logs_contain("pdf"));
+        assert!(logs_contain("1.2.3"));
+        assert!(logs_contain("https://skills.example.com/index.json"));
     }
 }
