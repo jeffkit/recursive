@@ -376,7 +376,7 @@
     {
       "type": "assignment",
       "id": "review_prompt",
-      "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff main` to see the full change (three-dot is not needed; this covers both uncommitted edits and commits inherited from a resumed run, which `git diff HEAD` would miss), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
+      "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff $(git merge-base main HEAD)` to see the full change (relative to the branch point: covers both uncommitted edits and commits inherited from a resumed run, while excluding main-side commits that landed after this branch was cut — plain `git diff main` would show those as inverted deletions and waste your attention), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
       "next": "rev1",
       "source_line": 314
     },
@@ -388,7 +388,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa",
-      "source_line": 324
+      "source_line": 326
     },
     {
       "type": "if",
@@ -399,8 +399,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 326 行）",
-      "source_line": 326,
+      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 328 行）",
+      "source_line": 328,
       "next": "contains_text_verdict_ne",
       "else_next": "pub"
     },
@@ -414,7 +414,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true",
-      "source_line": 346
+      "source_line": 348
     },
     {
       "type": "if",
@@ -425,8 +425,8 @@
         "value": true
       },
       "name": "pub.merged == True?",
-      "desc": "if pub.merged == True（第 349 行）",
-      "source_line": 349,
+      "desc": "if pub.merged == True（第 351 行）",
+      "source_line": 351,
       "next": "_n4",
       "else_next": "land_rebase"
     },
@@ -440,7 +440,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_2",
-      "source_line": 357
+      "source_line": 359
     },
     {
       "type": "if",
@@ -451,8 +451,8 @@
         "value": false
       },
       "name": "land_rebase.ok == False?",
-      "desc": "if land_rebase.ok == False（第 373 行）",
-      "source_line": 373,
+      "desc": "if land_rebase.ok == False（第 375 行）",
+      "source_line": 375,
       "next": "wfp2",
       "else_next": "pub2"
     },
@@ -466,7 +466,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true_2",
-      "source_line": 378
+      "source_line": 380
     },
     {
       "type": "if",
@@ -477,8 +477,8 @@
         "value": true
       },
       "name": "pub2.merged == True?",
-      "desc": "if pub2.merged == True（第 381 行）",
-      "source_line": 381,
+      "desc": "if pub2.merged == True（第 383 行）",
+      "source_line": 383,
       "next": "_n2",
       "else_next": "wfp3"
     },
@@ -488,7 +488,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
       "next": "_n1",
-      "source_line": 384
+      "source_line": 386
     },
     {
       "type": "end",
@@ -502,7 +502,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 387
+      "source_line": 389
     },
     {
       "type": "end",
@@ -515,7 +515,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish-retry',…",
-      "source_line": 382
+      "source_line": 384
     },
     {
       "type": "writefile",
@@ -523,7 +523,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)",
       "next": "_n3",
-      "source_line": 374
+      "source_line": 376
     },
     {
       "type": "end",
@@ -536,7 +536,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 376
+      "source_line": 378
     },
     {
       "type": "end",
@@ -549,7 +549,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish', 'note…",
-      "source_line": 350
+      "source_line": 352
     },
     {
       "type": "if",
@@ -560,8 +560,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 327 行）",
-      "source_line": 327,
+      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 329 行）",
+      "source_line": 329,
       "next": "wfr",
       "else_next": "fix_prompt"
     },
@@ -570,7 +570,7 @@
       "id": "fix_prompt",
       "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
       "next": "_n6",
-      "source_line": 332
+      "source_line": 334
     },
     {
       "type": "agentrun",
@@ -580,7 +580,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev2",
-      "source_line": 336
+      "source_line": 338
     },
     {
       "type": "agentrun",
@@ -590,7 +590,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_2",
-      "source_line": 337
+      "source_line": 339
     },
     {
       "type": "if",
@@ -601,8 +601,8 @@
         "value": true
       },
       "name": "F.contains(rev2.text, 'VERD…",
-      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 339 行）",
-      "source_line": 339,
+      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 341 行）",
+      "source_line": 341,
       "next": "wfr2",
       "else_next": "pub"
     },
@@ -612,7 +612,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
       "content": "$NODE.rev2.text",
       "next": "_n5",
-      "source_line": 340
+      "source_line": 342
     },
     {
       "type": "end",
@@ -625,7 +625,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 342
+      "source_line": 344
     },
     {
       "type": "writefile",
@@ -633,7 +633,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
       "content": "$NODE.rev1.text",
       "next": "_n7",
-      "source_line": 328
+      "source_line": 330
     },
     {
       "type": "end",
@@ -646,7 +646,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 330
+      "source_line": 332
     },
     {
       "type": "agentrun",
