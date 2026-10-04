@@ -8,6 +8,7 @@
 pub mod a2a;
 pub mod agent;
 pub mod agent_defs;
+pub mod artifacts;
 pub mod checkpoint;
 pub mod client_fs;
 pub mod dispatch;
@@ -140,6 +141,7 @@ pub use dispatch::{new_shared_sandbox_roots, resolve_within_any, AccessTier, Sha
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
 pub use agent::{AgentTool, SharedMemoryRead, SharedMemoryWrite};
 pub use agent_defs::{AgentDefinition, AgentDefinitions};
+pub use artifacts::{ArtifactListTool, ArtifactReadTool, ArtifactStore};
 pub use checkpoint::{
     build_checkpoint_save_tool, build_checkpoint_tools, CheckpointDiff, CheckpointList,
     CheckpointSave, CheckpointSaveCtx, CheckpointToolCtx,

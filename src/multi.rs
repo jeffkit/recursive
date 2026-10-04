@@ -3,6 +3,7 @@
 use crate::kernel::{AgentKernel, TurnContext, TurnOutcome};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
+use crate::storage::StorageBackend;
 use crate::tasks::TaskRegistry;
 use crate::tools::{
     AgentDefinitions, AgentTool, ListWorkersTool, SendMessageTool, ToolRegistry, WorkerRegistry,
@@ -13,10 +14,69 @@ use crate::tools::{
 };
 use crate::{ChatProvider, Config};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock};
+
+/// Storage keys under which the collaboration state persists. Both live in
+/// the backend's memory-key namespace (`LocalStorageBackend` writes them to
+/// `<root>/.recursive/memory/<key>`; Redis/S3 backends use `memory/<key>`).
+pub(crate) const SHARED_MEMORY_KEY: &str = "multi/shared-memory.json";
+pub(crate) const MESSAGE_BUS_KEY: &str = "multi/message-bus.json";
+
+/// Best-effort persist helper: log-and-degrade. Persistence failures must
+/// never break an in-flight collaboration — the in-memory copy stays the
+/// source of truth for the current process; the disk copy is the
+/// crash-recovery snapshot.
+async fn persist_json(backend: &Arc<dyn StorageBackend>, key: &str, value: &impl serde::Serialize) {
+    match serde_json::to_string(value) {
+        Ok(json) => {
+            if let Err(e) = backend.save_memory(key, &json).await {
+                tracing::warn!("multi: failed to persist {key}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("multi: failed to serialize {key}: {e}"),
+    }
+}
+
+/// Restore `SharedMemory` entries written by a previous process. Best-effort:
+/// a missing/corrupt snapshot yields an empty store, never an error.
+async fn restore_shared_memory(backend: &Arc<dyn StorageBackend>) -> Vec<MemoryEntry> {
+    match backend.load_memory(SHARED_MEMORY_KEY).await {
+        Ok(Some(json)) => match serde_json::from_str::<Vec<MemoryEntry>>(&json) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("multi: corrupt shared-memory snapshot ignored: {e}");
+                Vec::new()
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("multi: failed to load shared-memory snapshot: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Restore `MessageBus` history written by a previous process. Best-effort in
+/// the same way as [`restore_shared_memory`].
+async fn restore_bus_history(backend: &Arc<dyn StorageBackend>) -> Vec<AgentMessage> {
+    match backend.load_memory(MESSAGE_BUS_KEY).await {
+        Ok(Some(json)) => match serde_json::from_str::<Vec<AgentMessage>>(&json) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::warn!("multi: corrupt message-bus snapshot ignored: {e}");
+                Vec::new()
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("multi: failed to load message-bus snapshot: {e}");
+            Vec::new()
+        }
+    }
+}
 
 /// Per-turn cancellation token slot (issue #40). Hosts that mint a fresh
 /// CancellationToken at each turn start (the TUI) store the current token
@@ -27,10 +87,17 @@ use tokio::sync::{broadcast, RwLock};
 pub type SharedTokenSlot = Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>;
 
 /// Shared memory store for multi-agent coordination.
+///
+/// The in-memory map stays the hot path (same-process workers see writes
+/// immediately). When a [`StorageBackend`] is attached
+/// ([`SharedMemory::with_backend`]), every mutation is also written through
+/// under a single storage key, so a crash/restart (or another coordinator
+/// replica) can restore the last snapshot via [`SharedMemory::restore`].
 #[derive(Clone)]
 pub struct SharedMemory {
     store: Arc<RwLock<HashMap<String, MemoryEntry>>>,
     seq: Arc<AtomicU64>,
+    backend: Option<Arc<dyn StorageBackend>>,
 }
 
 /// A single entry in the shared memory store.
@@ -54,6 +121,52 @@ impl SharedMemory {
         Self {
             store: Arc::new(RwLock::new(HashMap::new())),
             seq: Arc::new(AtomicU64::new(1)),
+            backend: None,
+        }
+    }
+
+    /// Attach a storage backend and enable write-through persistence.
+    pub fn with_backend(mut self, backend: Arc<dyn StorageBackend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// Load the last persisted snapshot (if any) into the in-memory store.
+    /// No-op when no backend is attached. Entries already in memory win:
+    /// restore only fills keys that are absent, so a live store is never
+    /// clobbered by a stale snapshot.
+    pub async fn restore(&self) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        let entries = restore_shared_memory(backend).await;
+        if entries.is_empty() {
+            return;
+        }
+        let mut store = self.store.write().await;
+        let mut max_seq = 0u64;
+        for entry in entries {
+            max_seq = max_seq.max(entry.seq);
+            store.entry(entry.key.clone()).or_insert(entry);
+        }
+        // Keep the seq counter ahead of every restored entry so new writes
+        // keep ordering monotonic across the restart boundary.
+        self.seq.fetch_max(max_seq + 1, Ordering::Relaxed);
+    }
+
+    /// Snapshot the current entries to the backend (best-effort). Called
+    /// internally after every mutation; public so hosts can force a flush
+    /// before shutdown.
+    pub async fn persist(&self) {
+        if let Some(backend) = &self.backend {
+            let snapshot = self
+                .store
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            persist_json(backend, SHARED_MEMORY_KEY, &snapshot).await;
         }
     }
 
@@ -71,6 +184,7 @@ impl SharedMemory {
             seq,
         };
         self.store.write().await.insert(key, entry);
+        self.persist().await;
     }
 
     pub async fn get(&self, key: &str) -> Option<MemoryEntry> {
@@ -86,7 +200,11 @@ impl SharedMemory {
     }
 
     pub async fn remove(&self, key: &str) -> bool {
-        self.store.write().await.remove(key).is_some()
+        let removed = self.store.write().await.remove(key).is_some();
+        if removed {
+            self.persist().await;
+        }
+        removed
     }
 
     pub async fn to_context_string(&self) -> String {
@@ -170,6 +288,12 @@ fn now_timestamp() -> u64 {
 pub const MESSAGE_BUS_CAPACITY: usize = 1000;
 
 /// An inter-agent message bus supporting publish/subscribe and history.
+///
+/// The in-process ring buffer + broadcast channels stay the hot path. When a
+/// [`StorageBackend`] is attached ([`MessageBus::with_backend`]), every send
+/// also appends to a single persisted history key so the most recent
+/// `capacity` messages survive a process restart
+/// ([`MessageBus::restore`]).
 #[derive(Clone)]
 pub struct MessageBus {
     /// Bounded ring buffer of recent messages. Oldest evicted
@@ -180,6 +304,7 @@ pub struct MessageBus {
     /// Maximum number of messages to retain. Defaults to
     /// `MESSAGE_BUS_CAPACITY`; overridable via `with_capacity`.
     capacity: usize,
+    backend: Option<Arc<dyn StorageBackend>>,
 }
 
 impl MessageBus {
@@ -188,7 +313,79 @@ impl MessageBus {
             messages: Arc::new(RwLock::new(VecDeque::with_capacity(MESSAGE_BUS_CAPACITY))),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             capacity: MESSAGE_BUS_CAPACITY,
+            backend: None,
         }
+    }
+
+    /// Attach a storage backend and enable write-through history persistence.
+    pub fn with_backend(mut self, backend: Arc<dyn StorageBackend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// Load the persisted history (if any) into the ring buffer. No-op when
+    /// no backend is attached. Live in-memory messages always win: snapshot
+    /// entries are merged in as "older" messages (prepended, deduped by
+    /// message id, re-evicted down to `capacity`), so the buffer never
+    /// exceeds capacity and live messages are never clobbered.
+    pub async fn restore(&self) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let snapshot = restore_bus_history(&backend).await;
+        if snapshot.is_empty() {
+            return;
+        }
+        let mut history = self.messages.write().await;
+        let live_ids: std::collections::HashSet<String> =
+            history.iter().map(|m| m.id.clone()).collect();
+        // Insert oldest-first so chronology is preserved inside the ring.
+        let mut missing: Vec<AgentMessage> = snapshot
+            .into_iter()
+            .filter(|m| !live_ids.contains(&m.id))
+            .collect();
+        missing.reverse();
+        for msg in missing {
+            history.push_front(msg);
+        }
+        while history.len() > self.capacity {
+            history.pop_front();
+        }
+    }
+
+    /// Snapshot the current history to the backend (best-effort). The write
+    /// MERGES with the previously persisted snapshot (older entries first,
+    /// deduped by message id, capped to `capacity`) so two coordinator
+    /// replicas — or a restart that sends before restoring — never silently
+    /// drop each other's messages. Called internally after every send;
+    /// public so hosts can force a flush before shutdown.
+    pub async fn persist(&self) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let current: Vec<AgentMessage> = self.messages.read().await.iter().cloned().collect();
+        if current.is_empty() {
+            // Empty live history (fresh bus, or clear()) must OVERWRITE the
+            // snapshot, not merge with it — otherwise a clear() followed by a
+            // restart resurrects every previously persisted message. A fresh
+            // (never-restored) bus also lands here once, which is harmless:
+            // its snapshot is whatever another process persisted, and this
+            // process has nothing to add.
+            persist_json(&backend, MESSAGE_BUS_KEY, &Vec::<AgentMessage>::new()).await;
+            return;
+        }
+        let persisted = restore_bus_history(&backend).await;
+        let mut merged: Vec<AgentMessage> = Vec::with_capacity(persisted.len() + current.len());
+        let mut seen = std::collections::HashSet::new();
+        for msg in persisted.into_iter().chain(current) {
+            if seen.insert(msg.id.clone()) {
+                merged.push(msg);
+            }
+        }
+        while merged.len() > self.capacity {
+            merged.remove(0);
+        }
+        persist_json(&backend, MESSAGE_BUS_KEY, &merged).await;
     }
 
     /// Send a message. Stores in history with bounded eviction and notifies
@@ -201,6 +398,7 @@ impl MessageBus {
             }
             history.push_back(msg.clone());
         }
+        self.persist().await;
         let subs = self.subscribers.read().await;
         if msg.to == "broadcast" {
             for tx in subs.values() {
@@ -217,6 +415,7 @@ impl MessageBus {
             messages: Arc::new(RwLock::new(VecDeque::with_capacity(cap))),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             capacity: cap,
+            backend: None,
         }
     }
 
@@ -257,9 +456,10 @@ impl MessageBus {
         self.messages.read().await.clone()
     }
 
-    /// Clear all stored messages.
+    /// Clear all stored messages (in-memory + persisted snapshot).
     pub async fn clear(&self) {
         self.messages.write().await.clear();
+        self.persist().await;
     }
 }
 
@@ -322,6 +522,11 @@ pub struct AgentPool {
     /// inherit the parent's budget so the pool can never outlive the session
     /// that spawned it. 0 = parent was unlimited → sub-agents stay unlimited.
     wall_timeout_secs: u64,
+    /// Goal #106: set once the persisted snapshot has been rehydrated. The
+    /// registration site (`register_subagent_if_enabled`) is synchronous and
+    /// cannot await, so the restore is deferred to the first async use via
+    /// [`AgentPool::ensure_restored`].
+    restored: Arc<AtomicBool>,
 }
 
 impl AgentPool {
@@ -332,7 +537,34 @@ impl AgentPool {
             memory: SharedMemory::new(),
             bus: MessageBus::new(),
             wall_timeout_secs: config.wall_timeout_secs,
+            restored: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Attach a storage backend: `SharedMemory` writes and `MessageBus`
+    /// history become write-through persistent, and a fresh process can
+    /// restore the last snapshot via [`AgentPool::restore`].
+    pub fn with_backend(mut self, backend: Arc<dyn StorageBackend>) -> Self {
+        self.memory = self.memory.with_backend(backend.clone());
+        self.bus = self.bus.with_backend(backend);
+        self
+    }
+
+    /// Restore the last persisted collaboration snapshot into the pool's
+    /// shared memory and bus. Best-effort; no-op without a backend.
+    pub async fn restore(&self) {
+        self.memory.restore().await;
+        self.bus.restore().await;
+    }
+
+    /// Rehydrate the persisted snapshot exactly once (best-effort). Safe to
+    /// call on every agent dispatch: the first call restores, later calls are
+    /// a single relaxed atomic check.
+    pub async fn ensure_restored(&self) {
+        if self.restored.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.restore().await;
     }
 
     pub fn memory(&self) -> &SharedMemory {
@@ -586,6 +818,22 @@ pub fn register_subagent_if_enabled(
         tracing::warn!("Failed to load agent definitions: {e}");
         AgentDefinitions::default()
     });
+    // Goal #106: collaboration state (shared memory, bus history, artifacts)
+    // persists through a local-storage backend rooted at the per-workspace
+    // data dir, so a crash/restart rehydrates instead of losing everything.
+    // Cloud deployments override via the S3/Redis backends; tests construct
+    // their own pools and are unaffected.
+    let collab_backend: Arc<dyn StorageBackend> =
+        Arc::new(crate::storage::LocalStorageBackend::new(
+            crate::paths::user_workspace_dir(&config.workspace)
+                .unwrap_or_else(|_| config.workspace.join(".recursive").join("collab")),
+        ));
+    let artifact_store = Arc::new(crate::tools::artifacts::ArtifactStore::new(
+        collab_backend.clone(),
+    ));
+    let pool = Arc::new(tokio::sync::RwLock::new(
+        AgentPool::new(provider.clone(), config.clone()).with_backend(collab_backend),
+    ));
     // A single shared registry pair so the `agent` tool and the coordinator-side
     // task/message tools observe the same workers.
     let task_registry = Arc::new(TaskRegistry::new());
@@ -608,6 +856,8 @@ pub fn register_subagent_if_enabled(
     .with_task_registry(task_registry.clone())
     .with_registry(worker_registry.clone())
     .with_workers(worker_table.clone())
+    .with_pool(pool)
+    .with_artifact_store(artifact_store.clone())
     // Issue #40: workers inherit the parent's wall budget and cancellation
     // token so a stalled worker LLM call can never park the parent turn.
     .with_wall_timeout_secs(config.wall_timeout_secs);
@@ -631,6 +881,15 @@ pub fn register_subagent_if_enabled(
         .register(Arc::new(ListWorkersTool::new(
             worker_registry.clone(),
             task_registry.clone(),
+        )))
+        // Goal #106: the coordinator is the primary consumer of artifact
+        // references embedded in worker results, so it needs the loader tools
+        // too — without them the advertised `artifact_read` is uncallable.
+        .register(Arc::new(crate::tools::artifacts::ArtifactReadTool::new(
+            artifact_store.clone(),
+        )))
+        .register(Arc::new(crate::tools::artifacts::ArtifactListTool::new(
+            artifact_store,
         )));
 
     #[cfg(feature = "coordinator-mode")]
@@ -1158,6 +1417,275 @@ mod tests {
         assert_eq!(keys, vec!["x", "y"]);
     }
 
+    // --- Write-through persistence (goal #106) ---
+
+    #[tokio::test]
+    async fn shared_memory_persists_and_restores_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        // Process 1: write two entries (write-through fires on each set).
+        let mem = SharedMemory::new().with_backend(backend.clone());
+        mem.set("goal".into(), "build feature X".into(), "planner".into())
+            .await;
+        mem.set("status".into(), "in-progress".into(), "coder".into())
+            .await;
+
+        // Process 2: a fresh instance restores the snapshot.
+        let revived = SharedMemory::new().with_backend(backend);
+        assert!(
+            revived.get("goal").await.is_none(),
+            "fresh instance starts empty until restore() runs"
+        );
+        revived.restore().await;
+        let goal = revived.get("goal").await.expect("restored entry");
+        assert_eq!(goal.value, "build feature X");
+        assert_eq!(goal.author, "planner");
+        assert_eq!(revived.get("status").await.unwrap().value, "in-progress");
+    }
+
+    #[tokio::test]
+    async fn shared_memory_restore_never_clobbers_live_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let mem = SharedMemory::new().with_backend(backend.clone());
+        mem.set("k".into(), "old".into(), "p1".into()).await;
+
+        // A live instance writes a NEWER value for the same key before
+        // restoring — the in-memory copy must win over the stale snapshot.
+        let live = SharedMemory::new().with_backend(backend);
+        live.set("k".into(), "newer".into(), "p2".into()).await;
+        live.restore().await;
+        assert_eq!(live.get("k").await.unwrap().value, "newer");
+    }
+
+    #[tokio::test]
+    async fn shared_memory_seq_stays_monotonic_after_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let mem = SharedMemory::new().with_backend(backend.clone());
+        mem.set("a".into(), "1".into(), "x".into()).await;
+        mem.set("b".into(), "2".into(), "x".into()).await;
+        let max_seq = mem.all().await.iter().map(|e| e.seq).max().unwrap_or(0);
+
+        let revived = SharedMemory::new().with_backend(backend);
+        revived.restore().await;
+        let a_seq = revived.get("a").await.unwrap().seq;
+        assert_eq!(a_seq, 1, "restored entries keep their original seq");
+        revived.set("c".into(), "3".into(), "y".into()).await;
+        let fresh = revived.get("c").await.unwrap().seq;
+        assert!(
+            fresh > max_seq,
+            "post-restore writes must keep seq monotonic across the restart boundary ({fresh} must exceed {max_seq})"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_memory_persist_failure_degrades_not_errors() {
+        // A backend that always fails must not break set()/remove(): the
+        // in-memory store stays the source of truth.
+        struct FailingBackend;
+        #[async_trait::async_trait]
+        impl StorageBackend for FailingBackend {
+            async fn load_transcript(
+                &self,
+                _session_id: &str,
+            ) -> crate::error::Result<Vec<Message>> {
+                Ok(vec![])
+            }
+            async fn save_transcript(
+                &self,
+                _session_id: &str,
+                _messages: &[Message],
+            ) -> crate::error::Result<()> {
+                Err(crate::error::Error::Storage {
+                    message: "boom".into(),
+                })
+            }
+            async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+                Err(crate::error::Error::Storage {
+                    message: "boom".into(),
+                })
+            }
+            async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+                Err(crate::error::Error::Storage {
+                    message: "boom".into(),
+                })
+            }
+        }
+
+        let mem = SharedMemory::new().with_backend(Arc::new(FailingBackend));
+        mem.set("k".into(), "v".into(), "a".into()).await;
+        assert_eq!(mem.get("k").await.unwrap().value, "v");
+        assert!(mem.remove("k").await);
+        assert!(mem.get("k").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_memory_remove_persists_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let mem = SharedMemory::new().with_backend(backend.clone());
+        mem.set("gone".into(), "soon".into(), "a".into()).await;
+        assert!(mem.remove("gone").await);
+
+        let revived = SharedMemory::new().with_backend(backend);
+        revived.restore().await;
+        assert!(
+            revived.get("gone").await.is_none(),
+            "removal must survive a restart (snapshot rewritten without the key)"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_bus_history_persists_and_restores_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let bus = MessageBus::new().with_backend(backend.clone());
+        bus.send(make_msg("planner", "coder", "task one", MessageType::Task))
+            .await;
+        bus.send(make_msg("coder", "planner", "done", MessageType::Result))
+            .await;
+
+        let revived = MessageBus::new().with_backend(backend);
+        assert!(
+            revived.history().await.is_empty(),
+            "fresh instance starts empty until restore() runs"
+        );
+        revived.restore().await;
+        let history = revived.history().await;
+        let contents: Vec<_> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(contents, vec!["task one", "done"]);
+        // The restored bus is a fully functional one: routing still works.
+        let inbox = revived.inbox("coder").await;
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].content, "task one");
+    }
+
+    #[tokio::test]
+    async fn message_bus_restore_respects_capacity_and_live_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let bus = MessageBus::with_capacity(3).with_backend(backend.clone());
+        for i in 0..5 {
+            bus.send(make_msg(
+                "a",
+                "broadcast",
+                &format!("m{i}"),
+                MessageType::Feedback,
+            ))
+            .await;
+        }
+
+        // Live instance: a newer message beats restore().
+        let live = MessageBus::with_capacity(3).with_backend(backend);
+        live.send(make_msg("z", "broadcast", "fresh", MessageType::Broadcast))
+            .await;
+        live.restore().await;
+        let contents: Vec<_> = live
+            .history()
+            .await
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["m3", "m4", "fresh"],
+            "restore must not clobber a live buffer or exceed capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_bus_clear_persists_empty_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let bus = MessageBus::new().with_backend(backend.clone());
+        bus.send(make_msg("a", "b", "hello", MessageType::Task))
+            .await;
+        bus.clear().await;
+        let revived = MessageBus::new().with_backend(backend);
+        revived.restore().await;
+        assert!(
+            revived.history().await.is_empty(),
+            "clear() must persist so a restart does not resurrect old messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_pool_restore_rehydrates_memory_and_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let provider: Arc<dyn ChatProvider> = Arc::new(MockProvider::new(vec![]));
+        let pool = AgentPool::new(provider.clone(), test_config()).with_backend(backend.clone());
+        pool.memory()
+            .set("plan".into(), "step 1".into(), "planner".into())
+            .await;
+        pool.bus()
+            .send(make_msg(
+                "coordinator",
+                "worker",
+                "kick off",
+                MessageType::Task,
+            ))
+            .await;
+
+        // A second pool over the same backend restores the collaboration state.
+        let pool2 = AgentPool::new(provider, test_config()).with_backend(backend);
+        pool2.restore().await;
+        assert_eq!(
+            pool2.memory().get("plan").await.unwrap().value,
+            "step 1",
+            "pool restore must rehydrate shared memory"
+        );
+        assert_eq!(
+            pool2.bus().inbox("worker").await[0].content,
+            "kick off",
+            "pool restore must rehydrate bus history"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_pool_ensure_restored_is_single_shot_and_keeps_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(crate::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let provider: Arc<dyn ChatProvider> = Arc::new(MockProvider::new(vec![]));
+        let pool = AgentPool::new(provider.clone(), test_config()).with_backend(backend.clone());
+        pool.memory().set("k".into(), "v".into(), "a".into()).await;
+
+        let revived = AgentPool::new(provider, test_config()).with_backend(backend);
+        revived.ensure_restored().await;
+        assert_eq!(revived.memory().get("k").await.unwrap().value, "v");
+        // A repeated ensure_restored must not wipe or double-apply the state.
+        revived.ensure_restored().await;
+        assert_eq!(revived.memory().get("k").await.unwrap().value, "v");
+    }
+
     #[tokio::test]
     async fn shared_memory_all_empty_returns_empty_vec() {
         let mem = SharedMemory::new();
@@ -1318,6 +1846,26 @@ mod tests {
             initial_names,
             "disabled subagent must not register any additional tools"
         );
+    }
+
+    #[test]
+    fn register_subagent_if_enabled_registers_artifact_tools() {
+        // Hermetic: pin RECURSIVE_HOME so the collab backend resolves inside
+        // an isolated tempdir, not the developer's real data dir.
+        let ws = crate::test_util::IsolatedWorkspace::new();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let mut config = test_config();
+        config.subagent_enabled = true;
+        config.workspace = ws.path().to_path_buf();
+        let tools = crate::tools::ToolRegistry::local();
+        let result = register_subagent_if_enabled(tools, &config, provider, None);
+        let names = result.names();
+        for expected in ["agent", "artifact_read", "artifact_list"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "coordinator registry must expose '{expected}', got: {names:?}"
+            );
+        }
     }
 }
 

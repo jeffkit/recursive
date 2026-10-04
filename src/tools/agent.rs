@@ -36,6 +36,9 @@ use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
 use crate::tasks::{TaskId, TaskRegistry, TaskState};
 use crate::tools::agent_defs::AgentDefinitions;
+use crate::tools::artifacts::{
+    artifact_reference_text, ArtifactListTool, ArtifactReadTool, ArtifactStore,
+};
 use crate::tools::edit::EditTool;
 use crate::tools::fs::{ReadFile, ReadFileState, WriteFile};
 use crate::tools::send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
@@ -282,6 +285,11 @@ pub struct AgentTool {
     permission_hook: Option<Arc<dyn PermissionHook>>,
     registry: Option<WorkerRegistry>,
     pool: Option<Arc<RwLock<AgentPool>>>,
+    /// Goal #106: durable artifact handoff. When set, every worker's final
+    /// text is persisted as an artifact; results embed an id + preview
+    /// reference instead of relying on the raw inline text surviving
+    /// transcript trim/compaction.
+    artifacts: Option<Arc<ArtifactStore>>,
     task_registry: Arc<TaskRegistry>,
     definitions: Option<AgentDefinitions>,
     /// Background worker continuation table (worker_id → handle). Populated
@@ -323,6 +331,7 @@ impl AgentTool {
             permission_hook,
             registry: None,
             pool: None,
+            artifacts: None,
             task_registry: Arc::new(TaskRegistry::new()),
             definitions: None,
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -342,6 +351,13 @@ impl AgentTool {
     /// Attach an `AgentPool` for shared-memory coordination between workers.
     pub fn with_pool(mut self, pool: Arc<RwLock<AgentPool>>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Attach the durable artifact store (goal #106). When set, worker
+    /// results are persisted as artifacts and referenced by id + preview.
+    pub fn with_artifact_store(mut self, store: Arc<ArtifactStore>) -> Self {
+        self.artifacts = Some(store);
         self
     }
 
@@ -524,6 +540,10 @@ impl AgentTool {
         if let Some(pool) = &self.pool {
             child_agent = child_agent.with_pool(pool.clone());
         }
+        // Goal #106: descendants share the same durable artifact store.
+        if let Some(store) = &self.artifacts {
+            child_agent = child_agent.with_artifact_store(store.clone());
+        }
         // Always propagate the task registry and worker table so descendants
         // share coordination state with the coordinator. Issue #40: propagate
         // the wall budget and a CHILD cancellation token (parent cancel → all
@@ -557,6 +577,13 @@ impl AgentTool {
                 reg.clone(),
                 self.task_registry.clone(),
             )));
+        }
+
+        // Goal #106: artifact tools so workers can hand off / consume large
+        // outputs through the durable store instead of inline transcripts.
+        if let Some(store) = &self.artifacts {
+            sub_registry = sub_registry.register(Arc::new(ArtifactReadTool::new(store.clone())));
+            sub_registry = sub_registry.register(Arc::new(ArtifactListTool::new(store.clone())));
         }
 
         // Build the system prompt with shared-memory context
@@ -631,6 +658,30 @@ impl AgentTool {
         let final_text = outcome
             .final_text
             .unwrap_or_else(|| "(no final message)".to_string());
+
+        // Goal #106: persist the full result as an artifact and return an
+        // id + preview reference. Best-effort: when no store is attached or
+        // the save fails, fall back to the legacy fully-inline result so the
+        // worker's report is never lost.
+        if let Some(store) = &self.artifacts {
+            match store
+                .put(&final_text, format!("{worker_id}-result"), worker_id)
+                .await
+            {
+                Ok(meta) => {
+                    return Ok(format!(
+                        "[worker '{worker_id}' finished: {finish_label}]\n{}",
+                        artifact_reference_text(&meta, &final_text)
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "agent: artifact persistence failed for worker '{worker_id}', \
+                         falling back to inline result: {e}"
+                    );
+                }
+            }
+        }
 
         Ok(format!(
             "[worker '{worker_id}' finished: {finish_label}]\n{final_text}"
@@ -834,6 +885,7 @@ impl AgentTool {
         let permission_hook = self.permission_hook.clone();
         let registry = self.registry.clone();
         let pool = self.pool.clone();
+        let artifacts = self.artifacts.clone();
         let definitions = self.definitions.clone();
         let workers = self.workers.clone();
         let wall_timeout_secs = self.wall_timeout_secs;
@@ -868,6 +920,7 @@ impl AgentTool {
             let worker_token = child_token.as_ref().map(|t| t.child_token());
             let token_slot = token_slot.clone();
             let rescued = rescued.clone();
+            let artifacts = artifacts.clone();
 
             handles.push(tokio::spawn(async move {
                 // Deregister on every exit path, including the abort path of
@@ -897,6 +950,7 @@ impl AgentTool {
                     permission_hook,
                     registry: registry.clone(),
                     pool: pool.clone(),
+                    artifacts: artifacts.clone(),
                     task_registry: Arc::new(crate::tasks::TaskRegistry::new()),
                     definitions,
                     workers,
@@ -1290,6 +1344,17 @@ impl Tool for AgentTool {
     }
 
     async fn execute(&self, arguments: Value) -> Result<String> {
+        // Goal #106: rehydrate the persisted collaboration snapshot exactly
+        // once, on the first dispatch. The registration site is synchronous,
+        // so it cannot await; this is the first async choke point that holds
+        // both the pool and the artifact store.
+        if let Some(pool) = &self.pool {
+            pool.read().await.ensure_restored().await;
+        }
+        if let Some(store) = &self.artifacts {
+            store.ensure_restored().await;
+        }
+
         // --- Resolve mode ---
         let mode_str = arguments
             .get("mode")
