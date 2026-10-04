@@ -92,7 +92,10 @@ pub(super) fn inject_environment_segment(
 ///
 /// Callers add what is genuinely request-specific on top of the returned
 /// builder (`seed_transcript` for `/agui` resume, then `build()`).
-fn build_session_runtime(
+///
+/// `pub(super)` since issue #98: `http::cold_load` reuses this exact path for
+/// restored sessions so they cannot drift from freshly created ones.
+pub(super) fn build_session_runtime(
     state: &AppState,
     tool_registry: ToolRegistry,
     system_prompt: String,
@@ -350,13 +353,34 @@ pub(super) async fn run_agent(
 ///
 /// Accepted values (case-insensitive): `"default"`, `"auto"`, `"strict"`,
 /// `"bypass"` / `"bypass_permissions"`. Unknown values fall back to `Default`.
-fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMode {
+///
+/// `pub(super)` since issue #98: cold load re-parses the persisted
+/// `permission_mode` through here, so the `allow_bypass_permissions` guard
+/// applies to restored sessions too.
+pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMode {
     match s.to_ascii_lowercase().as_str() {
         "auto" => PermissionMode::Auto,
         "strict" => PermissionMode::Strict,
         "bypass" | "bypass_permissions" if allow_bypass => PermissionMode::BypassPermissions,
         _ => PermissionMode::Default,
     }
+}
+
+/// Render a [`PermissionMode`] in the API's request vocabulary (the strings
+/// [`parse_permission_mode`] accepts) so `GET /sessions/:id` can report the
+/// live mode. Variants unreachable from the HTTP surface keep their serde
+/// camelCase names.
+fn permission_mode_label(mode: &PermissionMode) -> String {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::Auto => "auto",
+        PermissionMode::Strict => "strict",
+        PermissionMode::BypassPermissions => "bypass",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::DontAsk => "dontAsk",
+        PermissionMode::Plan { .. } => "plan",
+    }
+    .to_string()
 }
 
 // ── Session endpoints ──────────────────────────────────────────────────────
@@ -395,6 +419,7 @@ pub(super) async fn create_session(
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
+    let custom_base = body.system_prompt.is_some() || body.append_system_prompt.is_some();
     let system_prompt = match body.system_prompt {
         Some(s) => s,
         None => {
@@ -405,6 +430,14 @@ pub(super) async fn create_session(
             }
             p
         }
+    };
+    // Issue #98: only a REQUEST-supplied base is persisted. A default session
+    // keeps tracking the server default (the pre-#98 behaviour), while a custom
+    // persona survives a restart instead of being silently swapped.
+    let base_system_prompt = if custom_base {
+        Some(system_prompt.clone())
+    } else {
+        None
     };
     // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
     // + base + skill index + coordinator/sub_agent note (when enabled).
@@ -450,6 +483,22 @@ pub(super) async fn create_session(
     // shutdown) through the storage backend that `build_session_runtime`
     // wires into the builder (Goal 396).
     runtime.set_session_id(&id);
+
+    // Issue #98: persist the per-session configuration so a cold-loaded
+    // session keeps its custom persona / permission mode / title / step cap
+    // instead of silently reverting to the server defaults. Best-effort:
+    // a storage failure must not fail session creation.
+    super::cold_load::persist_session_meta(
+        &state,
+        &id,
+        &super::cold_load::SessionMeta {
+            system_prompt: base_system_prompt,
+            permission_mode: body.permission_mode.clone(),
+            title: body.session_name.clone(),
+            max_steps: body.max_steps.map(|n| n as usize),
+        },
+    )
+    .await;
 
     // Extract the gate before moving runtime into the Mutex so HTTP handlers
     // can approve/reject without acquiring the per-session runtime lock.
@@ -573,7 +622,7 @@ pub(super) async fn get_session(
     };
 
     // Try a non-blocking lock for messages/todos/goal; fall back to empty when busy.
-    let (messages, todos, goal) = match session.runtime.try_lock() {
+    let (messages, todos, goal, permission_mode) = match session.runtime.try_lock() {
         Ok(runtime) => {
             let msgs = runtime
                 .transcript()
@@ -582,9 +631,13 @@ pub(super) async fn get_session(
                 .collect();
             let todos = runtime.current_todos();
             let goal = runtime.current_goal();
-            (msgs, todos, goal)
+            // Issue #98: read the live mode straight off the tool registry so
+            // a restored session reports what it actually runs with.
+            let permission_mode =
+                permission_mode_label(&runtime.kernel().tools().permission_mode());
+            (msgs, todos, goal, Some(permission_mode))
         }
-        Err(_) => (vec![], vec![], None),
+        Err(_) => (vec![], vec![], None, None),
     };
 
     // Extract first/last user prompt for display without a separate lock.
@@ -621,6 +674,7 @@ pub(super) async fn get_session(
         last_prompt,
         prompt_tokens,
         completion_tokens,
+        permission_mode,
     }))
 }
 
@@ -711,25 +765,34 @@ pub(super) async fn patch_session(
     Path(id): Path<String>,
     Json(body): Json<PatchSessionRequest>,
 ) -> Result<Json<SessionInfo>, ApiError> {
-    let sessions_lock = state.host.sessions();
-    let mut sessions = sessions_lock.write().await;
-    let session = sessions
-        .get_mut(&id)
-        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let (info, title) = {
+        let sessions_lock = state.host.sessions();
+        let mut sessions = sessions_lock.write().await;
+        let session = sessions
+            .get_mut(&id)
+            .ok_or_else(|| ApiError::not_found("session not found"))?;
 
-    if let Some(title) = body.title {
-        session.title = if title.is_empty() { None } else { Some(title) };
-    }
+        if let Some(title) = body.title {
+            session.title = if title.is_empty() { None } else { Some(title) };
+        }
 
-    // Read the pre-computed non-system message count directly from the
-    // atomic. It is updated whenever a non-system message is appended, so
-    // we don't need to acquire the runtime lock here.
-    Ok(Json(SessionInfo {
-        id: session.id.clone(),
-        created_at: session.created_at.clone(),
-        message_count: session.non_system_message_count.load(Ordering::Relaxed),
-        title: session.title.clone(),
-    }))
+        // Read the pre-computed non-system message count directly from the
+        // atomic. It is updated whenever a non-system message is appended, so
+        // we don't need to acquire the runtime lock here.
+        let info = SessionInfo {
+            id: session.id.clone(),
+            created_at: session.created_at.clone(),
+            message_count: session.non_system_message_count.load(Ordering::Relaxed),
+            title: session.title.clone(),
+        };
+        (info, session.title.clone())
+    };
+
+    // Issue #98: mirror the new title into the persisted metadata — outside
+    // the sessions lock, since this is storage IO — so a restart restores it.
+    super::cold_load::update_persisted_title(&state, &id, title).await;
+
+    Ok(Json(info))
 }
 
 // ── Fork session ─────────────────────────────────────────────────────────
@@ -3289,6 +3352,31 @@ mod tests {
         assert_eq!(
             parse_permission_mode("unknown", true),
             PermissionMode::Default
+        );
+    }
+
+    /// Issue #98: `GET /sessions/:id` reports the mode in the same vocabulary
+    /// `parse_permission_mode` accepts, so a client can round-trip it.
+    #[test]
+    fn permission_mode_label_covers_every_variant() {
+        assert_eq!(permission_mode_label(&PermissionMode::Default), "default");
+        assert_eq!(permission_mode_label(&PermissionMode::Auto), "auto");
+        assert_eq!(permission_mode_label(&PermissionMode::Strict), "strict");
+        assert_eq!(
+            permission_mode_label(&PermissionMode::BypassPermissions),
+            "bypass"
+        );
+        assert_eq!(
+            permission_mode_label(&PermissionMode::AcceptEdits),
+            "acceptEdits"
+        );
+        assert_eq!(permission_mode_label(&PermissionMode::DontAsk), "dontAsk");
+        assert_eq!(
+            permission_mode_label(&PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            }),
+            "plan"
         );
     }
 

@@ -361,4 +361,76 @@ mod cold_load_tests {
             "a deleted session must not be resurrected by cold load"
         );
     }
+
+    /// Issue #98 acceptance: a session created with a custom `system_prompt`
+    /// and a `permission_mode` must restore BOTH after a restart. The cold-load
+    /// path used to rebuild from the server defaults — silently swapping the
+    /// persona and downgrading the permission mode.
+    #[tokio::test]
+    async fn restart_preserves_custom_prompt_and_permission_mode() {
+        let (_dir, backend) = fresh_storage();
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let state = sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![stop_completion("hello there")])),
+            backend.clone(),
+        );
+        let app = build_router(state.clone());
+
+        let (status, created) = send(
+            &app,
+            "POST",
+            "/sessions",
+            Some(serde_json::json!({
+                "system_prompt": "You are a pirate.",
+                "permission_mode": "auto",
+            })),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let id = created["id"].as_str().expect("session id").to_string();
+
+        // One real turn so the transcript has restorable content (an empty —
+        // system-only — transcript intentionally cold-loads to 404).
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/sessions/{id}/messages"),
+            Some(serde_json::json!({"content": "hi"})),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // Graceful shutdown (Goal 396) → the next process sees only storage.
+        recursive::http::flush_all_sessions(&state).await;
+
+        let restarted =
+            sample_state_with_storage(Arc::new(MockProvider::new(vec![])), backend.clone());
+        let app2 = build_router(restarted);
+
+        let (status, detail) = send(&app2, "GET", &format!("/sessions/{id}"), None).await;
+        assert_eq!(status, 200);
+        let system_msg = detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "system")
+            .expect("restored transcript carries a system message");
+        assert!(
+            system_msg["content"]
+                .as_str()
+                .unwrap()
+                .contains("You are a pirate."),
+            "custom system prompt must survive the restart, got: {}",
+            system_msg["content"]
+        );
+        assert_eq!(
+            detail["permission_mode"], "auto",
+            "permission mode must survive the restart"
+        );
+        // The user prompt is still extracted from the restored transcript.
+        assert_eq!(detail["first_prompt"], "hi");
+        assert_eq!(detail["last_prompt"], "hi");
+    }
 }

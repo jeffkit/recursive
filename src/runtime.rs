@@ -878,6 +878,16 @@ impl AgentRuntime {
         &self.kernel
     }
 
+    /// Test-only: whether context-management compaction is installed.
+    ///
+    /// `AgentRuntime` deliberately exposes no compactor accessor publicly;
+    /// the cold-load tests still need to prove a restored runtime is not
+    /// compactor-less (issue #98).
+    #[cfg(test)]
+    pub(crate) fn has_compactor(&self) -> bool {
+        self.compactor.is_some()
+    }
+
     /// Issue #31: session-bound environment teardown. Drains the session's
     /// background-job manager (transport-backed jobs die with the
     /// environment) and calls `destroy()` on the registry's transport —

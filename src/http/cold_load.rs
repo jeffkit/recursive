@@ -27,13 +27,21 @@
 //! only contained a system message (or only orphan tool results) restores
 //! to nothing and must stay 404 — never a ghost session.
 //!
-//! # Metadata (minimal semantics)
+//! # Per-session metadata (issue #98)
 //!
-//! `created_at` is synthesized from the current time and `title` is `None`.
-//! Session-metadata persistence is NOT part of this goal — the
-//! [`crate::storage::StorageBackend`] trait exposes no mtime/metadata read,
-//! and per-session config echoes (permission mode, title, token counters)
-//! are not persisted anywhere yet.
+//! A restored runtime is built through the SAME frontend-neutral path as a
+//! fresh one (`handlers::build_session_runtime`), so it gets the compactor /
+//! microcompactor / transcript cap, token streaming and the storage backend.
+//! Before #98 the restored path skipped all of that and additionally rebuilt
+//! the system prompt from the server default — silently swapping a custom
+//! persona and downgrading the permission mode.
+//!
+//! The per-session config echoes (`system_prompt`, `permission_mode`, `title`,
+//! `max_steps`) are persisted as a JSON blob in the storage backends' generic
+//! key/value space (`session-meta/<id>`, the same space as the delete
+//! tombstone) at session creation. A transcript persisted by an older build
+//! has no blob: it restores with the server defaults — the pre-#98 behaviour —
+//! rather than failing. `title` is re-persisted on `PATCH /sessions/:id`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -41,7 +49,7 @@ use std::sync::Arc;
 use super::handlers::format_timestamp;
 use super::{ApiError, AppState, SessionState};
 use crate::message::{Message, Role};
-use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
+use crate::runtime::AgentRuntime;
 use std::time::SystemTime;
 
 /// Fetch a session from the in-memory table, cold-loading it from the
@@ -67,6 +75,84 @@ use std::time::SystemTime;
 /// generic key/value space so it works for every backend (local / S3).
 pub(super) fn deleted_marker_key(id: &str) -> String {
     format!("session-deleted/{id}")
+}
+
+/// Per-session configuration that must survive a server restart (issue #98).
+///
+/// Persisted as one JSON blob through [`crate::storage::StorageBackend`]'s
+/// generic key/value space, so it works for every backend (local / S3).
+/// Every field is optional: `None` means "use the server default", which is
+/// exactly how a blob from an older build (absent entirely) is treated.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct SessionMeta {
+    /// Channel-prepared BASE system prompt (before project-context / skill /
+    /// environment assembly), exactly as `create_session` resolved it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// `permission_mode` string as supplied to `create_session`. Re-parsed on
+    /// restore so the server's `allow_bypass_permissions` guard still applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Human-readable title (create-time `session_name`, later `PATCH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Explicit per-session step cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
+}
+
+/// Storage key for the per-session metadata blob (issue #98).
+pub(super) fn session_meta_key(id: &str) -> String {
+    format!("session-meta/{id}")
+}
+
+/// Best-effort persist of the per-session metadata: a storage failure is
+/// logged, never fatal — the session is still usable, it just restores with
+/// the server defaults (pre-#98 behaviour).
+pub(super) async fn persist_session_meta(state: &AppState, id: &str, meta: &SessionMeta) {
+    let Ok(json) = serde_json::to_string(meta) else {
+        tracing::warn!(session_id = %id, "failed to serialize session metadata");
+        return;
+    };
+    if let Err(e) = state
+        .storage
+        .save_memory(&session_meta_key(id), &json)
+        .await
+    {
+        tracing::warn!(session_id = %id, error = %e, "failed to persist session metadata");
+    }
+}
+
+/// Best-effort load of the persisted metadata. A read or parse failure
+/// degrades to `None` (server defaults) — a corrupt blob must not make a
+/// restorable session 500.
+pub(super) async fn load_session_meta(state: &AppState, id: &str) -> Option<SessionMeta> {
+    match state.storage.load_memory(&session_meta_key(id)).await {
+        Ok(Some(json)) => match serde_json::from_str(&json) {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "ignoring unparsable session metadata"
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "failed to load session metadata");
+            None
+        }
+    }
+}
+
+/// Mirror a new title into the persisted metadata, preserving every other
+/// field. Used by `PATCH /sessions/:id`.
+pub(super) async fn update_persisted_title(state: &AppState, id: &str, title: Option<String>) {
+    let mut meta = load_session_meta(state, id).await.unwrap_or_default();
+    meta.title = title;
+    persist_session_meta(state, id, &meta).await;
 }
 
 pub(super) async fn get_or_load_session(
@@ -102,8 +188,11 @@ pub(super) async fn get_or_load_session(
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     let non_system_count = seed.len();
 
-    // Phase 3: build the restored runtime with no lock held.
-    let runtime = build_restored_runtime(state, id, seed).await?;
+    // Phase 3: build the restored runtime with no lock held. The persisted
+    // per-session config (issue #98) drives the rebuild; absent, the server
+    // defaults apply.
+    let meta = load_session_meta(state, id).await;
+    let runtime = build_restored_runtime(state, id, seed, meta.as_ref()).await?;
     let plan_approval_gate = runtime.plan_approval_gate();
 
     // Phase 4: short write lock — first insert wins a concurrent race.
@@ -114,10 +203,10 @@ pub(super) async fn get_or_load_session(
     }
     let session = SessionState {
         id: id.to_string(),
-        // Minimal metadata semantics: synthesized timestamp, no title.
-        // Session-metadata persistence is out of scope for this goal.
+        // `created_at` stays synthesized: it is presentation metadata, not a
+        // per-session override, and was never persisted.
         created_at: format_timestamp(SystemTime::now()),
-        title: None,
+        title: meta.as_ref().and_then(|m| m.title.clone()),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -165,54 +254,66 @@ fn normalize_stored_transcript(msgs: Vec<Message>) -> Option<Vec<Message>> {
     }
 }
 
-/// Build a runtime for a cold-loaded session from the CURRENT server
-/// configuration (the original request's per-session overrides — permission
-/// mode, title, max_steps — were never persisted, so they are not restored).
+/// Build a runtime for a cold-loaded session.
 ///
-/// Upgrade sites, kept aligned with `create_session` / `fork_session`:
-/// - Goal 394: still clones the shared registry (per-session tool state is
-///   shared by every session-creation path today); switch to the true
-///   per-session fork when it lands, or the restored session re-imports the
-///   read-before-edit sharing bug through the back door.
-/// - Goal 393: CLI assembles a compactor + microcompactor here; HTTP paths
-///   gain that together once the front-end-neutral helper exists.
+/// Issue #98: this goes through the very same [`build_session_runtime`] the
+/// fresh-session and fork paths use, so a restored session gets the compactor
+/// / microcompactor / transcript cap, token streaming and the storage backend
+/// — previously it got none of them (unbounded context, one-shot streaming,
+/// no persistence). The per-session overrides come from the persisted
+/// [`SessionMeta`]; without one (transcript written by an older build) the
+/// current server configuration applies, exactly as before.
+///
+/// [`build_session_runtime`]: super::handlers::build_session_runtime
 async fn build_restored_runtime(
     state: &Arc<AppState>,
     id: &str,
     seed: Vec<Message>,
+    meta: Option<&SessionMeta>,
 ) -> Result<AgentRuntime, ApiError> {
+    // Base prompt: the persisted per-session prompt wins (issue #98 — a
+    // custom persona must not be silently swapped for the server default).
+    let base = meta
+        .and_then(|m| m.system_prompt.clone())
+        .unwrap_or_else(|| state.config.system_prompt.clone());
     // Same system-prompt assembly as every other channel (project context +
     // skill index + sub-agent note).
     let assembled = crate::assemble_system_prompt(
-        &state.config.system_prompt,
+        &base,
         &state.config.workspace,
         &state.skills,
         state.config.subagent_enabled,
     );
     // Issue #31: a restored session gets its OWN environment (container
     // tier) like a fresh one, plus the environment prompt segment.
-    let tool_registry = state
+    let mut tool_registry = state
         .session_tool_registry()
         .await
         .map_err(ApiError::internal)?;
+    if let Some(mode_str) = meta.and_then(|m| m.permission_mode.as_deref()) {
+        let perm_mode =
+            super::handlers::parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
+        tool_registry =
+            tool_registry.with_permissions(crate::permissions::LayeredPermissionsConfig {
+                mode: perm_mode,
+                layers: Vec::new(),
+            });
+    }
     let (full, segments) = super::handlers::inject_environment_segment(
         assembled.full,
         assembled.segments,
         &tool_registry,
     );
-    let mut runtime = AgentRuntimeBuilder::new()
-        .llm(state.provider.clone())
-        .tools(tool_registry)
-        .system_prompt(full)
-        .prompt_segments(segments)
-        .max_steps(state.config.max_steps)
-        // Goal 399: same wall-clock budget as freshly created sessions.
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        .seed_transcript(seed)
-        .build()
-        .map_err(|e| {
-            ApiError::internal(format!("failed to build restored session runtime: {e}"))
-        })?;
+    let max_steps = meta
+        .and_then(|m| m.max_steps)
+        .unwrap_or(state.config.max_steps);
+    let mut runtime =
+        super::handlers::build_session_runtime(state, tool_registry, full, segments, max_steps)
+            .seed_transcript(seed)
+            .build()
+            .map_err(|e| {
+                ApiError::internal(format!("failed to build restored session runtime: {e}"))
+            })?;
     runtime.set_session_id(id);
     Ok(runtime)
 }
@@ -222,6 +323,7 @@ mod tests {
     use super::*;
     use crate::http::now_session_ms;
     use crate::llm::{Completion, MockProvider, ToolCall};
+    use crate::runtime::AgentRuntimeBuilder;
     use crate::storage::{LocalStorageBackend, StorageBackend};
     use std::sync::atomic::AtomicU64;
 
@@ -406,6 +508,13 @@ mod tests {
         backend.save_transcript(id, &msgs).await.unwrap();
     }
 
+    fn restore_env(name: &str, saved: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+    }
+
     #[tokio::test]
     async fn cold_load_restores_single_system_and_valid_pairing() {
         let dir = tempfile::tempdir().unwrap();
@@ -442,6 +551,12 @@ mod tests {
             transcript.iter().filter(|m| m.role == Role::System).count(),
             1
         );
+        // No persisted metadata → the server default prompt applies (the
+        // pre-#98 fallback; a custom prompt instead comes from the meta blob).
+        assert!(
+            transcript[0].content.contains("test prompt"),
+            "unseeded meta must fall back to the server default prompt"
+        );
         // Stored content restored in order, pairing intact.
         assert_eq!(
             transcript
@@ -451,7 +566,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
         );
-        // Session metadata: synthesized, no title (minimal semantics).
+        // Session metadata: synthesized timestamp, no title (minimal semantics).
         assert!(session.title.is_none());
         assert_eq!(
             session
@@ -465,6 +580,185 @@ mod tests {
                 .sessions_active
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+    }
+
+    // ── issue #98: persisted per-session metadata ─────────────────────────
+
+    /// Pin the literal key namespace. Save and load share `session_meta_key`,
+    /// so a persist/load roundtrip alone cannot detect a key that collapsed to
+    /// an empty (or shared) string — the two calls would agree anyway.
+    #[test]
+    fn storage_keys_are_namespaced_per_session() {
+        assert_eq!(session_meta_key("abc"), "session-meta/abc");
+        assert_eq!(deleted_marker_key("abc"), "session-deleted/abc");
+    }
+
+    #[tokio::test]
+    async fn session_meta_roundtrips_through_the_storage_kv() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+
+        assert!(
+            load_session_meta(&state, "absent").await.is_none(),
+            "missing key → None (no ghost metadata)"
+        );
+        let meta = SessionMeta {
+            system_prompt: Some("be a pirate".into()),
+            permission_mode: Some("auto".into()),
+            title: Some("ship it".into()),
+            max_steps: Some(7),
+        };
+        persist_session_meta(&state, "s1", &meta).await;
+        let loaded = load_session_meta(&state, "s1")
+            .await
+            .expect("persisted meta");
+        assert_eq!(loaded.system_prompt.as_deref(), Some("be a pirate"));
+        assert_eq!(loaded.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(loaded.title.as_deref(), Some("ship it"));
+        assert_eq!(loaded.max_steps, Some(7));
+    }
+
+    #[tokio::test]
+    async fn update_persisted_title_keeps_the_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        persist_session_meta(
+            &state,
+            "s1",
+            &SessionMeta {
+                system_prompt: Some("keep me".into()),
+                permission_mode: None,
+                title: None,
+                max_steps: Some(9),
+            },
+        )
+        .await;
+
+        update_persisted_title(&state, "s1", Some("renamed".into())).await;
+        let loaded = load_session_meta(&state, "s1").await.expect("meta");
+        assert_eq!(loaded.title.as_deref(), Some("renamed"));
+        assert_eq!(loaded.system_prompt.as_deref(), Some("keep me"));
+        assert_eq!(loaded.max_steps, Some(9));
+    }
+
+    /// Issue #98 acceptance: a session created with a custom `system_prompt`
+    /// and a non-default `permission_mode` restores BOTH, and the restored
+    /// runtime keeps context management — previously the cold-load path built
+    /// a compactor-less runtime and swapped in the server default prompt.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn cold_load_restores_custom_prompt_mode_and_context_management() {
+        // `apply_context_management` reads the compaction threshold from the
+        // environment; hold the process-global env lock for the whole test so
+        // a parallel test can neither disable the compactor nor leave a stale
+        // threshold behind. (current_thread: the guard is held across awaits.)
+        let _env = crate::test_util::env_lock();
+        let saved_threshold = std::env::var("RECURSIVE_COMPACT_THRESHOLD").ok();
+        let saved_cap = std::env::var("RECURSIVE_MAX_TRANSCRIPT_CHARS").ok();
+        std::env::remove_var("RECURSIVE_COMPACT_THRESHOLD");
+        std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(
+            dir.path().to_path_buf(),
+            vec![Completion {
+                content: "earlier conversation summary".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            }],
+        );
+        let mut long = Vec::new();
+        for i in 0..6 {
+            long.push(user(&format!("q{i}")));
+            long.push(assistant(&format!("a{i}")));
+        }
+        seed(dir.path(), "sess-98", long).await;
+        persist_session_meta(
+            &state,
+            "sess-98",
+            &SessionMeta {
+                system_prompt: Some("You are a pirate.".into()),
+                permission_mode: Some("auto".into()),
+                title: Some("pirate chat".into()),
+                max_steps: Some(7),
+            },
+        )
+        .await;
+
+        let session = get_or_load_session(&state, "sess-98")
+            .await
+            .expect("cold load");
+        assert_eq!(
+            session.title.as_deref(),
+            Some("pirate chat"),
+            "the persisted title must survive the restart"
+        );
+        let mut rt = session.runtime.lock().await;
+        assert!(
+            rt.transcript()[0].content.contains("You are a pirate."),
+            "the custom system prompt must survive the restart"
+        );
+        assert!(
+            matches!(
+                rt.kernel().tools().permission_mode(),
+                crate::permissions::PermissionMode::Auto
+            ),
+            "the persisted permission mode must be restored"
+        );
+        assert_eq!(
+            rt.kernel().max_steps,
+            7,
+            "the persisted per-session step cap must be restored"
+        );
+        assert!(
+            rt.has_compactor(),
+            "a restored session must keep context management (issue #98)"
+        );
+        // And it actually fires on the long restored transcript.
+        rt.compact_now().await.expect("compaction runs");
+        assert!(
+            rt.transcript().iter().any(|m| m.is_compaction_summary),
+            "the restored session must be able to compact a long conversation"
+        );
+        drop(rt);
+
+        restore_env("RECURSIVE_COMPACT_THRESHOLD", saved_threshold);
+        restore_env("RECURSIVE_MAX_TRANSCRIPT_CHARS", saved_cap);
+    }
+
+    /// The `allow_bypass_permissions` guard still applies to restored
+    /// sessions: a persisted `bypass` mode must not outlive the server policy.
+    #[tokio::test]
+    async fn cold_load_ignores_persisted_bypass_when_server_disallows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // `test_config()` sets allow_bypass_permissions = false.
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        seed(dir.path(), "sess-bypass", vec![user("hi"), assistant("yo")]).await;
+        persist_session_meta(
+            &state,
+            "sess-bypass",
+            &SessionMeta {
+                system_prompt: None,
+                permission_mode: Some("bypass".into()),
+                title: None,
+                max_steps: None,
+            },
+        )
+        .await;
+
+        let session = get_or_load_session(&state, "sess-bypass")
+            .await
+            .expect("cold load");
+        let rt = session.runtime.lock().await;
+        assert!(
+            matches!(
+                rt.kernel().tools().permission_mode(),
+                crate::permissions::PermissionMode::Default
+            ),
+            "bypass must be re-parsed against the server's allow_bypass policy"
         );
     }
 

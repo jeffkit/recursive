@@ -262,6 +262,11 @@ pub struct SessionDetailResponse {
     pub prompt_tokens: u64,
     /// Total completion tokens generated across all turns in this session.
     pub completion_tokens: u64,
+    /// Issue #98: the session's effective permission mode (`"default"` /
+    /// `"auto"` / `"strict"` / `"bypass"`), read from the live tool registry.
+    /// Absent while the session is busy (runtime lock held).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 // ── Goal-168: goal endpoint types ────────────────────────────────────────
@@ -1323,6 +1328,11 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "completion_tokens": {
                             "type": "integer",
                             "description": "Cumulative completion tokens for this session"
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "nullable": true,
+                            "description": "issue #98: effective permission mode (default | auto | strict | bypass); null while the session is busy"
                         }
                     },
                     "required": ["id", "created_at", "messages", "status", "todos", "prompt_tokens", "completion_tokens"]
