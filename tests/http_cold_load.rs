@@ -433,4 +433,170 @@ mod cold_load_tests {
         assert_eq!(detail["first_prompt"], "hi");
         assert_eq!(detail["last_prompt"], "hi");
     }
+
+    /// Issue #102 acceptance: `DELETE ?purge=true` must leave **no copy** of the
+    /// session on disk. The default DELETE above keeps the snapshot behind a
+    /// tombstone; purge is the true-delete path — and it must also reach a copy
+    /// that is no longer live (the "erase my data" request against a session
+    /// that was already closed).
+    #[tokio::test]
+    async fn purge_delete_leaves_no_copy_of_the_session_on_disk() {
+        let (dir, backend) = fresh_storage();
+        seed(
+            &backend,
+            "purge-2",
+            vec![msg(Role::User, "hi"), msg(Role::Assistant, "yo")],
+        )
+        .await;
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let app = build_router(sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![])),
+            backend.clone(),
+        ));
+
+        // Close the session the ordinary way: snapshot + tombstone land on disk.
+        let (status, _) = send(&app, "GET", "/sessions/purge-2", None).await;
+        assert_eq!(status, 200);
+        let (status, _) = send(&app, "DELETE", "/sessions/purge-2", None).await;
+        assert_eq!(status, 204);
+        let transcript = dir.path().join(".recursive/sessions/purge-2.jsonl");
+        assert!(transcript.exists(), "default DELETE keeps the snapshot");
+        assert!(backend
+            .load_memory("session-deleted/purge-2")
+            .await
+            .unwrap()
+            .is_some());
+        // Issue #98/#114: a session also persists a metadata blob (title,
+        // custom system prompt, owner) and a usage ledger, both keyed by the
+        // session id. Purge must reach them too — the acceptance walk below
+        // finds any record it misses.
+        backend
+            .save_memory(
+                &recursive::storage::session_meta_key("purge-2"),
+                "{\"title\":\"secret\"}",
+            )
+            .await
+            .unwrap();
+        backend
+            .save_memory(&recursive::storage::session_usage_key("purge-2"), "{}")
+            .await
+            .unwrap();
+
+        // The session is no longer live — purge must still reach the copy.
+        let (status, _) = send(&app, "DELETE", "/sessions/purge-2?purge=true", None).await;
+        assert_eq!(status, 204);
+
+        assert!(!transcript.exists(), "no transcript may survive a purge");
+        assert!(backend.load_transcript("purge-2").await.unwrap().is_empty());
+        assert!(
+            backend
+                .load_memory("session-deleted/purge-2")
+                .await
+                .unwrap()
+                .is_none(),
+            "no tombstone naming the session may survive a purge"
+        );
+
+        // The acceptance criterion, checked against the real file layout: no
+        // file under `.recursive/` may be named after — or mention — the
+        // purged session.
+        let mut offenders = Vec::new();
+        let mut stack = vec![dir.path().join(".recursive")];
+        while let Some(dir_path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir_path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.to_string_lossy().contains("purge-2") {
+                    offenders.push(path);
+                    continue;
+                }
+                if std::fs::read_to_string(&path).is_ok_and(|text| text.contains("purge-2")) {
+                    offenders.push(path);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "purge must leave no copy of the session on disk, found: {offenders:?}"
+        );
+    }
+
+    /// Issue #102 review (blocking): `?purge=true` must not be a
+    /// delete-arbitrary-files primitive. axum percent-decodes path parameters,
+    /// so `DELETE /sessions/..%2F..%2Foutside?purge=true` hands the handler the
+    /// id `../../outside`; without a validation step before the storage calls
+    /// that erases `<workspace>/outside.jsonl` — or, via the tombstone path,
+    /// `<workspace>/.recursive/important.txt`, or even a file outside the
+    /// workspace entirely.
+    #[tokio::test]
+    async fn purge_delete_rejects_path_traversal_ids() {
+        let (dir, backend) = fresh_storage();
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let app = build_router(sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![])),
+            backend.clone(),
+        ));
+
+        // Arm both delete targets' parents: the transcript path only resolves
+        // `..` if `sessions/` exists, and the tombstone path is only reachable
+        // once `memory/session-deleted/` has been created (as any deployment
+        // that has deleted a session once will have).
+        std::fs::create_dir_all(dir.path().join(".recursive/sessions")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".recursive/memory/session-deleted")).unwrap();
+
+        // The two files the escape attempts below aim at.
+        let sibling = dir.path().join("outside.jsonl");
+        std::fs::write(&sibling, "not yours").unwrap();
+        let under_recursive = dir.path().join(".recursive/important.txt");
+        std::fs::write(&under_recursive, "not yours either").unwrap();
+
+        let escapes = [
+            // `../../outside` + the backend's `.jsonl` suffix → the sibling.
+            "/sessions/..%2F..%2Foutside?purge=true",
+            // `session-deleted/../../important.txt` → one level above memory/.
+            "/sessions/..%2F..%2Fimportant.txt?purge=true",
+            // Same, percent-encoded differently.
+            "/sessions/%2E%2E%2F%2E%2E%2Foutside?purge=true",
+            // Out of the workspace altogether (`/tmp/zz_escaped`).
+            "/sessions/..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2Ftmp%2Fzz_escaped?purge=true",
+            // A backslash path separator is rejected on every platform.
+            "/sessions/..%5C..%5Coutside?purge=true",
+            // The check must not be purge-only: a plain DELETE gets the same id.
+            "/sessions/..%2F..%2Foutside",
+        ];
+        for uri in escapes {
+            let (status, _) = send(&app, "DELETE", uri, None).await;
+            assert_eq!(status, 400, "{uri} must be rejected with 400");
+        }
+
+        assert!(
+            sibling.exists(),
+            "a traversal id must not delete a file next to the sessions dir"
+        );
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"not yours");
+        assert!(
+            under_recursive.exists(),
+            "a traversal id must not delete a file under .recursive/"
+        );
+        assert!(!std::path::Path::new("/tmp/zz_escaped.jsonl").exists());
+
+        // The jail must not have broken the normal path.
+        seed(&backend, "ok-session", vec![msg(Role::User, "hi")]).await;
+        let (status, _) = send(&app, "DELETE", "/sessions/ok-session?purge=true", None).await;
+        assert_eq!(status, 204);
+        assert!(!dir
+            .path()
+            .join(".recursive/sessions/ok-session.jsonl")
+            .exists());
+    }
 }

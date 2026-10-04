@@ -89,6 +89,52 @@ pub fn user_scratchpad_path(workspace: &Path) -> Result<PathBuf> {
     Ok(user_workspace_dir(workspace)?.join("scratchpad.json"))
 }
 
+/// `<user_workspace_dir>/shadow-git/` resolved **without** touching disk.
+///
+/// Unlike [`user_shadow_git_dir`] (which materialises the per-workspace data
+/// dir and its `path.txt` marker as a side effect of resolving the path),
+/// this is safe for read-only probes — e.g. "does this workspace have a
+/// shadow repo to purge?" — that must not create one they meant to inspect.
+pub fn user_shadow_git_dir_if_exists(workspace: &Path) -> PathBuf {
+    let abs = canonicalize_workspace(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    user_data_dir()
+        .join("workspaces")
+        .join(workspace_hash_from_canonical(&abs))
+        .join("shadow-git")
+}
+
+/// Validate a session id for use as a single file-name component and a git
+/// ref segment.
+///
+/// Session ids reach the filesystem by plain interpolation
+/// (`<workspace>/.recursive/sessions/<id>.jsonl`, `memory/session-deleted/<id>`)
+/// and git refs (`refs/sessions/<id>/…`), so an id carrying a separator or a
+/// `..` escapes the store: axum percent-decodes path parameters, which makes
+/// `DELETE /sessions/..%2F..%2Foutside?purge=true` a request to erase a file
+/// outside `.recursive/`. One definition, shared by the storage and checkpoint
+/// layers, so the two can never disagree about what an id may contain.
+///
+/// Allowed: alphanumerics plus `-` `_` `.` — real ids include macOS tmpdir
+/// segments (`…-var-folders-T-.tmpAbc`) and AG-UI's `agui-<hex>`. Rejected: an
+/// empty id, a `..` sequence anywhere, a leading `.`, and any other character —
+/// which includes both path separators (`/` and `\` admit none of the allowed
+/// classes, so they need no clause of their own).
+pub fn validate_session_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.contains("..")
+        || id.starts_with('.')
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(Error::BadToolArgs {
+            name: "session_id".into(),
+            message: format!("invalid session_id `{id}` (must be alphanumeric/-/_/.)"),
+        });
+    }
+    Ok(())
+}
+
 /// 12-char workspace hash. Stable across calls for the same canonical
 /// path. Public for diagnostics.
 pub fn workspace_hash(workspace: &Path) -> String {
@@ -311,5 +357,44 @@ mod tests {
         assert_eq!(h.len(), 12, "hash must be exactly 12 chars");
         assert!(!h.is_empty(), "hash must not be empty");
         assert_ne!(h, "xyzzy", "hash must not be placeholder");
+    }
+
+    // ── validate_session_id: the shared path/ref-segment rule ────────────────
+
+    #[test]
+    fn validate_session_id_accepts_real_session_ids() {
+        for id in [
+            "ok-1",
+            "ok_2",
+            "AbCdef123",
+            "0198f0c1-9d3b-7c4a-8e2f-0123456789ab",
+            "agui-0f1e2d3c4b5a6978",
+            // macOS tmpdir segments carry dots.
+            "2026-05-29T00-09-56Z-var-folders-T-.tmpAbc",
+        ] {
+            assert!(validate_session_id(id).is_ok(), "`{id}` must be allowed");
+        }
+    }
+
+    #[test]
+    fn validate_session_id_rejects_escapes_and_odd_ids() {
+        // Empty, separators, mid-string `..`, a leading dot, and chars
+        // outside [A-Za-z0-9._-] each have to be rejected on their own.
+        for id in [
+            "", "a/b", "a\\b", "..", "a..b", ".hidden", "a!b", "a@b", " ",
+        ] {
+            assert!(validate_session_id(id).is_err(), "`{id}` must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_session_id_error_names_the_offending_id() {
+        let msg = validate_session_id("../../outside")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("../../outside"),
+            "the error must name the rejected id, got: {msg}"
+        );
     }
 }

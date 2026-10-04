@@ -1506,6 +1506,119 @@ mod http_tests {
         }
     }
 
+    /// Issue #102: `DELETE /sessions/:id?purge=true` is the true-delete path.
+    /// The default DELETE keeps the Goal-396 snapshot behind a tombstone;
+    /// purge erases both — and works when the session is no longer live, so a
+    /// data-subject deletion request can still reach a persisted copy.
+    #[tokio::test]
+    async fn delete_session_with_purge_erases_snapshot_and_tombstone() {
+        use recursive::storage::StorageBackend;
+
+        let storage = MemoryStorage::new();
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hello".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_storage(provider, storage.clone());
+
+        // Create a session with a real transcript.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({"content": "hi"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let tombstone = format!("session-deleted/{session_id}");
+
+        // Default DELETE: snapshot persisted, tombstone written.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+        assert!(
+            storage.deleted().is_empty(),
+            "a default DELETE must not erase the snapshot (Goal 396)"
+        );
+        assert!(storage.has_memory(&tombstone), "tombstone written");
+        assert!(!storage
+            .load_transcript(&session_id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Purge DELETE: the session is no longer live, yet every persisted
+        // copy must go.
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/sessions/{session_id}?purge=true"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+
+        assert_eq!(
+            storage.deleted(),
+            vec![session_id.clone()],
+            "purge must delete the persisted transcript"
+        );
+        assert!(
+            storage
+                .load_transcript(&session_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no transcript copy may survive a purge"
+        );
+        assert!(
+            !storage.has_memory(&tombstone),
+            "no tombstone naming the session may survive a purge"
+        );
+    }
+
     #[tokio::test]
     async fn post_message_to_nonexistent_session_returns_404() {
         let provider = Arc::new(MockProvider::new(vec![]));
@@ -2668,6 +2781,35 @@ mod http_tests {
             "missing /sessions/{{id}}/events"
         );
         assert!(paths.contains_key("/openapi.json"), "missing /openapi.json");
+    }
+
+    /// Issue #102: the delete operation must document the `purge` query flag —
+    /// clients discover the true-delete path from the spec, and an
+    /// undocumented deletion API is not a usable deletion API.
+    #[tokio::test]
+    async fn openapi_documents_the_delete_purge_flag() {
+        let app = build_router(sample_state());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let params = spec["paths"]["/sessions/{id}"]["delete"]["parameters"]
+            .as_array()
+            .expect("delete must declare parameters");
+        let purge = params
+            .iter()
+            .find(|p| p["name"] == "purge")
+            .expect("delete must document the purge query flag");
+        assert_eq!(purge["in"], "query");
+        assert_eq!(purge["schema"]["type"], "boolean");
     }
 
     // ------------------------------------------------------------------------

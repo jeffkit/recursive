@@ -666,10 +666,16 @@ mod tests {
         ) -> crate::error::Result<()> {
             Ok(())
         }
+        async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
         async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
             Ok(None)
         }
         async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
     }

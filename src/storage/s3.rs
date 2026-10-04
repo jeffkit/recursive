@@ -134,6 +134,25 @@ impl StorageBackend for S3StorageBackend {
         Ok(())
     }
 
+    // `cloud-runtime` is off in the mutation gate's feature set, so this module
+    // is not compiled there: every mutant below would be unobservable by
+    // construction. S3 behaviour is covered by the cloud-runtime tests.
+    #[cfg_attr(test, mutants::skip)]
+    async fn delete_transcript(&self, session_id: &str) -> Result<()> {
+        let key = self.transcript_key(session_id);
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+            // S3 DELETE is idempotent: deleting a missing key succeeds.
+            .map_err(|e| Error::Storage {
+                message: format!("s3 DELETE {key}: {e}"),
+            })?;
+        Ok(())
+    }
+
     async fn load_memory(&self, key: &str) -> Result<Option<String>> {
         let s3_key = self.memory_key(key);
         let resp = self
@@ -174,6 +193,23 @@ impl StorageBackend for S3StorageBackend {
             .await
             .map_err(|e| Error::Storage {
                 message: format!("s3 PUT {s3_key}: {e}"),
+            })?;
+        Ok(())
+    }
+
+    // Same as `delete_transcript` above: not compiled under the mutation
+    // gate's feature set.
+    #[cfg_attr(test, mutants::skip)]
+    async fn delete_memory(&self, key: &str) -> Result<()> {
+        let s3_key = self.memory_key(key);
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+            .map_err(|e| Error::Storage {
+                message: format!("s3 DELETE {s3_key}: {e}"),
             })?;
         Ok(())
     }

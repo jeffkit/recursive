@@ -1247,14 +1247,47 @@ pub(super) async fn get_session_usage(
     )))
 }
 
+/// Query parameters for `DELETE /sessions/:id`.
+#[derive(serde::Deserialize, Debug, Default)]
+pub(super) struct DeleteSessionQuery {
+    /// Issue #102: `?purge=true` erases every persisted copy of the session —
+    /// transcript snapshot, tombstone, metadata and usage records, shadow-git
+    /// checkpoint chain — instead of leaving the Goal-396 snapshot on disk
+    /// behind a tombstone.
+    #[serde(default)]
+    pub(super) purge: bool,
+}
+
 /// DELETE /sessions/:id — remove a session.
 ///
 /// Issue #85: only the session's owner (or an admin) may delete it.
+///
+/// Without `?purge=true` this keeps the Goal-396 semantics: the transcript is
+/// snapshotted to the storage backend and a tombstone stops cold load from
+/// resurrecting the session.
+///
+/// With `?purge=true` it is the true-delete path (issue #102): the snapshot,
+/// its keyed records (tombstone, metadata blob, usage ledger) and the
+/// session's shadow-git checkpoint chain are erased.
+/// Purge is idempotent and does not require the session to be live — a session
+/// that is only present in storage (idle-evicted, or deleted earlier without
+/// purge) is erased just the same, so a data-subject deletion request can
+/// never be answered with 404 while a plaintext copy survives.
 pub(super) async fn delete_session(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DeleteSessionQuery>,
 ) -> Result<StatusCode, ApiError> {
+    // Issue #102: the id reaches storage paths and git refs by interpolation,
+    // and axum percent-decodes path parameters — so `..%2F..%2Foutside`
+    // arrives as `../../outside` and would make the purge path erase a file
+    // outside `.recursive/`. Reject it before any storage call (the storage
+    // and checkpoint layers re-check the same rule, this only turns it into a
+    // 400 instead of a best-effort purge that silently erases nothing).
+    if let Err(e) = crate::paths::validate_session_id(&id) {
+        return Err(ApiError::bad_request(e.to_string()));
+    }
     // Look up the runtime under a read lock so we can take the per-session
     // runtime Mutex and call `close()` without holding the global write
     // lock across an await point.
@@ -1292,43 +1325,107 @@ pub(super) async fn delete_session(
             .fetch_sub(1, Ordering::Relaxed);
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
-        if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
-            // Issue #123: a failed teardown save is real data loss — count it
-            // so it is visible on `/metrics`, not just in the log.
-            state
-                .metrics
-                .persist_failures
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "failed to persist deleted session transcript"
-            );
+        if query.purge {
+            purge_persisted_session(&state, &id).await;
+        } else {
+            if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
+                // Issue #123: a failed teardown save is real data loss — count it
+                // so it is visible on `/metrics`, not just in the log.
+                state
+                    .metrics
+                    .persist_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "failed to persist deleted session transcript"
+                );
+            }
+            // Goal 396/397 集成语义：快照保留，但删掉的会话**不得被冷加载复活**
+            // （否则 DELETE → GET 会 200，违反 v050 生命周期契约）。落一个 tombstone，
+            // 冷加载见它即 404；驱逐/停机不写 tombstone，仍可从存储恢复。
+            if let Err(e) = state
+                .storage
+                .save_memory(&super::cold_load::deleted_marker_key(&id), "1")
+                .await
+            {
+                // Issue #123: a missing tombstone means a deleted session can be
+                // cold-loaded back to life — a correctness failure, so count it.
+                state
+                    .metrics
+                    .persist_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "failed to write session tombstone"
+                );
+            }
         }
-        // Goal 396/397 集成语义：快照保留，但删掉的会话**不得被冷加载复活**
-        // （否则 DELETE → GET 会 200，违反 v050 生命周期契约）。落一个 tombstone，
-        // 冷加载见它即 404；驱逐/停机不写 tombstone，仍可从存储恢复。
-        if let Err(e) = state
-            .storage
-            .save_memory(&super::cold_load::deleted_marker_key(&id), "1")
-            .await
-        {
-            // Issue #123: a missing tombstone means a deleted session can be
-            // cold-loaded back to life — a correctness failure, so count it.
-            state
-                .metrics
-                .persist_failures
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                session_id = %id,
-                error = %e,
-                "failed to write session tombstone"
-            );
-        }
-        tracing::info!(session_id = %id, "session deleted");
+        tracing::info!(session_id = %id, purge = query.purge, "session deleted");
+        Ok(StatusCode::NO_CONTENT)
+    } else if query.purge {
+        // Issue #102: idempotent true-delete. The session is not live, but a
+        // persisted snapshot may still be on disk (idle eviction, or an
+        // earlier non-purge DELETE). Erase it instead of 404-ing — otherwise
+        // the caller cannot reach the copy it is asking to have destroyed.
+        //
+        // Issue #85: there is no live entry to check, so ownership comes from
+        // the persisted metadata — purge must not become a cross-tenant way to
+        // destroy another identity's session.
+        ensure_session_access_by_id(&state, &id, &identity).await?;
+        purge_persisted_session(&state, &id).await;
+        tracing::info!(session_id = %id, "session purged (not in memory)");
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("session not found"))
+    }
+}
+
+/// Issue #102: erase every persisted copy of session `id`.
+///
+/// Each artifact is erased best-effort with its own log line — a backend
+/// hiccup on the tombstone must not stop the transcript from being erased.
+/// The shadow-git sweep shells out to `git` (including `git gc`), so it runs
+/// on the blocking pool: the HTTP handler must never block a runtime thread
+/// on process I/O.
+async fn purge_persisted_session(state: &AppState, id: &str) {
+    if let Err(e) = state.storage.delete_transcript(id).await {
+        tracing::warn!(session_id = %id, error = %e, "purge: failed to delete transcript");
+    }
+    // Issue #85/#98/#114: the tombstone, the metadata blob (title, custom
+    // system prompt, owner) and the usage ledger are all keyed by the
+    // session id — a purge that erased only the transcript would leave
+    // those plaintext records on disk behind it.
+    for key in std::iter::once(super::cold_load::deleted_marker_key(id))
+        .chain(crate::storage::session_payload_keys(id))
+    {
+        if let Err(e) = state.storage.delete_memory(&key).await {
+            tracing::warn!(
+                session_id = %id,
+                key = %key,
+                error = %e,
+                "purge: failed to delete session record"
+            );
+        }
+    }
+    let workspace = state.config.workspace.clone();
+    let sid = id.to_string();
+    let shadow = tokio::task::spawn_blocking(move || {
+        crate::checkpoint::purge_session_refs(&workspace, &sid)
+    })
+    .await;
+    match shadow {
+        Ok(Ok(0)) => {}
+        Ok(Ok(refs)) => {
+            tracing::info!(session_id = %id, refs, "purge: removed shadow-git checkpoints")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(session_id = %id, error = %e, "purge: shadow-git cleanup failed")
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "purge: shadow-git task failed")
+        }
     }
 }
 
@@ -4654,6 +4751,12 @@ mod tests {
                     message: "disk full".into(),
                 })
             }
+            async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
         }
         let state = readyz_state(crate::http::Metrics::default(), Arc::new(FailingStorage), 8);
         let (status, Json(body)) = readyz(State(state)).await;
@@ -4686,6 +4789,12 @@ mod tests {
                 Ok(None)
             }
             async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
                 Ok(())
             }
         }
@@ -4739,6 +4848,12 @@ mod tests {
                     });
                 }
                 *self.stored.lock().unwrap_or_else(|e| e.into_inner()) = Some(value.to_string());
+                Ok(())
+            }
+            async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
                 Ok(())
             }
         }
@@ -6057,5 +6172,263 @@ mod tests {
             "deltas must carry the answer exactly once — no duplicated final message"
         );
         assert!(saw_run_finished, "stream must end with RunFinished");
+    }
+
+    // ── Issue #102: DELETE ?purge=true is the true-delete path ────────────
+
+    /// AppState whose session storage is rooted at `dir` (the workspace is the
+    /// same dir, so the shadow-git probe resolves under a pinned/real home and
+    /// finds nothing to purge — no side effects on the checkout).
+    fn state_with_storage(dir: &std::path::Path) -> Arc<AppState> {
+        use crate::llm::MockProvider;
+        use crate::tools::ToolRegistry;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let mut config = crate::config::Config::from_env().unwrap();
+        config.workspace = dir.to_path_buf();
+        Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(dir.to_path_buf())),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
+        })
+    }
+
+    fn transcript_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+        dir.join(".recursive")
+            .join("sessions")
+            .join(format!("{id}.jsonl"))
+    }
+
+    fn stored_user_message(content: &str) -> crate::message::Message {
+        crate::message::Message {
+            role: Role::User,
+            content: content.to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            is_compaction_summary: false,
+        }
+    }
+
+    /// The GDPR case: the session is not live (idle-evicted or already deleted
+    /// without purge), yet the plaintext copy is on disk. Purge must erase it
+    /// rather than answering 404 while the copy survives.
+    #[tokio::test]
+    async fn purge_delete_erases_a_session_that_is_only_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_storage(dir.path());
+        let id = "purge-only-on-disk";
+        let marker = crate::http::cold_load::deleted_marker_key(id);
+        state
+            .storage
+            .save_transcript(id, &[stored_user_message("secret business text")])
+            .await
+            .unwrap();
+        state.storage.save_memory(&marker, "1").await.unwrap();
+        // Issue #98/#114: the session's other persisted records — its
+        // metadata blob and usage ledger — name the same id.
+        state
+            .storage
+            .save_memory(
+                &crate::storage::session_meta_key(id),
+                "{\"title\":\"secret\"}",
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_memory(&crate::storage::session_usage_key(id), "{}")
+            .await
+            .unwrap();
+        let path = transcript_path(dir.path(), id);
+        assert!(path.exists());
+
+        let status = delete_session(
+            State(state.clone()),
+            axum::Extension(crate::http::AuthIdentity::local()),
+            Path(id.to_string()),
+            axum::extract::Query(DeleteSessionQuery { purge: true }),
+        )
+        .await
+        .expect("purge of a session that is only persisted must still succeed");
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!path.exists(), "purged transcript must be gone from disk");
+        assert!(
+            state.storage.load_memory(&marker).await.unwrap().is_none(),
+            "the tombstone naming the session must be gone too"
+        );
+        for key in crate::storage::session_payload_keys(id) {
+            assert!(
+                state.storage.load_memory(&key).await.unwrap().is_none(),
+                "purge must erase the session's `{key}` record too"
+            );
+        }
+    }
+
+    /// Two-step flow: a default DELETE keeps the Goal-396 snapshot behind a
+    /// tombstone, and a later `?purge=true` erases it.
+    #[tokio::test]
+    async fn default_delete_keeps_snapshot_then_purge_erases_it() {
+        use crate::llm::ChatProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_storage(dir.path());
+        let id = "purge-two-step";
+        let marker = crate::http::cold_load::deleted_marker_key(id);
+
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(Arc::new(crate::llm::MockProvider::new(vec![])) as Arc<dyn ChatProvider>)
+            .system_prompt("system")
+            .build()
+            .unwrap();
+        let gate = runtime.plan_approval_gate();
+        state.host.sessions().write().await.insert(
+            id.to_string(),
+            SessionState {
+                id: id.to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                title: None,
+                owner: None,
+                tenant: None,
+                runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+                plan_approval_gate: gate,
+                interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+                non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                last_active_ms: Arc::new(AtomicU64::new(0)),
+                usage: Arc::new(crate::http::SessionUsage::new("test-model")),
+                event_seq: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        let status = delete_session(
+            State(state.clone()),
+            axum::Extension(crate::http::AuthIdentity::local()),
+            Path(id.to_string()),
+            axum::extract::Query(DeleteSessionQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let path = transcript_path(dir.path(), id);
+        assert!(
+            path.exists(),
+            "a default DELETE keeps the Goal-396 snapshot on disk"
+        );
+        assert_eq!(
+            state.storage.load_memory(&marker).await.unwrap().as_deref(),
+            Some("1"),
+            "a default DELETE leaves a tombstone behind"
+        );
+
+        let status = delete_session(
+            State(state.clone()),
+            axum::Extension(crate::http::AuthIdentity::local()),
+            Path(id.to_string()),
+            axum::extract::Query(DeleteSessionQuery { purge: true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!path.exists(), "the later purge must erase the snapshot");
+        assert!(
+            state.storage.load_memory(&marker).await.unwrap().is_none(),
+            "the later purge must erase the tombstone"
+        );
+    }
+
+    /// Purge must not erase anything else: an unrelated session's transcript
+    /// survives.
+    #[tokio::test]
+    async fn purge_delete_leaves_other_sessions_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_storage(dir.path());
+        state
+            .storage
+            .save_transcript("keep-me", &[stored_user_message("other work")])
+            .await
+            .unwrap();
+        state
+            .storage
+            .save_transcript("drop-me", &[stored_user_message("to erase")])
+            .await
+            .unwrap();
+
+        delete_session(
+            State(state.clone()),
+            axum::Extension(crate::http::AuthIdentity::local()),
+            Path("drop-me".to_string()),
+            axum::extract::Query(DeleteSessionQuery { purge: true }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!transcript_path(dir.path(), "drop-me").exists());
+        assert!(
+            transcript_path(dir.path(), "keep-me").exists(),
+            "purge must be scoped to the requested session id"
+        );
+    }
+
+    /// Issue #102 x #85: purging a session that is only on disk must still
+    /// respect ownership — the persisted metadata decides, so purge cannot
+    /// become a cross-tenant way to destroy another identity's session.
+    #[tokio::test]
+    async fn purge_of_a_foreign_persisted_session_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_storage(dir.path());
+        let id = "purge-foreign";
+        state
+            .storage
+            .save_transcript(id, &[stored_user_message("alice's work")])
+            .await
+            .unwrap();
+        crate::http::cold_load::persist_session_meta(
+            &state,
+            id,
+            &crate::http::cold_load::SessionMeta {
+                owner: Some("alice".into()),
+                tenant: Some("acme".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let path = transcript_path(dir.path(), id);
+        assert!(path.exists());
+
+        let bob = crate::http::AuthIdentity {
+            subject: "bob".into(),
+            tenant: Some("acme".into()),
+            admin: false,
+        };
+        let err = delete_session(
+            State(state.clone()),
+            axum::Extension(bob),
+            Path(id.to_string()),
+            axum::extract::Query(DeleteSessionQuery { purge: true }),
+        )
+        .await
+        .expect_err("a foreign identity must not purge another session");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(path.exists(), "a refused purge must leave the transcript");
     }
 }

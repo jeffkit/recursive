@@ -254,8 +254,12 @@ impl UsageResponse {
 }
 
 /// Storage key for a session's persisted usage snapshot.
+///
+/// The shape lives in [`crate::storage::session_usage_key`]: issue #102's
+/// purge/retention erase this record with the transcript, so writer and erasers
+/// share one definition of the key.
 pub(super) fn usage_key(id: &str) -> String {
-    format!("session-usage/{id}")
+    crate::storage::session_usage_key(id)
 }
 
 /// The persisted shape: the token snapshot plus the USD already billed.
@@ -607,6 +611,12 @@ mod tests {
             async fn save_memory(&self, _k: &str, _v: &str) -> crate::error::Result<()> {
                 Ok(())
             }
+            async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
         }
         let storage: Arc<dyn StorageBackend> = Arc::new(ReadFailing);
         assert!(load_persisted_usage(&storage, "x").await.is_none());
@@ -648,6 +658,12 @@ mod tests {
                 Err(crate::error::Error::Storage {
                     message: "read-only".into(),
                 })
+            }
+            async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
             }
         }
         let storage: Arc<dyn StorageBackend> = Arc::new(Failing);

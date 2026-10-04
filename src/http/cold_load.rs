@@ -78,8 +78,12 @@ use std::time::SystemTime;
 /// then GET resurrects the session", which breaks the v050 lifecycle contract
 /// (DELETE → GET must be 404). The tombstone lives in the storage backends'
 /// generic key/value space so it works for every backend (local / S3).
+///
+/// The key shape itself lives in [`crate::storage::deleted_marker_key`]: the
+/// transcript retention sweep (issue #102) has to remove the same key, and a
+/// second copy of the literal would drift silently.
 pub(super) fn deleted_marker_key(id: &str) -> String {
-    format!("session-deleted/{id}")
+    crate::storage::deleted_marker_key(id)
 }
 
 /// Per-session configuration that must survive a server restart (issue #98).
@@ -129,8 +133,12 @@ pub(super) struct SessionMeta {
 }
 
 /// Storage key for the per-session metadata blob (issue #98).
+///
+/// The shape lives in [`crate::storage::session_meta_key`]: the key/value space
+/// is shared, and issue #102's purge/retention have to erase this record with
+/// the transcript, so the writer and the erasers must not each hold a literal.
 pub(super) fn session_meta_key(id: &str) -> String {
-    format!("session-meta/{id}")
+    crate::storage::session_meta_key(id)
 }
 
 /// Best-effort persist of the per-session metadata: a storage failure is

@@ -39,6 +39,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_impl(path, bytes, None)
+}
+
+/// Like [`atomic_write`], but create the file with `mode` (a POSIX mode,
+/// e.g. `0o600`) instead of the process default.
+///
+/// The mode is applied at creation *and* re-applied to the temp file before
+/// the rename — a post-rename `chmod` leaves the content readable under the
+/// process umask for the window in between, and permanently if the process
+/// dies inside it. `O_CREAT`'s mode is masked by the umask, so the explicit
+/// `set_permissions` is what pins the exact mode; creating with the mode is
+/// what keeps the file private while it is still empty.
+///
+/// The mode is ignored on non-Unix platforms, where the process ACL model does
+/// not expose a POSIX mode.
+pub fn atomic_write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write_impl(path, bytes, Some(mode))
+}
+
+fn atomic_write_impl(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
+    // The POSIX mode only exists on Unix; elsewhere the parameter is inert.
+    #[cfg(not(unix))]
+    let _ = mode;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(
@@ -50,11 +73,19 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
     // Write to temp, fsync the data, then rename.
     {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -69,7 +100,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Async wrapper around [`atomic_write`] for async call sites.
+/// Async [`atomic_write_with_mode`] for async call sites.
 ///
 /// Uses `tokio::task::spawn_blocking` under the hood so the blocking
 /// fs work does not stall the async runtime. Takes `&Path` (and
@@ -77,9 +108,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// original path in error messages after the move. The bytes are
 /// moved into the blocking task, so callers can pass an owned
 /// `Vec<u8>` from async contexts without copying.
-pub async fn atomic_write_async(path: &Path, bytes: Vec<u8>) -> io::Result<()> {
+pub async fn atomic_write_async_with_mode(
+    path: &Path,
+    bytes: Vec<u8>,
+    mode: u32,
+) -> io::Result<()> {
     let owned_path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || atomic_write(&owned_path, &bytes))
+    tokio::task::spawn_blocking(move || atomic_write_with_mode(&owned_path, &bytes, mode))
         .await
         .map_err(|e| io::Error::other(format!("atomic_write_async join: {e}")))?
 }
@@ -221,10 +256,46 @@ mod tests {
     async fn test_atomic_write_async_roundtrip() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("async.txt");
-        atomic_write_async(&p, b"async bytes".to_vec())
+        atomic_write_async_with_mode(&p, b"async bytes".to_vec(), 0o600)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"async bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "async write must apply the mode too");
+        }
+    }
+
+    /// Issue #102 review: the mode must be on the file when it appears at
+    /// `path` — a post-rename chmod leaves a window (and a crash leaves the
+    /// plaintext world-readable for good).
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_with_mode_is_private_from_the_rename_on() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("secret.jsonl");
+        atomic_write_with_mode(&p, b"secret", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&p).unwrap(), b"secret");
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the renamed file must be owner-only, got {:o}",
+            mode & 0o777
+        );
+        // No temp file may linger with the content either.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let s = entry.unwrap().file_name();
+            assert!(
+                !s.to_string_lossy().starts_with(".tmp-"),
+                "found leftover temp file: {s:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
