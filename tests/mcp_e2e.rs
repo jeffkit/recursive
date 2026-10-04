@@ -46,6 +46,8 @@ async fn spawn_mock(mode: &str) -> Result<McpClient> {
         args: vec![mode.to_string()],
         url: None,
         env: None,
+        headers: None,
+        transport: None,
     };
     let attempts = if mode == "timeout" {
         1

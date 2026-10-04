@@ -3120,6 +3120,8 @@ mod tests {
             args: vec![],
             url: Some("http://x".into()),
             env: None,
+            headers: None,
+            transport: None,
         };
         assert_eq!(mcp_server_transport(&s), "http");
     }
@@ -3134,6 +3136,8 @@ mod tests {
             args: vec![],
             url: None,
             env: None,
+            headers: None,
+            transport: None,
         };
         assert_eq!(mcp_server_transport(&s), "stdio");
     }
@@ -3146,8 +3150,41 @@ mod tests {
             args: vec![],
             url: None,
             env: None,
+            headers: None,
+            transport: None,
         };
         assert_eq!(mcp_server_transport(&s), "unknown");
+    }
+
+    /// Issue #104: the new remote `headers` / `transport` config fields must
+    /// not perturb the `/mcp` display — classification stays url-vs-command
+    /// based regardless of explicit transport override or auth headers.
+    #[test]
+    fn mcp_server_transport_ignores_remote_auth_and_transport_override() {
+        let remote = recursive::mcp::McpServer {
+            name: "github".into(),
+            command: String::new(),
+            args: vec![],
+            url: Some("https://api.example.com/mcp".into()),
+            env: None,
+            headers: Some(std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer tok".to_string(),
+            )])),
+            transport: Some("sse".into()),
+        };
+        assert_eq!(mcp_server_transport(&remote), "http");
+
+        let stdio = recursive::mcp::McpServer {
+            name: "fs".into(),
+            command: "mcp-fs".into(),
+            args: vec![],
+            url: None,
+            env: None,
+            headers: None,
+            transport: None,
+        };
+        assert_eq!(mcp_server_transport(&stdio), "stdio");
     }
 
     // ── Goal-323: max_turns counts arbiter-driven Run turns (582 path) ──

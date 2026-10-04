@@ -430,6 +430,12 @@ async fn rebind_per_session_registry(
                 .build_registry_result()
                 .await
                 .map_err(|e| e.to_string())?;
+            // The provider builds a fresh local registry, so re-attach the
+            // already-spawned MCP tools (they hold process-wide clients) —
+            // otherwise every `mcp__*` tool silently vanishes on the rebuild.
+            for tool in base.mcp_tools() {
+                reg.register_mut(tool);
+            }
             if let Some(sp) = base.shared_permissions() {
                 reg = reg.with_shared_permissions(sp);
             }
@@ -454,10 +460,9 @@ impl AppState {
     /// pruning) are re-applied here because the container tier rebuilds the
     /// registry from scratch — filtering only the startup registry would
     /// silently hand rebuilt sessions the full toolset again. On the clone
-    /// path this is an idempotent re-filter. (MCP tools are still lost on a
-    /// container rebuild — the provider builds a fresh local registry —
-    /// which stays a documented container-tier gap, not a silent contract
-    /// violation.)
+    /// path this is an idempotent re-filter. MCP tools survive the rebuild:
+    /// `rebind_per_session_registry` re-attaches the process-wide MCP tools
+    /// to the fresh container registry before the surface filters run.
     pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
         let mut registry =
             rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await?;
@@ -2024,6 +2029,24 @@ mod goal_403_http_sandbox_entry {
             session_block.contains("retain_tools(&self.config.allow_tools)"),
             "session_tool_registry must reapply allow_tools narrowing to the \
              per-session (container-rebuilt) registry"
+        );
+    }
+
+    /// Issue #104: the container tier rebuilds the registry from scratch, so
+    /// it must re-attach the process-wide MCP tools — otherwise every
+    /// `mcp__*` tool silently vanishes for container sessions.
+    #[test]
+    fn session_rebind_reattaches_mcp_tools() {
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let rebind_block = src
+            .split("async fn rebind_per_session_registry")
+            .nth(1)
+            .and_then(|rest| rest.split("impl AppState").next())
+            .expect("rebind_per_session_registry must exist");
+        assert!(
+            rebind_block.contains("base.mcp_tools()"),
+            "container-tier registry rebuild must re-attach MCP tools via \
+             base.mcp_tools() (issue #104)"
         );
     }
 

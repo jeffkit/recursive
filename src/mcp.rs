@@ -41,9 +41,20 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
-    /// URL for HTTP+SSE transport (mutually exclusive with `command`).
+    /// URL for HTTP transport (mutually exclusive with `command`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Extra HTTP headers sent with every request to a remote (`url`)
+    /// server — the auth channel for SaaS servers (GitHub, Notion, …).
+    /// Values support `${VAR}` env expansion, so a token can live in the
+    /// environment rather than the checked-in `.mcp.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    /// Remote transport override: `"sse"` (legacy HTTP+SSE) or `"http"`
+    /// (2025-03-26 Streamable HTTP). Absent = auto (Streamable HTTP with
+    /// fallback to legacy SSE). Ignored for stdio servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 /// Configuration for a single MCP server.
@@ -55,12 +66,20 @@ pub struct McpServer {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// URL for HTTP+SSE transport, or None if using stdio.
+    /// URL for HTTP transport, or None if using stdio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Extra environment variables to set when spawning a stdio subprocess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
+    /// Extra HTTP headers for a remote server (auth). See
+    /// [`McpServerConfig::headers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    /// Remote transport override (`"sse"` / `"http"`). See
+    /// [`McpServerConfig::transport`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 impl From<(String, McpServerConfig)> for McpServer {
@@ -71,8 +90,69 @@ impl From<(String, McpServerConfig)> for McpServer {
             args: config.args,
             url: config.url,
             env: config.env,
+            headers: config.headers,
+            transport: config.transport,
         }
     }
+}
+
+/// A remote MCP transport selected for a `url`-based server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteTransport {
+    /// Legacy HTTP+SSE (`GET` stream + `POST` endpoint discovered from it).
+    LegacySse,
+    /// 2025-03-26 Streamable HTTP (single endpoint, `POST` JSON-RPC).
+    StreamableHttp,
+    /// Try Streamable HTTP first, fall back to legacy SSE.
+    Auto,
+}
+
+/// Resolve the configured `transport` string to a [`RemoteTransport`].
+/// Unknown values warn and fall back to auto so a typo degrades to the
+/// working transport instead of failing the server outright.
+fn resolve_remote_transport(transport: Option<&str>, server: &str) -> RemoteTransport {
+    match transport.map(str::trim) {
+        None | Some("") | Some("auto") => RemoteTransport::Auto,
+        Some("sse") => RemoteTransport::LegacySse,
+        Some("http") | Some("streamable") | Some("streamable-http") => {
+            RemoteTransport::StreamableHttp
+        }
+        Some(other) => {
+            tracing::warn!(
+                target: "recursive::mcp",
+                server = %server,
+                transport = %other,
+                "unknown MCP transport; falling back to auto"
+            );
+            RemoteTransport::Auto
+        }
+    }
+}
+
+/// Expand `${VAR}` references in a config string against the process
+/// environment (Claude Code `.mcp.json` convention). An unset variable
+/// expands to the empty string; `$${` is not special (only `${…}`).
+fn expand_env(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                out.push_str(&std::env::var(name).unwrap_or_default());
+                rest = &after[end + 1..];
+            }
+            None => {
+                // Unterminated `${` — keep it literally.
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Optional 2025-03-26 MCP tool annotations that carry hints about
@@ -195,6 +275,20 @@ enum McpTransport {
         /// Buffer for accumulating SSE data between reads.
         buffer: String,
     },
+    /// 2025-03-26 Streamable HTTP transport: a single endpoint that
+    /// accepts JSON-RPC via `POST` and answers either with a JSON body or
+    /// with an SSE stream in the POST response.
+    StreamableHttp {
+        client: reqwest::Client,
+        /// Single endpoint URL (both POST and, if needed, GET).
+        url: String,
+        /// Session id returned by the server (the `Mcp-Session-Id` header
+        /// from the initialize response), echoed on subsequent requests.
+        session_id: Option<String>,
+        /// Response body parsed from the last POST, consumed by
+        /// [`McpClient::read_response`].
+        pending: Option<Value>,
+    },
 }
 
 impl fmt::Debug for McpTransport {
@@ -207,6 +301,13 @@ impl fmt::Debug for McpTransport {
                 .debug_struct("HttpSse")
                 .field("sse_url", sse_url)
                 .field("post_url", post_url)
+                .finish(),
+            Self::StreamableHttp {
+                url, session_id, ..
+            } => f
+                .debug_struct("StreamableHttp")
+                .field("url", url)
+                .field("session_id", session_id)
                 .finish(),
         }
     }
@@ -237,6 +338,18 @@ pub struct McpClient {
 /// MCP server. Generous on purpose — real servers can pause briefly
 /// during large tool runs without being broken.
 pub const DEFAULT_STDIO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Protocol revision this client offers during `initialize`. The server may
+/// negotiate down; [`SUPPORTED_PROTOCOL_VERSIONS`] lists what we can speak.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// MCP protocol revisions this client implements, newest first.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", "2024-11-05"];
+
+/// Default cap on the bytes an MCP tool result may contribute to the
+/// transcript before it is truncated (see [`McpTool`]). Mirrors
+/// `web_fetch`'s default `max_bytes`.
+pub const DEFAULT_MCP_MAX_OUTPUT_BYTES: usize = 65536;
 
 /// Capabilities advertised by an MCP server during the initialize handshake.
 #[derive(Debug, Clone, Default)]
@@ -279,13 +392,60 @@ impl McpClient {
     /// a short value (e.g. 500ms) to keep the suite fast; production
     /// callers should stick to [`spawn`].
     pub async fn spawn_with_timeout(server: &McpServer, read_timeout: Duration) -> Result<Self> {
-        if let Some(url) = &server.url {
-            // HTTP+SSE has its own internal timeouts that are independent
-            // of stdio handshake behavior; keep its existing semantics.
-            Self::spawn_http_sse(server, url).await
-        } else {
-            Self::spawn_stdio(server, read_timeout).await
+        let Some(url) = &server.url else {
+            return Self::spawn_stdio(server, read_timeout).await;
+        };
+        // Remote transports have their own internal timeouts independent of
+        // stdio handshake behavior; keep their existing semantics.
+        match resolve_remote_transport(server.transport.as_deref(), &server.name) {
+            RemoteTransport::LegacySse => Self::spawn_http_sse(server, url).await,
+            RemoteTransport::StreamableHttp => Self::spawn_streamable(server, url).await,
+            RemoteTransport::Auto => match Self::spawn_streamable(server, url).await {
+                Ok(client) => Ok(client),
+                Err(streamable_err) => {
+                    tracing::debug!(
+                        target: "recursive::mcp",
+                        server = %server.name,
+                        error = %streamable_err,
+                        "Streamable HTTP unavailable; falling back to legacy SSE"
+                    );
+                    Self::spawn_http_sse(server, url).await
+                }
+            },
         }
+    }
+
+    /// Build the shared HTTP client for a remote server, applying its
+    /// configured `headers` (auth). Header values support `${VAR}` env
+    /// expansion so tokens need not be stored in the config file.
+    fn build_http_client(server: &McpServer) -> Result<reqwest::Client> {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Some(extra) = &server.headers {
+            for (key, value) in extra {
+                let name =
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+                        Error::Mcp {
+                            server: server.name.clone(),
+                            message: format!("invalid header name `{key}`: {e}"),
+                        }
+                    })?;
+                let expanded = expand_env(value);
+                let value =
+                    reqwest::header::HeaderValue::from_str(&expanded).map_err(|e| Error::Mcp {
+                        server: server.name.clone(),
+                        message: format!("invalid header value for `{key}`: {e}"),
+                    })?;
+                default_headers.insert(name, value);
+            }
+        }
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .default_headers(default_headers)
+            .build()
+            .map_err(|e| Error::Mcp {
+                server: server.name.clone(),
+                message: format!("failed to build HTTP client: {e}"),
+            })
     }
 
     /// Spawn via stdio subprocess.
@@ -330,15 +490,35 @@ impl McpClient {
         Ok(client)
     }
 
+    /// Spawn via the 2025-03-26 Streamable HTTP transport.
+    ///
+    /// Unlike legacy SSE there is no separate event-stream connection: every
+    /// JSON-RPC message is `POST`ed to the single `url`, and the server
+    /// answers either with a JSON body or an SSE stream in that same POST
+    /// response. The `initialize` handshake establishes the optional
+    /// `Mcp-Session-Id`.
+    async fn spawn_streamable(server: &McpServer, url: &str) -> Result<Self> {
+        let http_client = Self::build_http_client(server)?;
+        let mut client = Self {
+            transport: McpTransport::StreamableHttp {
+                client: http_client,
+                url: url.to_string(),
+                session_id: None,
+                pending: None,
+            },
+            next_id: 1,
+            capabilities: ServerCapabilities::default(),
+            server_name: server.name.clone(),
+            read_timeout: DEFAULT_STDIO_READ_TIMEOUT,
+            elicitation: None,
+        };
+        client.do_initialize(&server.name).await?;
+        Ok(client)
+    }
+
     /// Spawn via HTTP+SSE transport.
     async fn spawn_http_sse(server: &McpServer, url: &str) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::Mcp {
-                server: server.name.clone(),
-                message: format!("failed to build HTTP client: {e}"),
-            })?;
+        let http_client = Self::build_http_client(server)?;
 
         // Connect to the SSE endpoint and read the initial event to discover
         // the message endpoint.
@@ -436,20 +616,21 @@ impl McpClient {
             .send_request(
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "recursive-agent",
-                        "version": "0.1.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     }
                 }),
             )
             .await?;
 
-        // Check protocol version in response
+        // Check protocol version in response. A server may legitimately
+        // answer with an older revision it prefers; only warn when it picks
+        // one this client does not implement at all.
         if let Some(server_proto) = init_result.get("protocolVersion").and_then(|v| v.as_str()) {
-            if server_proto != "2024-11-05" {
-                // Non-fatal: log but continue
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&server_proto) {
                 tracing::warn!(
                     target: "recursive::mcp",
                     server = %server_name,
@@ -844,6 +1025,72 @@ impl McpClient {
                 }
                 Ok(())
             }
+            McpTransport::StreamableHttp {
+                client,
+                url,
+                session_id,
+                pending,
+            } => {
+                let body = serde_json::to_string(value)?;
+                let mut request = client
+                    .post(url.as_str())
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .body(body);
+                if let Some(sid) = session_id.as_deref() {
+                    request = request.header("Mcp-Session-Id", sid);
+                }
+                let response = request.send().await.map_err(|e| Error::Mcp {
+                    server: self.server_name.clone(),
+                    message: format!("HTTP POST to `{url}` failed: {e}"),
+                })?;
+
+                // Capture / refresh the session id the server assigns
+                // (usually on the initialize response).
+                if let Some(sid) = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    *session_id = Some(sid.to_string());
+                }
+
+                if !response.status().is_success() {
+                    return Err(Error::Mcp {
+                        server: self.server_name.clone(),
+                        message: format!(
+                            "HTTP POST to `{url}` returned HTTP {}",
+                            response.status()
+                        ),
+                    });
+                }
+
+                // Notifications get no JSON-RPC reply (202 Accepted, no body).
+                let Some(expected_id) = value.get("id").and_then(|v| v.as_u64()) else {
+                    // Drain the (typically empty) body so the connection can
+                    // be reused instead of being torn down mid-stream.
+                    let _ = response.bytes().await;
+                    return Ok(());
+                };
+
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let text = response.text().await.map_err(|e| Error::Mcp {
+                    server: self.server_name.clone(),
+                    message: format!("failed to read HTTP response body from `{url}`: {e}"),
+                })?;
+                *pending = Some(parse_http_jsonrpc_response(
+                    &text,
+                    &content_type,
+                    expected_id,
+                    &self.server_name,
+                )?);
+                Ok(())
+            }
         }
     }
 
@@ -870,6 +1117,13 @@ impl McpClient {
                 )
                 .await
             }
+            McpTransport::StreamableHttp { pending, .. } => match pending.take() {
+                Some(result) => Ok(result),
+                None => Err(Error::Mcp {
+                    server: self.server_name.clone(),
+                    message: format!("no buffered HTTP response for id {expected_id}"),
+                }),
+            },
         }
     }
 
@@ -1044,6 +1298,72 @@ fn parse_sse_endpoint(buffer: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Interpret one JSON-RPC message object, returning its `result` for the
+/// expected id, or an error describing why it does not match / is invalid.
+fn parse_jsonrpc_message(parsed: &Value, expected_id: u64, server_name: &str) -> Result<Value> {
+    if parsed.get("id").and_then(|v| v.as_u64()) != Some(expected_id) {
+        return Err(Error::Mcp {
+            server: server_name.to_string(),
+            message: format!("response does not match request id {expected_id}"),
+        });
+    }
+    if let Some(err) = parsed.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        return Err(Error::Mcp {
+            server: server_name.to_string(),
+            message: format!("error (code {code}): {msg}"),
+        });
+    }
+    if let Some(result) = parsed.get("result") {
+        return Ok(result.clone());
+    }
+    Err(Error::Mcp {
+        server: server_name.to_string(),
+        message: "response missing both `result` and `error`".into(),
+    })
+}
+
+/// Parse a Streamable HTTP POST response body. The body is either a JSON
+/// JSON-RPC message (object or batch array) or an SSE-framed stream, per the
+/// response `Content-Type`.
+fn parse_http_jsonrpc_response(
+    body: &str,
+    content_type: &str,
+    expected_id: u64,
+    server_name: &str,
+) -> Result<Value> {
+    if content_type.contains("text/event-stream") {
+        return parse_sse_response(body, expected_id, server_name).unwrap_or_else(|| {
+            Err(Error::Mcp {
+                server: server_name.to_string(),
+                message: format!("SSE response contained no message for id {expected_id}"),
+            })
+        });
+    }
+
+    let parsed: Value = serde_json::from_str(body.trim()).map_err(|e| Error::Mcp {
+        server: server_name.to_string(),
+        message: format!("server returned non-JSON body: {e}"),
+    })?;
+    match parsed {
+        Value::Array(items) => items
+            .iter()
+            .find(|item| item.get("id").and_then(|v| v.as_u64()) == Some(expected_id))
+            .map(|item| parse_jsonrpc_message(item, expected_id, server_name))
+            .unwrap_or_else(|| {
+                Err(Error::Mcp {
+                    server: server_name.to_string(),
+                    message: format!("batch response contained no message for id {expected_id}"),
+                })
+            }),
+        other => parse_jsonrpc_message(&other, expected_id, server_name),
+    }
 }
 
 /// Parse an SSE stream buffer looking for a JSON-RPC response with the
@@ -1413,6 +1733,11 @@ pub struct McpTool {
     /// Trust level of the originating server. Controls whether annotation
     /// hints are used to derive [`ToolSideEffect`].
     trust: McpServerTrust,
+    /// Cap on the result bytes returned to the transcript. MCP servers can
+    /// return unbounded payloads; without a cap a single call re-inflates
+    /// every subsequent prompt. Defaults to
+    /// [`DEFAULT_MCP_MAX_OUTPUT_BYTES`].
+    max_output_bytes: usize,
 }
 
 impl McpTool {
@@ -1426,6 +1751,7 @@ impl McpTool {
             spec,
             server_name: server_name.into(),
             trust: McpServerTrust::Untrusted,
+            max_output_bytes: DEFAULT_MCP_MAX_OUTPUT_BYTES,
         }
     }
 
@@ -1434,12 +1760,28 @@ impl McpTool {
         self.trust = trust;
         self
     }
+
+    /// Builder: override the result-byte cap.
+    pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    /// The server that owns this tool (used to preserve MCP tools across a
+    /// container-tier registry rebuild — see `ToolRegistry::mcp_tools`).
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
 }
 
 #[async_trait]
 impl Tool for McpTool {
     fn is_deferred(&self) -> bool {
         true
+    }
+
+    fn mcp_server_name(&self) -> Option<&str> {
+        Some(&self.server_name)
     }
 
     fn spec(&self) -> ToolSpec {
@@ -1470,8 +1812,21 @@ impl Tool for McpTool {
 
     async fn execute(&self, arguments: Value) -> Result<String> {
         let mut client = self.client.lock().await;
-        client.call_tool(&self.spec.name, arguments).await
+        let text = client.call_tool(&self.spec.name, arguments).await?;
+        Ok(truncate_mcp_output(text, self.max_output_bytes))
     }
+}
+
+/// Cap an MCP tool result to `max_bytes`, appending a marker that names the
+/// original size so the model knows the payload was cut. No-op when within
+/// budget. Bytes are counted UTF-8-safely via [`crate::truncate_str`].
+fn truncate_mcp_output(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let total = text.len();
+    let truncated = crate::truncate_str(&text, max_bytes);
+    format!("{truncated}\n\n[…truncated at {max_bytes} bytes; full result was {total} bytes]")
 }
 
 // ---------------------------------------------------------------------------
@@ -2306,6 +2661,302 @@ mod tests {
         assert_eq!(
             err_obj.code, -32603,
             "internal_error must use the JSON-RPC -32603 error code (negative)"
+        );
+    }
+
+    // ── issue #104: remote auth headers + transport selection ─────────────
+
+    fn server_with_url(url: &str, transport: Option<&str>) -> McpServer {
+        McpServer {
+            name: "remote".into(),
+            command: String::new(),
+            args: vec![],
+            url: Some(url.into()),
+            env: None,
+            headers: None,
+            transport: transport.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_remote_transport_defaults_to_auto() {
+        assert_eq!(resolve_remote_transport(None, "s"), RemoteTransport::Auto);
+        assert_eq!(
+            resolve_remote_transport(Some(""), "s"),
+            RemoteTransport::Auto
+        );
+        assert_eq!(
+            resolve_remote_transport(Some("auto"), "s"),
+            RemoteTransport::Auto
+        );
+    }
+
+    #[test]
+    fn resolve_remote_transport_maps_explicit_values() {
+        assert_eq!(
+            resolve_remote_transport(Some("sse"), "s"),
+            RemoteTransport::LegacySse
+        );
+        assert_eq!(
+            resolve_remote_transport(Some("http"), "s"),
+            RemoteTransport::StreamableHttp
+        );
+        assert_eq!(
+            resolve_remote_transport(Some("streamable-http"), "s"),
+            RemoteTransport::StreamableHttp
+        );
+    }
+
+    #[test]
+    fn resolve_remote_transport_unknown_falls_back_to_auto() {
+        assert_eq!(
+            resolve_remote_transport(Some("carrier-pigeon"), "s"),
+            RemoteTransport::Auto
+        );
+    }
+
+    #[test]
+    fn expand_env_substitutes_known_and_empties_unknown() {
+        std::env::set_var("RECURSIVE_MCP_TEST_TOK", "s3cret");
+        assert_eq!(
+            expand_env("Bearer ${RECURSIVE_MCP_TEST_TOK}"),
+            "Bearer s3cret"
+        );
+        // Unknown var → empty string.
+        assert_eq!(expand_env("x${RECURSIVE_MCP_TEST_DEFINITELY_UNSET}y"), "xy");
+        // No placeholders → unchanged.
+        assert_eq!(expand_env("plain"), "plain");
+        // Unterminated placeholder is left literal.
+        assert_eq!(expand_env("a${OPS"), "a${OPS");
+    }
+
+    #[tokio::test]
+    async fn discover_parses_headers_and_transport_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{
+                "mcpServers": {
+                    "github": {
+                        "url": "https://api.example.com/mcp",
+                        "transport": "http",
+                        "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" }
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let servers = discover_mcp_servers(dir.path()).await.unwrap();
+        assert_eq!(servers.len(), 1);
+        let gh = &servers[0];
+        assert_eq!(gh.transport.as_deref(), Some("http"));
+        let headers = gh.headers.as_ref().expect("headers must be parsed");
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer ${GITHUB_TOKEN}")
+        );
+    }
+
+    // ── issue #104: result truncation ────────────────────────────────────
+
+    #[test]
+    fn truncate_mcp_output_within_budget_is_untouched() {
+        let s = "hello world".to_string();
+        assert_eq!(truncate_mcp_output(s.clone(), 100), s);
+    }
+
+    #[test]
+    fn truncate_mcp_output_at_exact_budget_is_untouched() {
+        let s = "abcde".to_string();
+        assert_eq!(truncate_mcp_output(s.clone(), 5), s);
+    }
+
+    #[test]
+    fn truncate_mcp_output_over_budget_appends_marker() {
+        let s = "x".repeat(100);
+        let out = truncate_mcp_output(s.clone(), 10);
+        assert!(out.starts_with(&"x".repeat(10)), "prefix kept: {out}");
+        assert!(out.contains("truncated at 10 bytes"), "marker: {out}");
+        assert!(out.contains("full result was 100 bytes"), "size: {out}");
+        assert!(out.len() > 10, "marker must be appended after the prefix");
+    }
+
+    #[test]
+    fn truncate_mcp_output_respects_multibyte_boundary() {
+        // 4 chars × 3 bytes = 12 bytes. max=4 lands mid-character.
+        let s = "你好世界".to_string();
+        let out = truncate_mcp_output(s, 4);
+        // Must not panic and must remain valid UTF-8 (truncate_str guarantees this).
+        assert!(out.is_char_boundary(out.find('\n').unwrap_or(out.len())));
+        assert!(out.contains("truncated at 4 bytes"));
+    }
+
+    // ── issue #104: Streamable HTTP response parsing ─────────────────────
+
+    #[test]
+    fn parse_http_jsonrpc_response_plain_json_object() {
+        let body = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        let v = parse_http_jsonrpc_response(body, "application/json", 7, "s").unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn parse_http_jsonrpc_response_batch_array_picks_matching_id() {
+        let body =
+            r#"[{"jsonrpc":"2.0","id":1,"result":"a"},{"jsonrpc":"2.0","id":2,"result":"b"}]"#;
+        let v = parse_http_jsonrpc_response(body, "application/json", 2, "s").unwrap();
+        assert_eq!(v, serde_json::json!("b"));
+    }
+
+    #[test]
+    fn parse_http_jsonrpc_response_batch_missing_id_errors() {
+        let body = r#"[{"jsonrpc":"2.0","id":1,"result":"a"}]"#;
+        let err = parse_http_jsonrpc_response(body, "application/json", 99, "s").unwrap_err();
+        assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    #[test]
+    fn parse_http_jsonrpc_response_sse_framed_body() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"n\":1}}\n\n";
+        let v =
+            parse_http_jsonrpc_response(body, "text/event-stream; charset=utf-8", 3, "s").unwrap();
+        assert_eq!(v["n"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn parse_http_jsonrpc_response_propagates_jsonrpc_error() {
+        let body = r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"nope"}}"#;
+        let err = parse_http_jsonrpc_response(body, "application/json", 5, "s").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("-32601") && msg.contains("nope"), "{msg}");
+    }
+
+    // ── issue #104: Streamable HTTP end-to-end against a loopback mock ────
+
+    /// A blocking loopback HTTP server that speaks enough Streamable HTTP
+    /// for one client session. Records every raw request head for header
+    /// assertions. One connection per request (`Connection: close`).
+    fn spawn_streamable_mock(captured: Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = vec![0u8; 16384];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                captured.lock().unwrap().push(head.to_string());
+                let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = request.get("id").cloned();
+                let (status, extra, payload) = match method {
+                    "initialize" => (
+                        "200 OK",
+                        "Mcp-Session-Id: s-1\r\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {},
+                                "serverInfo": {"name": "mock", "version": "1"}
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    "notifications/initialized" => ("202 Accepted", "", String::new()),
+                    "tools/list" => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}
+                        })
+                        .to_string(),
+                    ),
+                    "tools/call" => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"content": [{"type": "text", "text": "pong"}]}
+                        })
+                        .to_string(),
+                    ),
+                    _ => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {"code": -32601, "message": "unknown"}
+                        })
+                        .to_string(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    #[tokio::test]
+    async fn streamable_http_initialize_and_list_tools() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_streamable_mock(captured.clone());
+        // transport=None → auto → Streamable HTTP succeeds, no SSE fallback.
+        let server = server_with_url(&url, None);
+        let mut client = McpClient::spawn(&server).await.expect("spawn");
+        let tools = client.list_tools().await.expect("list_tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        let out = client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .expect("call");
+        assert_eq!(out, "pong");
+
+        let heads = captured.lock().unwrap().clone();
+        let init_head = heads
+            .iter()
+            .find(|h| h.starts_with("POST /mcp"))
+            .expect("a POST must have been recorded");
+        assert!(
+            init_head
+                .to_lowercase()
+                .contains("accept: application/json, text/event-stream"),
+            "streamable POST must advertise both response types: {init_head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamable_http_sends_configured_auth_header() {
+        std::env::set_var("RECURSIVE_MCP_TEST_AUTH", "tok-123");
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_streamable_mock(captured.clone());
+        let mut server = server_with_url(&url, Some("http"));
+        server.headers = Some(HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer ${RECURSIVE_MCP_TEST_AUTH}".to_string(),
+        )]));
+        let _client = McpClient::spawn(&server).await.expect("spawn");
+        let heads = captured.lock().unwrap().clone();
+        let head = heads.first().expect("at least one request");
+        assert!(
+            head.to_lowercase()
+                .contains("authorization: bearer tok-123"),
+            "auth header (with env expansion) must be sent: {head}"
         );
     }
 }

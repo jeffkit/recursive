@@ -75,6 +75,14 @@ pub trait Tool: Send + Sync {
         ToolKind::Other
     }
 
+    /// The MCP server this tool is proxied from, or `None` for native tools.
+    /// Overridden by [`crate::mcp::McpTool`] so a registry rebuild (e.g. the
+    /// container sandbox tier) can re-attach already-spawned MCP tools rather
+    /// than silently dropping them.
+    fn mcp_server_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Convenience: a tool is read-only iff it classifies as `ReadOnly`.
     /// Used by the parallel-dispatch path in `agent.rs`. Override only if
     /// you have an unusual reason (you almost never should — override
@@ -671,6 +679,17 @@ impl ToolRegistry {
             return self.tools.get(primary).cloned();
         }
         None
+    }
+
+    /// Every registered tool proxied from an MCP server. Used to re-attach
+    /// MCP routing after a registry is rebuilt from scratch (the container
+    /// sandbox tier builds a fresh registry per session).
+    pub fn mcp_tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools
+            .values()
+            .filter(|t| t.mcp_server_name().is_some())
+            .cloned()
+            .collect()
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -2170,5 +2189,54 @@ mod tests {
     fn build_kind_map_empty_registry() {
         let map = make_registry().build_kind_map();
         assert!(map.is_empty());
+    }
+
+    /// Issue #104: a native tool reports no MCP server, so `mcp_tools`
+    /// excludes it.
+    #[test]
+    fn mcp_tools_excludes_native_tools() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "ReadTool" }));
+        assert!(reg.mcp_tools().is_empty());
+    }
+
+    /// Issue #104: a proxied MCP tool is reattachable after a registry
+    /// rebuild (the container sandbox tier builds a fresh registry).
+    #[test]
+    fn mcp_tools_collects_proxied_tools() {
+        struct McpLikeTool {
+            name: &'static str,
+            server: &'static str,
+        }
+        #[async_trait]
+        impl Tool for McpLikeTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.to_string(),
+                    description: "mcp proxied test tool".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+            fn mcp_server_name(&self) -> Option<&str> {
+                Some(self.server)
+            }
+            async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+                Ok("ok".into())
+            }
+        }
+
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "ReadTool" }))
+            .register(Arc::new(McpLikeTool {
+                name: "mcp__gh__search",
+                server: "gh",
+            }));
+        let mcp = reg.mcp_tools();
+        assert_eq!(mcp.len(), 1);
+        assert_eq!(mcp[0].spec().name, "mcp__gh__search");
+        assert_eq!(mcp[0].mcp_server_name(), Some("gh"));
+
+        // Re-attaching the collected tools reconstructs MCP routing.
+        let rebuilt = make_registry().register(mcp.into_iter().next().unwrap());
+        assert!(rebuilt.find_by_name("mcp__gh__search").is_some());
     }
 }

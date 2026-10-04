@@ -432,6 +432,8 @@ mod tests {
             args: vec![],
             url: Some("http://localhost:8080/sse".into()),
             env: None,
+            headers: None,
+            transport: None,
         };
         // The McpClient::spawn method checks server.url.is_some()
         // to decide transport. We verify the config is wired correctly.
@@ -448,6 +450,8 @@ mod tests {
             args: vec!["hello".into()],
             url: None,
             env: None,
+            headers: None,
+            transport: None,
         };
         assert!(!server.command.is_empty());
         assert!(server.url.is_none());

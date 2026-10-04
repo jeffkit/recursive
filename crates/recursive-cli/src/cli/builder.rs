@@ -1263,6 +1263,8 @@ done
             args: vec![script],
             url: None,
             env: None,
+            headers: None,
+            transport: None,
         };
         let mut registry = ToolRegistry::local();
         let count = register_mcp_server_tools(&mut registry, &server, None)
@@ -1282,6 +1284,8 @@ done
             args: Vec::new(),
             url: None,
             env: None,
+            headers: None,
+            transport: None,
         };
         let msg = auto_discovered_message(std::slice::from_ref(&server))
             .expect("a discovered server must produce a log line");

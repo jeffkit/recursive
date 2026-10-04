@@ -48,6 +48,8 @@ fn server() -> &'static McpServer {
             ],
             url: None,
             env: None,
+            headers: None,
+            transport: None,
         }
     })
 }
