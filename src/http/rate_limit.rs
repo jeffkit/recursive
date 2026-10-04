@@ -31,13 +31,18 @@ pub struct RateLimiter {
     /// so a hop count larger than the real one can never select a
     /// client-supplied entry.
     trusted_proxies: usize,
-    /// Hard upper bound on stored buckets (#107). When the map is full, the
-    /// least-recently-refilled idle-capacity bucket is evicted first; if none
-    /// is idle, a deterministic adversarial-override rule applies: keys that
-    /// came from the header-derived `xff:` class are evicted before
-    /// socket-derived (`ip:`) and credential-derived (`apikey:`) keys, so a
-    /// header-rotating flood cannot crowd out real clients. Unbounded growth
-    /// would otherwise let one fake-IP flood exhaust memory.
+    /// Burst guard: target ceiling on stored buckets (#107). When the map is
+    /// at `max_buckets` the least-recently-refilled *idle* bucket is evicted
+    /// first — idle meaning refilled back to capacity per the clock
+    /// ([`is_idle`]), since a drained bucket's stored counter never reaches
+    /// capacity; eviction prefers header-derived (`xff:`) keys over socket
+    /// (`ip:`) and credential (`apikey:`) keys, so a header-rotating flood
+    /// cannot crowd out real clients. If every bucket has been used within
+    /// the refill window the insert proceeds WITHOUT eviction, so the map can
+    /// exceed the cap by the number of not-yet-idle buckets — those are
+    /// reclaimed once they refill, by this eviction and by the periodic
+    /// `prune()` sweep (same projection). Unbounded growth would otherwise
+    /// let one fake-IP flood exhaust memory.
     max_buckets: usize,
 }
 
@@ -49,6 +54,17 @@ struct TokenBucket {
 
 /// Default hard cap on tracked client buckets (`RECURSIVE_RATE_LIMIT_MAX_BUCKETS`).
 const DEFAULT_MAX_BUCKETS: usize = 10_000;
+
+/// Refill rate (tokens/second) used by the prune/eviction tests. With burst 2
+/// a drained bucket stores `capacity - 1` and is idle 200 ms later, so the
+/// tests reach the idle state through `check()` + a sleep rather than by
+/// writing `tokens` (which is exactly how the counter-only predicate used to
+/// be kept green).
+#[cfg(test)]
+const IDLE_REFILL_RATE: f64 = 5.0;
+/// Sleep that reliably exceeds the [`IDLE_REFILL_RATE`] refill window.
+#[cfg(test)]
+const IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl RateLimiter {
     /// Create a new rate limiter with the given capacity and refill rate.
@@ -96,17 +112,20 @@ impl RateLimiter {
         let now = Instant::now();
 
         // Bound the map before inserting a NEW key (#107). Eviction picks a
-        // victim deterministically: fully-refilled (idle) buckets first —
-        // safe to drop since a re-arriving client would get a fresh full
-        // bucket anyway — preferring header-derived (`xff:`) keys over
-        // socket (`ip:`) and authenticated (`apikey:`) ones so a
-        // header-rotating flood cannot crowd out real clients. When every
-        // bucket is partially drained we reject the eviction (the caller
-        // still gets its token decision) — the alternative (evicting an
-        // active attacker-controlled bucket) would hand the attacker a fresh
-        // full bucket on every request.
+        // victim deterministically: idle buckets first — a bucket is idle
+        // once it has refilled back to capacity, which is derived from the
+        // clock by `projected_tokens`, NOT read off `tokens` (a drained
+        // bucket always stores `capacity - 1`) — safe to drop since a
+        // re-arriving client would get a fresh full bucket anyway —
+        // preferring header-derived (`xff:`) keys over socket (`ip:`) and
+        // authenticated (`apikey:`) ones so a header-rotating flood cannot
+        // crowd out real clients. When every bucket has been used within the
+        // refill window we reject the eviction (the caller still gets its
+        // token decision) — the alternative (evicting an active
+        // attacker-controlled bucket) would hand the attacker a fresh full
+        // bucket on every request.
         if !buckets.contains_key(key) && buckets.len() >= self.max_buckets {
-            if let Some(victim) = pick_eviction_victim(&buckets, self.capacity) {
+            if let Some(victim) = pick_eviction_victim(&buckets, self.capacity, self.refill_rate) {
                 buckets.remove(&victim);
             }
         }
@@ -134,13 +153,16 @@ impl RateLimiter {
         }
     }
 
-    /// Remove idle token buckets (tokens fully refilled to capacity).
+    /// Remove idle token buckets (refilled back to capacity).
     ///
-    /// Safe to drop: a re-arriving client gets a fresh full bucket,
-    /// which is the same as the stored state.
+    /// Idleness is decided by [`is_idle`], i.e. projected from the clock with
+    /// the same refill formula [`check`](Self::check) applies — a bucket
+    /// drained an hour ago is idle even though its stored counter still reads
+    /// `capacity - 1`. Safe to drop: a re-arriving client gets a fresh full
+    /// bucket, which is the same as the stored state.
     pub(super) async fn prune(&self) {
         let mut buckets = self.buckets.lock().await;
-        buckets.retain(|_, b| b.tokens < self.capacity as f64);
+        buckets.retain(|_, b| !is_idle(b, self.capacity, self.refill_rate));
     }
 
     /// Return the number of client buckets currently stored.
@@ -154,6 +176,11 @@ impl RateLimiter {
 ///
 /// - `RECURSIVE_RATE_LIMIT_RPM`: requests per minute (default: 60)
 /// - `RECURSIVE_RATE_LIMIT_BURST`: burst capacity (default: 10)
+/// - `RECURSIVE_RATE_LIMIT_TRUSTED_PROXIES`: trusted reverse-proxy hops whose
+///   `X-Forwarded-For` entries may be used as the client address (default: 0
+///   = never trust XFF, use the socket IP)
+/// - `RECURSIVE_RATE_LIMIT_MAX_BUCKETS`: cap on tracked client buckets before
+///   eviction kicks in (default: 10 000)
 pub fn rate_limiter_from_env() -> RateLimiter {
     let rpm = std::env::var("RECURSIVE_RATE_LIMIT_RPM")
         .ok()
@@ -291,8 +318,19 @@ pub(super) fn extract_client_key_with_config(
 /// carries fewer than `n` entries — a short chain means a trusted proxy did
 /// not append, so no entry can be attributed to it.
 fn trusted_xff_client(req: &axum::extract::Request, trusted_proxies: usize) -> Option<String> {
-    let xff = req.headers().get("x-forwarded-for")?.to_str().ok()?;
-    let entries: Vec<&str> = xff.split(',').map(str::trim).collect();
+    // A request may carry several `X-Forwarded-For` header *fields*: a proxy
+    // that emits its own field instead of appending to the client's (or a
+    // middlebox) yields a second field, and `Headers::get` would then read
+    // only the client-controlled first one — putting the forged entry back at
+    // `len - n`. Flatten every field left-to-right (a single `"a, b"` field
+    // and two separate fields produce the same ordered entry list) before
+    // indexing, so the trusted-hop count always lands on a proxy-appended
+    // entry. Any non-UTF-8 field fails closed to the socket IP.
+    let mut entries: Vec<&str> = Vec::new();
+    for value in req.headers().get_all("x-forwarded-for") {
+        let value = value.to_str().ok()?;
+        entries.extend(value.split(',').map(str::trim));
+    }
     // Each trusted hop appended exactly one entry, so the client is entry
     // `len - n`. `checked_sub` is `None` when the chain is shorter than `n`
     // (a trusted hop is missing → fail closed); `get` is `None` for `n == 0`
@@ -304,11 +342,28 @@ fn trusted_xff_client(req: &axum::extract::Request, trusted_proxies: usize) -> O
     Some(client.to_string())
 }
 
+/// Tokens a bucket would hold now if it were refilled, capped at `capacity`.
+///
+/// This is the same refill [`RateLimiter::check`] applies. The stored
+/// counter alone cannot answer "is this bucket idle?": `check` always
+/// decrements after clamping, so a bucket that has been idle for an hour
+/// still stores `capacity - 1`. Idleness has to be projected from the clock
+/// (`tokens + elapsed × refill_rate`) instead.
+fn projected_tokens(bucket: &TokenBucket, capacity: u32, refill_rate: f64) -> f64 {
+    (bucket.tokens + bucket.last_refill.elapsed().as_secs_f64() * refill_rate).min(capacity as f64)
+}
+
+/// Whether a bucket has refilled back to capacity — dropping it and
+/// re-creating it on the next request are indistinguishable.
+fn is_idle(bucket: &TokenBucket, capacity: u32, refill_rate: f64) -> bool {
+    projected_tokens(bucket, capacity, refill_rate) >= capacity as f64 - f64::EPSILON
+}
+
 /// Pick the bucket to evict when the map is at its hard cap (#107).
 ///
 /// Preference order:
-/// 1. an idle bucket (tokens back at capacity — dropping it is
-///    indistinguishable from the prune sweep), taken from the class that is
+/// 1. an idle bucket (refilled back to capacity per [`is_idle`] — dropping it
+///    is indistinguishable from the prune sweep), taken from the class that is
 ///    cheapest for an attacker to mint first: header-derived `xff:` keys,
 ///    then socket-derived `ip:` keys, then credential-derived `apikey:`
 ///    keys. Within a class the least-recently-refilled bucket goes first.
@@ -317,11 +372,21 @@ fn trusted_xff_client(req: &axum::extract::Request, trusted_proxies: usize) -> O
 ///    proceeds WITHOUT eviction instead, so the map can exceed the cap by the
 ///    number of not-yet-idle buckets — roughly (new keys per second) ×
 ///    (seconds for a drained bucket to refill to idle), since only
-///    fully-refilled buckets are evictable. What bounds the map in the long
-///    run is the periodic `prune()` sweep in the server reaper; this cap only
-///    keeps a single burst from growing it without limit.
-fn pick_eviction_victim(buckets: &HashMap<String, TokenBucket>, capacity: u32) -> Option<String> {
-    let is_idle = |b: &TokenBucket| b.tokens >= capacity as f64 - f64::EPSILON;
+///    refilled-to-capacity buckets are evictable. Keys untouched for that
+///    refill window are reclaimed by this eviction and by the periodic
+///    `prune()` sweep in the server reaper (same projection); this cap only
+///    keeps a single burst from growing the map without limit.
+///
+/// Cost: an `O(max_buckets)` scan under the limiter mutex, and it runs only
+/// when a *new* key arrives at cap. A client that mints a fresh key per
+/// request (e.g. rotating an unvalidated pre-auth `x-api-key`) can therefore
+/// force a full scan per request while the map is at cap — acceptable at the
+/// default cap of 10 000, but not free.
+fn pick_eviction_victim(
+    buckets: &HashMap<String, TokenBucket>,
+    capacity: u32,
+    refill_rate: f64,
+) -> Option<String> {
     // Eviction priority: HIGHER rank is evicted first. `xff:` keys are the
     // header-derived class — cheapest to mint, since the origin may also be
     // reachable around the proxy; `ip:` keys come from the socket and cannot
@@ -337,7 +402,7 @@ fn pick_eviction_victim(buckets: &HashMap<String, TokenBucket>, capacity: u32) -
     };
     let mut best: Option<(&String, &TokenBucket)> = None;
     for (k, b) in buckets.iter() {
-        if !is_idle(b) {
+        if !is_idle(b, capacity, refill_rate) {
             continue;
         }
         // Victim preference: HIGHER class rank first (header-derived before
@@ -551,89 +616,149 @@ mod tests {
         std::env::remove_var("RECURSIVE_RATE_LIMIT_MAX_BUCKETS");
     }
 
-    /// #107: with `trusted_proxies >= 1` wired through the middleware, the
-    /// XFF-derived bucket is per-client again; without it the same request
-    /// shares the `ip:` bucket (forged XFF ignored).
+    /// #107: pin the middleware↔limiter wiring — the middleware must derive
+    /// the bucket key from the limiter's configured hop count, never a
+    /// hardcoded default. Capacity 1 / refill 0 makes bucket *sharing*
+    /// observable: at `trusted = 1` distinct XFF values are distinct buckets
+    /// (both allowed) while a repeat shares one (429); at `trusted = 0` the
+    /// XFF is ignored and every request shares the `ip:unknown` bucket (the
+    /// second distinct-XFF request is already 429).
     #[tokio::test]
-    async fn middleware_respects_trusted_proxies_config() {
+    async fn middleware_derives_key_from_limiter_trust_config() {
         use axum::routing::get;
-        let req = |trusted: usize| {
-            let limiter = RateLimiter::new(10_000, 1.0).with_trusted_proxies(trusted);
+        let app = |trusted: usize| {
+            let limiter = RateLimiter::new(1, 0.0).with_trusted_proxies(trusted);
             axum::Router::new()
                 .route("/", get(|| async { "ok" }))
                 .layer(axum::middleware::from_fn_with_state(
                     (limiter, Arc::new(Metrics::default())),
                     rate_limit_middleware,
                 ))
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri("/")
-                        // One trusted hop appends exactly one entry.
-                        .header("x-forwarded-for", "9.9.9.9")
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
         };
-        // trusted=0: XFF ignored → ip:unknown bucket, 200 either way here.
-        let resp = req(0).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        // trusted=1: client 9.9.9.9 gets its own bucket — a DIFFERENT
-        // limiter instance per request, so this only asserts acceptance,
-        // but the key-derivation branch is unit-pinned above.
-        let resp = req(1).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let hit = |app: axum::Router, xff: &'static str| async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header("x-forwarded-for", xff)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        // trusted = 1: the header keys the bucket.
+        let trusted = app(1);
+        assert_eq!(hit(trusted.clone(), "9.9.9.1").await, StatusCode::OK);
+        assert_eq!(hit(trusted.clone(), "9.9.9.2").await, StatusCode::OK);
+        assert_eq!(
+            hit(trusted, "9.9.9.1").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "same XFF must reuse the same bucket at trusted_proxies = 1"
+        );
+
+        // trusted = 0: the header is ignored → one shared bucket.
+        let untrusted = app(0);
+        assert_eq!(hit(untrusted.clone(), "9.9.9.1").await, StatusCode::OK);
+        assert_eq!(
+            hit(untrusted, "9.9.9.2").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "distinct XFF must still share the ip:unknown bucket at trusted_proxies = 0"
+        );
+    }
+
+    /// #107: the socket-IP fallback reads the peer address from the
+    /// `ConnectInfo<SocketAddr>` extension (installed by the serving
+    /// make-service). Present → a per-IP bucket; absent → `ip:unknown`.
+    #[test]
+    fn extract_client_key_uses_socket_ip_from_connect_info() {
+        let mut req = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [203, 0, 113, 7],
+                4242,
+            ))));
+        assert_eq!(
+            extract_client_key_with_config(&req, 0),
+            "ip:203.0.113.7",
+            "ConnectInfo socket IP must key the bucket when XFF is untrusted"
+        );
+    }
+
+    /// #107: end-to-end pin that the serve path actually installs
+    /// `ConnectInfo`. Without `into_make_service_with_connect_info` the
+    /// handler sees no extension and the key collapses to `ip:unknown` —
+    /// every header-less client sharing one bucket. This test fails on the
+    /// old plain-`axum::serve` wire-up, which is exactly the shipped-binary
+    /// gap an independent review caught.
+    #[tokio::test]
+    async fn serve_path_installs_connect_info_for_ip_fallback() {
+        async fn key_handler(req: axum::extract::Request) -> String {
+            extract_client_key_with_config(&req, 0)
+        }
+        let app = axum::Router::new().route("/key", get(key_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            crate::http::serve_with_graceful_shutdown(listener, app, async move {
+                let _ = rx.await;
+            })
+            .await
+        });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"GET /key HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut body = String::new();
+        stream
+            .read_to_string(&mut body)
+            .await
+            .expect("read response");
+        assert!(
+            body.ends_with("ip:127.0.0.1"),
+            "serve path must install ConnectInfo so the key is the socket IP, got: {body}"
+        );
+
+        let _ = tx.send(());
+        server
+            .await
+            .expect("server task")
+            .expect("serve returns Ok");
     }
 
     #[tokio::test]
     async fn prune_removes_full_buckets() {
-        let limiter = RateLimiter::new(2, 1.0);
-        // Create entries and drain them partially
+        let limiter = RateLimiter::new(2, IDLE_REFILL_RATE);
+        // Create entries and drain them (each check leaves 1 of 2 tokens).
         limiter.check("client-a").await;
         limiter.check("client-b").await;
-        limiter.check("client-new-full").await;
-        // At this point all entries are partially drained (1 token left each).
-        // prune() should remove nothing.
+        limiter.check("client-c").await;
+        // Every bucket was used just now, so none has refilled yet.
         limiter.prune().await;
-        let count_after = limiter.bucket_count().await;
-        assert_eq!(
-            count_after, 3,
-            "all partially drained, none should be removed"
-        );
-
-        // Insert a full bucket (tokens == capacity) to test eviction
-        {
-            let mut b = limiter.buckets.lock().await;
-            b.insert(
-                "idle-client".to_string(),
-                TokenBucket {
-                    tokens: 2.0, // == capacity → idle
-                    last_refill: std::time::Instant::now(),
-                },
-            );
-        }
-        limiter.prune().await;
-        // idle-client evicted, 3 partial buckets remain
         assert_eq!(
             limiter.bucket_count().await,
             3,
-            "idle-client should be evicted"
+            "recently used buckets are not idle, none should be removed"
         );
 
-        // Directly refill the remaining buckets to capacity so
-        // prune() evicts them.
-        {
-            let mut b = limiter.buckets.lock().await;
-            let now = std::time::Instant::now();
-            for bucket in b.values_mut() {
-                bucket.tokens = 2.0;
-                bucket.last_refill = now;
-            }
-        }
+        // Once the refill window has passed every bucket is idle (projected
+        // from the clock — the stored counter still reads `capacity - 1`).
+        tokio::time::sleep(IDLE_WAIT).await;
         limiter.prune().await;
         assert_eq!(
             limiter.bucket_count().await,
             0,
-            "all buckets should be idle after manual refill"
+            "buckets refilled to capacity should be pruned"
         );
     }
 
@@ -758,6 +883,37 @@ mod goal_h3_xff {
         assert_eq!(key, "xff:203.0.113.42", "forged prefix must be ignored");
     }
 
+    /// A proxy that emits a *separate* `X-Forwarded-For` field instead of
+    /// appending to the client's must not leave the client-controlled field
+    /// at the trusted index. Parsing flattens every field left-to-right, so
+    /// the proxy-appended entry is still the rightmost in the flat chain.
+    #[test]
+    fn extract_client_key_flattens_multiple_xff_fields() {
+        let req = Request::builder()
+            .uri("/")
+            // Client-controlled field first, proxy-appended field second.
+            .header("x-forwarded-for", "1.2.3.4")
+            .header("x-forwarded-for", "203.0.113.42")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            extract_client_key_with_config(&req, 1),
+            "xff:203.0.113.42",
+            "the proxy-appended field must win over the client's"
+        );
+
+        // Two separate fields, two trusted hops: the client sits second from
+        // the right across the flattened chain.
+        let req = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .header("x-forwarded-for", "203.0.113.42")
+            .header("x-forwarded-for", "10.1.0.7")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_client_key_with_config(&req, 2), "xff:203.0.113.42");
+    }
+
     /// A chain shorter than the trusted-hop count is not trustworthy — some
     /// trusted proxy in the path did not append an entry. Fall through to the
     /// socket-IP branch instead of trusting a client-supplied entry.
@@ -818,44 +974,38 @@ mod goal_h3_xff {
         );
     }
 
-    /// Bucket-map hard cap (#107): a flood of unique keys is evicted back down
-    /// once victims go idle. Active (non-idle) buckets are never evicted, so
-    /// the map can exceed the cap by the number of in-flight clients — the
-    /// periodic `prune()` sweep, not this cap, is what bounds it long-run.
+    /// Bucket-map cap (#107): a flood of unique keys is evicted back down once
+    /// victims go idle, and idleness is derived from the clock — the stored
+    /// counter alone never signals it. Buckets used within the refill window
+    /// are never evicted, so the map can exceed the cap by the number of
+    /// in-flight clients.
     #[tokio::test]
     async fn bucket_map_is_bounded_under_unique_key_flood() {
-        let limiter = RateLimiter::new(2, 0.0).with_max_buckets(4);
-        // Each drained client becomes idle-after-refill? No: refill rate 0
-        // keeps them at 1.0 (partially drained) — active clients are NOT
-        // evictable, so the 5th DISTINCT key cannot insert a victim-based
-        // eviction but must still not be rejected... The contract: the map
-        // never exceeds cap unless every slot is an active (non-idle)
-        // bucket. First fill 4 clients.
+        let limiter = RateLimiter::new(2, IDLE_REFILL_RATE).with_max_buckets(4);
+        // Fill the cap with four distinct clients, each drained by its request.
         for i in 0..4 {
             assert!(limiter.check(&format!("flood-{i}")).await);
         }
         assert_eq!(limiter.bucket_count().await, 4);
-        // A 5th distinct client: all 4 buckets are partially drained (1.0
-        // of 2.0 left), so no victim exists; the insert is still allowed
-        // (bounded by concurrent active clients), but once a client's
-        // bucket refills to idle it becomes evictable.
+        // A 5th distinct client arrives while all four buckets are still
+        // refilling: none is idle yet, so no victim exists and the insert is
+        // allowed (the cap is a burst guard, not a hard ceiling).
         assert!(limiter.check("flood-4").await);
         assert_eq!(limiter.bucket_count().await, 5);
 
-        // Simulate refill-to-idle for flood-0 (reaper-equivalent state),
-        // then the next new key evicts it instead of growing the map.
-        {
-            let mut b = limiter.buckets.lock().await;
-            if let Some(bucket) = b.get_mut("flood-0") {
-                bucket.tokens = 2.0; // == capacity → idle
-            }
-        }
+        // Once the refill window elapses every bucket is idle (no counter was
+        // written — the state comes from the clock), so the next new key
+        // reclaims one instead of growing the map.
+        tokio::time::sleep(IDLE_WAIT).await;
         assert!(limiter.check("flood-5").await);
-        let count = limiter.bucket_count().await;
-        assert_eq!(count, 5, "idle victim evicted; map stops growing");
+        assert_eq!(
+            limiter.bucket_count().await,
+            5,
+            "an idle victim must be evicted so the map stops growing"
+        );
         assert!(
             !limiter.buckets.lock().await.contains_key("flood-0"),
-            "the idle bucket must be the eviction victim"
+            "the least-recently-refilled idle bucket must be the eviction victim"
         );
     }
 
@@ -865,17 +1015,13 @@ mod goal_h3_xff {
     /// full map.
     #[tokio::test]
     async fn eviction_prefers_header_derived_keys_over_socket_and_authenticated() {
-        let limiter = RateLimiter::new(2, 0.0).with_max_buckets(3);
+        let limiter = RateLimiter::new(2, IDLE_REFILL_RATE).with_max_buckets(3);
         assert!(limiter.check("apikey:aaa").await);
         assert!(limiter.check("ip:ccc").await);
         assert!(limiter.check("xff:bbb").await);
-        // Make ALL buckets idle → all evictable.
-        {
-            let mut b = limiter.buckets.lock().await;
-            for bucket in b.values_mut() {
-                bucket.tokens = 2.0; // == capacity → idle
-            }
-        }
+        // After the refill window ALL buckets are idle (clock-derived) → all
+        // evictable.
+        tokio::time::sleep(IDLE_WAIT).await;
 
         // New key #1: the header-derived bucket loses.
         assert!(limiter.check("apikey:zzz").await);
@@ -889,13 +1035,9 @@ mod goal_h3_xff {
             assert!(b.contains_key("ip:ccc"));
         }
 
-        // New key #2: now the socket-IP bucket goes, not the authenticated one.
-        {
-            let mut b = limiter.buckets.lock().await;
-            for bucket in b.values_mut() {
-                bucket.tokens = 2.0;
-            }
-        }
+        // New key #2: now the socket-IP bucket goes, not the authenticated
+        // one. `apikey:aaa` and `ip:ccc` were never touched again, so they are
+        // still idle; `apikey:zzz` was just used and is not.
         assert!(limiter.check("ip:ddd").await);
         let b = limiter.buckets.lock().await;
         assert!(

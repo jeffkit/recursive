@@ -127,3 +127,114 @@ All five findings addressed in `src/http/rate_limit.rs` + `CHANGELOG.md`:
   当身份 → 轮换伪造 key 仍能造新桶（既有问题）。彻底修需把限流移到 auth 之后、
   或对 key 做验证；在那之前驱逐策略里 `apikey:` 桶不可信但仍排在最后。
 - E2E 08b-rate-limit 套件只测 burst/429，不依赖 XFF 行为，无需改 fixture。
+
+## Review fixes (round 3 — 第二次独立评审 returned NEEDS_FIX)
+
+评审 BLOCKER：文档承诺的 "socket IP" 回落**不存在**——`extract_client_key_with_config`
+结尾读 `ConnectInfo<SocketAddr>` 扩展，但唯一生产 serve 路径
+`serve_with_graceful_shutdown`（`src/http/mod.rs`）用的是裸 `axum::serve(listener,
+router)`，从不安装 connect info（axum 只在
+`into_make_service_with_connect_info::<C>()` 下注入）。实测 `127.0.0.1` 与 `[::1]`
+两个源 IP 共用 `ip:unknown` 单桶：默认 `trusted_proxies = 0` 时所有无
+`x-api-key` 的请求（含全部 JWT 客户端、代理后所有客户端）挤一个全局桶，一个人可
+429 掉所有人，且默认配置下重新引入 NEW-HTTP-7。文档/CHANGELOG 的 "direct exposure
+⇒ per-client" 叙述对出货二进制为假。
+
+修复：
+
+1. **BLOCKER（连接信息接线）**——`src/http/mod.rs::serve_with_graceful_shutdown`
+   改用 `router.into_make_service_with_connect_info::<std::net::SocketAddr>()`，
+   并补 fn 文档说明前一条 `axum::serve` 会静默省略该扩展。回落从此真实存在。
+2. **不能失败的老测试**——`middleware_respects_trusted_proxies_config` 每请求新建
+   limiter、断言两次 200，即使中间件硬编码 0 也过。重写为
+   `middleware_derives_key_from_limiter_trust_config`：单 limiter、capacity 1 /
+   refill 0，`trusted = 1` 时两个不同 XFF → 200/200、同一 XFF → 429；
+   `trusted = 0` 时两个不同 XFF → 200/429（XFF 被忽略）。真正钉死接线。
+3. **多字段 XFF**——`headers().get()` 只读第一个 `X-Forwarded-For` 字段；代理若
+   另起一个字段 append，客户端可控字段仍落在 `len - n` 上。`trusted_xff_client`
+   改为展开 `get_all()` 全部字段（`"a, b"` 与两个独立字段等价）后索引。
+4. **文档一致性**——`max_buckets` 字段文档开头写 "Hard upper bound" 又说会超限；
+   改为 "Burst guard: target ceiling"，与 `pick_eviction_victim` 文档对齐。
+5. **热路径成本**——`pick_eviction_victim` 文档补 O(max_buckets) 扫描成本说明。
+
+新增测试：
+
+- `tests::serve_path_installs_connect_info_for_ip_fallback` —— 真起
+  `serve_with_graceful_shutdown`，TCP 连 `127.0.0.1`，handler 回显限流 key，断言
+  以 `ip:127.0.0.1` 结尾（旧的裸 `axum::serve` 会得 `ip:unknown`，测试即红）。
+- `tests::extract_client_key_uses_socket_ip_from_connect_info` —— 注入
+  `ConnectInfo` 扩展断言 `ip:203.0.113.7`。
+- `goal_h3_xff::extract_client_key_flattens_multiple_xff_fields` —— 两个独立
+  XFF 字段（n=1 / n=2）仍取代理 append 的那条。
+
+Verification (round 3):
+- `cargo test --lib http::rate_limit` → 19 passed / 0 failed
+- `cargo test --workspace` → 2493 passed, 1 failed:
+  `tools::execution::shell::tests::timeout_kills_child_process`（`shell.rs:324`
+  "child should have written its PID before exec"）——与 #107 无关的 shell 超时用例，
+  机器满载（多个 pipeline 并发编译）下子进程没来得及在断言前写 PID；单跑复现
+  `cargo test --lib tools::execution::shell::tests::timeout_kills_child_process`
+  → 1 passed / 0 failed。非本改动引入，未改。
+- `cargo clippy --all-targets --all-features -- -D warnings` → clean（含 run 级
+  `Cargo clippy --workspace` 范围）。
+- `cargo fmt --all -- --check` → clean。
+- `agent-mutants.sh` 未跑成：copy 模式冷编译 thiserror build script 时
+  clang 段错误（`clang: error: unable to execute command: Segmentation fault: 11`，
+  `ERROR cargo build failed in an unmutated tree`）——满载环境的瞬时链接器崩溃，
+  非源码问题；v2 self-improve flow 只接 fmt/clippy/test 三门，不跑 mutants。
+
+
+
+## Review fixes (round 4 — 第三次独立评审 returned NEEDS_FIX)
+
+评审 BLOCKER：限流桶的驱逐/清理判据**永远不可能为真**，所以 SEC-011 实际未修，
+而 CHANGELOG/字段文档宣称已修——又一类"文档承诺、二进制没有"。
+
+根因：`TokenBucket.tokens` 存的是**剩余** token，且 `check()` 在任何情况下都先
+夹到 `capacity` 再 `-= 1.0`；因此一个空闲了一小时的桶里存的仍是
+`min(...) - 1 == capacity - 1`，**生产路径永远不会写出 `tokens == capacity`**。
+而两个判据都要求恰好等于 capacity：
+
+- `pick_eviction_victim` 的 `is_idle = tokens >= capacity - EPSILON` → 永假 →
+  `max_buckets` 形同虚设；
+- `prune()` 的 `retain(|_, b| b.tokens < capacity)` → 全部保留 → reaper 扫了个寂寞。
+
+于是默认 `trusted_proxies = 0` 下，客户端每请求换一个伪造 `x-api-key`（该头在
+auth 之前就被当作身份）就多一个桶、且永不回收 = #107/SEC-011 的无界增长仍在。
+
+修复（按评审给出的方案）：
+
+- 新增 `projected_tokens(b, capacity, refill_rate) = (tokens + last_refill.elapsed()
+  × refill_rate).min(capacity)` 与 `is_idle(...) = projected_tokens >= capacity`；
+  **空闲必须由时钟推算**，不能读那个陈旧的计数器。
+- `pick_eviction_victim(buckets, capacity, refill_rate)` 与 `prune()` 都用同一个
+  `is_idle`（驱逐与清理语义从此一致）。
+- 测试不再手写 `tokens`：三个测试改为「`check()` 排空 → `tokio::sleep(IDLE_WAIT)`
+  → 断言空闲可被驱逐/清理」，重利用率常量 `IDLE_REFILL_RATE = 5.0` / `IDLE_WAIT
+  = 250ms`（capacity 2，排空后 200ms 后回满）。反证：把 `is_idle` 临时改回
+  计数器版本，三个测试立刻红（prune 3≠0、flood 6≠5、xff 桶未被驱逐），证明它们
+  不再靠手写状态过关。
+
+非阻塞项一并处理：
+
+- `rate_limiter_from_env` 文档补上 `TRUSTED_PROXIES` / `MAX_BUCKETS` 两个新旋钮
+  （唯一面向运维的清单）。
+- CHANGELOG 语法修："…Requests carrying a non-empty `x-api-key` key on the hash of
+  that header…" → "…are keyed on the hash of that header…"。
+- CHANGELOG 的 bound 叙述改为与实现一致：清理判据来自时钟；drained bucket 恒为
+  `capacity − 1`，计数器判据永远不触发；cap 是 burst guard，稳态大小约
+  `cap + (new keys/s) × refill window`，超过 refill window 未再被使用的 key 一律回收。
+- `src/http/mod.rs:755` 的过期注释（"cannot bypass limits by rotating API keys
+  (SEC-006)"）与本次 pre-auth `apikey:` 取键自相矛盾，改为如实描述：限流层先于
+  auth 跑，带非空 `x-api-key` 的请求按该头哈希分桶、轮换仍能造新桶；不可伪造的是
+  无凭证身份（socket IP / 可信代理 XFF 右侧项）。
+
+Verification (round 4):
+- `cargo test --lib http::rate_limit` → 19 passed / 0 failed
+- `cargo test --lib` → 2494 passed / 0 failed（上一轮那个 shell 超时用例本轮绿）
+- `cargo test --test http` → 103 passed / 0 failed
+- `cargo test --workspace` → all suites green（lib 2494 passed；首次跑时
+  `tools::execution::shell::tests::timeout_kills_child_process` 又因机器满载
+  偶发红一次——单跑与复跑均绿，与 #107 无关，未改）
+- `cargo clippy --all-targets --all-features -- -D warnings` → clean
+- `cargo fmt --all -- --check` → clean

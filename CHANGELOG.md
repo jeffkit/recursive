@@ -11,17 +11,29 @@
   address is then the `trusted_proxies`-th XFF entry counting from the
   **right**, discarding the untrusted leftmost chain). A chain shorter than the
   configured hop count fails closed to the socket IP rather than trusting a
-  client-supplied entry. Requests carrying a non-empty `x-api-key` key on the
-  hash of that header regardless of any XFF they send — note the limiter runs
-  *before* authentication, so the header only partitions buckets and is not an
+  client-supplied entry, and that socket-IP fallback is now actually wired: the
+  server make-service installs `ConnectInfo<SocketAddr>`
+  (`into_make_service_with_connect_info`) — plain `axum::serve` silently omits
+  it, so without this the fallback degraded to one shared `ip:unknown` bucket.
+  Multiple `X-Forwarded-For` header *fields* are flattened before indexing, so a
+  proxy that emits its own field cannot leave the client-controlled entry
+  selectable. Requests carrying a non-empty `x-api-key` are keyed on the hash of
+  that header regardless of any XFF they send — note the limiter runs *before*
+  authentication, so the header only partitions buckets and is not an
   authorization decision; a client rotating a bogus `x-api-key` can therefore
   still mint fresh buckets (pre-existing limitation, tracked separately). The
-  bucket map is also bounded now (`RECURSIVE_RATE_LIMIT_MAX_BUCKETS`, default
-  10 000; SEC-011): eviction picks idle buckets first and header-derived
-  (`xff:`) keys before socket (`ip:`) and authenticated (`apikey:`) ones, so a
-  unique-key flood cannot crowd real clients out. The cap is a burst guard, not
-  a hard ceiling — active (non-idle) buckets are never evicted, so it is the
-  reaper's periodic bucket prune that bounds the map long-run. Multi-replica
+  bucket map is also reclaimed now (SEC-011): `RECURSIVE_RATE_LIMIT_MAX_BUCKETS`
+  (default 10 000) is a burst guard that evicts an idle bucket when a new key
+  arrives at the cap, and the reaper's periodic `prune()` drops every bucket
+  that has refilled to capacity. Both judge idleness from the clock
+  (`tokens + elapsed × refill_rate`), not from the stored counter — a drained
+  bucket always stores `capacity − 1`, so a counter-only predicate could never
+  fire and the map grew without bound under a unique-key flood. Eviction prefers
+  header-derived (`xff:`) keys over socket (`ip:`) and authenticated
+  (`apikey:`) ones, so a unique-key flood cannot crowd real clients out. The cap
+  is a burst guard, not a hard ceiling — a bucket used within the refill window
+  is never evicted, so the map settles around `cap + (new keys/s) × (refill
+  window)`, and every key untouched for that window is reclaimed. Multi-replica
   shared-state limiting remains a separate (cloud-runtime) work item — buckets
   are still per-process.
 - feat(sandbox): 会话级环境绑定 + 能力注入 + 后台任务随环境销毁 (#31)：`ToolRegistry`

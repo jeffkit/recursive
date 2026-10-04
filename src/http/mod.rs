@@ -696,14 +696,24 @@ pub fn build_router(state: AppState) -> Router {
 /// direct `axum` dependency. `shutdown` is any future that completes when
 /// the server should stop (e.g. `CancellationToken::cancelled()` wrapped in
 /// an `async move` block fired on SIGINT/SIGTERM).
+///
+/// Connect info IS installed (`into_make_service_with_connect_info`): the
+/// rate limiter's socket-IP fallback (#107) reads the peer address from the
+/// `ConnectInfo<SocketAddr>` request extension, which only exists when the
+/// serving make-service installs it. Plain `axum::serve(listener, router)`
+/// silently omits it, collapsing every header-less request into the single
+/// `ip:unknown` bucket.
 pub async fn serve_with_graceful_shutdown(
     listener: tokio::net::TcpListener,
     router: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// Build the HTTP router with an explicit `AuthConfig`.
@@ -749,9 +759,14 @@ pub fn build_router_with_auth_and_rate_limit(
 
     // Protected sub-router: every other route goes through auth and
     // rate-limit. The rate-limit layer is the **outermost** of the
-    // two so it runs first — unauthenticated (brute-force) requests
-    // are counted against the IP-based bucket and cannot bypass
-    // limits by rotating API keys (SEC-006).
+    // two so it runs first — every request is counted before auth does
+    // any work. The limiter runs before authentication, so it cannot
+    // validate the credential it keys on: a request carrying a non-empty
+    // `x-api-key` is bucketed by that (hashed) header value, and rotating
+    // it still mints fresh buckets. What cannot be bypassed is the
+    // credential-less identity: with no `x-api-key` the bucket comes from
+    // the socket IP (or the trusted-proxy XFF entry on the right), which
+    // the client does not choose.
     let protected = Router::new()
         .route("/tools", get(list_tools))
         .route("/run", post(run_agent))
