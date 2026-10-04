@@ -5,9 +5,9 @@
 //! connection that started it — disconnect and the answer was lost. This
 //! module is the outbound extension point: a [`Notifier`] delivers one
 //! message to one [`NotifyTarget`], and [`dispatch_notify`] is the
-//! fire-and-forget wrapper callers use after a run finishes (delivery
-//! failure is logged, never fails the run itself — the agent work already
-//! happened).
+//! best-effort wrapper callers use after a run finishes (delivery failure
+//! is logged and returned as a result string, never failing the run itself
+//! — the agent work already happened).
 //!
 //! Two built-in carriers:
 //!
@@ -117,6 +117,11 @@ pub struct HttpNotifier {
     http: reqwest::Client,
 }
 
+/// Total budget for one webhook delivery. Applied per request as well as
+/// on the client below, so even a client that could not carry builder
+/// defaults is time-bounded.
+const WEBHOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl HttpNotifier {
     /// Build with explicit timeouts — reqwest has none by default and a
     /// hung webhook must not hang the run's teardown (AGENTS.md network
@@ -124,11 +129,28 @@ impl HttpNotifier {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(WEBHOOK_TIMEOUT)
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                // TLS-backend init failure: the default client has no
+                // timeout of its own, so `send_webhook` re-applies
+                // `WEBHOOK_TIMEOUT` per request.
+                tracing::warn!(
+                    error = %e,
+                    "notify: http client builder failed; falling back to a default client"
+                );
+                reqwest::Client::default()
+            });
         Self { http }
     }
+}
+
+/// The process-wide notifier used by the turn/trigger paths: one client,
+/// one connection pool. Building a `reqwest::Client` per turn would throw
+/// both away for no benefit.
+pub fn shared_notifier() -> &'static HttpNotifier {
+    static NOTIFIER: std::sync::OnceLock<HttpNotifier> = std::sync::OnceLock::new();
+    NOTIFIER.get_or_init(HttpNotifier::new)
 }
 
 impl Default for HttpNotifier {
@@ -387,7 +409,9 @@ async fn send_webhook(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 ) -> std::result::Result<reqwest::StatusCode, String> {
-    let mut req = http.post(url).body(body);
+    // Per-request budget: guaranteed even for a client whose builder
+    // defaults are missing (see `HttpNotifier::new`).
+    let mut req = http.post(url).body(body).timeout(WEBHOOK_TIMEOUT);
     for (k, v) in headers {
         req = req.header(k, v);
     }

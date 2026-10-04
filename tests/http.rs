@@ -4965,6 +4965,51 @@ pub(crate) mod trigger_endpoints {
         assert_eq!(status, 400, "empty goal must be rejected");
     }
 
+    /// Regression (issue #105 review): a malformed webhook notify URL must
+    /// fail the create call, not surface hours later as a fire-time
+    /// delivery error.
+    #[tokio::test]
+    async fn create_trigger_rejects_malformed_notify_webhook_url() {
+        let (ws, state) = trigger_state();
+        let app = build_router(state);
+        for bad in ["not a url", "example.com/hook", "file:///etc/passwd"] {
+            let (status, body) = post_json(
+                app.clone(),
+                "/triggers",
+                serde_json::json!({
+                    "id": "trig-bad-notify",
+                    "kind": "cron",
+                    "cron": "0 9 * * *",
+                    "goal": "g",
+                    "notify": {"kind": "webhook", "url": bad},
+                }),
+            )
+            .await;
+            assert_eq!(status, 400, "'{bad}' must be rejected: {body}");
+        }
+        // Nothing was persisted for the rejected registrations.
+        let store = TriggerStore::for_workspace(ws.path());
+        assert!(
+            store.get("trig-bad-notify").expect("load").is_none(),
+            "a rejected registration must not be stored"
+        );
+
+        // A well-formed target still registers.
+        let (status, body) = post_json(
+            app,
+            "/triggers",
+            serde_json::json!({
+                "id": "trig-ok-notify",
+                "kind": "cron",
+                "cron": "0 9 * * *",
+                "goal": "g",
+                "notify": {"kind": "webhook", "url": "https://example.com/hook"},
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "valid notify target: {body}");
+    }
+
     #[tokio::test]
     async fn trigger_crud_list_get_delete_patch() {
         let (_ws, state) = trigger_state();

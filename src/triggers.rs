@@ -534,7 +534,14 @@ pub fn next_after(expr: &str, from_secs: i64) -> Option<i64> {
             dom_ok && dow_ok
         };
         if !day_ok {
-            candidate += 86_400;
+            // Snap to the next midnight, NOT `candidate += 86_400`: the
+            // hour/minute scan below can only move forward, so keeping this
+            // day's time-of-day would skip the earlier windows of a later
+            // matching day (e.g. "0 9 * * 5" scanned from Wed 15:00 would
+            // walk past Friday 09:00 and lose a whole week). `day_ok` does
+            // not depend on the time of day, so the next midnight is the
+            // earliest instant a later day can match.
+            candidate = (candidate.div_euclid(86_400) + 1) * 86_400;
             continue;
         }
         if !expr.hour.contains(t.hour) {
@@ -711,6 +718,53 @@ mod tests {
         // "0 9 * * 1" (Mondays) from Mon 09:00 → next Monday.
         let next = next_after("0 9 * * 1", monday_0900()).expect("next");
         assert_eq!(format_rfc3339_utc(next), "2026-01-12T09:00:00Z");
+    }
+
+    #[test]
+    fn next_after_keeps_a_matching_days_earlier_window() {
+        // Regression (issue #105 review): the day fast-forward must snap to
+        // the next midnight. Advancing by a flat 86_400 kept the scan's
+        // time-of-day, so a *matching* day reached at 15:00 skipped its own
+        // 09:00 window and the scan jumped a whole cycle.
+        let wed_1500 = parse_rfc3339_utc("2026-01-07T15:00:00Z").expect("Wed 15:00");
+        assert_eq!(
+            format_rfc3339_utc(next_after("0 9 * * 5", wed_1500).expect("next")),
+            "2026-01-09T09:00:00Z",
+            "Friday 09:00 two days out, not the Friday after"
+        );
+        // Same shape once the day walk starts from a non-midnight scan:
+        // 02:00 on the next Monday, not the Monday after.
+        assert_eq!(
+            format_rfc3339_utc(next_after("0 2 * * 1", wed_1500).expect("next")),
+            "2026-01-12T02:00:00Z"
+        );
+        // dom-restricted: the Jan 1 window is in the past, so Feb 1 — a
+        // month late would mean the scan lost the January cycle.
+        let thu_1200 = parse_rfc3339_utc("2026-01-15T12:00:00Z").expect("Thu 12:00");
+        assert_eq!(
+            format_rfc3339_utc(next_after("0 0 1 * *", thu_1200).expect("next")),
+            "2026-02-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn next_after_is_within_one_cycle_from_a_non_midnight_start() {
+        // A weekly schedule can never be more than 7 days out, whatever
+        // the time of day the scan starts at. Pinned as a property across
+        // every hour of the week so the day fast-forward cannot regress
+        // into skipping a cycle again.
+        let base = parse_rfc3339_utc("2026-01-05T00:00:00Z").expect("Mon 00:00");
+        for hour in 0..(7 * 24) {
+            let from = base + i64::from(hour) * 3600;
+            let next = next_after("0 9 * * 5", from).expect("weekly expr always matches");
+            assert!(
+                next - from <= 7 * 86_400,
+                "from {}: next {} is more than one week out",
+                format_rfc3339_utc(from),
+                format_rfc3339_utc(next)
+            );
+            assert!(next > from, "must be strictly after the from-time");
+        }
     }
 
     #[test]
@@ -928,6 +982,48 @@ mod tests {
         let next =
             parse_rfc3339_utc(advanced.next_fire_at.as_deref().expect("next")).expect("parseable");
         assert!(next > epoch_now(), "next window is always strictly ahead");
+    }
+
+    /// Regression (issue #105 review): after a restart on a day *after* the
+    /// window, `advance_cron` recomputes from `now` — the old day
+    /// fast-forward lost the next window whenever the scan reached a
+    /// matching weekday later than its scheduled hour, silently dropping a
+    /// whole week. A weekly schedule is never more than one week out.
+    ///
+    /// (`advance_cron` reads `epoch_now()` itself, so the bound is the
+    /// assertion; the deterministic per-window cases live in the
+    /// `next_after_*` tests above.)
+    #[test]
+    fn advance_cron_keeps_weekly_schedules_within_one_cycle() {
+        let (_d, store) = temp_store();
+        let mut t = Trigger::new(
+            "trig-weekly",
+            TriggerSpec::Cron {
+                expr: "0 9 * * 5".into(),
+            },
+            "weekly summary",
+            None,
+            None,
+        );
+        t.enabled = true;
+        // Last window a week ago and the process was down since: the
+        // overdue window is catch-up fired, the next one is computed
+        // forward from the restart.
+        t.next_fire_at = Some(format_rfc3339_utc(epoch_now() - 7 * 86_400));
+        store.upsert(t).expect("upsert");
+
+        let advanced = store
+            .advance_cron("trig-weekly", "delivered")
+            .expect("advance")
+            .expect("trigger updated");
+        let next = parse_rfc3339_utc(advanced.next_fire_at.as_deref().expect("next set"))
+            .expect("parseable");
+        let after = epoch_now();
+        assert!(
+            next <= after + 7 * 86_400,
+            "a weekly schedule must stay within one week of the restart, got {}",
+            advanced.next_fire_at.as_deref().unwrap_or("")
+        );
     }
 
     #[test]

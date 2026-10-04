@@ -179,10 +179,13 @@ pub(super) async fn create_trigger(
         }
     };
     // Surface a bad notify target at registration time, not at 9am.
-    if let Some(NotifyTarget::File { path }) = &body.notify {
-        // Best-effort validation: the process context is bound at server
-        // startup, so the check is authoritative here.
-        validate_notify_path(&state, path)?;
+    if let Some(target) = &body.notify {
+        match target {
+            // Best-effort validation: the process context is bound at
+            // server startup, so the check is authoritative here.
+            NotifyTarget::File { path } => validate_notify_path(&state, path)?,
+            NotifyTarget::Webhook { url, .. } => validate_notify_webhook_url(url)?,
+        }
     }
     let mut trigger = Trigger::new(id, spec, body.goal, body.session_id, body.notify);
     trigger.enabled = body.enabled;
@@ -228,6 +231,29 @@ fn validate_notify_path(state: &AppState, path: &std::path::Path) -> Result<(), 
         Ok(Err(e)) => Err(ApiError::bad_request(e.to_string())),
         Err(_) => Err(ApiError::internal("notify path validation panicked")),
     }
+}
+
+/// Validate a webhook notify target's URL: absolute and `http(s)`.
+///
+/// A typo (`"not a url"`, `"example.com/hook"`) or a non-HTTP scheme would
+/// otherwise only surface hours later as a fire-time delivery error.
+///
+/// The SSRF guard `WebFetch` applies is deliberately **not** reused here:
+/// notify targets are supplied by the authenticated caller of
+/// `POST /triggers` (who can run arbitrary commands through a session
+/// anyway), and a self-hosted receiver on loopback or the LAN is the normal
+/// deployment — the same distinction `HttpCall` draws when it puts private
+/// endpoints behind an explicit `allow_private` opt-in.
+fn validate_notify_webhook_url(url: &str) -> Result<(), ApiError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| ApiError::bad_request(format!("invalid notify webhook url '{url}': {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::bad_request(format!(
+            "notify webhook url must be http:// or https://, got '{}'",
+            parsed.scheme()
+        )));
+    }
+    Ok(())
 }
 
 /// GET /triggers — list all registered triggers.
@@ -418,7 +444,7 @@ async fn fire_trigger(
             final_text: outcome_text.as_deref(),
         };
         crate::notify::notify_best_effort(
-            &crate::notify::HttpNotifier::new(),
+            crate::notify::shared_notifier(),
             &notify_target,
             &payload,
         )
@@ -435,14 +461,33 @@ async fn fire_trigger(
 /// means a slow run cannot push the next window — the schedule is decided
 /// by the tick, not by the run's duration.
 fn stamp_result(s: TriggerStore, trigger: &Trigger, result: String) {
-    if let Ok(mut all) = s.load() {
-        if let Some(t) = all.iter_mut().find(|t| t.id == trigger.id) {
-            t.last_fired_at = Some(crate::triggers::format_rfc3339_utc(
-                crate::triggers::epoch_now(),
-            ));
-            t.last_result = Some(result);
+    // Both failures are logged rather than silently dropped: a corrupt or
+    // unwritable store is exactly the state where "did my 9am run go out?"
+    // must still be answerable from the logs.
+    let mut all = match s.load() {
+        Ok(all) => all,
+        Err(e) => {
+            tracing::warn!(
+                trigger_id = %trigger.id,
+                result = %result,
+                error = %e,
+                "trigger fire finished but its result could not be recorded"
+            );
+            return;
         }
-        let _ = s.save(&all);
+    };
+    if let Some(t) = all.iter_mut().find(|t| t.id == trigger.id) {
+        t.last_fired_at = Some(crate::triggers::format_rfc3339_utc(
+            crate::triggers::epoch_now(),
+        ));
+        t.last_result = Some(result);
+    }
+    if let Err(e) = s.save(&all) {
+        tracing::warn!(
+            trigger_id = %trigger.id,
+            error = %e,
+            "failed to persist trigger last_result"
+        );
     }
 }
 
@@ -663,7 +708,7 @@ pub fn trigger_openapi_paths() -> serde_json::Value {
                             }
                         }
                     },
-                    "400": { "description": "Invalid cron expression / goal / kind" }
+                    "400": { "description": "Invalid cron expression / goal / kind / notify target" }
                 }
             }
         },
@@ -866,6 +911,33 @@ mod tests {
         assert!(!body.enabled, "triggers default to disabled");
         assert!(body.notify.is_none());
         assert!(body.session_id.is_none());
+    }
+
+    /// A malformed URL fails at registration instead of at the first fire.
+    #[test]
+    fn notify_webhook_url_validation() {
+        for ok in [
+            "https://example.com/hook",
+            "http://127.0.0.1:8080/notify",
+            "http://[::1]:9000/x",
+        ] {
+            assert!(
+                validate_notify_webhook_url(ok).is_ok(),
+                "{ok} must be accepted"
+            );
+        }
+        for bad in [
+            "not a url",
+            "example.com/hook",
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "http://",
+        ] {
+            assert!(
+                validate_notify_webhook_url(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

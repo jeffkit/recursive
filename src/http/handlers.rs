@@ -1273,9 +1273,12 @@ pub(super) async fn send_session_message(
         .unwrap_or_default();
 
     // Issue #105: optional outbound delivery of this turn's result.
-    // Fire-and-forget from the turn's perspective: a delivery failure is
-    // reported via `notify_result`, never as a failed request (the agent
-    // work already happened).
+    // Non-fatal from the turn's perspective: a delivery failure is reported
+    // via `notify_result`, never as a failed request (the agent work
+    // already happened). Delivery stays on this path because that field
+    // *is* the outcome — spawning it away would drop it — but it is
+    // bounded by the notifier's 15 s request timeout and reuses the
+    // process-wide client.
     let notify_result = match &body.notify {
         Some(target) => {
             let payload = crate::notify::NotifyPayload {
@@ -1285,7 +1288,7 @@ pub(super) async fn send_session_message(
                 final_text: Some(&last_assistant),
             };
             Some(crate::notify::notify_best_effort(
-                &crate::notify::HttpNotifier::new(),
+                crate::notify::shared_notifier(),
                 target,
                 &payload,
             ))

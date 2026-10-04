@@ -217,9 +217,9 @@ pub struct SessionMessageRequest {
     pub content: String,
     /// Issue #105: optional outbound delivery of this turn's result.
     /// When set, the final assistant text is POSTed (webhook) or appended
-    /// (file) after the turn completes — fire-and-forget: delivery
-    /// failure is logged and reported via the `notify_result` response
-    /// field, never failing the turn.
+    /// (file) after the turn completes — best-effort: delivery failure is
+    /// logged and reported via the `notify_result` response field, never
+    /// failing the turn.
     #[serde(default)]
     pub notify: Option<crate::notify::NotifyTarget>,
 }
@@ -1333,7 +1333,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "content": { "type": "string" },
                         "notify": {
                             "$ref": "#/components/schemas/NotifyTarget",
-                            "description": "Issue #105: deliver this turn's final text out-of-band (fire-and-forget)."
+                            "description": "Issue #105: deliver this turn's final text out-of-band; the outcome is reported in `notify_result` and a delivery failure never fails the turn."
                         }
                     },
                     "required": ["content"]
