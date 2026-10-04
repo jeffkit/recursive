@@ -168,6 +168,14 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Issue #100: override the cross-step retry policy for transient
+    /// provider failures (429 / 5xx / network). Forwarded to the kernel
+    /// builder; when unset, `RetryPolicy::for_step_loop_from_env` applies.
+    pub fn step_retry(mut self, policy: crate::llm::RetryPolicy) -> Self {
+        self.kernel_builder = self.kernel_builder.step_retry(policy);
+        self
+    }
+
     /// Set a transcript character limit (optional, default unlimited).
     pub fn max_transcript_chars(mut self, n: usize) -> Self {
         self.kernel_builder = self.kernel_builder.max_transcript_chars(n);

@@ -25,7 +25,7 @@ use crate::agent::FinishReason;
 use crate::compact::Compactor;
 use crate::event::AgentEvent;
 use crate::hooks::HookRegistry;
-use crate::llm::{ChatProvider, TokenUsage, ToolSpec};
+use crate::llm::{ChatProvider, RetryPolicy, TokenUsage, ToolSpec};
 use crate::message::Message;
 use crate::permissions::PermissionMode;
 use crate::storage::{NoopSessionStore, SessionStore, StorageBackend};
@@ -200,6 +200,11 @@ pub struct AgentKernel {
     /// for [`TurnContext::wall_timeout_secs`] when the caller leaves it at 0.
     /// 0 = unlimited (legacy behaviour, unchanged).
     pub(crate) wall_timeout_secs: u64,
+    /// Issue #100: bounded cross-step retry policy for transient provider
+    /// failures (`RunCore` re-issues the LLM call after a cancel-aware
+    /// backoff instead of ending the turn). Defaults to
+    /// [`RetryPolicy::for_step_loop_from_env`].
+    pub(crate) step_retry: RetryPolicy,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -356,6 +361,7 @@ impl AgentKernel {
                 } else {
                     None
                 },
+                step_retry: self.step_retry.clone(),
             }
         };
 
@@ -432,6 +438,9 @@ pub struct AgentKernelBuilder {
     globs_skills: Vec<crate::skills::Skill>,
     /// Goal 399: session wall-clock budget in seconds (default 0 = unlimited).
     wall_timeout_secs: u64,
+    /// Issue #100: cross-step retry policy for transient provider failures.
+    /// `None` → [`RetryPolicy::for_step_loop_from_env`] at build time.
+    step_retry: Option<RetryPolicy>,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -487,6 +496,14 @@ impl AgentKernelBuilder {
     /// — data, not an error (invariant #7).
     pub fn wall_timeout_secs(mut self, secs: u64) -> Self {
         self.wall_timeout_secs = secs;
+        self
+    }
+
+    /// Issue #100: override the cross-step retry policy used when a
+    /// transient provider failure (429 / 5xx / network) interrupts a step.
+    /// When unset, [`RetryPolicy::for_step_loop_from_env`] applies.
+    pub fn step_retry(mut self, policy: RetryPolicy) -> Self {
+        self.step_retry = Some(policy);
         self
     }
 
@@ -604,6 +621,9 @@ impl AgentKernelBuilder {
             stuck_error_rate: self.stuck_error_rate.unwrap_or(0.8),
             globs_skills: self.globs_skills,
             wall_timeout_secs: self.wall_timeout_secs,
+            step_retry: self
+                .step_retry
+                .unwrap_or_else(RetryPolicy::for_step_loop_from_env),
         })
     }
 

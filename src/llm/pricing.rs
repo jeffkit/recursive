@@ -33,6 +33,65 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Cross-step retry policy for a whole ReAct step (issue #100).
+    ///
+    /// Deliberately more patient than [`RetryPolicy::default`] — which caps
+    /// the *provider's* own per-request retries — because a gateway
+    /// throttling window can outlast one or two one-second retries, and the
+    /// cost of giving up at the step level is discarding every step already
+    /// completed in the turn. Three retries (≈7 s of backoff on their own,
+    /// more once each attempt's own provider retries are counted) covers a
+    /// short burst without turning a genuinely unreachable provider into a
+    /// multi-minute hang; raise `RECURSIVE_STEP_RETRY_MAX` /
+    /// `RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS` for longer throttling windows.
+    pub fn for_step_loop() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+
+    /// [`RetryPolicy::for_step_loop`] with env overrides:
+    /// `RECURSIVE_STEP_RETRY_MAX`, `RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS`
+    /// and `RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS`. Unset or unparseable
+    /// values keep the default.
+    pub fn for_step_loop_from_env() -> Self {
+        let mut policy = Self::for_step_loop();
+        if let Some(v) = std::env::var("RECURSIVE_STEP_RETRY_MAX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            policy.max_retries = v;
+        }
+        if let Some(v) = std::env::var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            policy.initial_backoff = Duration::from_secs(v);
+        }
+        if let Some(v) = std::env::var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            policy.max_backoff = Duration::from_secs(v);
+        }
+        policy
+    }
+
+    /// Returns `Some(backoff)` when the cross-step retry loop should sleep
+    /// and re-issue the call after provider `err`, or `None` when the error
+    /// is permanent (or the retry budget is spent).
+    ///
+    /// Wraps [`RetryPolicy::backoff_for`] with the error → status / network
+    /// classification from [`crate::error::Error`].
+    pub fn backoff_for_error(&self, attempt: usize, err: &crate::error::Error) -> Option<Duration> {
+        if !err.is_transient_provider_error() {
+            return None;
+        }
+        self.backoff_for(attempt, err.http_status(), err.is_network_error())
+    }
+
     /// Returns `Some(backoff)` if the caller should sleep-and-retry, or `None`
     /// to propagate the error. `attempt` is 0-indexed (0 = after the first failure).
     pub fn backoff_for(
@@ -297,6 +356,109 @@ mod tests {
             Duration::from_secs(5),
             "backoff must be capped at max_backoff"
         );
+    }
+
+    // ── Step-loop retry policy (issue #100) ─────────────────────────────────
+
+    #[test]
+    fn step_loop_policy_is_more_patient_than_provider_default() {
+        let step = RetryPolicy::for_step_loop();
+        let provider = RetryPolicy::default();
+        assert!(
+            step.max_retries > provider.max_retries,
+            "step-level retries must outlast the provider's own budget"
+        );
+        assert!(
+            step.max_backoff > provider.max_backoff,
+            "step-level backoff must be able to wait out a throttling window"
+        );
+    }
+
+    #[test]
+    fn step_loop_policy_env_overrides_apply() {
+        // One test for all three vars: `set_var`/`remove_var` are
+        // process-global, so splitting would race under parallel `cargo test`.
+        let orig = [
+            (
+                "RECURSIVE_STEP_RETRY_MAX",
+                std::env::var("RECURSIVE_STEP_RETRY_MAX").ok(),
+            ),
+            (
+                "RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS",
+                std::env::var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS").ok(),
+            ),
+            (
+                "RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS",
+                std::env::var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS").ok(),
+            ),
+        ];
+
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "9");
+        std::env::set_var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS", "3");
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS", "120");
+        // A nonsense value must be ignored, not panic.
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "not-a-number");
+        assert_eq!(
+            RetryPolicy::for_step_loop_from_env().max_retries,
+            RetryPolicy::for_step_loop().max_retries,
+            "unparseable env must fall back to the default"
+        );
+
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "9");
+        let policy = RetryPolicy::for_step_loop_from_env();
+        assert_eq!(policy.max_retries, 9);
+        assert_eq!(policy.initial_backoff, Duration::from_secs(3));
+        assert_eq!(policy.max_backoff, Duration::from_secs(120));
+
+        for (key, value) in orig {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_for_error_retries_transient_and_rejects_permanent() {
+        let policy = RetryPolicy::default();
+        let llm = |msg: &str| crate::error::Error::Llm {
+            provider: "x".into(),
+            message: msg.to_string(),
+        };
+        assert!(policy
+            .backoff_for_error(0, &llm("HTTP 429 Too Many Requests: slow down"))
+            .is_some());
+        assert!(policy
+            .backoff_for_error(0, &llm("HTTP 503 Service Unavailable: upstream"))
+            .is_some());
+        assert!(policy
+            .backoff_for_error(0, &llm("request failed: connection reset"))
+            .is_some());
+        assert!(policy
+            .backoff_for_error(
+                0,
+                &crate::error::Error::RateLimited {
+                    provider: "x".into(),
+                    retry_after_ms: 1,
+                }
+            )
+            .is_some());
+        // Permanent failures must not be retried.
+        assert!(policy
+            .backoff_for_error(0, &llm("HTTP 400 Bad Request: bad tool schema"))
+            .is_none());
+        assert!(policy
+            .backoff_for_error(
+                0,
+                &crate::error::Error::Config {
+                    message: "x".into(),
+                }
+            )
+            .is_none());
+        // Budget exhaustion still wins.
+        assert!(policy
+            .backoff_for_error(2, &llm("HTTP 500 Internal Server Error: x"))
+            .is_none());
     }
 
     // ── ModelPricing::cost_usd ───────────────────────────────────────────────

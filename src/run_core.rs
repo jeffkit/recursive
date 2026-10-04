@@ -28,7 +28,9 @@ pub(crate) const DENIAL_LIMIT_SENTINEL: &str = "ERROR_DENIAL_LIMIT:";
 use crate::compact::Compactor;
 use crate::error::Result;
 use crate::hooks::{HookAction, HookEvent, HookRegistry};
-use crate::llm::{ChatProvider, Completion, StreamChunk, StreamSender, TokenUsage, ToolCall};
+use crate::llm::{
+    ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
+};
 use crate::message::Message;
 
 use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
@@ -71,6 +73,23 @@ fn bump_stuck_count<'a>(counts: &mut std::collections::HashMap<&'a str, usize>, 
 /// consistency between event payloads and HTTP API responses.
 fn finish_reason_str(reason: &FinishReason) -> String {
     reason.to_string()
+}
+
+/// Short label for the [`AgentEvent::LlmRetry`] `reason` field.
+///
+/// `rate_limited` / `timeout` / `server_error` are the labels the CLI's
+/// `api_retry` mapper already understands; `network` covers transport
+/// failures with no HTTP status.
+fn retry_reason(err: &crate::error::Error) -> &'static str {
+    match err {
+        crate::error::Error::RateLimited { .. } => "rate_limited",
+        crate::error::Error::Timeout { .. } => "timeout",
+        _ => match err.http_status() {
+            Some(429) => "rate_limited",
+            Some(s) if (500..600).contains(&s) => "server_error",
+            _ => "network",
+        },
+    }
 }
 
 /// Rough token estimate from message content lengths.
@@ -195,6 +214,12 @@ pub(crate) struct RunCore<'a> {
     /// Wall-clock start instant, recorded when `RunCore` is
     /// constructed. `None` when the timeout is not active.
     pub(crate) wall_start: Option<std::time::Instant>,
+    /// Issue #100: bounded cross-step retry policy for transient provider
+    /// failures. When a step's LLM call fails with a retryable error
+    /// (429 / 5xx / network), `dispatch_llm_step_with_retry` sleeps a
+    /// cancel-aware backoff and re-issues the call instead of ending the
+    /// turn and discarding the steps already completed.
+    pub(crate) step_retry: RetryPolicy,
 }
 
 impl<'a> RunCore<'a> {
@@ -406,6 +431,68 @@ impl<'a> RunCore<'a> {
         };
 
         Ok((completion, new_final_message))
+    }
+
+    /// Issue #100: run one ReAct step's LLM call with a bounded, cancel-aware
+    /// cross-step retry.
+    ///
+    /// A transient provider failure (429, 5xx, network) is re-issued after a
+    /// backoff drawn from [`RetryPolicy::backoff_for_error`] instead of
+    /// bubbling out of `run_inner` and ending the turn — which would discard
+    /// every step already completed in a long task for what is often a few
+    /// seconds of gateway throttling. The loop stops as soon as the error is
+    /// permanent, the retry budget is spent, or the shutdown token fires
+    /// (the backoff sleep is cancel-aware, unlike the pre-Goal-288 loop).
+    async fn dispatch_llm_step_with_retry(
+        &mut self,
+        specs: &[crate::llm::ToolSpec],
+        step: usize,
+        total_usage: &mut TokenUsage,
+    ) -> crate::error::Result<(Completion, Option<String>)> {
+        let mut attempt = 0usize;
+        loop {
+            match self.dispatch_llm_step(specs, step, total_usage).await {
+                Ok(v) => return Ok(v),
+                Err(e) => match self.step_retry.backoff_for_error(attempt, &e) {
+                    Some(backoff) => {
+                        self.emit(AgentEvent::LlmRetry {
+                            step,
+                            attempt: (attempt + 1) as u32,
+                            wait_ms: backoff.as_millis() as u64,
+                            reason: retry_reason(&e).to_string(),
+                        });
+                        warn!(
+                            target: "recursive::agent",
+                            step,
+                            attempt,
+                            wait_ms = backoff.as_millis() as u64,
+                            error = %e,
+                            "transient provider error — backing off before retrying step"
+                        );
+                        if !self.sleep_cancel_aware(backoff).await {
+                            return Err(crate::error::Error::Cancelled);
+                        }
+                        attempt += 1;
+                    }
+                    None => return Err(e),
+                },
+            }
+        }
+    }
+
+    /// Sleep for `dur`, returning `false` when the shutdown token is
+    /// cancelled first. Without a token the sleep always completes.
+    async fn sleep_cancel_aware(&self, dur: std::time::Duration) -> bool {
+        match self.shutdown_token.clone() {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => false,
+                _ = tokio::time::sleep(dur) => true,
+            },
+            None => {
+                tokio::time::sleep(dur).await;
+                true
+            }
+        }
     }
 
     /// Process the result of a tool batch: emit per-call `ToolResult`
@@ -1369,32 +1456,34 @@ impl<'a> RunCore<'a> {
             self.maybe_compact(step).await;
 
             // ---- LLM call (with retry) --------------------------------------------
-            let (completion, new_final_message) =
-                match self.dispatch_llm_step(&specs, step, &mut total_usage).await {
-                    Ok(v) => v,
-                    Err(crate::error::Error::Cancelled) => {
-                        // Mid-call cancellation → Cancelled, partial
-                        // transcript persisted by the caller (Invariant #7).
-                        return Ok(self.make_cancelled_outcome(
-                            step,
-                            final_message,
-                            total_usage,
-                            tool_audits,
-                        ));
-                    }
-                    Err(crate::error::Error::WallClockExceeded { secs }) => {
-                        // Issue #40: per-call wall budget fired inside a
-                        // stalled non-stream `complete()`.
-                        return Ok(self.wall_clock_finish(
-                            secs,
-                            step,
-                            final_message,
-                            total_usage,
-                            tool_audits,
-                        ));
-                    }
-                    Err(e) => return Err(e),
-                };
+            let (completion, new_final_message) = match self
+                .dispatch_llm_step_with_retry(&specs, step, &mut total_usage)
+                .await
+            {
+                Ok(v) => v,
+                Err(crate::error::Error::Cancelled) => {
+                    // Mid-call cancellation → Cancelled, partial
+                    // transcript persisted by the caller (Invariant #7).
+                    return Ok(self.make_cancelled_outcome(
+                        step,
+                        final_message,
+                        total_usage,
+                        tool_audits,
+                    ));
+                }
+                Err(crate::error::Error::WallClockExceeded { secs }) => {
+                    // Issue #40: per-call wall budget fired inside a
+                    // stalled non-stream `complete()`.
+                    return Ok(self.wall_clock_finish(
+                        secs,
+                        step,
+                        final_message,
+                        total_usage,
+                        tool_audits,
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             // Goal 382: a stream-interrupted completion (finish_reason
             // "interrupted") persists the partial reply as a Cancelled turn.
             if completion.finish_reason.as_deref() == Some("interrupted") {
@@ -1719,6 +1808,7 @@ mod tests {
             consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
+            step_retry: crate::llm::RetryPolicy::default(),
         }
     }
 
@@ -1846,6 +1936,7 @@ mod tests {
             consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
+            step_retry: crate::llm::RetryPolicy::default(),
         }
     }
 
@@ -2729,6 +2820,7 @@ mod tests {
             consecutive_compact_failures: 0,
             wall_timeout_secs: 0,
             wall_start: None,
+            step_retry: crate::llm::RetryPolicy::default(),
         }
     }
 
@@ -3901,5 +3993,176 @@ mod tests {
             "expected Err(WallClockExceeded) on spent budget, got {:?}",
             result.map(|_| ())
         );
+    }
+
+    // ── Issue #100: cross-step retry for transient provider failures ─────
+
+    /// A transient 429 must not end the turn: the step is re-issued after a
+    /// backoff and the run completes normally.
+    #[tokio::test]
+    async fn run_inner_recovers_from_transient_provider_error() {
+        use crate::agent::FinishReason;
+        use crate::error::Error;
+        use crate::llm::{Completion, RetryPolicy};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(
+            crate::llm::MockProvider::new(vec![Completion {
+                content: "recovered".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            }])
+            .with_errors(vec![Error::Llm {
+                provider: "mock".into(),
+                message: "HTTP 429 Too Many Requests: slow down".into(),
+            }]),
+        );
+        let mut core = make_run_core_for_inner(
+            vec![Message::user("hello".to_string())],
+            &hooks,
+            provider,
+            3,
+        );
+        core.step_retry = RetryPolicy {
+            max_retries: 3,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(2),
+        };
+
+        let outcome = core
+            .run_inner()
+            .await
+            .expect("a transient 429 must not fail the turn");
+        assert!(matches!(
+            outcome.finish_reason,
+            FinishReason::NoMoreToolCalls
+        ));
+        assert_eq!(outcome.final_message.as_deref(), Some("recovered"));
+    }
+
+    /// Once the retry budget is spent, the last transient error surfaces.
+    #[tokio::test]
+    async fn run_inner_gives_up_after_step_retry_budget() {
+        use crate::error::Error;
+        use crate::llm::RetryPolicy;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let down = || Error::Llm {
+            provider: "mock".into(),
+            message: "HTTP 503 Service Unavailable: upstream".into(),
+        };
+        // One more error than the budget: initial call + 2 retries.
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]).with_errors(vec![
+            down(),
+            down(),
+            down(),
+        ]));
+        let mut core = make_run_core_for_inner(
+            vec![Message::user("hello".to_string())],
+            &hooks,
+            provider,
+            3,
+        );
+        core.step_retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(1),
+        };
+
+        let err = match core.run_inner().await {
+            Err(e) => e,
+            Ok(_) => panic!("an unrecovered 5xx must fail the turn"),
+        };
+        assert_eq!(err.http_status(), Some(503));
+    }
+
+    /// A permanent error (4xx other than 429) is returned without retrying.
+    #[tokio::test]
+    async fn run_inner_does_not_retry_permanent_error() {
+        use crate::error::Error;
+        use crate::llm::{Completion, RetryPolicy};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(
+            crate::llm::MockProvider::new(vec![Completion {
+                content: "must not be reached".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            }])
+            .with_errors(vec![Error::Llm {
+                provider: "mock".into(),
+                message: "HTTP 400 Bad Request: bad tool schema".into(),
+            }]),
+        );
+        let mut core = make_run_core_for_inner(
+            vec![Message::user("hello".to_string())],
+            &hooks,
+            provider.clone(),
+            3,
+        );
+        // A policy generous enough to retry if the error were transient.
+        core.step_retry = RetryPolicy {
+            max_retries: 10,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(1),
+        };
+
+        let err = match core.run_inner().await {
+            Err(e) => e,
+            Ok(_) => panic!("a 400 must fail immediately"),
+        };
+        assert_eq!(err.http_status(), Some(400));
+        assert_eq!(
+            provider.calls().len(),
+            1,
+            "a permanent error must not trigger a second LLM call"
+        );
+    }
+
+    /// The retry backoff sleep must honour the shutdown token instead of
+    /// parking the run for the full backoff.
+    #[tokio::test]
+    async fn step_retry_backoff_is_cancel_aware() {
+        use crate::agent::FinishReason;
+        use crate::error::Error;
+        use crate::llm::RetryPolicy;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider =
+            Arc::new(
+                crate::llm::MockProvider::new(vec![]).with_errors(vec![Error::RateLimited {
+                    provider: "mock".into(),
+                    retry_after_ms: 1,
+                }]),
+            );
+        let mut core = make_run_core_for_inner(
+            vec![Message::user("hello".to_string())],
+            &hooks,
+            provider,
+            3,
+        );
+        // Backoff far longer than the test timeout: only cancellation can
+        // end the run this fast.
+        core.step_retry = RetryPolicy {
+            max_retries: 5,
+            initial_backoff: std::time::Duration::from_secs(30),
+            max_backoff: std::time::Duration::from_secs(30),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        core.shutdown_token = Some(token.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), core.run_inner())
+            .await
+            .expect("cancel-aware backoff must end the run well before 30s")
+            .expect("cancellation is a finish reason, not an error (invariant #7)");
+        assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
     }
 }

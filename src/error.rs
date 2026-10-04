@@ -137,6 +137,55 @@ impl Error {
             Error::RateLimited { .. } | Error::Timeout { .. } | Error::Http(_) | Error::Io(_)
         )
     }
+
+    /// HTTP status code carried by this error, when it came from an LLM
+    /// HTTP response.
+    ///
+    /// The OpenAI / Anthropic adapters format an exhausted provider
+    /// failure as `Error::Llm { message: "HTTP <status>: <body>" }`, so the
+    /// code is parsed from that prefix; `Error::RateLimited` is the
+    /// structured 429 variant. Transport failures, config errors and tool
+    /// errors carry no status.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Error::RateLimited { .. } => Some(429),
+            Error::Llm { message, .. } => message
+                .strip_prefix("HTTP ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(|code| code.trim_end_matches(':'))
+                .and_then(|code| code.parse::<u16>().ok()),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` for transport-level failures with no HTTP status to
+    /// classify: a `reqwest` error, raw IO, a timeout, or the `Error::Llm`
+    /// message the adapters synthesise for a dropped send / stream
+    /// (`"request failed: …"` / `"SSE stream read error: …"`).
+    pub fn is_network_error(&self) -> bool {
+        match self {
+            Error::Http(_) | Error::Io(_) | Error::Timeout { .. } => true,
+            // Prefix match only: a parse failure embeds the raw response
+            // body, which may itself contain words like "connection".
+            Error::Llm { message, .. } => {
+                message.starts_with("request failed:")
+                    || message.starts_with("SSE stream read error:")
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns `true` when a bounded cross-step retry may recover from this
+    /// provider failure: HTTP 429, any 5xx, or a network/transport error.
+    /// Other 4xx (bad request, auth, context overflow) are permanent and
+    /// must surface unchanged. Drives `RunCore`'s step-level retry
+    /// (issue #100).
+    pub fn is_transient_provider_error(&self) -> bool {
+        self.is_network_error()
+            || self
+                .http_status()
+                .is_some_and(|s| s == 429 || (500..600).contains(&s))
+    }
 }
 
 /// Return `true` when `err` looks like an LLM context-window-exceeded error.
@@ -430,6 +479,111 @@ mod tests {
             message: "bad config".into()
         }
         .is_transient());
+    }
+
+    // ── http_status / is_network_error / is_transient_provider_error ──────
+
+    #[test]
+    fn http_status_parses_adapter_llm_messages() {
+        // The adapters format provider failures as "HTTP <status phrase>: body".
+        let err = Error::Llm {
+            provider: "openai".into(),
+            message: "HTTP 429 Too Many Requests: slow down".into(),
+        };
+        assert_eq!(err.http_status(), Some(429));
+        let err = Error::Llm {
+            provider: "anthropic".into(),
+            message: "HTTP 503 Service Unavailable: upstream".into(),
+        };
+        assert_eq!(err.http_status(), Some(503));
+        assert_eq!(
+            Error::RateLimited {
+                provider: "x".into(),
+                retry_after_ms: 1
+            }
+            .http_status(),
+            Some(429)
+        );
+    }
+
+    #[test]
+    fn http_status_none_for_non_http_errors() {
+        assert_eq!(Error::Timeout { duration_ms: 1 }.http_status(), None);
+        assert_eq!(
+            Error::Llm {
+                provider: "x".into(),
+                message: "request failed: connection reset".into(),
+            }
+            .http_status(),
+            None
+        );
+        assert_eq!(
+            Error::Llm {
+                provider: "x".into(),
+                message: "upstream 5xx".into(),
+            }
+            .http_status(),
+            None,
+            "a bare '5xx' token without the HTTP prefix must not parse"
+        );
+    }
+
+    #[test]
+    fn is_network_error_covers_transport_failures() {
+        assert!(Error::Timeout { duration_ms: 1 }.is_network_error());
+        assert!(Error::Llm {
+            provider: "x".into(),
+            message: "request failed: error sending request for url".into(),
+        }
+        .is_network_error());
+        assert!(Error::Llm {
+            provider: "x".into(),
+            message: "SSE stream read error: connection closed".into(),
+        }
+        .is_network_error());
+        assert!(!Error::Llm {
+            provider: "x".into(),
+            message: "invalid tool schema".into(),
+        }
+        .is_network_error());
+    }
+
+    #[tokio::test]
+    async fn is_network_error_covers_http_transport_variant() {
+        // Build a reqwest error without a network round-trip: an unusable URL
+        // fails at request-build time.
+        let e = reqwest::Client::new()
+            .get("::not-a-url::")
+            .send()
+            .await
+            .expect_err("invalid URL must fail request construction");
+        assert!(Error::Http(e).is_network_error());
+    }
+
+    #[test]
+    fn is_transient_provider_error_classifies_retryable_statuses() {
+        let llm = |msg: &str| Error::Llm {
+            provider: "x".into(),
+            message: msg.to_string(),
+        };
+        assert!(llm("HTTP 429 Too Many Requests: x").is_transient_provider_error());
+        assert!(llm("HTTP 500 Internal Server Error: x").is_transient_provider_error());
+        assert!(llm("HTTP 502 Bad Gateway: x").is_transient_provider_error());
+        assert!(llm("request failed: connection reset").is_transient_provider_error());
+        // Permanent client errors must not be retried.
+        assert!(!llm("HTTP 400 Bad Request: x").is_transient_provider_error());
+        assert!(!llm("HTTP 401 Unauthorized: x").is_transient_provider_error());
+        assert!(!llm("HTTP 200 but response body is empty").is_transient_provider_error());
+        assert!(!Error::Config {
+            message: "x".into()
+        }
+        .is_transient_provider_error());
+        assert!(!Error::Tool {
+            name: "x".into(),
+            call_id: None,
+            message: "x".into()
+        }
+        .is_transient_provider_error());
     }
 
     // ── is_context_window_exceeded ────────────────────────────────────

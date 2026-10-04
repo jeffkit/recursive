@@ -1657,19 +1657,17 @@ async fn stuck_detection_keeps_tool_calls_paired() {
     );
 }
 
-/// Goal 287 / Goal 288: verify that LLM errors propagate correctly.
-/// After Goal 288 removed the outer retry loop, the provider's internal
-/// `RetryPolicy` handles retries. MockProvider does not retry internally,
-/// so a `RateLimited` error surfaces immediately as a run error.
+/// Issue #100: a transient provider error (`RateLimited` here) is retried at
+/// the step level instead of ending the turn. `MockProvider` never retries
+/// internally, so recovering the turn proves the run_core loop re-issued the
+/// call. The `LlmRetry` event must still be emitted for TUI / SDK consumers.
 #[tokio::test]
-async fn llm_retry_emits_event() {
+async fn llm_retry_recovers_and_emits_event() {
     use crate::event::ChannelSink;
 
-    let (sink, _event_rx) = ChannelSink::new();
+    let (sink, mut rx) = ChannelSink::new();
     let sink = Arc::new(sink);
 
-    // MockProvider returns a RateLimited error — without an outer retry
-    // loop, this propagates to the caller.
     let provider = Arc::new(
         MockProvider::new(vec![Completion {
             content: "Hello!".into(),
@@ -1687,22 +1685,37 @@ async fn llm_retry_emits_event() {
     let mut rt = AgentRuntime::builder()
         .llm(provider)
         .event_sink(sink)
+        // Fast backoff so the test does not sleep the default second.
+        .step_retry(crate::llm::RetryPolicy {
+            max_retries: 2,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(1),
+        })
         .build()
         .unwrap();
 
-    // The error should propagate — retry is now handled at the provider
-    // layer via `RetryPolicy`, not in `run_core`.
-    let result = rt.run("hi").await;
-    assert!(
-        result.is_err(),
-        "expected error from RateLimited MockProvider without outer retry loop"
+    // Drain registration events.
+    while rx.try_recv().is_ok() {}
+
+    let outcome = rt.run("hi").await.expect("a transient 429 must be retried");
+    assert_eq!(
+        outcome.final_text.as_deref(),
+        Some("Hello!"),
+        "the retried call's completion must be the turn's final text"
     );
-    let err = result.unwrap_err();
-    let err_str = format!("{err}");
-    assert!(
-        err_str.contains("rate limited"),
-        "expected rate-limited error, got: {err_str}"
-    );
+
+    let mut retried = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::LlmRetry {
+            attempt, reason, ..
+        } = ev
+        {
+            assert_eq!(attempt, 1, "first retry after the initial failure");
+            assert_eq!(reason, "rate_limited");
+            retried = true;
+        }
+    }
+    assert!(retried, "an LlmRetry event must be emitted for the backoff");
 }
 
 // ── P0-2: set_event_sink / replace_event_sink side-effect contract ────

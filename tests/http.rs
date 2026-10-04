@@ -310,14 +310,25 @@ mod http_tests {
         );
     }
 
+    /// Issue #100: a transient 429 is retried at the step level, so a run
+    /// whose provider recovers completes with 200 instead of surfacing the
+    /// error. The 429 → `Retry-After` mapping itself is pinned by the
+    /// `map_run_error` unit tests in `src/http/handlers.rs`.
     #[tokio::test]
-    async fn run_returns_429_with_retry_after_on_rate_limited() {
+    async fn run_recovers_from_transient_rate_limit() {
         use recursive::error::Error;
 
         let provider = Arc::new(
-            MockProvider::new(vec![]).with_errors(vec![Error::RateLimited {
+            MockProvider::new(vec![Completion {
+                content: "recovered".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            }])
+            .with_errors(vec![Error::RateLimited {
                 provider: "mock".into(),
-                retry_after_ms: 1234,
+                retry_after_ms: 1,
             }]),
         );
         let state = sample_state_with_provider(provider);
@@ -337,20 +348,13 @@ mod http_tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), 429);
-        // The regression-prone part: the `Retry-After` header value, not
-        // just the status code. 1234ms floors to 1 whole second.
-        let retry_after = response
-            .headers()
-            .get(axum::http::header::RETRY_AFTER)
-            .expect("429 must carry a Retry-After header");
-        assert_eq!(retry_after, "1", "1234ms must floor to Retry-After: 1");
-
+        assert_eq!(response.status(), 200);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp["status"], "success");
         assert!(
-            resp["error"].as_str().unwrap().contains("rate limited"),
-            "429 body should explain the rate limit, got: {resp}"
+            resp["messages"].to_string().contains("recovered"),
+            "the retried completion must land in the transcript, got: {resp}"
         );
     }
 

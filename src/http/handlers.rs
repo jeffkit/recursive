@@ -1909,6 +1909,31 @@ mod tests {
     use crate::event::AgentEvent;
     use crate::http::SseEvent;
 
+    /// Issue #100: a `RateLimited` that exhausts the step-level retry budget
+    /// must still map to 429 + `Retry-After`. The `/run` integration test now
+    /// covers the recover path (a transient 429 is retried), so this pins the
+    /// error mapping itself.
+    #[test]
+    fn map_run_error_maps_rate_limited_to_429_with_retry_after() {
+        let err = crate::error::Error::RateLimited {
+            provider: "mock".into(),
+            retry_after_ms: 1234,
+        };
+        let api = map_run_error(&err);
+        assert_eq!(api.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(api.retry_after_secs, Some(1), "1234ms floors to 1s");
+        assert!(api.message.contains("rate limited"));
+
+        let cancelled = map_run_error(&crate::error::Error::Cancelled);
+        assert_eq!(cancelled.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let llm = map_run_error(&crate::error::Error::Llm {
+            provider: "p".into(),
+            message: "HTTP 500 Internal Server Error: boom".into(),
+        });
+        assert_eq!(llm.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     /// Goal-393: `build_session_runtime` must install the same context
     /// management the CLI gets — compactor (auto threshold from the model),
     /// microcompactor (opt-in), transcript cap (env). Asserted at the
