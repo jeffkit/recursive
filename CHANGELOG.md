@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- fix(http): rate-limit key no longer trusts a client-forged `X-Forwarded-For`
+  (#107). The old `extract_client_key` took the **leftmost** XFF entry
+  unconditionally, so a direct-connected client could mint a fresh full token
+  bucket per request by rotating the header. XFF is now trusted only when the
+  operator declares the proxy hop count via
+  `RECURSIVE_RATE_LIMIT_TRUSTED_PROXIES` (default `0` = never trust; the client
+  address is then the `trusted_proxies`-th XFF entry counting from the
+  **right**, discarding the untrusted leftmost chain). A chain shorter than the
+  configured hop count fails closed to the socket IP rather than trusting a
+  client-supplied entry. Requests carrying a non-empty `x-api-key` key on the
+  hash of that header regardless of any XFF they send — note the limiter runs
+  *before* authentication, so the header only partitions buckets and is not an
+  authorization decision; a client rotating a bogus `x-api-key` can therefore
+  still mint fresh buckets (pre-existing limitation, tracked separately). The
+  bucket map is also bounded now (`RECURSIVE_RATE_LIMIT_MAX_BUCKETS`, default
+  10 000; SEC-011): eviction picks idle buckets first and header-derived
+  (`xff:`) keys before socket (`ip:`) and authenticated (`apikey:`) ones, so a
+  unique-key flood cannot crowd real clients out. The cap is a burst guard, not
+  a hard ceiling — active (non-idle) buckets are never evicted, so it is the
+  reaper's periodic bucket prune that bounds the map long-run. Multi-replica
+  shared-state limiting remains a separate (cloud-runtime) work item — buckets
+  are still per-process.
 - feat(sandbox): 会话级环境绑定 + 能力注入 + 后台任务随环境销毁 (#31)：`ToolRegistry`
   持有会话的 `BackgroundJobManager`（`Clone` 共享、fork 新建），`run_background` 在容器档
   经共享 transport 在沙箱内执行（解除宿主执行的排除）；新增幂等
