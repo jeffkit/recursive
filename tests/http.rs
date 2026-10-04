@@ -4733,3 +4733,741 @@ mod http_tests {
         assert_eq!(unique.len(), 3, "both pages together cover all 3 sessions");
     }
 }
+
+// ===========================================================================
+// Issue #105 — inbound triggers + outbound notifications
+// ===========================================================================
+
+#[cfg(feature = "http")]
+pub(crate) mod trigger_endpoints {
+    use super::common::{mock_config, SET_INSECURE_OK};
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use recursive::http::{build_router, AppState, Metrics, RateLimiter};
+    use recursive::llm::{Completion, MockProvider};
+    use recursive::tools::ToolRegistry;
+    use recursive::triggers::{Trigger, TriggerSpec, TriggerStore};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    pub(crate) fn state_with_workspace(ws: &std::path::Path) -> AppState {
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hello".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        AppState {
+            tools: vec![],
+            config: {
+                let mut c = mock_config();
+                c.workspace = ws.to_path_buf();
+                c
+            },
+            tool_registry: ToolRegistry::local(),
+            provider,
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            host: Arc::new(recursive::session_host::SessionHost::new(
+                std::time::Duration::from_secs(0),
+                recursive::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: RateLimiter::new(100, 1.0),
+            skills: vec![],
+            storage: Arc::new(recursive::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("trig-test-{}", std::process::id())),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// State whose workspace is a private tempdir, so trigger stores in
+    /// tests never collide (TriggerStore keys on `config.workspace`).
+    fn trigger_state() -> (tempfile::TempDir, AppState) {
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let state = state_with_workspace(ws.path());
+        (ws, state)
+    }
+
+    /// Local re-implementation of the listing serialization contract:
+    /// secret absent, webhook_path present.
+    fn trigger_response_for_test(t: &Trigger) -> serde_json::Value {
+        let (cron, webhook_path) = match &t.spec {
+            TriggerSpec::Cron { expr } => (Some(expr.clone()), None),
+            TriggerSpec::Webhook { .. } => (
+                None,
+                Some(match &t.spec {
+                    TriggerSpec::Webhook { secret } if secret.is_empty() => {
+                        format!("/webhooks/{}", t.id)
+                    }
+                    TriggerSpec::Webhook { secret } => {
+                        format!("/webhooks/{}?key={}", t.id, secret)
+                    }
+                    _ => unreachable!(),
+                }),
+            ),
+        };
+        serde_json::json!({
+            "id": t.id,
+            "kind": t.spec.kind(),
+            "cron": cron,
+            "secret": serde_json::Value::Null,
+            "goal": t.goal,
+            "enabled": t.enabled,
+            "webhook_path": webhook_path,
+        })
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_cron_trigger_round_trips_and_computes_next_fire() {
+        let (ws, state) = trigger_state();
+        let app = build_router(state);
+        let (status, body) = post_json(
+            app.clone(),
+            "/triggers",
+            serde_json::json!({
+                "id": "trig-morning",
+                "kind": "cron",
+                "cron": "30 9 * * *",
+                "goal": "morning summary",
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "create cron trigger: {body}");
+        assert_eq!(body["kind"], "cron");
+        assert_eq!(body["cron"], "30 9 * * *");
+        assert_eq!(body["enabled"], true);
+        // next_fire_at was computed at registration (not null).
+        let next = body["next_fire_at"].as_str().expect("next_fire_at set");
+        assert!(recursive::triggers::parse_rfc3339_utc(next).is_some());
+
+        // Persisted under the workspace's user dir.
+        let store = TriggerStore::for_workspace(ws.path());
+        let stored = store.get("trig-morning").expect("load").expect("stored");
+        assert_eq!(stored.goal, "morning summary");
+        assert!(stored.enabled);
+    }
+
+    #[tokio::test]
+    async fn create_webhook_trigger_echoes_secret_once() {
+        let (ws, state) = trigger_state();
+        let app = build_router(state);
+        let (status, body) = post_json(
+            app.clone(),
+            "/triggers",
+            serde_json::json!({"kind": "webhook", "goal": "g"}),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let secret = body["secret"].as_str().expect("secret echoed on create");
+        assert_eq!(secret.len(), 32);
+        assert!(
+            body["webhook_path"].as_str().unwrap_or("").contains(secret),
+            "webhook_path must include the key: {body}"
+        );
+        // But the stored/listed form does NOT echo it.
+        let store = TriggerStore::for_workspace(ws.path());
+        let id = body["id"].as_str().unwrap().to_string();
+        let listed = store.get(&id).expect("get").expect("stored");
+        // The stored spec keeps the secret (needed to verify callers) but
+        // the serialized listing response must not carry it.
+        let resp = trigger_response_for_test(&listed);
+        assert!(resp["secret"].is_null(), "listing must not echo the secret");
+        assert_eq!(resp["webhook_path"], format!("/webhooks/{id}?key={secret}"));
+    }
+
+    #[tokio::test]
+    async fn create_trigger_rejects_bad_cron_and_kind() {
+        let (_ws, state) = trigger_state();
+        let app = build_router(state);
+        let (status, body) = post_json(
+            app.clone(),
+            "/triggers",
+            serde_json::json!({"kind": "cron", "cron": "99 * * * *", "goal": "g"}),
+        )
+        .await;
+        assert_eq!(status, 400, "minute 99 must be rejected: {body}");
+        let (status, _) = post_json(
+            app.clone(),
+            "/triggers",
+            serde_json::json!({"kind": "signal", "goal": "g"}),
+        )
+        .await;
+        assert_eq!(status, 400, "unknown kind must be rejected");
+        let (status, _) = post_json(
+            app,
+            "/triggers",
+            serde_json::json!({"kind": "cron", "cron": "0 9 * * *", "goal": "  "}),
+        )
+        .await;
+        assert_eq!(status, 400, "empty goal must be rejected");
+    }
+
+    #[tokio::test]
+    async fn trigger_crud_list_get_delete_patch() {
+        let (_ws, state) = trigger_state();
+        let app = build_router(state);
+        let (status, _created) = post_json(
+            app.clone(),
+            "/triggers",
+            serde_json::json!({"id": "trig-crud", "kind": "cron", "cron": "0 9 * * *", "goal": "g"}),
+        )
+        .await;
+        assert_eq!(status, 201);
+
+        // GET one.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/triggers/trig-crud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(got["id"], "trig-crud");
+        assert_eq!(got["enabled"], false, "created disabled by default");
+
+        // LIST contains it.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/triggers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert!(ids.contains(&"trig-crud"));
+
+        // PATCH enable.
+        let (status, patched) = post_json(app.clone(), "/triggers", serde_json::json!({})).await; // POST again on /triggers would create; use PATCH below instead.
+        let _ = (status, patched);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/triggers/trig-crud")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let patched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(patched["enabled"], true);
+
+        // DELETE.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/triggers/trig-crud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/triggers/trig-crud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    // clippy::await_holding_lock: the std env guard deliberately spans the
+    // fire's awaits — only same-process trigger tests contend for the
+    // process-global FILE_ROOT it protects (same posture as
+    // `agui_prompt_fixture` in src/http/handlers.rs).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn webhook_fire_runs_goal_and_delivers_notify() {
+        // FILE_ROOT is process-global; serialize against the scheduler
+        // test so the bound root cannot be swapped mid-fire. The std
+        // guard deliberately spans the awaits below — only same-process
+        // trigger tests contend (same posture as `agui_prompt_fixture`).
+        let _guard = recursive::test_util::env_lock();
+        let (ws, state) = trigger_state();
+        // Bind the notify file context to this workspace BEFORE the fire.
+        recursive::notify::set_file_context(ws.path());
+        let sink = recursive::notify::allowed_file_root(ws.path()).join("sink.jsonl");
+
+        // Register the trigger directly in the store (enabled, with a
+        // file notify target) — the create handler is covered above.
+        let store = TriggerStore::for_workspace(ws.path());
+        let mut trigger = Trigger::new(
+            "trig-hook",
+            TriggerSpec::Webhook {
+                secret: "s3cret".into(),
+            },
+            "say the word",
+            None,
+            Some(recursive::notify::NotifyTarget::File { path: sink.clone() }),
+        );
+        trigger.enabled = true;
+        store.upsert(trigger).expect("seed");
+
+        let app = build_router(state);
+        // Fire without a key → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-hook")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "missing key must be unauthorized");
+        // Fire with the wrong key → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-hook?key=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        // Fire correctly → 202.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-hook?key=s3cret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"extra":"context"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202, "fire accepted");
+
+        // The run is queued as a fire-and-forget task (202 above), so wait
+        // for it to record its outcome. `stamp_result` runs *after* the
+        // notify delivery, so once `last_result` is set the sink is final.
+        let store = TriggerStore::for_workspace(ws.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let updated = loop {
+            let t = store.get("trig-hook").expect("get").expect("present");
+            if t.last_result.is_some() {
+                break t;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fire never recorded its result"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        let content = std::fs::read_to_string(&sink).expect("notify sink written");
+        let line: serde_json::Value = serde_json::from_str(content.trim()).expect("jsonl line");
+        assert_eq!(line["source"], "webhook:trig-hook");
+        // One-shot trigger runs persist under a `trigger-run/` key, not a
+        // registered session id.
+        assert!(
+            line["session_id"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("trigger-run/"),
+            "one-shot run keyed under trigger-run/: {line}"
+        );
+
+        assert!(updated.last_fired_at.is_some());
+        let result = updated.last_result.unwrap_or_default();
+        assert!(
+            result.contains("notified") || result.contains("finished"),
+            "last_result records the outcome: {result}"
+        );
+    }
+
+    /// The handler takes the per-trigger fence before queuing, so a retry
+    /// while a run is still in flight gets the documented 409 instead of a
+    /// second concurrent run.
+    #[tokio::test]
+    async fn webhook_fire_returns_409_while_a_run_is_in_flight() {
+        let (ws, state) = trigger_state();
+        let host = Arc::clone(&state.host);
+        let store = TriggerStore::for_workspace(ws.path());
+        let mut trigger = Trigger::new(
+            "trig-busy",
+            TriggerSpec::Webhook { secret: "k".into() },
+            "g",
+            None,
+            None,
+        );
+        trigger.enabled = true;
+        store.upsert(trigger).expect("seed");
+        // Simulate an in-flight run for this trigger.
+        let _held = host
+            .try_begin_run("trigger:trig-busy")
+            .expect("fence free to start with");
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-busy?key=k")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "in-flight run must conflict");
+    }
+
+    #[tokio::test]
+    async fn webhook_fire_refuses_unknown_disabled_and_cron_ids() {
+        let (ws, state) = trigger_state();
+        let store = TriggerStore::for_workspace(ws.path());
+        let mut cron = Trigger::new(
+            "trig-cron",
+            TriggerSpec::Cron {
+                expr: "0 9 * * *".into(),
+            },
+            "g",
+            None,
+            None,
+        );
+        cron.enabled = true;
+        store.upsert(cron).expect("seed cron");
+        store
+            .upsert(Trigger::new(
+                "trig-disabled",
+                TriggerSpec::Webhook {
+                    secret: String::new(),
+                },
+                "g",
+                None,
+                None,
+            ))
+            .expect("seed disabled");
+        let app = build_router(state);
+
+        // Unknown id → 404.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        // Cron id → 400 (fires on schedule, not via HTTP).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-cron")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        // Disabled → 409.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/trig-disabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_trigger_endpoints() {
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let app = build_router(state_with_workspace(ws.path()));
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for path in ["/triggers", "/triggers/{id}", "/webhooks/{id}"] {
+            assert!(spec["paths"].get(path).is_some(), "openapi missing {path}");
+        }
+        for schema in ["CreateTriggerRequest", "TriggerResponse", "NotifyTarget"] {
+            assert!(
+                spec["components"]["schemas"].get(schema).is_some(),
+                "openapi missing schema {schema}"
+            );
+        }
+    }
+
+    /// The cron scheduler fires a due trigger end-to-end: a cron with
+    /// next_fire_at in the past gets picked up on the first tick, the run
+    /// happens against the mock provider, and the schedule advances.
+    // See webhook_fire_runs_goal_and_delivers_notify for the allow rationale.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scheduler_fires_due_cron_and_advances() {
+        use recursive::http::triggers as trig_http;
+        // FILE_ROOT is process-global; serialize against the webhook test.
+        // The std guard deliberately spans the awaits below (see the
+        // webhook test's note).
+        let _guard = recursive::test_util::env_lock();
+        let (ws, state) = trigger_state();
+        recursive::notify::set_file_context(ws.path());
+        let store = TriggerStore::for_workspace(ws.path());
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let mut trigger = Trigger::new(
+            "trig-sched",
+            TriggerSpec::Cron {
+                expr: "0 9 * * *".into(),
+            },
+            "scheduled work",
+            None,
+            None,
+        );
+        trigger.enabled = true;
+        trigger.next_fire_at = Some("2000-01-01T00:00:00Z".into()); // long due
+        store.upsert(trigger).expect("seed");
+
+        let _handle = trig_http::spawn_trigger_scheduler(
+            std::sync::Arc::new(state),
+            std::time::Duration::from_millis(50),
+        );
+        // Phase 1: the scheduler consumes the due slot (advance past the
+        // seeded 2000 timestamp, stamping the "firing" placeholder).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let advanced = store.get("trig-sched").expect("get").expect("present");
+            if advanced.next_fire_at.as_deref() != Some("2000-01-01T00:00:00Z") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scheduler never advanced the due trigger"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Phase 2: the spawned fire completes the run and overwrites the
+        // placeholder with the real outcome.
+        loop {
+            let advanced = store.get("trig-sched").expect("get").expect("present");
+            let result = advanced.last_result.as_deref().unwrap_or("");
+            if result.contains("finished") || result.contains("error") || result.contains("failed")
+            {
+                assert!(
+                    result.contains("finished"),
+                    "one-shot run completed against the mock provider: {result}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fire never recorded its result (last_result still {result:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let advanced = store.get("trig-sched").expect("get").expect("present");
+        assert!(advanced.last_fired_at.is_some(), "fire was stamped");
+        let _ = fired;
+        let _ = ws;
+    }
+}
+
+#[cfg(feature = "http")]
+mod session_message_notify {
+    use super::trigger_endpoints::state_with_workspace;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use recursive::http::build_router;
+    use recursive::notify;
+    use tower::ServiceExt;
+
+    /// POST /sessions then /sessions/:id/messages with a file notify
+    /// target: the response carries `notify_result` and the sink file
+    /// contains this turn's final text.
+    // See trigger_endpoints::webhook_fire_runs_goal_and_delivers_notify
+    // for the allow rationale (process-global FILE_ROOT + std env lock).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_message_with_notify_delivers_result() {
+        // Same allow posture as the other trigger tests: the std env lock
+        // spans awaits; only same-process tests contend.
+        let _guard = recursive::test_util::env_lock();
+        let ws = tempfile::tempdir().expect("ws");
+        notify::set_file_context(ws.path());
+        let sink = notify::allowed_file_root(ws.path()).join("turns.jsonl");
+        let _ = std::fs::remove_file(&sink);
+
+        let app = build_router(state_with_workspace(ws.path()));
+        // Create a session.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"system_prompt":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let sid = created["id"].as_str().unwrap().to_string();
+
+        // Send a message with a notify target.
+        let body = serde_json::json!({
+            "content": "hello",
+            "notify": {"kind": "file", "path": sink.to_string_lossy()},
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{sid}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let result = reply["notify_result"].as_str().expect("notify_result set");
+        assert!(
+            result.contains("notified via file"),
+            "delivery must succeed: {result}"
+        );
+
+        let content = std::fs::read_to_string(&sink).expect("sink written");
+        let line: serde_json::Value = serde_json::from_str(content.trim()).expect("jsonl");
+        assert_eq!(line["session_id"], sid.as_str());
+        assert_eq!(line["source"], "session:message");
+        assert_eq!(line["final_text"], "hello");
+    }
+
+    /// Without `notify` the response has no `notify_result` field (exact
+    /// backward compatibility).
+    #[tokio::test]
+    async fn session_message_without_notify_omits_field() {
+        let ws = tempfile::tempdir().expect("ws");
+        let app = build_router(state_with_workspace(ws.path()));
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"system_prompt":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let sid: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let sid = sid["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{sid}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            reply.get("notify_result").is_none(),
+            "no notify requested → no field: {reply}"
+        );
+    }
+}

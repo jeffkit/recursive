@@ -12,6 +12,7 @@ mod cold_load;
 mod environment_binding_tests;
 mod handlers;
 mod rate_limit;
+pub mod triggers;
 
 // Goal 395: the admission gate moved to the transport-agnostic
 // `session_host` module; re-exported here so front-end call sites and
@@ -30,6 +31,10 @@ use handlers::{
     session_interrupt, session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
+
+use triggers::{
+    create_trigger, delete_trigger, fire_webhook, get_trigger, list_triggers, patch_trigger,
+};
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -210,6 +215,13 @@ pub struct CreateSessionResponse {
 #[derive(serde::Deserialize, Debug)]
 pub struct SessionMessageRequest {
     pub content: String,
+    /// Issue #105: optional outbound delivery of this turn's result.
+    /// When set, the final assistant text is POSTed (webhook) or appended
+    /// (file) after the turn completes — fire-and-forget: delivery
+    /// failure is logged and reported via the `notify_result` response
+    /// field, never failing the turn.
+    #[serde(default)]
+    pub notify: Option<crate::notify::NotifyTarget>,
 }
 
 /// Response body for `POST /sessions/:id/messages`.
@@ -217,6 +229,10 @@ pub struct SessionMessageRequest {
 pub struct SessionMessageResponse {
     pub role: String,
     pub content: String,
+    /// Issue #105: delivery outcome when `notify` was requested
+    /// (`"notified via webhook"` / an error description). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_result: Option<String>,
 }
 
 /// Detail response for `GET /sessions/:id`.
@@ -626,6 +642,11 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, message)
     }
 
+    /// 401 Unauthorized with a message.
+    pub(super) fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, message)
+    }
+
     /// Attach a `Retry-After: <secs>` header to this error response.
     ///
     /// Goal-313: lets `session_clear_goal` preserve the `Retry-After: 5`
@@ -770,6 +791,12 @@ pub fn build_router_with_auth_and_rate_limit(
     let protected = Router::new()
         .route("/tools", get(list_tools))
         .route("/run", post(run_agent))
+        .route("/triggers", post(create_trigger))
+        .route("/triggers", get(list_triggers))
+        .route("/triggers/{id}", get(get_trigger))
+        .route("/triggers/{id}", axum::routing::patch(patch_trigger))
+        .route("/triggers/{id}", axum::routing::delete(delete_trigger))
+        .route("/webhooks/{id}", post(fire_webhook))
         .route("/sessions", post(create_session))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session))
@@ -812,7 +839,7 @@ pub fn build_router_with_auth_and_rate_limit(
 
 /// Build a static OpenAPI 3.0.3 specification describing all API endpoints.
 pub fn build_openapi_spec() -> serde_json::Value {
-    serde_json::json!({
+    let mut spec = serde_json::json!({
         "openapi": "3.0.3",
         "info": {
             "title": "Recursive Agent API",
@@ -1303,7 +1330,11 @@ pub fn build_openapi_spec() -> serde_json::Value {
                 "SessionMessageRequest": {
                     "type": "object",
                     "properties": {
-                        "content": { "type": "string" }
+                        "content": { "type": "string" },
+                        "notify": {
+                            "$ref": "#/components/schemas/NotifyTarget",
+                            "description": "Issue #105: deliver this turn's final text out-of-band (fire-and-forget)."
+                        }
                     },
                     "required": ["content"]
                 },
@@ -1311,13 +1342,47 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "role": { "type": "string" },
-                        "content": { "type": "string" }
+                        "content": { "type": "string" },
+                        "notify_result": { "type": "string", "description": "Delivery outcome when `notify` was requested." }
                     },
                     "required": ["role", "content"]
                 }
             }
         }
-    })
+    });
+    // Issue #105: merge the trigger/webhook endpoint paths and schemas
+    // (authored in `triggers.rs` so the feature's spec stays beside the
+    // handlers).
+    if let Some(paths_obj) = spec.get_mut("paths").and_then(|p| p.as_object_mut()) {
+        if let Some(trigger_paths) = triggers::trigger_openapi_paths().as_object_mut() {
+            for (k, v) in trigger_paths {
+                paths_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    if let Some(schemas_obj) = spec
+        .pointer_mut("/components/schemas")
+        .and_then(|s| s.as_object_mut())
+    {
+        for (k, v) in triggers::trigger_openapi_schemas() {
+            schemas_obj.insert(k, v);
+        }
+    }
+    if let Some(components) = spec.get_mut("components").and_then(|c| c.as_object_mut()) {
+        components.insert(
+            "parameters".to_string(),
+            serde_json::json!({
+                "TriggerId": {
+                    "name": "id",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" },
+                    "description": "Trigger id (trig-xxxxxxxx)."
+                }
+            }),
+        );
+    }
+    spec
 }
 
 /// Spawn a background task that periodically evicts idle sessions.

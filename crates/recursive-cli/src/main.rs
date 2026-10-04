@@ -908,6 +908,32 @@ async fn main() -> anyhow::Result<()> {
                 std::sync::Arc::new(recursive::storage::LocalStorageBackend::new(
                     recursive::user_workspace_dir(&config.workspace)?,
                 ));
+            // Issue #105: bind the notify file-target sandbox root (and the
+            // cron/webhook trigger stores derive from the same workspace).
+            // One bind at startup; delivery and registration share it.
+            recursive::notify::set_file_context(&config.workspace);
+            let state_for_scheduler = recursive::http::AppState {
+                tools: tool_infos.clone(),
+                tool_registry: tools.clone(),
+                config: config.clone(),
+                provider: provider.clone(),
+                host: std::sync::Arc::clone(&host),
+                event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
+                metrics: std::sync::Arc::clone(&metrics),
+                slash_commands: std::sync::Arc::new(slash_commands.clone()),
+                rate_limiter: recursive::http::rate_limiter_from_env(),
+                skills: skills.clone(),
+                storage: std::sync::Arc::clone(&storage),
+                agui_active_runs: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+            };
+            recursive::http::triggers::spawn_trigger_scheduler(
+                std::sync::Arc::new(state_for_scheduler),
+                std::time::Duration::from_secs(30),
+            );
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -3096,8 +3122,25 @@ async fn run_weixin_headless_daemon(
     )
     .await?;
 
+    // The binding the runtime currently holds (`None` = a fresh, unbound
+    // conversation). Compared against each request's binding to decide
+    // whether the transcript must be switched.
+    let mut active_session: Option<String> = None;
+
     while let Some(req) = next_weixin_request(&mut weixin_req_rx, &shutdown).await {
         info!("WeChat: processing message from {}", req.user_id);
+        // The daemon forwards the sender's binding; a change (`/c N`, `/r`)
+        // points this runtime at the right conversation before the turn.
+        if req.session_id != active_session {
+            active_session = switch_weixin_session(
+                &mut runtime,
+                &config,
+                &workspace,
+                &req.user_id,
+                req.session_id.as_deref(),
+                &req.text,
+            );
+        }
         match runtime.enqueue(&req.text).await {
             Ok(Some(outcome)) => {
                 let _ = req.reply_tx.send(outcome.final_text);
@@ -3117,6 +3160,84 @@ async fn run_weixin_headless_daemon(
         eprintln!("📱 Recursive WeChat daemon stopped.");
     }
     Ok(())
+}
+
+/// Point the single headless runtime at `user_id`'s bound session.
+///
+/// Implements the message-path half of the multiplexer (issue #105 §3):
+/// `/c N` rebinds the user, so the next message must *resume* session N,
+/// and `/r` unbinds them, so the next message must start fresh. Returns the
+/// binding the runtime is now on (`Some(id)`), which the caller caches to
+/// avoid reloading on every message.
+///
+/// The fresh case creates a real on-disk session and binds the user to it,
+/// so the new conversation is durable and `/l` can read it back.
+#[cfg(feature = "weixin")]
+fn switch_weixin_session(
+    runtime: &mut recursive::AgentRuntime,
+    config: &recursive::config::Config,
+    workspace: &std::path::Path,
+    user_id: &str,
+    wanted: Option<&str>,
+    first_message: &str,
+) -> Option<String> {
+    use std::sync::{Arc, Mutex};
+
+    let Some(id) = wanted else {
+        return start_fresh_weixin_session(runtime, config, workspace, user_id, first_message);
+    };
+    let Some(dir) = recursive::weixin::session_map::find_session_dir(workspace, id) else {
+        tracing::warn!(session_id = %id, "WeChat: bound session not found; starting fresh");
+        return start_fresh_weixin_session(runtime, config, workspace, user_id, first_message);
+    };
+    let seed = recursive::session::SessionReader::load_messages(&dir).unwrap_or_else(|e| {
+        tracing::warn!(session_id = %id, error = %e, "WeChat: failed to load session");
+        Vec::new()
+    });
+    runtime.set_transcript(seed);
+    runtime.set_session_id(id);
+    // Append to the resumed session when its lock is free (a session held
+    // by a live TUI/CLI cannot be appended to — degrade to in-memory).
+    if let Ok(writer) = recursive::session::SessionWriter::open_existing(&dir) {
+        runtime.replace_event_sink(Arc::new(recursive::SessionPersistenceSink::new(Arc::new(
+            Mutex::new(writer),
+        ))));
+    }
+    Some(id.to_string())
+}
+
+/// Create + bind a new session for `user_id` and reset the runtime onto it.
+#[cfg(feature = "weixin")]
+fn start_fresh_weixin_session(
+    runtime: &mut recursive::AgentRuntime,
+    config: &recursive::config::Config,
+    workspace: &std::path::Path,
+    user_id: &str,
+    first_message: &str,
+) -> Option<String> {
+    use std::sync::{Arc, Mutex};
+
+    runtime.set_transcript(Vec::new());
+    let writer = match recursive::weixin::WeixinSessionMap::create_bound_session(
+        workspace,
+        user_id,
+        first_message,
+        &config.model,
+        &config.provider_type,
+        config.preset.as_deref(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("WeChat: could not create a session: {e}");
+            return None;
+        }
+    };
+    let id = writer.session_id().to_string();
+    runtime.set_session_id(id.clone());
+    runtime.replace_event_sink(Arc::new(recursive::SessionPersistenceSink::new(Arc::new(
+        Mutex::new(writer),
+    ))));
+    Some(id)
 }
 
 /// Await the next WeChat request, or `None` when the daemon must stop.
@@ -3385,6 +3506,7 @@ mod tests {
                 recursive::weixin::WeixinRequest {
                     user_id: "u".into(),
                     text: text.into(),
+                    session_id: None,
                     reply_tx,
                 },
                 reply_rx,

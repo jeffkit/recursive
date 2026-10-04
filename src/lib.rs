@@ -47,6 +47,7 @@ pub mod memory;
 pub mod message;
 pub mod migrate;
 pub mod multi;
+pub mod notify;
 pub mod paths;
 pub mod permissions;
 pub mod providers;
@@ -67,6 +68,7 @@ pub(crate) mod team;
 pub mod tool_set_provider;
 pub mod tools;
 pub mod transcript;
+pub mod triggers;
 #[cfg(feature = "weixin")]
 pub mod weixin;
 

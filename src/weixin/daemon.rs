@@ -2,8 +2,9 @@
 //!
 //! [`WeixinDaemon`] manages a single iLink connection and exposes a
 //! [`WeixinRequest`] channel that the agent backend (TUI or headless) listens
-//! on. Incoming WeChat messages are parsed as commands or forwarded to the
-//! current session's runtime.
+//! on. Incoming WeChat messages are parsed as commands (operating on the
+//! sender's own session binding — see [`super::session_map`]) or forwarded
+//! to the backend worker as agent turns.
 //!
 //! # Lifecycle
 //!
@@ -24,6 +25,9 @@ use tracing::{debug, error, info, warn};
 use wechatbot::{BotOptions, WeChatBot};
 
 use super::commands::{parse_command, WeixinCommand, HELP_TEXT};
+use super::session_map::{
+    render_session_tail, render_sessions_list, resolve_change, WeixinSessionMap,
+};
 
 // ---------------------------------------------------------------------------
 // WeixinRequest
@@ -38,6 +42,12 @@ pub struct WeixinRequest {
     pub user_id: String,
     /// The message text to pass to the agent.
     pub text: String,
+    /// The session the sender is currently bound to (`None` = no binding:
+    /// the backend starts a fresh conversation and binds it). Read from
+    /// [`WeixinSessionMap`] when the message is forwarded, so `/c N` and
+    /// `/r` take effect on the next message — that is what the command
+    /// help promises.
+    pub session_id: Option<String>,
     /// Channel for the backend to return the agent's response.
     pub reply_tx: oneshot::Sender<Option<String>>,
 }
@@ -159,23 +169,34 @@ impl WeixinDaemon {
 
         // Spawn the message processor.
         let bot_proc = Arc::clone(&bot);
-        let req_tx_proc = req_tx.clone();
         tokio::spawn(async move {
             while let Some(incoming) = raw_rx.recv().await {
                 let preview: String = incoming.text.chars().take(80).collect();
                 debug!("WeChat message from {}: {}", incoming.user_id, preview);
 
                 if let Some(cmd) = parse_command(&incoming.text) {
-                    handle_command(cmd, &bot_proc, &incoming, &workspace, &req_tx_proc).await;
+                    handle_command(cmd, &bot_proc, &incoming, &workspace).await;
                 } else {
-                    // Regular message — forward to backend worker.
+                    // Regular message — forward to backend worker together
+                    // with the sender's current binding, so `/c N` / `/r`
+                    // are honoured on the message path.
                     let (reply_tx, reply_rx) = oneshot::channel();
+                    let session_id = match WeixinSessionMap::for_workspace(&workspace)
+                        .session_of(&incoming.user_id)
+                    {
+                        Ok(binding) => binding,
+                        Err(e) => {
+                            warn!("WeChat: session map read failed: {e}");
+                            None
+                        }
+                    };
                     let req = WeixinRequest {
                         user_id: incoming.user_id.clone(),
                         text: incoming.text.clone(),
+                        session_id,
                         reply_tx,
                     };
-                    if req_tx_proc.send(req).is_err() {
+                    if req_tx.send(req).is_err() {
                         warn!("WeChat: backend worker channel closed");
                         break;
                     }
@@ -217,84 +238,52 @@ async fn handle_command(
     bot: &Arc<WeChatBot>,
     incoming: &RawIncoming,
     workspace: &std::path::Path,
-    _req_tx: &mpsc::UnboundedSender<WeixinRequest>,
 ) {
+    let map = WeixinSessionMap::for_workspace(workspace);
     let reply = match cmd {
         WeixinCommand::Help => HELP_TEXT.to_string(),
 
-        WeixinCommand::Sessions => list_sessions(workspace),
+        // /s — numbered list; each user's own binding is NOT consulted
+        // here (the list is workspace-global, like `recursive resume`).
+        WeixinCommand::Sessions => render_sessions_list(workspace),
 
-        WeixinCommand::List { count } => {
-            // Session history listing is handled by the backend via a
-            // dedicated control command.  For now, inform the user.
-            format!("最近 {count} 条对话记录查询正在开发中，请使用 TUI 查看完整历史。")
-        }
+        // /list N — the caller's own session's last N turns.
+        WeixinCommand::List { count } => match map.session_of(&incoming.user_id) {
+            Ok(Some(session_id)) => render_session_tail(workspace, &session_id, count),
+            Ok(None) => {
+                "你还没有会话。发送任意消息开始对话，或 /s 查看工作区会话列表。".to_string()
+            }
+            Err(e) => {
+                warn!("WeChat /list: session map error: {e}");
+                "读取会话绑定失败，请稍后重试。".to_string()
+            }
+        },
 
-        WeixinCommand::Change { index } => {
-            format!("切换会话功能即将到来。当前仅支持单会话模式。(要切到第 {index} 个会话)")
-        }
+        // /c N — rebind the caller to the Nth most-recent session.
+        WeixinCommand::Change { index } => match resolve_change(workspace, index) {
+            Ok(session_id) => match map.bind(&incoming.user_id, &session_id) {
+                Ok(()) => format!("✅ 已切换到会话 {session_id}。发送 /list 查看记录。"),
+                Err(e) => {
+                    warn!("WeChat /c: bind failed: {e}");
+                    "切换会话失败，请稍后重试。".to_string()
+                }
+            },
+            Err(msg) => msg,
+        },
 
-        WeixinCommand::Reset => {
-            // Reset is handled by the backend; send a special marker message.
-            // For now just acknowledge.
-            "🔄 会话重置功能即将到来。".to_string()
-        }
+        // /r — drop the caller's binding; next message starts fresh.
+        WeixinCommand::Reset => match map.unbind(&incoming.user_id) {
+            Ok(true) => "🔄 已重置你的会话，下一条消息将开始新对话。".to_string(),
+            Ok(false) => "你当前没有会话绑定。".to_string(),
+            Err(e) => {
+                warn!("WeChat /r: unbind failed: {e}");
+                "重置失败，请稍后重试。".to_string()
+            }
+        },
     };
 
     if let Err(e) = bot.send(&incoming.user_id, &reply).await {
         error!("WeChat command reply failed: {e}");
-    }
-}
-
-fn list_sessions(workspace: &std::path::Path) -> String {
-    let sessions_dir = match crate::paths::user_workspace_dir(workspace) {
-        Ok(d) => d.join("sessions"),
-        Err(_) => return "暂无会话记录。".to_string(),
-    };
-    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
-        return "暂无会话记录。".to_string();
-    };
-
-    let mut sessions: Vec<(std::time::SystemTime, String)> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            let name = e.file_name().to_string_lossy().to_string();
-            Some((modified, name))
-        })
-        .collect();
-
-    sessions.sort_by_key(|s: &(std::time::SystemTime, String)| std::cmp::Reverse(s.0));
-    sessions.truncate(10);
-
-    if sessions.is_empty() {
-        return "暂无会话记录。".to_string();
-    }
-
-    let mut lines = vec!["📋 工作区会话列表：".to_string()];
-    for (i, (modified, id)) in sessions.iter().enumerate() {
-        let ago = format_elapsed(*modified);
-        let short_id = if id.len() > 12 { &id[..12] } else { id };
-        lines.push(format!("[{}] {} ({})", i + 1, short_id, ago));
-    }
-    lines.push("\n发送 /c N 切换会话".to_string());
-    lines.join("\n")
-}
-
-fn format_elapsed(modified: std::time::SystemTime) -> String {
-    let Ok(elapsed) = modified.elapsed() else {
-        return "未知".to_string();
-    };
-    let secs = elapsed.as_secs();
-    if secs < 60 {
-        format!("{secs}秒前")
-    } else if secs < 3600 {
-        format!("{}分钟前", secs / 60)
-    } else if secs < 86400 {
-        format!("{}小时前", secs / 3600)
-    } else {
-        format!("{}天前", secs / 86400)
     }
 }
 

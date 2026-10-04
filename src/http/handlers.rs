@@ -1272,9 +1272,31 @@ pub(super) async fn send_session_message(
         .map(|m| m.content.clone())
         .unwrap_or_default();
 
+    // Issue #105: optional outbound delivery of this turn's result.
+    // Fire-and-forget from the turn's perspective: a delivery failure is
+    // reported via `notify_result`, never as a failed request (the agent
+    // work already happened).
+    let notify_result = match &body.notify {
+        Some(target) => {
+            let payload = crate::notify::NotifyPayload {
+                session_id: &id,
+                source: "session:message",
+                finish_reason: &outcome.finish_reason.to_string(),
+                final_text: Some(&last_assistant),
+            };
+            Some(crate::notify::notify_best_effort(
+                &crate::notify::HttpNotifier::new(),
+                target,
+                &payload,
+            ))
+        }
+        None => None,
+    };
+
     Ok(Json(SessionMessageResponse {
         role: "assistant".into(),
         content: last_assistant,
+        notify_result,
     }))
 }
 

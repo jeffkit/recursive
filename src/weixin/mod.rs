@@ -14,15 +14,20 @@
 //! 3. **Headless daemon** (`recursive weixin-daemon`): Agent runs without a
 //!    TUI, driven entirely by WeChat messages.
 //!
-//! # Session multiplexer
+//! # Session multiplexer (issue #105 §3)
 //!
-//! A single WeChat account is shared across all sessions. Users can:
-//! - `/l`  — list last 10 turns of the current session
-//! - `/s`  — list all sessions in the workspace
-//! - `/c N`— switch to session N
-//! - `/r`  — reset current session (start fresh)
+//! Every WeChat user gets their own session binding, persisted across
+//! daemon restarts (`weixin_sessions.json` under the workspace user dir —
+//! see [`session_map`]). Control commands operate on the caller's
+//! binding:
+//! - `/l [N]` — last N turns of **your** session
+//! - `/s`     — list workspace sessions (numbered, `/c`-compatible)
+//! - `/c N`   — rebind yourself to session N
+//! - `/r`     — drop your binding; next message starts a fresh session
 
 pub mod commands;
 pub mod daemon;
+pub mod session_map;
 
 pub use daemon::{WeixinDaemon, WeixinDaemonOptions, WeixinRequest};
+pub use session_map::WeixinSessionMap;

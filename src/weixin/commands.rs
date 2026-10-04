@@ -51,10 +51,10 @@ pub fn parse_command(text: &str) -> Option<WeixinCommand> {
 /// Help text sent back to the WeChat user.
 pub const HELP_TEXT: &str = "\
 📱 Recursive WeChat 命令：
-/l [N]    — 列出最近 N 条对话（默认10条）
-/s        — 列出所有会话
-/c N      — 切换到第 N 个会话
-/r        — 重置当前会话（清空上下文）
+/l [N]    — 查看你会话的最近 N 条对话（默认10条）
+/s        — 列出工作区所有会话
+/c N      — 切换到第 N 个会话（每人独立绑定）
+/r        — 重置你的会话（下一条消息开始新对话）
 /help     — 显示此帮助
 
 发送普通消息与 Agent 对话。";
