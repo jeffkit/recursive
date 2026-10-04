@@ -3122,24 +3122,39 @@ async fn run_weixin_headless_daemon(
     )
     .await?;
 
-    // The binding the runtime currently holds (`None` = a fresh, unbound
-    // conversation). Compared against each request's binding to decide
-    // whether the transcript must be switched.
+    // The binding the runtime currently holds, plus whether a switch has
+    // happened at all. Two variables rather than `Option<Option<String>>`
+    // because the "never switched" state must stay distinct from "switched
+    // to the unbound/fresh state": a first-time user also arrives with
+    // `session_id == None`, so with a bare `Option<String>` their `None`
+    // compares equal to the initial value and `switch_weixin_session` — the
+    // only place outside `/c` that creates a binding — never runs. Their
+    // conversation would then be neither bound nor persisted.
+    let mut switched = false;
     let mut active_session: Option<String> = None;
 
     while let Some(req) = next_weixin_request(&mut weixin_req_rx, &shutdown).await {
         info!("WeChat: processing message from {}", req.user_id);
         // The daemon forwards the sender's binding; a change (`/c N`, `/r`)
         // points this runtime at the right conversation before the turn.
-        if req.session_id != active_session {
-            active_session = switch_weixin_session(
+        if !switched || req.session_id != active_session {
+            match switch_weixin_session(
                 &mut runtime,
                 &config,
                 &workspace,
                 &req.user_id,
                 req.session_id.as_deref(),
                 &req.text,
-            );
+            ) {
+                Some(bound) => {
+                    active_session = Some(bound);
+                    switched = true;
+                }
+                // No session could be created: leave `switched` false so the
+                // next message retries instead of reusing whatever transcript
+                // the runtime happens to hold.
+                None => switched = false,
+            }
         }
         match runtime.enqueue(&req.text).await {
             Ok(Some(outcome)) => {
@@ -3168,7 +3183,9 @@ async fn run_weixin_headless_daemon(
 /// `/c N` rebinds the user, so the next message must *resume* session N,
 /// and `/r` unbinds them, so the next message must start fresh. Returns the
 /// binding the runtime is now on (`Some(id)`), which the caller caches to
-/// avoid reloading on every message.
+/// avoid reloading on every message; `None` means the switch did not happen
+/// (no session could be created), which the caller must *not* cache — it
+/// retries on the next message.
 ///
 /// The fresh case creates a real on-disk session and binds the user to it,
 /// so the new conversation is durable and `/l` can read it back.
@@ -3196,12 +3213,25 @@ fn switch_weixin_session(
     });
     runtime.set_transcript(seed);
     runtime.set_session_id(id);
-    // Append to the resumed session when its lock is free (a session held
-    // by a live TUI/CLI cannot be appended to — degrade to in-memory).
-    if let Ok(writer) = recursive::session::SessionWriter::open_existing(&dir) {
-        runtime.replace_event_sink(Arc::new(recursive::SessionPersistenceSink::new(Arc::new(
-            Mutex::new(writer),
-        ))));
+    // Append to the resumed session when its lock is free; a session held by
+    // a live TUI/CLI cannot be appended to, so that case degrades to
+    // in-memory — which requires *detaching* the previous session's sink.
+    // Leaving it attached would append this session's turns to the previous
+    // session's `transcript.jsonl` while the runtime's context is this one's.
+    match recursive::session::SessionWriter::open_existing(&dir) {
+        Ok(writer) => {
+            runtime.replace_event_sink(Arc::new(recursive::SessionPersistenceSink::new(Arc::new(
+                Mutex::new(writer),
+            ))));
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "WeChat: cannot append to session; continuing in-memory"
+            );
+            runtime.replace_event_sink(Arc::new(recursive::NullSink));
+        }
     }
     Some(id.to_string())
 }
@@ -3218,6 +3248,10 @@ fn start_fresh_weixin_session(
     use std::sync::{Arc, Mutex};
 
     runtime.set_transcript(Vec::new());
+    // Detach the previous session's sink *before* the new one is known: if
+    // creation fails we return early, and a still-attached old sink would
+    // append this conversation's turns to the previous session.
+    runtime.replace_event_sink(Arc::new(recursive::NullSink));
     let writer = match recursive::weixin::WeixinSessionMap::create_bound_session(
         workspace,
         user_id,
