@@ -2220,6 +2220,32 @@ async fn run_loop(
     );
     let prompt_segments = assembled.segments;
 
+    // Issue #99: a wakeup armed by a previous process is persisted in that
+    // session's directory together with its due time. Restore an overdue one
+    // as this loop's first goal instead of letting the restart silently drop
+    // it. A not-yet-due record is deliberately left alone — the operator just
+    // started this loop and must not be parked until the old wakeup time.
+    // Only a session-recording loop takes part: `--no-session` has no
+    // directory to persist into, and restoring would *delete* another
+    // session's record while being unable to carry it forward.
+    let now_ms = recursive::tasks::wakeup_store::now_ms();
+    let goal = if session_writer.is_some() {
+        match recursive::tasks::wakeup_store::take_due_in_workspace(&config.workspace, now_ms) {
+            Some((dir, pending)) => {
+                eprintln!(
+                    "loop: restoring overdue wakeup from {} (reason: {}, {}s past due)",
+                    dir.display(),
+                    pending.reason,
+                    pending.overdue_ms(now_ms) / 1000,
+                );
+                pending.restored_goal(&goal)
+            }
+            None => goal,
+        }
+    } else {
+        goal
+    };
+
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
@@ -2242,10 +2268,24 @@ async fn run_loop(
     if let Some(sink) = event_sink {
         builder = builder.event_sink(sink);
     }
+    // Issue #99: persist the pending wakeup into this loop's session
+    // directory, so a process that dies (or is upgraded) mid-wait can be
+    // resumed by the next start. `--no-session` has no directory and keeps
+    // the previous in-memory-only behaviour.
+    if let Some(w) = session_writer.as_ref() {
+        let dir = w
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session_dir()
+            .to_path_buf();
+        builder = builder.wakeup_store_dir(dir);
+    }
     let mut runtime = builder.build().map_err(Into::<anyhow::Error>::into)?;
 
-    // `runtime.run_loop` `?`-propagates a mid-loop error (e.g. provider 404
-    // on a wakeup turn). We must NOT let that skip session finalization —
+    // `runtime.run_loop` `?`-propagates a mid-loop error — a non-retryable
+    // failure (e.g. provider 404 on a wakeup turn), or a transient one that
+    // exhausted the loop's retry budget (issue #99). We must NOT let that skip
+    // session finalization —
     // the turns that DID complete already appended to transcript.jsonl, and
     // leaving the session `active` makes it look unresumable. So capture the
     // error, finalize the writer as `Crashed`, then propagate. Mirrors the

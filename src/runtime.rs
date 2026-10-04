@@ -44,6 +44,10 @@ pub use builder::AgentRuntimeBuilder;
 mod checkpoint;
 pub(crate) use checkpoint::CheckpointState;
 
+// Issue #99: bounded exponential-backoff retry for a failed loop turn.
+mod loop_retry;
+pub use loop_retry::LoopRetryPolicy;
+
 // Goal-393: frontend-neutral context-management assembly (compactor /
 // microcompactor / transcript cap), shared by the CLI and HTTP builders.
 mod context_management;
@@ -212,6 +216,14 @@ pub struct AgentRuntime {
     /// recompaction chains (compacting again within a few turns of the
     /// previous compaction). `None` when no compaction has occurred yet.
     last_compact_turn: Option<u32>,
+    /// Issue #99: retry budget for a loop turn that failed with a transient
+    /// error (see [`LoopRetryPolicy`]). Only `run_loop` uses it.
+    loop_retry: LoopRetryPolicy,
+    /// Issue #99: session directory the pending wakeup is persisted into, so
+    /// a restart can restore it instead of dropping it. `None` disables
+    /// persistence (no session recording, or a host that keeps loop state in
+    /// memory only). Set via [`AgentRuntimeBuilder::wakeup_store_dir`].
+    wakeup_store_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -286,8 +298,8 @@ impl AgentRuntime {
         });
         self.append_user_message(&user_text).await;
 
-        let turn_outcome = match self.execute_kernel_turn().await {
-            Ok(outcome) => outcome,
+        match self.drive_turn().await {
+            Ok(outcome) => Ok(outcome),
             Err(e) if is_context_window_exceeded(&e) => {
                 // The LLM rejected the request because the transcript exceeded its
                 // context window.  Try to compact in-place (bypassing the normal
@@ -300,13 +312,26 @@ impl AgentRuntime {
                     "context window exceeded; attempting emergency compaction before retry"
                 );
                 if self.compact_on_overflow().await? {
-                    self.execute_kernel_turn().await?
+                    self.drive_turn().await
                 } else {
-                    return Err(e);
+                    Err(e)
                 }
             }
-            Err(e) => return Err(e),
-        };
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Execute the turn already staged in the transcript, then do the
+    /// post-turn bookkeeping: emit the turn's messages, run cross-turn
+    /// compaction, and advance the turn counter.
+    ///
+    /// Split out of [`run`](AgentRuntime::run) for issue #99 so a loop-level
+    /// retry can re-drive a failed turn *without* appending the user message a
+    /// second time. A failed kernel turn leaves the transcript at the point it
+    /// stopped (`execute_kernel_turn` folds the attempt's committed messages
+    /// back in), so the re-drive resumes there rather than starting over.
+    async fn drive_turn(&mut self) -> Result<RuntimeOutcome> {
+        let turn_outcome = self.execute_kernel_turn().await?;
         self.emit_turn_messages(&turn_outcome).await;
         // Goal 289: cross-turn compaction runs AFTER the turn so the
         // threshold check sees the full turn's growth (user + assistant +
@@ -656,20 +681,30 @@ impl AgentRuntime {
     /// Spawns a forwarder task that withholds `TurnFinished` until after all
     /// assistant/tool `MessageAppended` events have been emitted (prevents SDK
     /// consumers from closing their stream before receiving the final text).
+    /// The forwarder also returns the messages it saw appended, which a failed
+    /// kernel turn folds back into the transcript (see below).
     async fn execute_kernel_turn(&mut self) -> Result<crate::kernel::TurnOutcome> {
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::event::AgentEvent>();
         let sink = self.event_sink.clone();
         let forwarder = tokio::spawn(async move {
             let mut deferred_finished: Option<crate::event::AgentEvent> = None;
+            let mut committed: Vec<Message> = Vec::new();
             while let Some(ev) = event_rx.recv().await {
-                if matches!(ev, AgentEvent::TurnFinished { .. }) {
-                    deferred_finished = Some(ev);
-                    continue;
+                match &ev {
+                    AgentEvent::TurnFinished { .. } => {
+                        deferred_finished = Some(ev);
+                        continue;
+                    }
+                    AgentEvent::MessageAppended { message, .. }
+                    | AgentEvent::MessageAppendedWithAudit { message, .. } => {
+                        committed.push(message.clone());
+                    }
+                    _ => {}
                 }
                 sink.emit(ev).await;
             }
-            deferred_finished
+            (deferred_finished, committed)
         });
 
         let ctx = TurnContext {
@@ -689,14 +724,34 @@ impl AgentRuntime {
             wall_timeout_secs: self.kernel.wall_timeout_secs,
         };
 
-        let turn_outcome = self.kernel.run(ctx).await?;
+        let turn_outcome = self.kernel.run(ctx).await;
         drop(event_tx);
         // Wait for forwarder; stash the deferred TurnFinished for emit_turn_messages.
-        self.deferred_turn_finished = match forwarder.await {
+        let (deferred_finished, committed) = match forwarder.await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("forwarder task panicked, TurnFinished will be synthesized: {e}");
-                None
+                (None, Vec::new())
+            }
+        };
+        self.deferred_turn_finished = deferred_finished;
+        let turn_outcome = match turn_outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Issue #99: the kernel runs on a copy-on-write clone of the
+                // transcript, so a failed turn's already-committed messages
+                // never reached it — even though `RunCore` persisted them at
+                // push time (`transcript.jsonl` already has them). Fold them
+                // back so the canonical transcript matches what is on disk and
+                // a loop retry resumes at the step that failed instead of
+                // re-running the turn's tools.
+                //
+                // A kernel failure always happens while dispatching the LLM
+                // call for a step, i.e. before that step's assistant message is
+                // pushed, so the fold can never end mid-way through a
+                // tool_call/tool_result pair (invariant #8).
+                Arc::make_mut(&mut self.transcript).extend(committed);
+                return Err(e);
             }
         };
         Ok(turn_outcome)
@@ -1372,6 +1427,21 @@ impl AgentRuntime {
     ///
     /// The `wakeup_slot` should be the same slot registered with the
     /// `ScheduleWakeup` tool in the agent's tool registry.
+    ///
+    /// Issue #99 — the loop survives two things it used to die of:
+    ///
+    /// - **Restart.** When a wakeup store directory is configured (see
+    ///   `AgentRuntimeBuilder::wakeup_store_dir`), the pending wakeup is
+    ///   written to disk (with its due time) before the sleep and cleared as
+    ///   soon as it fires (and again when the loop ends), so an
+    ///   upgraded/restarted process can restore a record whose due time has
+    ///   passed ([`crate::tasks::wakeup_store`]).
+    /// - **A single failed turn.** A turn whose failure left no assistant
+    ///   output is re-driven under [`LoopRetryPolicy`] backoff instead of
+    ///   ending the whole loop. The re-drive resumes from the failed step
+    ///   because `execute_kernel_turn` folds the attempt's committed messages
+    ///   back into the transcript; a turn that already answered is never
+    ///   replayed (`AgentRuntime::retry_is_safe`).
     pub async fn run_loop(
         &mut self,
         initial_goal: impl Into<String>,
@@ -1381,7 +1451,15 @@ impl AgentRuntime {
         let mut next_goal = initial_goal.into();
 
         loop {
-            let outcome = self.run(&next_goal).await?;
+            let outcome = match self.run_turn_with_retry(&next_goal).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // The loop is over — leaving a pending record behind would
+                    // resurrect a finished loop on the next start.
+                    self.clear_pending_wakeup();
+                    return Err(e);
+                }
+            };
             outcomes.push(outcome);
 
             // Check if the agent scheduled a wakeup
@@ -1389,13 +1467,112 @@ impl AgentRuntime {
 
             match wakeup {
                 Some(req) => {
+                    self.persist_pending_wakeup(&req);
                     tokio::time::sleep(req.delay).await;
+                    // The wakeup just fired: the request is this turn's goal
+                    // now, not a pending record. Leaving it on disk (due time
+                    // in the past) for the whole turn would let another loop in
+                    // the same workspace steal it. A crash during the turn is
+                    // recoverable — the transcript holds the goal.
+                    self.clear_pending_wakeup();
                     next_goal = req.prompt;
                 }
-                None => break,
+                None => {
+                    self.clear_pending_wakeup();
+                    break;
+                }
             }
         }
         Ok(outcomes)
+    }
+
+    /// Run one loop turn, retrying a transient failure with exponential
+    /// backoff (issue #99).
+    ///
+    /// Only a turn that is safe to replay is retried (`retry_is_safe`); the
+    /// replay goes through `drive_turn` because `run` already appended the
+    /// goal, and appending it again would double the prompt in the transcript.
+    async fn run_turn_with_retry(&mut self, goal: &str) -> Result<RuntimeOutcome> {
+        let mut result = self.run(goal).await;
+        let mut attempt = 0usize;
+        loop {
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) => {
+                    if !LoopRetryPolicy::is_retryable(&err) || !self.retry_is_safe() {
+                        return Err(err);
+                    }
+                    let Some(backoff) = self.loop_retry.backoff_for(attempt) else {
+                        return Err(err);
+                    };
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        max_retries = self.loop_retry.max_retries,
+                        backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                        error = %err,
+                        "loop turn failed; retrying after backoff"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+            result = self.drive_turn().await;
+        }
+    }
+
+    /// Whether replaying the current turn can duplicate work.
+    ///
+    /// A replay is safe unless the turn already produced its final answer:
+    /// `execute_kernel_turn` folds a failed attempt's committed messages back
+    /// into the transcript, so the tail is the *resume point* — the staged
+    /// prompt, a tool result, or an injected system note — and re-driving the
+    /// turn re-issues only the LLM call that failed, never a tool that already
+    /// ran. An assistant tail means the turn ended and the failure came from
+    /// post-turn bookkeeping; replaying that would append a second answer for
+    /// work that is already recorded.
+    fn retry_is_safe(&self) -> bool {
+        !matches!(
+            self.transcript.last().map(|m| m.role),
+            None | Some(crate::message::Role::Assistant)
+        )
+    }
+
+    /// Write the pending wakeup to the session directory so a restart can
+    /// restore it. Best-effort: a full disk must not end a healthy loop — the
+    /// in-memory loop continues either way.
+    fn persist_pending_wakeup(&self, req: &crate::tools::WakeupRequest) {
+        let Some(dir) = self.wakeup_store_dir.as_deref() else {
+            return;
+        };
+        let record = crate::tasks::wakeup_store::PersistedWakeup::new(
+            req.reason.clone(),
+            req.prompt.clone(),
+            req.delay,
+            crate::tasks::wakeup_store::now_ms(),
+        );
+        if let Err(e) = crate::tasks::wakeup_store::persist(dir, &record) {
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "could not persist pending wakeup; a restart will drop it"
+            );
+        }
+    }
+
+    /// Drop the session's pending wakeup record (no-op when persistence is
+    /// disabled). Best-effort, for the same reason as
+    /// [`Self::persist_pending_wakeup`].
+    fn clear_pending_wakeup(&self) {
+        let Some(dir) = self.wakeup_store_dir.as_deref() else {
+            return;
+        };
+        if let Err(e) = crate::tasks::wakeup_store::clear(dir) {
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "could not clear pending wakeup record"
+            );
+        }
     }
 
     /// Run a loop with background job awareness.

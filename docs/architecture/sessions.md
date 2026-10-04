@@ -23,7 +23,8 @@ Every agent run is a session. Sessions are persisted to disk so:
 └── sessions/<session-id>/
     ├── .meta.json               ← session metadata
     ├── transcript.jsonl         ← one message per line
-    └── cost.json                ← token usage and cost
+    ├── cost.json                ← token usage and cost
+    └── wakeup.jsonl             ← pending loop wakeup (issue #99), if any
 ```
 
 Session ID format: `<ISO8601-start>-<workspace-slug>` (e.g. `2026-05-28T03:41:37Z-...`)
@@ -63,6 +64,23 @@ provider with HTTP 400.
 `AgentRuntime` can reload a previous session's transcript and continue from
 where it left off. The self-improve flow's auto-resume step checks that a
 saved transcript exists before attempting resume.
+
+## Loop wakeups (issue #99)
+
+`recursive loop` arms its next turn with `schedule_wakeup`. The pending request
+is persisted to `wakeup.jsonl` in the active session directory — one JSON line
+with `reason`, `prompt`, `scheduled_at_ms`, `due_at_ms` — before the loop
+sleeps, and removed as soon as the wakeup fires (the request is the following
+turn's goal then, not a pending record) and again when the loop ends. A process
+that starts later scans the workspace's session directories for a record whose
+due time has passed and restores it as the loop's first goal; a record that is
+not yet due is left alone (and stays on disk) rather than blocking the operator
+until the original wakeup time. The scan skips session directories whose
+`.lock` is held by a live process, so a running loop's record is never stolen
+by another loop started in the same workspace. Restoration consumes the record,
+so a second restart cannot replay it. Loops started with `--no-session` have no
+directory to write to, keep the previous in-memory-only behaviour, and do not
+consume another session's record.
 
 ## Migration
 

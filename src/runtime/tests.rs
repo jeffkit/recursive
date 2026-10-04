@@ -2439,3 +2439,75 @@ fn runtime_builder_wall_timeout_defaults_to_zero() {
         .expect("runtime build");
     assert_eq!(runtime.kernel.wall_timeout_secs, 0);
 }
+
+// ── Issue #99: loop retry safety + wakeup-store wiring ─────────────────────
+
+#[tokio::test]
+async fn retry_is_safe_only_when_the_tail_can_be_re_dispatched() {
+    let mut rt = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .expect("runtime build");
+
+    assert!(!rt.retry_is_safe(), "an empty transcript is not replayable");
+
+    Arc::make_mut(&mut rt.transcript).push(Message::user("go"));
+    assert!(rt.retry_is_safe(), "a staged user prompt is replayable");
+
+    Arc::make_mut(&mut rt.transcript).push(Message::tool_result("c1", "output"));
+    assert!(
+        rt.retry_is_safe(),
+        "a tool-result tail is the failed attempt's resume point"
+    );
+
+    Arc::make_mut(&mut rt.transcript).push(Message::system("injected note"));
+    assert!(
+        rt.retry_is_safe(),
+        "an injected system note (skill / compaction summary) is replayable"
+    );
+
+    Arc::make_mut(&mut rt.transcript).push(Message::assistant("done"));
+    assert!(
+        !rt.retry_is_safe(),
+        "an assistant tail means the turn completed — replaying duplicates work"
+    );
+}
+
+#[test]
+fn runtime_builder_wires_the_loop_retry_policy_and_wakeup_store_dir() {
+    let dir = std::path::PathBuf::from("/tmp/recursive-issue-99-test-dir");
+    let policy = LoopRetryPolicy::new(
+        7,
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(9),
+    );
+    let rt = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .loop_retry(policy)
+        .wakeup_store_dir(&dir)
+        .build()
+        .expect("runtime build");
+
+    assert_eq!(rt.loop_retry, policy);
+    assert_eq!(rt.wakeup_store_dir.as_deref(), Some(dir.as_path()));
+}
+
+#[test]
+fn loop_retry_and_wakeup_store_dir_default_to_off_and_bounded() {
+    use crate::tools::WakeupRequest;
+    let rt = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .expect("runtime build");
+
+    assert_eq!(rt.loop_retry, LoopRetryPolicy::default());
+    assert!(rt.wakeup_store_dir.is_none());
+
+    // Persisting with no directory configured is a silent no-op.
+    rt.persist_pending_wakeup(&WakeupRequest {
+        delay: std::time::Duration::from_secs(1),
+        reason: "r".into(),
+        prompt: "p".into(),
+    });
+    rt.clear_pending_wakeup();
+}

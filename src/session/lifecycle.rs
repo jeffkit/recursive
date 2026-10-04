@@ -270,6 +270,26 @@ impl Drop for SessionLock {
     }
 }
 
+/// Whether session directory `dir` is currently held by a *live* process.
+///
+/// Mirrors the liveness half of [`SessionLock::acquire`]'s stale-lock
+/// recovery: no `.lock` (or an unparseable one) means free, a lock whose
+/// recorded pid is alive on this host means held, and a lock from another host
+/// counts as held because pid namespaces are not comparable.
+///
+/// Used by the loop-wakeup store to skip a session whose owner is still
+/// running: its pending record belongs to a live loop, not to whatever process
+/// is scanning ([`crate::tasks::wakeup_store::take_due_in_workspace`]).
+pub fn locked_by_live_process(dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join(SESSION_LOCK_FILE)) else {
+        return false;
+    };
+    match SentinelInfo::parse(&text) {
+        Some(existing) => existing.hostname != current_hostname() || is_pid_alive(existing.pid),
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UUID chain recovery
 // ---------------------------------------------------------------------------
@@ -432,6 +452,55 @@ mod tests {
         // kills mutations that replace current_hostname() body with ""
         let h = current_hostname();
         assert!(!h.is_empty(), "hostname must be non-empty");
+    }
+
+    #[test]
+    fn locked_by_live_process_follows_the_sentinel() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let session_dir = tmp.path().join("session-live");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let lock = session_dir.join(SESSION_LOCK_FILE);
+
+        assert!(!locked_by_live_process(&session_dir), "no sentinel = free");
+
+        let ours = SentinelInfo {
+            pid: std::process::id(),
+            hostname: current_hostname(),
+            started_at_unix: 0,
+        };
+        std::fs::write(&lock, ours.serialise()).unwrap();
+        assert!(
+            locked_by_live_process(&session_dir),
+            "own live pid holds it"
+        );
+
+        let dead = SentinelInfo {
+            pid: u32::MAX,
+            hostname: current_hostname(),
+            started_at_unix: 0,
+        };
+        std::fs::write(&lock, dead.serialise()).unwrap();
+        assert!(
+            !locked_by_live_process(&session_dir),
+            "a dead pid on our host is recoverable"
+        );
+
+        let cross = SentinelInfo {
+            pid: u32::MAX,
+            hostname: "definitely-not-our-host-123".to_string(),
+            started_at_unix: 0,
+        };
+        std::fs::write(&lock, cross.serialise()).unwrap();
+        assert!(
+            locked_by_live_process(&session_dir),
+            "another host's pids are not ours to judge"
+        );
+
+        std::fs::write(&lock, "garbage").unwrap();
+        assert!(
+            !locked_by_live_process(&session_dir),
+            "an unparseable sentinel is recoverable"
+        );
     }
 
     // -- SessionLock tests --------------------------------------------------

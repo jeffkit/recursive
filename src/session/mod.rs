@@ -29,7 +29,10 @@ use crate::llm::ToolSpec;
 use crate::message::Message;
 
 // Re-exports from sub-modules (keep the 8 `pub use` in lib.rs working)
-pub use lifecycle::{truncate_transcript_to_turn, SessionLock, SessionLockBusy, TruncateStats};
+pub use lifecycle::{
+    locked_by_live_process, truncate_transcript_to_turn, SessionLock, SessionLockBusy,
+    TruncateStats,
+};
 pub use orphan::OrphanToolCall;
 pub use reader::SessionReader;
 pub use serialize::{entry_to_message, LoadedEntry, TranscriptEntry};

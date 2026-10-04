@@ -54,6 +54,11 @@ pub struct AgentRuntimeBuilder {
     /// Goal-335: optional skill re-injector for post-compaction restoration
     /// of invoked skill bodies as System attachments.
     skill_reinjector: Option<crate::compact::SkillReinjector>,
+    /// Issue #99: retry policy for turns that fail inside `run_loop`.
+    loop_retry: crate::runtime::LoopRetryPolicy,
+    /// Issue #99: session directory that pending wakeups are persisted into
+    /// (and cleared from). `None` keeps loop/wakeup state in memory only.
+    wakeup_store_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -97,6 +102,8 @@ impl AgentRuntimeBuilder {
             prompt_segments: None,
             file_reinjector: None,
             skill_reinjector: None,
+            loop_retry: crate::runtime::LoopRetryPolicy::default(),
+            wakeup_store_dir: None,
         }
     }
 
@@ -324,6 +331,23 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Issue #99: override the retry budget `run_loop` uses for a turn that
+    /// failed with a transient error. Defaults to
+    /// [`crate::runtime::LoopRetryPolicy::default`].
+    pub fn loop_retry(mut self, policy: crate::runtime::LoopRetryPolicy) -> Self {
+        self.loop_retry = policy;
+        self
+    }
+
+    /// Issue #99: persist the pending wakeup into `dir` (normally the
+    /// session directory) so a restarted process can restore it instead of
+    /// silently dropping it. Callers without session recording simply leave
+    /// this unset.
+    pub fn wakeup_store_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.wakeup_store_dir = Some(dir.into());
+        self
+    }
+
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.
@@ -436,6 +460,8 @@ impl AgentRuntimeBuilder {
             plan_todo_reinjector,
             last_compact_turn: None,
             permission_hook: None,
+            loop_retry: self.loop_retry,
+            wakeup_store_dir: self.wakeup_store_dir,
         })
     }
 }

@@ -50,6 +50,7 @@ pub mod task_update;
 pub mod team_create;
 #[cfg(feature = "coordinator-mode")]
 pub mod team_delete;
+pub mod wakeup_store;
 pub mod watch_file;
 
 // ---------------------------------------------------------------------------
