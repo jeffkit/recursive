@@ -933,9 +933,9 @@ impl<'a> RunCore<'a> {
     /// (registered by `freeze_deferred_specs`) appears in the eager list and
     /// its results in the message history are serialized as `tool_reference`
     /// blocks by `serialize_messages_anthropic`.
-    /// Inject the skill catalog as a `<system-reminder>` user turn, appended
-    /// to the **tail** of the per-request message copy. See
-    /// `inject_skill_reminder` in `crate::agent::types` for rationale.
+    /// The skill catalog rides on the system message of the per-request copy
+    /// as a `<system-reminder>` block. See `inject_skill_reminder` in
+    /// `crate::agent::types` for rationale.
     async fn call_llm(
         &self,
         specs: &[crate::llm::ToolSpec],
@@ -972,10 +972,9 @@ impl<'a> RunCore<'a> {
                 (specs, &self.messages)
             };
 
-        // Ship the skill catalog per-turn as a tail-appended `system-reminder`
-        // (cache-friendly; see inject_skill_reminder doc).
-        let injected: Vec<crate::message::Message> =
-            crate::agent::types::inject_skill_reminder(messages, &self.globs_skills);
+        // Ship the skill catalog per-step as a `system-reminder` on the system
+        // message (fixed offset → prefix-cacheable; see inject_skill_reminder).
+        let injected = crate::agent::types::inject_skill_reminder(messages, &self.globs_skills);
 
         if let Some(ref tx) = stream_sender {
             let cancel_token = self.shutdown_token.clone();

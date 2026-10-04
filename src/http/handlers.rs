@@ -3342,8 +3342,8 @@ mod tests {
     // ── Goal-312: skill_index injection into system prompt ──────────
 
     /// Verify the skill catalog is produced as a `system-reminder` and is
-    /// NOT inlined into the static system prompt (it ships per-turn via
-    /// `skill_reminder`, keeping the `system` field cacheable).
+    /// NOT inlined into the static system prompt (it ships per-request via
+    /// `skill_reminder`, so a skill change never rewrites the transcript).
     #[test]
     fn skill_reminder_produced_and_not_inlined() {
         let skills = vec![crate::skills::Skill {

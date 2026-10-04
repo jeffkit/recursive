@@ -1153,14 +1153,14 @@ pub fn skill_index(skills: &[Skill]) -> String {
 /// Render the available-skills catalog as a `<system-reminder>` block.
 ///
 /// The skill list is volatile (skills load/unload, descriptions edit) and
-/// long, so it does NOT belong in the static `system` prompt — inlining it
-/// there breaks prefix-cache stability on every skill change. Instead we
-/// ship it per-turn as a `system-reminder` (placed in a user turn, which is
-/// how Anthropic expects it), budget-truncated and refreshed each turn. This
-/// mirrors how fake-cc delivers its skill catalog: the Skill tool's
-/// description only points at the reminder, the catalog itself lives
-/// out-of-system-prompt. Callers inject the returned string into the request
-/// (see `crate::run_core::call_llm`) without mutating the transcript.
+/// long, so it does NOT belong in the assembled *static* system prompt —
+/// inlining it there breaks prefix-cache stability on every skill change.
+/// Instead it is appended per-step to the system message of the per-request
+/// copy, budget-truncated and refreshed each step. This mirrors how fake-cc
+/// delivers its skill catalog: the Skill tool's description only points at the
+/// reminder, the catalog itself is not part of the assembled prompt. Callers
+/// inject the returned string into the request (see
+/// `crate::run_core::call_llm`) without mutating the transcript.
 pub fn skill_reminder(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
