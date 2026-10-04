@@ -12,9 +12,10 @@
 //! Two built-in carriers:
 //!
 //! - **Webhook** ([`NotifyTarget::Webhook`]) — HTTP POST the payload as
-//!   JSON. Optional HMAC-style secret: when set, a
-//!   `X-Recursive-Signature` header carries the BLAKE3 hex of
-//!   `secret + body` so the receiver can authenticate the caller.
+//!   JSON. Optional secret: when set, a `X-Recursive-Signature` header
+//!   carries `hex(blake3_keyed(blake3(secret), body))` so the receiver
+//!   can authenticate the caller (see [`webhook_signature`] for the one
+//!   authoritative formula).
 //! - **File** ([`NotifyTarget::File`]) — append the payload as a JSONL
 //!   line under a user-chosen path. The zero-infrastructure carrier for
 //!   local deployments and, more importantly, the test seam: every
@@ -39,8 +40,9 @@ pub enum NotifyTarget {
     /// POST the payload as JSON to `url`.
     Webhook {
         url: String,
-        /// When set, `X-Recursive-Signature: blake3(secret + body)` is
-        /// attached so the receiver can verify the caller.
+        /// When set, `X-Recursive-Signature` carries
+        /// `hex(blake3_keyed(blake3(secret), body))` so the receiver can
+        /// verify the caller (compute it with [`webhook_signature`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
     },

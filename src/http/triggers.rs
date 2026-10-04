@@ -79,8 +79,8 @@ pub struct TriggerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_result: Option<String>,
     pub enabled: bool,
-    /// Webhook fire URL, path only (`/webhooks/{id}?key=...`). Cron
-    /// triggers omit it.
+    /// Webhook fire path (`/webhooks/{id}`). Cron triggers omit it. The
+    /// keyed form (`?key=...`) is returned **once**, by the create call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_path: Option<String>,
 }
@@ -89,10 +89,10 @@ impl TriggerResponse {
     fn from_trigger(t: &Trigger) -> Self {
         let (cron, webhook_path) = match &t.spec {
             TriggerSpec::Cron { expr } => (Some(expr.clone()), None),
-            // (The webhook secret is never echoed in listings; the creator
-            // sees it once in the create response — they chose it or it
-            // was returned by this very call.)
-            TriggerSpec::Webhook { .. } => (None, Some(webhook_path(t))),
+            // Listing / get / patch never carry the secret, so the path
+            // they return is the keyless form; `create_trigger` re-adds
+            // both the secret and the keyed path to its own response.
+            TriggerSpec::Webhook { .. } => (None, Some(format!("/webhooks/{}", t.id))),
         };
         Self {
             id: t.id.clone(),
@@ -111,7 +111,9 @@ impl TriggerResponse {
     }
 }
 
-/// The webhook invocation URL (path + key query) for a trigger.
+/// The keyed webhook invocation URL (`/webhooks/{id}?key=...`). Only the
+/// create response carries this; every other response uses the keyless
+/// path from [`TriggerResponse::from_trigger`].
 fn webhook_path(t: &Trigger) -> String {
     let TriggerSpec::Webhook { secret } = &t.spec else {
         return String::new();
@@ -202,10 +204,12 @@ pub(super) async fn create_trigger(
     store(&state)
         .upsert(trigger.clone())
         .map_err(trigger_error)?;
-    // Echo the webhook secret ONCE in the create response.
+    // Echo the webhook secret ONCE in the create response, together with
+    // the keyed fire path the caller needs to configure its sender.
     let mut resp = TriggerResponse::from_trigger(&trigger);
     if let TriggerSpec::Webhook { secret } = &trigger.spec {
         resp.secret = Some(secret.clone());
+        resp.webhook_path = Some(webhook_path(&trigger));
     }
     tracing::info!(trigger_id = %trigger.id, kind = %trigger.spec.kind(), "trigger created");
     Ok((StatusCode::CREATED, Json(resp)))
@@ -571,8 +575,16 @@ pub fn spawn_trigger_scheduler(
         loop {
             interval.tick().await;
             let s = TriggerStore::for_workspace(&state.config.workspace);
-            let Ok(all) = s.load() else {
-                continue;
+            let all = match s.load() {
+                Ok(all) => all,
+                // Keep ticking (a transient read error must not kill the
+                // scheduler) but say so out loud: without this line a
+                // corrupt `triggers.json` looks like "my 9am run simply
+                // never happened".
+                Err(e) => {
+                    tracing::warn!(error = %e, "scheduler: cannot read trigger store; skipping tick");
+                    continue;
+                }
             };
             let now = crate::triggers::epoch_now();
             for trigger in all.iter().filter(|t| t.is_due(now)) {
@@ -774,7 +786,7 @@ pub fn trigger_openapi_schemas() -> serde_json::Map<String, serde_json::Value> {
                 "last_fired_at": { "type": "string" },
                 "last_result": { "type": "string" },
                 "enabled": { "type": "boolean" },
-                "webhook_path": { "type": "string", "description": "Relative fire URL including ?key= for secretless path building." }
+                "webhook_path": { "type": "string", "description": "Relative fire path (/webhooks/{id}). The create response instead carries the keyed form (/webhooks/{id}?key=...), which is the only place the secret is returned." }
             }
         }),
     );
@@ -786,16 +798,16 @@ pub fn trigger_openapi_schemas() -> serde_json::Map<String, serde_json::Value> {
                 {
                     "type": "object",
                     "properties": {
-                        "kind": { "const": "webhook" },
+                        "kind": { "type": "string", "enum": ["webhook"] },
                         "url": { "type": "string" },
-                        "secret": { "type": "string", "description": "When set, X-Recursive-Signature: blake3-keyed(secret, body) is attached." }
+                        "secret": { "type": "string", "description": "When set, X-Recursive-Signature carries hex(blake3_keyed(blake3(secret), body))." }
                     },
                     "required": ["kind", "url"]
                 },
                 {
                     "type": "object",
                     "properties": {
-                        "kind": { "const": "file" },
+                        "kind": { "type": "string", "enum": ["file"] },
                         "path": { "type": "string", "description": "JSONL sink under the server's user-data dir." }
                     },
                     "required": ["kind", "path"]
@@ -823,12 +835,11 @@ mod tests {
         );
         t.enabled = true;
         let resp = TriggerResponse::from_trigger(&t);
-        assert_eq!(
-            resp.webhook_path.as_deref(),
-            Some("/webhooks/trig-x?key=abc")
-        );
+        assert_eq!(resp.webhook_path.as_deref(), Some("/webhooks/trig-x"));
         assert!(resp.secret.is_none(), "listing must not echo the secret");
         assert_eq!(resp.kind, "webhook");
+        // The keyed form exists, but only the create response uses it.
+        assert_eq!(webhook_path(&t), "/webhooks/trig-x?key=abc");
 
         let cron = Trigger::new(
             "trig-c",

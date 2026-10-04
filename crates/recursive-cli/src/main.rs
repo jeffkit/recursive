@@ -912,28 +912,6 @@ async fn main() -> anyhow::Result<()> {
             // cron/webhook trigger stores derive from the same workspace).
             // One bind at startup; delivery and registration share it.
             recursive::notify::set_file_context(&config.workspace);
-            let state_for_scheduler = recursive::http::AppState {
-                tools: tool_infos.clone(),
-                tool_registry: tools.clone(),
-                config: config.clone(),
-                provider: provider.clone(),
-                host: std::sync::Arc::clone(&host),
-                event_channels: std::sync::Arc::new(tokio::sync::RwLock::new(
-                    std::collections::HashMap::new(),
-                )),
-                metrics: std::sync::Arc::clone(&metrics),
-                slash_commands: std::sync::Arc::new(slash_commands.clone()),
-                rate_limiter: recursive::http::rate_limiter_from_env(),
-                skills: skills.clone(),
-                storage: std::sync::Arc::clone(&storage),
-                agui_active_runs: std::sync::Arc::new(std::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                )),
-            };
-            recursive::http::triggers::spawn_trigger_scheduler(
-                std::sync::Arc::new(state_for_scheduler),
-                std::time::Duration::from_secs(30),
-            );
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -959,6 +937,13 @@ async fn main() -> anyhow::Result<()> {
             // Clone the state before consuming it for the router (both share the
             // same Arc-wrapped inner fields, so no actual data is duplicated).
             let reaper_state = std::sync::Arc::new(state.clone());
+            // Issue #105: the cron scheduler shares the same state (same
+            // Arc-wrapped fields), one `state.clone()` instead of a second
+            // 13-field literal that had to be kept in sync by hand.
+            recursive::http::triggers::spawn_trigger_scheduler(
+                std::sync::Arc::new(state.clone()),
+                Duration::from_secs(30),
+            );
             // Goal 396: keep a handle on the session map for the graceful
             // shutdown transcript flush below.
             let flush_state = std::sync::Arc::new(state.clone());

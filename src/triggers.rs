@@ -7,8 +7,12 @@
 //!
 //! - **Cron** ([`TriggerSpec::Cron`]) — a wall-clock schedule evaluated
 //!   against the persisted `next_fire_at` timestamp.
-//! - **Webhook** ([`TriggerSpec::Webhook`]) — a token endpoint; any HTTP
-//!   POST to `/webhooks/{id}?key=...` fires it.
+//! - **Webhook** ([`TriggerSpec::Webhook`]) — a token endpoint; an HTTP
+//!   POST to `/webhooks/{id}?key=...` fires it. The `?key=` secret is an
+//!   *additional* credential, not a replacement for the server's own
+//!   auth: the route lives on the protected router, so the request must
+//!   also carry the usual API key (unless the server runs with auth
+//!   disabled).
 //!
 //! # Persistence and delivery contract
 //!

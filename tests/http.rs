@@ -4803,33 +4803,19 @@ pub(crate) mod trigger_endpoints {
         (ws, state)
     }
 
-    /// Local re-implementation of the listing serialization contract:
-    /// secret absent, webhook_path present.
-    fn trigger_response_for_test(t: &Trigger) -> serde_json::Value {
-        let (cron, webhook_path) = match &t.spec {
-            TriggerSpec::Cron { expr } => (Some(expr.clone()), None),
-            TriggerSpec::Webhook { .. } => (
-                None,
-                Some(match &t.spec {
-                    TriggerSpec::Webhook { secret } if secret.is_empty() => {
-                        format!("/webhooks/{}", t.id)
-                    }
-                    TriggerSpec::Webhook { secret } => {
-                        format!("/webhooks/{}?key={}", t.id, secret)
-                    }
-                    _ => unreachable!(),
-                }),
-            ),
+    async fn get_json(app: axum::Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
         };
-        serde_json::json!({
-            "id": t.id,
-            "kind": t.spec.kind(),
-            "cron": cron,
-            "secret": serde_json::Value::Null,
-            "goal": t.goal,
-            "enabled": t.enabled,
-            "webhook_path": webhook_path,
-        })
+        (status, json)
     }
 
     async fn post_json(
@@ -4902,19 +4888,54 @@ pub(crate) mod trigger_endpoints {
         assert_eq!(status, 201);
         let secret = body["secret"].as_str().expect("secret echoed on create");
         assert_eq!(secret.len(), 32);
-        assert!(
-            body["webhook_path"].as_str().unwrap_or("").contains(secret),
-            "webhook_path must include the key: {body}"
+        let id = body["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            body["webhook_path"],
+            serde_json::json!(format!("/webhooks/{id}?key={secret}")),
+            "the create response must hand back a ready-to-use fire URL"
         );
-        // But the stored/listed form does NOT echo it.
+
+        // Every *later* read goes through the real handler and must carry
+        // neither the secret nor the key — asserted on the wire, not on a
+        // local re-implementation of the serializer.
+        let (status, list) = get_json(app.clone(), "/triggers").await;
+        assert_eq!(status, 200, "list: {list}");
+        let entry = list
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["id"] == id.as_str())
+            .expect("created trigger listed");
+        assert!(
+            entry["secret"].is_null(),
+            "listing must not echo the secret: {entry}"
+        );
+        assert_eq!(
+            entry["webhook_path"],
+            serde_json::json!(format!("/webhooks/{id}"))
+        );
+        assert!(
+            !entry["webhook_path"]
+                .as_str()
+                .unwrap_or("")
+                .contains(secret),
+            "listing must not leak the key: {entry}"
+        );
+
+        let (status, one) = get_json(app.clone(), &format!("/triggers/{id}")).await;
+        assert_eq!(status, 200, "get: {one}");
+        assert!(one["secret"].is_null(), "get must not echo the secret");
+        assert!(!one["webhook_path"].as_str().unwrap_or("").contains(secret));
+
+        // The stored spec still keeps the secret — verifying inbound
+        // calls is the whole point; only the responses omit it.
         let store = TriggerStore::for_workspace(ws.path());
-        let id = body["id"].as_str().unwrap().to_string();
-        let listed = store.get(&id).expect("get").expect("stored");
-        // The stored spec keeps the secret (needed to verify callers) but
-        // the serialized listing response must not carry it.
-        let resp = trigger_response_for_test(&listed);
-        assert!(resp["secret"].is_null(), "listing must not echo the secret");
-        assert_eq!(resp["webhook_path"], format!("/webhooks/{id}?key={secret}"));
+        let stored = store.get(&id).expect("get").expect("stored");
+        assert!(
+            matches!(&stored.spec, TriggerSpec::Webhook { secret: s } if s.as_str() == secret),
+            "stored trigger keeps the secret: {:?}",
+            stored.spec
+        );
     }
 
     #[tokio::test]
@@ -4996,8 +5017,6 @@ pub(crate) mod trigger_endpoints {
         assert!(ids.contains(&"trig-crud"));
 
         // PATCH enable.
-        let (status, patched) = post_json(app.clone(), "/triggers", serde_json::json!({})).await; // POST again on /triggers would create; use PATCH below instead.
-        let _ = (status, patched);
         let resp = app
             .clone()
             .oneshot(
