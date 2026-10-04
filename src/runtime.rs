@@ -1442,7 +1442,29 @@ impl AgentRuntime {
     ///   because `execute_kernel_turn` folds the attempt's committed messages
     ///   back into the transcript; a turn that already answered is never
     ///   replayed (`AgentRuntime::retry_is_safe`).
+    ///
+    /// Loop mode owns retry: `run_turn_with_retry` re-drives a failed turn
+    /// from the step it stopped at (the failed attempt's committed messages
+    /// are folded back into the transcript by `execute_kernel_turn`), so the
+    /// per-step retry (`RunCore::dispatch_llm_step_with_retry`, issue #100)
+    /// would only stack a second budget on the same transient failure — each
+    /// loop attempt would first burn the step budget, so a `LoopRetryPolicy`
+    /// of N retries would cost far more than N+1 LLM calls and the budget the
+    /// operator set would not be the one that applies. The inner layer is
+    /// therefore suppressed for the loop's lifetime; the provider's own
+    /// per-request retry is untouched.
     pub async fn run_loop(
+        &mut self,
+        initial_goal: impl Into<String>,
+        wakeup_slot: &crate::tools::WakeupSlot,
+    ) -> Result<Vec<RuntimeOutcome>> {
+        let saved_step_retry_max = std::mem::replace(&mut self.kernel.step_retry.max_retries, 0);
+        let result = self.run_loop_turns(initial_goal, wakeup_slot).await;
+        self.kernel.step_retry.max_retries = saved_step_retry_max;
+        result
+    }
+
+    async fn run_loop_turns(
         &mut self,
         initial_goal: impl Into<String>,
         wakeup_slot: &crate::tools::WakeupSlot,

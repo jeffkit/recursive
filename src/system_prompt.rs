@@ -253,9 +253,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let skills = vec![make_skill("pdf", "Manipulate PDF documents")];
         // The skill catalog must NOT be inlined into the static system
-        // prompt — it now ships per-turn as a `system-reminder` via
-        // `skill_reminder()`. This keeps the `system` field stable for
-        // prefix caching.
+        // prompt — it ships per-request as a `system-reminder` via
+        // `skill_reminder()`. This keeps the stored transcript stable when a
+        // skill is loaded or unloaded.
         let out = assemble_system_prompt("BASE", tmp.path(), &skills, false).into_full();
         assert!(!out.contains("Available skills"), "{out}");
         assert!(!out.contains("pdf"), "{out}");
