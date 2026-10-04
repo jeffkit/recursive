@@ -1510,12 +1510,22 @@ mod tests {
                     message: "boom".into(),
                 })
             }
+            async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+                Err(crate::error::Error::Storage {
+                    message: "boom".into(),
+                })
+            }
             async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
                 Err(crate::error::Error::Storage {
                     message: "boom".into(),
                 })
             }
             async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+                Err(crate::error::Error::Storage {
+                    message: "boom".into(),
+                })
+            }
+            async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
                 Err(crate::error::Error::Storage {
                     message: "boom".into(),
                 })

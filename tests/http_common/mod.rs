@@ -60,6 +60,16 @@ pub struct MemoryStorage {
     pub probe_sessions: Option<Arc<RwLock<HashMap<String, recursive::http::SessionState>>>>,
     /// Backing store for round-trip reads (session_id → jsonl lines).
     store: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    /// Named memory entries (per-session tombstones, shared memory, …).
+    memory: std::sync::Mutex<HashMap<String, String>>,
+    /// Sessions passed to `delete_transcript`, in call order.
+    pub deleted: std::sync::Mutex<Vec<String>>,
+    /// Requested retention windows passed to `purge_expired_sessions`.
+    pub purges: std::sync::Mutex<Vec<std::time::Duration>>,
+    /// Live-session ids passed alongside each retention window.
+    pub purge_keep: std::sync::Mutex<Vec<Vec<String>>>,
+    /// Value `purge_expired_sessions` reports (the number "removed").
+    pub purge_result: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryStorage {
@@ -78,6 +88,18 @@ impl MemoryStorage {
 
     pub fn saves(&self) -> Vec<SaveRecord> {
         self.saves.lock().unwrap().clone()
+    }
+
+    pub fn deleted(&self) -> Vec<String> {
+        self.deleted.lock().unwrap().clone()
+    }
+
+    pub fn purges(&self) -> Vec<std::time::Duration> {
+        self.purges.lock().unwrap().clone()
+    }
+
+    pub fn has_memory(&self, key: &str) -> bool {
+        self.memory.lock().unwrap().contains_key(key)
     }
 }
 
@@ -127,12 +149,39 @@ impl StorageBackend for MemoryStorage {
         Ok(())
     }
 
-    async fn load_memory(&self, _key: &str) -> recursive::error::Result<Option<String>> {
-        Ok(None)
+    async fn delete_transcript(&self, session_id: &str) -> recursive::error::Result<()> {
+        self.store.lock().unwrap().remove(session_id);
+        self.deleted.lock().unwrap().push(session_id.to_string());
+        Ok(())
     }
 
-    async fn save_memory(&self, _key: &str, _value: &str) -> recursive::error::Result<()> {
+    async fn load_memory(&self, key: &str) -> recursive::error::Result<Option<String>> {
+        Ok(self.memory.lock().unwrap().get(key).cloned())
+    }
+
+    async fn save_memory(&self, key: &str, value: &str) -> recursive::error::Result<()> {
+        self.memory
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
         Ok(())
+    }
+
+    async fn delete_memory(&self, key: &str) -> recursive::error::Result<()> {
+        self.memory.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn purge_expired_sessions(
+        &self,
+        max_age: std::time::Duration,
+        keep: &std::collections::HashSet<String>,
+    ) -> recursive::error::Result<usize> {
+        self.purges.lock().unwrap().push(max_age);
+        let mut keep: Vec<String> = keep.iter().cloned().collect();
+        keep.sort();
+        self.purge_keep.lock().unwrap().push(keep);
+        Ok(self.purge_result.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

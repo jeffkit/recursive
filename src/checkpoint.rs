@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result};
+use crate::paths::validate_session_id;
 
 // ── public types ─────────────────────────────────────────────────────────────
 
@@ -485,6 +486,72 @@ impl ShadowRepo {
         Ok(())
     }
 
+    /// Erase this session's checkpoint chain: delete every ref under
+    /// `refs/sessions/<session_id>/` and garbage-collect the commits and
+    /// blobs they were the only reachable roots of. Returns the number of
+    /// refs removed (`0` when the session never checkpointed).
+    ///
+    /// Issue #102: `ShadowRepo` is shared by every session in the workspace,
+    /// so a "delete the session" operation that only removed the transcript
+    /// left the session's code snapshots behind in the object store. This is
+    /// the shadow-git half of the purge path; other sessions' chains are
+    /// untouched (they are separate refs).
+    pub fn purge_session(&self, session_id: &str) -> Result<usize> {
+        validate_session_id(session_id)?;
+        let prefix = format!("refs/sessions/{}/", sanitize_for_refname(session_id));
+        let out = git_cmd()
+            .env("GIT_DIR", &self.shadow_dir)
+            .args(["for-each-ref", "--format=%(refname)", &format!("{prefix}*")])
+            .output()
+            .map_err(git_err)?;
+        if !out.status.success() {
+            return Err(Error::Tool {
+                name: "checkpoint".into(),
+                call_id: None,
+                message: format!(
+                    "git for-each-ref failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            });
+        }
+        // One refname per line, and nothing else on stdout. `split_whitespace`
+        // drops the trailing newline and any blank line without a filter that
+        // could never fire.
+        let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        // Nothing to erase — and nothing for the gc below to reclaim.
+        if refs.is_empty() {
+            return Ok(0);
+        }
+        for refname in &refs {
+            let del = git_cmd()
+                .env("GIT_DIR", &self.shadow_dir)
+                .args(["update-ref", "-d", refname])
+                .output()
+                .map_err(git_err)?;
+            if !del.status.success() {
+                return Err(Error::Tool {
+                    name: "checkpoint".into(),
+                    call_id: None,
+                    message: format!(
+                        "git update-ref -d {refname} failed: {}",
+                        String::from_utf8_lossy(&del.stderr)
+                    ),
+                });
+            }
+        }
+        // Reclaim the now-unreachable objects. gc() is best-effort by
+        // contract (a concurrent repo lock must not fail the purge) — the
+        // refs are what make the snapshots unreachable, so a failed gc only
+        // leaves disk space behind, never reachable session data.
+        if let Err(e) = self.gc() {
+            tracing::warn!(session_id, error = %e, "shadow-git purge: gc failed");
+        }
+        Ok(refs.len())
+    }
+
     /// Run git garbage collection on the shadow repo, pruning all unreachable
     /// objects immediately. This reclaims disk space after rewinds (which
     /// orphan commits) and after the pathspec exclusion fixes (which left
@@ -680,15 +747,19 @@ fn is_missing_blob_stderr(stderr: &str) -> bool {
         || stderr.contains("exists on disk, but not in")
 }
 
-/// Reject `/` or `\` in session ids (git-ref safety).
+/// Erase a session's shadow-git footprint for `workspace`, if one exists.
 ///
-/// `|| → &&` between the two arms is near-equivalent for mutation scoring:
-/// an id containing both separators is already rejected by either arm alone,
-/// and the charset `.all(...)` catch-all still fires for other invalid chars.
-/// Explicit slash/backslash unit tests pin each rejection path independently.
-#[cfg_attr(test, mutants::skip)]
-fn session_id_has_path_separator(sid: &str) -> bool {
-    sid.contains('/') || sid.contains('\\')
+/// Issue #102: the HTTP delete path has no `ShadowRepo` handle (HTTP sessions
+/// do not enable checkpoints), so this resolves the workspace's shadow repo
+/// itself — and, crucially, **does not create one**: a workspace that never
+/// checkpointed answers `Ok(0)` without writing a `shadow-git/` directory as
+/// a side effect of being asked to purge. Returns the number of refs removed.
+pub fn purge_session_refs(workspace: &Path, session_id: &str) -> Result<usize> {
+    let shadow_dir = crate::paths::user_shadow_git_dir_if_exists(workspace);
+    if !shadow_dir.exists() {
+        return Ok(0);
+    }
+    ShadowRepo::open_at(workspace, shadow_dir)?.purge_session(session_id)
 }
 
 fn git_cmd() -> Command {
@@ -738,28 +809,6 @@ fn session_ref(sid: &str) -> String {
 /// (e.g. `sess.1` vs `sess-1`) never collide on the same git ref.
 fn sanitize_for_refname(sid: &str) -> String {
     sid.replace('.', "_dot_").replace('-', "_dash_")
-}
-
-fn validate_session_id(sid: &str) -> Result<()> {
-    // Allow alphanumerics + `-` `_` `.`. The `.` is permitted because
-    // real session ids include the workspace slug, which on macOS may
-    // contain `.tmpXXX` segments from `/var/folders/...`. We still
-    // reject path separators, `..`, and leading-dot to keep the id
-    // safe for use as a git ref component.
-    if sid.is_empty()
-        || session_id_has_path_separator(sid)
-        || sid.contains("..")
-        || sid.starts_with('.')
-        || !sid
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        return Err(Error::BadToolArgs {
-            name: "checkpoint".into(),
-            message: format!("invalid session_id `{sid}` (must be alphanumeric/-/_/.)"),
-        });
-    }
-    Ok(())
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -863,6 +912,82 @@ mod tests {
         assert_eq!(list_b.len(), 1, "B should see only its own checkpoint");
         assert_eq!(list_a[0].id, id_a1);
         assert_eq!(list_b[0].id, id_b1);
+    }
+
+    // ── Issue #102: purge a session's shadow-git footprint ────────────────
+
+    #[test]
+    fn purge_session_removes_only_its_own_chain() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        fs::write(w.path().join("a.txt"), "from-A").unwrap();
+        let r = w.open_repo().unwrap();
+        let _ = r.snapshot_for_session("sessA", "A turn 0").unwrap();
+        let _ = r.snapshot_for_session("sessB", "B turn 0").unwrap();
+
+        assert_eq!(r.purge_session("sessA").unwrap(), 1);
+
+        assert!(
+            r.list_for_session("sessA").unwrap().is_empty(),
+            "the purged session must have no checkpoint chain left"
+        );
+        assert_eq!(
+            r.list_for_session("sessB").unwrap().len(),
+            1,
+            "sibling sessions share the object store but not the refs — \
+             purge must not touch them"
+        );
+        // Idempotent: a second purge finds nothing.
+        assert_eq!(r.purge_session("sessA").unwrap(), 0);
+    }
+
+    #[test]
+    fn purge_session_rejects_unsafe_ids() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+        assert!(r.purge_session("../escape").is_err());
+        assert!(r.purge_session("").is_err());
+    }
+
+    #[test]
+    fn purge_session_refs_is_a_noop_without_a_shadow_repo() {
+        use crate::test_util::PinnedRecursiveHome;
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = PinnedRecursiveHome::new(home.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let ws_path = workspace.path().canonicalize().unwrap();
+
+        assert_eq!(purge_session_refs(&ws_path, "sess").unwrap(), 0);
+        assert!(
+            !crate::paths::user_shadow_git_dir_if_exists(&ws_path).exists(),
+            "purging a workspace that never checkpointed must not create a \
+             shadow repo as a side effect"
+        );
+    }
+
+    #[test]
+    fn purge_session_refs_erases_a_real_chain() {
+        use crate::test_util::PinnedRecursiveHome;
+
+        if !has_git() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _guard = PinnedRecursiveHome::new(home.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let ws_path = workspace.path().canonicalize().unwrap();
+        fs::write(ws_path.join("a.txt"), "content").unwrap();
+
+        let repo = ShadowRepo::open(&ws_path).unwrap();
+        let _ = repo.snapshot_for_session("sess-1", "turn 0").unwrap();
+        assert_eq!(purge_session_refs(&ws_path, "sess-1").unwrap(), 1);
+        assert!(repo.list_for_session("sess-1").unwrap().is_empty());
     }
 
     #[test]

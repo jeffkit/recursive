@@ -49,7 +49,7 @@ use axum::{
 /// Prevents OOM via maliciously large JSON payloads on POST /run and
 /// POST /sessions/:id/messages, both of which accept unbounded user strings.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -988,16 +988,34 @@ pub fn build_openapi_spec() -> serde_json::Value {
                 },
                 "delete": {
                     "summary": "Delete a session",
-                    "description": "Remove a session and its transcript.",
+                    "description": "Remove a session. By default the Goal-396 \
+                        semantics apply: the transcript is snapshotted to the \
+                        storage backend and a tombstone prevents cold load from \
+                        resurrecting the session. With `purge=true` every \
+                        persisted copy is erased instead (transcript snapshot, \
+                        tombstone, shadow-git checkpoint chain) — issue #102. \
+                        Purge is idempotent and also works for sessions that \
+                        are only present in storage (idle-evicted or deleted \
+                        earlier without purge).",
                     "parameters": [{
                         "name": "id",
                         "in": "path",
                         "required": true,
                         "schema": { "type": "string" }
+                    }, {
+                        "name": "purge",
+                        "in": "query",
+                        "required": false,
+                        "description": "Erase every persisted copy of the session \
+                            (true delete) instead of keeping the transcript \
+                            snapshot behind a tombstone.",
+                        "schema": { "type": "boolean", "default": false }
                     }],
                     "responses": {
-                        "204": { "description": "Session deleted" },
-                        "404": { "description": "Session not found" }
+                        "204": { "description": "Session deleted (or already gone, for purge)" },
+                        "400": { "description": "Malformed session id (path separators, \
+                            `..`, or characters outside [A-Za-z0-9._-])" },
+                        "404": { "description": "Session not found (non-purge deletes only)" }
                     }
                 }
             },
@@ -1408,11 +1426,64 @@ pub fn spawn_session_reaper(
             // One sweep: evict idle sessions, close each runtime, persist its
             // transcript (Goal 396) and prune the per-session channels.
             evict_idle_sessions(&state).await;
+            // Issue #102: drop transcripts older than the configured
+            // retention window. Runs after eviction so a session evicted in
+            // this tick is only eligible once it is genuinely old.
+            if let Some(max_age) = session_retention_from_env() {
+                purge_expired_transcripts(&state, max_age).await;
+            }
             // Prune idle rate-limit buckets (goal-290). Runs every
             // reaper tick so the bucket map doesn't grow unboundedly.
             state.rate_limiter.prune().await;
         }
     })
+}
+
+/// Per-workspace transcript retention window (issue #102).
+///
+/// `RECURSIVE_SESSION_RETENTION_DAYS` bounds how long a persisted transcript
+/// may sit on disk. Unset, `0`, or unparseable disables retention — opt-in, so
+/// an existing deployment never starts deleting data on upgrade.
+///
+/// The "owner" of a transcript here is its **workspace**: this build has no
+/// user/account notion, and every session under one workspace's data dir
+/// belongs to the same operator, so a per-workspace window is the finest
+/// scope expressible today.
+pub(super) fn session_retention_from_env() -> Option<std::time::Duration> {
+    let days = std::env::var("RECURSIVE_SESSION_RETENTION_DAYS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    (days > 0).then(|| std::time::Duration::from_secs(days.saturating_mul(86_400)))
+}
+
+/// One retention sweep: ask the storage backend to drop sessions older than
+/// `max_age`. Returns the number of session records removed.
+///
+/// The window is a parameter rather than an env read so the sweep is testable
+/// without racing process-global env; the reaper supplies
+/// [`session_retention_from_env`]. Live sessions are passed as `keep` so the
+/// sweep can never reap the only copy a crash could recover (see
+/// [`StorageBackend::purge_expired_sessions`]). Backends that don't implement
+/// enumeration (object stores enforce retention through a lifecycle policy)
+/// answer `Ok(0)` — the trait default.
+pub(super) async fn purge_expired_transcripts(
+    state: &AppState,
+    max_age: std::time::Duration,
+) -> usize {
+    let keep: HashSet<String> = state.host.sessions().read().await.keys().cloned().collect();
+    match state.storage.purge_expired_sessions(max_age, &keep).await {
+        Ok(0) => 0,
+        Ok(n) => {
+            tracing::info!(removed = n, "retention: purged expired session records");
+            n
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "retention sweep failed");
+            0
+        }
+    }
 }
 
 /// One host-layer eviction sweep.
@@ -1667,28 +1738,40 @@ mod goal_396_persistence_tests {
     /// Fake backend that records saves and optionally probes the host's
     /// sessions-map write lock at save time — before any await — so a
     /// host that persisted under the lock fails the test.
+    #[derive(Default)]
     struct RecordingStorage {
         saves: std::sync::Mutex<Vec<SaveRecord>>,
+        /// Retention windows passed to `purge_expired_sessions` (issue #102).
+        purges: std::sync::Mutex<Vec<std::time::Duration>>,
+        /// Live-session ids passed alongside each retention window.
+        purge_keep: std::sync::Mutex<Vec<Vec<String>>>,
+        /// What `purge_expired_sessions` reports as "removed".
+        purge_result: std::sync::atomic::AtomicUsize,
         probe_sessions: Option<Arc<RwLock<SessionsMap>>>,
     }
 
     impl RecordingStorage {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                saves: std::sync::Mutex::new(Vec::new()),
-                probe_sessions: None,
-            })
+            Arc::new(Self::default())
         }
 
         fn with_probe(sessions: Arc<RwLock<SessionsMap>>) -> Arc<Self> {
             Arc::new(Self {
-                saves: std::sync::Mutex::new(Vec::new()),
                 probe_sessions: Some(sessions),
+                ..Default::default()
             })
         }
 
         fn saves(&self) -> Vec<SaveRecord> {
             self.saves.lock().unwrap().clone()
+        }
+
+        fn purges(&self) -> Vec<std::time::Duration> {
+            self.purges.lock().unwrap().clone()
+        }
+
+        fn purge_keep(&self) -> Vec<Vec<String>> {
+            self.purge_keep.lock().unwrap().clone()
         }
     }
 
@@ -1712,12 +1795,32 @@ mod goal_396_persistence_tests {
             Ok(())
         }
 
+        async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
         async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
             Ok(None)
         }
 
         async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
             Ok(())
+        }
+
+        async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        async fn purge_expired_sessions(
+            &self,
+            max_age: std::time::Duration,
+            keep: &std::collections::HashSet<String>,
+        ) -> crate::error::Result<usize> {
+            self.purges.lock().unwrap().push(max_age);
+            let mut keep: Vec<String> = keep.iter().cloned().collect();
+            keep.sort();
+            self.purge_keep.lock().unwrap().push(keep);
+            Ok(self.purge_result.load(std::sync::atomic::Ordering::Relaxed))
         }
     }
 
@@ -2000,6 +2103,76 @@ mod goal_396_persistence_tests {
         assert!(
             state.host.sessions().read().await.is_empty(),
             "flush must drain the session map"
+        );
+    }
+
+    // ── Issue #102: retention window config + sweep wiring ────────────────
+
+    #[test]
+    fn retention_window_is_opt_in_and_days_based() {
+        // Env is process-global: hold the lock so a concurrent test cannot
+        // observe (or leak) a value mid-assertion.
+        let _guard = crate::test_util::env_lock();
+        std::env::remove_var("RECURSIVE_SESSION_RETENTION_DAYS");
+        assert_eq!(session_retention_from_env(), None, "unset must be disabled");
+
+        std::env::set_var("RECURSIVE_SESSION_RETENTION_DAYS", "0");
+        assert_eq!(session_retention_from_env(), None, "0 must be disabled");
+
+        std::env::set_var("RECURSIVE_SESSION_RETENTION_DAYS", "7");
+        assert_eq!(
+            session_retention_from_env(),
+            Some(std::time::Duration::from_secs(7 * 86_400)),
+            "days must be converted to a window"
+        );
+
+        std::env::set_var("RECURSIVE_SESSION_RETENTION_DAYS", " 30 ");
+        assert_eq!(
+            session_retention_from_env(),
+            Some(std::time::Duration::from_secs(30 * 86_400)),
+            "surrounding whitespace must be tolerated"
+        );
+
+        std::env::set_var("RECURSIVE_SESSION_RETENTION_DAYS", "forever");
+        assert_eq!(
+            session_retention_from_env(),
+            None,
+            "an unparseable value must fall back to disabled, never to 0 days"
+        );
+
+        std::env::remove_var("RECURSIVE_SESSION_RETENTION_DAYS");
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_passes_the_window_through_and_reports_removals() {
+        let host = test_host(0);
+        let storage = RecordingStorage::new();
+        storage
+            .purge_result
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        // A live session must be handed to the backend as "keep": its on-disk
+        // snapshot is the only copy a crash could recover.
+        host.sessions()
+            .write()
+            .await
+            .insert("live".to_string(), test_session("live", 1));
+        let state = test_state(host, storage.clone()).await;
+
+        let window = std::time::Duration::from_secs(14 * 86_400);
+        assert_eq!(
+            purge_expired_transcripts(&state, window).await,
+            3,
+            "the backend's removed count must be reported to the caller"
+        );
+        assert_eq!(
+            storage.purges(),
+            vec![window],
+            "the operator's window must reach the storage backend unchanged"
+        );
+        assert_eq!(
+            storage.purge_keep(),
+            vec![vec!["live".to_string()]],
+            "live session ids must be excluded from the sweep"
         );
     }
 }

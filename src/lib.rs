@@ -73,7 +73,7 @@ pub mod triggers;
 pub mod weixin;
 
 pub use agent::{FinishReason, PermissionDecision};
-pub use checkpoint::{CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};
+pub use checkpoint::{purge_session_refs, CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};
 pub use checkpoint_log::{
     read_log as read_checkpoint_log, truncate_to_turn as truncate_checkpoint_log,
     CheckpointLogWriter, CheckpointRecord, TouchedVia,
