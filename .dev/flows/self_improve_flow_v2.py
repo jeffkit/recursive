@@ -14,7 +14,9 @@
 - gate_with_fix 子流程：跑门 → 绿则过；红则 fix（≤3 轮，prompt 喂 stdout 尾部）
 - 评审环：reviewer AGENTRUN → F.contains 判 VERDICT → NEEDS_FIX 喂回修复 ≤3 轮
 - 落地：GIT_PUBLISH main 模式；merged=False → worktree rebase 新 main 后重推
-  一次（rebase-retry，2026-10-01）；仍败 failed-preserved
+  一次（rebase-retry，2026-10-01）；rebase 冲突进 AGENTRUN 修复环（#137）——
+  现场落 land-failure.log → 当轮 agent 就地解 → rebase 推完再重推；修复轮用尽
+  仍冲突才 failed-preserved
 
 v2 与 v1 引擎的有意差异：
 - watchdog（journal 增长/后代活性）暂由 AGENTRUN timeout_secs 硬墙替代——
@@ -184,7 +186,7 @@ def self_improve_v2(INPUT):
         "The flow runs these again as a backstop. Fix the source, never `#[allow]`.\n"
         "Only stop once fmt + clippy + test are all green by your own hand.\"\"\")\n"
         "    if resumed:\n"
-        "        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——land 阶段不会自动替你解冲突。\\n\")\n"
+        "        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n"
         "        import glob as _glob\n"
         "        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', '*failure.log')))\n"
         "        if _rf:\n"
@@ -377,28 +379,124 @@ def self_improve_v2(INPUT):
     # ── rebase-retry（2026-10-01 jeffkit 拍板；#65/#70 实证 ff 失败即弃单浪费）──
     # ff 合并失败（main 已前进）→ worktree rebase 新 main → 删远端旧同名分支
     # （rebase 后历史分叉，普通 push 会被拒；本地持有全部提交，删远端不丢东西，
-    # GIT_PUBLISH 会重新 -u 推）→ 重推一次。仍败则 failed-preserved 供人工。
+    # GIT_PUBLISH 会重新 -u 推）→ 重推一次。
+    # #137：冲突不再「首检即弃」——rebase 停在冲突处**不 abort**，现场（status /
+    # 未合并文件 / 冲突块 / 被重放的提交摘要）喂当轮 AGENTRUN 就地解（对齐门禁
+    # 修复环：首检 → 修 → 复检定论），解完把 rebase 推完再走同一 GIT_PUBLISH
+    # 重试；修复轮用尽仍冲突才 abort 回分支尖 + failed-preserved（WIP 不丢，
+    # 语义同修复前；续跑最小路照旧消费 land-failure.log）。
     land_rebase = CODE(id="land_rebase", lang="python",
                        input={"wt": pre.worktree, "branch": pre.branch}, code=(
         "import subprocess\n"
         "\n"
+        "\n"
         "def run(input):\n"
+        "    wt = input[\"wt\"]\n"
+        "\n"
         "    def git(*a):\n"
-        "        return subprocess.run([\"git\", \"-C\", input[\"wt\"]] + list(a),\n"
+        "        return subprocess.run([\"git\", \"-C\", wt] + list(a),\n"
         "                              capture_output=True, text=True)\n"
+        "\n"
         "    git(\"fetch\", \"origin\")\n"
         "    r = git(\"rebase\", \"origin/main\")\n"
         "    if r.returncode != 0:\n"
-        "        git(\"rebase\", \"--abort\")\n"
-        "        return {\"ok\": False,\n"
+        "        # 冲突现场留在 worktree（不 abort），交当轮修复环就地解\n"
+        "        NL = \"\\n\"\n"
+        "        st = git(\"status\", \"--short\").stdout.strip()\n"
+        "        uf = git(\"diff\", \"--name-only\", \"--diff-filter=U\").stdout.strip()\n"
+        "        df = git(\"diff\").stdout\n"
+        "        lg = git(\"log\", \"--oneline\", \"origin/main..HEAD\").stdout.strip()\n"
+        "        scene = NL.join([\"git status --short\", st, \"\", \"unmerged files\", uf,\n"
+        "                         \"\", \"conflict diff\", df[:6000], \"\",\n"
+        "                         \"origin/main..HEAD\", lg[-2000:]])\n"
+        "        return {\"ok\": False, \"scene\": scene,\n"
         "                \"why\": ((r.stderr or \"\") + (r.stdout or \"\"))[-400:]}\n"
         "    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n"
-        "    return {\"ok\": True}\n"))
+        "    return {\"ok\": True, \"scene\": \"\", \"why\": \"\"}\n"))
     if land_rebase.ok == False:
-        wfp2 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
-                         content=F.concat("rebase conflict: ", land_rebase.why))
-        return {"verdict": "failed-preserved", "stage": "land",
-                "why": F.concat("rebase conflict: ", land_rebase.why)}
+        wlp = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+                        content=F.concat("rebase conflict: ", land_rebase.why,
+                                         "\n\n", land_rebase.scene))
+        land_fix = AGENTRUN(agent=agent, prompt=F.concat(
+                "The git rebase onto origin/main stopped with merge conflicts. "
+                "Resolve them in place so the rebase can finish, without changing "
+                "behaviour on either side: keep both the upstream change and the "
+                "local change of this branch, drop nothing, and do not weaken the "
+                "change under review. Inspect the conflicting files in the report "
+                "below, edit out every conflict marker, then run `git add -A` "
+                "followed by `GIT_EDITOR=true git rebase --continue` until the "
+                "rebase completes with exit code 0 and `git status` is clean. "
+                "Do not abort the rebase, do not create a merge commit, and do "
+                "not re-run the quality gates."
+                "\n\n--- rebase conflict report ---\n", land_rebase.scene),
+            repo=pre.worktree, timeout_secs=7200)
+        land_rebase2 = CODE(id="land_rebase2", lang="python",
+                            input={"wt": pre.worktree, "branch": pre.branch}, code=(
+            "import os, subprocess\n"
+            "\n"
+            "\n"
+            "def run(input):\n"
+            "    wt = input[\"wt\"]\n"
+            "    env = dict(os.environ)\n"
+            "    env[\"GIT_EDITOR\"] = \"true\"\n"
+            "    env[\"GIT_SEQUENCE_EDITOR\"] = \"true\"\n"
+            "\n"
+            "    def git(*a):\n"
+            "        return subprocess.run([\"git\", \"-C\", wt] + list(a),\n"
+            "                              capture_output=True, text=True, env=env)\n"
+            "\n"
+            "    def rebasing():\n"
+            "        gd = git(\"rev-parse\", \"--git-dir\").stdout.strip()\n"
+            "        gd = gd if os.path.isabs(gd) else os.path.join(wt, gd)\n"
+            "        return (os.path.isdir(os.path.join(gd, \"rebase-merge\"))\n"
+            "                or os.path.isdir(os.path.join(gd, \"rebase-apply\")))\n"
+            "\n"
+            "    def unmerged():\n"
+            "        return git(\"diff\", \"--name-only\", \"--diff-filter=U\").stdout.strip()\n"
+            "\n"
+            "    def done():\n"
+            "        return git(\"merge-base\", \"--is-ancestor\", \"origin/main\",\n"
+            "                   \"HEAD\").returncode == 0\n"
+            "\n"
+            "    def scene():\n"
+            "        NL = \"\\n\"\n"
+            "        return NL.join([\"git status --short\",\n"
+            "                        git(\"status\", \"--short\").stdout.strip(), \"\",\n"
+            "                        \"unmerged files\", unmerged(), \"\",\n"
+            "                        \"conflict diff\", git(\"diff\").stdout[:6000], \"\",\n"
+            "                        \"origin/main..HEAD\",\n"
+            "                        git(\"log\", \"--oneline\", \"origin/main..HEAD\")\n"
+            "                        .stdout.strip()[-2000:]])\n"
+            "\n"
+            "    # agent 解完可能已 continue，也可能只 add 未 continue：替它把 rebase 推完\n"
+            "    why = \"\"\n"
+            "    for _ in range(50):\n"
+            "        if not rebasing() or unmerged():\n"
+            "            break\n"
+            "        c = git(\"rebase\", \"--continue\")\n"
+            "        if c.returncode != 0:\n"
+            "            why = ((c.stderr or \"\") + (c.stdout or \"\"))[-400:]\n"
+            "            break\n"
+            "    if not rebasing() and not done():\n"
+            "        # agent 可能 abort 后重试：现场没在 rebase，就自己重来一次定论\n"
+            "        rr = git(\"rebase\", \"origin/main\")\n"
+            "        if rr.returncode != 0:\n"
+            "            why = why or ((rr.stderr or \"\") + (rr.stdout or \"\"))[-400:]\n"
+            "    if rebasing() or unmerged() or not done():\n"
+            "        s = scene()\n"
+            "        if rebasing():\n"
+            "            git(\"rebase\", \"--abort\")\n"
+            "        return {\"ok\": False, \"scene\": s,\n"
+            "                \"why\": why or \"unresolved rebase conflict\"}\n"
+            "    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n"
+            "    return {\"ok\": True, \"scene\": \"\", \"why\": \"\"}\n"))
+        if land_rebase2.ok == False:
+            wlp2 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+                             content=F.concat("rebase conflict (fix round done): ",
+                                              land_rebase2.why, "\n\n",
+                                              land_rebase2.scene))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "why": F.concat("rebase conflict: ", land_rebase2.why)}
     pub2 = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
                        commit_message=F.concat("self-improve: ", goal),
                        merge_mode="main", main_clone=repo, base_branch="main")

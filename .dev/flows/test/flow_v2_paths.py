@@ -37,6 +37,7 @@ CALLS = []          # [("agentrun", id, prompt[:40]), ("gate", gate_name), ...]
 GATE_SCRIPT = {}    # gate_name -> [exit_code, ...] 逐次弹出，末项常驻
 AGENT_SCRIPT = {}   # 路由键 -> 文本
 PUBLISH_RESULT = {"pushed": True, "merged": True, "note": "stub", "push_note": ""}
+PUBLISH_SCRIPT = []  # 逐次弹出，末项常驻；空则用 PUBLISH_RESULT（land 场景要 ff 先败）
 
 
 def _eval(node, execution, attr, default=""):
@@ -74,6 +75,8 @@ def _route_agent(self, execution):
                 (Path(repo) / "impl_change.txt").write_text("stub impl edit\n")
             except Exception:
                 pass
+        if text == "@LAND_CONFLICT":
+            _make_land_conflict(_eval(self, execution, "repo"))
         return {"text": text, "cli": "stub", "model": "stub", "session_id": "s",
                 "usage": {}, "dry_run": False}
     if prompt.startswith("You are an independent reviewer"):
@@ -81,6 +84,14 @@ def _route_agent(self, execution):
         if isinstance(rv, list):               # 序列脚本：原地弹出，末项常驻
             rv = rv.pop(0) if len(rv) > 1 else rv[0]
         return {"text": rv, "cli": "stub",
+                "model": "stub", "session_id": "s", "usage": {}, "dry_run": False}
+    if prompt.startswith("The git rebase onto origin/main"):
+        # land 冲突修复环（#137）：真 git 收口——桩按脚本解或不解
+        mode = AGENT_SCRIPT.get("landfix", "@RESOLVE")
+        if mode in ("@RESOLVE", "@RESOLVE_STAGED"):
+            _resolve_land_conflict(_eval(self, execution, "repo"),
+                                   cont=mode == "@RESOLVE")
+        return {"text": "stub land fix done", "cli": "stub",
                 "model": "stub", "session_id": "s", "usage": {}, "dry_run": False}
     return {"text": "stub fix done", "cli": "stub", "model": "stub",
             "session_id": "s", "usage": {}, "dry_run": False}   # 门禁/评审修复段
@@ -97,7 +108,10 @@ def _route_gate(self, execution):
 
 def _route_publish(self, execution):
     CALLS.append(("publish", self.id, str(self.worktree_dir)))
-    return dict(PUBLISH_RESULT)
+    seq = PUBLISH_SCRIPT
+    if not seq:
+        return dict(PUBLISH_RESULT)
+    return dict(seq.pop(0) if len(seq) > 1 else seq[0])
 
 
 def _patch():
@@ -107,6 +121,62 @@ def _patch():
     ar.AgentRunNode.execute = _route_agent
     g.GateNode.execute = _route_gate
     gp.GitPublishNode.execute = _route_publish
+
+
+# ── land 冲突 fixture 工具（#137：真 git rebase 撞真冲突）──────────────────
+def _git(cwd, *a, check=True):
+    r = subprocess.run(["git", "-C", str(cwd)] + list(a),
+                       capture_output=True, text=True)
+    assert not check or r.returncode == 0, f"git {a}: {r.stderr[-300:]}"
+    return r
+
+
+def _main_repo_of(wt: str) -> str:
+    """worktree 所属主仓路径（worktree add 里 `.git` 文件指向主仓 gitdir）。"""
+    gd = _git(wt, "rev-parse", "--git-common-dir").stdout.strip()
+    gd = gd if os.path.isabs(gd) else os.path.join(wt, gd)
+    return str(Path(gd).parent)
+
+
+def _add_origin(repo: Path, root: Path) -> None:
+    """land 场景前置：加裸仓 origin 并推 main（land_rebase 要 fetch origin）。"""
+    origin = root / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)],
+                   check=True, capture_output=True)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "-u", "origin", "main")
+
+
+def _make_land_conflict(wt: str) -> None:
+    """impl 桩（@LAND_CONFLICT）：本分支提交 README 改动，主仓 main 前进同处改动。
+
+    harness 里 GIT_PUBLISH 是桩（不替 worktree commit），故这里替它把分支改动
+    提交掉；main 侧在仓内提交并推 origin——land_rebase 的
+    `git fetch origin && git rebase origin/main` 才真撞冲突（而非 dirty-tree 伪失败）。"""
+    main_repo = _main_repo_of(wt)
+    (Path(wt) / "README.md").write_text("branch side\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "land conflict branch side")
+    (Path(main_repo) / "README.md").write_text("main side\n")
+    _git(main_repo, "add", "-A")
+    _git(main_repo, "commit", "-qm", "land conflict main side")
+    _git(main_repo, "push", "-q", "origin", "main")
+
+
+def _resolve_land_conflict(wt: str, cont: bool) -> None:
+    """桩「agent 就地解冲突」：取被重放的本分支侧改动 + add，可选 continue。
+
+    真 agent 的收口是「留住两侧意图、不改语义」；fixture 的两侧互斥（同文件同处），
+    这里取 --theirs（rebase 中 = 本分支提交）保住分支侧语义。cont=False 模拟
+    「解了但没收尾」——由 land_rebase2 复检推完。"""
+    for f in _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split():
+        _git(wt, "checkout", "--theirs", "--", f)
+    _git(wt, "add", "-A")
+    if cont:
+        env = dict(os.environ, GIT_EDITOR="true", GIT_SEQUENCE_EDITOR="true")
+        r = subprocess.run(["git", "-C", wt, "rebase", "--continue"],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, f"桩解冲突后 rebase --continue 应成功: {r.stderr[-300:]}"
 
 
 # ── fixture：真 git 仓 + run 目录 ────────────────────────────────────────
@@ -283,6 +353,64 @@ def s10_全新run会话存储存在但不取():
         f"全新 run 不应带 session: {impl_calls}"
 
 
+def _land_fixture(landfix: str) -> dict:
+    """land 场景公共装配：真冲突 + ff 先败（pub）后成（pub2）。"""
+    repo, root = make_repo()
+    _add_origin(repo, root)
+    AGENT_SCRIPT.update({"impl": "@LAND_CONFLICT", "review": "VERDICT:PASS",
+                         "landfix": landfix})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    PUBLISH_SCRIPT[:] = [
+        dict(PUBLISH_RESULT, merged=False, note="stub-ff-failed"),
+        dict(PUBLISH_RESULT, merged=True, note="stub-retry")]
+    return run_flow(repo, root)
+
+
+def s30_land冲突_当轮修复环解掉_重推committed():
+    """#137 主路：rebase 冲突 → 当轮 AGENTRUN 就地解 → rebase 推完 → 重推 committed。
+
+    判据：无重派（同一 run 内 committed）、修复环节点被调、现场落 land-failure.log、
+    rebase 后 origin/main 是 HEAD 祖先。"""
+    v = _land_fixture("@RESOLVE")
+    assert v["verdict"] == "committed" and v["via"] == "git-publish-retry", v
+    rd = Path(v["_run_dir"])
+    wt = rd / "worktree"
+    log = rd / "land-failure.log"
+    assert log.exists(), "冲突现场应落 land-failure.log（当轮修复环看得见）"
+    txt = log.read_text()
+    assert "unmerged files" in txt and "README.md" in txt, txt[:400]
+    fix_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "land_fix"]
+    assert len(fix_calls) == 1, f"land 修复环应恰一次 AGENTRUN: {CALLS}"
+    assert len([c for c in CALLS if c[0] == "publish"]) == 2, "冲突解完应重推一次"
+    assert _git(wt, "merge-base", "--is-ancestor", "origin/main", "HEAD",
+                check=False).returncode == 0, "rebase 后 origin/main 应是 HEAD 祖先"
+
+
+def s31_land冲突_修复无果_preserved保留WIP():
+    """#137 验收③：修复轮用尽仍冲突 → abort 回分支尖 + failed-preserved，WIP 不丢。"""
+    v = _land_fixture("@NOOP")
+    assert v["verdict"] == "failed-preserved" and v.get("stage") == "land", v
+    rd = Path(v["_run_dir"])
+    wt = rd / "worktree"
+    log = rd / "land-failure.log"
+    assert log.exists() and "unmerged files" in log.read_text()
+    assert not [c for c in CALLS if c[0] == "publish" and c[1] == "pub2"], \
+        "冲突未解不应走到重推"
+    assert _git(wt, "status", "--porcelain").stdout.strip() == "", "abort 后工作树应干净"
+    show = _git(wt, "show", "HEAD:README.md").stdout
+    assert "branch side" in show, f"分支 WIP 应保留: {show!r}"
+    assert _git(wt, "log", "--format=%s", "-1").stdout.strip() == "land conflict branch side"
+
+
+def s32_land冲突_agent只解不收尾_复检推完rebase():
+    """agent 解了冲突但没 continue（只 add）→ land_rebase2 复检替它把 rebase 推完。"""
+    v = _land_fixture("@RESOLVE_STAGED")
+    assert v["verdict"] == "committed" and v["via"] == "git-publish-retry", v
+    wt = Path(v["_run_dir"]) / "worktree"
+    assert _git(wt, "merge-base", "--is-ancestor", "origin/main", "HEAD",
+                check=False).returncode == 0, "复检应把 rebase 推完"
+
+
 def s18_全部prompt表达式可解析():
     """$F.concat 常量含转义引号时 pyparsing 匹配失败→静默回退 variable→
     KeyError '$F'（49 实证）。编译期不炸、执行期才炸，harness 桩曾吞异常
@@ -295,7 +423,9 @@ def s18_全部prompt表达式可解析():
                       for k in ("g1", "g1b", "g2", "g2b", "g3", "g3b",
                                 "impl", "rev1", "rev2", "pre", "pub")}}
     ctx["$NODE"].update({"pre": {"worktree": "/wt", "branch": "b", "baseline": "h",
-                                  "sys_prompt": "s", "last_sid": "", "ok": True, "why": ""}})
+                                  "sys_prompt": "s", "last_sid": "", "ok": True, "why": ""},
+                          "land_rebase": {"ok": False, "why": "x", "scene": "x"},
+                          "land_rebase2": {"ok": False, "why": "x", "scene": "x"}})
     bad = []
     for n in m.self_improve_v2.nodes:
         for attr in ("prompt", "content"):
@@ -879,6 +1009,9 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
              s9_续跑找到会话_impl带sid, s10_全新run会话存储存在但不取,
+             s30_land冲突_当轮修复环解掉_重推committed,
+             s31_land冲突_修复无果_preserved保留WIP,
+             s32_land冲突_agent只解不收尾_复检推完rebase,
              s18_全部prompt表达式可解析,
              s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
              s13_v3_节点异常自动重试, s14_v3_重试耗尽_engine_error,
@@ -901,6 +1034,7 @@ if __name__ == "__main__":
 
     for s in SCENARIOS:
         CALLS.clear(); GATE_SCRIPT.clear(); AGENT_SCRIPT.clear()
+        PUBLISH_SCRIPT.clear()
         try:
             s()
             print(f"  PASS  {s.__name__}")
