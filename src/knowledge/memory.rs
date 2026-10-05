@@ -22,6 +22,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -303,6 +304,15 @@ pub fn memory_summary(workspace: &std::path::Path, limit: usize) -> String {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
+/// Render one `recall` result line: `ID [tag,…] text` (tags omitted when none).
+fn format_memory_line(id: &str, tags: &[String], text: &str) -> String {
+    if tags.is_empty() {
+        format!("{id} {text}")
+    } else {
+        format!("{id} [{}] {text}", tags.join(","))
+    }
+}
+
 pub struct Remember {
     workspace: PathBuf,
     /// Mutex for thread-safe access to the memory file.
@@ -509,64 +519,62 @@ impl Tool for Recall {
         let tag = arguments["tag"].as_str();
         let limit = arguments["limit"].as_i64().unwrap_or(10) as usize;
 
-        // Try vector search first; fall back to file-based keyword search
-        // when the vector store or embedding provider is a no-op. An empty
-        // query is never embedded — an embedding of "" ranks garbage above
-        // real notes, and a tag/limit-only recall must stay a recency listing.
-        let query_vec = if query.is_empty() {
-            Vec::new()
-        } else {
-            self.embedding_provider.embed(query).await
-        };
-        let use_vector = !query_vec.is_empty();
+        // `memory.json` is the durable source of truth: it holds every note
+        // ever written, including ones the vector index has never seen (written
+        // before the feature was enabled, or while the index was unreachable).
+        // Querying it on every call is what keeps `recall` working in the
+        // default build, where the shared backends are a no-op — their
+        // in-process store must never shadow the file.
+        let path = memory_path(&self.workspace);
+        let file_store = MemoryStore::load(&path)?;
+        let query_opt = if query.is_empty() { None } else { Some(query) };
+        let file_hits = file_store.search(query_opt, tag, limit);
 
-        if use_vector || tag.is_none() {
-            // Use the vector store (semantic or keyword fallback inside the
-            // store). It applies the tag filter itself, before its `limit`.
-            match self.vector_store.search(query_vec, query, tag, limit).await {
-                Ok(entries) if !entries.is_empty() => {
-                    let lines: Vec<String> = entries
-                        .iter()
-                        .map(|e| {
-                            let tags_str = if e.tags.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" [{}]", e.tags.join(","))
-                            };
-                            format!("{}{} {}", e.id, tags_str, e.text)
-                        })
-                        .collect();
-                    return Ok(lines.join("\n"));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "recall: vector search failed, falling back to file");
+        let mut lines: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Semantic hits rank by relevance, so they lead when a real query
+        // vector is available. An empty query is never embedded (an embedding
+        // of "" ranks garbage above real notes, and a tag/limit-only recall
+        // must stay a recency listing), and the no-op provider returns an empty
+        // vector for every input — both cases skip the semantic path entirely,
+        // leaving the file hits to answer the call.
+        if !query.is_empty() {
+            let query_vec = self.embedding_provider.embed(query).await;
+            if !query_vec.is_empty() {
+                match self.vector_store.search(query_vec, query, tag, limit).await {
+                    Ok(entries) => {
+                        for entry in entries {
+                            if lines.len() >= limit {
+                                break;
+                            }
+                            if seen.insert(entry.id.clone()) {
+                                lines.push(format_memory_line(&entry.id, &entry.tags, &entry.text));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "recall: vector search failed, falling back to file");
+                    }
                 }
             }
         }
 
-        // File-based fallback (or when only tag filter is used).
-        let path = memory_path(&self.workspace);
-        let file_store = MemoryStore::load(&path)?;
-        let query_opt = if query.is_empty() { None } else { Some(query) };
-        let results = file_store.search(query_opt, tag, limit);
-
-        if results.is_empty() {
-            return Ok("no matching notes found".to_string());
+        // Durable keyword hits fill the remaining slots — and are the whole
+        // answer in the default build. De-duplicating by id keeps a note the
+        // index already returned from appearing twice.
+        for note in file_hits {
+            if lines.len() >= limit {
+                break;
+            }
+            if seen.insert(note.id.clone()) {
+                lines.push(format_memory_line(&note.id, &note.tags, &note.text));
+            }
         }
 
-        let lines: Vec<String> = results
-            .iter()
-            .map(|n| {
-                let tags_str = if n.tags.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", n.tags.join(","))
-                };
-                format!("{}{} {}", n.id, tags_str, n.text)
-            })
-            .collect();
-
+        if lines.is_empty() {
+            return Ok("no matching notes found".to_string());
+        }
         Ok(lines.join("\n"))
     }
 }
@@ -1604,6 +1612,113 @@ mod tests {
             "the untagged note must be filtered out: {out}"
         );
         assert_eq!(out.lines().count(), 2);
+    }
+
+    /// The production default wiring (feature off, or no embedding key) hands
+    /// the *same* `NoopVectorStore` to every memory tool. It is in-process only,
+    /// so it must never shadow the durable `memory.json`: a query that also
+    /// matches a note written this session must still return the notes written
+    /// in earlier sessions.
+    #[tokio::test]
+    async fn recall_still_sees_notes_from_earlier_sessions_in_the_default_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = memory_path(tmp.path());
+
+        // A note from a previous session, on disk only — the in-process store
+        // knows nothing about it.
+        let mut prior = MemoryStore::default();
+        prior.add("legacy widgets note".into(), vec![]);
+        prior.save(&path).unwrap();
+
+        let store = Arc::new(NoopVectorStore::new());
+        let embedding = Arc::new(NoopEmbedding);
+        Remember::new(tmp.path())
+            .with_vector_store(store.clone(), embedding.clone())
+            .execute(json!({ "text": "fresh widgets note" }))
+            .await
+            .unwrap();
+
+        let out = Recall::new(tmp.path())
+            .with_vector_store(store, embedding)
+            .execute(json!({ "query": "widgets" }))
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("legacy widgets note"),
+            "recall must still see notes written before this session: {out}"
+        );
+        assert!(out.contains("fresh widgets note"), "{out}");
+    }
+
+    /// `recall`'s documented contract is "most recent first". The shared no-op
+    /// store used to answer from insertion order (oldest first) instead.
+    #[tokio::test]
+    async fn recall_is_most_recent_first_in_the_default_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(NoopVectorStore::new());
+        let embedding = Arc::new(NoopEmbedding);
+        for text in ["first widgets", "second widgets"] {
+            Remember::new(tmp.path())
+                .with_vector_store(store.clone(), embedding.clone())
+                .execute(json!({ "text": text }))
+                .await
+                .unwrap();
+        }
+
+        let out = Recall::new(tmp.path())
+            .with_vector_store(store, embedding)
+            .execute(json!({ "query": "widgets" }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            vec!["N2 second widgets", "N1 first widgets"],
+            "recall must be most recent first"
+        );
+    }
+
+    /// With a real embedding the semantic hits lead, but they must be unioned
+    /// with the durable file hits so a note the index has never seen is still
+    /// returned.
+    #[tokio::test]
+    async fn recall_unions_semantic_hits_with_the_durable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = memory_path(tmp.path());
+
+        // Only N1 is present in the vector index; N2 lives only in memory.json.
+        let store = Arc::new(NoopVectorStore::new());
+        store
+            .upsert(
+                &MemoryEntry {
+                    id: "N1".into(),
+                    text: "indexed widgets".into(),
+                    tags: vec![],
+                    ts: "2026-01-01T00:00:00Z".into(),
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut file = MemoryStore::default();
+        file.add("indexed widgets".into(), vec![]);
+        file.add("unindexed widgets".into(), vec![]);
+        file.save(&path).unwrap();
+
+        let recall = Recall::new(tmp.path()).with_vector_store(
+            store,
+            Arc::new(CountingEmbedding {
+                calls: Mutex::new(0),
+            }),
+        );
+        let out = recall.execute(json!({ "query": "widgets" })).await.unwrap();
+
+        assert!(
+            out.contains("unindexed widgets"),
+            "a pre-index note must not become unreachable: {out}"
+        );
+        assert!(out.contains("indexed widgets"), "{out}");
     }
 
     // ── Scratchpad unit tests ────────────────────────────────────────────────

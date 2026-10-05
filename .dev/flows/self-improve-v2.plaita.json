@@ -213,7 +213,7 @@
         }
       },
       "next": "passed_eq_false",
-      "source_line": 252
+      "source_line": 256
     },
     {
       "type": "if",
@@ -224,8 +224,8 @@
         "value": false
       },
       "name": "g1.passed == False?",
-      "desc": "if g1.passed == False（第 254 行）",
-      "source_line": 254,
+      "desc": "if g1.passed == False（第 258 行）",
+      "source_line": 258,
       "next": "_n14",
       "else_next": "g2"
     },
@@ -235,7 +235,7 @@
       "input": {
         "name": "clippy",
         "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-        "timeout_secs": 1200,
+        "timeout_secs": 1800,
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -285,7 +285,7 @@
         }
       },
       "next": "passed_eq_false_2",
-      "source_line": 269
+      "source_line": 278
     },
     {
       "type": "if",
@@ -296,8 +296,8 @@
         "value": false
       },
       "name": "g2.passed == False?",
-      "desc": "if g2.passed == False（第 272 行）",
-      "source_line": 272,
+      "desc": "if g2.passed == False（第 281 行）",
+      "source_line": 281,
       "next": "_n11",
       "else_next": "g3"
     },
@@ -357,7 +357,7 @@
         }
       },
       "next": "passed_eq_false_3",
-      "source_line": 289
+      "source_line": 298
     },
     {
       "type": "if",
@@ -368,8 +368,8 @@
         "value": false
       },
       "name": "g3.passed == False?",
-      "desc": "if g3.passed == False（第 291 行）",
-      "source_line": 291,
+      "desc": "if g3.passed == False（第 300 行）",
+      "source_line": 300,
       "next": "_n9",
       "else_next": "review_prompt"
     },
@@ -378,7 +378,7 @@
       "id": "review_prompt",
       "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff $(git merge-base main HEAD)` to see the full change (relative to the branch point: covers both uncommitted edits and commits inherited from a resumed run, while excluding main-side commits that landed after this branch was cut — plain `git diff main` would show those as inverted deletions and waste your attention), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
       "next": "rev1",
-      "source_line": 314
+      "source_line": 323
     },
     {
       "type": "agentrun",
@@ -388,7 +388,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa",
-      "source_line": 326
+      "source_line": 335
     },
     {
       "type": "if",
@@ -399,8 +399,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 328 行）",
-      "source_line": 328,
+      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 337 行）",
+      "source_line": 337,
       "next": "contains_text_verdict_ne",
       "else_next": "pub"
     },
@@ -414,7 +414,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true",
-      "source_line": 348
+      "source_line": 357
     },
     {
       "type": "if",
@@ -425,8 +425,8 @@
         "value": true
       },
       "name": "pub.merged == True?",
-      "desc": "if pub.merged == True（第 351 行）",
-      "source_line": 351,
+      "desc": "if pub.merged == True（第 360 行）",
+      "source_line": 360,
       "next": "_n4",
       "else_next": "land_rebase"
     },
@@ -440,7 +440,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_2",
-      "source_line": 359
+      "source_line": 368
     },
     {
       "type": "if",
@@ -451,8 +451,8 @@
         "value": false
       },
       "name": "land_rebase.ok == False?",
-      "desc": "if land_rebase.ok == False（第 375 行）",
-      "source_line": 375,
+      "desc": "if land_rebase.ok == False（第 384 行）",
+      "source_line": 384,
       "next": "wfp2",
       "else_next": "pub2"
     },
@@ -466,7 +466,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true_2",
-      "source_line": 380
+      "source_line": 389
     },
     {
       "type": "if",
@@ -477,8 +477,8 @@
         "value": true
       },
       "name": "pub2.merged == True?",
-      "desc": "if pub2.merged == True（第 383 行）",
-      "source_line": 383,
+      "desc": "if pub2.merged == True（第 392 行）",
+      "source_line": 392,
       "next": "_n2",
       "else_next": "wfp3"
     },
@@ -488,7 +488,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
       "next": "_n1",
-      "source_line": 386
+      "source_line": 395
     },
     {
       "type": "end",
@@ -502,7 +502,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 389
+      "source_line": 398
     },
     {
       "type": "end",
@@ -515,7 +515,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish-retry',…",
-      "source_line": 384
+      "source_line": 393
     },
     {
       "type": "writefile",
@@ -523,7 +523,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why)",
       "next": "_n3",
-      "source_line": 376
+      "source_line": 385
     },
     {
       "type": "end",
@@ -536,7 +536,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 378
+      "source_line": 387
     },
     {
       "type": "end",
@@ -549,7 +549,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish', 'note…",
-      "source_line": 352
+      "source_line": 361
     },
     {
       "type": "if",
@@ -560,8 +560,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 329 行）",
-      "source_line": 329,
+      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 338 行）",
+      "source_line": 338,
       "next": "wfr",
       "else_next": "fix_prompt"
     },
@@ -570,7 +570,7 @@
       "id": "fix_prompt",
       "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
       "next": "_n6",
-      "source_line": 334
+      "source_line": 343
     },
     {
       "type": "agentrun",
@@ -580,7 +580,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev2",
-      "source_line": 338
+      "source_line": 347
     },
     {
       "type": "agentrun",
@@ -590,7 +590,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_2",
-      "source_line": 339
+      "source_line": 348
     },
     {
       "type": "if",
@@ -601,8 +601,8 @@
         "value": true
       },
       "name": "F.contains(rev2.text, 'VERD…",
-      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 341 行）",
-      "source_line": 341,
+      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 350 行）",
+      "source_line": 350,
       "next": "wfr2",
       "else_next": "pub"
     },
@@ -612,7 +612,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
       "content": "$NODE.rev2.text",
       "next": "_n5",
-      "source_line": 342
+      "source_line": 351
     },
     {
       "type": "end",
@@ -625,7 +625,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 344
+      "source_line": 353
     },
     {
       "type": "writefile",
@@ -633,7 +633,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
       "content": "$NODE.rev1.text",
       "next": "_n7",
-      "source_line": 330
+      "source_line": 339
     },
     {
       "type": "end",
@@ -646,17 +646,17 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 332
+      "source_line": 341
     },
     {
       "type": "agentrun",
       "id": "_n9",
       "agent": "$NODE.agent",
-      "prompt": "$F.concat(\"The cargo test check failed. Edit the source files to fix every failing test below, then re-run `cargo test --workspace` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.g3.out)",
+      "prompt": "$F.concat(\"The cargo test check failed. Edit the source files to fix every failing test below, then re-run `cargo test --workspace` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- stdout ---\\n\", $NODE.g3.out, \"\\n--- stderr ---\\n\", $NODE.g3.err)",
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g3b",
-      "source_line": 292
+      "source_line": 301
     },
     {
       "type": "child",
@@ -714,7 +714,7 @@
         }
       },
       "next": "passed_eq_false_4",
-      "source_line": 299
+      "source_line": 308
     },
     {
       "type": "if",
@@ -725,8 +725,8 @@
         "value": false
       },
       "name": "g3b.passed == False?",
-      "desc": "if g3b.passed == False（第 301 行）",
-      "source_line": 301,
+      "desc": "if g3b.passed == False（第 310 行）",
+      "source_line": 310,
       "next": "wgf3",
       "else_next": "review_prompt"
     },
@@ -736,7 +736,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-test.log\")",
       "content": "$F.concat(\"cmd: cargo test --workspace\\n--- stdout ---\\n\", $NODE.g3b.out, \"\\n--- stderr ---\\n\", $NODE.g3b.err)",
       "next": "_n8",
-      "source_line": 302
+      "source_line": 311
     },
     {
       "type": "end",
@@ -750,17 +750,17 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 305
+      "source_line": 314
     },
     {
       "type": "agentrun",
       "id": "_n11",
       "agent": "$NODE.agent",
-      "prompt": "$F.concat(\"The clippy check failed. Edit the source files to fix every error below, then re-run `cargo clippy --workspace --all-targets --all-features -- -D warnings` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.g2.out)",
+      "prompt": "$F.concat(\"The clippy check failed. Edit the source files to fix every error below, then re-run `cargo clippy --workspace --all-targets --all-features -- -D warnings` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- stdout ---\\n\", $NODE.g2.out, \"\\n--- stderr ---\\n\", $NODE.g2.err)",
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g2b",
-      "source_line": 273
+      "source_line": 282
     },
     {
       "type": "child",
@@ -768,7 +768,7 @@
       "input": {
         "name": "clippy",
         "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-        "timeout_secs": 1200,
+        "timeout_secs": 1800,
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -818,7 +818,7 @@
         }
       },
       "next": "passed_eq_false_5",
-      "source_line": 280
+      "source_line": 289
     },
     {
       "type": "if",
@@ -829,8 +829,8 @@
         "value": false
       },
       "name": "g2b.passed == False?",
-      "desc": "if g2b.passed == False（第 283 行）",
-      "source_line": 283,
+      "desc": "if g2b.passed == False（第 292 行）",
+      "source_line": 292,
       "next": "wgf2",
       "else_next": "g3"
     },
@@ -840,7 +840,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-clippy.log\")",
       "content": "$F.concat(\"cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\\n--- stdout ---\\n\", $NODE.g2b.out, \"\\n--- stderr ---\\n\", $NODE.g2b.err)",
       "next": "_n10",
-      "source_line": 284
+      "source_line": 293
     },
     {
       "type": "end",
@@ -854,17 +854,17 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 287
+      "source_line": 296
     },
     {
       "type": "agentrun",
       "id": "_n14",
       "agent": "$NODE.agent",
-      "prompt": "$F.concat(\"The fmt check failed. Edit the source files to fix every error below, then re-run `cargo fmt --all` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- output tail ---\\n\", $NODE.g1.out)",
+      "prompt": "$F.concat(\"The fmt check failed. Edit the source files to fix every error below, then re-run `cargo fmt --all` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- stdout ---\\n\", $NODE.g1.out, \"\\n--- stderr ---\\n\", $NODE.g1.err)",
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g1b",
-      "source_line": 255
+      "source_line": 259
     },
     {
       "type": "child",
@@ -922,7 +922,7 @@
         }
       },
       "next": "_n12",
-      "source_line": 261
+      "source_line": 265
     },
     {
       "type": "if",
@@ -933,8 +933,8 @@
         "value": false
       },
       "name": "g1b.passed == False?",
-      "desc": "if g1b.passed == False（第 263 行）",
-      "source_line": 263,
+      "desc": "if g1b.passed == False（第 267 行）",
+      "source_line": 267,
       "next": "wgf1",
       "else_next": "g2"
     },
@@ -944,7 +944,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-fmt.log\")",
       "content": "$F.concat(\"cmd: cargo fmt --all\\n--- stdout ---\\n\", $NODE.g1b.out, \"\\n--- stderr ---\\n\", $NODE.g1b.err)",
       "next": "_n13",
-      "source_line": 264
+      "source_line": 268
     },
     {
       "type": "end",
@@ -958,7 +958,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 267
+      "source_line": 271
     },
     {
       "type": "end",

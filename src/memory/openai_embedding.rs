@@ -58,9 +58,10 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The dedicated `RECURSIVE_EMBEDDING_*` vars take precedence, so a deployment
 /// can point embeddings at a different endpoint (or a private gateway) than the
 /// chat provider — necessary when the chat provider is Anthropic, which exposes
-/// no OpenAI-compatible key to reuse. Falling back to the shared chat key logs
-/// a warning: reusing a non-OpenAI credential fires one doomed request per
-/// `remember` / `recall` before the keyword path takes over.
+/// no OpenAI-compatible key to reuse. Falling back to the shared chat key emits
+/// one construction-time warning: a chat credential is not necessarily an
+/// embeddings credential, so every `remember` / `recall` may fire a doomed
+/// request before the keyword path takes over.
 ///
 /// Requests are bounded by [`CONNECT_TIMEOUT`] and [`REQUEST_TIMEOUT`], so a
 /// dead embeds endpoint costs a few seconds and an empty vector, never a

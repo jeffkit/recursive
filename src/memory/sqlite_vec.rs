@@ -28,6 +28,15 @@ fn storage_err(e: impl std::fmt::Display) -> Error {
     }
 }
 
+/// Minimum cosine similarity for a semantic hit to count as a match.
+///
+/// Cosine search always has a nearest neighbour, so without a floor a query
+/// that matches nothing returns the `limit` "least unrelated" notes and reads
+/// to the agent as a successful search. Unrelated text under
+/// `text-embedding-3-small` (the default model) sits well below this;
+/// deployment with a model whose cosine distribution differs should adjust it.
+pub const MIN_COSINE_SIMILARITY: f32 = 0.2;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
@@ -224,12 +233,14 @@ impl VectorStore for SqliteVecStore {
                     })
                     .collect();
 
-                // Sort by descending similarity, then drop non-tagged entries
-                // *before* truncating — `limit` counts returned notes, not
+                // Sort by descending similarity, then drop the entries below
+                // the match floor and the non-tagged entries — both *before*
+                // truncating, because `limit` counts returned notes, not
                 // candidates.
                 scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 let entries: Vec<MemoryEntry> = scored
                     .into_iter()
+                    .filter(|(score, _)| *score >= MIN_COSINE_SIMILARITY)
                     .map(|(_, e)| e)
                     .filter(|e| matches_tag(e, tag))
                     .take(limit)
@@ -239,14 +250,17 @@ impl VectorStore for SqliteVecStore {
 
             // Fallback: keyword scan. Tags live in a JSON array column rather
             // than a table of their own, so the tag filter runs in Rust after
-            // the text match — which means no SQL LIMIT: truncating in SQL
+            // the text matches — which means no SQL LIMIT: truncating in SQL
             // would drop tagged rows ranked below the cut-off. The scan stays
             // small because the note store is capped (RECURSIVE_MEMORY_MAX_NOTES).
+            // Both the text and the tags column are matched, so a substring
+            // that only appears in a tag is still found (same contract as the
+            // file store and `NoopVectorStore`).
             let q = format!("%{}%", query_text.to_lowercase());
             let mut stmt = conn
                 .prepare(
                     "SELECT id, text, tags, ts FROM memory_entries
-                     WHERE lower(text) LIKE ?1
+                     WHERE lower(text) LIKE ?1 OR lower(tags) LIKE ?1
                      ORDER BY ts DESC",
                 )
                 .map_err(|e| storage_err(e.to_string()))?;
@@ -504,7 +518,7 @@ mod tests {
             tags: vec!["other".into()],
             ts: "2026-01-01T00:00:01Z".into(),
         };
-        store.upsert(&wanted, vec![0.0, 1.0]).await.unwrap();
+        store.upsert(&wanted, vec![0.6, 0.8]).await.unwrap();
         store.upsert(&closer, vec![1.0, 0.0]).await.unwrap();
 
         // The query is closest to the untagged entry: picking the top 1 by
@@ -513,6 +527,53 @@ mod tests {
             .search(vec![1.0, 0.0], "", Some("work"), 1)
             .await
             .unwrap();
+        assert_eq!(
+            results.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["E1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_drops_hits_below_the_similarity_floor() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::open(dir.path().join("test.db")).unwrap();
+
+        // Nearly orthogonal to the query — a nearest-neighbour scan would still
+        // return it as the "closest" entry, which is why the floor exists.
+        let unrelated = MemoryEntry {
+            id: "E1".into(),
+            text: "nothing to do with the query".into(),
+            tags: vec![],
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        store
+            .upsert(&unrelated, vec![0.1, 0.994_987])
+            .await
+            .unwrap();
+
+        let results = store.search(vec![1.0, 0.0], "", None, 10).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "a below-floor hit must not be reported as a match: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_keyword_search_matches_tags() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::open(dir.path().join("test.db")).unwrap();
+
+        let entry = MemoryEntry {
+            id: "E1".into(),
+            text: "general note".into(),
+            tags: vec!["special-tag".into()],
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        store.upsert(&entry, vec![]).await.unwrap();
+
+        // The keyword occurs only in the tag, never in the text — the file
+        // store and `NoopVectorStore` both match it, so this one must too.
+        let results = store.search(vec![], "special-tag", None, 5).await.unwrap();
         assert_eq!(
             results.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
             vec!["E1"]

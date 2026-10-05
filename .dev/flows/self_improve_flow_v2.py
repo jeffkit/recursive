@@ -249,6 +249,10 @@ def self_improve_v2(INPUT):
     # 格式化结果随提交走；解析错误才红并交 fix-loop 修语法。不用 --check：
     # apply 后 check 恒过，纯冗余；也不用 && 链——GATE 对单字符串 shlex.split
     # 后无 shell 直执行，&& 会变字面量参数（keeper 同款教训）。
+    # 修复提示必须带 stderr：cargo/rustfmt 的诊断全走 stderr，只喂 stdout
+    # 等于喂空串——fix-loop 收到「--- output tail ---」后面什么都没有，只能瞎猜
+    # （2026-10-05 pipeline-93-1005122022 实证：clippy 门红、g2.out 长度 0，
+    # 修复 agent 拿到空清单）。失败落盘分支早已是 out+err 双写，提示词对齐即可。
     g1 = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
                       "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
@@ -256,7 +260,7 @@ def self_improve_v2(INPUT):
                 'The fmt check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo fmt --all` yourself to verify "
                 "before stopping.\nFix the source, never silence with #[allow]."
-                "\n--- output tail ---\n", g1.out),
+                "\n--- stdout ---\n", g1.out, "\n--- stderr ---\n", g1.err),
             repo=pre.worktree, timeout_secs=7200)
         g1b = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
                            "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
@@ -266,20 +270,25 @@ def self_improve_v2(INPUT):
                                               g1b.out, "\n--- stderr ---\n", g1b.err))
             return {"verdict": "failed-preserved", "stage": "gates", "gate": g1b.gate,
                     "out": g1b.out}
+    # clippy 预算 1800s（原 1200s）：首次（冷 target）clippy check 每个依赖都要
+    # 出 rmeta，aws-lc-sys/libsqlite3-sys 这类原生依赖还要真编译；3 条 pipeline
+    # 并发抢 CPU 时 1200s 跑不完，门被 kill 在半途，输出里连一条 lint 都没有
+    # （2026-10-05 pipeline-93-1005122022 实证：g2 = 1200.8s、err 全是 Checking/
+    # Compiling 进度、零 error 行）。keeper 侧 gates.json 对该命令本就给 1800s。
     g2 = CHILD(input={"name": "clippy",
                       "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-                      "timeout_secs": 1200, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
                 'The clippy check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo clippy --workspace --all-targets "
                 "--all-features -- -D warnings` yourself to verify before stopping."
                 "\nFix the source, never silence with #[allow]."
-                "\n--- output tail ---\n", g2.out),
+                "\n--- stdout ---\n", g2.out, "\n--- stderr ---\n", g2.err),
             repo=pre.worktree, timeout_secs=7200)
         g2b = CHILD(input={"name": "clippy",
                            "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-                           "timeout_secs": 1200, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
         if g2b.passed == False:
             wgf2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-clippy.log"),
                              content=F.concat("cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\n--- stdout ---\n",
@@ -294,7 +303,7 @@ def self_improve_v2(INPUT):
                 "failing test below, then re-run `cargo test --workspace` yourself "
                 "to verify before stopping."
                 "\nFix the source, never silence with #[allow]."
-                "\n--- output tail ---\n", g3.out),
+                "\n--- stdout ---\n", g3.out, "\n--- stderr ---\n", g3.err),
             repo=pre.worktree, timeout_secs=7200)
         g3b = CHILD(input={"name": "test", "cmd": "cargo test --workspace",
                            "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)

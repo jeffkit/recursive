@@ -217,13 +217,16 @@ cargo build -p recursive-cli --features vector-memory
 The dedicated vars win, so embeddings can point somewhere other than the chat
 provider — needed when the chat provider is Anthropic or an in-house gateway
 with no OpenAI-compatible credential to reuse. Reusing the shared
-`RECURSIVE_API_KEY` for embeddings logs a warning: a chat credential is not
-necessarily an embeddings credential. Embedding requests are bounded (5 s to
-connect, 30 s in total), so a dead endpoint costs one failed request and then
-falls back to keyword recall rather than stalling the turn. The index at
-`<workspace>/.recursive/memory_vectors.db` is created on the first write, not
-when the workspace is opened. Without the feature or without a key, `recall`
-degrades to the keyword path instead of failing.
+`RECURSIVE_API_KEY` for embeddings logs one warning at startup: a chat
+credential is not necessarily an embeddings credential. Embedding requests are
+bounded (5 s to connect, 30 s in total), so a dead endpoint costs one failed
+request and then falls back to keyword recall rather than stalling the turn. The
+index at `<workspace>/.recursive/memory_vectors.db` is created on the first
+write, not when the workspace is opened. `recall` always unions the durable
+`memory.json` hits with the semantic ones — so a note written before the index
+existed stays reachable — and drops semantic hits below a cosine floor (every
+query has a nearest neighbour, even an unrelated one). Without the feature or
+without a key, `recall` degrades to the keyword path instead of failing.
 
 #### Adding a custom provider
 

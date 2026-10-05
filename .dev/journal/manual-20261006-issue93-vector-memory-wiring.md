@@ -95,3 +95,43 @@
 - 验证：`cargo test --workspace` → 0 failed（lib 822 passed）；`cargo test --lib --features vector-memory`
   → 2678 passed / 0 failed；`cargo clippy --all-targets --all-features -- -D warnings` → exit 0；
   `cargo fmt --all` → 干净。README 补超时/告警/惰性建库说明。
+
+## 复审第 2 轮修复（BLOCKING：默认构建下共享 no-op store 遮蔽 memory.json）
+
+续跑上下文里的 review-failure.log 判 NEEDS_FIX：默认构建（feature off）下
+`default_backends` 返回的**同一个** `NoopVectorStore` 被 remember/recall/forget
+共享。`remember` 一旦把笔记写进进程内 store，`Recall` 就会命中「向量结果非空」分支
+提前 return，文件回退从此不可达：
+
+- PROBE-1：只要本次会话有一条笔记命中文关键字，早先会话写进 `memory.json` 的笔记
+  被静默丢弃。
+- PROBE-2：返回插入序（最旧在前），违反工具自身 spec 的“most recent first”。
+
+修复：
+
+- `src/knowledge/memory.rs::Recall::execute` 重写为「**始终**先取 `memory.json`
+  的持久命中；只有在真的拿到 query 向量时才补做语义检索；再按 id 去重合并」。
+  - no-op embedding 恒返回空向量 → 完全跳过向量 store → 默认构建回到文件路径
+    （持久 + 最近优先），共享 no-op store 再也无法遮蔽文件。
+  - 语义命中（相关性序）在前，持久文件命中补齐剩余槽位——**并集**，使 secondary
+    的「语义路径一旦非空就终结文件路径 / 索引出现前写入的笔记不可见」一并解决。
+- `src/memory/sqlite_vec.rs`：语义分支加相似度下限 `MIN_COSINE_SIMILARITY = 0.2`
+  （`pub`，文档说明按部署模型可调）。没有下限时，不相关的 query 也会返回 `limit`
+  条「最近邻」，agent 会把它当成命中。
+- `src/memory/sqlite_vec.rs`：关键词分支改为
+  `WHERE lower(text) LIKE ?1 OR lower(tags) LIKE ?1`，与文件 store /
+  `NoopVectorStore` 的「匹配文本或标签」契约对齐（minor）。
+- `src/memory/openai_embedding.rs` 文档 + README：回落告警措辞统一为「构建期一次」
+  （minor）。
+- 新测试：`recall_still_sees_notes_from_earlier_sessions_in_the_default_build`
+  （复现 PROBE-1）、`recall_is_most_recent_first_in_the_default_build`（复现
+  PROBE-2）、`recall_unions_semantic_hits_with_the_durable_file`、
+  `sqlite_store_drops_hits_below_the_similarity_floor`、
+  `sqlite_store_keyword_search_matches_tags`；并调整
+  `sqlite_store_applies_the_tag_filter_before_the_similarity_limit` 的向量，使
+  被选条目落在下限之上（保留「先过滤后截断」的断言意图）。
+- 验证：`cargo test --lib -- memory::` → 66 passed / 0 failed；
+  `cargo test --lib --features vector-memory -- memory::` → 86 passed / 0 failed；
+  `cargo fmt --all -- --check` → 干净；
+  `cargo clippy --all-targets --all-features -- -D warnings` → exit 0；
+  `cargo test --workspace` → 全绿。

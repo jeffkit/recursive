@@ -202,6 +202,15 @@ Don't edit files a live worktree run is working on.
    is the tell). Symptom to react to: you clean every listed survivor, re-run, and the gate
    is red again. Fix: budget the gate for a long run (`.flowcast/gates.json` → `timeout`,
    aligned with `agent-mutants`) — never shrink the gate's scope to hide this.
+9. **v2 flow `clippy` gate: timeout reads as "clippy failed" with an empty error list.**
+   `self_improve_flow_v2.py`'s clippy gate is a cold `cargo clippy --all-features` on every
+   fresh worktree target — all deps must emit rmeta (`aws-lc-sys` / `libsqlite3-sys` really
+   compile) — so with several pipelines running it blew the old 1200 s budget and was killed
+   mid-build (telltale: `g2` ≈ budget, stderr full of `Checking`/`Compiling`, zero `error`
+   lines). The fix-round prompt then showed nothing, because it fed only `g2.out` while
+   cargo writes diagnostics to stderr. Both fixed at source (budget 1800 s = keeper
+   `gates.json`; prompts now carry `out` + `err`). If you see a cargo gate "fail" with an
+   empty tail, read the gate's stderr in the run checkpoint before editing any Rust.
 
 New failure modes should be added here, not silently worked around.
 
