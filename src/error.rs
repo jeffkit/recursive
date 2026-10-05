@@ -180,16 +180,31 @@ impl Error {
         }
     }
 
-    /// Issue #123: did the LLM call itself fail — a revoked key, an
-    /// unreachable gateway, a malformed provider response?
+    /// Issue #123: did the LLM call itself fail *providing service* — a
+    /// revoked key (401/403), a rate limit (429), a 5xx, an unreachable
+    /// gateway, a malformed provider response?
     ///
     /// The adapters funnel all of those into [`Error::Llm`] (transport errors
-    /// included, via `"request failed: …"`), so only that variant counts.
-    /// `RateLimited` deliberately does not: a 429 means the endpoint answered.
+    /// included, via `"request failed: …"`), so a message with no parseable
+    /// status counts: the endpoint never answered.
+    ///
+    /// A **request-caused** 4xx does not — an oversized prompt earning a 400,
+    /// or a 404 for a model name, says nothing about the endpoint's health,
+    /// and three of those in a row would pull a healthy pod out of rotation.
+    /// 401/403/429 are the opposite case: they reject the key or the account,
+    /// so they stay provider-side.
+    ///
     /// Drives `/readyz`'s LLM check, where a tool, storage or cancellation
     /// fault must not look like provider downtime.
     pub fn is_llm_failure(&self) -> bool {
-        matches!(self, Error::Llm { .. })
+        match self {
+            Error::RateLimited { .. } => true,
+            Error::Llm { .. } => match self.http_status() {
+                Some(status) => !(400..500).contains(&status) || matches!(status, 401 | 403 | 429),
+                None => true,
+            },
+            _ => false,
+        }
     }
 
     /// Returns `true` for transport-level failures with no HTTP status to
@@ -620,23 +635,46 @@ mod tests {
         .is_transient_provider_error());
     }
 
-    /// Issue #123: only a failed LLM call itself may count against `/readyz` —
-    /// a rate limit means the endpoint answered, and every non-LLM variant is
-    /// some other subsystem's fault.
+    /// Issue #123: only a provider-side failure may count against `/readyz` —
+    /// a request-caused 4xx (an oversized prompt earning a 400) says nothing
+    /// about the endpoint, and every non-LLM variant is some other subsystem's
+    /// fault.
     #[test]
-    fn is_llm_failure_covers_only_the_provider_variant() {
-        assert!(Error::Llm {
+    fn is_llm_failure_covers_only_provider_side_failures() {
+        let llm = |message: &str| Error::Llm {
             provider: "openai".into(),
-            message: "HTTP 401 Unauthorized: bad key".into(),
+            message: message.into(),
+        };
+        for message in [
+            "HTTP 401 Unauthorized: bad key",
+            "HTTP 403 Forbidden: key lacks model access",
+            "HTTP 429 Too Many Requests: slow down",
+            "HTTP 503 Service Unavailable: upstream down",
+            // A 2xx we could not use is still the provider's fault.
+            "HTTP 200 but response body is empty",
+            // No status: the endpoint never answered — a dropped send, a
+            // stream read error, or a body we could not parse.
+            "request failed: connection refused",
+            "SSE stream read error: unexpected eof",
+        ] {
+            assert!(
+                llm(message).is_llm_failure(),
+                "{message} must count against readiness"
+            );
         }
-        .is_llm_failure());
-        assert!(Error::Llm {
-            provider: "openai".into(),
-            message: "request failed: connection refused".into(),
+        for message in [
+            // Request-caused: a healthy endpoint rejecting our payload.
+            "HTTP 400 Bad Request: prompt is too long",
+            "HTTP 404 Not Found: unknown model",
+            "HTTP 422 Unprocessable Entity: bad tool schema",
+        ] {
+            assert!(
+                !llm(message).is_llm_failure(),
+                "{message} must not pull a healthy pod out of rotation"
+            );
         }
-        .is_llm_failure());
 
-        assert!(!Error::RateLimited {
+        assert!(Error::RateLimited {
             provider: "openai".into(),
             retry_after_ms: 1000,
         }

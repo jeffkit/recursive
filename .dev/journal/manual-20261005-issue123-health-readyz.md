@@ -129,8 +129,8 @@ client cancellations. Split the signals:
 - `record_run_success` / `record_run_failed` — run counters only.
 - `record_llm_success` / `record_llm_failure` — readiness signal, called only
   where the run really completed (or `Error::is_llm_failure()` holds: a
-  revoked key, an unreachable gateway, a malformed provider response; a 429
-  means the endpoint answered and does not count).
+  revoked key, a rate limit, a 5xx, an unreachable gateway, a malformed
+  provider response — see the second review round below for the 4xx split).
 - A cancelled turn (AG-UI cancel, session interrupt) now touches neither.
 
 ### Storage probe: real round-trip, shared, and bounded
@@ -154,3 +154,54 @@ client cancellations. Split the signals:
 `memory_round_trip_{accepts_a_working_backend,rejects_a_refused_write,rejects_a_dropped_write}`
 (storage), plus the rewritten `record_run_metrics_track_llm_streak` and the
 stamped-threshold updates.
+
+## Review round 2 (NEEDS_FIX → fixes)
+
+### Blocking: `doctor --probe` probed a storage root no production path uses
+
+`probe_storage` built its backend with `http_storage_backend(config.workspace)`,
+so it wrote `<workspace>/.recursive/memory/__doctor_probe__` while `recursive
+http` roots the *same* factory at `user_workspace_dir(&config.workspace)`
+(`<RECURSIVE_HOME|~>/.recursive/workspaces/<hash>/`). A read-only or full
+*server* storage dir therefore still reported
+`✓ Storage write/read round-trip`, and the probe parked residue in the project
+tree. Fixed:
+
+- `probe_storage` resolves
+  `recursive::user_workspace_dir(&config.workspace)` and builds the backend
+  from that root; the success detail now names that root (the operator needs to
+  know which dir was probed).
+- The `remove_file` moved *before* the error propagates: a round trip that
+  failed may still have landed the write.
+- `doctor_probe_storage_round_trips_against_the_server_root_and_cleans_up`
+  pins `RECURSIVE_HOME` at a tempdir (it used to write into the real user dir),
+  asserts the detail names the user-dir root, that the probe entry is gone from
+  there, and that `<workspace>/.recursive/memory` was never created.
+
+### `/readyz` LLM check: request-caused 4xx counted as provider downtime
+
+`is_llm_failure()` was `matches!(self, Error::Llm { .. })`, so three
+consecutive *client-caused* failures — an oversized prompt earning an HTTP 400
+from emergency compaction, a 404 for a model name — 503'd `/readyz` for the
+60 s window and pulled a healthy pod out of rotation. It now classifies by
+status through the existing `Error::http_status()`: everything counts except a
+*request-caused* 4xx — so a message with no parseable status (transport /
+unparseable body), a 5xx, 401/403/429 and an unusable 2xx all count, while
+400/404/422 do not. `Error::RateLimited` (the structured 429) counts too, for
+one rule per status.
+
+### `doctor --probe` LLM probe retried on the Anthropic arm
+
+`probe_llm` zeroed only the `RetryPolicy` argument, which the Anthropic arm of
+`build_llm_provider` ignores (it derives its policy from `config.retry_*`), so
+"one real chat request" was 3 retries and ~7 s of backoff against a dead
+gateway. The probe now builds from a cloned config with `retry_max = 0`, which
+both arms honour.
+
+### Tests changed by this round
+
+- `error.rs`: `is_llm_failure_covers_only_provider_side_failures` (rewritten —
+  401/403/429/5xx/transport count; 400/404/422 do not; `RateLimited` does).
+- `crates/recursive-cli/src/main.rs`:
+  `doctor_probe_storage_round_trips_against_the_server_root_and_cleans_up`
+  (renamed + rewritten as above).

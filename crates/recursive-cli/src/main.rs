@@ -1626,13 +1626,23 @@ async fn cmd_doctor(
 /// This is the only check that can see a dead key or an unreachable gateway —
 /// the static "API key is set" check passes for a revoked key.
 async fn probe_llm(config: &Config) -> std::result::Result<String, String> {
-    let api_key = config.require_api_key().map_err(|e| e.to_string())?;
-    let retry = RetryPolicy {
-        max_retries: 0,
-        initial_backoff: Duration::from_secs(1),
-        max_backoff: Duration::from_secs(1),
+    // One request, no retry, on *both* arms: the Anthropic arm derives its
+    // policy from `config.retry_*` and ignores the `retry` argument, so zeroing
+    // only the latter would still sit through the configured retries and their
+    // backoff before reporting a dead gateway.
+    let probe_config = &Config {
+        retry_max: 0,
+        retry_initial_backoff_secs: 1,
+        retry_max_backoff_secs: 1,
+        ..config.clone()
     };
-    let provider = cli::builder::build_llm_provider(config, api_key, retry, None)
+    let api_key = probe_config.require_api_key().map_err(|e| e.to_string())?;
+    let retry = RetryPolicy {
+        max_retries: probe_config.retry_max,
+        initial_backoff: Duration::from_secs(probe_config.retry_initial_backoff_secs),
+        max_backoff: Duration::from_secs(probe_config.retry_max_backoff_secs),
+    };
+    let provider = cli::builder::build_llm_provider(probe_config, api_key, retry, None)
         .map_err(|e| e.to_string())?;
     let messages = vec![recursive::message::Message::user("ping")];
     let started = std::time::Instant::now();
@@ -1649,13 +1659,21 @@ async fn probe_llm(config: &Config) -> std::result::Result<String, String> {
 }
 
 /// `--probe`: write then read back a reserved key through the same storage
-/// backend the HTTP server uses — a read-only mount or a full disk fails here.
+/// backend the HTTP server uses, rooted where the server roots it — a
+/// read-only mount or a full disk fails here.
+///
+/// The root is [`recursive::user_workspace_dir`], not the workspace: the HTTP
+/// server persists transcripts and memory under the per-workspace *user* dir
+/// (`<user_workspace_dir>/.recursive/…`, see `recursive http`'s startup), so
+/// probing the project tree would report healthy storage while a read-only
+/// server dir still loses every session.
 ///
 /// Cleanup is best-effort (the backend trait has no delete); a leftover
 /// `__doctor_probe__` entry is harmless.
 async fn probe_storage(config: &Config) -> std::result::Result<String, String> {
     const KEY: &str = "__doctor_probe__";
-    let backend = recursive::storage::http_storage_backend(config.workspace.clone())
+    let root = recursive::user_workspace_dir(&config.workspace).map_err(|e| e.to_string())?;
+    let backend = recursive::storage::http_storage_backend(root.clone())
         .await
         .map_err(|e| e.to_string())?;
     // The same write+read-back `/readyz` runs (issue #123) — one
@@ -1663,13 +1681,15 @@ async fn probe_storage(config: &Config) -> std::result::Result<String, String> {
     // the life of the process, so a concurrent probe cannot make this one's
     // read-back look like a mismatch.
     let value = format!("probe {}", std::process::id());
-    recursive::storage::memory_round_trip(backend.as_ref(), KEY, &value)
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(config.workspace.join(".recursive").join("memory").join(KEY));
+    let round_trip = recursive::storage::memory_round_trip(backend.as_ref(), KEY, &value).await;
+    // Before propagating: a *failed* round trip may still have landed the
+    // write, and its residue must not outlive the probe. (The S3 arm ignores
+    // `root` and has no delete — see `storage::http_storage_backend`.)
+    let _ = std::fs::remove_file(root.join(".recursive").join("memory").join(KEY));
+    round_trip.map_err(|e| e.to_string())?;
     Ok(format!(
         "{} accepted and returned the probe",
-        config.workspace.display()
+        root.display()
     ))
 }
 
@@ -4250,19 +4270,41 @@ mod tests {
     }
 
     /// Issue #123: `doctor --probe` writes and reads back a probe through the
-    /// same storage backend the HTTP server uses, and leaves no residue.
+    /// same storage backend the HTTP server uses — rooted at the per-workspace
+    /// *user* dir, not the project tree — and leaves no residue.
     #[tokio::test]
-    async fn doctor_probe_storage_round_trips_and_cleans_up() {
+    async fn doctor_probe_storage_round_trips_against_the_server_root_and_cleans_up() {
         std::env::remove_var(recursive::storage::ENV_S3_BUCKET);
+        let home = tempfile::tempdir().expect("home");
         let tmp = tempfile::tempdir().expect("tempdir");
+        // `user_workspace_dir` resolves through RECURSIVE_HOME, so pin it at
+        // the tempdir: without this the probe writes into the developer's real
+        // user dir.
+        let prev_home = std::env::var_os("RECURSIVE_HOME");
+        std::env::set_var("RECURSIVE_HOME", home.path());
+
         let config = dummy_config(tmp.path());
+        let root = recursive::user_workspace_dir(tmp.path()).expect("user workspace dir");
 
         let detail = probe_storage(&config)
             .await
             .expect("storage probe must pass");
         assert!(detail.contains("accepted"), "detail: {detail}");
-        let probe = tmp.path().join(".recursive/memory/__doctor_probe__");
+        assert!(
+            detail.contains(&root.display().to_string()),
+            "the probe must report the server's storage root: {detail}"
+        );
+        let probe = root.join(".recursive/memory/__doctor_probe__");
         assert!(!probe.exists(), "probe entry must be cleaned up");
+        assert!(
+            !tmp.path().join(".recursive/memory").exists(),
+            "the probe must not write into the project tree"
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+            None => std::env::remove_var("RECURSIVE_HOME"),
+        }
     }
 
     /// Issue #123: the disk probe writes then verifies 1 MiB and removes it.
