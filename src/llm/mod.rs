@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::message::Message;
 
 pub mod chat;
+pub mod factory;
 pub mod pricing;
 pub mod search;
 
@@ -40,6 +41,7 @@ pub use crate::message::ToolCall;
 
 // ── Re-exports: pricing ───────────────────────────────────────────────────────
 
+pub use factory::build_llm_provider;
 pub use pricing::{
     context_window_tokens_for_model, context_window_tokens_for_model_effective,
     default_compact_threshold_chars, default_compact_threshold_tokens, pricing_for, ModelPricing,

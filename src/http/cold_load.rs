@@ -107,6 +107,13 @@ pub(super) struct SessionMeta {
     /// restores with the server default, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// Issue #94: per-session run overrides (USD ceiling, thinking budget).
+    /// `default` keeps stored blobs written before this field existed valid.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::http::SessionOverrides::is_default"
+    )]
+    pub overrides: crate::http::SessionOverrides,
 }
 
 /// Storage key for the per-session metadata blob (issue #98).
@@ -322,6 +329,9 @@ async fn build_restored_runtime(
         meta.and_then(|m| m.preset.as_deref()),
         &state.config,
     )?;
+    // Issue #94: restore the session's run overrides so a cold-loaded session
+    // keeps the budget / thinking budget its creator asked for.
+    let overrides = meta.map(|m| m.overrides).unwrap_or_default();
     let mut runtime = super::handlers::build_session_runtime(
         state,
         tool_registry,
@@ -329,6 +339,7 @@ async fn build_restored_runtime(
         segments,
         max_steps,
         &preset,
+        overrides,
     )
     .seed_transcript(seed)
     .build()
@@ -628,6 +639,7 @@ mod tests {
             title: Some("ship it".into()),
             max_steps: Some(7),
             preset: Some("standard".into()),
+            overrides: Default::default(),
         };
         persist_session_meta(&state, "s1", &meta).await;
         let loaded = load_session_meta(&state, "s1")
@@ -657,6 +669,7 @@ mod tests {
                 title: None,
                 max_steps: Some(9),
                 preset: None,
+                overrides: Default::default(),
             },
         )
         .await;
@@ -716,6 +729,7 @@ mod tests {
                 title: Some("pirate chat".into()),
                 max_steps: Some(7),
                 preset: Some("standard".into()),
+                overrides: Default::default(),
             },
         )
         .await;
@@ -792,6 +806,7 @@ mod tests {
                 title: None,
                 max_steps: None,
                 preset: None,
+                overrides: Default::default(),
             },
         )
         .await;

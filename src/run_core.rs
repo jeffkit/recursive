@@ -46,6 +46,58 @@ use crate::tools::PermissionHook;
 /// Placeholder text used when trimming old tool results to fit the transcript budget.
 pub(crate) const TRIM_PLACEHOLDER: &str = "[older tool output trimmed to fit budget]";
 
+/// Issue #94: mid-turn USD spend ceiling.
+///
+/// The step loop evaluates this at every step wrap-up (see
+/// [`RunCore::process_tool_results`]) and terminates with
+/// [`FinishReason::BudgetExceeded`] once the turn's accumulated spend reaches
+/// the ceiling — so a looping model cannot keep issuing LLM calls after the
+/// caller's budget is gone.
+///
+/// Pricing is resolved once, from the configured model, at construction.
+/// A model with no entry in the pricing catalog degrades to a token ceiling
+/// at [`CostBudget::FALLBACK_USD_PER_MILLION_TOKENS`] — a deliberately
+/// pessimistic blended rate — so an unpriced model still cannot run away.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CostBudget {
+    limit_usd: f64,
+    pricing: Option<crate::llm::ModelPricing>,
+}
+
+impl CostBudget {
+    /// Blended rate assumed when the model has no pricing entry. $10 per
+    /// million tokens is above every mainstream coding model's blended rate,
+    /// so the derived token ceiling errs on the side of stopping early.
+    pub(crate) const FALLBACK_USD_PER_MILLION_TOKENS: f64 = 10.0;
+
+    /// Build a guard from a USD ceiling. `None` / a non-positive ceiling
+    /// disables budgeting entirely (mirrors `max_steps == 0` = unlimited).
+    pub(crate) fn new(
+        limit_usd: Option<f64>,
+        pricing: Option<crate::llm::ModelPricing>,
+    ) -> Option<Self> {
+        limit_usd
+            .filter(|l| *l > 0.0)
+            .map(|limit_usd| Self { limit_usd, pricing })
+    }
+
+    /// USD value of the accumulated usage: exact when the model is priced,
+    /// otherwise the pessimistic blended-rate estimate.
+    pub(crate) fn spend_usd(&self, usage: &TokenUsage) -> f64 {
+        match self.pricing {
+            Some(p) => p.cost_usd(*usage),
+            None => {
+                f64::from(usage.total_tokens) * Self::FALLBACK_USD_PER_MILLION_TOKENS / 1_000_000.0
+            }
+        }
+    }
+
+    /// Whether the accumulated usage has already reached the ceiling.
+    pub(crate) fn exceeded(&self, usage: &TokenUsage) -> bool {
+        self.spend_usd(usage) >= self.limit_usd
+    }
+}
+
 /// Minimum tool-result size (bytes) worth trimming; shorter results are kept verbatim.
 const MIN_TRIM_LENGTH: usize = 200;
 
@@ -220,6 +272,9 @@ pub(crate) struct RunCore<'a> {
     /// cancel-aware backoff and re-issues the call instead of ending the
     /// turn and discarding the steps already completed.
     pub(crate) step_retry: RetryPolicy,
+    /// Issue #94: mid-turn USD spend ceiling (from
+    /// [`crate::kernel::AgentKernelBuilder::cost_budget`]). `None` = unbudgeted.
+    pub(crate) cost_budget: Option<CostBudget>,
 }
 
 impl<'a> RunCore<'a> {
@@ -519,6 +574,7 @@ impl<'a> RunCore<'a> {
         &mut self,
         results: &[ToolCallOutcome],
         step: usize,
+        total_usage: &TokenUsage,
         recent_errors: &mut std::collections::VecDeque<(bool, String)>,
         tool_audits: &mut std::collections::HashMap<
             crate::tools::AuditKey,
@@ -627,6 +683,18 @@ impl<'a> RunCore<'a> {
         // tool_result in the transcript, so ending the turn here cannot
         // leave orphaned `tool_use` blocks behind.
         if let Some(finish) = stuck_finish {
+            self.emit(AgentEvent::TurnFinished {
+                reason: finish_reason_str(&finish),
+                steps: step,
+            });
+            return Some(finish);
+        }
+
+        // Issue #94: cost ceiling, evaluated at the same wrap-up point (and
+        // for the same reason — the batch is fully paired before we can
+        // return). Stopping here means the next step's LLM call is never
+        // issued once the turn's spend has reached `max_budget_usd`.
+        if let Some(finish) = self.cost_budget_finish(total_usage) {
             self.emit(AgentEvent::TurnFinished {
                 reason: finish_reason_str(&finish),
                 steps: step,
@@ -811,6 +879,23 @@ impl<'a> RunCore<'a> {
             "agent.run.complete (wall clock)"
         );
         Some((finish, finished_steps))
+    }
+
+    /// Issue #94: evaluate the USD ceiling against the turn's accumulated
+    /// usage. Returns [`FinishReason::BudgetExceeded`] once the spend has
+    /// reached `max_budget_usd` — data, not an error (invariant #7), so the
+    /// transcript survives. Kept out of `run_inner` to protect invariant #1.
+    fn cost_budget_finish(&self, total_usage: &TokenUsage) -> Option<FinishReason> {
+        let budget = self.cost_budget?;
+        if !budget.exceeded(total_usage) {
+            return None;
+        }
+        warn!(
+            target: "recursive::agent",
+            spent_usd = budget.spend_usd(total_usage),
+            "cost budget exceeded — stopping turn before the next LLM call"
+        );
+        Some(FinishReason::BudgetExceeded)
     }
 
     /// Assemble the final outcome for a run that terminates with `finish`
@@ -1520,6 +1605,7 @@ impl<'a> RunCore<'a> {
             if let Some(finish) = self.process_tool_results(
                 &results,
                 step,
+                &total_usage,
                 &mut recent_errors,
                 &mut tool_audits,
                 &mut skill_injector,
@@ -1574,7 +1660,7 @@ mod tests {
 
     use super::{
         effective_step_limit, estimate_prompt_tokens, estimate_tokens_by_bytes, finish_reason_str,
-        RunCore, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
+        CostBudget, RunCore, TokenUsage, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
     };
     use crate::context_breakdown::StaticBreakdownCache;
     use crate::message::Message;
@@ -1808,6 +1894,7 @@ mod tests {
             wall_timeout_secs: 0,
             wall_start: None,
             step_retry: crate::llm::RetryPolicy::default(),
+            cost_budget: None,
         }
     }
 
@@ -1936,6 +2023,7 @@ mod tests {
             wall_timeout_secs: 0,
             wall_start: None,
             step_retry: crate::llm::RetryPolicy::default(),
+            cost_budget: None,
         }
     }
 
@@ -2820,6 +2908,7 @@ mod tests {
             wall_timeout_secs: 0,
             wall_start: None,
             step_retry: crate::llm::RetryPolicy::default(),
+            cost_budget: None,
         }
     }
 
@@ -4163,5 +4252,143 @@ mod tests {
             .expect("cancel-aware backoff must end the run well before 30s")
             .expect("cancellation is a finish reason, not an error (invariant #7)");
         assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
+    }
+
+    // ========================================================================
+    // Issue #94: mid-turn USD cost ceiling
+    // ========================================================================
+
+    /// A priced model: `$1.00` per million input tokens, no output tokens.
+    fn one_dollar_per_million() -> crate::llm::ModelPricing {
+        crate::llm::ModelPricing {
+            input_per_million: 1.0,
+            output_per_million: 1.0,
+            cache_hit_input_per_million: 0.1,
+        }
+    }
+
+    fn usage_of(prompt_tokens: u32) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cost_budget_disabled_for_absent_or_non_positive_ceiling() {
+        assert!(CostBudget::new(None, Some(one_dollar_per_million())).is_none());
+        assert!(CostBudget::new(Some(0.0), Some(one_dollar_per_million())).is_none());
+        assert!(CostBudget::new(Some(-1.0), Some(one_dollar_per_million())).is_none());
+        assert!(CostBudget::new(Some(1.0), Some(one_dollar_per_million())).is_some());
+    }
+
+    #[test]
+    fn cost_budget_uses_pricing_when_the_model_is_priced() {
+        let budget = CostBudget::new(Some(1.0), Some(one_dollar_per_million()))
+            .expect("1 USD ceiling is a real budget");
+        // 1M input tokens at $1/M = exactly the ceiling.
+        assert!((budget.spend_usd(&usage_of(1_000_000)) - 1.0).abs() < 1e-9);
+        assert!(
+            budget.exceeded(&usage_of(1_000_000)),
+            "== ceiling must trip"
+        );
+        assert!(!budget.exceeded(&usage_of(999_999)));
+    }
+
+    #[test]
+    fn cost_budget_degrades_to_a_token_ceiling_when_the_model_is_unpriced() {
+        let budget = CostBudget::new(Some(1.0), None).expect("unpriced models still budget");
+        // $1 at the pessimistic $10/M fallback rate = 100_000 tokens.
+        let ceiling_tokens = (1_000_000.0 / CostBudget::FALLBACK_USD_PER_MILLION_TOKENS) as u32;
+        assert_eq!(ceiling_tokens, 100_000);
+        assert!(budget.exceeded(&usage_of(ceiling_tokens)));
+        assert!(!budget.exceeded(&usage_of(ceiling_tokens - 1)));
+    }
+
+    /// A tool that always succeeds — keeps stuck detection quiet so the cost
+    /// ceiling is the only thing that can end the run.
+    struct AlwaysOkTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for AlwaysOkTool {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::llm::ToolSpec {
+                name: "AlwaysOkTool".to_string(),
+                description: "always succeeds".to_string(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    /// Issue #94 acceptance: a goal that would otherwise keep looping stops
+    /// mid-run with `BudgetExceeded` once the turn's spend reaches the
+    /// ceiling — before the next LLM call is issued — and the reported usage
+    /// does not exceed the ceiling. Also pins invariant #7: the transcript
+    /// (assistant + paired tool results) survives the budget exit.
+    #[tokio::test]
+    async fn run_inner_stops_with_budget_exceeded_at_the_usd_ceiling() {
+        use crate::agent::FinishReason;
+        use crate::llm::{Completion, ToolCall};
+        use crate::tools::ToolRegistry;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // $0.01 per step: 10_000 prompt tokens at $1/M.
+        let step_usage = usage_of(10_000);
+        let make_tc = |id: &str| Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "AlwaysOkTool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: Some(step_usage),
+            reasoning_content: None,
+        };
+        // Four scripted steps; only three may be consumed ($0.03 ceiling).
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            make_tc("tc1"),
+            make_tc("tc2"),
+            make_tc("tc3"),
+            make_tc("tc4"),
+        ]));
+        let mut core = make_run_core_for_inner(
+            vec![Message::user("loop forever".to_string())],
+            &hooks,
+            provider,
+            10,
+        );
+        core.tools = Arc::new(ToolRegistry::default().register(Arc::new(AlwaysOkTool)));
+        let ceiling_usd = 0.03;
+        core.cost_budget = CostBudget::new(Some(ceiling_usd), Some(one_dollar_per_million()));
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::BudgetExceeded),
+            "expected BudgetExceeded, got {:?}",
+            outcome.finish_reason,
+        );
+        assert_eq!(
+            outcome.steps, 3,
+            "must stop at the step where the ceiling was reached, not at max_steps"
+        );
+        let budget =
+            CostBudget::new(Some(ceiling_usd), Some(one_dollar_per_million())).expect("budget set");
+        let spent = budget.spend_usd(&outcome.total_usage);
+        assert!(
+            spent <= ceiling_usd + 1e-9,
+            "reported spend {spent} must not exceed the ceiling {ceiling_usd}"
+        );
+        assert!(
+            spent >= ceiling_usd - 1e-9,
+            "the ceiling must actually have been reached, spent {spent}"
+        );
+        // Transcript kept: 1 user + 3 × (assistant tool_call + tool result).
+        assert_eq!(outcome.messages.len(), 7, "transcript must be preserved");
     }
 }

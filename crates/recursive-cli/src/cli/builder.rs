@@ -12,7 +12,7 @@ use recursive::skills::{discover_skills, skills_for_injection, Skill};
 use recursive::tools::WebSearch;
 use recursive::{
     assemble_system_prompt,
-    llm::{AnthropicProvider, ChatProvider, OpenAiProvider},
+    llm::ChatProvider,
     register_subagent_if_enabled,
     tools::fs::ReadFileState,
     tools::EpisodicRecall,
@@ -653,46 +653,29 @@ fn apply_skill_injection(mut base: String, injected: &[(String, String)]) -> Str
 
 /// Construct the LLM provider named by `config.provider_type`.
 ///
-/// Shared by every surface that used to open-code the same `match` (the
-/// agent runtime, loop mode, the ACP server and the HTTP server), so the
-/// `"anthropic"` arm exists in exactly one place. `max_search_rounds`
-/// preserves the per-surface behaviour: agent surfaces forward
-/// `config.max_search_rounds`, while the ACP/HTTP servers keep the
-/// provider default (`None`) as before this helper existed.
+/// Thin delegation to [`recursive::llm::build_llm_provider`] (issue #94) —
+/// the construction moved into the library so the HTTP layer can build a
+/// provider for a single request (per-request `thinking_budget`) with the
+/// same Anthropic/OpenAI arms. `max_search_rounds` preserves the per-surface
+/// behaviour: agent surfaces forward `config.max_search_rounds`, while the
+/// ACP/HTTP servers keep the provider default (`None`) as before this helper
+/// existed. `config.thinking_budget` (set by `--effort` /
+/// `RECURSIVE_THINKING_BUDGET`) is forwarded as the Anthropic
+/// `thinking.budget_tokens` value.
 pub(crate) fn build_llm_provider(
     config: &Config,
     api_key: &str,
     retry: RetryPolicy,
     max_search_rounds: Option<usize>,
 ) -> anyhow::Result<Arc<dyn ChatProvider>> {
-    let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
-        "anthropic" => {
-            let anthropic_retry = recursive::llm::RetryPolicy {
-                max_retries: config.retry_max,
-                initial_backoff: Duration::from_secs(config.retry_initial_backoff_secs),
-                max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
-            };
-            let mut anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
-                .with_temperature(config.temperature)
-                .with_max_tokens(config.max_tokens)
-                .with_retry_policy(anthropic_retry);
-            if let Some(rounds) = max_search_rounds {
-                anthropic = anthropic.with_max_search_rounds(rounds);
-            }
-            Arc::new(anthropic)
-        }
-        _ => {
-            let mut openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
-                .with_temperature(config.temperature)
-                .with_max_tokens(config.max_tokens)
-                .with_retry_policy(retry);
-            if let Some(rounds) = max_search_rounds {
-                openai = openai.with_max_search_rounds(rounds);
-            }
-            Arc::new(openai)
-        }
-    };
-    Ok(provider)
+    recursive::llm::build_llm_provider(
+        config,
+        api_key,
+        retry,
+        max_search_rounds,
+        config.thinking_budget,
+    )
+    .map_err(Into::into)
 }
 
 /// Build an [`AgentRuntime`], optionally registering MCP tools from a config file.
@@ -826,6 +809,13 @@ pub(crate) async fn build_runtime(
         // Goal 399: `RECURSIVE_WALL_TIMEOUT_SECS` now reaches the agent loop —
         // previously parsed into Config but never consumed anywhere.
         .wall_timeout_secs(config.wall_timeout_secs)
+        // Issue #94: `--max-budget-usd` / `RECURSIVE_MAX_BUDGET_USD` used to
+        // be a stored-but-dead field; the step loop now stops with
+        // `BudgetExceeded` once the turn's spend reaches the ceiling.
+        .cost_budget(
+            config.max_budget_usd,
+            recursive::llm::pricing_for(&config.model),
+        )
         .streaming(stream)
         .stuck_window(config.stuck_window)
         .stuck_error_rate(config.stuck_error_rate)

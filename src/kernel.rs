@@ -205,6 +205,13 @@ pub struct AgentKernel {
     /// backoff instead of ending the turn). Defaults to
     /// [`RetryPolicy::for_step_loop_from_env`].
     pub(crate) step_retry: RetryPolicy,
+    /// Issue #94: per-turn USD spend ceiling, threaded into `RunCore` so the
+    /// step loop can stop with `FinishReason::BudgetExceeded`. `None` = no cap.
+    pub(crate) max_budget_usd: Option<f64>,
+    /// Issue #94: rate card used to convert accumulated usage into USD.
+    /// `None` when the configured model has no pricing entry — the guard then
+    /// degrades to a token ceiling.
+    pub(crate) budget_pricing: Option<crate::llm::ModelPricing>,
 }
 
 impl std::fmt::Debug for AgentKernel {
@@ -362,6 +369,10 @@ impl AgentKernel {
                     None
                 },
                 step_retry: self.step_retry.clone(),
+                cost_budget: crate::run_core::CostBudget::new(
+                    self.max_budget_usd,
+                    self.budget_pricing,
+                ),
             }
         };
 
@@ -441,6 +452,10 @@ pub struct AgentKernelBuilder {
     /// Issue #100: cross-step retry policy for transient provider failures.
     /// `None` → [`RetryPolicy::for_step_loop_from_env`] at build time.
     step_retry: Option<RetryPolicy>,
+    /// Issue #94: per-turn USD spend ceiling + the rate card used to convert
+    /// accumulated usage into USD (`None` pricing → token-ceiling fallback).
+    max_budget_usd: Option<f64>,
+    budget_pricing: Option<crate::llm::ModelPricing>,
 }
 
 impl std::fmt::Debug for AgentKernelBuilder {
@@ -504,6 +519,23 @@ impl AgentKernelBuilder {
     /// When unset, [`RetryPolicy::for_step_loop_from_env`] applies.
     pub fn step_retry(mut self, policy: RetryPolicy) -> Self {
         self.step_retry = Some(policy);
+        self
+    }
+
+    /// Issue #94: cap this runtime's API spend per turn. `max_budget_usd` is
+    /// the ceiling (`None` / non-positive = no cap); `pricing` is the
+    /// configured model's rate card — pass the result of
+    /// [`crate::llm::pricing_for`], or `None` when the model is unpriced (the
+    /// guard then falls back to a token ceiling). Reaching the ceiling ends
+    /// the turn with `FinishReason::BudgetExceeded` — data, not an error
+    /// (invariant #7).
+    pub fn cost_budget(
+        mut self,
+        max_budget_usd: Option<f64>,
+        pricing: Option<crate::llm::ModelPricing>,
+    ) -> Self {
+        self.max_budget_usd = max_budget_usd;
+        self.budget_pricing = pricing;
         self
     }
 
@@ -630,6 +662,8 @@ impl AgentKernelBuilder {
             step_retry: self
                 .step_retry
                 .unwrap_or_else(RetryPolicy::for_step_loop_from_env),
+            max_budget_usd: self.max_budget_usd,
+            budget_pricing: self.budget_pricing,
         })
     }
 

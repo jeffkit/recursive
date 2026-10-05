@@ -189,6 +189,21 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Issue #94: cap this session's API spend per turn, forwarded to the
+    /// kernel builder. `max_budget_usd` is the ceiling (`None` / non-positive
+    /// = no cap) and `pricing` is the configured model's rate card
+    /// (`None` = unpriced model → the guard degrades to a token ceiling).
+    /// Reaching the ceiling finishes the turn with
+    /// `FinishReason::BudgetExceeded` — data, not an error (invariant #7).
+    pub fn cost_budget(
+        mut self,
+        max_budget_usd: Option<f64>,
+        pricing: Option<crate::llm::ModelPricing>,
+    ) -> Self {
+        self.kernel_builder = self.kernel_builder.cost_budget(max_budget_usd, pricing);
+        self
+    }
+
     /// Set a transcript character limit (optional, default unlimited).
     pub fn max_transcript_chars(mut self, n: usize) -> Self {
         self.kernel_builder = self.kernel_builder.max_transcript_chars(n);

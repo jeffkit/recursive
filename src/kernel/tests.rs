@@ -544,3 +544,71 @@ fn kernel_builder_wall_timeout_default_is_zero() {
         .expect("build");
     assert_eq!(kernel.wall_timeout_secs, 0);
 }
+
+// -- Issue #94: cost budget wiring -------------------------------------
+
+/// Issue #94: no budget unless the caller sets one.
+#[test]
+fn kernel_builder_cost_budget_defaults_to_unbudgeted() {
+    let kernel = AgentKernelBuilder::default()
+        .llm(Arc::new(MockProvider::new(vec![])) as Arc<dyn ChatProvider>)
+        .build()
+        .expect("build");
+    assert!(kernel.max_budget_usd.is_none());
+    assert!(kernel.budget_pricing.is_none());
+}
+
+/// Issue #94: `cost_budget` forwards both the ceiling and the rate card onto
+/// the kernel.
+#[test]
+fn kernel_builder_forwards_cost_budget() {
+    let pricing = crate::llm::ModelPricing {
+        input_per_million: 2.0,
+        output_per_million: 8.0,
+        cache_hit_input_per_million: 0.2,
+    };
+    let kernel = AgentKernelBuilder::default()
+        .llm(Arc::new(MockProvider::new(vec![])) as Arc<dyn ChatProvider>)
+        .cost_budget(Some(1.25), Some(pricing))
+        .build()
+        .expect("build");
+    assert_eq!(kernel.max_budget_usd, Some(1.25));
+    assert_eq!(kernel.budget_pricing, Some(pricing));
+}
+
+/// Issue #94: a configured ceiling produces a guard whose spend tracks the
+/// rate card; an unconfigured one produces no guard at all.
+#[test]
+fn configured_budget_turns_into_a_cost_guard() {
+    let pricing = crate::llm::ModelPricing {
+        input_per_million: 1.0,
+        output_per_million: 1.0,
+        cache_hit_input_per_million: 0.1,
+    };
+    let kernel = AgentKernelBuilder::default()
+        .llm(Arc::new(MockProvider::new(vec![])) as Arc<dyn ChatProvider>)
+        .cost_budget(Some(0.5), Some(pricing))
+        .build()
+        .expect("build");
+    let guard = crate::run_core::CostBudget::new(kernel.max_budget_usd, kernel.budget_pricing)
+        .expect("configured budget must produce a guard");
+    let usage = crate::llm::TokenUsage {
+        prompt_tokens: 500_000,
+        total_tokens: 500_000,
+        ..Default::default()
+    };
+    assert!((guard.spend_usd(&usage) - 0.5).abs() < 1e-9);
+    assert!(
+        guard.exceeded(&usage),
+        "spend == ceiling must trip the guard"
+    );
+
+    let unbudgeted = AgentKernelBuilder::default()
+        .llm(Arc::new(MockProvider::new(vec![])) as Arc<dyn ChatProvider>)
+        .build()
+        .expect("build");
+    assert!(
+        crate::run_core::CostBudget::new(unbudgeted.max_budget_usd, unbudgeted.budget_pricing)
+            .is_none()
+    );
+}

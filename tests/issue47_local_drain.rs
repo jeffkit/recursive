@@ -18,22 +18,29 @@ async fn local_exec_shell_returns_despite_orphan_descendant() {
     let t = LocalTransport;
     let tmp = tempfile::tempdir().unwrap();
 
-    // `sh -c "sleep 8 & echo hi"` — sh exits immediately; the forked `sleep`
+    // `sh -c "sleep 60 & echo hi"` — sh exits immediately; the forked `sleep`
     // inherits the stdout/stderr write ends, so EOF never arrives on the
     // tool's reader side until sleep exits.
     let fut = t.exec_shell(
-        "sleep 8 & echo hi",
+        "sleep 60 & echo hi",
         tmp.path(),
         &[],
-        Duration::from_secs(2), // command timeout: sh exits instantly anyway
+        // Command budget is NOT the subject under test — it is set past the
+        // outer cap below so a slow-scheduled shell can never masquerade as an
+        // issue #47 drain hang. A 2s budget made this test fail on hosts that
+        // are oversubscribed (three self-improve pipelines share this box;
+        // load average >40 on 10 cores), where the freshly forked shell was
+        // not scheduled before the cap fired — a false "command timed out
+        // after 2s" for a shell that exits in microseconds.
+        Duration::from_secs(60),
         64 * 1024,
     );
 
-    // Bounded grace: command timeout (2s) + DRAIN_GRACE (2s) + CI margin.
-    // If the drain were unbounded, this outer timeout fires while `sleep 8`
-    // still holds the pipes. CI runner 派生/调度开销大，界限放宽到 20s
-    // （2026-09-30：5s 在 ubuntu/windows CI 上误报；无界 drain 仍会被外层抓住）。
-    let outcome = tokio::time::timeout(Duration::from_secs(20), fut).await;
+    // Bounded grace: the command exits instantly, then two DRAIN_GRACE (2s)
+    // drains, well under this cap. `sleep 60` deliberately outlives the cap:
+    // an unbounded drain parks until the orphan exits (60s) and trips it —
+    // the regression this test exists to catch.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), fut).await;
 
     match outcome {
         Ok(res) => {
@@ -41,7 +48,7 @@ async fn local_exec_shell_returns_despite_orphan_descendant() {
             assert!(res.stdout.contains("hi"), "stdout: {}", res.stdout);
         }
         Err(_) => panic!(
-            "issue #47 regression: exec_shell did not return within 5s — \
+            "issue #47 regression: exec_shell did not return within 30s — \
              reader tasks are parked on a pipe held by the orphaned `sleep`"
         ),
     }

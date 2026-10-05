@@ -20,6 +20,29 @@
   precise note instead, and the cloud docs now state the sticky-session
   requirement for multi-replica deployments.
 
+- feat(cost): four-dimensional mid-run budgets (#94). `max_budget_usd` and
+  `thinking_budget` were stored-but-dead fields: nothing in the agent loop read
+  either, and the HTTP schema still advertised them ("Agent stops after any turn
+  that would exceed this limit") to integrators. `RunCore` now carries a
+  `CostBudget` guard that compares the turn's accumulated spend after every
+  completed step and ends the turn with `FinishReason::BudgetExceeded` (data, not
+  an error — transcript kept) before the next LLM call is issued; models with no
+  pricing entry degrade to a token ceiling at a pessimistic $10/M blend, so an
+  unpriced gateway model still cannot run away. `thinking_budget` now reaches the
+  wire as Anthropic `thinking = {type:"enabled",budget_tokens:n}` (temperature
+  dropped and `max_tokens` raised above the budget, as the Messages API requires),
+  on both the streaming and non-streaming paths. `max_steps` / `wall_timeout_secs`
+  stop defaulting to `0` = silently unlimited: they now default to 200 steps /
+  3600 s per turn (both still revertible with an explicit `0` — the escape hatch
+  long-running `recursive loop` / batch flows rely on). New env knobs
+  `RECURSIVE_MAX_BUDGET_USD` (`--max-budget-usd` now reads it too) and
+  `RECURSIVE_THINKING_BUDGET`. HTTP `POST /run` and `POST /sessions` accept
+  per-request `max_budget_usd` / `thinking_budget`; a per-session thinking budget
+  builds a provider for that request (provider construction moved into
+  `recursive::llm::build_llm_provider`), and both survive a cold load
+  (`SessionMeta.overrides`). Semantics are per turn, not per session — the request
+  and flag docs now say so.
+
 - fix(http): rate-limit key no longer trusts a client-forged `X-Forwarded-For`
   (#107). The old `extract_client_key` took the **leftmost** XFF entry
   unconditionally, so a direct-connected client could mint a fresh full token

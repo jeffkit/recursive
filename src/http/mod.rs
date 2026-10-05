@@ -182,6 +182,30 @@ pub struct SessionInfo {
     pub title: Option<String>,
 }
 
+/// Per-session run overrides resolved from a request (issue #94).
+///
+/// These are provider/kernel settings rather than server-wide ones, so they
+/// live on the session runtime the request creates instead of in
+/// [`AppState::config`]. `Default` = "inherit the server's `Config`".
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionOverrides {
+    /// Per-turn USD ceiling. `None` falls back to `Config::max_budget_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
+    /// Anthropic extended-thinking budget. `None` falls back to
+    /// `Config::thinking_budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+}
+
+impl SessionOverrides {
+    /// True when neither override is set — used by `skip_serializing_if` so
+    /// sessions that opt into nothing keep byte-identical stored metadata.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Request body for `POST /sessions`.
 #[derive(serde::Deserialize, Debug)]
 pub struct CreateSessionRequest {
@@ -195,12 +219,16 @@ pub struct CreateSessionRequest {
     /// Maximum number of steps (tool calls) allowed in this session.
     pub max_steps: Option<u32>,
     /// Extended-thinking token budget for models that support it (e.g.
-    /// Anthropic claude-3-7). `0` disables thinking.
+    /// Anthropic claude-3-7). `0` disables thinking. Issue #94: this is a
+    /// *provider* setting, so setting it builds a provider for this session
+    /// with `thinking.budget_tokens = n` instead of reusing the server's.
     pub thinking_budget: Option<u32>,
     /// Permission mode: `"default"`, `"auto"`, `"strict"`, or `"bypass"`.
     pub permission_mode: Option<String>,
-    /// Maximum total API spend in USD for this session. Agent stops after any
-    /// turn that would exceed this limit.
+    /// Maximum API spend in USD **per turn** of this session (issue #94).
+    /// The agent stops with `budget_exceeded` at the first step boundary
+    /// where the turn's accumulated spend reaches this limit — it does not
+    /// cap the session's total spend across turns. `None` / `0` = no limit.
     pub max_budget_usd: Option<f64>,
     /// Issue #127: agent preset this session runs under (default `standard`,
     /// or `RECURSIVE_AGENT_PRESET`). An unknown id is rejected with 400 — a
@@ -576,11 +604,15 @@ pub struct RunRequest {
     /// replacing it. Ignored when `system_prompt` is also provided.
     pub append_system_prompt: Option<String>,
     /// Extended-thinking token budget for models that support it (e.g.
-    /// Anthropic claude-3-7). `0` disables thinking.
+    /// Anthropic claude-3-7). `0` disables thinking. Issue #94: honoured by
+    /// building a provider for this run with
+    /// `thinking = {type: "enabled", budget_tokens: n}`.
     pub thinking_budget: Option<u32>,
     /// Permission mode: `"default"`, `"auto"`, `"strict"`, or `"bypass"`.
     pub permission_mode: Option<String>,
-    /// Maximum total API spend in USD for this run.
+    /// Maximum API spend in USD for this run (issue #94). The run finishes
+    /// with `finish_reason: "budget_exceeded"` at the first step boundary
+    /// where the accumulated spend reaches this limit. `None` / `0` = no cap.
     pub max_budget_usd: Option<f64>,
 }
 
