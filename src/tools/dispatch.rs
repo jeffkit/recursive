@@ -112,6 +112,18 @@ impl ToolRegistry {
             };
         };
 
+        // Goal #133: capture the turn's change-ledger baseline *before* the
+        // first mutating tool call, so a change can never be observed after
+        // it happened. Read-only tools (and turns that only read) pay
+        // nothing; the call is idempotent once a baseline exists.
+        if !tool.is_readonly() {
+            if let Some(ledger) = &self.deliverables {
+                if let Err(err) = ledger.ensure_baseline() {
+                    tracing::debug!(error = %err, "deliverables: baseline capture failed");
+                }
+            }
+        }
+
         let side_effect = tool.side_effect_class();
         let step_id = uuid::Uuid::now_v7().hyphenated().to_string();
         let args_hash = blake3_canonical_json(&arguments);

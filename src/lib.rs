@@ -30,6 +30,7 @@ pub mod config_file;
 pub(crate) mod context_breakdown;
 pub mod coordinator;
 pub mod cost;
+pub mod deliverables;
 pub mod error;
 pub mod event;
 pub mod hooks;

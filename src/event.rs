@@ -272,6 +272,34 @@ pub enum AgentEvent {
         /// Short human-readable description of the error ("rate_limited" or "timeout").
         reason: String,
     },
+
+    // ── Deliverables: declared outputs + per-turn change ledger ──────
+    /// The agent declared delivered files this turn via the `Present` tool.
+    ///
+    /// Carries paths and sizes only — the file bodies never enter the
+    /// transcript or the event payload. Emitted once per *successful*
+    /// `Present` call that accepted at least one path.
+    DeliverablesPresented {
+        /// Turn the declaration belongs to.
+        turn: u32,
+        /// Accepted declarations, in the order they were given.
+        files: Vec<crate::deliverables::PresentedFile>,
+    },
+    /// The per-turn change ledger: what actually changed on disk during the
+    /// turn, with bounded diffs. Emitted at the end of a turn that changed
+    /// at least one file (or presented one), after the ledger was rendered
+    /// and **before** [`AgentEvent::TurnFinished`], so a consumer that closes
+    /// the turn on `TurnFinished` already has the ledger in hand.
+    ///
+    /// The payload is bounded but not small: at most `Budgets::max_files`
+    /// files carry a diff, each capped at 64 KiB — consumers should render it
+    /// as a summary, not splice it into a prompt.
+    ChangeLedger {
+        /// Turn the ledger describes.
+        turn: u32,
+        /// Added / modified / deleted files plus the turn's declarations.
+        changes: crate::deliverables::TurnChanges,
+    },
 }
 
 /// Why a proactive compaction was skipped.
@@ -705,6 +733,30 @@ mod tests {
                 attempt: 1,
                 wait_ms: 5000,
                 reason: "rate_limited".into(),
+            },
+            AgentEvent::DeliverablesPresented {
+                turn: 3,
+                files: vec![crate::deliverables::PresentedFile {
+                    path: "docs/report.md".into(),
+                    bytes: 2048,
+                }],
+            },
+            AgentEvent::ChangeLedger {
+                turn: 3,
+                changes: crate::deliverables::TurnChanges {
+                    turn: 3,
+                    added: vec![crate::deliverables::FileChange {
+                        path: "src/new.rs".into(),
+                        status: crate::deliverables::ChangeStatus::Added,
+                        bytes_before: None,
+                        bytes_after: Some(12),
+                        diff: "+++ b/src/new.rs\n@@ -0,0 +1,1 @@\n+fn main() {}\n".into(),
+                        coarse: false,
+                        coarse_reason: None,
+                    }],
+                    sources: vec!["shadow_index".into()],
+                    ..Default::default()
+                },
             },
         ];
 

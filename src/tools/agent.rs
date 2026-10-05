@@ -447,16 +447,32 @@ impl AgentTool {
     /// same transport/permissions/policy as the parent, so only explicitly
     /// listed tools are available — no accidental tool leakage.
     ///
+    /// The worker is its own session (Goal 394): its tools come from a
+    /// session fork of the parent, so every session-scoped slot a tool holds
+    /// is private to this worker — above all the deliverables ledger, else
+    /// parallel workers would share one baseline and one `presented` list and
+    /// clobber each other's turn ledger.
+    ///
+    /// `retain_tools` marks the surface as an explicit allow-list decision,
+    /// so `AgentRuntimeBuilder::build` does not re-inject tools (`TodoWrite`,
+    /// `Present`) this list left out — a read-only `explore`/`plan` worker
+    /// must not advertise a mutating tool.
+    ///
     /// Sub-agents receive a **fresh** `ReadFileState` so their read history
     /// is independent from the parent's.
     fn build_sub_registry(&self, tool_names: &[String]) -> ToolRegistry {
         let sub_read_state = Arc::new(Mutex::new(ReadFileState::new()));
-        // Start from parent's transport/permissions/policy but override
-        // read_file_state with a fresh instance for isolation.
+        // Fork once: `source` owns the worker's private session state and the
+        // tools bound to it.
+        let source = self.all_tools.fork_session();
+        // Start from parent's transport/permissions/policy (and its
+        // background-job manager) but override read_file_state with a fresh
+        // instance for isolation, and adopt the fork's own ledger.
         let mut reg = self
             .all_tools
             .with_same_transport()
-            .with_read_file_state(sub_read_state.clone());
+            .with_read_file_state(sub_read_state.clone())
+            .with_deliverables(source.deliverables());
         for name in tool_names {
             // ReadFile and EditTool carry internal read_state references;
             // create new instances bound to the sub-agent's fresh state rather
@@ -472,7 +488,7 @@ impl AgentTool {
                     WriteFile::new(&self.workspace).with_read_state(sub_read_state.clone()),
                 ),
                 _ => {
-                    if let Some(t) = self.all_tools.get(name) {
+                    if let Some(t) = source.get(name) {
                         t
                     } else {
                         continue;
@@ -481,6 +497,7 @@ impl AgentTool {
             };
             reg = reg.register(tool);
         }
+        reg.retain_tools(tool_names);
         reg
     }
 
@@ -1461,9 +1478,12 @@ impl Tool for AgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deliverables::{Budgets, Deliverables};
+    use crate::event::NullSink;
     use crate::llm::{Completion, MockProvider};
     use crate::tools::{
-        GlobTool, LocalTransport, ReadFile, SearchFiles, ToolTransport, WebFetch, WriteFile,
+        ChangeLedgerTool, GlobTool, LocalTransport, PresentTool, ReadFile, SearchFiles,
+        ToolTransport, WebFetch, WriteFile,
     };
 
     fn mock_provider(script: Vec<Completion>) -> Arc<dyn ChatProvider> {
@@ -2518,5 +2538,112 @@ allowed_tools:
             AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None),
             tmp,
         )
+    }
+
+    /// Goal #133 / Goal 394: a worker is its own session, so every worker
+    /// registry brings its own deliverables ledger. Without this, workers of
+    /// one `agent` call share the coordinator's ledger (`begin_turn` clears
+    /// the baseline of whoever ran last) and `ChangeLedger` renders the
+    /// coordinator's turn.
+    #[tokio::test]
+    async fn sub_agents_get_their_own_deliverables_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let coordinator_ledger = Arc::new(
+            Deliverables::new(&ws, tmp.path().join("private"), Budgets::default()).unwrap(),
+        );
+        let tools = full_tool_registry(&ws)
+            .with_deliverables(Some(coordinator_ledger.clone()))
+            .register(Arc::new(PresentTool::new(
+                coordinator_ledger.clone(),
+                Arc::new(NullSink),
+            )))
+            .register(Arc::new(ChangeLedgerTool::new(coordinator_ledger.clone())));
+        let agent = AgentTool::new(&ws, mock_provider(vec![]), tools, 2, 0, None);
+
+        // The coordinator's turn is armed and already has a change…
+        coordinator_ledger.begin_turn(1);
+        coordinator_ledger.ensure_baseline().unwrap();
+        std::fs::write(ws.join("coordinator.txt"), "c\n").unwrap();
+
+        let deliverables_tools = ["ChangeLedger".to_string(), "Present".to_string()];
+        let a = agent.build_sub_registry(&deliverables_tools);
+        let b = agent.build_sub_registry(&deliverables_tools);
+        let la = a.deliverables().expect("worker A ledger");
+        let lb = b.deliverables().expect("worker B ledger");
+        assert!(
+            !Arc::ptr_eq(&coordinator_ledger, &la) && !Arc::ptr_eq(&coordinator_ledger, &lb),
+            "a worker must not share the coordinator's ledger"
+        );
+        assert!(
+            !Arc::ptr_eq(&la, &lb),
+            "two workers must not share one ledger (parallel workers would clobber it)"
+        );
+
+        // …which worker A's ChangeLedger must not render.
+        let out = a
+            .invoke("ChangeLedger", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(out.contains("no change ledger"), "{out}");
+
+        // A worker's declaration lands in the worker's ledger only.
+        std::fs::write(ws.join("worker.txt"), "w\n").unwrap();
+        la.begin_turn(1);
+        a.invoke("Present", serde_json::json!({"files": ["worker.txt"]}))
+            .await
+            .unwrap();
+        assert_eq!(la.presented().len(), 1);
+        assert!(
+            coordinator_ledger.presented().is_empty(),
+            "a worker's declaration must not leak into the coordinator ledger"
+        );
+    }
+
+    /// A worker registry is built from an explicit allow-list, so the runtime
+    /// builder must not re-inject tools the list left out — a read-only
+    /// worker must not advertise `Present` (or `TodoWrite`).
+    #[tokio::test]
+    async fn read_only_workers_do_not_advertise_the_deliverables_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let ledger = Arc::new(
+            Deliverables::new(&ws, tmp.path().join("private"), Budgets::default()).unwrap(),
+        );
+        let tools = full_tool_registry(&ws)
+            .with_deliverables(Some(ledger.clone()))
+            .register(Arc::new(PresentTool::new(
+                ledger.clone(),
+                Arc::new(NullSink),
+            )))
+            .register(Arc::new(ChangeLedgerTool::new(ledger.clone())));
+        let agent = AgentTool::new(&ws, mock_provider(vec![]), tools, 2, 0, None);
+
+        let ro = agent.build_sub_registry(&["Read".to_string()]);
+        assert!(ro.find_by_name("Read").is_some(), "allow-listed tool kept");
+        assert!(
+            ro.find_by_name("Present").is_none() && ro.find_by_name("ChangeLedger").is_none(),
+            "an allow-list that dropped the deliverables tools stays strict"
+        );
+
+        let entry = WorkerManifestEntry {
+            system_prompt: "read-only".into(),
+            allowed_tools: vec![],
+        };
+        let runtime = agent
+            .build_worker_runtime("ro", &entry, 3, 0)
+            .await
+            .expect("worker runtime");
+        assert!(
+            runtime.kernel().tools().find_by_name("Present").is_none(),
+            "the builder must not re-inject Present into a read-only worker"
+        );
+        let worker_ledger = runtime.deliverables().expect("worker ledger");
+        assert!(
+            !Arc::ptr_eq(&ledger, &worker_ledger),
+            "the worker runtime must run on its own ledger"
+        );
     }
 }

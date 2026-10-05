@@ -36,6 +36,7 @@ impl ToolKind {
             "Glob" => ToolKind::Search,
             "WebFetch" => ToolKind::Fetch,
             "WebSearch" => ToolKind::WebSearch,
+            "ChangeLedger" => ToolKind::Read,
             _ => ToolKind::Other,
         }
     }
@@ -72,6 +73,7 @@ mod tests {
         assert_eq!(ToolKind::from_tool_name("Glob"), ToolKind::Search);
         assert_eq!(ToolKind::from_tool_name("WebFetch"), ToolKind::Fetch);
         assert_eq!(ToolKind::from_tool_name("WebSearch"), ToolKind::WebSearch);
+        assert_eq!(ToolKind::from_tool_name("ChangeLedger"), ToolKind::Read);
         assert_eq!(ToolKind::from_tool_name("UnknownTool"), ToolKind::Other);
     }
 }

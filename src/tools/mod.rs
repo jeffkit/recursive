@@ -16,8 +16,10 @@ pub mod elicitation;
 pub mod http_call;
 #[cfg(feature = "skill-hub")]
 pub mod install_skill;
+pub mod ledger;
 pub mod load_skill;
 pub mod plan_mode;
+pub mod present;
 pub mod registry;
 pub mod send_message;
 pub mod todo;
@@ -159,6 +161,7 @@ pub use fs::{ReadFile, ReadFileState, WriteFile};
 pub use glob::GlobTool;
 #[cfg(feature = "skill-hub")]
 pub use install_skill::InstallSkill;
+pub use ledger::{ChangeLedgerTool, CHANGE_LEDGER_TOOL_NAME, MAX_LEDGER_RENDER_BYTES};
 pub use load_skill::LoadSkill;
 pub use memory::{
     load_scratchpad, scratchpad_path, scratchpad_summary, Scratchpad, ScratchpadDelete,
@@ -171,6 +174,7 @@ pub use plan_mode::{
     PlanModeRequestResult, RequestPlanModeTool,
 };
 pub use policy_sandbox::{FsPolicy, PolicyConfig, ShellPolicy};
+pub use present::{PresentTool, PRESENT_TOOL_NAME};
 pub use run_background::LoopControl;
 pub use run_background::{
     BackgroundJobManager, CheckBackground, Job, JobState, RunBackground, WatchTarget,

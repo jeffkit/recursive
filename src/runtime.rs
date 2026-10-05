@@ -229,6 +229,13 @@ pub struct AgentRuntime {
     /// re-deriving it. `None` for runtimes built without a preset (raw
     /// `AgentRuntimeBuilder` users).
     preset_id: Option<String>,
+    /// Goal #133: session-scoped deliverables ledger — the same instance the
+    /// registry's `Present` / `ChangeLedger` tools hold. `None` when the
+    /// registry has none (empty/local registries, container tier, or
+    /// `RECURSIVE_DELIVERABLES=0`), in which case no per-turn ledger runs.
+    /// Every ledger failure is logged and swallowed: a broken ledger must
+    /// never take a turn down with it.
+    deliverables: Option<Arc<crate::deliverables::Deliverables>>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -259,6 +266,7 @@ impl std::fmt::Debug for AgentRuntime {
             .field("skill_reinjector", &self.skill_reinjector.is_some())
             .field("plan_todo_reinjector", &self.plan_todo_reinjector.is_some())
             .field("preset_id", &self.preset_id)
+            .field("deliverables", &self.deliverables.is_some())
             .finish()
     }
 }
@@ -299,6 +307,12 @@ impl AgentRuntime {
         }
 
         self.reset_touched_files();
+        // Goal #133: arm the deliverables ledger for this turn. Cheap — the
+        // baseline snapshot itself is captured lazily, before the first
+        // mutating tool call (see `tools::dispatch`).
+        if let Some(ledger) = &self.deliverables {
+            ledger.begin_turn(turn as u32);
+        }
         self.kernel.hooks().dispatch(HookEvent::UserPromptSubmit {
             content: &user_text,
         });
@@ -338,6 +352,13 @@ impl AgentRuntime {
     /// back in), so the re-drive resumes there rather than starting over.
     async fn drive_turn(&mut self) -> Result<RuntimeOutcome> {
         let turn_outcome = self.execute_kernel_turn().await?;
+        // Goal #133: close the change ledger for this turn and announce it.
+        // Emitted BEFORE `TurnFinished` (which `emit_turn_messages` releases)
+        // so a consumer reacting to the turn boundary already has the ledger,
+        // and before the turn counter advances so the ledger is keyed by the
+        // turn it describes. Best-effort — a failed ledger never fails a turn.
+        let turn = self.checkpoints.turn_index.load(Ordering::Relaxed) as u32;
+        self.finalize_deliverables(turn).await;
         self.emit_turn_messages(&turn_outcome).await;
         // Goal 289: cross-turn compaction runs AFTER the turn so the
         // threshold check sees the full turn's growth (user + assistant +
@@ -394,6 +415,32 @@ impl AgentRuntime {
                 *t = TouchedFiles::new();
             }
         }
+    }
+
+    /// Goal #133: finalize the turn's change ledger and emit
+    /// [`AgentEvent::ChangeLedger`] when the turn actually changed files (or
+    /// declared deliverables). Failures are logged, never propagated — the
+    /// ledger is an observability surface, not a turn dependency.
+    async fn finalize_deliverables(&self, turn: u32) {
+        let Some(ledger) = &self.deliverables else {
+            return;
+        };
+        match ledger.finalize_turn(turn) {
+            Ok(changes) if !changes.is_empty() => {
+                self.event_sink
+                    .emit(AgentEvent::ChangeLedger { turn, changes })
+                    .await;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "deliverables: change ledger finalize failed");
+            }
+        }
+    }
+
+    /// Goal #133: the session's deliverables ledger, if one is wired.
+    pub fn deliverables(&self) -> Option<Arc<crate::deliverables::Deliverables>> {
+        self.deliverables.clone()
     }
 
     /// Append a user message to the transcript and emit `MessageAppended`.

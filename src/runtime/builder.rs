@@ -462,6 +462,46 @@ impl AgentRuntimeBuilder {
             )));
         }
 
+        // Goal #133: the deliverables ledger is created by the registry
+        // (which knows the workspace); the runtime picks up the very same
+        // `Arc` so the tools that record declarations and the per-turn
+        // begin/finalize bookkeeping cannot drift apart. `None` means the
+        // subsystem is off for this session — no ledger runs and no
+        // `ChangeLedger` event is emitted.
+        let deliverables = kernel.tools().deliverables();
+        if let Some(ledger) = &deliverables {
+            // Same surface-filter rule as TodoWrite: re-register the
+            // NullSink placeholder with the live sink, but never resurrect a
+            // tool an explicit allow-list dropped.
+            let present_kept = kernel
+                .tools()
+                .find_by_name(crate::tools::PRESENT_TOOL_NAME)
+                .is_some();
+            let ledger_kept = kernel
+                .tools()
+                .find_by_name(crate::tools::CHANGE_LEDGER_TOOL_NAME)
+                .is_some();
+            let filtered = kernel.tools().surface_filtered();
+            if present_kept || !filtered {
+                kernel
+                    .tools_mut()
+                    .register_mut(Arc::new(crate::tools::PresentTool::new(
+                        ledger.clone(),
+                        event_sink.clone(),
+                    )));
+            }
+            // Both tools are bound to the runtime's ledger, so a registry
+            // whose ledger was swapped after registration cannot leave
+            // `ChangeLedger` rendering a stale one.
+            if ledger_kept || !filtered {
+                kernel
+                    .tools_mut()
+                    .register_mut(Arc::new(crate::tools::ChangeLedgerTool::new(
+                        ledger.clone(),
+                    )));
+            }
+        }
+
         // Goal-165 / Goal-202: plan mode tools block waiting for human approval
         // via the gate. They must only be registered when a live interactive
         // channel (TUI or interactive CLI) is present to call confirm_plan().
@@ -540,6 +580,7 @@ impl AgentRuntimeBuilder {
             loop_retry: self.loop_retry,
             wakeup_store_dir: self.wakeup_store_dir,
             preset_id: self.preset_id,
+            deliverables,
         })
     }
 }

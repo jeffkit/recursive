@@ -46,6 +46,12 @@ pub struct SessionToolState {
     /// roots granted before the fork keep working while post-fork expansions
     /// (TUI `/add-dir`) stay session-local.
     pub(crate) session_roots: Option<super::dispatch::SharedSandboxRoots>,
+    /// Fresh, EMPTY deliverables ledger (Goal #133) — same workspace and
+    /// budgets, private turn bookkeeping and shadow index. `Some` iff the
+    /// source registry had one; `Present` / `ChangeLedger` rewire themselves
+    /// to it, so a fork can never render (or declare into) the parent's
+    /// ledger.
+    pub(crate) deliverables: Option<Arc<crate::deliverables::Deliverables>>,
 }
 
 #[async_trait]
@@ -115,7 +121,8 @@ pub trait Tool: Send + Sync {
     ///   the parent's `Arc`);
     /// - `RunBackground` / `CheckBackground` / `WatchFile` / `StopLoop` —
     ///   the shared background-job manager;
-    /// - the structured fs tools — the runtime-mutable sandbox-roots slot.
+    /// - the structured fs tools — the runtime-mutable sandbox-roots slot;
+    /// - `Present` / `ChangeLedger` — the session's deliverables ledger.
     ///
     /// The default `None` means "session-stateless": every field the tool
     /// holds is immutable configuration (workspace root, transport,
@@ -218,6 +225,13 @@ pub struct ToolRegistry {
     /// TodoWrite because it's the default empty/local one" (safe to add the
     /// real tool) from "a filter deliberately dropped it" (must stay strict).
     surface_filtered: bool,
+    /// Goal #133: session-scoped deliverables ledger (declared outputs +
+    /// per-turn change ledger). `None` when the workspace cannot host one
+    /// (unwritable user data dir) or the subsystem is disabled — the
+    /// `Present` / `ChangeLedger` tools are then not registered either.
+    /// The baseline is captured from `dispatch_after_permission_check`
+    /// *before* the first mutating tool call of a turn.
+    pub(crate) deliverables: Option<Arc<crate::deliverables::Deliverables>>,
 }
 
 impl Default for ToolRegistry {
@@ -248,6 +262,7 @@ impl ToolRegistry {
                 super::run_background::BackgroundJobManager::new(),
             )),
             surface_filtered: false,
+            deliverables: None,
         }
     }
 
@@ -292,6 +307,7 @@ impl ToolRegistry {
             bg_manager: self.bg_manager.clone(),
             // Fresh empty registry — any later filter marks it itself.
             surface_filtered: false,
+            deliverables: self.deliverables.clone(),
         }
     }
 
@@ -319,6 +335,10 @@ impl ToolRegistry {
     /// - `session_roots` — a fresh slot seeded from the parent's current
     ///   roots; `/add-dir`-style expansions after the fork stay
     ///   session-local.
+    /// - `deliverables` — a fresh ledger for the same workspace (private
+    ///   turn bookkeeping and shadow index), rewired into `Present` /
+    ///   `ChangeLedger` via [`Tool::fork_box`]. Without that rewiring the
+    ///   tools would keep rendering the fork source's ledger.
     ///
     /// Shared on purpose — process-level or external resources; sharing is
     /// what makes a fork cheap and is NOT a bug:
@@ -348,12 +368,19 @@ impl ToolRegistry {
             let seeded = slot.read().map(|roots| roots.clone()).unwrap_or_default();
             Arc::new(std::sync::RwLock::new(seeded))
         });
+        // ONE fresh ledger per fork, shared by the fork's `Present` /
+        // `ChangeLedger` (via `state`) and by its runtime (via the registry
+        // field) — a fork is a different session, so a sub-agent's
+        // declarations and change set stay out of the parent's turn ledger,
+        // and two instances never share one shadow index file.
+        let fork_deliverables = self.fresh_deliverables();
         let state = SessionToolState {
             read_state: fork_read_state.clone(),
             bg_manager: Arc::new(tokio::sync::Mutex::new(
                 super::run_background::BackgroundJobManager::new(),
             )),
             session_roots: fork_roots.clone(),
+            deliverables: fork_deliverables.clone(),
         };
         let tools: BTreeMap<String, Arc<dyn Tool>> = self
             .tools
@@ -391,7 +418,31 @@ impl ToolRegistry {
             bg_manager: state.bg_manager.clone(),
             // Session forks inherit the surface contract (issue #65).
             surface_filtered: self.surface_filtered,
+            // Built above, so the tools rewired via `state` and the runtime
+            // that reads this field share ONE ledger. Falls back to the
+            // parent's ledger if a fresh one cannot be created.
+            deliverables: fork_deliverables,
         }
+    }
+
+    /// Goal #133: build a ledger for the same workspace but with private
+    /// per-instance state (shadow index, turn bookkeeping). `None` when this
+    /// registry has no ledger at all.
+    fn fresh_deliverables(&self) -> Option<Arc<crate::deliverables::Deliverables>> {
+        let parent = self.deliverables.as_ref()?;
+        let root =
+            parent
+                .root()
+                .join("forks")
+                .join(format!("{}-{}", std::process::id(), next_fork_seq()));
+        crate::deliverables::Deliverables::new(
+            parent.workspace().to_path_buf(),
+            root,
+            parent.budgets().clone(),
+        )
+        .ok()
+        .map(Arc::new)
+        .or_else(|| Some(parent.clone()))
     }
 
     /// Legacy fork entry point — a plain [`Clone`], kept for existing call
@@ -414,6 +465,23 @@ impl ToolRegistry {
     pub fn with_permission_hook(mut self, hook: Arc<dyn PermissionHook>) -> Self {
         self.permission_hook = Some(hook);
         self
+    }
+
+    /// Attach (or clear) the deliverables ledger (goal #133). The registry
+    /// only routes to it — the runtime picks the same `Arc` up via
+    /// [`Self::deliverables`] so per-turn bookkeeping and the tools agree.
+    pub fn with_deliverables(
+        mut self,
+        ledger: Option<Arc<crate::deliverables::Deliverables>>,
+    ) -> Self {
+        self.deliverables = ledger;
+        self
+    }
+
+    /// The deliverables ledger shared by this registry's `Present` /
+    /// `ChangeLedger` tools, if the subsystem is active.
+    pub fn deliverables(&self) -> Option<Arc<crate::deliverables::Deliverables>> {
+        self.deliverables.clone()
     }
 
     /// Attach a permission hook via mutable reference.
@@ -848,6 +916,14 @@ impl ToolRegistry {
     }
 }
 
+/// Monotonic counter giving every session fork a private deliverables root,
+/// so two ledgers never share one shadow index file.
+fn next_fork_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Build the standard tool registry for an agent rooted at `workspace`.
 ///
 /// This is the canonical tool set shared by all entry points (CLI, TUI, HTTP
@@ -1143,6 +1219,34 @@ pub fn build_standard_tools_with_transport_opt(
                 )),
             ]
         });
+
+    // Goal #133: deliverables — declared outputs (`Present`) plus the
+    // per-turn change ledger (`ChangeLedger`). Both tools and the runtime
+    // share ONE ledger instance (`ToolRegistry::deliverables`), so the
+    // ledger the tools write is the ledger the turn finalizes.
+    //
+    // Skipped in the container tier (`disable_host_exec`): the ledger
+    // observes the host filesystem, which is not the environment the tools
+    // actually mutate, so registering it there would report another
+    // machine's state. Disabled by `RECURSIVE_DELIVERABLES=0`, and
+    // fail-soft when the per-workspace data dir is unwritable.
+    if !disable_host_exec && crate::deliverables::enabled_from_env() {
+        match crate::deliverables::Deliverables::for_workspace(workspace) {
+            Ok(ledger) => {
+                let ledger = Arc::new(ledger);
+                registry = registry
+                    .with_deliverables(Some(ledger.clone()))
+                    .register(Arc::new(super::present::PresentTool::new(
+                        ledger.clone(),
+                        Arc::new(crate::event::NullSink),
+                    )))
+                    .register(Arc::new(super::ledger::ChangeLedgerTool::new(ledger)));
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "deliverables: unavailable for this workspace");
+            }
+        }
+    }
 
     // Goal-201: plan mode tools are channel capabilities (TUI / HTTP only).
     // They are registered exclusively by AgentRuntimeBuilder::build() which
@@ -1750,6 +1854,73 @@ mod tests {
                 &late_fork.session_roots().expect("late fork slot"),
             ),
             "session_roots must be re-allocated per fork"
+        );
+    }
+
+    // --- fork_session: deliverables ledger isolation (Goal #133) ---
+
+    /// A registry carrying a ledger plus the two tools bound to it.
+    fn ledger_registry(
+        tmp: &tempfile::TempDir,
+    ) -> (ToolRegistry, Arc<crate::deliverables::Deliverables>) {
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("workspace");
+        let ledger = Arc::new(
+            crate::deliverables::Deliverables::new(
+                &ws,
+                tmp.path().join("private"),
+                crate::deliverables::Budgets::default(),
+            )
+            .expect("ledger"),
+        );
+        let reg = make_registry()
+            .with_deliverables(Some(ledger.clone()))
+            .register(Arc::new(crate::tools::PresentTool::new(
+                ledger.clone(),
+                Arc::new(crate::event::NullSink),
+            )))
+            .register(Arc::new(crate::tools::ChangeLedgerTool::new(
+                ledger.clone(),
+            )));
+        (reg, ledger)
+    }
+
+    #[tokio::test]
+    async fn fork_session_rebinds_the_deliverables_tools_to_the_fork_ledger() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (reg, parent) = ledger_registry(&tmp);
+        let fork = reg.fork_session();
+        let fork_ledger = fork.deliverables().expect("fork ledger");
+        assert!(
+            !Arc::ptr_eq(&parent, &fork_ledger),
+            "a fork allocates its own ledger"
+        );
+
+        // The parent's turn is armed and has changes…
+        let ws = parent.workspace().to_path_buf();
+        parent.begin_turn(1);
+        parent.ensure_baseline().expect("parent baseline");
+        std::fs::write(ws.join("parent.txt"), "parent\n").expect("fixture");
+
+        // …which the fork must not render. Without `fork_box` on
+        // `ChangeLedgerTool` the tool would still hold the parent's `Arc` and
+        // report the parent's ledger.
+        let out = fork
+            .invoke("ChangeLedger", serde_json::json!({}))
+            .await
+            .expect("ChangeLedger");
+        assert!(out.contains("no change ledger"), "{out}");
+
+        // Declarations land on the fork's ledger only.
+        std::fs::write(ws.join("out.txt"), "x\n").expect("fixture");
+        fork_ledger.begin_turn(1);
+        fork.invoke("Present", serde_json::json!({"files": ["out.txt"]}))
+            .await
+            .expect("Present");
+        assert_eq!(fork_ledger.presented().len(), 1);
+        assert!(
+            parent.presented().is_empty(),
+            "a fork's declaration must not leak into the parent ledger"
         );
     }
 
