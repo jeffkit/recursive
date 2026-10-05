@@ -34,6 +34,7 @@ use super::{
     ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
     ToolSpec,
 };
+use crate::credentials::ApiKeySource;
 use crate::error::{Error, Result};
 use crate::message::{Message, Role};
 
@@ -43,6 +44,11 @@ const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
 pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
+    /// When set, the key is re-resolved through this source immediately before
+    /// each request instead of using `api_key` (issue #130). A rotation of the
+    /// underlying credential therefore lands on the next request without
+    /// rebuilding the provider.
+    api_key_source: Option<Arc<dyn ApiKeySource>>,
     model: String,
     client: Client,
     temperature: f64,
@@ -72,6 +78,7 @@ impl OpenAiProvider {
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            api_key_source: None,
             model: model.into(),
             client,
             temperature: 0.2,
@@ -111,6 +118,24 @@ impl OpenAiProvider {
         self
     }
 
+    /// Resolve the API key through `source` immediately before each request
+    /// (issue #130) instead of using the key captured at construction.
+    ///
+    /// This is what makes a rotation visible to the *next* request: the store
+    /// behind the source is consulted per operation, not once per process.
+    pub fn with_api_key_source(mut self, source: Arc<dyn ApiKeySource>) -> Self {
+        self.api_key_source = Some(source);
+        self
+    }
+
+    /// The key to send for the request about to be issued.
+    fn current_api_key(&self) -> Result<String> {
+        match &self.api_key_source {
+            Some(source) => source.resolve_api_key(),
+            None => Ok(self.api_key.clone()),
+        }
+    }
+
     /// Build an `Error::Llm` with the model name prefixed.
     fn make_err(&self, ctx: impl Into<String>) -> Error {
         Error::Llm {
@@ -140,6 +165,8 @@ impl OpenAiProvider {
     /// (MiniMax transient failure). All three are retried with exponential back-off
     /// according to `self.retry`. Non-transient 4xx errors are returned immediately.
     async fn post_json_with_retry(&self, url: &str, body: &Value, label: &str) -> Result<String> {
+        // Resolved once per call (per operation), not per retry attempt.
+        let api_key = self.current_api_key()?;
         let mut attempt = 0;
         loop {
             tracing::debug!(
@@ -150,7 +177,7 @@ impl OpenAiProvider {
             let result = self
                 .client
                 .post(url)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(&api_key)
                 .json(body)
                 .send()
                 .await;
@@ -587,6 +614,7 @@ impl OpenAiProvider {
         // Stream requests need the raw Response object for SSE parsing, so we
         // can't use post_json_with_retry (which returns text). Retry only on
         // non-2xx and network errors; a successful 2xx hands off to parse_sse_stream.
+        let api_key = self.current_api_key()?;
         let mut attempt = 0;
         loop {
             tracing::debug!(
@@ -597,7 +625,7 @@ impl OpenAiProvider {
             let result = self
                 .client
                 .post(&url)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(&api_key)
                 .json(&body)
                 .send()
                 .await;
@@ -3037,5 +3065,87 @@ data: [DONE]
         };
         let tu = ru.to_token_usage();
         assert_eq!(tu.cache_miss_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn api_key_source_is_resolved_per_request_so_a_rotation_lands_immediately() {
+        // Issue #130: the provider must consult its credential source for every
+        // request, so rotating the credential takes effect on the next request
+        // — no provider rebuild, no process restart.
+        use crate::credentials::{CredentialRef, CredentialStore, StoredCredential};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CredentialStore::new(
+            dir.path().join("home"),
+            dir.path().join("cwd"),
+        ));
+        let reference = CredentialRef::parse("RECURSIVE_TEST_PROVIDER_ROTATE").unwrap();
+        store.set(&reference, "sk-old").unwrap();
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_seen = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                let key = request
+                    .lines()
+                    .find_map(|l| l.strip_prefix("authorization: bearer "))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                server_seen.lock().unwrap().push(key);
+
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let source = Arc::new(StoredCredential::new(Arc::clone(&store), reference.clone()));
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-static", "test-model")
+            .unwrap()
+            .with_api_key_source(source);
+
+        provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect("first request must succeed");
+
+        // Rotate the underlying credential, then issue the next request on the
+        // very same provider.
+        store.set(&reference, "sk-new").unwrap();
+        provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect("second request must succeed");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["sk-old".to_string(), "sk-new".to_string()],
+            "each request must carry the credential value current at request time"
+        );
     }
 }

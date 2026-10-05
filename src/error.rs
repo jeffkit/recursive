@@ -3,6 +3,7 @@
 //! Structured error types that library consumers can match on.
 //! Every distinct failure mode has its own variant.
 
+use crate::credentials::CredentialErrorCode;
 use crate::permissions::DecisionReason;
 use thiserror::Error;
 
@@ -57,6 +58,18 @@ pub enum Error {
     /// Auto-classifier denial limit exceeded — agent should stop
     #[error("permission denial limit exceeded for tool {name}")]
     PermissionDeniedLimit { name: String },
+
+    /// Credential resolution or authorization failure (issue #130).
+    ///
+    /// `code` is a stable, machine-readable discriminator (see
+    /// [`CredentialErrorCode`]) so callers can tell a user *decline*
+    /// (`authorization_declined`) from an infrastructure *failure*
+    /// (`authorization_failed`) without matching the message text.
+    #[error("credential error [{code}]: {message}")]
+    Credential {
+        code: CredentialErrorCode,
+        message: String,
+    },
 
     /// LLM response truncated by provider
     #[error("llm response truncated by provider (finish_reason = {0:?})")]
@@ -158,6 +171,18 @@ impl Error {
             self,
             Error::RateLimited { .. } | Error::Timeout { .. } | Error::Http(_) | Error::Io(_)
         )
+    }
+
+    /// The credential error code carried by this error, when it is one
+    /// (issue #130).
+    ///
+    /// This is the branch point for credential handling: a decline and an
+    /// infrastructure failure are different codes, not different message text.
+    pub fn credential_code(&self) -> Option<CredentialErrorCode> {
+        match self {
+            Error::Credential { code, .. } => Some(*code),
+            _ => None,
+        }
     }
 
     /// HTTP status code carried by this error, when it came from an LLM
