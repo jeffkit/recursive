@@ -360,7 +360,14 @@ enum Cmd {
     },
     /// Run diagnostics: verify API key, config, workspace, and MCP servers.
     /// Exits 0 if everything looks healthy, 1 if any check fails.
-    Doctor,
+    Doctor {
+        /// Actively probe dependencies instead of only checking that files
+        /// exist: send one LLM request (key/gateway), write+read the transcript
+        /// storage (read-only/full disk), and write+read a temp file on the
+        /// workspace disk (capacity).
+        #[arg(long)]
+        probe: bool,
+    },
     /// Configure and manage MCP servers for the current workspace.
     Mcp {
         #[command(subcommand)]
@@ -1421,7 +1428,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Cmd::Migrate { dry_run } => cli::session::cmd_migrate(&config.workspace, dry_run),
-        Cmd::Doctor => cmd_doctor(&config, cli.mcp_config).await,
+        Cmd::Doctor { probe } => cmd_doctor(&config, cli.mcp_config, probe).await,
         Cmd::Mcp { cmd } => cmd_mcp(cmd, &config.workspace).await,
         Cmd::Update | Cmd::Upgrade => cmd_update().await,
         Cmd::Agents => cmd_agents(&config.workspace),
@@ -1432,7 +1439,17 @@ async fn main() -> anyhow::Result<()> {
 // ─── doctor ──────────────────────────────────────────────────────────────────
 
 /// Run diagnostics and print a health report. Returns Ok if all checks pass.
-async fn cmd_doctor(config: &Config, mcp_config: Option<PathBuf>) -> anyhow::Result<()> {
+///
+/// With `probe` (issue #123) the static checks are followed by active probes
+/// — one real LLM request, a storage write/read round-trip and a disk
+/// write/read — because "file exists and parses" cannot see the three
+/// half-dead states (dead key/gateway, read-only/full storage, unwritable
+/// disk) that a running server still answers 200 for.
+async fn cmd_doctor(
+    config: &Config,
+    mcp_config: Option<PathBuf>,
+    probe: bool,
+) -> anyhow::Result<()> {
     let mut any_fail = false;
 
     macro_rules! check {
@@ -1530,6 +1547,34 @@ async fn cmd_doctor(config: &Config, mcp_config: Option<PathBuf>) -> anyhow::Res
         println!("  ·  Config file: not yet created");
     }
 
+    // 7. Active probes (`--probe`): fail on the states a static check cannot
+    //    see — a gateway that answers 401, a read-only/full storage backend,
+    //    an unwritable disk.
+    if probe {
+        println!("\nActive probes\n");
+        match probe_storage(config).await {
+            Ok(detail) => println!("  ✓  Storage write/read round-trip  — {detail}"),
+            Err(e) => {
+                println!("  ✗  Storage write/read round-trip  — {e}");
+                any_fail = true;
+            }
+        }
+        match probe_disk(config) {
+            Ok(detail) => println!("  ✓  Disk write/read  — {detail}"),
+            Err(e) => {
+                println!("  ✗  Disk write/read  — {e}");
+                any_fail = true;
+            }
+        }
+        match probe_llm(config).await {
+            Ok(detail) => println!("  ✓  LLM reachable  — {detail}"),
+            Err(e) => {
+                println!("  ✗  LLM reachable  — {e}");
+                any_fail = true;
+            }
+        }
+    }
+
     println!();
     if any_fail {
         eprintln!("One or more checks failed.");
@@ -1538,6 +1583,81 @@ async fn cmd_doctor(config: &Config, mcp_config: Option<PathBuf>) -> anyhow::Res
         println!("All checks passed.");
     }
     Ok(())
+}
+
+/// `--probe`: send one real chat request through the configured provider.
+///
+/// This is the only check that can see a dead key or an unreachable gateway —
+/// the static "API key is set" check passes for a revoked key.
+async fn probe_llm(config: &Config) -> std::result::Result<String, String> {
+    let api_key = config.require_api_key().map_err(|e| e.to_string())?;
+    let retry = RetryPolicy {
+        max_retries: 0,
+        initial_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(1),
+    };
+    let provider = cli::builder::build_llm_provider(config, api_key, retry, None)
+        .map_err(|e| e.to_string())?;
+    let messages = vec![recursive::message::Message::user("ping")];
+    let started = std::time::Instant::now();
+    let completion = provider
+        .complete(&messages, &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{} answered in {}ms ({} chars)",
+        config.model,
+        started.elapsed().as_millis(),
+        completion.content.chars().count()
+    ))
+}
+
+/// `--probe`: write then read back a reserved key through the same storage
+/// backend the HTTP server uses — a read-only mount or a full disk fails here.
+///
+/// Cleanup is best-effort (the backend trait has no delete); a leftover
+/// `__doctor_probe__` entry is harmless.
+async fn probe_storage(config: &Config) -> std::result::Result<String, String> {
+    const KEY: &str = "__doctor_probe__";
+    let backend = recursive::storage::http_storage_backend(config.workspace.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    // The same write+read-back `/readyz` runs (issue #123) — one
+    // implementation, so the two probes cannot drift. The value is stable for
+    // the life of the process, so a concurrent probe cannot make this one's
+    // read-back look like a mismatch.
+    let value = format!("probe {}", std::process::id());
+    recursive::storage::memory_round_trip(backend.as_ref(), KEY, &value)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(config.workspace.join(".recursive").join("memory").join(KEY));
+    Ok(format!(
+        "{} accepted and returned the probe",
+        config.workspace.display()
+    ))
+}
+
+/// `--probe`: write a 1 MiB file under the workspace's `.recursive/` tree and
+/// read it back — a full or read-only disk fails the write.
+fn probe_disk(config: &Config) -> std::result::Result<String, String> {
+    const SIZE: usize = 1 << 20;
+    let dir = config.workspace.join(".recursive");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("doctor-disk-probe-{}.tmp", std::process::id()));
+    let payload = vec![0xA5u8; SIZE];
+    let started = std::time::Instant::now();
+    std::fs::write(&path, &payload).map_err(|e| format!("write {}: {e}", path.display()))?;
+    let read = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let elapsed = started.elapsed();
+    let _ = std::fs::remove_file(&path);
+    if read.len() != SIZE {
+        return Err(format!("wrote {SIZE} bytes, read back {}", read.len()));
+    }
+    Ok(format!(
+        "wrote+verified {SIZE} bytes in {}ms under {}",
+        elapsed.as_millis(),
+        dir.display()
+    ))
 }
 
 // ─── mcp ─────────────────────────────────────────────────────────────────────
@@ -4019,5 +4139,45 @@ mod tests {
                 .expect("load transcript"),
             messages
         );
+    }
+
+    /// Issue #123: `doctor --probe` writes and reads back a probe through the
+    /// same storage backend the HTTP server uses, and leaves no residue.
+    #[tokio::test]
+    async fn doctor_probe_storage_round_trips_and_cleans_up() {
+        std::env::remove_var(recursive::storage::ENV_S3_BUCKET);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = dummy_config(tmp.path());
+
+        let detail = probe_storage(&config)
+            .await
+            .expect("storage probe must pass");
+        assert!(detail.contains("accepted"), "detail: {detail}");
+        let probe = tmp.path().join(".recursive/memory/__doctor_probe__");
+        assert!(!probe.exists(), "probe entry must be cleaned up");
+    }
+
+    /// Issue #123: the disk probe writes then verifies 1 MiB and removes it.
+    #[test]
+    fn doctor_probe_disk_writes_and_cleans_up() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = dummy_config(tmp.path());
+
+        let detail = probe_disk(&config).expect("disk probe must pass");
+        assert!(detail.contains("verified"), "detail: {detail}");
+        assert!(
+            detail.contains("1048576 bytes"),
+            "probe must write the full 1 MiB: {detail}"
+        );
+        let residual = std::fs::read_dir(tmp.path().join(".recursive"))
+            .expect("read .recursive")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("doctor-disk-probe")
+            })
+            .count();
+        assert_eq!(residual, 0, "probe tmp files must be removed");
     }
 }

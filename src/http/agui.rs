@@ -1130,9 +1130,19 @@ pub(crate) fn spawn_agui_run(
         );
         match &outcome {
             Ok(o) if !cancelled => {
-                super::handlers::record_run_success(&metrics, o.steps, &o.total_usage)
+                super::handlers::record_run_success(&metrics, o.steps, &o.total_usage);
+                super::handlers::record_llm_success(&metrics);
             }
-            _ => super::handlers::record_run_failed(&metrics),
+            // Issue #123: only a failure of the LLM call itself may count
+            // against `/readyz` — a tool/storage fault or a client
+            // cancellation says nothing about the endpoint.
+            Err(e) => {
+                super::handlers::record_run_failed(&metrics);
+                if e.is_llm_failure() {
+                    super::handlers::record_llm_failure(&metrics);
+                }
+            }
+            Ok(_) => super::handlers::record_run_failed(&metrics),
         }
 
         // Persist the run into the thread's native session (issue #57):

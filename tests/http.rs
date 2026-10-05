@@ -52,6 +52,52 @@ mod http_tests {
         assert_eq!(&body[..], b"ok");
     }
 
+    /// Issue #123: `/healthz` is the k8s-native liveness spelling; it must
+    /// behave exactly like `/health`.
+    #[tokio::test]
+    async fn healthz_returns_ok() {
+        let app = build_router(sample_state());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    /// Issue #123: `/readyz` probes storage/LLM/admission and reports them as
+    /// JSON (200 when healthy) — unlike the constant `"ok"` of `/health`.
+    #[tokio::test]
+    async fn readyz_reports_ready_with_checks() {
+        let app = build_router(sample_state());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ready"], true, "fresh router must be ready: {json}");
+        assert_eq!(json["checks"]["storage"]["ok"], true, "{json}");
+        assert_eq!(json["checks"]["llm"]["ok"], true, "{json}");
+        assert_eq!(json["checks"]["admission"]["saturated"], false, "{json}");
+    }
+
     #[tokio::test]
     async fn tools_returns_json_array() {
         let app = build_router(sample_state());
@@ -2786,12 +2832,12 @@ mod http_tests {
 
     #[tokio::test]
     async fn auth_health_and_metrics_are_exempt() {
-        // Even with auth enabled, /health and /metrics must answer
-        // unauthenticated (k8s liveness + Prometheus scraping).
+        // Even with auth enabled, /health, /healthz, /readyz and /metrics must
+        // answer unauthenticated (k8s liveness/readiness + Prometheus).
         let auth = AuthConfig::new(vec!["secret".into()]);
         let app = build_router_with_auth(sample_state(), auth);
 
-        for uri in ["/health", "/metrics"] {
+        for uri in ["/health", "/healthz", "/readyz", "/metrics"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -3166,7 +3212,7 @@ mod http_tests {
     async fn jwt_health_metrics_remain_exempt() {
         let app = router_with_jwt_only("test-secret-12345", None);
 
-        for uri in ["/health", "/metrics"] {
+        for uri in ["/health", "/healthz", "/readyz", "/metrics"] {
             let response = app
                 .clone()
                 .oneshot(

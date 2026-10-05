@@ -159,6 +159,28 @@ impl SessionStore for NoopSessionStore {
     }
 }
 
+/// Issue #123: write `value` under `key`, read it back, and require the
+/// backend to return exactly what was written.
+///
+/// This is the probe behind `/readyz`'s storage check and `recursive doctor
+/// --probe` — one implementation so the two cannot drift. The write catches a
+/// read-only mount or a full disk; the read-back catches a backend that
+/// accepts the write and then loses it.
+///
+/// Callers pass a value that is stable for the life of the process (not
+/// per-request) so two concurrent probes write identical bytes and cannot make
+/// each other's read-back look like a mismatch; it still differs from whatever
+/// a previous process left behind, so a silently-dropped write is visible.
+pub async fn memory_round_trip(backend: &dyn StorageBackend, key: &str, value: &str) -> Result<()> {
+    backend.save_memory(key, value).await?;
+    match backend.load_memory(key).await? {
+        Some(read) if read == value => Ok(()),
+        other => Err(crate::error::Error::Storage {
+            message: format!("round-trip mismatch: wrote {value:?}, read {other:?}"),
+        }),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP backend selection (issue #92)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +361,92 @@ mod tests {
         let rt: AgentCheckpointState = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.step, 0);
         assert_eq!(rt.transcript_len, 0);
+    }
+
+    // ── issue #123: shared storage round-trip probe ──────────────────────
+
+    /// In-memory backend whose writes can be refused (read-only mount / full
+    /// disk) or silently dropped (accepted then lost) — the two failure modes
+    /// `memory_round_trip` must tell apart from a healthy write.
+    #[derive(Default)]
+    struct ProbeBackend {
+        stored: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        drop_writes: bool,
+        fail_writes: bool,
+    }
+
+    #[async_trait]
+    impl StorageBackend for ProbeBackend {
+        async fn load_transcript(&self, _session_id: &str) -> Result<Vec<Message>> {
+            Ok(vec![])
+        }
+
+        async fn save_transcript(&self, _session_id: &str, _messages: &[Message]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_memory(&self, key: &str) -> Result<Option<String>> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+                .cloned())
+        }
+
+        async fn save_memory(&self, key: &str, value: &str) -> Result<()> {
+            if self.fail_writes {
+                return Err(crate::error::Error::Storage {
+                    message: "read-only filesystem".into(),
+                });
+            }
+            if !self.drop_writes {
+                self.stored
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.to_string(), value.to_string());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_round_trip_accepts_a_working_backend() {
+        let backend = ProbeBackend::default();
+        memory_round_trip(&backend, "probe", "value-1")
+            .await
+            .expect("a backend that stores what it is given must pass");
+    }
+
+    #[tokio::test]
+    async fn memory_round_trip_rejects_a_refused_write() {
+        let backend = ProbeBackend {
+            fail_writes: true,
+            ..ProbeBackend::default()
+        };
+        let err = memory_round_trip(&backend, "probe", "value-1")
+            .await
+            .expect_err("a read-only backend must fail the probe");
+        assert!(
+            matches!(err, crate::error::Error::Storage { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_round_trip_rejects_a_dropped_write() {
+        // The write is accepted but never lands: only the read-back sees it.
+        let backend = ProbeBackend {
+            drop_writes: true,
+            ..ProbeBackend::default()
+        };
+        let err = memory_round_trip(&backend, "probe", "value-1")
+            .await
+            .expect_err("a backend that loses the write must fail the probe");
+        assert!(
+            err.to_string().contains("round-trip mismatch"),
+            "the probe must report the mismatch: {err}"
+        );
     }
 
     // ── issue #92: HTTP backend selection ────────────────────────────────
