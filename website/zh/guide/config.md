@@ -44,7 +44,7 @@
 ## 云存储 — S3
 
 > 需要 `cloud-runtime` feature 标志。设置 `RECURSIVE_S3_BUCKET` 后，`recursive http`
-> 把每轮对话记录增量持久化到 S3，并在重启后内存 miss 时冷加载。S3 对象不支持追加，
+> 在每轮结束时把对话记录写入 S3，并在重启后内存 miss 时冷加载。S3 对象不支持追加，
 > 因此每轮都会重写整个对象（`GET` + `PUT`）；取舍见
 > [云端部署](/zh/deployment/cloud)。
 

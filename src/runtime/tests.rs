@@ -1,6 +1,7 @@
 use super::*;
 use crate::hooks::HookRegistry;
 use crate::llm::{Completion, MockProvider};
+use crate::storage::StorageBackend;
 use crate::tools::plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use crate::tools::todo::TodoStatus;
 use crate::tools::Tool;
@@ -3076,11 +3077,20 @@ impl crate::storage::StorageBackend for RecordingStorage {
         Ok(())
     }
 
+    async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+        self.transcript.lock().unwrap().clear();
+        Ok(())
+    }
+
     async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
         Ok(None)
     }
 
     async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
         Ok(())
     }
 }
@@ -3125,11 +3135,20 @@ impl crate::storage::StorageBackend for FlakyStorage {
         Ok(())
     }
 
+    async fn delete_transcript(&self, _session_id: &str) -> crate::error::Result<()> {
+        self.transcript.lock().unwrap().clear();
+        Ok(())
+    }
+
     async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
         Ok(None)
     }
 
     async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
         Ok(())
     }
 }
@@ -3179,6 +3198,31 @@ async fn per_turn_persistence_appends_only_the_delta() {
         storage.loads.load(Ordering::Relaxed),
         1,
         "only the first turn needs a backend read to resolve the watermark"
+    );
+}
+
+#[tokio::test]
+async fn set_session_id_invalidates_the_persistence_watermark() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![reply("one"), reply("two")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+    rt.run("hi").await.unwrap();
+    assert_eq!(storage.loads.load(Ordering::Relaxed), 1);
+
+    // A new id names a different stored record, so the reused watermark must
+    // be discarded and the backend re-read rather than appended to blindly.
+    rt.set_session_id("sess-2");
+    rt.run("more").await.unwrap();
+    assert_eq!(
+        storage.loads.load(Ordering::Relaxed),
+        2,
+        "an id change must force a backend read instead of trusting the old watermark"
     );
 }
 

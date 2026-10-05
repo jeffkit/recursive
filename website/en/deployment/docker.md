@@ -48,9 +48,10 @@ AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
 ```
 
-`RECURSIVE_S3_BUCKET` selects the S3 transcript backend, which the runtime
-appends to per turn. `RECURSIVE_REDIS_URL` is not consumed by `recursive http`
-and is ignored (a note is logged).
+`RECURSIVE_S3_BUCKET` selects the S3 transcript backend. S3 objects cannot be
+appended to, so the runtime rewrites the whole object each turn (a
+load-extend-save fallback). `RECURSIVE_REDIS_URL` is not consumed by
+`recursive http` and is ignored (a note is logged).
 
 ## Health probe
 

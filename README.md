@@ -410,10 +410,12 @@ supported `recursive http` mode.
 
 Requires the `cloud-runtime` feature flag. **Wired into `recursive http`**:
 when `RECURSIVE_S3_BUCKET` is set the server uses `S3StorageBackend` for
-transcripts, memory entries and per-session metadata. The runtime appends each
-turn's transcript growth (`append_transcript`), so sessions survive a restart,
-are visible to sibling replicas pointed at the same bucket, and a crash loses
-at most the in-flight turn. The bucket is only consulted when the feature is
+transcripts, memory entries and per-session metadata. The runtime persists each
+turn's transcript growth through `append_transcript`, so sessions survive a
+restart, are visible to sibling replicas pointed at the same bucket, and a
+crash loses at most the in-flight turn. S3 objects cannot be appended to, so
+`S3StorageBackend` takes the trait's load-extend-save fallback and rewrites the
+whole object each turn. The bucket is only consulted when the feature is
 compiled in; without it the var is inert (a warning is logged).
 
 | Env | Default | Purpose |
