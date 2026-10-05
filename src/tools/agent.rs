@@ -1020,15 +1020,12 @@ impl AgentTool {
             };
 
         // If the cancel/timeout branch fired, `outcomes` is empty but handles
-        // may still be running: cancel the child token (graceful), rescue the
-        // already-finished workers' real results, abort the stragglers, and
+        // may still be running: rescue the already-finished workers' real
+        // results, cancel the child token (graceful), abort the stragglers, and
         // produce placeholder results so the parent LLM sees one result line
         // per dispatched worker.
         let mut results: Vec<(String, String)> = Vec::new();
         if !aggregated {
-            if let Some(token) = &child_token {
-                token.cancel();
-            }
             let label = if timed_out {
                 "WallClockExceeded"
             } else {
@@ -1037,11 +1034,29 @@ impl AgentTool {
             // 超时/取消分支按登记表抢救已完成 worker 的真实结果；只对登记表里
             // 没有的（未完成）abort + 占位——deadline 一到，先完成的报告不能被
             // "did not finish" 占位整体顶掉。
+            //
+            // The snapshot MUST be taken before `token.cancel()`: a worker
+            // parked in `complete_with_budget` races its provider call against
+            // `token.cancelled()`, so cancelling first lets our own cancel
+            // surface as `FinishReason::Cancelled`, land in the ledger, and be
+            // rescued as "Cancelled" — mislabeling a wall-clock timeout (the
+            // race that made
+            // `…wall_deadline_labels_wall_clock_exceeded` flake under load).
             let ids: Vec<String> = manifest.keys().cloned().collect();
-            let ledger = rescued.lock().unwrap_or_else(|e| e.into_inner());
+            debug_assert_eq!(ids.len(), handles.len());
+            // Snapshot the whole ledger (id-keyed, not index-keyed) so the
+            // rescue lookup below stays coupled to the worker *id* rather than
+            // to `handles[idx]`/`manifest.keys()[idx]` positional alignment.
+            let rescued_before_cancel = {
+                let ledger = rescued.lock().unwrap_or_else(|e| e.into_inner());
+                ledger.clone()
+            };
+            if let Some(token) = &child_token {
+                token.cancel();
+            }
             for (idx, handle) in handles.into_iter().enumerate() {
                 let id = ids.get(idx).cloned().unwrap_or_else(|| "(unknown)".into());
-                match ledger.get(&id) {
+                match rescued_before_cancel.get(&id) {
                     Some(Ok(text)) => results.push((id, text.clone())),
                     Some(Err(e)) => results.push((id, format!("ERROR: {e}"))),
                     None => {
@@ -1063,7 +1078,6 @@ impl AgentTool {
                     }
                 }
             }
-            drop(ledger);
         } else {
             for outcome in outcomes {
                 match outcome {

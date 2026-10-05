@@ -3,6 +3,7 @@ pub(crate) mod claude_json;
 pub(crate) mod control;
 pub(crate) mod init;
 pub(crate) mod interrupt;
+pub(crate) mod observability;
 pub(crate) mod output;
 pub(crate) mod resume;
 pub(crate) mod session;

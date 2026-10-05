@@ -2428,14 +2428,27 @@ async fn run_once(
     };
 
     let (channel_sink, event_rx) = ChannelSink::new();
-    let event_sink: Arc<dyn EventSink> = if let Some(ref sw) = session_writer {
-        Arc::new(CompositeSink::new(vec![
-            Box::new(channel_sink) as Box<dyn EventSink>,
-            Box::new(SessionPersistenceSink::new(sw.clone())) as Box<dyn EventSink>,
-        ]))
-    } else {
-        Arc::new(channel_sink)
-    };
+    let mut event_sinks: Vec<Box<dyn EventSink>> = vec![Box::new(channel_sink)];
+    if let Some(ref sw) = session_writer {
+        event_sinks.push(Box::new(SessionPersistenceSink::new(sw.clone())));
+    }
+    // Issue #124: one Langfuse trace per CLI run when the observability env
+    // vars are set; an inert no-op otherwise.
+    let langfuse_run = cli::observability::attach(
+        session_writer
+            .as_ref()
+            .map(|w| {
+                w.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .session_id()
+                    .to_string()
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        config.model.clone(),
+        config.provider_type.clone(),
+        &mut event_sinks,
+    );
+    let event_sink: Arc<dyn EventSink> = Arc::new(CompositeSink::new(event_sinks));
     let mut runtime = cli::builder::build_runtime(
         &config,
         max_transcript_chars,
@@ -2648,6 +2661,9 @@ async fn run_once(
     let (outcome, emitted_streaming_turn_results) = match run_result {
         Ok(pair) => pair,
         Err(err) => {
+            // Issue #124: mark the Langfuse trace failed before returning so
+            // the root span carries the provider/transport error.
+            langfuse_run.finish(None, Some(&err.to_string())).await;
             // Drop the runtime first so its event-sink sender releases the
             // stream task's `rx` — otherwise `task.finish()` would await a
             // handle that never completes. Then emit a terminal error
@@ -2677,6 +2693,11 @@ async fn run_once(
 
     let transcript = runtime.transcript().to_vec();
     drop(runtime);
+
+    // Issue #124: close the run trace with its terminal finish reason.
+    langfuse_run
+        .finish(Some(&outcome.finish_reason.to_string()), None)
+        .await;
 
     // Cancellation is now visible via outcome.finish_reason ==
     // FinishReason::Cancelled; print_finish_note below renders it.

@@ -48,6 +48,7 @@ pub mod message;
 pub mod migrate;
 pub mod multi;
 pub mod notify;
+pub mod observability;
 pub mod paths;
 pub mod permissions;
 pub mod preset;

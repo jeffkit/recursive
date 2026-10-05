@@ -49,6 +49,14 @@ openai-embedding = []
 # Cosine similarity is computed in Rust; suitable for typical agent memory sizes (<10k entries).
 vector-memory = ["openai-embedding", "dep:rusqlite"]
 skill-hub = ["dep:zip"]
+# Issue #124: Langfuse / OTLP observability export. When compiled in, a
+# Langfuse run trace is produced at runtime whenever the `LANGFUSE_*`
+# (or `RECURSIVE_OTEL_TRACES_URL`) env vars are set — no rebuild needed.
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+]
 
 [lib]
 name = "recursive"
@@ -92,6 +100,16 @@ regex = "1"
 base64 = "0.22"
 blake3 = "1"
 sha2 = "0.10"
+# Issue #124: OTLP HTTP/protobuf span export to Langfuse (`otel` feature).
+# `http-proto` + `reqwest-client` + `reqwest-rustls` targets Langfuse's
+# `/api/public/otel/v1/traces` ingestion endpoint over the workspace's
+# existing rustls TLS stack; the default `grpc-tonic` path is dropped.
+# `reqwest-client` is REQUIRED: `http-proto` alone leaves the HTTP client
+# unselected (`reqwest-rustls` only flips TLS roots), so `SpanExporter::build`
+# fails with "no http client" and the exporter becomes a silent no-op.
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls", "trace"], optional = true }
 futures-util = { version = "0.3.32" }
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
@@ -143,7 +161,7 @@ mutants = "0.0.3"
 # and by downstream workspace crates. cargo-machete's text scan can't see
 # feature-gated usage, so it false-positives them as unused.
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "clap", "tower-http"]
+ignored = ["anyhow", "clap", "tower-http", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
 
 [profile.dev]
 opt-level = 0

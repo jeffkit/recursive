@@ -1322,6 +1322,12 @@ pub(super) async fn list_skills(State(state): State<Arc<AppState>>) -> Json<Vec<
     )
 }
 
+/// Number of user messages in a session transcript so far — the 0-based turn
+/// index reported to observability for the next run (issue #124).
+fn prior_turn_index(transcript: &[crate::message::Message]) -> u32 {
+    transcript.iter().filter(|m| m.role == Role::User).count() as u32
+}
+
 /// POST /sessions/:id/messages — send a message in a session.
 pub(super) async fn send_session_message(
     State(state): State<Arc<AppState>>,
@@ -1401,7 +1407,22 @@ pub(super) async fn send_session_message(
 
     // Wire a ChannelSink so events are forwarded to SSE subscribers.
     let (sink, mut event_rx) = ChannelSink::new();
-    runtime.set_event_sink(Arc::new(sink));
+    // Issue #124: one Langfuse trace per HTTP turn when the observability env
+    // vars are set; an inert no-op otherwise. The turn index is the count of
+    // prior user messages still in the transcript, so multi-turn sessions get
+    // distinct `langfuse.trace.metadata.turn` values.
+    let turn = prior_turn_index(runtime.transcript());
+    let langfuse_run = crate::observability::LangfuseRun::try_new(
+        crate::observability::RunMeta::new(
+            id.clone(),
+            state.config.model.clone(),
+            state.config.provider_type.clone(),
+        )
+        .with_turn(turn),
+    );
+    let mut event_sinks: Vec<Box<dyn crate::event::EventSink>> = vec![Box::new(sink)];
+    crate::observability::with_sink(&langfuse_run, &mut event_sinks);
+    runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(event_sinks)));
 
     // Spawn a forwarder: AgentEvent → SseEvent → broadcast channel.
     // SDK Phase B: track tool call start times so we can emit tool_progress
@@ -1470,10 +1491,18 @@ pub(super) async fn send_session_message(
     runtime.set_event_sink(Arc::new(NullSink));
     let _ = forward_handle.await;
 
+    if let Err(e) = &run_result {
+        // Issue #124: mark the Langfuse trace failed on provider/transport errors.
+        langfuse_run.finish(None, Some(&e.to_string())).await;
+    }
     let outcome = run_result.map_err(|e| {
         record_run_failed(&state.metrics);
         map_run_error(&e)
     })?;
+    // Issue #124: close the run trace with its terminal finish reason.
+    langfuse_run
+        .finish(Some(&outcome.finish_reason.to_string()), None)
+        .await;
 
     // Update per-session token counters and global metrics.
     prompt_tokens_arc.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
@@ -3234,6 +3263,22 @@ mod tests {
             state.host.try_begin_run(format!("session:{sid}")).is_some(),
             "the run fence must be free once the handler returns"
         );
+    }
+
+    #[test]
+    fn prior_turn_index_counts_only_user_messages() {
+        use crate::message::Message;
+        // User count (2) differs from non-user count (3) so an inverted
+        // predicate would be caught.
+        let transcript = vec![
+            Message::user("first"),
+            Message::user("second"),
+            Message::assistant("one"),
+            Message::assistant("two"),
+            Message::system("sys"),
+        ];
+        assert_eq!(prior_turn_index(&transcript), 2);
+        assert_eq!(prior_turn_index(&[]), 0);
     }
 
     #[tokio::test]
