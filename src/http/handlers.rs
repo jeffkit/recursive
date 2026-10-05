@@ -34,6 +34,207 @@ pub(super) async fn health() -> &'static str {
     "ok"
 }
 
+/// Issue #123: reserved storage key for the `/readyz` storage probe. No other
+/// code path reads or writes it, so it can never collide with a session
+/// transcript or a memory entry.
+const READYZ_PROBE_KEY: &str = "__readyz_probe__";
+
+/// Issue #123: consecutive failed **LLM** runs after which `/readyz` reports
+/// not-ready. Catches a hard-broken key/gateway within a few requests while
+/// letting a single transient 5xx recover without flapping a healthy pod out
+/// of rotation.
+pub const READYZ_MAX_LLM_FAILURES: u64 = 3;
+
+/// Issue #123: how long a failure streak keeps `/readyz` not-ready.
+///
+/// Clearing the streak on the next success is not enough on its own: once the
+/// probe fails, a k8s Service drops the pod from its endpoints, so it receives
+/// no runs — and therefore no success — and a three-request gateway blip would
+/// latch until a human restarted the pod (with every replica tripped, the
+/// Service would have no endpoints left and could not recover on its own).
+/// So a streak whose most recent failure is older than this window no longer
+/// describes the present: `/readyz` decays it and reports ready again. A
+/// genuinely broken gateway re-trips the streak within
+/// [`READYZ_MAX_LLM_FAILURES`] requests once traffic returns.
+pub const READYZ_LLM_FAILURE_WINDOW_MS: u64 = 60_000;
+
+/// Issue #123: how long a `/readyz` storage verdict is reused.
+///
+/// The endpoint is on the unauthenticated public router (a k8s probe cannot
+/// carry a key), so probing storage on every request would let an anonymous
+/// caller drive one write — an S3 PUT, in cloud deployments — per request just
+/// by scraping it.
+pub const READYZ_PROBE_TTL_MS: u64 = 5_000;
+
+/// Issue #123: [`super::now_session_ms`] with `0` reserved for the "never
+/// happened" sentinel the readiness bookkeeping uses.
+///
+/// The epoch is initialised lazily by the first caller in the process, so that
+/// first call reads `0` — a success, failure or probe landing in that first
+/// millisecond would otherwise be indistinguishable from "never happened"
+/// (`/readyz` would report `last_success_ms_ago: null` for a run that just
+/// succeeded).
+fn now_stamp_ms() -> u64 {
+    super::now_session_ms().max(1)
+}
+
+/// Issue #123: does a failure streak still describe the present?
+///
+/// Only a *recent* last failure does (see [`READYZ_LLM_FAILURE_WINDOW_MS`]);
+/// an unstamped streak (`last_failure_ms == 0`) is no evidence of an outage
+/// either, so it decays like a stale one.
+fn llm_streak_is_current(failures: u64, last_failure_ms: u64, now_ms: u64) -> bool {
+    failures > 0
+        && last_failure_ms != 0
+        && now_ms.saturating_sub(last_failure_ms) < READYZ_LLM_FAILURE_WINDOW_MS
+}
+
+/// Issue #123: is the cached storage verdict still usable?
+///
+/// A stamp of `0` means "never probed" — probe now instead of trusting a
+/// verdict nobody took (see [`READYZ_PROBE_TTL_MS`]).
+fn readyz_probe_is_fresh(probed_ms: u64, now_ms: u64) -> bool {
+    probed_ms != 0 && now_ms.saturating_sub(probed_ms) < READYZ_PROBE_TTL_MS
+}
+
+/// Value written by the `/readyz` storage probe.
+///
+/// Constant for the life of the process — not per request — so two concurrent
+/// probes write identical bytes and cannot make each other's read-back look
+/// like a mismatch, while still differing from whatever a previous process
+/// left behind (a backend that accepts our write and silently drops it then
+/// fails the read-back instead of reading a stale but plausible value).
+fn readyz_probe_value() -> String {
+    format!("readyz-{}", std::process::id())
+}
+
+/// Issue #123: probe storage writability with a real write + read-back.
+///
+/// This is the only way a read-only mount or a full disk shows up *before* a
+/// session teardown silently loses data. Shares its implementation with
+/// `recursive doctor --probe` so the two probes cannot drift.
+async fn probe_storage(storage: &Arc<dyn crate::storage::StorageBackend>) -> bool {
+    match crate::storage::memory_round_trip(
+        storage.as_ref(),
+        READYZ_PROBE_KEY,
+        &readyz_probe_value(),
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "readyz: storage probe failed");
+            false
+        }
+    }
+}
+
+/// `GET /readyz` — k8s-style readiness probe (issue #123).
+///
+/// `/health` is a constant `"ok"`; this endpoint exists to make the three
+/// "半死" states a live process still answers 200 for visible to a load
+/// balancer:
+///
+/// 1. **storage** — a real write *and read-back* round-trip to the configured
+///    backend, so a read-only mount or a full disk fails here exactly as it
+///    would on a session teardown save. The verdict is cached for
+///    [`READYZ_PROBE_TTL_MS`] because this endpoint is public and a probe
+///    costs a write.
+/// 2. **llm** — a *recent* streak of failed LLM runs
+///    (`READYZ_MAX_LLM_FAILURES` → a dead API key / unreachable gateway),
+///    decayed after [`READYZ_LLM_FAILURE_WINDOW_MS`] so a transient blip
+///    cannot latch the pod out of rotation forever.
+/// 3. **admission** — the run pool is saturated *and* requests are queued;
+///    fully-busy-but-draining is normal load, not unreadiness.
+///
+/// Returns `200` with a per-check JSON body when ready, `503` otherwise.
+pub(super) async fn readyz(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let now = super::now_session_ms();
+
+    // 1. Storage round-trip probe. The failure reason is logged, not echoed:
+    //    this endpoint is unauthenticated (a k8s probe cannot carry a key) and
+    //    backend errors carry absolute paths.
+    let probed_ms = state
+        .metrics
+        .readyz_storage_probed_ms
+        .load(Ordering::Relaxed);
+    let storage_ok = if readyz_probe_is_fresh(probed_ms, now) {
+        state.metrics.readyz_storage_ok.load(Ordering::Relaxed)
+    } else {
+        let ok = probe_storage(&state.storage).await;
+        // Verdict first, then the stamp: a concurrent reader that sees a fresh
+        // stamp must also see the verdict it belongs to.
+        state.metrics.readyz_storage_ok.store(ok, Ordering::Relaxed);
+        state
+            .metrics
+            .readyz_storage_probed_ms
+            .store(now_stamp_ms(), Ordering::Relaxed);
+        ok
+    };
+    let storage = serde_json::json!({ "ok": storage_ok });
+
+    // 2. LLM reachability: a failure streak that is still current.
+    let mut failures = state
+        .metrics
+        .llm_failures_consecutive
+        .load(Ordering::Relaxed);
+    let last_failure = state.metrics.last_llm_failure_ms.load(Ordering::Relaxed);
+    if failures > 0 && !llm_streak_is_current(failures, last_failure, now) {
+        // See READYZ_LLM_FAILURE_WINDOW_MS: a streak nothing has refreshed
+        // must not keep the pod out of rotation. Compare-and-swap so a failure
+        // recorded concurrently is not thrown away with the decayed streak.
+        failures = match state.metrics.llm_failures_consecutive.compare_exchange(
+            failures,
+            0,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => 0,
+            Err(current) => current,
+        };
+    }
+    let last_success = state.metrics.last_llm_success_ms.load(Ordering::Relaxed);
+    let llm_ok = failures < READYZ_MAX_LLM_FAILURES;
+    let llm = serde_json::json!({
+        "ok": llm_ok,
+        "consecutive_failures": failures,
+        "last_success_ms_ago": if last_success == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(now.saturating_sub(last_success))
+        },
+    });
+
+    // 3. Admission saturation.
+    let in_flight = state.metrics.runs_in_flight.load(Ordering::Relaxed);
+    let waiting = state.metrics.runs_waiting.load(Ordering::Relaxed);
+    let max_concurrent = state.host.admission().max_concurrent_runs() as u64;
+    let saturated = max_concurrent > 0 && in_flight >= max_concurrent;
+    let admission_ok = !(saturated && waiting > 0);
+    let admission = serde_json::json!({
+        "ok": admission_ok,
+        "in_flight": in_flight,
+        "max_concurrent": max_concurrent,
+        "saturated": saturated,
+    });
+
+    let ready = storage_ok && llm_ok && admission_ok;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ready": ready,
+            "checks": { "storage": storage, "llm": llm, "admission": admission },
+        })),
+    )
+}
+
 /// Map an admission failure to the standardized API error (Goal 398).
 ///
 /// `Timeout` → `503 Service Unavailable` with a `Retry-After` hint; a closed
@@ -263,9 +464,40 @@ pub(super) fn record_run_success(
 }
 
 /// Update metrics after a failed agent run.
+///
+/// Run bookkeeping only — a failure here says nothing about the LLM endpoint,
+/// so readiness is driven by [`record_llm_failure`] instead (a client
+/// cancellation or a tool/storage fault must not take a healthy pod out of
+/// rotation).
 pub(super) fn record_run_failed(metrics: &super::Metrics) {
     metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Issue #123: a run that really completed proves the LLM endpoint answered —
+/// reset the readiness streak and stamp the success instant.
+///
+/// Deliberately separate from [`record_run_success`]: a turn the client
+/// interrupted can finish as `Cancelled` without the provider ever having
+/// answered, so only call sites that know the run completed may clear the
+/// streak.
+pub(super) fn record_llm_success(metrics: &super::Metrics) {
+    metrics.llm_failures_consecutive.store(0, Ordering::Relaxed);
+    metrics
+        .last_llm_success_ms
+        .store(now_stamp_ms(), Ordering::Relaxed);
+}
+
+/// Issue #123: the LLM call itself failed — a revoked key, an unreachable
+/// gateway, a malformed provider response (see
+/// [`crate::error::Error::is_llm_failure`]). Drives the `/readyz` streak.
+pub(super) fn record_llm_failure(metrics: &super::Metrics) {
+    metrics
+        .llm_failures_consecutive
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .last_llm_failure_ms
+        .store(now_stamp_ms(), Ordering::Relaxed);
 }
 
 /// Map a typed runtime [`crate::error::Error`] to the correct HTTP status code.
@@ -418,12 +650,18 @@ pub(super) async fn run_agent(
         Err(e) => {
             runtime.destroy_environment().await;
             record_run_failed(&state.metrics);
+            // Issue #123: only a failure of the LLM call itself says the
+            // endpoint is down — a tool or storage error must not.
+            if e.is_llm_failure() {
+                record_llm_failure(&state.metrics);
+            }
             return Err(map_run_error(&e));
         }
     };
     runtime.destroy_environment().await;
 
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
+    record_llm_success(&state.metrics);
 
     // Serialize transcript messages to JSON values
     let messages: Vec<serde_json::Value> = runtime
@@ -845,6 +1083,12 @@ pub(super) async fn delete_session(
         // Clean up SSE event channel for this session.
         state.event_channels.write().await.remove(&id);
         if let Err(e) = state.storage.save_transcript(&id, &transcript).await {
+            // Issue #123: a failed teardown save is real data loss — count it
+            // so it is visible on `/metrics`, not just in the log.
+            state
+                .metrics
+                .persist_failures
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = %id,
                 error = %e,
@@ -859,6 +1103,12 @@ pub(super) async fn delete_session(
             .save_memory(&super::cold_load::deleted_marker_key(&id), "1")
             .await
         {
+            // Issue #123: a missing tombstone means a deleted session can be
+            // cold-loaded back to life — a correctness failure, so count it.
+            state
+                .metrics
+                .persist_failures
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = %id,
                 error = %e,
@@ -1497,6 +1747,11 @@ pub(super) async fn send_session_message(
     }
     let outcome = run_result.map_err(|e| {
         record_run_failed(&state.metrics);
+        // Issue #123: as in `/run`, only a failure of the LLM call itself
+        // counts against readiness.
+        if e.is_llm_failure() {
+            record_llm_failure(&state.metrics);
+        }
         map_run_error(&e)
     })?;
     // Issue #124: close the run trace with its terminal finish reason.
@@ -1511,6 +1766,14 @@ pub(super) async fn send_session_message(
         Ordering::Relaxed,
     );
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
+    // Issue #123: an interrupted turn may have been cancelled before the
+    // provider ever answered, so it must not clear the readiness streak.
+    if !matches!(
+        &outcome.finish_reason,
+        crate::agent::FinishReason::Cancelled
+    ) {
+        record_llm_success(&state.metrics);
+    }
 
     // Extract the last assistant message from the runtime's transcript.
     let last_assistant = runtime
@@ -2123,6 +2386,28 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
             Err(_) => transcript_bytes_skipped += 1,
         }
     }
+    // Issue #123: capacity / data-loss gauges that were previously invisible.
+    // `sse_clients` is derived from each per-session channel's subscriber
+    // count (`event_channels` has no other reader of `receiver_count`); the
+    // two `persist_failures` / `sessions_evicted` counters are bumped on the
+    // reaper, DELETE and shutdown paths. AG-UI runs have no `SessionState`
+    // row, so `agui_active_runs` is the only place they are counted.
+    let sse_clients: u64 = state
+        .event_channels
+        .read()
+        .await
+        .values()
+        .map(|tx| tx.receiver_count() as u64)
+        .sum();
+    let agui_runs = state
+        .agui_active_runs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u64;
+    let persist_failures = metrics.persist_failures.load(Ordering::Relaxed);
+    let sessions_evicted = metrics.sessions_evicted.load(Ordering::Relaxed);
+    let last_llm_success_ms = metrics.last_llm_success_ms.load(Ordering::Relaxed);
+    let llm_failures_consecutive = metrics.llm_failures_consecutive.load(Ordering::Relaxed);
 
     format!(
         "# HELP recursive_requests_total Total HTTP requests\n\
@@ -2166,7 +2451,25 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          recursive_transcript_bytes_skipped {transcript_bytes_skipped}\n\
          # HELP recursive_rate_limits_rejected_total Total requests rejected by rate limiting\n\
          # TYPE recursive_rate_limits_rejected_total counter\n\
-         recursive_rate_limits_rejected_total {rate_limits_rejected}\n"
+         recursive_rate_limits_rejected_total {rate_limits_rejected}\n\
+         # HELP recursive_sse_clients SSE subscribers across all session channels\n\
+         # TYPE recursive_sse_clients gauge\n\
+         recursive_sse_clients {sse_clients}\n\
+         # HELP recursive_agui_runs AG-UI runs currently in flight (issue #123)\n\
+         # TYPE recursive_agui_runs gauge\n\
+         recursive_agui_runs {agui_runs}\n\
+         # HELP recursive_persist_failures Transcript/memory persists that failed or were skipped with data loss (issue #123)\n\
+         # TYPE recursive_persist_failures counter\n\
+         recursive_persist_failures {persist_failures}\n\
+         # HELP recursive_sessions_evicted Total sessions removed by the idle reaper (issue #123)\n\
+         # TYPE recursive_sessions_evicted counter\n\
+         recursive_sessions_evicted {sessions_evicted}\n\
+         # HELP recursive_llm_last_success_ms Milliseconds since server epoch of the last successful run (0 = never; issue #123)\n\
+         # TYPE recursive_llm_last_success_ms gauge\n\
+         recursive_llm_last_success_ms {last_llm_success_ms}\n\
+         # HELP recursive_llm_failures_consecutive Failed LLM runs since the last success; decayed by /readyz once the streak is older than the readiness window (issue #123)\n\
+         # TYPE recursive_llm_failures_consecutive gauge\n\
+         recursive_llm_failures_consecutive {llm_failures_consecutive}\n"
     )
 }
 
@@ -3480,6 +3783,470 @@ mod tests {
         );
     }
 
+    /// Issue #123: minimal `AppState` for the readiness / metric-surface
+    /// tests, mirroring `metrics_handler_includes_new_fields`.
+    fn readyz_state(
+        metrics: crate::http::Metrics,
+        storage: Arc<dyn crate::storage::StorageBackend>,
+        max_concurrent: usize,
+    ) -> Arc<AppState> {
+        use crate::tools::ToolRegistry;
+        use std::sync::atomic::AtomicU64;
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let config = crate::config::Config::from_env().unwrap();
+        Arc::new(AppState {
+            metrics: Arc::new(metrics),
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config,
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            slash_commands: Arc::new(vec![]),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    max_concurrent,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage,
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn readyz_local_storage(tag: &str) -> Arc<dyn crate::storage::StorageBackend> {
+        Arc::new(crate::storage::LocalStorageBackend::new(
+            std::env::temp_dir().join(format!("recursive-readyz-{tag}-{}", std::process::id())),
+        ))
+    }
+
+    /// Metrics carrying a fixed admission gauge pair.
+    fn admission_metrics(in_flight: u64, waiting: u64) -> crate::http::Metrics {
+        use std::sync::atomic::AtomicU64;
+        crate::http::Metrics {
+            runs_in_flight: Arc::new(AtomicU64::new(in_flight)),
+            runs_waiting: Arc::new(AtomicU64::new(waiting)),
+            ..crate::http::Metrics::default()
+        }
+    }
+
+    /// Issue #123: a healthy server is ready; the body reports each check.
+    #[tokio::test]
+    async fn readyz_reports_ready_when_checks_pass() {
+        let state = readyz_state(
+            crate::http::Metrics::default(),
+            readyz_local_storage("ok"),
+            8,
+        );
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::OK, "healthy server must be ready");
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["checks"]["storage"]["ok"], true);
+        assert_eq!(body["checks"]["llm"]["ok"], true);
+        assert_eq!(body["checks"]["llm"]["consecutive_failures"], 0);
+        assert_eq!(body["checks"]["admission"]["max_concurrent"], 8);
+        assert_eq!(body["checks"]["admission"]["saturated"], false);
+    }
+
+    /// Issue #123: a broken key / unreachable gateway (a run-failure streak
+    /// at the threshold) makes `/readyz` report 503 instead of 200.
+    #[tokio::test]
+    async fn readyz_reports_503_when_llm_streak_reaches_threshold() {
+        let metrics = crate::http::Metrics::default();
+        metrics
+            .llm_failures_consecutive
+            .store(READYZ_MAX_LLM_FAILURES, Ordering::Relaxed);
+        // The failures must be *recent* to count (see
+        // READYZ_LLM_FAILURE_WINDOW_MS), so stamp them.
+        metrics
+            .last_llm_failure_ms
+            .store(now_stamp_ms(), Ordering::Relaxed);
+        let state = readyz_state(metrics, readyz_local_storage("llm-down"), 8);
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["checks"]["llm"]["ok"], false);
+        assert_eq!(
+            body["checks"]["llm"]["consecutive_failures"],
+            READYZ_MAX_LLM_FAILURES
+        );
+        // Storage stays healthy — only the LLM check fails.
+        assert_eq!(body["checks"]["storage"]["ok"], true);
+    }
+
+    /// Issue #123: one failure below the threshold still counts as ready —
+    /// a single transient error must not flap the pod out of rotation.
+    #[tokio::test]
+    async fn readyz_stays_ready_below_llm_failure_threshold() {
+        let metrics = crate::http::Metrics::default();
+        metrics
+            .llm_failures_consecutive
+            .store(READYZ_MAX_LLM_FAILURES - 1, Ordering::Relaxed);
+        metrics
+            .last_llm_failure_ms
+            .store(now_stamp_ms(), Ordering::Relaxed);
+        let state = readyz_state(metrics, readyz_local_storage("llm-flaky"), 8);
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["checks"]["llm"]["ok"], true);
+    }
+
+    /// Issue #123: a failure streak nobody has refreshed must not latch the
+    /// pod out of rotation forever. Once the probe fails, a k8s Service drops
+    /// the pod from its endpoints, so it receives no runs — and therefore no
+    /// success that could clear the streak — and nothing short of a restart
+    /// would ever make it ready again.
+    #[tokio::test]
+    async fn readyz_decays_a_stale_llm_streak_instead_of_latching() {
+        let metrics = crate::http::Metrics::default();
+        metrics
+            .llm_failures_consecutive
+            .store(READYZ_MAX_LLM_FAILURES, Ordering::Relaxed);
+        // A failure instant at least one window old: in a young process the
+        // subtraction saturates to the "no instant recorded" sentinel, which
+        // is stale too — either way the streak is not evidence of an outage
+        // *now*.
+        metrics.last_llm_failure_ms.store(
+            crate::http::now_session_ms().saturating_sub(READYZ_LLM_FAILURE_WINDOW_MS),
+            Ordering::Relaxed,
+        );
+        let state = readyz_state(metrics, readyz_local_storage("llm-stale"), 8);
+
+        let (status, Json(body)) = readyz(State(state.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a streak older than the window must not keep the pod unready"
+        );
+        assert_eq!(body["checks"]["llm"]["ok"], true);
+        assert_eq!(body["checks"]["llm"]["consecutive_failures"], 0);
+        assert_eq!(
+            state
+                .metrics
+                .llm_failures_consecutive
+                .load(Ordering::Relaxed),
+            0,
+            "the decay must reset the counter, not only the response body"
+        );
+    }
+
+    /// Issue #123: the streak decision itself, at and around the window.
+    #[test]
+    fn llm_streak_is_current_only_while_the_last_failure_is_recent() {
+        let window = READYZ_LLM_FAILURE_WINDOW_MS;
+        assert!(
+            !llm_streak_is_current(0, 1_000, 1_000),
+            "no failures is not a streak"
+        );
+        assert!(
+            llm_streak_is_current(3, 1_000, 1_000),
+            "fresh failures are a live streak"
+        );
+        assert!(
+            llm_streak_is_current(3, 1_000, 1_000 + window - 1),
+            "still inside the window"
+        );
+        assert!(
+            !llm_streak_is_current(3, 1_000, 1_000 + window),
+            "at the window boundary the streak stops counting"
+        );
+        assert!(
+            !llm_streak_is_current(3, 0, 1_000),
+            "a streak with no recorded failure instant proves nothing"
+        );
+    }
+
+    /// Issue #123: a saturated pool *with queued requests* is capacity
+    /// exhaustion → 503; but fully-busy-but-draining is normal load, and an
+    /// unlimited pool (`max_concurrent == 0`) can never be saturated.
+    #[tokio::test]
+    async fn readyz_reports_503_only_when_saturated_with_waiters() {
+        // 8/8 in flight with 5 waiting → not ready.
+        let state = readyz_state(
+            admission_metrics(8, 5),
+            readyz_local_storage("sat-queue"),
+            8,
+        );
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["checks"]["admission"]["ok"], false);
+        assert_eq!(body["checks"]["admission"]["saturated"], true);
+
+        // 8/8 in flight, nobody waiting → still ready.
+        let state = readyz_state(
+            admission_metrics(8, 0),
+            readyz_local_storage("sat-drain"),
+            8,
+        );
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::OK, "draining load is not unreadiness");
+        assert_eq!(body["checks"]["admission"]["saturated"], true);
+        assert_eq!(body["checks"]["admission"]["ok"], true);
+
+        // Unlimited pool (0) with a huge in-flight count → never saturated.
+        let state = readyz_state(
+            admission_metrics(100, 50),
+            readyz_local_storage("sat-unbounded"),
+            0,
+        );
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["checks"]["admission"]["max_concurrent"], 0);
+        assert_eq!(body["checks"]["admission"]["saturated"], false);
+    }
+
+    /// Issue #123: a read-only / full storage backend makes `/readyz` 503.
+    #[tokio::test]
+    async fn readyz_reports_503_when_storage_write_fails() {
+        struct FailingStorage;
+        #[async_trait::async_trait]
+        impl crate::storage::StorageBackend for FailingStorage {
+            async fn load_transcript(
+                &self,
+                _session_id: &str,
+            ) -> crate::error::Result<Vec<crate::message::Message>> {
+                Ok(vec![])
+            }
+            async fn save_transcript(
+                &self,
+                _session_id: &str,
+                _messages: &[crate::message::Message],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+                Ok(None)
+            }
+            async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+                Err(crate::error::Error::Storage {
+                    message: "disk full".into(),
+                })
+            }
+        }
+        let state = readyz_state(crate::http::Metrics::default(), Arc::new(FailingStorage), 8);
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["checks"]["storage"]["ok"], false);
+    }
+
+    /// Issue #123: a backend that accepts the probe write and then loses it
+    /// fails the read-back — a write-only check would call this healthy.
+    #[tokio::test]
+    async fn readyz_reports_503_when_the_storage_round_trip_is_lost() {
+        struct DroppingStorage;
+        #[async_trait::async_trait]
+        impl crate::storage::StorageBackend for DroppingStorage {
+            async fn load_transcript(
+                &self,
+                _session_id: &str,
+            ) -> crate::error::Result<Vec<crate::message::Message>> {
+                Ok(vec![])
+            }
+            async fn save_transcript(
+                &self,
+                _session_id: &str,
+                _messages: &[crate::message::Message],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+                Ok(None)
+            }
+            async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+        let state = readyz_state(
+            crate::http::Metrics::default(),
+            Arc::new(DroppingStorage),
+            8,
+        );
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["checks"]["storage"]["ok"], false);
+    }
+
+    /// Issue #123: the storage verdict is cached, so scraping this public
+    /// route cannot drive one write per request; a stale verdict is re-probed.
+    #[tokio::test]
+    async fn readyz_caches_the_storage_verdict_within_the_ttl() {
+        #[derive(Default)]
+        struct ProbeCountingStorage {
+            writes: std::sync::atomic::AtomicUsize,
+            broken: std::sync::atomic::AtomicBool,
+            stored: std::sync::Mutex<Option<String>>,
+        }
+        #[async_trait::async_trait]
+        impl crate::storage::StorageBackend for ProbeCountingStorage {
+            async fn load_transcript(
+                &self,
+                _session_id: &str,
+            ) -> crate::error::Result<Vec<crate::message::Message>> {
+                Ok(vec![])
+            }
+            async fn save_transcript(
+                &self,
+                _session_id: &str,
+                _messages: &[crate::message::Message],
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+                Ok(self
+                    .stored
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone())
+            }
+            async fn save_memory(&self, _key: &str, value: &str) -> crate::error::Result<()> {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                if self.broken.load(Ordering::Relaxed) {
+                    return Err(crate::error::Error::Storage {
+                        message: "read-only filesystem".into(),
+                    });
+                }
+                *self.stored.lock().unwrap_or_else(|e| e.into_inner()) = Some(value.to_string());
+                Ok(())
+            }
+        }
+
+        let storage = Arc::new(ProbeCountingStorage::default());
+        let backend: Arc<dyn crate::storage::StorageBackend> = storage.clone();
+        let state = readyz_state(crate::http::Metrics::default(), backend, 8);
+
+        let (status, _) = readyz(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(storage.writes.load(Ordering::Relaxed), 1);
+
+        // A second probe inside the TTL reuses the verdict instead of writing.
+        storage.broken.store(true, Ordering::Relaxed);
+        let (status, Json(body)) = readyz(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK, "a fresh verdict is reused");
+        assert_eq!(body["checks"]["storage"]["ok"], true);
+        assert_eq!(
+            storage.writes.load(Ordering::Relaxed),
+            1,
+            "a cached verdict must not write again"
+        );
+
+        // With the cache marked stale (`0` = never probed) the probe runs
+        // again — and now sees the broken backend.
+        state
+            .metrics
+            .readyz_storage_probed_ms
+            .store(0, Ordering::Relaxed);
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["checks"]["storage"]["ok"], false);
+        assert_eq!(
+            storage.writes.load(Ordering::Relaxed),
+            2,
+            "a stale verdict must be re-probed"
+        );
+    }
+
+    /// Issue #123: the probe-freshness decision, at and around the TTL.
+    #[test]
+    fn readyz_probe_is_fresh_only_inside_the_ttl() {
+        let ttl = READYZ_PROBE_TTL_MS;
+        assert!(!readyz_probe_is_fresh(0, 10), "never probed");
+        assert!(readyz_probe_is_fresh(1_000, 1_000), "just probed");
+        assert!(readyz_probe_is_fresh(1_000, 1_000 + ttl - 1));
+        assert!(
+            !readyz_probe_is_fresh(1_000, 1_000 + ttl),
+            "at the TTL boundary the verdict is stale"
+        );
+    }
+
+    /// Issue #123: the new capacity / data-loss series reach `/metrics`, and
+    /// the SSE gauge counts live subscribers on `event_channels`.
+    #[tokio::test]
+    async fn metrics_handler_exposes_capacity_and_loss_series() {
+        let metrics = crate::http::Metrics {
+            persist_failures: AtomicU64::new(4),
+            sessions_evicted: AtomicU64::new(2),
+            last_llm_success_ms: AtomicU64::new(1234),
+            llm_failures_consecutive: AtomicU64::new(1),
+            ..crate::http::Metrics::default()
+        };
+        let state = readyz_state(metrics, readyz_local_storage("series"), 8);
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        state.event_channels.write().await.insert("s".into(), tx);
+        state
+            .agui_active_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("t".into(), tokio_util::sync::CancellationToken::new());
+
+        let output = metrics_handler(State(state)).await;
+        for expected in [
+            "recursive_persist_failures 4",
+            "recursive_sessions_evicted 2",
+            "recursive_llm_last_success_ms 1234",
+            "recursive_llm_failures_consecutive 1",
+            "recursive_sse_clients 1",
+            "recursive_agui_runs 1",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+    }
+
+    /// Issue #123: a run that completed resets the failure streak and stamps
+    /// the success instant; an LLM *call* failure bumps the streak and stamps
+    /// its own instant — while a plain run failure (a cancellation, a tool or
+    /// storage error) only moves the run counters.
+    ///
+    /// Both stamps are asserted `> 0`, which is only meaningful because the
+    /// stamps are never 0: the session epoch is initialised by the first
+    /// caller in the process, so this test would otherwise fail whenever it
+    /// runs first (0 doubles as the "never happened" sentinel).
+    #[test]
+    fn record_run_metrics_track_llm_streak() {
+        let metrics = crate::http::Metrics::default();
+        record_run_failed(&metrics);
+        record_run_failed(&metrics);
+        assert_eq!(
+            metrics.agent_runs_failed.load(Ordering::Relaxed),
+            2,
+            "run failures are still counted"
+        );
+        assert_eq!(
+            metrics.llm_failures_consecutive.load(Ordering::Relaxed),
+            0,
+            "a cancellation / tool / storage failure says nothing about the LLM"
+        );
+        assert_eq!(
+            metrics.last_llm_failure_ms.load(Ordering::Relaxed),
+            0,
+            "no LLM failure yet must read as 0"
+        );
+
+        record_llm_failure(&metrics);
+        assert_eq!(metrics.llm_failures_consecutive.load(Ordering::Relaxed), 1);
+        assert!(
+            metrics.last_llm_failure_ms.load(Ordering::Relaxed) > 0,
+            "an LLM failure stamps its instant"
+        );
+
+        record_run_success(&metrics, 1, &crate::llm::TokenUsage::default());
+        record_llm_success(&metrics);
+        assert_eq!(
+            metrics.llm_failures_consecutive.load(Ordering::Relaxed),
+            0,
+            "a success clears the streak"
+        );
+        assert!(
+            metrics.last_llm_success_ms.load(Ordering::Relaxed) > 0,
+            "a success stamps the timestamp"
+        );
+    }
+
     /// Goal-292: sessions_active increments on create_session and
     /// decrements on delete_session.
     #[tokio::test]
@@ -3661,6 +4428,20 @@ mod tests {
             description.contains("recursive_rate_limits_rejected_total"),
             "metrics description should mention recursive_rate_limits_rejected_total: {description}"
         );
+        // Issue #123: the capacity/data-loss series must be documented.
+        for series in [
+            "recursive_sse_clients",
+            "recursive_agui_runs",
+            "recursive_persist_failures",
+            "recursive_sessions_evicted",
+            "recursive_llm_last_success_ms",
+            "recursive_llm_failures_consecutive",
+        ] {
+            assert!(
+                description.contains(series),
+                "metrics description should mention {series}: {description}"
+            );
+        }
     }
 
     // ── Goal-303: sort GET /sessions results by created_at ───────────

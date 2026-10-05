@@ -158,6 +158,18 @@ impl Error {
         }
     }
 
+    /// Issue #123: did the LLM call itself fail — a revoked key, an
+    /// unreachable gateway, a malformed provider response?
+    ///
+    /// The adapters funnel all of those into [`Error::Llm`] (transport errors
+    /// included, via `"request failed: …"`), so only that variant counts.
+    /// `RateLimited` deliberately does not: a 429 means the endpoint answered.
+    /// Drives `/readyz`'s LLM check, where a tool, storage or cancellation
+    /// fault must not look like provider downtime.
+    pub fn is_llm_failure(&self) -> bool {
+        matches!(self, Error::Llm { .. })
+    }
+
     /// Returns `true` for transport-level failures with no HTTP status to
     /// classify: a `reqwest` error, raw IO, a timeout, or the `Error::Llm`
     /// message the adapters synthesise for a dropped send / stream
@@ -584,6 +596,42 @@ mod tests {
             message: "x".into()
         }
         .is_transient_provider_error());
+    }
+
+    /// Issue #123: only a failed LLM call itself may count against `/readyz` —
+    /// a rate limit means the endpoint answered, and every non-LLM variant is
+    /// some other subsystem's fault.
+    #[test]
+    fn is_llm_failure_covers_only_the_provider_variant() {
+        assert!(Error::Llm {
+            provider: "openai".into(),
+            message: "HTTP 401 Unauthorized: bad key".into(),
+        }
+        .is_llm_failure());
+        assert!(Error::Llm {
+            provider: "openai".into(),
+            message: "request failed: connection refused".into(),
+        }
+        .is_llm_failure());
+
+        assert!(!Error::RateLimited {
+            provider: "openai".into(),
+            retry_after_ms: 1000,
+        }
+        .is_llm_failure());
+        assert!(!Error::Cancelled.is_llm_failure());
+        assert!(!Error::WallClockExceeded { secs: 5 }.is_llm_failure());
+        assert!(!Error::Tool {
+            name: "Bash".into(),
+            call_id: None,
+            message: "boom".into(),
+        }
+        .is_llm_failure());
+        assert!(!Error::Storage {
+            message: "read-only filesystem".into(),
+        }
+        .is_llm_failure());
+        assert!(!Error::ProviderTruncated("length".into()).is_llm_failure());
     }
 
     // ── is_context_window_exceeded ────────────────────────────────────

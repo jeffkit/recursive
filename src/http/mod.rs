@@ -27,7 +27,7 @@ use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
     agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
     list_presets, list_sessions, list_skills, list_slash_commands, list_tools, metrics_handler,
-    openapi_spec, patch_session, run_agent, send_session_message, session_clear_goal,
+    openapi_spec, patch_session, readyz, run_agent, send_session_message, session_clear_goal,
     session_events, session_interrupt, session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
@@ -50,7 +50,7 @@ use axum::{
 /// POST /sessions/:id/messages, both of which accept unbounded user strings.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -87,6 +87,43 @@ pub struct Metrics {
     /// `Drop` so every acquire site (including `?` early returns) is
     /// covered by RAII.
     pub runs_in_flight: Arc<AtomicU64>,
+    /// Issue #123: timestamp (ms since [`SESSION_EPOCH`]) of the most recent
+    /// successful agent run — the cheapest honest proxy for "the LLM endpoint
+    /// answered at least once". `0` = never succeeded (stamps are always
+    /// non-zero — see `handlers::now_stamp_ms`). Exposed by `/readyz` and as
+    /// `recursive_llm_last_success_ms` on `/metrics`.
+    pub last_llm_success_ms: AtomicU64,
+    /// Issue #123: failed **LLM** runs since the last success. Bumped only by
+    /// `record_llm_failure` — a cancellation, tool or storage fault says
+    /// nothing about the endpoint and must not take a healthy pod out of
+    /// rotation. Cleared by `record_llm_success` and decayed by `/readyz`
+    /// once the streak is older than `READYZ_LLM_FAILURE_WINDOW_MS` (a pod
+    /// removed from its Service endpoints receives no runs, so nothing else
+    /// could ever clear it). `/readyz` reports **not ready** while this is at
+    /// or above `READYZ_MAX_LLM_FAILURES`, so a dead key / unreachable
+    /// gateway stops taking traffic instead of returning 200 forever.
+    pub llm_failures_consecutive: AtomicU64,
+    /// Issue #123: timestamp (ms since [`SESSION_EPOCH`]) of the most recent
+    /// failure that counted against [`Self::llm_failures_consecutive`]; `0` =
+    /// none recorded. `/readyz` uses it to tell a live failure streak from a
+    /// stale one that must no longer fail the probe.
+    pub last_llm_failure_ms: AtomicU64,
+    /// Issue #123: when `/readyz` last ran its storage round-trip probe, and
+    /// what the probe said. Probe bookkeeping (not exposed on `/metrics`) kept
+    /// next to the other readiness state so every `AppState` owns its own
+    /// verdict — the endpoint is public, so an anonymous scraper must not be
+    /// able to drive one storage write per request.
+    pub readyz_storage_probed_ms: AtomicU64,
+    /// See [`Self::readyz_storage_probed_ms`]. Only meaningful once
+    /// `readyz_storage_probed_ms != 0`.
+    pub readyz_storage_ok: AtomicBool,
+    /// Issue #123: transcript/memory persistence rounds that failed — or were
+    /// skipped with data loss (a session still busy at graceful shutdown).
+    /// Previously each of these only emitted a `tracing` line, so a
+    /// read-only/full backend silently dropped data.
+    pub persist_failures: AtomicU64,
+    /// Issue #123: sessions removed by the idle reaper (counter).
+    pub sessions_evicted: AtomicU64,
 }
 
 // ── Session types ──────────────────────────────────────────────────────────
@@ -754,7 +791,10 @@ pub struct ListSessionsQuery {
 /// Build the axum [`Router`] with all API routes.
 ///
 /// Routes:
-/// - `GET /health` — returns `"ok"` (200)
+/// - `GET /health` / `GET /healthz` — liveness, returns `"ok"` (200)
+/// - `GET /readyz` — readiness probe: storage write+read round-trip (verdict
+///   cached, see `READYZ_PROBE_TTL_MS`), recent LLM failures and admission
+///   saturation; `200` when ready, `503` otherwise (issue #123)
 /// - `GET /tools` — returns JSON array of [`ToolInfo`]
 /// - `POST /run` — runs the agent with a goal and returns the outcome
 /// - `POST /sessions` — create a new session
@@ -838,6 +878,15 @@ pub fn build_router_with_auth_and_rate_limit(
     // router but not to the bypass list.
     let public = Router::new()
         .route("/health", get(health))
+        // Issue #123: split liveness from readiness. `/health` stays the
+        // backward-compatible liveness alias; `/healthz` is the k8s-native
+        // spelling; `/readyz` probes the dependencies a "半死" server still
+        // answers 200 for (storage writability, recent LLM failures, admission
+        // saturation) and returns 503 when one is down. It stays unauthenticated
+        // (a k8s probe carries no key), so its storage probe verdict is cached
+        // (`READYZ_PROBE_TTL_MS`) instead of written once per request.
+        .route("/healthz", get(health))
+        .route("/readyz", get(readyz))
         .route("/openapi.json", get(openapi_spec))
         .route("/metrics", get(metrics_handler));
 
@@ -921,6 +970,46 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             "content": {
                                 "text/plain": {
                                     "schema": { "type": "string", "example": "ok" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/healthz": {
+                "get": {
+                    "summary": "Liveness check",
+                    "description": "Alias of /health for k8s liveness probes: returns 'ok' (200) whenever the process is up.",
+                    "responses": {
+                        "200": {
+                            "description": "Process is alive",
+                            "content": {
+                                "text/plain": {
+                                    "schema": { "type": "string", "example": "ok" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/readyz": {
+                "get": {
+                    "summary": "Readiness check",
+                    "description": "Probes the dependencies a half-dead server still answers 200 for: a storage write+read round-trip (verdict cached for ~5s, so scraping this public route cannot drive a write per request), a recent LLM failure streak, and admission-gate saturation. Returns 200 with a per-check JSON body when ready, 503 otherwise.",
+                    "responses": {
+                        "200": {
+                            "description": "Server is ready to serve runs",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "503": {
+                            "description": "One or more readiness checks failed",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
                                 }
                             }
                         }
@@ -1225,7 +1314,11 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         Includes the standard counters (requests, agent runs, tokens) plus \
                         `recursive_sessions_active` (gauge, count of currently open sessions) \
                         and `recursive_rate_limits_rejected_total` (counter, requests rejected \
-                        by rate limiting). Added in G292, documented in G298.",
+                        by rate limiting). Added in G292, documented in G298. Issue #123 adds \
+                        the capacity/data-loss series `recursive_sse_clients`, \
+                        `recursive_agui_runs`, `recursive_persist_failures`, \
+                        `recursive_sessions_evicted`, `recursive_llm_last_success_ms` and \
+                        `recursive_llm_failures_consecutive`.",
                     "responses": {
                         "200": {
                             "description": "Prometheus text format",
@@ -1561,6 +1654,7 @@ pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
             |session| session.runtime.try_lock().is_err(),
             |session| {
                 let storage = state.storage.clone();
+                let metrics = state.metrics.clone();
                 async move {
                     if let Ok(mut rt) = session.runtime.try_lock() {
                         rt.close(None).await;
@@ -1572,6 +1666,11 @@ pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
                         let transcript = rt.transcript().to_vec();
                         drop(rt);
                         if let Err(e) = storage.save_transcript(&session.id, &transcript).await {
+                            // Issue #123: this is real data loss, so it is
+                            // counted (not just logged) — one reaper sweep
+                            // that cannot write must be visible to
+                            // operators, not swallowed.
+                            metrics.persist_failures.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 session_id = %session.id,
                                 error = %e,
@@ -1586,6 +1685,10 @@ pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
                     .metrics
                     .sessions_active
                     .fetch_sub(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .sessions_evicted
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::info!("reaper: evicted idle session {id}");
             },
         )
@@ -1628,16 +1731,31 @@ pub async fn flush_all_sessions(state: &AppState) -> usize {
                 .await
             {
                 Ok(()) => persisted += 1,
-                Err(e) => tracing::warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "shutdown: failed to persist session transcript"
-                ),
+                Err(e) => {
+                    state
+                        .metrics
+                        .persist_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "shutdown: failed to persist session transcript"
+                    );
+                }
             }
         } else {
-            tracing::warn!(
+            // Issue #123: a session still mid-turn at shutdown loses
+            // everything since its last teardown save. That is data loss,
+            // so it is an `error` (not a `warn`) and it is counted — a
+            // clean shutdown that quietly drops an in-flight transcript
+            // was previously invisible in `/metrics`.
+            state
+                .metrics
+                .persist_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
                 session_id = %session.id,
-                "shutdown: session still busy, transcript not persisted"
+                "shutdown: session still busy, transcript not persisted (data loss)"
             );
         }
     }
@@ -1847,6 +1965,37 @@ mod goal_396_persistence_tests {
         }
     }
 
+    /// Issue #123: a backend whose every write fails — models a read-only or
+    /// full disk so the data-loss counters can be pinned.
+    struct FailingStorage;
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingStorage {
+        async fn load_transcript(&self, _session_id: &str) -> crate::error::Result<Vec<Message>> {
+            Ok(vec![])
+        }
+
+        async fn save_transcript(
+            &self,
+            _session_id: &str,
+            _messages: &[Message],
+        ) -> crate::error::Result<()> {
+            Err(crate::error::Error::Storage {
+                message: "read-only filesystem".into(),
+            })
+        }
+
+        async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+            Err(crate::error::Error::Storage {
+                message: "read-only filesystem".into(),
+            })
+        }
+    }
+
     fn test_config() -> crate::config::Config {
         crate::config::Config {
             workspace: PathBuf::from("."),
@@ -2053,6 +2202,79 @@ mod goal_396_persistence_tests {
             state.host.sessions().read().await.is_empty(),
             "evicted sessions must be gone from the map"
         );
+        // Issue #123: each eviction is counted; none of these saves failed.
+        assert_eq!(
+            state.metrics.sessions_evicted.load(Ordering::Relaxed),
+            2,
+            "every evicted session must bump sessions_evicted"
+        );
+        assert_eq!(
+            state.metrics.persist_failures.load(Ordering::Relaxed),
+            0,
+            "successful persists must not count as failures"
+        );
+    }
+
+    /// Issue #123: a reaper save that fails (read-only/full disk) is counted,
+    /// not merely logged.
+    #[tokio::test]
+    async fn evict_counts_persist_failure_when_storage_write_fails() {
+        let host = test_host(0);
+        let storage: Arc<dyn StorageBackend> = Arc::new(FailingStorage);
+        let state = test_state(host, storage).await;
+
+        state
+            .host
+            .insert("s-loss".into(), test_session("s-loss", 1))
+            .await;
+
+        let evicted = evict_idle_sessions(&state).await;
+        assert_eq!(evicted, vec!["s-loss"], "the idle session still evicts");
+        assert_eq!(
+            state.metrics.persist_failures.load(Ordering::Relaxed),
+            1,
+            "a failed teardown save must be counted"
+        );
+        assert_eq!(
+            state.metrics.sessions_evicted.load(Ordering::Relaxed),
+            1,
+            "the eviction itself still counts"
+        );
+    }
+
+    /// Issue #123: a session still mid-turn at graceful shutdown loses its
+    /// transcript — that is data loss, so it must show up in the counter.
+    #[tokio::test]
+    async fn flush_counts_busy_session_as_data_loss() {
+        let host = test_host(0);
+        let storage: Arc<dyn StorageBackend> = RecordingStorage::new();
+        let state = test_state(host, storage).await;
+
+        state
+            .host
+            .insert("busy".into(), test_session("busy", 1))
+            .await;
+        // Clone the runtime handle so the read guard drops before the flush
+        // takes its own write lock, then hold the runtime mutex to model an
+        // in-flight turn.
+        let rt_arc = state
+            .host
+            .sessions()
+            .read()
+            .await
+            .get("busy")
+            .unwrap()
+            .runtime
+            .clone();
+        let _guard = rt_arc.lock().await;
+
+        let persisted = flush_all_sessions(&state).await;
+        assert_eq!(persisted, 0, "a busy session cannot be persisted");
+        assert_eq!(
+            state.metrics.persist_failures.load(Ordering::Relaxed),
+            1,
+            "a busy-on-shutdown session must be counted as data loss"
+        );
     }
 
     #[tokio::test]
@@ -2126,6 +2348,11 @@ mod goal_396_persistence_tests {
         assert!(
             state.host.sessions().read().await.is_empty(),
             "flush must drain the session map"
+        );
+        assert_eq!(
+            state.metrics.persist_failures.load(Ordering::Relaxed),
+            0,
+            "a clean shutdown must not report data loss"
         );
     }
 }

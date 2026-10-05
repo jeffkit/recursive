@@ -296,7 +296,10 @@ docker run -p 3000:3000 \
   recursive:dev
 ```
 
-The image defaults to `recursive http --addr 0.0.0.0:3000` and exposes `/health` for probes.
+The image defaults to `recursive http --addr 0.0.0.0:3000` and exposes
+`/health` (and the k8s-native `/healthz` alias) for liveness probes plus
+`/readyz` — which probes storage writability, LLM reachability and admission
+saturation — for readiness probes.
 
 > **⚠️ Auth required**: The HTTP server now rejects requests with 503
 > unless `RECURSIVE_HTTP_AUTH_KEYS` or `RECURSIVE_HTTP_AUTH_JWT_SECRET` is
