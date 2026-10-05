@@ -512,6 +512,113 @@ async fn redo_orphan(
     Ok(replay_orphan_call(tools, orphan).await)
 }
 
+/// Orphan policy for `replay --resume-from`.
+///
+/// Replay is the unattended continuation entry point, so an unanswered tail
+/// call defaults to the synthetic interrupted result (`skip`) rather than
+/// `resume`'s TTY heuristic (ask on a terminal, refuse otherwise): the seed
+/// slice exists precisely to continue a run that died mid-tool-call. An
+/// explicit `--orphans` wins and accepts the same four values as `resume`.
+pub(crate) fn replay_orphan_policy(flag: Option<&str>) -> anyhow::Result<OrphanPolicy> {
+    match flag {
+        Some(s) => OrphanPolicy::from_str(s),
+        None => Ok(OrphanPolicy::Skip),
+    }
+}
+
+/// Answer the orphan tool calls a `replay --resume-from N` seed slice may
+/// end on, returning the seed a provider can accept.
+///
+/// The counterpart of the orphan block in [`cmd_resume`] for a seed that is
+/// an in-memory transcript slice rather than a session directory: the slice
+/// can stop exactly on "assistant issued a tool_call, result never landed"
+/// (the SIGKILL/power-loss shape `--resume-from` exists for), and sending
+/// that unpaired tail to a provider is an HTTP 400. `skip` injects the
+/// synthetic interrupted result, `redo` re-executes the call against
+/// `tools`. The answered seed is the run's transcript, so the result lands
+/// on disk with it (`--transcript-out` / `--session-out`).
+pub(crate) async fn prepare_replay_seed(
+    seed: Vec<recursive::message::Message>,
+    tools: &recursive::tools::ToolRegistry,
+    policy: OrphanPolicy,
+) -> anyhow::Result<Vec<recursive::message::Message>> {
+    let orphans = recursive::session::scan_orphan_tool_calls_in_messages(&seed, tools);
+    if orphans.is_empty() {
+        return Ok(seed);
+    }
+
+    eprintln!(
+        "\nreplay: seed has {} incomplete tool call(s):\n",
+        orphans.len()
+    );
+    for o in &orphans {
+        eprintln!(
+            "  {}  (call-id {})\n    side-effect class: {:?}",
+            o.tool_name, o.tool_call_id, o.side_effect_at_call
+        );
+    }
+    eprintln!();
+
+    let mut resolutions: Vec<(String, String)> = Vec::new();
+    match policy {
+        OrphanPolicy::Abort => {
+            anyhow::bail!(
+                "seed has {} orphan tool call(s); refusing to continue. \
+                 Use --orphans=skip, --orphans=redo, or --orphans=ask to proceed.",
+                orphans.len()
+            );
+        }
+        OrphanPolicy::Skip => {
+            eprintln!(
+                "orphans: answering {} call(s) with a synthetic interrupted result \
+                 (--orphans=skip)",
+                orphans.len()
+            );
+            for o in &orphans {
+                resolutions.push((o.tool_call_id.clone(), ORPHAN_SKIPPED_RESULT.to_string()));
+            }
+        }
+        OrphanPolicy::Redo => {
+            use std::io::IsTerminal;
+            let interactive = std::io::stdin().is_terminal();
+            eprintln!("orphans: will re-execute on replay (--orphans=redo)");
+            for o in &orphans {
+                let result = redo_orphan(tools, o, false, interactive).await?;
+                resolutions.push((o.tool_call_id.clone(), result));
+            }
+        }
+        OrphanPolicy::Ask => {
+            use std::io::IsTerminal;
+            let interactive = std::io::stdin().is_terminal();
+            for o in &orphans {
+                eprintln!(
+                    "Orphan: {}  (side-effect: {:?})",
+                    o.tool_name, o.side_effect_at_call
+                );
+                match prompt_orphan_choice(&o.tool_name)? {
+                    OrphanPolicy::Abort => anyhow::bail!("replay aborted by user."),
+                    OrphanPolicy::Skip => {
+                        eprintln!("  → skipping '{}'", o.tool_name);
+                        resolutions
+                            .push((o.tool_call_id.clone(), ORPHAN_SKIPPED_RESULT.to_string()));
+                    }
+                    OrphanPolicy::Redo => {
+                        eprintln!("  → redoing '{}'", o.tool_name);
+                        let result = redo_orphan(tools, o, true, interactive).await?;
+                        resolutions.push((o.tool_call_id.clone(), result));
+                    }
+                    OrphanPolicy::Ask => unreachable!(),
+                }
+            }
+        }
+    }
+    eprintln!();
+    Ok(recursive::session::splice_orphan_results(
+        seed,
+        &resolutions,
+    ))
+}
+
 /// Whether `run_resumed` should print the `resuming from N seeded message(s)`
 /// banner: text consumers want it, JSON consumers must keep stderr clean.
 ///
@@ -840,9 +947,10 @@ pub(crate) async fn run_resumed(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_orphan_answer, cmd_resume, legacy_resume_error, prompt_orphan_choice_with,
-        redo_orphan, resolve_resume_message, resolve_resume_target, resume_banner_enabled,
-        run_resumed, OrphanPolicy, ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
+        classify_orphan_answer, cmd_resume, legacy_resume_error, prepare_replay_seed,
+        prompt_orphan_choice_with, redo_orphan, replay_orphan_policy, resolve_resume_message,
+        resolve_resume_target, resume_banner_enabled, run_resumed, OrphanPolicy,
+        ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
     };
     use crate::cli::session::resolve_session_path;
     use std::path::Path;
@@ -1560,6 +1668,167 @@ mod tests {
         assert!(
             out.starts_with(ORPHAN_REDO_FAILED_PREFIX),
             "a failed replay must be reported as such, got: {out}"
+        );
+    }
+
+    // ── replay --resume-from orphan handling ────────────────────────────────
+
+    /// The seed a `replay --resume-from N` slice stops on when the run died
+    /// mid-tool-call: `user → assistant(tool_calls)` with no `tool` result.
+    fn crashed_seed() -> Vec<recursive::message::Message> {
+        vec![
+            recursive::message::Message::user("go"),
+            recursive::message::Message::assistant_with_tool_calls(
+                "calling",
+                vec![recursive::llm::ToolCall {
+                    id: "tc-1".into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"path": "note.txt"}),
+                }],
+            ),
+        ]
+    }
+
+    #[test]
+    fn replay_orphan_policy_defaults_to_skip_and_validates_the_flag() {
+        // Unattended continuation: absent flag means skip, not resume's
+        // ask/abort TTY heuristic.
+        assert_eq!(replay_orphan_policy(None).unwrap(), OrphanPolicy::Skip);
+        assert_eq!(
+            replay_orphan_policy(Some("redo")).unwrap(),
+            OrphanPolicy::Redo
+        );
+        assert_eq!(
+            replay_orphan_policy(Some("abort")).unwrap(),
+            OrphanPolicy::Abort
+        );
+        assert!(
+            replay_orphan_policy(Some("nope")).is_err(),
+            "an unknown --orphans value must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_replay_seed_skip_answers_the_orphan() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let seed = prepare_replay_seed(crashed_seed(), &tools, OrphanPolicy::Skip)
+            .await
+            .unwrap();
+        assert_eq!(seed.len(), 3, "user + assistant + synthetic result");
+        assert_eq!(seed[2].role, recursive::message::Role::Tool);
+        assert_eq!(seed[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(seed[2].content, ORPHAN_SKIPPED_RESULT);
+    }
+
+    #[tokio::test]
+    async fn prepare_replay_seed_redo_replays_the_call() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let seed = prepare_replay_seed(crashed_seed(), &tools, OrphanPolicy::Redo)
+            .await
+            .unwrap();
+        assert_eq!(seed.len(), 3);
+        assert_eq!(seed[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert!(
+            seed[2].content.contains("hello from disk"),
+            "redo must carry the re-executed output, got: {}",
+            seed[2].content
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_replay_seed_abort_refuses_the_unanswered_tail() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let err = prepare_replay_seed(crashed_seed(), &tools, OrphanPolicy::Abort)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("orphan"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn prepare_replay_seed_leaves_a_paired_seed_untouched() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let mut paired = crashed_seed();
+        paired.push(recursive::message::Message::tool_result("tc-1", "recorded"));
+        let out = prepare_replay_seed(paired.clone(), &tools, OrphanPolicy::Skip)
+            .await
+            .unwrap();
+        assert_eq!(out, paired, "a paired seed must pass through unchanged");
+    }
+
+    /// Acceptance: `replay --resume-from` on a slice that ends on an
+    /// unanswered tool_call completes a provider round-trip and the
+    /// synthetic result is persisted with the run's transcript.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_resume_from_skip_round_trips_the_provider_and_persists_the_result() {
+        let _guard = HOME_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let prev_home = pin_recursive_home(home.path());
+
+        let mut cfg = test_config(ws.path());
+        let (api_base, server) = spawn_one_shot_provider().await;
+        cfg.api_base = api_base;
+        let tools = tools_for(&cfg).await;
+
+        let seed = prepare_replay_seed(crashed_seed(), &tools, OrphanPolicy::Skip)
+            .await
+            .unwrap();
+        let transcript_out = ws.path().join("replayed.json");
+
+        let res = run_resumed(
+            cfg,
+            seed,
+            "continue".into(),
+            None,
+            Some(transcript_out.clone()),
+            None,
+            None,
+            None,
+            false,
+            false,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            false,
+        )
+        .await;
+        let request = server.await.unwrap();
+        restore_recursive_home(prev_home);
+
+        res.expect("the answered seed must complete a provider round-trip");
+        assert!(
+            request.contains("\"role\":\"tool\""),
+            "the provider must receive a tool result for the orphan: {request}"
+        );
+        assert!(
+            request.contains("\"tool_call_id\":\"tc-1\""),
+            "the synthetic result must answer the orphan's call id: {request}"
+        );
+        assert!(
+            request.contains(ORPHAN_SKIPPED_RESULT),
+            "the synthetic note must be on the wire: {request}"
+        );
+
+        let saved = recursive::TranscriptFile::read_from(&transcript_out).unwrap();
+        assert!(
+            saved.messages().iter().any(|m| {
+                m.role == recursive::message::Role::Tool
+                    && m.tool_call_id.as_deref() == Some("tc-1")
+                    && m.content == ORPHAN_SKIPPED_RESULT
+            }),
+            "the synthetic result must be persisted with the run's transcript"
         );
     }
 }

@@ -33,7 +33,10 @@ pub use lifecycle::{
     locked_by_live_process, truncate_transcript_to_turn, SessionLock, SessionLockBusy,
     TruncateStats,
 };
-pub use orphan::{OrphanToolCall, ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT};
+pub use orphan::{
+    scan_orphan_tool_calls_in_messages, splice_orphan_results, OrphanToolCall,
+    ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
+};
 pub use reader::SessionReader;
 pub use serialize::{entry_to_message, LoadedEntry, TranscriptEntry};
 pub use writer::{SessionPersistenceSink, SessionWriter};

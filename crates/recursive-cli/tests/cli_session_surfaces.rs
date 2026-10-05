@@ -275,3 +275,82 @@ fn replay_resume_from_with_a_goal_starts_the_run() {
         "the resume banner should announce the seeded transcript, got:\n{stderr}"
     );
 }
+
+/// The transcript a crash during tool execution leaves behind:
+/// `user → assistant(tool_calls)` with no `tool` result.
+fn orphan_transcript_fixture(rig: &Rig) -> std::path::PathBuf {
+    let path = rig.workspace.path().join("orphan-transcript.json");
+    std::fs::write(
+        &path,
+        r#"{"meta":{"saved_at":"2026-01-01T00:00:00Z","steps":1,"model":"test-model"},
+            "messages":[
+              {"role":"user","content":"seed"},
+              {"role":"assistant","content":"calling","tool_calls":[
+                {"id":"tc-1","name":"Read","arguments":{"path":"note.txt"}}]}]}"#,
+    )
+    .expect("write orphan transcript fixture");
+    path
+}
+
+/// Build a `replay <file> --resume-from 2 <goal>` invocation against an
+/// unreachable provider: it fails *inside* the run, after the orphan scan.
+fn replay_orphan_cmd(rig: &Rig, transcript: &Path, extra: &[&str]) -> Output {
+    let mut cmd = rig.cmd();
+    cmd.arg("--api-base").arg("http://127.0.0.1:1");
+    cmd.arg("--api-key").arg("sk-test-key");
+    cmd.arg("--model").arg("test-model");
+    cmd.arg("--provider").arg("openai");
+    let mut args = vec![
+        "replay",
+        transcript.to_str().expect("utf8 path"),
+        "--resume-from",
+        "2",
+    ];
+    args.extend_from_slice(extra);
+    args.push("continue");
+    cmd.args(args);
+    cmd.output().expect("spawn recursive")
+}
+
+#[test]
+fn replay_resume_from_answers_an_unpaired_seed_tail_by_default() {
+    let rig = Rig::new();
+    let transcript = orphan_transcript_fixture(&rig);
+
+    // No --orphans flag: the unattended default (skip) must answer the tail
+    // call instead of forwarding an unpaired transcript to the provider.
+    let out = replay_orphan_cmd(&rig, &transcript, &[]);
+    let stderr = stderr_of(&out);
+
+    assert!(
+        stderr.contains("1 incomplete tool call(s)"),
+        "the orphan scan must run on the seed slice, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--orphans=skip"),
+        "the default policy must be the synthetic skip, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("resuming from 3 seeded message(s)"),
+        "the synthetic result must be spliced into the seed (2 + 1), got:\n{stderr}"
+    );
+}
+
+#[test]
+fn replay_resume_from_orphans_abort_refuses_the_run() {
+    let rig = Rig::new();
+    let transcript = orphan_transcript_fixture(&rig);
+
+    let out = replay_orphan_cmd(&rig, &transcript, &["--orphans", "abort"]);
+    let stderr = stderr_of(&out);
+
+    assert!(!out.status.success(), "--orphans=abort must fail the run");
+    assert!(
+        stderr.contains("refusing to continue"),
+        "the explicit abort policy must refuse the orphaned seed, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("resuming from"),
+        "the refusal must land before the run starts, got:\n{stderr}"
+    );
+}

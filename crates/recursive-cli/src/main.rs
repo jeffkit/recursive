@@ -309,6 +309,12 @@ enum Cmd {
         /// Mutually exclusive with --tail. Ignored when --resume-from is given.
         #[arg(long)]
         head: Option<usize>,
+        /// How to handle orphan tool calls in the `--resume-from` seed (a
+        /// tool_call in the slice's tail with no matching tool result — what
+        /// a crash during tool execution leaves). Choices: skip (default),
+        /// redo, ask, abort. Ignored without --resume-from.
+        #[arg(long)]
+        orphans: Option<String>,
     },
     /// Resume a run from a saved session.
     ///
@@ -1054,6 +1060,7 @@ async fn main() -> anyhow::Result<()> {
             goal,
             tail,
             head,
+            orphans,
         } => {
             // Check mutual exclusivity of --head and --tail
             if head_tail_conflict(head.is_some(), tail.is_some()) {
@@ -1084,10 +1091,18 @@ async fn main() -> anyhow::Result<()> {
                             file.messages().len()
                         )
                     })?;
+                    // The slice can end on an unanswered tool_call (the crash
+                    // boundary this entry point continues from); answer it
+                    // before a provider sees the transcript, or the run dies
+                    // on "tool_use without tool_result" (HTTP 400).
+                    let (tools, _) = cli::builder::build_tools(&config, None).await;
+                    let policy = cli::resume::replay_orphan_policy(orphans.as_deref())?;
+                    let seed =
+                        cli::resume::prepare_replay_seed(seed.to_vec(), &tools, policy).await?;
                     let shutdown = shutdown_signal();
                     cli::resume::run_resumed(
                         config,
-                        seed.to_vec(),
+                        seed,
                         goal.join(" "),
                         cli.max_transcript_chars,
                         cli.transcript_out,
