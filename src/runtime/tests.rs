@@ -2660,6 +2660,31 @@ async fn per_turn_persistence_appends_only_the_delta() {
 }
 
 #[tokio::test]
+async fn set_session_id_invalidates_the_persistence_watermark() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![reply("one"), reply("two")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+    rt.run("hi").await.unwrap();
+    assert_eq!(storage.loads.load(Ordering::Relaxed), 1);
+
+    // A new id names a different stored record, so the reused watermark must
+    // be discarded and the backend re-read rather than appended to blindly.
+    rt.set_session_id("sess-2");
+    rt.run("more").await.unwrap();
+    assert_eq!(
+        storage.loads.load(Ordering::Relaxed),
+        2,
+        "an id change must force a backend read instead of trusting the old watermark"
+    );
+}
+
+#[tokio::test]
 async fn per_turn_persistence_is_off_by_default() {
     let storage = Arc::new(RecordingStorage::default());
     let llm = Arc::new(MockProvider::new(vec![reply("one")]));

@@ -38,24 +38,54 @@ impl LocalStorageBackend {
     }
 }
 
-/// Whether `path` exists, is non-empty, and does not end with `\n`.
+/// How an existing transcript file ends, for the purposes of appending.
+enum Trailing {
+    /// No file (or an empty one) — nothing to separate from.
+    Absent,
+    /// Ends with a newline: the next append can start at the last byte.
+    Terminated,
+    /// Ends with a complete record but no newline (a pre-#92
+    /// `lines.join("\n")` file): one separator byte is needed.
+    UnterminatedRecord,
+    /// Ends with a truncated fragment (a torn append): the fragment must be
+    /// dropped by a full rewrite — terminating it in place would turn a
+    /// read-tolerated torn line into a *terminated* one, i.e. permanent
+    /// corruption.
+    TornFragment,
+}
+
+/// Classify what `path` ends with.
 ///
-/// Reads only the last byte (seek to end) so appending stays O(1) rather than
-/// re-reading the whole transcript on the hot path. Any I/O error is treated
-/// as "no separator needed" — the append itself will surface the failure.
-async fn misses_trailing_newline(path: &std::path::Path) -> bool {
+/// Reads only the last byte on the common (terminated) path, so appending stays
+/// O(1). The trailing line is read in full only when the file is unterminated —
+/// a rare one-off repair (legacy file or torn append). Any I/O error is treated
+/// as "nothing to separate from" — the append itself will surface the failure.
+async fn classify_trailing(path: &std::path::Path) -> Trailing {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return false;
+        return Trailing::Absent;
     };
     let Ok(len) = file.metadata().await.map(|m| m.len()) else {
-        return false;
+        return Trailing::Absent;
     };
     if len == 0 || file.seek(std::io::SeekFrom::End(-1)).await.is_err() {
-        return false;
+        return Trailing::Absent;
     }
     let mut last = [0u8; 1];
-    file.read_exact(&mut last).await.is_ok() && last[0] != b'\n'
+    if file.read_exact(&mut last).await.is_err() || last[0] == b'\n' {
+        return Trailing::Terminated;
+    }
+    let Ok(content) = tokio::fs::read_to_string(path).await else {
+        // Cannot tell a legacy record from a torn fragment: fail closed by
+        // rewriting, whose read will surface any real error.
+        return Trailing::TornFragment;
+    };
+    let fragment = content.rsplit('\n').next().unwrap_or("");
+    if serde_json::from_str::<Message>(fragment).is_ok() {
+        Trailing::UnterminatedRecord
+    } else {
+        Trailing::TornFragment
+    }
 }
 
 #[async_trait]
@@ -121,6 +151,20 @@ impl StorageBackend for LocalStorageBackend {
             return Ok(());
         }
         let path = self.transcript_path(session_id);
+        // A pre-#92 build wrote `lines.join("\n")` with no terminator (leaving
+        // a complete record), and a torn append can leave a truncated last
+        // line. The former needs a separator byte; the latter must be dropped
+        // by a full rewrite, since terminating it in place would make the
+        // read-tolerated fragment an unrecoverable parse error.
+        let separator = match classify_trailing(&path).await {
+            Trailing::Absent | Trailing::Terminated => false,
+            Trailing::UnterminatedRecord => true,
+            Trailing::TornFragment => {
+                let mut all = self.load_transcript(session_id).await?;
+                all.extend_from_slice(messages);
+                return self.save_transcript(session_id, &all).await;
+            }
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -129,11 +173,7 @@ impl StorageBackend for LocalStorageBackend {
                 })?;
         }
         let mut body = String::new();
-        // A pre-#92 build wrote `lines.join("\n")` with no terminator
-        // (and a torn append can leave a truncated last line). Without a
-        // separator the first appended record merges onto that line and the
-        // whole file becomes unparsable, so close the gap first.
-        if misses_trailing_newline(&path).await {
+        if separator {
             body.push('\n');
         }
         for m in messages {
@@ -327,6 +367,27 @@ mod tests {
         let mut content = tokio::fs::read_to_string(&path).await.unwrap();
         content.push_str("{\"role\":\"assist");
         tokio::fs::write(&path, content).await.unwrap();
+
+        assert_eq!(b.load_transcript("torn").await.unwrap(), msgs);
+    }
+
+    /// A torn append followed by another append must not "repair" the fragment
+    /// by terminating it in place: that would turn the read-tolerated torn line
+    /// into a hard parse error and make the session permanently unloadable.
+    #[tokio::test]
+    async fn append_transcript_after_torn_tail_rewrites_cleanly() {
+        let (b, _dir) = backend();
+        let msgs = make_messages();
+        b.save_transcript("torn", &msgs[..1]).await.unwrap();
+        let path = b.transcript_path("torn");
+        let mut content = tokio::fs::read_to_string(&path).await.unwrap();
+        content.push_str("{\"role\":\"assist");
+        tokio::fs::write(&path, content).await.unwrap();
+
+        // Reading tolerates the fragment, but writing must not.
+        assert_eq!(b.load_transcript("torn").await.unwrap(), msgs[..1].to_vec());
+
+        b.append_transcript("torn", &msgs[1..]).await.unwrap();
 
         assert_eq!(b.load_transcript("torn").await.unwrap(), msgs);
     }

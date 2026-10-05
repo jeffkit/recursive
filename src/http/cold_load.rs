@@ -312,10 +312,10 @@ async fn build_restored_runtime(
             .seed_transcript(seed)
             // Issue #92: a restored session must keep persisting per turn,
             // otherwise it silently regresses to teardown-only after a
-            // restart. The runtime transcript's first message is its
-            // reassembled system prompt, which the stored transcript is
-            // missing (the seeder drops it), so the first persist resyncs with
-            // a full save and later ones append.
+            // restart. The first persist re-reads the stored record and
+            // compares it against the rebuilt transcript: when the stored
+            // system message already matches the reassembled one it appends,
+            // otherwise it resyncs with a full save.
             .persist_transcript_per_turn(true)
             .build()
             .map_err(|e| {

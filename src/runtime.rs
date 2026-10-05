@@ -1103,6 +1103,11 @@ impl AgentRuntime {
     /// `RUST_LOG=recursive[{session_id}]=debug` or the `session_id` label.
     pub fn set_session_id(&mut self, id: impl Into<String>) {
         self.checkpoints.session_id = Some(id.into());
+        // Issue #92: the per-turn persistence watermark describes the stored
+        // record for the previous id's transcript, so it must not survive an
+        // id change — the next persist falls back to a backend read.
+        self.persisted_transcript_len = None;
+        self.transcript_rewritten = false;
     }
 
     /// Set a new event sink (useful for REPL mode between turns).

@@ -36,8 +36,9 @@ turn instead of everything since the last teardown.
 - Watermark (round-2 semantics): the runtime tracks how many leading messages are
   an **exact prefix** of the stored record. It is resolved on first persist by
   re-reading the backend and comparing content (`is_stored_prefix`), which makes
-  a cold-loaded session correct (its reassembled system prompt is not the stored
-  message at index 0, so it resyncs with one full save and appends afterwards)
+  a cold-loaded session correct (whether the stored record matches the rebuilt
+  transcript — then it appends — or diverges, e.g. a legacy file without the
+  system message, then it resyncs with one full save)
   and a fresh session correct (empty backend → everything is appended).
 - `transcript_rewritten` (round 2): set by every in-place rewrite of
   `self.transcript` — cross-turn compaction, emergency (`compact_on_overflow`) and
@@ -176,3 +177,38 @@ are each killed by at least one of the new tests.
 
 Not run here: Docker e2e (needs a release binary + image build). The change
 does not alter e2e behaviour.
+
+## Fix round 2 (reviewer blocker: a torn tail was poisoned by the next append)
+
+The reviewer found that `append_transcript` closed an unterminated tail with a
+separator byte whenever the last byte wasn't `\n`, without checking whether
+that tail was a *complete* record. For a torn append (truncated fragment) the
+separator turned the read-tolerated fragment into a *terminated* malformed line,
+which `load_transcript` treats as hard corruption — so the very append that was
+supposed to repair a failed write made the session permanently unloadable (and,
+in-process, left the watermark unresolvable for the session's lifetime).
+
+- `src/storage/local.rs`: `misses_trailing_newline` (last-byte check) replaced
+  by `classify_trailing` → `Trailing::{Absent, Terminated, UnterminatedRecord,
+  TornFragment}`. Only `UnterminatedRecord` (a complete pre-#92 record with no
+  terminator) gets the separator byte; `TornFragment` falls back to
+  load-extend-save, which drops the fragment and rewrites the file cleanly.
+  The common terminated path still reads a single byte.
+- Test `append_transcript_after_torn_tail_rewrites_cleanly`: torn tail loads,
+  then a following append leaves `disk == memory` with no parse error.
+
+Non-blocking items from the same review, also fixed:
+
+- `website/en/deployment/docker.md` / `index.md`: no longer claim S3 is
+  "appended per turn"; now match `cloud.md` (whole-object load-extend-save).
+- `src/runtime.rs::set_session_id`: clears `persisted_transcript_len` (and
+  `transcript_rewritten`), so a post-persist id change cannot reuse another
+  session's watermark. Test `set_session_id_invalidates_the_persistence_watermark`.
+- `src/http/cold_load.rs` comment: corrected — the first persist only full-saves
+  when the stored record isn't the rebuilt transcript's prefix; with an
+  unchanged config the stored system message matches and it appends. The earlier
+  "the seeder drops the system prompt" claim was wrong (the comment above).
+
+Gates re-run: `cargo fmt --all`, `cargo clippy --all-targets --all-features --
+-D warnings`, `cargo test --workspace` — all green.
+
