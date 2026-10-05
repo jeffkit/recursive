@@ -205,3 +205,30 @@ both arms honour.
 - `crates/recursive-cli/src/main.rs`:
   `doctor_probe_storage_round_trips_against_the_server_root_and_cleans_up`
   (renamed + rewritten as above).
+
+## Land round (rebase conflict, #137 handoff)
+
+The previous attempt's land rebase onto `origin/main` conflicted; this round
+took it over. `git fetch origin && git rebase origin/main` (branch point
+`bba862ab`, new base `e33e9d66`) replayed both #123 commits; `src/error.rs`,
+`src/http/mod.rs`, `tests/http.rs` and `crates/recursive-cli/src/main.rs`
+auto-merged, and the only content conflict was the top of
+`src/http/handlers.rs`:
+
+- main side (#85 tenant identity) inserted `ensure_access` / `ensure_owned` /
+  `ensure_session_access_by_id` right after `health()`;
+- #123 side inserted the `READYZ_*` constants, `now_stamp_ms`,
+  `llm_streak_is_current`, `readyz_probe_is_fresh`, `readyz_probe_value`,
+  `probe_storage` and `readyz` at the same anchor.
+
+Both blocks are independent (no overlapping symbols), so the resolution keeps
+both — main's ownership guards first, then the readiness block. Nothing was
+dropped from either side.
+
+Gates re-run on the rebased tree:
+
+- `cargo fmt --all` — clean (no diff)
+- `cargo clippy --all-targets --all-features -- -D warnings` — pass
+- `cargo test --workspace` — 4356 passed, 0 failed (all `readyz_*`,
+  `doctor_probe_*`, `memory_round_trip_*` and `record_run_metrics_*` tests
+  included)
