@@ -13,6 +13,7 @@
 //! in the CLI crate.
 
 use std::sync::Arc;
+#[cfg(feature = "anthropic")]
 use std::time::Duration;
 
 use crate::config::Config;
@@ -34,7 +35,7 @@ pub fn build_llm_provider(
     api_key: &str,
     retry: RetryPolicy,
     max_search_rounds: Option<usize>,
-    thinking_budget: Option<u32>,
+    #[cfg_attr(not(feature = "anthropic"), allow(unused_variables))] thinking_budget: Option<u32>,
 ) -> Result<Arc<dyn ChatProvider>> {
     let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
         #[cfg(feature = "anthropic")]
