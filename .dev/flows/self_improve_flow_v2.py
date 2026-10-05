@@ -339,10 +339,23 @@ def self_improve_v2(INPUT):
         rev2 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                         timeout_secs=5400)
         if F.contains(rev2.text, "VERDICT:PASS") != True:
-            wfr2 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
-                             content=rev2.text)
-            return {"verdict": "failed-preserved", "stage": "review",
-                    "why": "review did not pass after one fix round"}
+            # 第二轮修复（2026-10-05 jeffkit 拍板「review 修复可以多加一两轮」）：
+            # 首轮修后仍 NEEDS_FIX 时再修一轮、再复审定论；仍不过才 preserved。
+            # 代价上界 = 每轮 fix(≤7200s) + review(≤5400s)；若撞 8h 运行墙由
+            # 宿主到点优雅退出（checkpoint 落盘、下轮 L3 续跑），不丢现场。
+            fix_prompt2 = F.concat(
+                "An independent reviewer still rejects this change after one fix round. ",
+                "Address every remaining issue below. Do not regress passing checks.",
+                "\n\n--- reviewer feedback ---\n", rev2.text)
+            fix2 = AGENTRUN(agent=agent, prompt=fix_prompt2, repo=pre.worktree,
+                            timeout_secs=7200)
+            rev3 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
+                            timeout_secs=5400)
+            if F.contains(rev3.text, "VERDICT:PASS") != True:
+                wfr3 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
+                                 content=rev3.text)
+                return {"verdict": "failed-preserved", "stage": "review",
+                        "why": "review did not pass after two fix rounds"}
 
     # ── 落地：GIT_PUBLISH（幂等 commit + main 模式 ff 推送）──
     pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
