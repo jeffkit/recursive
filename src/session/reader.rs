@@ -158,6 +158,43 @@ impl SessionReader {
         Ok(entries.into_iter().map(entry_to_message).collect())
     }
 
+    /// Load the resume seed ([`Self::load_messages`]) with the results of
+    /// orphan tool calls spliced in.
+    ///
+    /// A session whose process died mid-tool-call ends on an assistant
+    /// message whose `tool_calls` have no matching `tool` result. That seed
+    /// is not sendable to a provider — a `tool_use` without a `tool_result`
+    /// is an HTTP 400 — so every unpaired call must be answered *before* the
+    /// run starts: with [`ORPHAN_SKIPPED_RESULT`](super::orphan::ORPHAN_SKIPPED_RESULT)
+    /// (`--orphans=skip`) or with the output of a re-execution
+    /// (`--orphans=redo`).
+    ///
+    /// `answers` pairs a tool-call id with the content that stands in for
+    /// its result. The answers are inserted, in the order given, right after
+    /// the last `tool` message that follows the issuing assistant message
+    /// (or directly after the assistant message when the crash left no
+    /// result at all), so the seeded transcript stays one contiguous
+    /// tool-call/tool-result chain (invariant #8).
+    ///
+    /// An empty `answers` is exactly [`Self::load_messages`].
+    pub fn load_messages_with_orphan_results(
+        session_dir: &Path,
+        answers: &[(String, String)],
+    ) -> std::io::Result<Vec<crate::message::Message>> {
+        let entries = Self::load_transcript(session_dir)?;
+        if answers.is_empty() {
+            return Ok(entries.into_iter().map(entry_to_message).collect());
+        }
+        let insert_at = orphan_result_insert_at(&entries);
+        let mut messages: Vec<crate::message::Message> =
+            entries.into_iter().map(entry_to_message).collect();
+        let synthetic = answers
+            .iter()
+            .map(|(id, content)| crate::message::Message::tool_result(id.clone(), content.clone()));
+        messages.splice(insert_at..insert_at, synthetic);
+        Ok(messages)
+    }
+
     /// Goal-153: scan the transcript for "orphan" tool calls — tool_calls
     /// in the last assistant message that have no matching `tool` reply.
     ///
@@ -217,6 +254,7 @@ impl SessionReader {
                     assistant_msg_id: asst_entry.id.clone(),
                     tool_call_id: tc.id.clone(),
                     tool_name: tc.name.clone(),
+                    call: tc.clone(),
                     args_hash,
                     side_effect_at_call: side_effect,
                 });
@@ -353,6 +391,28 @@ impl SessionReader {
         }
         sessions.sort();
         Ok(sessions)
+    }
+}
+
+/// Index into a transcript's entry list where results for its unanswered
+/// tool calls belong: right after the last `tool` result that follows the
+/// issuing assistant message, so the call/result chain stays contiguous.
+///
+/// Falls back to the end of the transcript when it holds no assistant
+/// message with tool calls (nothing to pair against).
+fn orphan_result_insert_at(entries: &[TranscriptEntry]) -> usize {
+    let Some(asst_idx) = entries
+        .iter()
+        .rposition(|e| e.role == "assistant" && !e.tool_calls.is_empty())
+    else {
+        return entries.len();
+    };
+    match entries[asst_idx + 1..]
+        .iter()
+        .rposition(|e| e.role == "tool")
+    {
+        Some(offset) => asst_idx + 2 + offset,
+        None => asst_idx + 1,
     }
 }
 
@@ -865,5 +925,159 @@ mod tests {
             loaded.iter().all(|e| matches!(e, LoadedEntry::Message(_))),
             "no CompactBoundary markers when the session never compacted"
         );
+    }
+
+    // ── load_messages_with_orphan_results ────────────────────────────────────
+
+    /// Build `user → assistant(tool_calls) → [tool results]`, i.e. the shape a
+    /// session has after a crash mid-tool-call.
+    fn crash_session(answers_written: &[&str]) -> (crate::test_util::IsolatedWorkspace, PathBuf) {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
+        let mut asst = Message::assistant("calling".to_string());
+        asst.tool_calls = vec![
+            crate::llm::ToolCall {
+                id: "tc-1".to_string(),
+                name: "Read".to_string(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            crate::llm::ToolCall {
+                id: "tc-2".to_string(),
+                name: "Bash".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+        ];
+        w.append(&Message::user("go".to_string()), None, None)
+            .unwrap();
+        w.append(&asst, None, None).unwrap();
+        for id in answers_written {
+            w.append(&Message::tool_result(*id, "recorded"), None, None)
+                .unwrap();
+        }
+        let dir = w.session_dir().to_path_buf();
+        drop(w);
+        (tmp, dir)
+    }
+
+    #[test]
+    fn load_messages_with_orphan_results_empty_answers_is_plain_load() {
+        let (_tmp, dir) = crash_session(&[]);
+        let plain = SessionReader::load_messages(&dir).unwrap();
+        let spliced = SessionReader::load_messages_with_orphan_results(&dir, &[]).unwrap();
+        assert_eq!(plain, spliced);
+    }
+
+    #[test]
+    fn load_messages_with_orphan_results_answers_every_unpaired_call() {
+        let (_tmp, dir) = crash_session(&[]);
+        // Crash left no result at all → answers go straight after the assistant.
+        let spliced = SessionReader::load_messages_with_orphan_results(
+            &dir,
+            &[
+                ("tc-1".to_string(), "read output".to_string()),
+                ("tc-2".to_string(), "shell output".to_string()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(spliced.len(), 4, "user + assistant + 2 synthetic results");
+        assert_eq!(spliced[2].role, crate::message::Role::Tool);
+        assert_eq!(spliced[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(spliced[2].content, "read output");
+        assert_eq!(spliced[3].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(spliced[3].content, "shell output");
+    }
+
+    #[test]
+    fn load_messages_with_orphan_results_follows_a_partial_result_batch() {
+        // tc-1's result made it to disk before the crash; the answer for
+        // tc-2 must land *after* it, not between the assistant and it —
+        // otherwise the seeded chain is `assistant, tool(2), tool(1)`.
+        let (_tmp, dir) = crash_session(&["tc-1"]);
+        let spliced = SessionReader::load_messages_with_orphan_results(
+            &dir,
+            &[("tc-2".to_string(), "shell output".to_string())],
+        )
+        .unwrap();
+
+        assert_eq!(spliced.len(), 4);
+        assert_eq!(spliced[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(spliced[2].content, "recorded");
+        assert_eq!(spliced[3].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(spliced[3].content, "shell output");
+    }
+
+    #[test]
+    fn load_messages_with_orphan_results_appends_without_an_assistant_call() {
+        // No assistant tool_calls anywhere → nothing to pair against, so the
+        // answers trail the transcript (and never get dropped).
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
+        w.append(&Message::user("hi".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("hello".to_string()), None, None)
+            .unwrap();
+        let dir = w.session_dir().to_path_buf();
+        drop(w);
+
+        let spliced = SessionReader::load_messages_with_orphan_results(
+            &dir,
+            &[("tc-1".to_string(), "late".to_string())],
+        )
+        .unwrap();
+        assert_eq!(spliced.len(), 3);
+        assert_eq!(spliced[2].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[test]
+    fn orphan_result_insert_at_pins_the_only_assistant_call() {
+        // Pins the index arithmetic: `asst_idx + 1` when no result exists,
+        // `asst_idx + 2 + offset` when one does (offset is relative to
+        // `asst_idx + 1`, so the `+ 1` must not be forgotten).
+        let entry = |role: &str, tools: bool| {
+            let mut e = TranscriptEntry {
+                uuid: String::new(),
+                parent_uuid: None,
+                source_tool_assistant_uuid: None,
+                id: "id".into(),
+                parent_id: None,
+                role: role.into(),
+                content: String::new(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                usage: None,
+                timestamp: String::new(),
+                audit: None,
+            };
+            if tools {
+                e.tool_calls = vec![crate::llm::ToolCall {
+                    id: "tc".into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({}),
+                }];
+            }
+            e
+        };
+
+        let no_result = vec![entry("user", false), entry("assistant", true)];
+        assert_eq!(orphan_result_insert_at(&no_result), 2);
+
+        let one_result = vec![
+            entry("user", false),
+            entry("assistant", true),
+            entry("tool", false),
+        ];
+        assert_eq!(orphan_result_insert_at(&one_result), 3);
+
+        let unrelated_tail = vec![
+            entry("assistant", true),
+            entry("tool", false),
+            entry("user", false),
+        ];
+        assert_eq!(orphan_result_insert_at(&unrelated_tail), 2);
+
+        let none = vec![entry("user", false)];
+        assert_eq!(orphan_result_insert_at(&none), 1);
     }
 }

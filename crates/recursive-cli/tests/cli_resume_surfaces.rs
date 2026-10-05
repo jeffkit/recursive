@@ -3,6 +3,8 @@
 //! Pins user-visible behaviours that only appear when the real binary runs:
 //!
 //! * the orphan-tool-call block runs at all (`if !orphans.is_empty()`),
+//! * `--orphans=skip` answers every orphan with a synthetic tool result and
+//!   persists it into the session,
 //! * only *External*-classified orphans get the re-execution warning,
 //! * a drifted `tool_registry_hash` hard-fails without `--allow-tool-drift`
 //!   and degrades to a warning (+ vanished-tool report) with it; redo of a
@@ -374,7 +376,7 @@ fn resume_refuses_to_proceed_with_orphans_when_asked_to_abort() {
 }
 
 #[test]
-fn resume_skip_policy_treats_orphans_as_completed() {
+fn resume_skip_policy_answers_orphans_with_a_synthetic_result() {
     let rig = Rig::new();
     let dir = rig.session_dir("sess-skip", &["TotallyUnknownTool"]);
 
@@ -389,9 +391,25 @@ fn resume_skip_policy_treats_orphans_as_completed() {
         "the orphan report must be printed, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("treating as completed"),
+        stderr.contains("synthetic interrupted result"),
         "skip policy must announce the chosen handling, got:\n{stderr}"
     );
+    assert!(
+        out.status.success(),
+        "the repaired seed must complete the run, got:\n{stderr}"
+    );
+
+    // The answer has to land in the session itself, not only in the seed the
+    // provider sees — an unpersisted repair is re-detected (and, under redo,
+    // re-executed) on the next resume.
+    let transcript = std::fs::read_to_string(dir.join("transcript.jsonl")).expect("transcript");
+    let answer = transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|e| e["role"] == "tool")
+        .expect("a tool result must answer the orphan");
+    assert_eq!(answer["tool_call_id"], "c0");
+    assert_eq!(answer["content"], "[interrupted: no result recorded]");
 }
 
 #[test]

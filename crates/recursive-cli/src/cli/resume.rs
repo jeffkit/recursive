@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
+use recursive::session::{ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT};
 use recursive::{
     ChannelSink, CompositeSink, EventSink, FinishReason, SessionPersistenceSink, SessionStatus,
     SessionWriter,
@@ -192,6 +193,15 @@ fn resolve_resume_message(message: Option<String>) -> String {
 /// and only an explicit `--orphans=redo` of a tool that no longer exists
 /// is refused. Without the flag the mismatch keeps its hard-fail
 /// behaviour (upgrade-safety for unattended callers).
+///
+/// Orphan tool calls (a `tool_call` with no matching `tool` result — what a
+/// crash during tool execution leaves on disk) are answered before the seed
+/// is built: `--orphans=skip` inserts a synthetic
+/// "[interrupted: no result recorded]" result, `--orphans=redo` re-executes
+/// the call against the current registry and records its real output. The
+/// answers are appended to the session transcript too, so the seed the
+/// provider receives is a paired transcript *and* the next resume does not
+/// re-detect the same orphans.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_resume(
     config: recursive::config::Config,
@@ -269,23 +279,22 @@ pub(crate) async fn cmd_resume(
     }
 
     // ── Goal-153: orphan detection ───────────────────────────────────────────
+    // Every orphan is answered with a tool-result message before the run
+    // starts (`resolutions`), either synthetic (skip) or re-executed (redo).
+    // A seeded transcript that ends on an unanswered tool_call is not
+    // sendable to a provider — `tool_use` without `tool_result` is an HTTP
+    // 400 — so "do nothing" is not one of the options.
     let orphans = recursive::session::SessionReader::scan_orphan_tool_calls(&session_dir, &tools)?;
+    let mut resolutions: Vec<(String, String)> = Vec::new();
     if !orphans.is_empty() {
         use std::io::IsTerminal;
 
+        let interactive = std::io::stdin().is_terminal();
         // Determine policy: explicit flag > TTY heuristic
-        let default_policy = if orphans_flag.is_none() {
-            if std::io::stdin().is_terminal() {
-                OrphanPolicy::Ask
-            } else {
-                OrphanPolicy::Abort
-            }
-        } else {
-            OrphanPolicy::Ask // overwritten below
-        };
         let policy = match &orphans_flag {
             Some(s) => OrphanPolicy::from_str(s)?,
-            None => default_policy,
+            None if interactive => OrphanPolicy::Ask,
+            None => OrphanPolicy::Abort,
         };
 
         eprintln!(
@@ -310,11 +319,14 @@ pub(crate) async fn cmd_resume(
                 );
             }
             OrphanPolicy::Skip => {
-                eprintln!("orphans: treating as completed (--orphans=skip)");
-                // Nothing to do — orphan tool calls will be treated as if
-                // they completed with an empty result. The resume seeded
-                // transcript already lacks their tool result messages, which
-                // the model will handle as "no result yet" context.
+                eprintln!(
+                    "orphans: answering {} call(s) with a synthetic interrupted result \
+                     (--orphans=skip)",
+                    orphans.len()
+                );
+                for o in &orphans {
+                    resolutions.push((o.tool_call_id.clone(), ORPHAN_SKIPPED_RESULT.to_string()));
+                }
             }
             OrphanPolicy::Redo => {
                 // A redo re-executes the call with the *current* registry.
@@ -337,17 +349,11 @@ pub(crate) async fn cmd_resume(
                         );
                     }
                 }
-                // Warn if any are External — unsafe to auto-redo.
-                for o in &orphans {
-                    if o.side_effect_at_call == recursive::tools::ToolSideEffect::External {
-                        eprintln!(
-                            "WARNING: '{}' is classified External — re-executing \
-                             may duplicate side-effects (network calls, etc.).",
-                            o.tool_name
-                        );
-                    }
-                }
                 eprintln!("orphans: will re-execute on resume (--orphans=redo)");
+                for o in &orphans {
+                    let result = redo_orphan(&tools, o, false, interactive).await?;
+                    resolutions.push((o.tool_call_id.clone(), result));
+                }
             }
             OrphanPolicy::Ask => {
                 for orphan in &orphans {
@@ -362,9 +368,15 @@ pub(crate) async fn cmd_resume(
                         }
                         OrphanPolicy::Skip => {
                             eprintln!("  → skipping '{}'", orphan.tool_name);
+                            resolutions.push((
+                                orphan.tool_call_id.clone(),
+                                ORPHAN_SKIPPED_RESULT.to_string(),
+                            ));
                         }
                         OrphanPolicy::Redo => {
-                            eprintln!("  → will redo '{}'", orphan.tool_name);
+                            eprintln!("  → redoing '{}'", orphan.tool_name);
+                            let result = redo_orphan(&tools, orphan, true, interactive).await?;
+                            resolutions.push((orphan.tool_call_id.clone(), result));
                         }
                         OrphanPolicy::Ask => unreachable!(),
                     }
@@ -388,9 +400,29 @@ pub(crate) async fn cmd_resume(
         None
     };
 
-    // Load the seeded transcript (everything that's already on disk).
-    let seed = recursive::session::SessionReader::load_messages(&session_dir)
-        .with_context(|| format!("loading transcript for session {}", session_dir.display()))?;
+    // Load the seeded transcript (everything that's already on disk), with
+    // each orphan's answer spliced in so the provider sees a paired
+    // transcript.
+    let seed = recursive::session::SessionReader::load_messages_with_orphan_results(
+        &session_dir,
+        &resolutions,
+    )
+    .with_context(|| format!("loading transcript for session {}", session_dir.display()))?;
+    // Persist the same answers: the seeded repair is otherwise lost, and the
+    // next resume would re-detect (and, under redo, re-execute) them.
+    if let Some(w) = &writer {
+        let mut w = w
+            .lock()
+            .map_err(|e| anyhow::anyhow!("session lock poisoned: {e}"))?;
+        for (tool_call_id, content) in &resolutions {
+            w.append(
+                &recursive::message::Message::tool_result(tool_call_id.clone(), content.clone()),
+                None,
+                None,
+            )
+            .with_context(|| format!("recording the resume result for tool call {tool_call_id}"))?;
+        }
+    }
     // Resume is driven by the session id, not by the saved goal. The
     // next turn is a user message: an explicit one passed via -p /
     // --message, or a synthetic continuation prompt when none is
@@ -417,6 +449,67 @@ pub(crate) async fn cmd_resume(
         accept_user_messages,
     )
     .await
+}
+
+/// Re-execute one orphaned tool call against the current registry and render
+/// the content that stands in for its result.
+///
+/// A failed re-execution is not fatal: the error text becomes the tool
+/// result — exactly what the model would have seen had the call returned an
+/// error before the crash — and the run can still make progress.
+async fn replay_orphan_call(
+    tools: &recursive::tools::ToolRegistry,
+    orphan: &recursive::session::OrphanToolCall,
+) -> String {
+    match tools
+        .invoke_with_audit(&orphan.tool_name, orphan.call.arguments.clone())
+        .await
+        .result
+    {
+        Ok(output) => output,
+        Err(e) => format!("{ORPHAN_REDO_FAILED_PREFIX}{e}"),
+    }
+}
+
+/// Resolve one orphan under `--orphans=redo`.
+///
+/// `External` calls (Bash, `Agent`, any unannotated tool) may duplicate
+/// side-effects when replayed, so they keep their human confirmation: a TTY
+/// gets the same redo/skip/abort prompt as `--orphans=ask`, and skipping
+/// falls back to the synthetic interrupted result. With no TTY there is
+/// nobody to ask — the explicit `--orphans=redo` opt-in is honoured and the
+/// warning is left in the log for the operator.
+///
+/// `already_confirmed` marks the `--orphans=ask` path, where the answer that
+/// selected redo *was* the confirmation.
+async fn redo_orphan(
+    tools: &recursive::tools::ToolRegistry,
+    orphan: &recursive::session::OrphanToolCall,
+    already_confirmed: bool,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    let external = orphan.side_effect_at_call == recursive::tools::ToolSideEffect::External;
+    if external && !already_confirmed {
+        if !interactive {
+            eprintln!(
+                "warning: '{}' is classified External — re-executing may duplicate \
+                 side-effects (no TTY to confirm; --orphans=redo was given explicitly).",
+                orphan.tool_name
+            );
+            return Ok(replay_orphan_call(tools, orphan).await);
+        }
+        eprintln!(
+            "WARNING: '{}' is classified External — re-executing may duplicate \
+             side-effects (network calls, writes outside the workspace, ...).",
+            orphan.tool_name
+        );
+        match prompt_orphan_choice(&orphan.tool_name)? {
+            OrphanPolicy::Redo => {}
+            OrphanPolicy::Skip => return Ok(ORPHAN_SKIPPED_RESULT.to_string()),
+            OrphanPolicy::Abort | OrphanPolicy::Ask => anyhow::bail!("resume aborted by user."),
+        }
+    }
+    Ok(replay_orphan_call(tools, orphan).await)
 }
 
 /// Whether `run_resumed` should print the `resuming from N seeded message(s)`
@@ -748,8 +841,8 @@ pub(crate) async fn run_resumed(
 mod tests {
     use super::{
         classify_orphan_answer, cmd_resume, legacy_resume_error, prompt_orphan_choice_with,
-        resolve_resume_message, resolve_resume_target, resume_banner_enabled, run_resumed,
-        OrphanPolicy,
+        redo_orphan, resolve_resume_message, resolve_resume_target, resume_banner_enabled,
+        run_resumed, OrphanPolicy, ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
     };
     use crate::cli::session::resolve_session_path;
     use std::path::Path;
@@ -1168,5 +1261,305 @@ mod tests {
     fn resume_banner_is_printed_only_for_text_output() {
         assert!(resume_banner_enabled(false));
         assert!(!resume_banner_enabled(true));
+    }
+
+    // ── orphan resolution (skip / redo) ─────────────────────────────────────
+
+    /// Write the transcript a SIGKILL during tool execution leaves behind:
+    /// `user → assistant(tool_calls)` with no `tool` results at all.
+    fn write_crashed_session(dir: &Path, calls: &[(&str, &str, serde_json::Value)]) {
+        let user = serde_json::json!({
+            "uuid": "u-1",
+            "id": "msg_001",
+            "role": "user",
+            "content": "go",
+            "timestamp": "2026-01-01T00:00:00Z",
+        });
+        let tool_calls: Vec<serde_json::Value> = calls
+            .iter()
+            .map(|(id, name, args)| serde_json::json!({"id": id, "name": name, "arguments": args}))
+            .collect();
+        let assistant = serde_json::json!({
+            "uuid": "u-2",
+            "parent_uuid": "u-1",
+            "id": "msg_002",
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": tool_calls,
+            "timestamp": "2026-01-01T00:00:00Z",
+        });
+        std::fs::write(
+            dir.join("transcript.jsonl"),
+            format!("{user}\n{assistant}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Serialises the tests that pin `RECURSIVE_HOME`. This crate cannot use
+    /// `recursive::test_util`'s env lock (it needs the `test-utils` feature),
+    /// and a tokio mutex is the one whose guard may be held across awaits.
+    static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Pin `RECURSIVE_HOME` for a test that drives a full resume: the
+    /// checkpoint wiring resolves the shadow-git dir through the user data
+    /// dir, which must not be the developer's real one.
+    fn pin_recursive_home(home: &Path) -> Option<std::ffi::OsString> {
+        let prev = std::env::var_os("RECURSIVE_HOME");
+        std::env::set_var("RECURSIVE_HOME", home);
+        prev
+    }
+
+    fn restore_recursive_home(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
+            None => std::env::remove_var("RECURSIVE_HOME"),
+        }
+    }
+
+    /// Read one whole HTTP request (headers + `Content-Length` body) so the
+    /// assertions see the provider payload, not just the first packet.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                let want = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buf.len() >= head_end + 4 + want {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Serve exactly one canned chat completion, returning the API base to
+    /// point a config at plus a handle yielding the captured request.
+    async fn spawn_one_shot_provider() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept one request");
+            let request = read_http_request(&mut sock).await;
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.flush().await;
+            request
+        });
+        (format!("http://{addr}/v1"), server)
+    }
+
+    fn orphan_with(
+        name: &str,
+        args: serde_json::Value,
+        class: recursive::tools::ToolSideEffect,
+    ) -> recursive::session::OrphanToolCall {
+        recursive::session::OrphanToolCall {
+            assistant_msg_id: "msg_002".into(),
+            tool_call_id: "tc-1".into(),
+            tool_name: name.into(),
+            call: recursive::llm::ToolCall {
+                id: "tc-1".into(),
+                name: name.into(),
+                arguments: args,
+            },
+            args_hash: String::new(),
+            side_effect_at_call: class,
+        }
+    }
+
+    async fn tools_for(cfg: &recursive::config::Config) -> recursive::tools::ToolRegistry {
+        crate::cli::builder::build_tools(cfg, None).await.0
+    }
+
+    /// Acceptance: a transcript that ends on an unanswered `tool_call` gets
+    /// answered with the synthetic note, and the resumed session then drives
+    /// a complete provider round-trip (the old `--orphans=skip` printed a
+    /// note, sent the unpaired seed, and died on the provider's HTTP 400).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_resume_skip_answers_the_orphan_and_round_trips_the_provider() {
+        let _guard = HOME_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let prev_home = pin_recursive_home(home.path());
+
+        let mut cfg = test_config(ws.path());
+        let hash = current_tool_hash(&cfg).await;
+        let (api_base, server) = spawn_one_shot_provider().await;
+        cfg.api_base = api_base;
+
+        let sdir = ws.path().join("sess-skip");
+        std::fs::create_dir_all(&sdir).unwrap();
+        write_session_meta(&sdir, Some(hash));
+        write_crashed_session(
+            &sdir,
+            &[("tc-1", "Read", serde_json::json!({"path": "note.txt"}))],
+        );
+
+        let res = cmd_resume(
+            cfg,
+            None,
+            Some(sdir.clone()),
+            Some("skip".into()),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            false,
+        )
+        .await;
+        let request = server.await.unwrap();
+        restore_recursive_home(prev_home);
+
+        res.expect("--orphans=skip must let the session reach the provider");
+        assert!(
+            request.contains("\"role\":\"tool\""),
+            "the provider must receive a tool result for the orphan: {request}"
+        );
+        assert!(
+            request.contains("\"tool_call_id\":\"tc-1\""),
+            "the synthetic result must answer the orphan's call id: {request}"
+        );
+        assert!(
+            request.contains(ORPHAN_SKIPPED_RESULT),
+            "the synthetic note must be on the wire: {request}"
+        );
+
+        let entries = recursive::session::SessionReader::load_transcript(&sdir).unwrap();
+        let answer = entries
+            .iter()
+            .find(|e| e.role == "tool")
+            .expect("the answer must be persisted, or the next resume re-detects it");
+        assert_eq!(answer.tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(answer.content, ORPHAN_SKIPPED_RESULT);
+    }
+
+    /// Acceptance: `--orphans=redo` really replays the call — the recorded
+    /// result is the tool's output, not a note saying it will be replayed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_resume_redo_replays_the_orphaned_call() {
+        let _guard = HOME_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let prev_home = pin_recursive_home(home.path());
+        std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
+
+        let mut cfg = test_config(ws.path());
+        cfg.api_base = "http://127.0.0.1:1/v1".into();
+        let hash = current_tool_hash(&cfg).await;
+        let sdir = ws.path().join("sess-redo");
+        std::fs::create_dir_all(&sdir).unwrap();
+        write_session_meta(&sdir, Some(hash));
+        write_crashed_session(
+            &sdir,
+            &[("tc-1", "Read", serde_json::json!({"path": "note.txt"}))],
+        );
+
+        // The provider is unreachable, so the resumed run itself fails — the
+        // replay has already happened and been persisted by then.
+        let _ = cmd_resume(
+            cfg,
+            None,
+            Some(sdir.clone()),
+            Some("redo".into()),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            false,
+        )
+        .await;
+        restore_recursive_home(prev_home);
+
+        let entries = recursive::session::SessionReader::load_transcript(&sdir).unwrap();
+        let answer = entries
+            .iter()
+            .find(|e| e.role == "tool")
+            .expect("the replayed result must be persisted");
+        assert_eq!(answer.tool_call_id.as_deref(), Some("tc-1"));
+        assert!(
+            answer.content.contains("hello from disk"),
+            "redo must carry the re-executed output, got: {}",
+            answer.content
+        );
+    }
+
+    #[tokio::test]
+    async fn redo_orphan_replays_a_readonly_call() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let orphan = orphan_with(
+            "Read",
+            serde_json::json!({"path": "note.txt"}),
+            recursive::tools::ToolSideEffect::ReadOnly,
+        );
+        let out = redo_orphan(&tools, &orphan, false, false).await.unwrap();
+        assert!(out.contains("hello from disk"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn redo_orphan_replays_external_calls_without_a_tty() {
+        // `External` orphans normally ask a human first. With no TTY there is
+        // nobody to ask: the explicit `--orphans=redo` opt-in is honoured
+        // (with the warning) instead of the resume refusing to proceed.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let orphan = orphan_with(
+            "Read",
+            serde_json::json!({"path": "note.txt"}),
+            recursive::tools::ToolSideEffect::External,
+        );
+        let out = redo_orphan(&tools, &orphan, false, false).await.unwrap();
+        assert!(out.contains("hello from disk"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn redo_orphan_answers_with_the_error_when_the_replay_fails() {
+        // A failing replay must not abort the resume: the error text is the
+        // tool result the model would have seen had the call returned.
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = test_config(ws.path());
+        let tools = tools_for(&cfg).await;
+
+        let orphan = orphan_with(
+            "Read",
+            serde_json::json!({"path": "missing.txt"}),
+            recursive::tools::ToolSideEffect::ReadOnly,
+        );
+        let out = redo_orphan(&tools, &orphan, false, false).await.unwrap();
+        assert!(
+            out.starts_with(ORPHAN_REDO_FAILED_PREFIX),
+            "a failed replay must be reported as such, got: {out}"
+        );
     }
 }

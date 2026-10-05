@@ -65,6 +65,16 @@ provider with HTTP 400.
 where it left off. The self-improve flow's auto-resume step checks that a
 saved transcript exists before attempting resume.
 
+A crash during tool execution leaves an unanswered `tool_call` at the tail of
+the transcript, which the provider rejects (invariant #8), so `recursive
+resume` requires a policy for those orphan calls: `--orphans=skip` answers
+each one with a synthetic `[interrupted: no result recorded]` result,
+`--orphans=redo` re-executes it against the current registry, `--orphans=ask`
+prompts, and `--orphans=abort` (the default when stdin is not a TTY) refuses
+to resume. The answer is both seeded into the run and appended to
+`transcript.jsonl`, so the next resume sees a paired transcript instead of
+re-detecting the same orphans.
+
 ## Loop wakeups (issue #99)
 
 `recursive loop` arms its next turn with `schedule_wakeup`. The pending request

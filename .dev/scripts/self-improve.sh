@@ -405,6 +405,13 @@ set -e
 # paths to resume via native `recursive resume --from-file <dir>` —
 # the orthodox session-id resume — instead of replaying the
 # transcript file with --resume-from.
+#
+# Every resume below passes `--orphans=skip` explicitly: a run killed
+# mid-tool-call leaves an unanswered tool_call at the tail of the transcript,
+# and without an explicit policy the non-TTY default is `abort` — the resume
+# would refuse to run. `skip` answers the call with a synthetic
+# "[interrupted: no result recorded]" result so the agent can decide whether
+# to re-issue it; `redo` would silently repeat whatever the killed command was.
 SESSION_DIR="$(rg -o 'session: recording to .*' "$LOG" 2>/dev/null | head -1 | cut -d' ' -f4)"
 
 # ---- Auto-resume on BudgetExceeded -----------------------------------------
@@ -429,7 +436,7 @@ if [[ "$AGENT_STATUS" -ne 0 ]] \
     --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
     $PRICING_FLAG \
     --log warn \
-    resume --from-file "$SESSION_DIR" 2>&1 | redact_secrets | tee -a "$LOG"
+    resume --from-file "$SESSION_DIR" --orphans=skip 2>&1 | redact_secrets | tee -a "$LOG"
   AGENT_STATUS=${PIPESTATUS[0]}
   set -e
 
@@ -778,7 +785,7 @@ Please fix the compilation/test errors. Do NOT start over — fix the specific i
       --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
       $PRICING_FLAG \
       --log warn \
-      resume --from-file "$SESSION_DIR" -p "$FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
+      resume --from-file "$SESSION_DIR" --orphans=skip -p "$FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
     FIX_STATUS=${PIPESTATUS[0]}
     set -e
 
@@ -866,7 +873,7 @@ Please fix the lint warnings. Mechanical fixes (needless_borrow, redundant_clone
       --transcript-out "$RESUMED_TRANSCRIPT_OUT" \
       $PRICING_FLAG \
       --log warn \
-      resume --from-file "$SESSION_DIR" -p "$CLIPPY_FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
+      resume --from-file "$SESSION_DIR" --orphans=skip -p "$CLIPPY_FIX_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
     CLIPPY_FIX_STATUS=${PIPESTATUS[0]}
     set -e
 
@@ -1064,7 +1071,7 @@ Please investigate and fix the regression. Do NOT start over — fix the specifi
           --transcript-out "$SMOKE_TRANSCRIPT_OUT" \
           $PRICING_FLAG \
           --log warn \
-          resume --from-file "$SESSION_DIR" -p "$SMOKE_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
+          resume --from-file "$SESSION_DIR" --orphans=skip -p "$SMOKE_PROMPT" 2>&1 | redact_secrets | tee -a "$LOG"
         SMOKE_FIX_STATUS=${PIPESTATUS[0]}
         set -e
 
