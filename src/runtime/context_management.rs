@@ -1,15 +1,12 @@
 //! Frontend-neutral context-management assembly (Goal 393).
 //!
-//! Both frontends (CLI and HTTP) must install the same cross-turn context
-//! management — compactor, microcompactor, transcript cap — otherwise the
-//! same kernel behaves differently per channel: CLI compacts on overflow and
-//! continues, while a compactor-less HTTP runtime propagates the context
-//! error and kills the session.
-//!
-//! This module is the single source of truth for that assembly. The CLI's
-//! `builder.rs` and all HTTP runtime build points call
-//! [`apply_context_management`]; frontend-specific wiring (reinjectors,
-//! event sinks, hooks, wall-clock budgets) stays at the call site.
+//! Issue #127 moved the single source of truth to [`crate::preset`]: a session
+//! resolves a [`crate::preset::ResolvedPreset`] (the `standard` preset plus the
+//! operator's environment) and installs it with [`crate::preset::apply`],
+//! which also wires post-compaction re-injection — the half the HTTP channel
+//! used to lack. This module keeps the Goal-393 entry point working for
+//! callers that hold no reinjection assets by applying the same preset with
+//! none.
 //!
 //! # Environment variables (identical semantics on every frontend)
 //!
@@ -25,6 +22,7 @@
 //! the API reports real `prompt_tokens` — more reliable for CJK content.
 
 use crate::config::Config;
+use crate::preset::{ChannelSupport, PresetAssets, PresetEnv, STANDARD};
 use crate::runtime::AgentRuntimeBuilder;
 
 /// Install the standard context management (compactor / microcompactor /
@@ -32,52 +30,26 @@ use crate::runtime::AgentRuntimeBuilder;
 /// CLI always has. Idempotent per call; each session should get a fresh
 /// [`Compactor`](crate::compact::Compactor) — value config, no shared
 /// mutable state.
+///
+/// Issue #127: a thin shim over the preset assembly. Channels that hold the
+/// assets for post-compaction re-injection (a shared read state, a skill
+/// catalog) should call [`crate::preset::apply`] with them instead, so they
+/// get the whole preset rather than only its context half.
 pub fn apply_context_management(
-    mut builder: AgentRuntimeBuilder,
+    builder: AgentRuntimeBuilder,
     config: &Config,
 ) -> AgentRuntimeBuilder {
-    // Char threshold: explicit override (0 = disabled) / auto from the
-    // model's context window / explicitly disabled. Invalid strings disable
-    // rather than error — same tolerance as the CLI had.
-    let compact_threshold: Option<usize> =
-        match std::env::var("RECURSIVE_COMPACT_THRESHOLD").as_deref() {
-            Ok("0") | Ok("off") | Ok("false") => None, // explicitly disabled
-            Ok(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
-            Err(_) => {
-                // Auto-compute: mirrors fake-cc's getAutoCompactThreshold.
-                Some(crate::llm::default_compact_threshold_chars(&config.model))
-            }
-        };
-    if let Some(n) = compact_threshold {
-        let token_threshold = crate::llm::default_compact_threshold_tokens(&config.model);
-        builder = builder
-            .compactor(crate::compact::Compactor::new(n).threshold_prompt_tokens(token_threshold));
-    }
-
-    // Count-based proactive prune of old tool results.
-    let microcompactor = crate::compact::micro::build_microcompactor_from_env(
-        std::env::var("RECURSIVE_MICROCOMPACT_TRIGGER")
-            .ok()
-            .as_deref(),
-        std::env::var("RECURSIVE_MICROCOMPACT_KEEP").ok().as_deref(),
-    );
-    if let Some(mc) = microcompactor {
-        builder = builder.microcompactor(mc);
-    }
-
-    // Hard transcript cap (Goal 393: HTTP parity with the CLI flag). Unset
-    // keeps the historical unlimited behaviour.
-    let max_transcript_chars: Option<usize> =
-        match std::env::var("RECURSIVE_MAX_TRANSCRIPT_CHARS").as_deref() {
-            Ok("0") | Ok("off") | Ok("false") => None,
-            Ok(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
-            Err(_) => None,
-        };
-    if let Some(n) = max_transcript_chars {
-        builder = builder.max_transcript_chars(n);
-    }
-
-    builder
+    let env = PresetEnv::from_process();
+    let resolved = STANDARD.resolve(config, &env);
+    crate::preset::apply(
+        builder,
+        &resolved,
+        &PresetAssets::new(),
+        // Plan-mode tools need a live human, and a caller of *this* helper has
+        // not declared one — the preset's gate belongs to `preset::apply`
+        // callers that pass their channel's support level.
+        ChannelSupport { interactive: false },
+    )
 }
 
 #[cfg(test)]
@@ -192,6 +164,44 @@ mod tests {
         // RECURSIVE_MODEL / RECURSIVE_API_KEY were set, not just mutated;
         // leaving them is harmless for other tests (config tests set the
         // same values under the same lock).
+    }
+
+    /// Issue #127: the shim installs exactly the `standard` preset's context
+    /// half — the assembly is preset-driven now, not a second implementation
+    /// that could drift from the declaration.
+    #[test]
+    fn shim_installs_the_resolved_standard_preset() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _pinned = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+        std::env::set_var("RECURSIVE_MODEL", "goal127-test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::remove_var("RECURSIVE_COMPACT_THRESHOLD");
+
+        let config = Config::from_env().expect("config");
+        let resolved = STANDARD.resolve(&config, &PresetEnv::from_process());
+        let builder = apply_context_management(AgentRuntimeBuilder::new().llm(mock_llm()), &config);
+        let facts = builder.context_management_facts();
+        assert_eq!(facts.compaction, resolved.context.compaction);
+        assert_eq!(facts.microcompaction, resolved.context.microcompaction);
+        assert_eq!(
+            facts.max_transcript_chars,
+            resolved.context.max_transcript_chars
+        );
+        assert_eq!(
+            facts.reinject_recent_files, None,
+            "this shim holds no shared read state, so the file half of the \
+             declaration is skipped — not silently installed inert"
+        );
+        assert_eq!(
+            facts.reinject_invoked_skills,
+            resolved.context.reinject_invoked_skills
+        );
+        assert_eq!(builder.preset_id(), Some("standard"));
+        assert!(
+            !builder.with_plan_mode_tools_for_test(),
+            "the shim cannot know its caller has a live human"
+        );
     }
 
     fn restore(name: &str, saved: Option<String>) {

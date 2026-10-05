@@ -786,11 +786,11 @@ pub(crate) struct AguiRuntimeDeps<'a> {
     pub prompt_segments: crate::system_prompt::PromptSegments,
     /// Step budget for the run (config.max_steps at the HTTP layer).
     pub max_steps: usize,
-    /// Model id (`config.model` at the HTTP layer). Context management
-    /// derives the auto-compaction thresholds from it — passing the SAME
-    /// model the REST endpoints use keeps every channel's thresholds
-    /// identical.
-    pub model: String,
+    /// Issue #127: the resolved agent preset for this run. The HTTP layer
+    /// resolves it (it holds `AppState` and the model); this layer only
+    /// applies it — passing the SAME object every other channel gets keeps
+    /// the compaction thresholds and re-injection identical.
+    pub preset: crate::preset::ResolvedPreset,
     /// Goal 399: wall-clock budget in seconds (`config.wall_timeout_secs`
     /// at the HTTP layer). Main's monolith applied it via
     /// `build_session_runtime`; the layer must keep applying it or AG-UI
@@ -876,7 +876,9 @@ pub(crate) fn build_agui_runtime(
         deps.system_prompt,
         deps.prompt_segments,
         deps.max_steps,
-        &deps.model,
+        &deps.preset,
+        deps.skills.clone(),
+        super::handlers::HTTP_CHANNEL,
     )
     // #74 拆单 3/3: same per-turn skill reminder the REST endpoints get.
     .skills(deps.skills)
@@ -1841,7 +1843,10 @@ mod tests {
             seed_transcript: None,
             interrupt_before,
             client_tools,
-            model: "mock".into(),
+            preset: crate::preset::STANDARD.resolve(
+                &crate::http::test_config_stub(),
+                &crate::preset::PresetEnv::default(),
+            ),
             wall_timeout_secs: 0,
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-agui-test-{}", std::process::id())),

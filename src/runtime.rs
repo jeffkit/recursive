@@ -224,6 +224,11 @@ pub struct AgentRuntime {
     /// persistence (no session recording, or a host that keeps loop state in
     /// memory only). Set via [`AgentRuntimeBuilder::wakeup_store_dir`].
     wakeup_store_dir: Option<std::path::PathBuf>,
+    /// Issue #127: the agent preset this runtime was assembled from, so a
+    /// channel can report the effective preset (`GET /sessions/:id`) without
+    /// re-deriving it. `None` for runtimes built without a preset (raw
+    /// `AgentRuntimeBuilder` users).
+    preset_id: Option<String>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -253,6 +258,7 @@ impl std::fmt::Debug for AgentRuntime {
             .field("file_reinjector", &self.file_reinjector.is_some())
             .field("skill_reinjector", &self.skill_reinjector.is_some())
             .field("plan_todo_reinjector", &self.plan_todo_reinjector.is_some())
+            .field("preset_id", &self.preset_id)
             .finish()
     }
 }
@@ -886,6 +892,48 @@ impl AgentRuntime {
     #[cfg(test)]
     pub(crate) fn has_compactor(&self) -> bool {
         self.compactor.is_some()
+    }
+
+    /// Issue #127: the agent preset this runtime was assembled from.
+    pub fn preset_id(&self) -> Option<&str> {
+        self.preset_id.as_deref()
+    }
+
+    /// Issue #127: what context management this runtime runs with, as plain
+    /// data. The cross-channel parity guarantee is "same preset ⇒ same
+    /// facts"; a frontend test asserts its assembled runtime against
+    /// [`crate::preset::AgentPreset::resolve`].
+    pub fn context_management_facts(&self) -> crate::preset::ContextFacts {
+        crate::preset::ContextFacts {
+            compaction: self
+                .compactor
+                .as_ref()
+                .map(|c| crate::preset::CompactionFacts {
+                    threshold_chars: c.threshold_chars,
+                    threshold_prompt_tokens: c.threshold_prompt_tokens,
+                    keep_recent_n: c.keep_recent_n,
+                }),
+            microcompaction: self.microcompactor.as_ref().map(|mc| {
+                crate::preset::MicrocompactionSpec {
+                    trigger_tool_count: mc.trigger_tool_count,
+                    keep_recent: mc.keep_recent,
+                }
+            }),
+            max_transcript_chars: self.kernel.max_transcript_chars,
+            reinject_recent_files: self.file_reinjector.as_ref().map(|r| {
+                crate::preset::FileReinjectSpec {
+                    max_files: r.max_files,
+                    token_budget: r.token_budget,
+                    per_file_budget: r.per_file_budget,
+                }
+            }),
+            reinject_invoked_skills: self.skill_reinjector.as_ref().map(|r| {
+                crate::preset::SkillReinjectSpec {
+                    token_budget: r.token_budget,
+                    per_skill_budget: r.per_skill_budget,
+                }
+            }),
+        }
     }
 
     /// Issue #31: session-bound environment teardown. Drains the session's

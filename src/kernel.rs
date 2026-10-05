@@ -521,6 +521,12 @@ impl AgentKernelBuilder {
         self.max_transcript_chars
     }
 
+    /// The transcript cap this builder carries (default unlimited). Read by
+    /// `AgentRuntimeBuilder::context_management_facts` (issue #127).
+    pub(crate) fn max_transcript_chars_cap(&self) -> Option<usize> {
+        self.max_transcript_chars
+    }
+
     /// Set the compactor for summarising old messages.
     pub fn compactor(mut self, compactor: Compactor) -> Self {
         self.compactor = Some(compactor);

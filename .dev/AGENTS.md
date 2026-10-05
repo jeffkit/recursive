@@ -39,6 +39,12 @@ src/
                     protects.
   runtime.rs        stateful wrapper (AgentRuntime) — transcript, checkpoints,
                     goal state, message queue, cross-turn compaction
+  preset.rs         agent presets (issue #127) — the declarative session
+                    composition (prompt / tool / context / re-injection) and
+                    `preset::apply`, the SINGLE assembly point every frontend
+                    (HTTP / CLI / TUI) goes through. Adding a preset is one
+                    declaration; never re-add per-channel assembly branches —
+                    that is exactly how the three builders drifted apart.
   runtime_goal.rs   GoalState / GoalStatus / GoalEvaluator (auto-loop judge)
   coordinator.rs    coordinator-mode orchestrator (multi-agent dispatch)
   multi.rs          multi-agent pool, shared memory, message bus

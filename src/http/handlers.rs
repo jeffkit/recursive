@@ -22,7 +22,7 @@ use crate::tools::ToolRegistry;
 
 use super::{
     build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, CreateSessionRequest,
-    CreateSessionResponse, ErrorResponse, ListSessionsQuery, RunRequest, RunResponse,
+    CreateSessionResponse, ErrorResponse, ListSessionsQuery, PresetInfo, RunRequest, RunResponse,
     SessionDetailResponse, SessionInfo, SessionMessageRequest, SessionMessageResponse,
     SessionState, SetGoalRequest, SlashCommandInfo, SseContentBlock, SseEvent, ToolInfo, UsageInfo,
 };
@@ -78,17 +78,23 @@ pub(super) fn inject_environment_segment(
     (full, segments)
 }
 
-/// Goal-393: the one place where HTTP session runtimes get built. Every
-/// build point (`POST /run`, `POST /sessions`, session fork) goes
-/// through here so the channels cannot drift apart — the compactor /
-/// microcompactor / transcript-cap assembly comes from the same
-/// frontend-neutral helper the CLI uses (`apply_context_management`).
+/// Goal-393 / issue #127: the one place where HTTP session runtimes get
+/// built. Every build point (`POST /run`, `POST /sessions`, session fork)
+/// goes through here so the channels cannot drift apart — the compactor /
+/// microcompactor / transcript cap / post-compaction re-injection assembly
+/// comes from the same frontend-neutral preset the CLI and TUI use
+/// ([`crate::preset::apply`]).
 ///
-/// `/agui` builds through [`build_session_runtime_parts`] (same context
-/// management); the provider / wall-timeout / storage / streaming setters
-/// are layered on in `super::agui::build_agui_runtime` — fed from
-/// `AppState` here, so every channel stays on the same budget. Its runtime
-/// assembly lives in `super::agui`, away from the axum types.
+/// `/agui` builds through [`build_session_runtime_parts`] (same preset
+/// assembly); the provider / wall-timeout / storage / streaming setters are
+/// layered on in `super::agui::build_agui_runtime` — fed from `AppState`
+/// here, so every channel stays on the same budget. Its runtime assembly
+/// lives in `super::agui`, away from the axum types.
+///
+/// The caller resolves the session's preset with
+/// [`resolve_session_preset`] and passes it in, so a request-scoped preset
+/// (`POST /sessions`'s `preset` field) is applied exactly once, and an
+/// unknown id fails the request instead of silently falling back.
 ///
 /// Callers add what is genuinely request-specific on top of the returned
 /// builder (`seed_transcript` for `/agui` resume, then `build()`).
@@ -101,74 +107,89 @@ pub(super) fn build_session_runtime(
     system_prompt: String,
     prompt_segments: crate::system_prompt::PromptSegments,
     max_steps: usize,
+    preset: &crate::preset::ResolvedPreset,
 ) -> AgentRuntimeBuilder {
-    crate::runtime::apply_context_management(
-        build_session_runtime_parts(
-            tool_registry,
-            system_prompt,
-            prompt_segments,
-            max_steps,
-            &state.config.model,
-        )
-        // #74 拆单 3/3: the merged skill catalog (directory + service-level
-        // SkillSource entries) rides into the kernel, which ships it as the
-        // per-turn `<system-reminder>` — without this the catalog is
-        // computed at startup but never reaches any run's context.
-        .skills(state.skills.clone())
-        .llm(state.provider.clone())
-        // Goal 399: safe wall-clock budget for HTTP sessions
-        // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
-        // into state.config at server startup). Exceeding it finishes
-        // with WallClockExceeded.
-        .wall_timeout_secs(state.config.wall_timeout_secs)
-        // Goal 396: the host layer persists this session's transcript
-        // through the same storage backend on teardown (DELETE / idle
-        // eviction / graceful shutdown) — not per turn.
-        .storage(state.storage.clone())
-        // Issue #66 §3.2: token-level streaming for every HTTP entry
-        // point (/sessions, /runs, /agui). RunCore only builds the
-        // partial-token forwarder when `streaming` is set, so before
-        // this an AG-UI answer arrived as ONE TextMessageContent frame
-        // and `/sessions/:id/events` never emitted `partial_message`.
-        // Consumers are ready: the AguiConverter frames PartialToken
-        // deltas into TextMessageStart/Content/End, and both SDKs treat
-        // `partial_message`/`stream_event` as fire-hose-only — their
-        // final result still aggregates from the complete `message`
-        // events.
-        .streaming(true),
-        &state.config,
+    let skills = state.skills.clone();
+    build_session_runtime_parts(
+        tool_registry,
+        crate::preset::apply_prompt(system_prompt, preset),
+        prompt_segments,
+        max_steps,
+        preset,
+        skills.clone(),
+        HTTP_CHANNEL,
     )
+    // #74 拆单 3/3: the merged skill catalog (directory + service-level
+    // SkillSource entries) rides into the kernel, which ships it as the
+    // per-turn `<system-reminder>` — without this the catalog is
+    // computed at startup but never reaches any run's context.
+    .skills(skills)
+    .llm(state.provider.clone())
+    // Goal 399: safe wall-clock budget for HTTP sessions
+    // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
+    // into state.config at server startup). Exceeding it finishes
+    // with WallClockExceeded.
+    .wall_timeout_secs(state.config.wall_timeout_secs)
+    // Goal 396: the host layer persists this session's transcript
+    // through the same storage backend on teardown (DELETE / idle
+    // eviction / graceful shutdown) — not per turn.
+    .storage(state.storage.clone())
+    // Issue #66 §3.2: token-level streaming for every HTTP entry
+    // point (/sessions, /runs, /agui). RunCore only builds the
+    // partial-token forwarder when `streaming` is set, so before
+    // this an AG-UI answer arrived as ONE TextMessageContent frame
+    // and `/sessions/:id/events` never emitted `partial_message`.
+    // Consumers are ready: the AguiConverter frames PartialToken
+    // deltas into TextMessageStart/Content/End, and both SDKs treat
+    // `partial_message`/`stream_event` as fire-hose-only — their
+    // final result still aggregates from the complete `message`
+    // events.
+    .streaming(true)
 }
 
-/// Provider-agnostic core of [`build_session_runtime`]: context management
-/// only. The AG-UI layer (`super::agui::build_agui_runtime`) layers the
-/// provider and wall-clock budget on top, keeping its runtime build free of
-/// `AppState`.
+/// What an HTTP session can host (issue #127): the plan-mode tools block on a
+/// live human answering `confirm_plan()`, and an HTTP session is polled
+/// asynchronously — so the preset's plan tools stay unregistered here, exactly
+/// as before presets existed. Change this to `interactive: true` only together
+/// with a real plan-approval flow, not to satisfy a preset declaration.
+pub(super) const HTTP_CHANNEL: crate::preset::ChannelSupport =
+    crate::preset::ChannelSupport { interactive: false };
+
+/// Resolve the preset a request (or a restored session) runs with, mapping an
+/// unknown id to a 400 instead of silently falling back to `standard`
+/// (issue #127).
+pub(super) fn resolve_session_preset(
+    explicit: Option<&str>,
+    config: &crate::config::Config,
+) -> Result<crate::preset::ResolvedPreset, ApiError> {
+    crate::preset::resolve_session(explicit, config, &crate::preset::PresetEnv::from_process())
+        .map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+/// Provider-agnostic core of [`build_session_runtime`]: the preset assembly
+/// (context management + post-compaction re-injection + tool flags) on top of
+/// an empty builder. The AG-UI layer (`super::agui::build_agui_runtime`)
+/// layers the provider and wall-clock budget on top, keeping its runtime
+/// build free of `AppState`.
 pub(super) fn build_session_runtime_parts(
     tool_registry: ToolRegistry,
     system_prompt: String,
     prompt_segments: crate::system_prompt::PromptSegments,
     max_steps: usize,
-    model: &str,
+    preset: &crate::preset::ResolvedPreset,
+    skills: Vec<crate::skills::Skill>,
+    channel: crate::preset::ChannelSupport,
 ) -> AgentRuntimeBuilder {
-    // `apply_context_management` only reads `config.model` (auto compaction
-    // thresholds); a minimal stub carrying exactly that model keeps the
-    // AG-UI build path independent of `AppState` while producing thresholds
-    // identical to `/run` and `/sessions` — they all pass the SAME model
-    // (`state.config.model`) in, so the channels cannot drift apart.
-    let config = crate::config::Config {
-        workspace: std::path::PathBuf::from("."),
-        model: model.to_string(),
-        ..crate::http::test_config_stub()
-    };
-    crate::runtime::apply_context_management(
-        AgentRuntimeBuilder::new()
-            .tools(tool_registry)
-            .system_prompt(system_prompt)
-            .prompt_segments(prompt_segments)
-            .max_steps(max_steps),
-        &config,
-    )
+    // The assets (shared read state, skill catalog) come from the registry
+    // BEFORE it moves into the builder, so post-compaction re-injection has
+    // something to re-inject on every channel — not just the CLI (issue #127).
+    let assets = crate::preset::assets_from_registry(&tool_registry, skills);
+    let builder = AgentRuntimeBuilder::new()
+        .tools(tool_registry)
+        .system_prompt(system_prompt)
+        .prompt_segments(prompt_segments)
+        .max_steps(max_steps);
+    crate::preset::apply(builder, preset, &assets, channel)
 }
 
 /// Update metrics after a successful agent run.
@@ -247,6 +268,26 @@ pub(super) async fn list_tools(State(state): State<Arc<AppState>>) -> Json<Vec<T
     Json(state.tools.clone())
 }
 
+/// GET /presets — the built-in agent presets, each with its capability
+/// inventory and the context management it currently resolves to (issue #127).
+///
+/// Read-only and cheap: the resolution is pure, so this is also the honest
+/// answer to "what would a session created right now actually run with?".
+pub(super) async fn list_presets(State(state): State<Arc<AppState>>) -> Json<Vec<PresetInfo>> {
+    let env = crate::preset::PresetEnv::from_process();
+    Json(
+        crate::preset::builtin()
+            .iter()
+            .map(|p| PresetInfo {
+                id: p.id.to_string(),
+                description: p.description.to_string(),
+                capabilities: p.capabilities.to_vec(),
+                resolved: p.resolve(&state.config, &env),
+            })
+            .collect(),
+    )
+}
+
 pub(super) async fn run_agent(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RunRequest>,
@@ -302,12 +343,14 @@ pub(super) async fn run_agent(
         });
     }
 
+    let preset = resolve_session_preset(None, &state.config)?;
     let mut runtime = build_session_runtime(
         &state,
         tool_registry,
         system_prompt,
         prompt_segments,
         max_steps,
+        &preset,
     )
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
@@ -467,12 +510,17 @@ pub(super) async fn create_session(
         });
     }
 
+    // Issue #127: the session's agent preset — an explicit request id wins,
+    // else `RECURSIVE_AGENT_PRESET`, else `standard`. An unknown id is a 400,
+    // never a silent fallback.
+    let preset = resolve_session_preset(body.preset.as_deref(), &state.config)?;
     let mut runtime = build_session_runtime(
         &state,
         tool_registry,
         system_prompt,
         prompt_segments,
         max_steps,
+        &preset,
     )
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
@@ -488,6 +536,11 @@ pub(super) async fn create_session(
     // session keeps its custom persona / permission mode / title / step cap
     // instead of silently reverting to the server defaults. Best-effort:
     // a storage failure must not fail session creation.
+    //
+    // Issue #127: the preset is persisted even when it is the default. Unlike
+    // the persona (a default session should track the server default), a preset
+    // *is* the session's runtime wiring — restoring one with a different preset
+    // would silently change its tools and context management mid-life.
     super::cold_load::persist_session_meta(
         &state,
         &id,
@@ -496,6 +549,7 @@ pub(super) async fn create_session(
             permission_mode: body.permission_mode.clone(),
             title: body.session_name.clone(),
             max_steps: body.max_steps.map(|n| n as usize),
+            preset: Some(preset.id.clone()),
         },
     )
     .await;
@@ -622,7 +676,7 @@ pub(super) async fn get_session(
     };
 
     // Try a non-blocking lock for messages/todos/goal; fall back to empty when busy.
-    let (messages, todos, goal, permission_mode) = match session.runtime.try_lock() {
+    let (messages, todos, goal, permission_mode, preset) = match session.runtime.try_lock() {
         Ok(runtime) => {
             let msgs = runtime
                 .transcript()
@@ -635,9 +689,18 @@ pub(super) async fn get_session(
             // a restored session reports what it actually runs with.
             let permission_mode =
                 permission_mode_label(&runtime.kernel().tools().permission_mode());
-            (msgs, todos, goal, Some(permission_mode))
+            // Issue #127: same principle for the preset — the runtime knows
+            // what it was assembled from, so a restored session reports the
+            // preset it was rebuilt with, not the server's current default.
+            (
+                msgs,
+                todos,
+                goal,
+                Some(permission_mode),
+                runtime.preset_id().map(str::to_string),
+            )
         }
-        Err(_) => (vec![], vec![], None, None),
+        Err(_) => (vec![], vec![], None, None, None),
     };
 
     // Extract first/last user prompt for display without a separate lock.
@@ -675,6 +738,7 @@ pub(super) async fn get_session(
         prompt_tokens,
         completion_tokens,
         permission_mode,
+        preset,
     }))
 }
 
@@ -822,7 +886,7 @@ pub(super) async fn fork_session(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<ForkSessionResponse>), ApiError> {
     // Snapshot the source transcript while holding the write lock.
-    let transcript_snapshot = {
+    let (transcript_snapshot, source_preset) = {
         let sessions_lock = state.host.sessions();
         let sessions = sessions_lock.read().await;
         let src = sessions
@@ -832,7 +896,13 @@ pub(super) async fn fork_session(
             .runtime
             .try_lock()
             .map_err(|_| ApiError::conflict("session is busy"))?;
-        rt.transcript().to_vec()
+        (
+            rt.transcript().to_vec(),
+            // Issue #127: a fork inherits the source's preset, not the server
+            // default — otherwise the same transcript continues under
+            // different tools and context management.
+            rt.preset_id().map(str::to_string),
+        )
     };
 
     // Build a new session with the copied transcript.
@@ -857,12 +927,14 @@ pub(super) async fn fork_session(
     let (system_prompt, prompt_segments) =
         inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
 
+    let preset = resolve_session_preset(source_preset.as_deref(), &state.config)?;
     let mut runtime = build_session_runtime(
         &state,
         tool_registry,
         system_prompt,
         prompt_segments,
         state.config.max_steps,
+        &preset,
     )
     .build()
     .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
@@ -1706,6 +1778,24 @@ pub(super) async fn agui_run(
         &tool_registry,
     );
 
+    // Issue #127: the AG-UI channel runs under the server-default preset —
+    // the same object the REST channels resolve, so thresholds and
+    // re-injection cannot drift between channels.
+    let preset = crate::preset::resolve_session(
+        None,
+        &state.config,
+        &crate::preset::PresetEnv::from_process(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
     let (runtime, hooks) = super::agui::build_agui_runtime(
         &state.config.workspace,
         &input.thread_id,
@@ -1718,7 +1808,7 @@ pub(super) async fn agui_run(
             seed_transcript: prepared.seed_transcript,
             interrupt_before: input.interrupt_before.as_deref().unwrap_or(&[]),
             client_tools: &input.tools,
-            model: state.config.model.clone(),
+            preset,
             wall_timeout_secs: state.config.wall_timeout_secs,
             storage: state.storage.clone(),
             skills: state.skills.clone(),
@@ -2057,12 +2147,14 @@ mod tests {
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
+        let preset = resolve_session_preset(None, &state.config).expect("preset");
         let builder = build_session_runtime(
             &state,
             ToolRegistry::default(),
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
+            &preset,
         );
         let compactor = builder.compactor_for_test().expect("compactor installed");
         assert_eq!(compactor.threshold_chars, 7777);
@@ -2119,12 +2211,14 @@ mod tests {
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
+        let preset = resolve_session_preset(None, &state.config).expect("preset");
         let builder = build_session_runtime(
             &state,
             ToolRegistry::default(),
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
+            &preset,
         );
         let skills = builder.skills_for_test();
         assert_eq!(skills.len(), 1, "catalog must ride into the runtime");
@@ -2133,6 +2227,176 @@ mod tests {
             skills[0].body.is_some(),
             "service-level skills stay content-backed (never on disk)"
         );
+    }
+
+    // ── Issue #127: agent preset observability ───────────────────────────
+
+    /// Build the `AppState` the preset tests need: a standard tool registry
+    /// (so the session has a shared read state for re-injection) and a
+    /// temp-dir storage backend.
+    fn preset_test_state(root: &std::path::Path) -> crate::http::AppState {
+        crate::http::AppState {
+            tools: vec![],
+            tool_registry: crate::tools::build_standard_tools(root, &[], 60),
+            config: crate::config::Config::from_env().expect("config"),
+            provider: Arc::new(crate::llm::MockProvider::new(vec![])),
+            host: Arc::new(crate::session_host::SessionHost::new(
+                Duration::from_secs(0),
+                crate::http::AdmissionGate::new(
+                    1,
+                    Duration::ZERO,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                root.join("storage"),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Acceptance 1 (HTTP half): a `standard`-preset session is assembled
+    /// exactly as the preset declares — context management AND post-compaction
+    /// re-injection. The CLI and TUI crates assert the same reference in their
+    /// own tests, so either channel drifting fails a test.
+    ///
+    /// Before #127 the HTTP channel wired NO re-injectors at all (only the CLI
+    /// did), so this also pins the drift that motivated the issue.
+    #[test]
+    fn http_assembly_matches_the_resolved_standard_preset() {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::remove_var("RECURSIVE_AGENT_PRESET");
+        for var in [
+            "RECURSIVE_COMPACT_THRESHOLD",
+            "RECURSIVE_MAX_TRANSCRIPT_CHARS",
+            "RECURSIVE_MICROCOMPACT_TRIGGER",
+            "RECURSIVE_REINJECT_FILES",
+            "RECURSIVE_REINJECT_SKILLS",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = preset_test_state(tmp.path());
+        let preset = resolve_session_preset(Some("standard"), &state.config).expect("preset");
+
+        let builder = build_session_runtime(
+            &state,
+            crate::tools::build_standard_tools(tmp.path(), &[], 60),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+            &preset,
+        );
+
+        assert_eq!(builder.preset_id(), Some("standard"));
+        assert_eq!(
+            builder.context_management_facts(),
+            preset.context,
+            "the assembled runtime must be exactly what the preset resolved to"
+        );
+        assert!(
+            builder
+                .context_management_facts()
+                .reinject_recent_files
+                .is_some(),
+            "the HTTP channel must now re-inject recently-read files like the CLI"
+        );
+        assert!(
+            !builder.with_plan_mode_tools_for_test(),
+            "an HTTP session has no live human for the plan-approval prompt"
+        );
+    }
+
+    /// Acceptance 2: `POST /sessions`'s `preset` is persisted (the #98 path, so
+    /// a restart restores it) and echoed by `GET /sessions/:id`. An unknown id
+    /// is a 400 with the known ids — never a silent fallback.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the std env lock only guards same-crate tests
+    async fn session_preset_is_persisted_and_echoed() {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::remove_var("RECURSIVE_AGENT_PRESET");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(preset_test_state(tmp.path()));
+        let body = |preset: Option<&str>| CreateSessionRequest {
+            system_prompt: None,
+            append_system_prompt: None,
+            session_name: None,
+            max_steps: None,
+            thinking_budget: None,
+            permission_mode: None,
+            max_budget_usd: None,
+            preset: preset.map(str::to_string),
+        };
+
+        let (status, Json(created)) =
+            create_session(State(state.clone()), Json(body(Some("standard"))))
+                .await
+                .expect("session created");
+        assert_eq!(status, StatusCode::CREATED);
+
+        // GET echoes the effective preset, read off the live runtime.
+        let Json(detail) = get_session(State(state.clone()), Path(created.id.clone()))
+            .await
+            .expect("session detail");
+        assert_eq!(detail.preset.as_deref(), Some("standard"));
+
+        // ...and it is in the #98 metadata blob, so a restart restores it.
+        let meta = state
+            .storage
+            .load_memory(&crate::http::cold_load::session_meta_key(&created.id))
+            .await
+            .expect("storage read")
+            .expect("metadata persisted");
+        assert!(
+            meta.contains("\"preset\":\"standard\""),
+            "preset must ride the #98 metadata path, got: {meta}"
+        );
+
+        // An unknown id is rejected with the list of what does exist.
+        let err = create_session(State(state.clone()), Json(body(Some("no-such-preset"))))
+            .await
+            .expect_err("unknown preset must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("standard"),
+            "the 400 must name the known presets: {}",
+            err.message
+        );
+    }
+
+    /// `GET /presets` exposes the capability inventory — including the
+    /// capabilities that exist but default to off, which is the whole point of
+    /// listing them (issue #127, item 4).
+    #[tokio::test]
+    async fn list_presets_exposes_the_capability_inventory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(preset_test_state(tmp.path()));
+        let Json(presets) = list_presets(State(state)).await;
+        assert_eq!(presets.len(), crate::preset::builtin().len());
+        let standard = presets
+            .iter()
+            .find(|p| p.id == "standard")
+            .expect("standard is built in");
+        assert!(
+            standard.capabilities.iter().any(|c| {
+                c.name == "proactive-tool-result-pruning"
+                    && c.default == crate::preset::CapabilityDefault::Disabled
+            }),
+            "a disabled-by-default capability must be discoverable here"
+        );
+        assert_eq!(standard.resolved.id, "standard");
     }
 
     // ── SDK Phase B: tool_progress forwarder ─────────────────────────────

@@ -59,6 +59,10 @@ pub struct AgentRuntimeBuilder {
     /// Issue #99: session directory that pending wakeups are persisted into
     /// (and cleared from). `None` keeps loop/wakeup state in memory only.
     wakeup_store_dir: Option<std::path::PathBuf>,
+    /// Issue #127: the agent preset this session was assembled from. Carried
+    /// into the runtime so `GET /sessions/:id` can report the effective preset
+    /// without re-deriving it.
+    preset_id: Option<String>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -75,6 +79,7 @@ impl std::fmt::Debug for AgentRuntimeBuilder {
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .field("file_reinjector", &self.file_reinjector.is_some())
             .field("skill_reinjector", &self.skill_reinjector.is_some())
+            .field("preset_id", &self.preset_id)
             .finish()
     }
 }
@@ -104,6 +109,7 @@ impl AgentRuntimeBuilder {
             skill_reinjector: None,
             loop_retry: crate::runtime::LoopRetryPolicy::default(),
             wakeup_store_dir: None,
+            preset_id: None,
         }
     }
 
@@ -235,6 +241,60 @@ impl AgentRuntimeBuilder {
     #[cfg(test)]
     pub(crate) fn skills_for_test(&self) -> &[crate::skills::Skill] {
         &self.skills
+    }
+
+    /// Inspect whether a builder chain asked for the plan-mode tools
+    /// (tests only). The registry mutation itself happens in `build()`.
+    #[cfg(test)]
+    pub(crate) fn with_plan_mode_tools_for_test(&self) -> bool {
+        self.with_plan_mode_tools
+    }
+
+    /// Issue #127: stamp the agent preset this session is assembled from.
+    pub fn with_preset_id(mut self, id: String) -> Self {
+        self.preset_id = Some(id);
+        self
+    }
+
+    /// The agent preset id this builder carries, if any.
+    pub fn preset_id(&self) -> Option<&str> {
+        self.preset_id.as_deref()
+    }
+
+    /// Issue #127: the context management this builder chain installed, as
+    /// plain data. Lets a frontend (or a test) compare what it assembled
+    /// against the resolved preset without reaching into the runtime.
+    pub fn context_management_facts(&self) -> crate::preset::ContextFacts {
+        crate::preset::ContextFacts {
+            compaction: self
+                .compactor
+                .as_ref()
+                .map(|c| crate::preset::CompactionFacts {
+                    threshold_chars: c.threshold_chars,
+                    threshold_prompt_tokens: c.threshold_prompt_tokens,
+                    keep_recent_n: c.keep_recent_n,
+                }),
+            microcompaction: self.microcompactor.as_ref().map(|mc| {
+                crate::preset::MicrocompactionSpec {
+                    trigger_tool_count: mc.trigger_tool_count,
+                    keep_recent: mc.keep_recent,
+                }
+            }),
+            max_transcript_chars: self.kernel_builder.max_transcript_chars_cap(),
+            reinject_recent_files: self.file_reinjector.as_ref().map(|r| {
+                crate::preset::FileReinjectSpec {
+                    max_files: r.max_files,
+                    token_budget: r.token_budget,
+                    per_file_budget: r.per_file_budget,
+                }
+            }),
+            reinject_invoked_skills: self.skill_reinjector.as_ref().map(|r| {
+                crate::preset::SkillReinjectSpec {
+                    token_budget: r.token_budget,
+                    per_skill_budget: r.per_skill_budget,
+                }
+            }),
+        }
     }
 
     /// Goal 396: inject a storage backend, forwarded to the kernel builder
@@ -464,6 +524,7 @@ impl AgentRuntimeBuilder {
             permission_hook: None,
             loop_retry: self.loop_retry,
             wakeup_store_dir: self.wakeup_store_dir,
+            preset_id: self.preset_id,
         })
     }
 }

@@ -50,6 +50,7 @@ pub mod multi;
 pub mod notify;
 pub mod paths;
 pub mod permissions;
+pub mod preset;
 pub mod providers;
 pub mod providers_cache;
 pub mod rewind;

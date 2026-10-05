@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::message::Message;
+use crate::preset::{FileReinjectSpec, SkillReinjectSpec};
 use crate::tools::fs::ReadFileState;
 use crate::tools::plan_mode::PlanApprovalGate;
 use crate::tools::todo::{TodoItem, TodoStatus};
@@ -139,25 +140,41 @@ fn path_appears_in_preserved(path: &Path, preserved: &[Message]) -> bool {
 pub fn build_file_reinjector_from_env(
     read_state: Arc<Mutex<ReadFileState>>,
 ) -> Option<FileReinjector> {
-    let raw = std::env::var("RECURSIVE_REINJECT_FILES").ok();
-    let max_files: Option<usize> = match raw.as_deref() {
+    let files_raw = std::env::var("RECURSIVE_REINJECT_FILES").ok();
+    let budget_raw = std::env::var("RECURSIVE_REINJECT_FILE_BUDGET").ok();
+    let spec = file_reinjector_spec_from_env(files_raw.as_deref(), budget_raw.as_deref())?;
+    Some(FileReinjector {
+        max_files: spec.max_files,
+        token_budget: spec.token_budget,
+        per_file_budget: spec.per_file_budget,
+        read_state,
+    })
+}
+
+/// Pure core of [`build_file_reinjector_from_env`]: the same tolerance rules
+/// with the environment passed in, so an agent preset can resolve the file
+/// re-injection an env value asks for (issue #127) without a process-global
+/// read.
+pub fn file_reinjector_spec_from_env(
+    files_raw: Option<&str>,
+    budget_raw: Option<&str>,
+) -> Option<FileReinjectSpec> {
+    let max_files: Option<usize> = match files_raw {
         Some("0") | Some("off") | Some("false") => None,
         Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
         None => Some(5), // Default.
     };
     let max_files = max_files?; // None = disabled.
 
-    let budget_raw = std::env::var("RECURSIVE_REINJECT_FILE_BUDGET").ok();
-    let token_budget: usize = match budget_raw.as_deref() {
+    let token_budget: usize = match budget_raw {
         Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(50_000),
         None => 50_000,
     };
 
-    Some(FileReinjector {
+    Some(FileReinjectSpec {
         max_files,
         token_budget,
         per_file_budget: 5_000,
-        read_state,
     })
 }
 
@@ -327,31 +344,39 @@ impl SkillReinjector {
 pub fn build_skill_reinjector_from_env(
     skills: Vec<crate::skills::Skill>,
 ) -> Option<SkillReinjector> {
-    let raw = std::env::var("RECURSIVE_REINJECT_SKILLS").ok();
-    match raw.as_deref() {
+    let skills_raw = std::env::var("RECURSIVE_REINJECT_SKILLS").ok();
+    let budget_raw = std::env::var("RECURSIVE_REINJECT_SKILL_BUDGET").ok();
+    let spec = skill_reinjector_spec_from_env(skills_raw.as_deref(), budget_raw.as_deref())?;
+    Some(SkillReinjector {
+        token_budget: spec.token_budget,
+        per_skill_budget: spec.per_skill_budget,
+        skills,
+    })
+}
+
+/// Pure core of [`build_skill_reinjector_from_env`]: the same tolerance rules
+/// with the environment passed in, so an agent preset can resolve the skill
+/// re-injection an env value asks for (issue #127).
+pub fn skill_reinjector_spec_from_env(
+    skills_raw: Option<&str>,
+    budget_raw: Option<&str>,
+) -> Option<SkillReinjectSpec> {
+    match skills_raw {
         Some("0") | Some("off") | Some("false") => return None,
         _ => {}
     }
 
-    let token_budget: usize = match raw.as_deref() {
+    let token_budget: usize = match skills_raw {
         Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(25_000),
-        None => {
-            let budget_raw = std::env::var("RECURSIVE_REINJECT_SKILL_BUDGET").ok();
-            match budget_raw.as_deref() {
-                Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(25_000),
-                None => 25_000,
-            }
-        }
+        None => match budget_raw {
+            Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(25_000),
+            None => 25_000,
+        },
     };
 
-    if token_budget == 0 {
-        return None;
-    }
-
-    Some(SkillReinjector {
+    Some(SkillReinjectSpec {
         token_budget,
         per_skill_budget: 5_000,
-        skills,
     })
 }
 

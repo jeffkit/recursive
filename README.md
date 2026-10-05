@@ -367,6 +367,9 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_COMPACT_THRESHOLD` | auto (from model context window) | Cross-turn compaction char threshold (`0`/`off`/`false` = disable). Goal 393: effective for HTTP sessions too, same semantics as the CLI |
 | `RECURSIVE_MICROCOMPACT_TRIGGER` / `RECURSIVE_MICROCOMPACT_KEEP` | _(disabled)_ / `4` | Opt-in proactive tool-result pruning after N tool messages, keeping the most recent K (`0` = off). Goal 393: effective for HTTP sessions too |
 | `RECURSIVE_MAX_TRANSCRIPT_CHARS` | _(unlimited)_ | Hard transcript char cap per session (Goal 393: honored by HTTP session runtimes; the CLI also takes `--max-transcript-chars`) |
+| `RECURSIVE_REINJECT_FILES` / `RECURSIVE_REINJECT_FILE_BUDGET` | `5` / `50000` | Post-compaction re-injection of recently-read files (`0`/`off`/`false` = off). Issue #127: the CLI/TUI contract now applies to HTTP, AG-UI and trigger runs too |
+| `RECURSIVE_REINJECT_SKILLS` / `RECURSIVE_REINJECT_SKILL_BUDGET` | _(enabled)_ / `25000` | Post-compaction re-injection of invoked skills (`0`/`off`/`false` = off, a positive integer = token budget) |
+| `RECURSIVE_AGENT_PRESET` | `standard` | Session preset (issue #127) selecting the whole assembly — prompt profile, tool profile, context management, re-injection. `GET /presets` lists the built-in presets with their capability inventory (including what is off by default); `POST /sessions` takes a per-session `preset` which `GET /sessions/:id` echoes. The variables above override the preset's declaration |
 
 #### Cloud storage — Redis (session hot-state)
 

@@ -567,12 +567,22 @@ async fn one_shot_run(state: &Arc<AppState>, goal: &str) -> (String, Option<Stri
         assembled.segments,
         &tool_registry,
     );
+    // Issue #127: same preset assembly as every other channel. A trigger run
+    // has no client to report a 400 to, so an unknown `RECURSIVE_AGENT_PRESET`
+    // (a server misconfiguration) falls back to the built-in standard preset.
+    let preset =
+        super::handlers::resolve_session_preset(None, &state.config).unwrap_or_else(|_| {
+            crate::preset::STANDARD
+                .resolve(&state.config, &crate::preset::PresetEnv::from_process())
+        });
     let mut runtime = match super::handlers::build_session_runtime_parts(
         tool_registry,
         system_prompt,
         prompt_segments,
         state.config.max_steps,
-        &state.config.model,
+        &preset,
+        state.skills.clone(),
+        super::handlers::HTTP_CHANNEL,
     )
     .llm(state.provider.clone())
     .wall_timeout_secs(state.config.wall_timeout_secs)

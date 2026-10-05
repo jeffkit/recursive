@@ -99,6 +99,14 @@ pub(super) struct SessionMeta {
     /// Explicit per-session step cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
+    /// Issue #127: the agent preset the session was assembled from. Unlike the
+    /// other fields this one is persisted even when the session took the
+    /// server default — a preset IS the session's runtime wiring (tools,
+    /// compaction, re-injection), so restoring it with a different one would
+    /// silently rewire a live session. A blob without the field (older build)
+    /// restores with the server default, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 /// Storage key for the per-session metadata blob (issue #98).
@@ -307,13 +315,24 @@ async fn build_restored_runtime(
     let max_steps = meta
         .and_then(|m| m.max_steps)
         .unwrap_or(state.config.max_steps);
-    let mut runtime =
-        super::handlers::build_session_runtime(state, tool_registry, full, segments, max_steps)
-            .seed_transcript(seed)
-            .build()
-            .map_err(|e| {
-                ApiError::internal(format!("failed to build restored session runtime: {e}"))
-            })?;
+    // Issue #127: restore the preset the session was created with; a session
+    // persisted before presets existed (or with the field absent) falls back
+    // to the server default.
+    let preset = super::handlers::resolve_session_preset(
+        meta.and_then(|m| m.preset.as_deref()),
+        &state.config,
+    )?;
+    let mut runtime = super::handlers::build_session_runtime(
+        state,
+        tool_registry,
+        full,
+        segments,
+        max_steps,
+        &preset,
+    )
+    .seed_transcript(seed)
+    .build()
+    .map_err(|e| ApiError::internal(format!("failed to build restored session runtime: {e}")))?;
     runtime.set_session_id(id);
     Ok(runtime)
 }
@@ -608,6 +627,7 @@ mod tests {
             permission_mode: Some("auto".into()),
             title: Some("ship it".into()),
             max_steps: Some(7),
+            preset: Some("standard".into()),
         };
         persist_session_meta(&state, "s1", &meta).await;
         let loaded = load_session_meta(&state, "s1")
@@ -617,6 +637,11 @@ mod tests {
         assert_eq!(loaded.permission_mode.as_deref(), Some("auto"));
         assert_eq!(loaded.title.as_deref(), Some("ship it"));
         assert_eq!(loaded.max_steps, Some(7));
+        assert_eq!(
+            loaded.preset.as_deref(),
+            Some("standard"),
+            "issue #127: the session's preset rides the #98 metadata path"
+        );
     }
 
     #[tokio::test]
@@ -631,6 +656,7 @@ mod tests {
                 permission_mode: None,
                 title: None,
                 max_steps: Some(9),
+                preset: None,
             },
         )
         .await;
@@ -660,7 +686,7 @@ mod tests {
         std::env::remove_var("RECURSIVE_MAX_TRANSCRIPT_CHARS");
 
         let dir = tempfile::tempdir().unwrap();
-        let state = test_state(
+        let mut state = test_state(
             dir.path().to_path_buf(),
             vec![Completion {
                 content: "earlier conversation summary".into(),
@@ -670,6 +696,11 @@ mod tests {
                 reasoning_content: None,
             }],
         );
+        // A real tool surface carries the shared read state the preset's file
+        // re-injector needs (issue #127); the bare fixture registry has none.
+        Arc::get_mut(&mut state)
+            .expect("freshly built state is uniquely owned")
+            .tool_registry = crate::tools::build_standard_tools(dir.path(), &[], 60);
         let mut long = Vec::new();
         for i in 0..6 {
             long.push(user(&format!("q{i}")));
@@ -684,6 +715,7 @@ mod tests {
                 permission_mode: Some("auto".into()),
                 title: Some("pirate chat".into()),
                 max_steps: Some(7),
+                preset: Some("standard".into()),
             },
         )
         .await;
@@ -717,6 +749,20 @@ mod tests {
             rt.has_compactor(),
             "a restored session must keep context management (issue #98)"
         );
+        // Issue #127: the session's preset survives the restart and is what
+        // the runtime reports — and a restored runtime gets the preset's full
+        // context half, post-compaction re-injection included.
+        assert_eq!(
+            rt.preset_id(),
+            Some("standard"),
+            "the persisted preset must drive the restore"
+        );
+        assert!(
+            rt.context_management_facts()
+                .reinject_recent_files
+                .is_some(),
+            "a restored session must re-inject recently-read files after compaction"
+        );
         // And it actually fires on the long restored transcript.
         rt.compact_now().await.expect("compaction runs");
         assert!(
@@ -745,6 +791,7 @@ mod tests {
                 permission_mode: Some("bypass".into()),
                 title: None,
                 max_steps: None,
+                preset: None,
             },
         )
         .await;

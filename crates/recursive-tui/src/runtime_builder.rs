@@ -224,49 +224,41 @@ fn discover_loaded_skills(config: &Config) -> Vec<Skill> {
     discover_skills(&paths)
 }
 
-/// Build the transcript compactor for TUI mode, mirroring the CLI's
-/// `RECURSIVE_COMPACT_THRESHOLD` env contract so headless and interactive
-/// runs compact at the same point:
-///   `RECURSIVE_COMPACT_THRESHOLD=<n>` → explicit char threshold
-///   `0` / `off` / `false`             → explicitly disabled
-///   unset                             → auto-compute from the model's context window
-/// Returns `None` when compaction is disabled; the runtime then runs without a
-/// compactor (transcript grows unbounded, but manual `/compact` still works).
-fn build_compactor(model: &str) -> Option<recursive::Compactor> {
-    build_compactor_from_env(
-        std::env::var("RECURSIVE_COMPACT_THRESHOLD").ok().as_deref(),
-        model,
-    )
+/// Resolve the agent preset a TUI session runs under (issue #127).
+///
+/// `RECURSIVE_AGENT_PRESET` selects it; `standard` is the default. An unknown
+/// id is a server-/user-side misconfiguration, not a reason to leave the
+/// operator without a TUI, so it falls back to `standard` and says so.
+fn resolve_tui_preset(config: &Config) -> recursive::preset::ResolvedPreset {
+    let env = recursive::preset::PresetEnv::from_process();
+    match recursive::preset::resolve_session(None, config, &env) {
+        Ok(preset) => preset,
+        Err(e) => {
+            tracing::warn!(error = %e, "unknown agent preset; falling back to standard");
+            recursive::preset::STANDARD.resolve(config, &env)
+        }
+    }
 }
 
-/// Pure core of [`build_compactor`]: given the raw `RECURSIVE_COMPACT_THRESHOLD`
-/// env value and the model name, decide the compactor. Split out so the
-/// threshold-parsing logic is unit-testable without touching the process
-/// environment (which would race under parallel `cargo test`).
-fn build_compactor_from_env(raw: Option<&str>, model: &str) -> Option<recursive::Compactor> {
-    let threshold_chars: Option<usize> = match raw {
-        Some("0") | Some("off") | Some("false") => None,
-        Some(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
-        None => Some(recursive::llm::default_compact_threshold_chars(model)),
-    };
-    let n = threshold_chars?;
-    let token_threshold = recursive::llm::default_compact_threshold_tokens(model);
-    Some(recursive::Compactor::new(n).threshold_prompt_tokens(token_threshold))
-}
-
-/// Build the microcompactor for TUI mode, mirroring the CLI's
-/// RECURSIVE_MICROCOMPACT_TRIGGER env contract so interactive and headless
-/// runs microcompact at the same point:
-///   RECURSIVE_MICROCOMPACT_TRIGGER=<n> → explicit trigger count
-///   0 / off / false                → explicitly disabled
-///   unset                                → default 12
-/// Returns None when microcompact is disabled.
-fn build_microcompactor() -> Option<recursive::compact::Microcompactor> {
-    recursive::compact::micro::build_microcompactor_from_env(
-        std::env::var("RECURSIVE_MICROCOMPACT_TRIGGER")
-            .ok()
-            .as_deref(),
-        std::env::var("RECURSIVE_MICROCOMPACT_KEEP").ok().as_deref(),
+/// Install the session's preset on a TUI runtime builder (issue #127): context
+/// management, post-compaction re-injection and the plan-mode tool gate. The
+/// TUI has a live human, so it reports itself interactive; the preset still
+/// decides whether the plan tools exist at all.
+fn apply_preset(
+    builder: recursive::AgentRuntimeBuilder,
+    preset: &recursive::preset::ResolvedPreset,
+    read_state: Option<Arc<std::sync::Mutex<recursive::tools::fs::ReadFileState>>>,
+    skills: Vec<Skill>,
+) -> recursive::AgentRuntimeBuilder {
+    let mut assets = recursive::preset::PresetAssets::new().with_skills(skills);
+    if let Some(state) = read_state {
+        assets = assets.with_read_state(state);
+    }
+    recursive::preset::apply(
+        builder,
+        preset,
+        &assets,
+        recursive::preset::ChannelSupport { interactive: true },
     )
 }
 
@@ -347,54 +339,40 @@ pub fn build_runtime() -> TuiRuntime {
         provider.clone(),
         Some(subagent_token_slot.clone()),
     );
+    // Issue #127: the session's agent preset is resolved once, up front —
+    // both the prompt profile and the builder consume it. `RECURSIVE_AGENT_PRESET`
+    // selects it; `standard` is the default.
+    let preset = resolve_tui_preset(&config);
     let assembled = assemble_system_prompt(
         &config.system_prompt,
         &config.workspace,
         &skills,
         config.subagent_enabled,
     );
+    let system_prompt = recursive::preset::apply_prompt(assembled.full, &preset);
     let prompt_segments = assembled.segments;
 
-    // Goal-334: extract the shared read_state BEFORE `tools` is moved into the
-    // builder, so we can construct a FileReinjector from it below.
+    // Extract the shared read_state BEFORE `tools` is moved into the builder,
+    // so the preset's file re-injector can be built from it below.
     let read_state = tools.read_file_state();
 
-    let mut builder = AgentRuntimeBuilder::new()
+    let builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&assembled.full)
+        .system_prompt(&system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
         .wall_timeout_secs(config.wall_timeout_secs)
-        .with_plan_mode_tools(true)
         // Stream partial tokens so the TUI shows the answer building up live
         // and so reasoner models that only expose `reasoning_content` through
         // the streaming SSE channel surface their thinking block.
         .streaming(true);
-    if let Some(c) = build_compactor(&config.model) {
-        builder = builder.compactor(c);
-    }
-    if let Some(mc) = build_microcompactor() {
-        builder = builder.microcompactor(mc);
-    }
-    // Goal-334: file reinjector for post-compaction restoration
-    if let Some(rs) = read_state {
-        if let Some(r) = recursive::build_file_reinjector_from_env(rs) {
-            builder = builder.file_reinjector(r);
-        }
-    }
-    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
-    // skills was discovered above (discover_loaded_skills); clone it so the
-    // reinjector can look up bodies for skills the agent invoked pre-compaction.
-    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
-        builder = builder.skill_reinjector(r);
-    }
-    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
-    // skills was discovered above (discover_loaded_skills); clone it so the
-    // reinjector can look up bodies for skills the agent invoked pre-compaction.
-    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
-        builder = builder.skill_reinjector(r);
-    }
+    // Issue #127: context management (compactor / microcompactor / transcript
+    // cap), post-compaction re-injection of recently-read files and invoked
+    // skills, and the plan-mode tool gate all come from the session's agent
+    // preset — the same single assembly point the CLI and HTTP channels use,
+    // so the three can no longer drift apart.
+    let builder = apply_preset(builder, &preset, read_state, skills.clone());
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
@@ -519,54 +497,40 @@ fn build_runtime_with_skill_tx(
         provider.clone(),
         Some(subagent_token_slot.clone()),
     );
+    // Issue #127: the session's agent preset is resolved once, up front —
+    // both the prompt profile and the builder consume it. `RECURSIVE_AGENT_PRESET`
+    // selects it; `standard` is the default.
+    let preset = resolve_tui_preset(&config);
     let assembled = assemble_system_prompt(
         &config.system_prompt,
         &config.workspace,
         &skills,
         config.subagent_enabled,
     );
+    let system_prompt = recursive::preset::apply_prompt(assembled.full, &preset);
     let prompt_segments = assembled.segments;
 
-    // Goal-334: extract the shared read_state BEFORE `tools` is moved into the
-    // builder, so we can construct a FileReinjector from it below.
+    // Extract the shared read_state BEFORE `tools` is moved into the builder,
+    // so the preset's file re-injector can be built from it below.
     let read_state = tools.read_file_state();
 
-    let mut builder = AgentRuntimeBuilder::new()
+    let builder = AgentRuntimeBuilder::new()
         .llm(provider)
         .tools(tools)
-        .system_prompt(&assembled.full)
+        .system_prompt(&system_prompt)
         .prompt_segments(prompt_segments)
         .max_steps(config.max_steps)
         .wall_timeout_secs(config.wall_timeout_secs)
-        .with_plan_mode_tools(true)
         // Stream partial tokens so the TUI shows the answer building up live
         // and so reasoner models that only expose `reasoning_content` through
         // the streaming SSE channel surface their thinking block.
         .streaming(true);
-    if let Some(c) = build_compactor(&config.model) {
-        builder = builder.compactor(c);
-    }
-    if let Some(mc) = build_microcompactor() {
-        builder = builder.microcompactor(mc);
-    }
-    // Goal-334: file reinjector for post-compaction restoration
-    if let Some(rs) = read_state {
-        if let Some(r) = recursive::build_file_reinjector_from_env(rs) {
-            builder = builder.file_reinjector(r);
-        }
-    }
-    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
-    // skills was discovered above (discover_loaded_skills); clone it so the
-    // reinjector can look up bodies for skills the agent invoked pre-compaction.
-    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
-        builder = builder.skill_reinjector(r);
-    }
-    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
-    // skills was discovered above (discover_loaded_skills); clone it so the
-    // reinjector can look up bodies for skills the agent invoked pre-compaction.
-    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
-        builder = builder.skill_reinjector(r);
-    }
+    // Issue #127: context management (compactor / microcompactor / transcript
+    // cap), post-compaction re-injection of recently-read files and invoked
+    // skills, and the plan-mode tool gate all come from the session's agent
+    // preset — the same single assembly point the CLI and HTTP channels use,
+    // so the three can no longer drift apart.
+    let builder = apply_preset(builder, &preset, read_state, skills.clone());
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
@@ -591,51 +555,116 @@ mod tests {
     use crate::events::UiEvent;
     use crate::events::UserAction;
 
-    #[test]
-    fn build_compactor_disabled_when_threshold_zero() {
-        // `0` / `off` / `false` all mean "explicitly disabled" → no compactor.
-        // Pins the disabled branch so a mutant that falls through to the
-        // auto-compute arm (treating `0` as unset) is caught.
-        assert!(build_compactor_from_env(Some("0"), "deepseek-chat").is_none());
-        assert!(build_compactor_from_env(Some("off"), "deepseek-chat").is_none());
-        assert!(build_compactor_from_env(Some("false"), "deepseek-chat").is_none());
-    }
+    // ── Issue #127: the TUI assembles from the same agent preset ──────────
 
+    /// `apply_preset` installs exactly what the resolved preset declares —
+    /// the same assertion the HTTP and CLI channels make, which is what keeps
+    /// the three from drifting.
     #[test]
-    fn build_compactor_uses_explicit_threshold_when_set() {
-        // An explicit positive char threshold is honoured verbatim, and the
-        // token threshold is still derived from the model's context window.
-        let c = build_compactor_from_env(Some("500"), "deepseek-chat")
-            .expect("explicit positive threshold must yield a compactor");
-        assert_eq!(c.threshold_chars, 500, "char threshold must match override");
+    fn tui_assembly_matches_the_resolved_preset() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _model = EnvGuard::set("RECURSIVE_MODEL", "deepseek-chat");
+        let _preset_env = EnvGuard::remove("RECURSIVE_AGENT_PRESET");
+        let config = Config::from_env().expect("config");
+
+        let preset = resolve_tui_preset(&config);
+        assert_eq!(preset.id, "standard", "no env override → the built-in");
         assert!(
-            c.threshold_prompt_tokens.is_some(),
-            "token threshold must be derived from the model context window"
+            preset.context.compaction.is_some(),
+            "standard compacts on overflow"
+        );
+
+        let tools = recursive::tools::build_standard_tools(std::path::Path::new("."), &[], 300);
+        let read_state = tools.read_file_state();
+        let builder = apply_preset(
+            AgentRuntimeBuilder::new().llm(Arc::new(recursive::llm::MockProvider::new(vec![]))),
+            &preset,
+            read_state,
+            Vec::new(),
+        );
+        assert_eq!(builder.context_management_facts(), preset.context);
+        assert_eq!(builder.preset_id(), Some("standard"));
+
+        // The TUI channel is interactive, so the preset's plan tools must
+        // actually land in the built registry (the preset alone is not enough).
+        let runtime = builder.build().expect("runtime builds");
+        assert_eq!(runtime.preset_id(), Some("standard"));
+        assert!(
+            runtime
+                .kernel()
+                .tools()
+                .find_by_name("enter_plan_mode")
+                .is_some(),
+            "the TUI must report itself as an interactive channel"
         );
     }
 
+    /// The env overrides reach the TUI's assembly through the preset: a
+    /// `RECURSIVE_COMPACT_THRESHOLD` that disables compaction must leave the
+    /// TUI runtime without a compactor, exactly as it did before presets.
     #[test]
-    fn build_compactor_rejects_non_positive_explicit_threshold() {
-        // A parseable-but-non-positive value (e.g. negative parsed as 0 via
-        // a malformed input) is filtered out. `0` is handled by the disabled
-        // arm above; here we cover garbage that fails to parse → None.
-        assert!(build_compactor_from_env(Some("not-a-number"), "deepseek-chat").is_none());
+    fn tui_preset_resolution_honours_compaction_env() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _model = EnvGuard::set("RECURSIVE_MODEL", "deepseek-chat");
+        let _preset_env = EnvGuard::remove("RECURSIVE_AGENT_PRESET");
+        let config = Config::from_env().expect("config");
+
+        let _off = EnvGuard::set("RECURSIVE_COMPACT_THRESHOLD", "0");
+        assert!(resolve_tui_preset(&config).context.compaction.is_none());
+        drop(_off);
+
+        let _explicit = EnvGuard::set("RECURSIVE_COMPACT_THRESHOLD", "4321");
+        let compaction = resolve_tui_preset(&config)
+            .context
+            .compaction
+            .expect("explicit threshold must yield a compactor");
+        assert_eq!(compaction.threshold_chars, 4321);
+        assert!(
+            compaction.threshold_prompt_tokens.is_some(),
+            "the token threshold is still derived from the model"
+        );
     }
 
+    /// An unknown `RECURSIVE_AGENT_PRESET` must not leave the operator
+    /// TUI-less: it is warned about and the built-in standard preset is used.
     #[test]
-    fn build_compactor_auto_computes_when_env_unset() {
-        // No env override → auto-compute from the model's context window.
-        // Both thresholds must be populated (non-zero) for a known model.
-        let c = build_compactor_from_env(None, "deepseek-chat")
-            .expect("unset env must auto-compute a compactor for a known model");
-        assert!(
-            c.threshold_chars > 0,
-            "auto char threshold must be positive"
+    fn unknown_preset_env_falls_back_to_standard() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _model = EnvGuard::set("RECURSIVE_MODEL", "deepseek-chat");
+        let _preset_env = EnvGuard::set("RECURSIVE_AGENT_PRESET", "no-such-preset");
+        let config = Config::from_env().expect("config");
+
+        assert_eq!(resolve_tui_preset(&config).id, "standard");
+    }
+
+    /// A preset with no re-injection declaration installs no reinjector even
+    /// when the assets are present — the declaration is the only source of
+    /// truth (this is what "adding a preset is one declaration" means).
+    #[test]
+    fn a_preset_without_reinjection_installs_none() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _model = EnvGuard::set("RECURSIVE_MODEL", "deepseek-chat");
+        let config = Config::from_env().expect("config");
+        let mut preset = resolve_tui_preset(&config);
+        preset.context.reinject_recent_files = None;
+        preset.context.reinject_invoked_skills = None;
+
+        let tools = recursive::tools::build_standard_tools(std::path::Path::new("."), &[], 300);
+        let builder = apply_preset(
+            AgentRuntimeBuilder::new().llm(Arc::new(recursive::llm::MockProvider::new(vec![]))),
+            &preset,
+            tools.read_file_state(),
+            Vec::new(),
         );
-        assert!(
-            c.threshold_prompt_tokens.is_some(),
-            "auto token threshold must be derived"
-        );
+        assert_eq!(builder.context_management_facts(), preset.context);
+        assert!(builder
+            .context_management_facts()
+            .reinject_recent_files
+            .is_none());
     }
 
     /// RAII guard that clears API key env vars for the duration of a test

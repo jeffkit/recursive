@@ -736,6 +736,18 @@ pub(crate) async fn build_runtime(
     };
     let provider = build_llm_provider(config, api_key, retry, Some(config.max_search_rounds))?;
     let (tools, read_state) = build_tools(config, None).await;
+    // Issue #127: the session's agent preset is the single assembly point for
+    // context management (compactor / microcompactor / transcript cap),
+    // post-compaction re-injection and the plan-mode tool gate. It is resolved
+    // once, up front, because both the prompt profile and the builder consume
+    // it: an explicit id would come from the channel, otherwise
+    // `RECURSIVE_AGENT_PRESET` decides, otherwise `standard`. An unknown id is
+    // a hard error — the preset decides how the session runs.
+    let preset = recursive::preset::resolve_session(
+        None,
+        config,
+        &recursive::preset::PresetEnv::from_process(),
+    )?;
     // MCP + touched-files + coordinator pruning all live in one shared tail
     // (issues #70 / #65) so channels cannot drift apart.
     let elicitation = recursive::mcp::new_elicitation_slot();
@@ -778,13 +790,32 @@ pub(crate) async fn build_runtime(
         &skills,
         config.subagent_enabled,
     );
-    let injected = skills_for_injection(&skills, goal.unwrap_or(""));
-    assembled.full = apply_skill_injection(assembled.full, &injected);
+    // Issue #127: the preset's prompt profile — persona suffix first, then the
+    // goal-matched skill bodies it declares. A channel with no goal at
+    // prompt-build time cannot honour the injection, which is why it is a
+    // declared capability rather than an assumption.
+    assembled.full = recursive::preset::apply_prompt(assembled.full, &preset);
+    if preset.prompt.auto_skill_injection {
+        let injected = skills_for_injection(&skills, goal.unwrap_or(""));
+        assembled.full = apply_skill_injection(assembled.full, &injected);
+    }
     // Goal-328: forward the structured segments to the runtime so the
     // local ContextBreakdown estimator can size the static buckets.
     // The joined prompt (`assembled.full`) is consumed directly by the
     // builder.
     let prompt_segments = assembled.segments;
+
+    // Issue #127: the session's agent preset is the single assembly point for
+    // context management (compactor / microcompactor / transcript cap),
+    // post-compaction re-injection and the plan-mode tool gate. Resolved once,
+    // here: an explicit id would come from the channel, otherwise
+    // `RECURSIVE_AGENT_PRESET` decides, otherwise `standard`. An unknown id is
+    // a hard error — the preset decides how the session runs.
+    let preset = recursive::preset::resolve_session(
+        None,
+        config,
+        &recursive::preset::PresetEnv::from_process(),
+    )?;
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
@@ -805,26 +836,28 @@ pub(crate) async fn build_runtime(
     if !seed.is_empty() {
         builder = builder.seed_transcript(seed);
     }
-    // Goal-393: compactor / microcompactor / transcript cap assembly is
-    // shared with the HTTP frontends via the frontend-neutral helper, so the
-    // two channels cannot drift apart again. Env semantics
-    // (RECURSIVE_COMPACT_THRESHOLD / RECURSIVE_MICROCOMPACT_TRIGGER /
-    // RECURSIVE_MICROCOMPACT_KEEP / RECURSIVE_MAX_TRANSCRIPT_CHARS) are
-    // documented there.
-    builder = recursive::runtime::apply_context_management(builder, config);
+    // Issue #127: the resolved preset installs context management (compactor /
+    // microcompactor / transcript cap), post-compaction re-injection of
+    // recently-read files and invoked skills, and the plan-mode tool gate — the
+    // same single assembly point the HTTP and TUI channels use, so they cannot
+    // drift apart. Env semantics (RECURSIVE_COMPACT_THRESHOLD /
+    // RECURSIVE_MICROCOMPACT_TRIGGER / RECURSIVE_MICROCOMPACT_KEEP /
+    // RECURSIVE_MAX_TRANSCRIPT_CHARS / RECURSIVE_REINJECT_*) override the
+    // declaration and are documented on `recursive::preset`.
+    let assets = recursive::preset::PresetAssets::new()
+        .with_read_state(read_state.clone())
+        .with_skills(skills.clone());
+    builder = recursive::preset::apply(
+        builder,
+        &preset,
+        &assets,
+        recursive::preset::ChannelSupport { interactive },
+    );
     // CLI-specific override: the --max-transcript-chars flag (and its clap
-    // env fallback) keeps flag-over-env precedence over the cap the helper
+    // env fallback) keeps flag-over-env precedence over the cap the preset
     // just applied.
     if let Some(n) = max_transcript_chars {
         builder = builder.max_transcript_chars(n);
-    }
-    // Goal-334: file reinjector for post-compaction restoration of recently-read files.
-    if let Some(r) = recursive::build_file_reinjector_from_env(read_state.clone()) {
-        builder = builder.file_reinjector(r);
-    }
-    // Goal-335: skill reinjector for post-compaction restoration of invoked skills.
-    if let Some(r) = recursive::build_skill_reinjector_from_env(skills.clone()) {
-        builder = builder.skill_reinjector(r);
     }
     if hook_timing {
         use recursive::hooks::HookRegistry;
@@ -835,10 +868,7 @@ pub(crate) async fn build_runtime(
     if let Some(sink) = event_sink {
         builder = builder.event_sink(sink);
     }
-    builder
-        .with_plan_mode_tools(interactive)
-        .build()
-        .map_err(Into::into)
+    builder.build().map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1563,6 +1593,133 @@ done
                 .iter()
                 .any(|m| m.content == "seeded hello"),
             "a non-empty seed must be installed on the runtime transcript"
+        );
+    }
+
+    /// Issue #127 acceptance 1 (CLI half): the CLI assembles exactly what the
+    /// resolved agent preset declares — context management AND post-compaction
+    /// re-injection. The HTTP and TUI crates assert the same reference in their
+    /// own tests, so a drift on any side fails a test.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the std env lock only guards same-crate tests
+    async fn cli_assembly_matches_the_resolved_standard_preset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        // Pin the preset-relevant env to "unset" so the expectation below
+        // cannot race the ambient environment of the developer's shell.
+        let _env = EnvGuard::set(&[
+            ("RECURSIVE_AGENT_PRESET", None),
+            ("RECURSIVE_COMPACT_THRESHOLD", None),
+            ("RECURSIVE_MAX_TRANSCRIPT_CHARS", None),
+            ("RECURSIVE_MICROCOMPACT_TRIGGER", None),
+            ("RECURSIVE_MICROCOMPACT_KEEP", None),
+            ("RECURSIVE_REINJECT_FILES", None),
+            ("RECURSIVE_REINJECT_FILE_BUDGET", None),
+            ("RECURSIVE_REINJECT_SKILLS", None),
+            ("RECURSIVE_REINJECT_SKILL_BUDGET", None),
+        ]);
+
+        let headless = build_runtime(
+            &cfg,
+            None,
+            vec![],
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("build_runtime");
+
+        let expected =
+            recursive::preset::STANDARD.resolve(&cfg, &recursive::preset::PresetEnv::default());
+        assert_eq!(
+            headless.context_management_facts(),
+            expected.context,
+            "the CLI assembly must be exactly what the preset resolved to"
+        );
+        assert_eq!(headless.preset_id(), Some("standard"));
+        assert!(
+            headless
+                .context_management_facts()
+                .reinject_recent_files
+                .is_some(),
+            "the standard preset re-injects recently-read files"
+        );
+        assert!(
+            headless
+                .kernel()
+                .tools()
+                .find_by_name("enter_plan_mode")
+                .is_none(),
+            "a headless run must not register the blocking plan tools"
+        );
+
+        // The interactive channel asks for the same preset but can host the
+        // plan tools, so the preset's gate admits them.
+        let interactive = build_runtime(
+            &cfg,
+            None,
+            vec![],
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("build_runtime interactive");
+        assert!(
+            interactive
+                .kernel()
+                .tools()
+                .find_by_name("enter_plan_mode")
+                .is_some(),
+            "an interactive channel must get the preset's plan tools"
+        );
+        assert_eq!(
+            interactive.context_management_facts(),
+            expected.context,
+            "channel interactivity must not change the context half"
+        );
+    }
+
+    /// An unknown `RECURSIVE_AGENT_PRESET` is a hard error, not a silent
+    /// fallback: the preset decides how the session runs (issue #127).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the std env lock only guards same-crate tests
+    async fn unknown_preset_env_fails_the_cli_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        let _env = EnvGuard::set(&[("RECURSIVE_AGENT_PRESET", Some("no-such-preset"))]);
+
+        let err = build_runtime(
+            &cfg,
+            None,
+            vec![],
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("an unknown preset must fail the build");
+        assert!(
+            err.to_string().contains("standard"),
+            "the error must name the known presets: {err}"
         );
     }
 

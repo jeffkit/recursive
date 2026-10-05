@@ -26,9 +26,9 @@ pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
     agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
-    list_sessions, list_skills, list_slash_commands, list_tools, metrics_handler, openapi_spec,
-    patch_session, run_agent, send_session_message, session_clear_goal, session_events,
-    session_interrupt, session_plan_confirm, session_plan_reject, session_set_goal,
+    list_presets, list_sessions, list_skills, list_slash_commands, list_tools, metrics_handler,
+    openapi_spec, patch_session, run_agent, send_session_message, session_clear_goal,
+    session_events, session_interrupt, session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
 
@@ -202,6 +202,12 @@ pub struct CreateSessionRequest {
     /// Maximum total API spend in USD for this session. Agent stops after any
     /// turn that would exceed this limit.
     pub max_budget_usd: Option<f64>,
+    /// Issue #127: agent preset this session runs under (default `standard`,
+    /// or `RECURSIVE_AGENT_PRESET`). An unknown id is rejected with 400 — a
+    /// preset is the session's runtime wiring, never a silent fallback.
+    /// `GET /presets` lists what is available.
+    #[serde(default)]
+    pub preset: Option<String>,
 }
 
 /// Response body for `POST /sessions`.
@@ -209,6 +215,19 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionResponse {
     pub id: String,
     pub created_at: String,
+}
+
+/// One entry of `GET /presets` (issue #127): a session preset with its full
+/// capability inventory — including the capabilities that are off by default —
+/// and the context management it resolves to under the server's current
+/// environment. This is what makes "the mechanism exists but nothing turns it
+/// on" discoverable instead of folklore.
+#[derive(serde::Serialize, Debug)]
+pub struct PresetInfo {
+    pub id: String,
+    pub description: String,
+    pub capabilities: Vec<crate::preset::Capability>,
+    pub resolved: crate::preset::ResolvedPreset,
 }
 
 /// Request body for `POST /sessions/:id/messages`.
@@ -267,6 +286,11 @@ pub struct SessionDetailResponse {
     /// Absent while the session is busy (runtime lock held).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    /// Issue #127: the agent preset this session was assembled from, read off
+    /// the live runtime (so a restored session reports the preset it was
+    /// rebuilt with). Absent while the session is busy (runtime lock held).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 // ── Goal-168: goal endpoint types ────────────────────────────────────────
@@ -497,11 +521,11 @@ impl AppState {
     }
 }
 
-/// Minimal `Config` for build paths that only need the model name
-/// (auto compaction thresholds). Values mirror safe defaults; the shared
-/// HTTP runtime assembly uses it to stay independent of `AppState`.
-/// Every field of `Config` must be listed here, so a newly added field
+/// Minimal `Config` for tests that need a `Config` without a full
+/// environment: any field the code under test reads must be overridden by the
+/// caller. Every field of `Config` must be listed here, so a newly added field
 /// breaks compilation instead of silently defaulting.
+#[cfg(test)]
 pub(crate) fn test_config_stub() -> crate::config::Config {
     crate::config::Config {
         workspace: std::path::PathBuf::from("."),
@@ -797,6 +821,7 @@ pub fn build_router_with_auth_and_rate_limit(
     // the client does not choose.
     let protected = Router::new()
         .route("/tools", get(list_tools))
+        .route("/presets", get(list_presets))
         .route("/run", post(run_agent))
         .route("/triggers", post(create_trigger))
         .route("/triggers", get(list_triggers))
@@ -882,6 +907,25 @@ pub fn build_openapi_spec() -> serde_json::Value {
                                     "schema": {
                                         "type": "array",
                                         "items": { "$ref": "#/components/schemas/ToolInfo" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/presets": {
+                "get": {
+                    "summary": "List agent presets",
+                    "description": "Returns the built-in session presets (issue #127) with their capability inventory and the context management each resolves to under the server's current environment. `POST /sessions` accepts a preset id in its `preset` field.",
+                    "responses": {
+                        "200": {
+                            "description": "Array of preset descriptors",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/PresetInfo" }
                                     }
                                 }
                             }
@@ -1230,6 +1274,30 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     },
                     "required": ["name", "description", "parameters"]
                 },
+                "PresetInfo": {
+                    "type": "object",
+                    "description": "An agent preset (issue #127): its capability inventory plus the context management it resolves to under the server's current environment.",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "description": { "type": "string" },
+                        "capabilities": {
+                            "type": "array",
+                            "description": "Every capability the preset declares, including the ones that are off by default.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "default": { "type": "string", "enum": ["enabled", "disabled"] },
+                                    "toggle": { "type": "string" },
+                                    "note": { "type": "string" }
+                                },
+                                "required": ["name", "default", "toggle", "note"]
+                            }
+                        },
+                        "resolved": { "type": "object" }
+                    },
+                    "required": ["id", "description", "capabilities", "resolved"]
+                },
                 "RunRequest": {
                     "type": "object",
                     "properties": {
@@ -1278,7 +1346,8 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "max_steps": { "type": "integer", "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
                         "permission_mode": { "type": "string", "enum": ["default", "auto", "strict", "bypass"], "nullable": true },
-                        "max_budget_usd": { "type": "number", "nullable": true }
+                        "max_budget_usd": { "type": "number", "nullable": true },
+                        "preset": { "type": "string", "nullable": true, "description": "issue #127: agent preset id; unknown ids are rejected with 400. See GET /presets." }
                     }
                 },
                 "CreateSessionResponse": {
@@ -1343,6 +1412,11 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             "type": "string",
                             "nullable": true,
                             "description": "issue #98: effective permission mode (default | auto | strict | bypass); null while the session is busy"
+                        },
+                        "preset": {
+                            "type": "string",
+                            "nullable": true,
+                            "description": "issue #127: agent preset this session was assembled from; null while the session is busy"
                         }
                     },
                     "required": ["id", "created_at", "messages", "status", "todos", "prompt_tokens", "completion_tokens"]
