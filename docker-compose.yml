@@ -1,15 +1,17 @@
 # docker-compose.yml — Local cloud-stack for Recursive
 #
-# Spins up three services:
+# Spins up two services:
 #   recursive  — the agent HTTP gateway (recursive http), built with
 #                `cloud-runtime` so RECURSIVE_S3_BUCKET selects S3
-#   redis      — reserved for session hot-state (see note below; not consumed
-#                by `recursive http` yet)
 #   localstack — AWS-compatible S3 emulation for transcript/memory storage
 #
+# Redis is intentionally NOT provisioned: `recursive http` does not consume a
+# `RedisSessionStore` (no per-turn checkpoint consumer), and transcripts are
+# persisted per turn to S3 instead. See README "Full cloud stack".
+#
 # Usage:
-#   docker compose up          # start all services
-#   docker compose up recursive # start only the agent (requires external Redis/S3 or defaults)
+#   docker compose up          # start both services
+#   docker compose up recursive # start only the agent (requires external S3 or defaults)
 #
 # Build the image first (or rely on published image):
 #   docker build -t recursive:dev --target runtime --build-arg FEATURES=http,cloud-runtime .
@@ -48,15 +50,9 @@ services:
       # ── HTTP server ──
       RECURSIVE_HTTP_AUTH_KEYS: "${RECURSIVE_HTTP_AUTH_KEYS:-}"
 
-      # ── Cloud storage backend (Redis) ──
-      # Set for forward compatibility: `recursive http` recognises the var but
-      # does not build a RedisSessionStore yet (no per-turn checkpoint consumer),
-      # so hot-state is still in-process. See README "Full cloud stack".
-      RECURSIVE_REDIS_URL: "redis://redis:6379"
-      RECURSIVE_REDIS_KEY_PREFIX: "recursive:dev:"
-      RECURSIVE_REDIS_SESSION_TTL_SECS: "7200"
-
       # ── Cloud storage backend (S3 via LocalStack) ──
+      # Issue #92: transcripts are appended per turn and cold-loaded on
+      # restart, so a crashed gateway loses at most the in-flight turn.
       RECURSIVE_S3_BUCKET: "recursive-dev"
       RECURSIVE_S3_PREFIX: "transcripts"
       RECURSIVE_S3_TENANT_ID: "local"
@@ -65,8 +61,6 @@ services:
       AWS_DEFAULT_REGION: "us-east-1"
       AWS_ENDPOINT_URL: "http://localstack:4566"
     depends_on:
-      redis:
-        condition: service_healthy
       localstack:
         condition: service_healthy
     restart: unless-stopped
@@ -75,21 +69,6 @@ services:
       interval: 15s
       timeout: 3s
       start_period: 10s
-      retries: 3
-
-  # ── Redis — hot session state ─────────────────────────────────────────────
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --save 60 1 --loglevel warning
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
       retries: 3
 
   # ── LocalStack — S3-compatible object storage ─────────────────────────────
@@ -113,5 +92,4 @@ services:
       retries: 5
 
 volumes:
-  redis_data:
   localstack_data:

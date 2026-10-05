@@ -25,8 +25,11 @@ All configuration is done via environment variables (or CLI flags where noted). 
 ## Cloud Storage — Redis
 
 > Requires the `cloud-runtime` feature flag (`--features cloud-runtime`).
-> `recursive http` does not consume it yet — hot-state stays in-process until
-> the kernel checkpoints per turn; the store is available through the library API.
+> `recursive http` does not consume it — the kernel never checkpoints per turn,
+> so hot-state stays in-process and `RECURSIVE_REDIS_URL` is ignored (a note is
+> logged). The store is available through the library API. This direction is
+> closed for the HTTP server: per-turn S3 transcripts + cold load cover crash
+> recovery.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -37,8 +40,10 @@ All configuration is done via environment variables (or CLI flags where noted). 
 ## Cloud Storage — S3
 
 > Requires the `cloud-runtime` feature flag. When `RECURSIVE_S3_BUCKET` is set,
-> `recursive http` persists transcripts/memory to S3 on session teardown and
-> cold-loads them on a memory miss.
+> `recursive http` persists each turn's transcript growth to S3 and cold-loads
+> it on a memory miss after a restart. S3 objects cannot be appended to, so
+> each turn rewrites the whole object (`GET` + `PUT`); see
+> [Cloud deployment](/en/deployment/cloud) for the trade-off.
 
 | Variable | Default | Description |
 |---|---|---|

@@ -394,10 +394,15 @@ pub struct AppState {
     /// when `RECURSIVE_S3_BUCKET` is set and the `cloud-runtime` feature is
     /// compiled in (issue #92), otherwise `LocalStorageBackend` under the
     /// per-workspace user dir. Injected into every session runtime via
-    /// `AgentRuntimeBuilder::storage`. The host layer calls
-    /// `save_transcript` on session teardown only — DELETE, idle eviction,
-    /// and graceful shutdown — never per turn (that would be an O(N²)
-    /// full-transcript rewrite on the hot path).
+    /// `AgentRuntimeBuilder::storage`.
+    ///
+    /// Issue #92: the runtime persists each turn's growth (see
+    /// `AgentRuntime::persist_transcript_turn`) — `append_transcript` when the
+    /// stored record is still an exact prefix of the runtime transcript, a
+    /// full `save_transcript` after any in-place rewrite (compaction,
+    /// microcompact pruning) — so a crashed pod loses at most the in-flight
+    /// turn. The host still calls `save_transcript` on session teardown
+    /// (DELETE, idle eviction, graceful shutdown) as a final resync.
     ///
     /// Goal 397 cold-load reads this same backend to restore sessions after a
     /// restart (`cold_load::get_or_load_session`).

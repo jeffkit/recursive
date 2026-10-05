@@ -224,6 +224,31 @@ pub struct AgentRuntime {
     /// persistence (no session recording, or a host that keeps loop state in
     /// memory only). Set via [`AgentRuntimeBuilder::wakeup_store_dir`].
     wakeup_store_dir: Option<std::path::PathBuf>,
+    /// Issue #92: when `true`, persist the transcript through the injected
+    /// [`StorageBackend`](crate::storage::StorageBackend) at the end of every
+    /// turn (appending when the stored record is still this transcript's exact
+    /// prefix, full-saving otherwise), so a crashed or OOM-killed host loses at
+    /// most the in-flight turn instead of everything since the last teardown.
+    /// Off by default — the CLI/TUI own their own session JSONL, and the HTTP
+    /// layer opts in only at the session-creation sites (which own a stable
+    /// session id) via [`AgentRuntimeBuilder::persist_transcript_per_turn`].
+    persist_transcript_per_turn: bool,
+    /// Issue #92: number of leading transcript messages known to be an exact
+    /// prefix of the persisted transcript. `None` means "unknown": never
+    /// resolved yet (a cold-loaded session is seeded with already-persisted
+    /// messages, so appending from index 0 would duplicate them), invalidated
+    /// by a rewrite, or left unadvanced by a failed write.
+    persisted_transcript_len: Option<usize>,
+    /// Issue #92: set whenever the transcript's *prefix* may have been
+    /// rewritten in place (compaction, microcompact pruning,
+    /// [`Self::truncate_transcript`], [`Self::set_transcript`]). A length is
+    /// not evidence that a prefix survived: compaction can drain the front
+    /// and splice a summary in while leaving the count unchanged, and
+    /// microcompact rewrites tool results without changing the count at all.
+    /// While set, the next persist re-reads the backend and re-checks the
+    /// stored record against the runtime transcript instead of trusting the
+    /// watermark. Cleared once that persist succeeds.
+    transcript_rewritten: bool,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -350,6 +375,16 @@ impl AgentRuntime {
         // land on the CompactionBoundary event (g336).
         self.maybe_compact_cross_turn(&turn_outcome.usage).await?;
 
+        // Issue #92: persist the turn's growth (or the post-compaction
+        // transcript) before returning, so a host crash loses at most the
+        // in-flight turn. Deliberately after the compaction pass: a compaction
+        // that rewrote the front of the transcript must reach the backend too,
+        // and `persist_transcript_turn` resyncs instead of appending when the
+        // stored record no longer matches.
+        if self.persist_transcript_per_turn {
+            self.persist_transcript_turn().await;
+        }
+
         let outcome: RuntimeOutcome = turn_outcome.into();
 
         tracing::info!(
@@ -360,6 +395,104 @@ impl AgentRuntime {
         self.checkpoints.turn_index.fetch_add(1, Ordering::Relaxed);
 
         Ok(outcome)
+    }
+
+    /// Issue #92: record that the transcript's prefix may no longer match what
+    /// the backend holds, so the next per-turn persist re-reads it and
+    /// resyncs instead of appending onto a stale prefix.
+    ///
+    /// Called by every in-place rewrite of `self.transcript`: cross-turn /
+    /// emergency / manual compaction (drain + summary), microcompact pruning
+    /// (content swapped at an unchanged index), and wholesale replacement.
+    ///
+    /// Intra-turn compaction needs no call: `RunCore` runs on its own
+    /// copy-on-write clone of the transcript (`Arc::make_mut` clones because
+    /// the runtime still holds the parent `Arc`), so it can only *extend* the
+    /// runtime transcript via `TurnOutcome::new_messages` — including a summary
+    /// it spliced in at index 0.
+    fn mark_transcript_rewritten(&mut self) {
+        self.transcript_rewritten = true;
+    }
+
+    /// Issue #92: persist the transcript through the injected storage backend,
+    /// appending this turn's growth when that is provably safe.
+    ///
+    /// The watermark is the number of leading transcript messages known to be
+    /// an *exact prefix* of what the backend holds. Trusting a count alone is
+    /// unsound — cross-turn compaction rewrites the front of the transcript
+    /// while the post-compaction length can match the watermark (silently
+    /// dropping an acknowledged turn) or exceed it (appending from an index
+    /// that no longer means what it did) — so a watermark is only reused when
+    /// no rewrite happened since it was taken
+    /// ([`Self::transcript_rewritten`]). Otherwise the backend is re-read and
+    /// the stored record is compared against the runtime transcript
+    /// ([`is_stored_prefix`]); anything else is resynced with a full
+    /// `save_transcript`, since append-only cannot express a rewrite.
+    ///
+    /// The full read happens at most once per runtime (plus once per turn that
+    /// rewrote the prefix). The write is best-effort: a storage error logs a
+    /// warning and never fails the turn (the session keeps running from
+    /// memory).
+    async fn persist_transcript_turn(&mut self) {
+        let Some(session_id) = self.checkpoints.session_id.clone() else {
+            return;
+        };
+        let storage = Arc::clone(self.kernel.storage());
+        let transcript = Arc::clone(&self.transcript);
+        let len = transcript.len();
+
+        // A rewrite invalidates the watermark: the same count no longer
+        // describes the same messages, so fall through to the backend check.
+        let trusted = if self.transcript_rewritten {
+            None
+        } else {
+            self.persisted_transcript_len
+        };
+        let watermark = match trusted {
+            Some(n) => Some(n),
+            None => match storage.load_transcript(&session_id).await {
+                // Only an exact prefix can be extended by appending to it. A
+                // longer record, or one that diverges at any index (a
+                // compaction summary where the runtime has its reassembled
+                // system prompt, a legacy file without one, a microcompacted
+                // tool result), cannot.
+                Ok(persisted) if is_stored_prefix(&persisted, &transcript) => Some(persisted.len()),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "per-turn transcript watermark load failed; skipping this turn"
+                    );
+                    return;
+                }
+            },
+        };
+
+        let written = match watermark {
+            Some(n) if n < len => {
+                storage
+                    .append_transcript(&session_id, &transcript[n..])
+                    .await
+            }
+            // The backend already holds everything in memory.
+            Some(_) => Ok(()),
+            None => storage.save_transcript(&session_id, &transcript).await,
+        };
+        if let Err(e) = written {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "per-turn transcript persistence failed"
+            );
+            // A transient error must not advance the watermark: the next turn
+            // re-reads the backend and repairs the gap rather than silently
+            // skipping the lost turn forever.
+            self.persisted_transcript_len = None;
+            return;
+        }
+        self.persisted_transcript_len = Some(len);
+        self.transcript_rewritten = false;
     }
 
     /// Signal that the session is permanently over and fire `SessionEnd`.
@@ -425,6 +558,10 @@ impl AgentRuntime {
             let turn = self.checkpoints.turn_index.load(Ordering::Relaxed);
             let pruned = m.prune(&mut *Arc::make_mut(&mut self.transcript));
             if pruned > 0 {
+                // Pruning swaps tool results for placeholders in place — same
+                // length, different content — so the persisted prefix is stale
+                // even though no message was added or removed.
+                self.mark_transcript_rewritten();
                 self.event_sink
                     .emit(AgentEvent::Microcompact { step: turn, pruned })
                     .await;
@@ -475,6 +612,10 @@ impl AgentRuntime {
             Ok(Some((removed, summary_chars))) => {
                 // Success — reset the circuit breaker.
                 self.consecutive_compact_failures = 0;
+                // Compaction drained the front of the transcript and spliced a
+                // summary in (+ the reinjected attachments below), so the
+                // persisted prefix no longer describes these indices.
+                self.mark_transcript_rewritten();
                 self.kernel.hooks().dispatch(HookEvent::PostCompact {
                     removed,
                     summary_chars,
@@ -638,6 +779,9 @@ impl AgentRuntime {
         else {
             return Ok(false);
         };
+        // Emergency compaction rewrote the transcript in place, exactly like
+        // the cross-turn path — the persisted prefix is stale.
+        self.mark_transcript_rewritten();
         self.kernel.hooks().dispatch(HookEvent::PostCompact {
             removed,
             summary_chars,
@@ -864,6 +1008,8 @@ impl AgentRuntime {
     /// Replace the current transcript (useful for restoring from a saved session).
     pub fn set_transcript(&mut self, transcript: Vec<Message>) {
         self.transcript = Arc::new(transcript);
+        // Wholesale replacement: whatever the watermark described is gone.
+        self.mark_transcript_rewritten();
     }
 
     /// Discard all transcript messages after index `len`, restoring the
@@ -871,6 +1017,8 @@ impl AgentRuntime {
     /// TUI abort path to prevent orphan tool_call entries.
     pub fn truncate_transcript(&mut self, len: usize) {
         Arc::make_mut(&mut self.transcript).truncate(len);
+        // A truncation is a rewrite the append path cannot express.
+        self.mark_transcript_rewritten();
     }
 
     /// Return a reference to the inner kernel.
@@ -1127,6 +1275,7 @@ impl AgentRuntime {
             .await?
             .is_some()
         {
+            self.mark_transcript_rewritten();
             self.last_compact_turn =
                 Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
         }
@@ -1172,6 +1321,7 @@ impl AgentRuntime {
             .await?;
         transcript.drain(..split);
         transcript.insert(0, summary_msg);
+        self.mark_transcript_rewritten();
         self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
         Ok(())
     }
@@ -1236,6 +1386,7 @@ impl AgentRuntime {
             .await?;
         transcript.truncate(start);
         transcript.push(summary_msg);
+        self.mark_transcript_rewritten();
         self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
         Ok(())
     }
@@ -1734,6 +1885,24 @@ impl AgentRuntime {
     pub fn turn_index(&self) -> usize {
         self.checkpoints.turn_index.load(Ordering::Relaxed)
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Issue #92: per-turn transcript persistence helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Whether `stored` is an exact prefix of `transcript` — i.e. appending
+/// `transcript[stored.len()..]` to the backend reproduces the runtime
+/// transcript.
+///
+/// Compares content, not counts: a compaction summary or a pruned tool result
+/// can occupy the same index as something else entirely, so a matching length
+/// says nothing about whether the stored record is still the same prefix.
+fn is_stored_prefix(
+    stored: &[crate::message::Message],
+    transcript: &[crate::message::Message],
+) -> bool {
+    stored.len() <= transcript.len() && stored == &transcript[..stored.len()]
 }
 
 // ──────────────────────────────────────────────────────────────────────────

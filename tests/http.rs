@@ -1442,6 +1442,81 @@ mod http_tests {
         }
     }
 
+    /// Issue #92: a turn persists its transcript immediately — without
+    /// waiting for DELETE / eviction / shutdown — so a crashed gateway loses
+    /// at most the in-flight turn.
+    #[tokio::test]
+    async fn post_message_appends_transcript_before_teardown() {
+        use recursive::storage::StorageBackend;
+
+        let storage = MemoryStorage::new();
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hi back".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let state = AppState {
+            storage: storage.clone(),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            ..state
+        };
+
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "content": "hello" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // No DELETE: the turn's transcript must already be on the backend.
+        let stored = storage.load_transcript(&session_id).await.unwrap();
+        assert!(
+            stored.iter().any(|m| m.content == "hi back"),
+            "the assistant reply must be persisted before teardown, got {stored:?}"
+        );
+        assert!(
+            storage.saves().is_empty(),
+            "the per-turn path must append, not full-save"
+        );
+        assert!(
+            !storage.appends().is_empty(),
+            "the turn must record at least one append"
+        );
+    }
+
     #[tokio::test]
     async fn post_message_to_nonexistent_session_returns_404() {
         let provider = Arc::new(MockProvider::new(vec![]));

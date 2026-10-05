@@ -310,6 +310,13 @@ async fn build_restored_runtime(
     let mut runtime =
         super::handlers::build_session_runtime(state, tool_registry, full, segments, max_steps)
             .seed_transcript(seed)
+            // Issue #92: a restored session must keep persisting per turn,
+            // otherwise it silently regresses to teardown-only after a
+            // restart. The runtime transcript's first message is its
+            // reassembled system prompt, which the stored transcript is
+            // missing (the seeder drops it), so the first persist resyncs with
+            // a full save and later ones append.
+            .persist_transcript_per_turn(true)
             .build()
             .map_err(|e| {
                 ApiError::internal(format!("failed to build restored session runtime: {e}"))

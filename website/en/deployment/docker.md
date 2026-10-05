@@ -13,7 +13,7 @@ docker run -p 3000:3000 \
 
 The image defaults to `recursive http --addr 0.0.0.0:3000` and exposes `/health` for probes.
 
-## Docker Compose (Redis + S3)
+## Docker Compose (S3)
 
 ```bash
 cp .env.example .env    # fill in RECURSIVE_API_KEY
@@ -23,9 +23,10 @@ docker compose up
 The bundled `docker-compose.yml` spins up:
 - **recursive** — the HTTP API server (port 3000), built with
   `--build-arg FEATURES=http,cloud-runtime`
-- **redis** — reserved for session hot-state (not consumed by `recursive http`
-  yet; see `cloud.md`)
 - **localstack** — S3-compatible transcript persistence (for local development)
+
+Redis is intentionally not provisioned — `recursive http` does not consume a
+`RedisSessionStore` (see `cloud.md`).
 
 ## Environment variables
 
@@ -41,16 +42,15 @@ RECURSIVE_HTTP_ADDR=0.0.0.0:3000
 For cloud storage, build the image with the `cloud-runtime` feature and set:
 
 ```bash
-RECURSIVE_REDIS_URL=redis://redis:6379
 RECURSIVE_S3_BUCKET=my-recursive-bucket
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
 ```
 
-`RECURSIVE_S3_BUCKET` selects the S3 transcript backend. `RECURSIVE_REDIS_URL`
-is recognised but the HTTP server does not build a Redis session store yet
-(no per-turn checkpoint consumer).
+`RECURSIVE_S3_BUCKET` selects the S3 transcript backend, which the runtime
+appends to per turn. `RECURSIVE_REDIS_URL` is not consumed by `recursive http`
+and is ignored (a note is logged).
 
 ## Health probe
 

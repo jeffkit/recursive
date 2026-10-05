@@ -25,8 +25,9 @@
 ## 云存储 — Redis
 
 > 需要 `cloud-runtime` feature 标志（`--features cloud-runtime`）。
-> `recursive http` 目前不消费它——内核逐轮 checkpoint 落地前热态仍在进程内；该后端可通过
-> 库 API 使用。
+> `recursive http` 不消费它——内核从不逐轮 checkpoint，热态留在进程内，设置
+> `RECURSIVE_REDIS_URL` 被忽略（仅打一条日志）。该后端可通过库 API 使用。该方向对 HTTP
+> 服务已关闭：逐轮 S3 落盘 + 冷加载已覆盖崩溃恢复。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -37,7 +38,9 @@
 ## 云存储 — S3
 
 > 需要 `cloud-runtime` feature 标志。设置 `RECURSIVE_S3_BUCKET` 后，`recursive http`
-> 在会话结束路径把对话记录/内存写入 S3，并在内存 miss 时冷加载。
+> 把每轮对话记录增量持久化到 S3，并在重启后内存 miss 时冷加载。S3 对象不支持追加，
+> 因此每轮都会重写整个对象（`GET` + `PUT`）；取舍见
+> [云端部署](/zh/deployment/cloud)。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|

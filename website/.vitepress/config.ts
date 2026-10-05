@@ -99,7 +99,7 @@ const enSidebar = {
       items: [
         { text: 'Overview', link: '/en/deployment/' },
         { text: 'Docker', link: '/en/deployment/docker' },
-        { text: 'Cloud (S3 + Redis)', link: '/en/deployment/cloud' },
+        { text: 'Cloud (S3)', link: '/en/deployment/cloud' },
         { text: 'Sandbox Modes', link: '/en/deployment/sandbox' },
       ],
     },
@@ -185,7 +185,7 @@ const zhSidebar = {
       items: [
         { text: '概览', link: '/zh/deployment/' },
         { text: 'Docker', link: '/zh/deployment/docker' },
-        { text: '云端部署（S3 + Redis）', link: '/zh/deployment/cloud' },
+        { text: '云端部署（S3）', link: '/zh/deployment/cloud' },
         { text: '沙箱模式', link: '/zh/deployment/sandbox' },
       ],
     },

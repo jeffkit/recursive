@@ -60,6 +60,10 @@ pub struct MemoryStorage {
     pub probe_sessions: Option<Arc<RwLock<HashMap<String, recursive::http::SessionState>>>>,
     /// Backing store for round-trip reads (session_id → jsonl lines).
     store: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    /// Issue #92: per-turn appends, kept separate from `saves` so tests that
+    /// assert on full-save counts (DELETE / eviction / shutdown) are not
+    /// perturbed by the runtime's incremental writes.
+    pub appends: std::sync::Mutex<Vec<SaveRecord>>,
 }
 
 impl MemoryStorage {
@@ -78,6 +82,10 @@ impl MemoryStorage {
 
     pub fn saves(&self) -> Vec<SaveRecord> {
         self.saves.lock().unwrap().clone()
+    }
+
+    pub fn appends(&self) -> Vec<SaveRecord> {
+        self.appends.lock().unwrap().clone()
     }
 }
 
@@ -123,6 +131,38 @@ impl StorageBackend for MemoryStorage {
             session_id: session_id.to_string(),
             messages: messages.to_vec(),
             probe_lock_was_free,
+        });
+        Ok(())
+    }
+
+    /// Issue #92: the runtime's per-turn path. Simulates a native append
+    /// (extend the stored lines) and records into `appends`, not `saves`.
+    async fn append_transcript(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+    ) -> recursive::error::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let new_lines: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                serde_json::to_string(m).map_err(|e| recursive::error::Error::Config {
+                    message: format!("memory storage serialize: {e}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.store
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .extend(new_lines);
+        self.appends.lock().unwrap().push(SaveRecord {
+            session_id: session_id.to_string(),
+            messages: messages.to_vec(),
+            probe_lock_was_free: None,
         });
         Ok(())
     }

@@ -35,4 +35,4 @@ recursive sessions delete abc123
 
 默认情况下，会话以 JSONL 文件形式存储在 `~/.recursive/sessions/`。
 
-当编译并启用 `cloud-runtime` feature 且设置 `RECURSIVE_S3_BUCKET` 时，`recursive http` 会把对话记录、内存条目和逐会话元数据写入 S3——在会话结束时写入，并由 `GET /sessions/:id` 冷加载。`recursive http` 目前不消费 Redis（仅限库 API）。
+当编译并启用 `cloud-runtime` feature 且设置 `RECURSIVE_S3_BUCKET` 时，`recursive http` 会把对话记录、内存条目和逐会话元数据写入 S3——每轮结束时写入该轮增量，崩溃最多丢当前进行中的这一轮；重启后由 `GET /sessions/:id` 冷加载。S3 不支持追加，每轮都会重写整个对象。`recursive http` 不消费 Redis（仅限库 API）。
