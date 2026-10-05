@@ -188,6 +188,25 @@
   precise note instead, and the cloud docs now state the sticky-session
   requirement for multi-replica deployments.
 
+- feat(storage): per-turn transcript persistence for HTTP sessions (#92
+  follow-up). `AgentRuntime` now appends each turn's transcript growth through
+  the injected `StorageBackend` (`StorageBackend::append_transcript`;
+  `LocalStorageBackend` appends JSONL lines natively, other backends fall back
+  to load-extend-save), opted into by `recursive http` via
+  `AgentRuntimeBuilder::persist_transcript_per_turn`. A crashed or OOM-killed
+  pod now loses at most the in-flight turn instead of everything since the last
+  teardown. The append path is taken only when the stored record is an exact
+  prefix of the runtime transcript — any turn that rewrote the transcript in
+  place (cross-turn / emergency compaction, microcompact pruning, which swaps
+  content at an unchanged index and length) is resynced with a full save
+  instead, so an acknowledged turn can never be dropped by a length-based
+  watermark. S3 has no native append, so on S3 each turn rewrites the whole
+  object (load-extend-save). Redis session
+  hot-state is now **explicitly closed** as an HTTP direction: per-turn S3
+  transcripts plus cold load cover crash recovery, so `docker-compose.yml` no
+  longer provisions a Redis service and `RECURSIVE_REDIS_URL` is ignored (a
+  note is logged); `RedisSessionStore` stays a library API.
+
 - feat(cost): four-dimensional mid-run budgets (#94). `max_budget_usd` and
   `thinking_budget` were stored-but-dead fields: nothing in the agent loop read
   either, and the HTTP schema still advertised them ("Agent stops after any turn

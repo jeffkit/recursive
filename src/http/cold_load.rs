@@ -396,6 +396,13 @@ async fn build_restored_runtime(
         overrides,
     )
     .seed_transcript(seed)
+    // Issue #92: a restored session must keep persisting per turn,
+    // otherwise it silently regresses to teardown-only after a
+    // restart. The first persist re-reads the stored record and
+    // compares it against the rebuilt transcript: when the stored
+    // system message already matches the reassembled one it appends,
+    // otherwise it resyncs with a full save.
+    .persist_transcript_per_turn(true)
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build restored session runtime: {e}")))?;
     runtime.set_session_id(id);

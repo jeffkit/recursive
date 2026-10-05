@@ -1,4 +1,4 @@
-# Cloud Deployment (S3 + Redis)
+# Cloud Deployment (S3)
 
 For production deployments with multiple users and horizontal scaling.
 
@@ -17,30 +17,34 @@ feature explicitly to enable the cloud backends:
 docker build -t recursive:dev --target runtime --build-arg FEATURES=http,cloud-runtime .
 ```
 
-## Redis (session hot-state)
+## Redis (session hot-state) — not used
 
 `RedisSessionStore` is implemented and integration-tested, but **`recursive http`
-does not consume it yet**: the kernel owns the session-store injection point and
-never checkpoints per turn, so the HTTP server keeps `NoopSessionStore` and only
-logs a note when `RECURSIVE_REDIS_URL` is set. In-flight sessions live in the
-process — route them with sticky sessions. Exposing Redis as a shared session
-table is future work.
-
-```bash
-RECURSIVE_REDIS_URL=redis://your-redis-host:6379
-RECURSIVE_REDIS_KEY_PREFIX=recursive:    # optional namespace
-RECURSIVE_REDIS_SESSION_TTL_SECS=7200    # 2 hours default
-```
+does not consume it**: the kernel owns the session-store injection point and
+never checkpoints per turn, so the HTTP server keeps `NoopSessionStore`. Setting
+`RECURSIVE_REDIS_URL` only logs a note. This direction is closed for the HTTP
+server: per-turn S3 transcripts plus cold load already cover crash recovery, so
+a shared Redis session table would be redundant. `RedisSessionStore` remains
+available through the library API (`AgentRuntimeBuilder::session_store`).
 
 ## S3 (transcript persistence)
 
-When `RECURSIVE_S3_BUCKET` is set, `recursive http` stores full conversation
+When `RECURSIVE_S3_BUCKET` is set, `recursive http` stores conversation
 transcripts, memory entries and per-session metadata in S3, and `GET
-/sessions/:id` cold-loads them on a memory miss — so a session torn down on one
-pod is visible to a sibling replica sharing the bucket. Transcripts are written
-on session teardown (DELETE / idle eviction / graceful shutdown) only, so a
-hard-killed pod can lose the turns since its last save; there is no per-turn
-write.
+/sessions/:id` cold-loads them on a memory miss — so a session from one pod is
+visible to a sibling replica sharing the bucket. The runtime **persists each
+turn's growth** to the transcript (issue #92), so a hard-killed or OOM-killed
+pod loses at most the in-flight turn; a turn that rewrote the transcript
+(compaction, microcompact pruning) is resynced with a full save instead of
+being appended to. Session teardown (DELETE / idle eviction / graceful
+shutdown) still performs a final full save.
+
+S3 objects cannot be appended to, so `S3StorageBackend` takes the trait's
+load-extend-save fallback: every turn rewrites the whole object (a full `GET` +
+`PUT` whose size grows with the transcript), unlike `LocalStorageBackend`, which
+appends in place. On S3 the per-turn write is therefore a cost to weigh against
+the crash-recovery window; batching or a log-segmented layout is the fix if it
+becomes the bottleneck.
 
 ```bash
 RECURSIVE_S3_BUCKET=my-recursive-bucket
@@ -59,10 +63,12 @@ AWS_SECRET_ACCESS_KEY=test
 
 ## Kubernetes example
 
-`replicas: 3` is only safe with sticky routing (e.g. a session-affinity
-`Service`/ingress): a session is served by the pod that created it until it is
-torn down and cold-loaded from S3 elsewhere. Without affinity, round-robin
-traffic returns 404 for sessions held in another pod's memory.
+`replicas: 3` needs sticky routing (e.g. a session-affinity `Service`/ingress)
+because in-flight sessions live in the creating pod's memory. Shared S3 makes
+the transcript durable and cold-loadable elsewhere, but cold load only happens
+on a memory miss: without affinity, round-robin traffic returns 404 for
+sessions held in another pod. Once a session is cold-loaded elsewhere it keeps
+working there.
 
 ```yaml
 apiVersion: apps/v1
@@ -90,8 +96,6 @@ spec:
             secretKeyRef:
               name: recursive-secrets
               key: api-key
-        - name: RECURSIVE_REDIS_URL
-          value: redis://redis-service:6379
         - name: RECURSIVE_S3_BUCKET
           value: my-recursive-bucket
         livenessProbe:

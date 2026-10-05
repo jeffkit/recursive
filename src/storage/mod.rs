@@ -67,6 +67,28 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// new messages before calling this.
     async fn save_transcript(&self, session_id: &str, messages: &[Message]) -> Result<()>;
 
+    /// Append messages to a session's persisted transcript.
+    ///
+    /// This is the incremental-persistence path (issue #92): the HTTP host
+    /// calls it after every turn so a crashed or OOM-killed pod loses at most
+    /// the in-flight turn, instead of every turn since the last teardown.
+    ///
+    /// `messages` are the *new* messages only — callers track what has already
+    /// been persisted, so a full transcript must never be passed here (that
+    /// would duplicate the prefix). Appending an empty slice is a no-op.
+    ///
+    /// The default implementation is a load-extend-save fallback: correct for
+    /// any backend, but it rewrites the whole record, so a backend that can
+    /// append natively (e.g. [`LocalStorageBackend`]) overrides it.
+    async fn append_transcript(&self, session_id: &str, messages: &[Message]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut existing = self.load_transcript(session_id).await?;
+        existing.extend_from_slice(messages);
+        self.save_transcript(session_id, &existing).await
+    }
+
     /// Delete the persisted transcript for a session.
     ///
     /// Idempotent: deleting a session that was never persisted (or whose
@@ -557,6 +579,70 @@ mod tests {
         async fn delete_memory(&self, _key: &str) -> crate::error::Result<()> {
             Ok(())
         }
+    }
+
+    // ── issue #92: default `append_transcript` (load-extend-save) ─────────
+
+    /// Minimal backend that does NOT override `append_transcript`, so the
+    /// trait default (the S3 / non-native-append path) is exercised. The
+    /// #102 `delete_*` hooks are required, so they are stubs here.
+    #[derive(Default)]
+    struct LoadExtendSaveStorage {
+        transcript: std::sync::Mutex<Vec<Message>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for LoadExtendSaveStorage {
+        async fn load_transcript(&self, _session_id: &str) -> Result<Vec<Message>> {
+            Ok(self.transcript.lock().unwrap().clone())
+        }
+
+        async fn save_transcript(&self, _session_id: &str, messages: &[Message]) -> Result<()> {
+            *self.transcript.lock().unwrap() = messages.to_vec();
+            Ok(())
+        }
+
+        async fn delete_transcript(&self, _session_id: &str) -> Result<()> {
+            self.transcript.lock().unwrap().clear();
+            Ok(())
+        }
+
+        async fn load_memory(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn save_memory(&self, _key: &str, _value: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_memory(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_append_transcript_extends_existing_transcript() {
+        let backend = LoadExtendSaveStorage::default();
+        backend
+            .save_transcript("s", &[Message::user("a")])
+            .await
+            .unwrap();
+        backend
+            .append_transcript("s", &[Message::assistant("b")])
+            .await
+            .unwrap();
+
+        let stored = backend.load_transcript("s").await.unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].content, "a");
+        assert_eq!(stored[1].content, "b");
+    }
+
+    #[tokio::test]
+    async fn default_append_transcript_empty_slice_is_noop() {
+        let backend = LoadExtendSaveStorage::default();
+        backend.append_transcript("s", &[]).await.unwrap();
+        assert!(backend.load_transcript("s").await.unwrap().is_empty());
     }
 
     #[tokio::test]

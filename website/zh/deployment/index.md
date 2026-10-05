@@ -6,10 +6,10 @@ Recursive 支持多种部署配置：
 |---|---|
 | **本地** | 开发、单用户、笔记本 |
 | **Docker（单容器）** | 小团队、自托管 |
-| **云端（S3 + Redis）** | 多用户、生产、水平扩展（需 sticky session） |
+| **云端（S3）** | 多用户、生产、水平扩展（需 sticky session） |
 
 ## 导航
 
 - [Docker](./docker) — 单容器和 Compose 配置
-- [云端（S3 + Redis）](./cloud) — 生产部署
+- [云端（S3）](./cloud) — 生产部署
 - [沙箱模式](./sandbox) — local、policy、docker、e2b

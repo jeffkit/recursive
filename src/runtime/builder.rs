@@ -77,6 +77,10 @@ pub struct AgentRuntimeBuilder {
     /// [`crate::register_subagent_if_enabled`] and the runtime, and the
     /// runtime publishes its sink / drains worker usage through it.
     worker_telemetry: Option<crate::tools::WorkerTelemetrySlot>,
+    /// Issue #92: persist the transcript through the injected storage backend
+    /// at the end of every turn (append-only delta) so a crashed host loses at
+    /// most the in-flight turn. Default `false`; `recursive http` opts in.
+    persist_transcript_per_turn: bool,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -127,6 +131,7 @@ impl AgentRuntimeBuilder {
             preset_id: None,
             tool_allow: None,
             worker_telemetry: None,
+            persist_transcript_per_turn: false,
         }
     }
 
@@ -378,11 +383,28 @@ impl AgentRuntimeBuilder {
     /// Goal 396: inject a storage backend, forwarded to the kernel builder
     /// (same forwarding pattern as `compactor`). The HTTP host layer shares
     /// the same `Arc` and persists transcripts on session close/eviction —
-    /// the kernel itself does NOT save per-turn (that would be an O(N²)
-    /// full-transcript write on the hot path). `recursive http` picks the
-    /// backend with [`crate::storage::http_storage_backend`] (issue #92).
+    /// and, with [`persist_transcript_per_turn`](Self::persist_transcript_per_turn),
+    /// after every turn as well. `recursive http` picks the backend with
+    /// [`crate::storage::http_storage_backend`] (issue #92).
     pub fn storage(mut self, storage: Arc<dyn crate::storage::StorageBackend>) -> Self {
         self.kernel_builder = self.kernel_builder.with_storage(storage);
+        self
+    }
+
+    /// Issue #92: persist the transcript to the injected storage backend at
+    /// the end of every turn (appending that turn's delta where the stored
+    /// record is still an exact prefix of the runtime transcript, full-saving
+    /// otherwise), so a host crash loses at most the in-flight turn.
+    ///
+    /// Default `false`: the CLI/TUI already write a per-message session JSONL
+    /// through their own sink, and the kernel must not double-write. The HTTP
+    /// REST session-creation sites opt in, because their sessions live only in
+    /// the process until teardown; AG-UI does not (it reseeds from
+    /// client-supplied messages each run, so a stored prefix never describes
+    /// its transcript). No-op when no session id is set or no storage is
+    /// injected.
+    pub fn persist_transcript_per_turn(mut self, enabled: bool) -> Self {
+        self.persist_transcript_per_turn = enabled;
         self
     }
 
@@ -692,6 +714,9 @@ impl AgentRuntimeBuilder {
             last_failed: crate::kernel::FailureOutcome::default(),
             pending_compact_usage: TokenUsage::default(),
             worker_telemetry: self.worker_telemetry,
+            persist_transcript_per_turn: self.persist_transcript_per_turn,
+            persisted_transcript_len: None,
+            transcript_rewritten: false,
         };
         // Issue #119: publish the freshly built sink into the bridge so any
         // already-registered `agent` tool's workers emit through it.

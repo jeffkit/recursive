@@ -8,7 +8,7 @@ recursive http [OPTIONS]
 
 ## Description
 
-Starts an axum-based HTTP server exposing a REST API with sessions and SSE streaming. In-flight sessions live in the server process; set `RECURSIVE_S3_BUCKET` (with the `cloud-runtime` feature) to share transcripts across replicas and route with sticky sessions — Redis is not consumed yet.
+Starts an axum-based HTTP server exposing a REST API with sessions and SSE streaming. In-flight sessions live in the server process; set `RECURSIVE_S3_BUCKET` (with the `cloud-runtime` feature) to persist each turn's transcript to shared storage so a restart cold-loads it, and route with sticky sessions — Redis is not consumed.
 
 ## Options
 
@@ -44,4 +44,4 @@ curl -N http://localhost:3000/sessions/$SESSION/run \
 ## See also
 
 - [HTTP API reference](../http-api/) — full endpoint documentation
-- [Deployment guide](../deployment/) — Docker, Redis, S3
+- [Deployment guide](../deployment/) — Docker, S3

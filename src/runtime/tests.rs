@@ -3035,3 +3035,537 @@ async fn failed_turn_bills_worker_usage_to_last_failed_usage() {
         crate::tools::WorkerUsage::default()
     );
 }
+
+// ── issue #92: per-turn transcript persistence ─────────────────────
+
+/// Records writes so the tests can assert *which* persistence path ran
+/// (append vs full-save) and what is on "disk". `loads` counts backend reads,
+/// which the watermark fast path is supposed to avoid.
+#[derive(Default)]
+struct RecordingStorage {
+    transcript: std::sync::Mutex<Vec<Message>>,
+    saves: std::sync::atomic::AtomicUsize,
+    appends: std::sync::atomic::AtomicUsize,
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::storage::StorageBackend for RecordingStorage {
+    async fn load_transcript(&self, _session_id: &str) -> crate::error::Result<Vec<Message>> {
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        Ok(self.transcript.lock().unwrap().clone())
+    }
+
+    async fn save_transcript(
+        &self,
+        _session_id: &str,
+        messages: &[Message],
+    ) -> crate::error::Result<()> {
+        self.saves.fetch_add(1, Ordering::Relaxed);
+        *self.transcript.lock().unwrap() = messages.to_vec();
+        Ok(())
+    }
+
+    async fn append_transcript(
+        &self,
+        _session_id: &str,
+        messages: &[Message],
+    ) -> crate::error::Result<()> {
+        self.appends.fetch_add(1, Ordering::Relaxed);
+        self.transcript.lock().unwrap().extend_from_slice(messages);
+        Ok(())
+    }
+
+    async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+}
+
+/// Like [`RecordingStorage`] but its next `fail_appends` appends return a
+/// transient error, so the watermark-reset / gap-repair path is reachable.
+#[derive(Default)]
+struct FlakyStorage {
+    transcript: std::sync::Mutex<Vec<Message>>,
+    fail_appends: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::storage::StorageBackend for FlakyStorage {
+    async fn load_transcript(&self, _session_id: &str) -> crate::error::Result<Vec<Message>> {
+        Ok(self.transcript.lock().unwrap().clone())
+    }
+
+    async fn save_transcript(
+        &self,
+        _session_id: &str,
+        messages: &[Message],
+    ) -> crate::error::Result<()> {
+        *self.transcript.lock().unwrap() = messages.to_vec();
+        Ok(())
+    }
+
+    async fn append_transcript(
+        &self,
+        _session_id: &str,
+        messages: &[Message],
+    ) -> crate::error::Result<()> {
+        let failing = self
+            .fail_appends
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        if failing.is_ok() {
+            return Err(crate::error::Error::Storage {
+                message: "transient append failure".into(),
+            });
+        }
+        self.transcript.lock().unwrap().extend_from_slice(messages);
+        Ok(())
+    }
+
+    async fn load_memory(&self, _key: &str) -> crate::error::Result<Option<String>> {
+        Ok(None)
+    }
+
+    async fn save_memory(&self, _key: &str, _value: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+}
+
+fn reply(text: &str) -> Completion {
+    Completion {
+        content: text.into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+#[tokio::test]
+async fn per_turn_persistence_appends_only_the_delta() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![reply("one"), reply("two")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("hi").await.unwrap();
+    assert_eq!(
+        storage.transcript.lock().unwrap().len(),
+        2,
+        "first turn must persist user + assistant"
+    );
+
+    rt.run("more").await.unwrap();
+    assert_eq!(
+        storage.transcript.lock().unwrap().len(),
+        4,
+        "second turn must append only the new pair"
+    );
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        storage.saves.load(Ordering::Relaxed),
+        0,
+        "no full rewrite on the hot path"
+    );
+    assert_eq!(
+        storage.loads.load(Ordering::Relaxed),
+        1,
+        "only the first turn needs a backend read to resolve the watermark"
+    );
+}
+
+#[tokio::test]
+async fn per_turn_persistence_is_off_by_default() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![reply("one")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("hi").await.unwrap();
+    assert!(storage.transcript.lock().unwrap().is_empty());
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn per_turn_persistence_does_not_duplicate_seeded_transcript() {
+    let storage = Arc::new(RecordingStorage::default());
+    let seeded = vec![Message::user("old"), Message::assistant("old reply")];
+    storage.save_transcript("sess-1", &seeded).await.unwrap();
+
+    let llm = Arc::new(MockProvider::new(vec![reply("fresh")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .seed_transcript(seeded.clone())
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("new").await.unwrap();
+    let stored = storage.transcript.lock().unwrap().clone();
+    assert_eq!(stored.len(), 4, "seed must not be re-appended");
+    assert_eq!(&stored[..2], &seeded[..]);
+    assert_eq!(stored[2].content, "new");
+}
+
+#[tokio::test]
+async fn per_turn_persistence_resyncs_when_stored_record_is_not_a_prefix() {
+    let storage = Arc::new(RecordingStorage::default());
+    let stale: Vec<Message> = vec![
+        Message::user("a"),
+        Message::assistant("b"),
+        Message::user("c"),
+        Message::assistant("d"),
+        Message::user("e"),
+    ];
+    storage.save_transcript("sess-1", &stale).await.unwrap();
+    let saves_before = storage.saves.load(Ordering::Relaxed);
+
+    let llm = Arc::new(MockProvider::new(vec![reply("ok")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("hi").await.unwrap();
+    let memory = rt.transcript().to_vec();
+    assert_eq!(memory.len(), 2);
+    assert_eq!(
+        storage.transcript.lock().unwrap().clone(),
+        memory,
+        "a stored record that is not a prefix of the runtime transcript must be \
+         overwritten, not appended to"
+    );
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 0);
+    assert_eq!(storage.saves.load(Ordering::Relaxed), saves_before + 1);
+}
+
+/// A failed write must NOT advance the watermark: the next turn has to
+/// re-resolve it from the backend and persist the gap, instead of silently
+/// skipping the lost turn forever.
+#[tokio::test]
+async fn per_turn_persistence_repairs_after_a_failed_write() {
+    let storage = Arc::new(FlakyStorage::default());
+    storage.fail_appends.store(1, Ordering::Relaxed);
+    let llm = Arc::new(MockProvider::new(vec![reply("one"), reply("two")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("hi").await.unwrap();
+    assert!(
+        storage.transcript.lock().unwrap().is_empty(),
+        "the failed turn must not be recorded as persisted"
+    );
+
+    rt.run("more").await.unwrap();
+    let stored = storage.transcript.lock().unwrap().clone();
+    assert_eq!(
+        stored.len(),
+        4,
+        "the retry must re-resolve the watermark and persist the whole gap, got {stored:?}"
+    );
+}
+
+/// A legacy / hand-written transcript may lack the runtime's leading system
+/// message entirely. It is then *not* this runtime's prefix — its index 0 is a
+/// user message where the runtime has a system prompt — so it must be resynced
+/// (full save) rather than appended to; appending would either duplicate the
+/// old tail or shift it behind the summary-free system prompt.
+#[tokio::test]
+async fn per_turn_persistence_resyncs_a_disk_prefix_without_system_message() {
+    let storage = Arc::new(RecordingStorage::default());
+    let seeded = vec![Message::user("old"), Message::assistant("old reply")];
+    storage.save_transcript("sess-1", &seeded).await.unwrap();
+    let saves_before = storage.saves.load(Ordering::Relaxed);
+
+    let llm = Arc::new(MockProvider::new(vec![reply("fresh"), reply("more")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .system_prompt("you are a test")
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .seed_transcript(seeded.clone())
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("new").await.unwrap();
+    let memory = rt.transcript().to_vec();
+    assert_eq!(memory[0].role, crate::message::Role::System);
+    assert_eq!(
+        storage.transcript.lock().unwrap().clone(),
+        memory,
+        "the stored record must end up equal to the runtime transcript"
+    );
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 0);
+    assert_eq!(storage.saves.load(Ordering::Relaxed), saves_before + 1);
+
+    // Once resynced, the watermark is valid again and the next turn appends.
+    rt.run("more").await.unwrap();
+    assert_eq!(
+        storage.transcript.lock().unwrap().clone(),
+        rt.transcript().to_vec()
+    );
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.saves.load(Ordering::Relaxed), saves_before + 1);
+}
+
+/// Regression (issue #92 review): cross-turn compaction rewrites the front of
+/// the transcript *after* the turn's messages are in place and *before* the
+/// persist. A watermark taken from the previous turn's length then still looks
+/// plausible — here the post-compaction transcript is one message longer than
+/// the watermark — so a length-based check appends a slice that starts at an
+/// index the stored file does not share, silently corrupting the session
+/// (dropping the summary, and in tool-using turns even the `Assistant`
+/// tool_call that the appended `Tool` result answers).
+#[tokio::test]
+async fn per_turn_persistence_resyncs_after_cross_turn_compaction() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![
+        reply("r1"),
+        reply("r2"),
+        reply("compaction summary"),
+    ]));
+    // keep_recent_n=8 → the first compaction needs 10 messages and leaves the
+    // summary plus 8 kept messages, i.e. it fires on turn 2 with 9 messages —
+    // exactly one past the 8-message watermark.
+    let compactor = crate::compact::Compactor::new(19).keep_recent_n(8);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .compactor(compactor)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .seed_transcript(alternating(6))
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("q1").await.unwrap();
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        storage.saves.load(Ordering::Relaxed),
+        0,
+        "turn 1 never compacted"
+    );
+
+    rt.run("q2").await.unwrap();
+    let memory = rt.transcript().to_vec();
+    assert_eq!(
+        memory.len(),
+        9,
+        "compaction must have replaced the front with a summary, got {memory:?}"
+    );
+    assert!(
+        memory[0].content.starts_with("[compacted:"),
+        "expected the compaction summary at the head, got {:?}",
+        memory[0]
+    );
+    assert_eq!(
+        storage.transcript.lock().unwrap().clone(),
+        memory,
+        "the compaction-rewritten transcript must be resynced, not appended to"
+    );
+    assert_eq!(storage.saves.load(Ordering::Relaxed), 1);
+}
+
+/// Regression (issue #92 review): the case where the post-compaction length
+/// *equals* the watermark. Nothing is appended (there is no delta to append),
+/// so without a rewrite signal the turn is reported as persisted while the
+/// backend still holds the pre-compaction transcript — the client-visible
+/// answer never reaches disk.
+#[tokio::test]
+async fn per_turn_persistence_persists_after_a_length_preserving_compaction() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![
+        reply("r1"),
+        reply("r2"),
+        reply("compaction summary"),
+    ]));
+    // 7 seed + 2 per turn: turn 1 → 9 messages (the watermark), turn 2 → 11,
+    // compacted to 1 + 8 = 9 — the same count, different messages.
+    let compactor = crate::compact::Compactor::new(21).keep_recent_n(8);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .compactor(compactor)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .seed_transcript(alternating(7))
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("q1").await.unwrap();
+    assert_eq!(storage.transcript.lock().unwrap().len(), 9);
+
+    rt.run("q2").await.unwrap();
+    let memory = rt.transcript().to_vec();
+    assert_eq!(memory.len(), 9, "length unchanged: {memory:?}");
+    assert!(
+        memory[0].content.starts_with("[compacted:"),
+        "got {:?}",
+        memory[0]
+    );
+    assert_eq!(
+        storage.transcript.lock().unwrap().clone(),
+        memory,
+        "an acknowledged turn must reach the backend even when the length is unchanged"
+    );
+    assert_eq!(storage.saves.load(Ordering::Relaxed), 1);
+}
+
+/// Regression (issue #92 review): microcompact pruning swaps tool results for
+/// placeholders *in place* — same length, different content. Appending the
+/// next turn's delta onto the un-pruned prefix would leave the backend with
+/// content the runtime no longer has.
+#[tokio::test]
+async fn per_turn_persistence_resyncs_after_microcompact_prune() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![reply("one")]));
+    let mc = crate::compact::Microcompactor::new(2, 1);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .microcompactor(mc)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    // Turn 1 persists a plain exchange, establishing the watermark over those
+    // two messages.
+    rt.run("hi").await.unwrap();
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 1);
+
+    // The tool results land inside the persisted prefix (a tool-using turn
+    // would have appended them the same way), and then cross-turn
+    // microcompaction rewrites their content.
+    let mut msgs = rt.transcript().to_vec();
+    for i in 0..5 {
+        msgs.push(Message::tool_result(format!("call_{i}"), "x".repeat(300)));
+    }
+    *Arc::make_mut(&mut rt.transcript) = msgs;
+    rt.persist_transcript_turn().await;
+    let before = rt.transcript().to_vec();
+    assert_eq!(storage.transcript.lock().unwrap().clone(), before);
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .unwrap();
+    let memory = rt.transcript().to_vec();
+    assert_eq!(
+        memory.len(),
+        before.len(),
+        "pruning must not change the length"
+    );
+    assert!(
+        memory
+            .iter()
+            .any(|m| m.content == crate::compact::MICROCOMPACT_PLACEHOLDER),
+        "expected pruned tool results, got {memory:?}"
+    );
+
+    rt.persist_transcript_turn().await;
+    assert_eq!(
+        storage.transcript.lock().unwrap().clone(),
+        memory,
+        "the pruned content must reach the backend, not just the runtime"
+    );
+    assert_eq!(storage.saves.load(Ordering::Relaxed), 1);
+}
+
+/// Persisting when the backend already holds the transcript must write
+/// nothing (no empty append, no rewrite).
+#[tokio::test]
+async fn per_turn_persistence_is_a_noop_when_backend_matches_memory() {
+    let storage = Arc::new(RecordingStorage::default());
+    let llm = Arc::new(MockProvider::new(vec![reply("one")]));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .storage(storage.clone())
+        .persist_transcript_per_turn(true)
+        .build()
+        .unwrap();
+    rt.set_session_id("sess-1");
+
+    rt.run("hi").await.unwrap();
+    assert_eq!(storage.appends.load(Ordering::Relaxed), 1);
+
+    rt.persist_transcript_turn().await;
+    assert_eq!(
+        storage.appends.load(Ordering::Relaxed),
+        1,
+        "no empty append"
+    );
+    assert_eq!(storage.saves.load(Ordering::Relaxed), 0, "no rewrite");
+    assert_eq!(
+        storage.loads.load(Ordering::Relaxed),
+        1,
+        "watermark is trusted"
+    );
+}
+
+/// `is_stored_prefix` compares content, not counts: a same-length record can
+/// still be a different transcript.
+#[test]
+fn is_stored_prefix_compares_content_not_length() {
+    let a = Message::user("a");
+    let b = Message::assistant("b");
+    let c = Message::user("c");
+
+    assert!(
+        is_stored_prefix(&[], std::slice::from_ref(&a)),
+        "an empty backend is a prefix of anything"
+    );
+    assert!(
+        is_stored_prefix(std::slice::from_ref(&a), std::slice::from_ref(&a)),
+        "identical transcripts"
+    );
+    assert!(
+        is_stored_prefix(std::slice::from_ref(&a), &[a.clone(), b.clone()]),
+        "a strict prefix"
+    );
+    assert!(
+        !is_stored_prefix(&[a.clone(), b.clone()], std::slice::from_ref(&a)),
+        "a longer stored record is not a prefix"
+    );
+    assert!(
+        !is_stored_prefix(&[c], &[a, b]),
+        "same length, different content is not a prefix"
+    );
+}
+
+/// `alternating(n)` builds n messages whose content is 2 chars each, so the
+/// byte estimate of a transcript equals `2 * len` (see [`Compactor`]).
+fn alternating(n: usize) -> Vec<Message> {
+    (0..n)
+        .map(|i| {
+            let content = format!("s{i}");
+            if i % 2 == 0 {
+                Message::user(content)
+            } else {
+                Message::assistant(content)
+            }
+        })
+        .collect()
+}

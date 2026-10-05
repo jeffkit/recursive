@@ -8,7 +8,7 @@ recursive http [选项]
 
 ## 说明
 
-启动基于 axum 的 HTTP 服务器，提供带会话和 SSE 流式输出的 REST API。存活会话在服务器进程内；设置 `RECURSIVE_S3_BUCKET`（配合 `cloud-runtime` feature）可让各副本共享对话记录，并需用 sticky session 路由——Redis 目前未被消费。
+启动基于 axum 的 HTTP 服务器，提供带会话和 SSE 流式输出的 REST API。存活会话在服务器进程内；设置 `RECURSIVE_S3_BUCKET`（配合 `cloud-runtime` feature）可把每轮对话记录增量持久化到共享存储、重启后冷加载，并需用 sticky session 路由——Redis 未被消费。
 
 ## 选项
 
@@ -44,4 +44,4 @@ curl -N http://localhost:3000/sessions/$SESSION/run \
 ## 另见
 
 - [HTTP API 参考](../http-api/) — 完整接口文档
-- [部署指南](../deployment/) — Docker、Redis、S3
+- [部署指南](../deployment/) — Docker、S3

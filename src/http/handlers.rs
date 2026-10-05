@@ -423,7 +423,8 @@ pub(super) fn build_session_runtime(
     .wall_timeout_secs(state.config.wall_timeout_secs)
     // Goal 396: the host layer persists this session's transcript
     // through the same storage backend on teardown (DELETE / idle
-    // eviction / graceful shutdown) — not per turn.
+    // eviction / graceful shutdown). Issue #92 lets a caller that owns a
+    // session id additionally opt into per-turn appends.
     .storage(state.storage.clone())
     // Issue #66 §3.2: token-level streaming for every HTTP entry
     // point (/sessions, /runs, /agui). RunCore only builds the
@@ -498,6 +499,14 @@ fn provider_for_request(
 /// an empty builder. The AG-UI layer (`super::agui::build_agui_runtime`)
 /// layers the provider and wall-clock budget on top, keeping its runtime
 /// build free of `AppState`.
+///
+/// Issue #92: per-turn transcript persistence is deliberately NOT enabled
+/// here. The session-creation sites that own a stable session id opt in with
+/// `.persist_transcript_per_turn(true)` (create / fork / cold load); AG-UI
+/// also builds through this factory but reseeds its transcript from the
+/// client-supplied `messages` on every run, so the append watermark premise
+/// ("on-disk prefix == runtime prefix") does not hold there — it stays
+/// teardown-only.
 pub(super) fn build_session_runtime_parts(
     tool_registry: ToolRegistry,
     system_prompt: String,
@@ -975,14 +984,18 @@ pub(super) async fn create_session(
             thinking_budget: body.thinking_budget,
         },
     )
+    // Issue #92: a session created here has a stable id for its whole life,
+    // so each turn can append its transcript growth to the storage backend.
+    // A crashed host then loses at most the in-flight turn; the host layer
+    // still does a final full save on teardown (DELETE / idle eviction /
+    // graceful shutdown) as a resync.
+    .persist_transcript_per_turn(true)
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
 
     // Register the session ID so all turns emit tracing spans with
-    // session_id. The transcript is NOT saved per turn — the host layer
-    // persists it once on teardown (DELETE / idle eviction / graceful
-    // shutdown) through the storage backend that `build_session_runtime`
-    // wires into the builder (Goal 396).
+    // session_id (and, issue #92, resolve the per-turn persistence
+    // watermark).
     runtime.set_session_id(&id);
 
     // Issue #98: persist the per-session configuration so a cold-loaded
@@ -1572,6 +1585,10 @@ pub(super) async fn fork_session(
         &preset,
         SessionOverrides::default(),
     )
+    // Issue #92: the fork is a real session of its own, so it persists
+    // per turn like a freshly created one — without this a crash loses the
+    // entire fork, which is the failure the issue is about.
+    .persist_transcript_per_turn(true)
     .build()
     .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
@@ -1606,6 +1623,10 @@ pub(super) async fn fork_session(
         .filter(|m| m.role != crate::message::Role::System)
         .count();
     runtime.set_transcript(transcript_snapshot);
+    // Issue #92: register the fork's own id so per-turn persistence writes
+    // under it (the lazily-resolved watermark sees the copied transcript and
+    // appends only what the fork grows afterwards).
+    runtime.set_session_id(&new_id);
 
     let plan_approval_gate = runtime.plan_approval_gate();
     let session = SessionState {
