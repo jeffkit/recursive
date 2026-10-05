@@ -488,9 +488,10 @@ pub(super) fn record_llm_success(metrics: &super::Metrics) {
         .store(now_stamp_ms(), Ordering::Relaxed);
 }
 
-/// Issue #123: the LLM call itself failed — a revoked key, an unreachable
-/// gateway, a malformed provider response (see
-/// [`crate::error::Error::is_llm_failure`]). Drives the `/readyz` streak.
+/// Issue #123: the LLM call failed *provider-side* — a revoked key, a rate
+/// limit, a 5xx, an unreachable gateway, a malformed provider response (see
+/// [`crate::error::Error::is_llm_failure`]; a request-caused 4xx is not one).
+/// Drives the `/readyz` streak.
 pub(super) fn record_llm_failure(metrics: &super::Metrics) {
     metrics
         .llm_failures_consecutive
