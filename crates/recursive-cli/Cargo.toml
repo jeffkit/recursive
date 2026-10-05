@@ -45,6 +45,9 @@ acp = ["recursive/acp"]
 cloud-runtime = ["recursive/cloud-runtime"]
 e2b-sandbox = ["recursive/e2b-sandbox"]
 weixin = ["recursive/weixin"]
+# Issue #93: opt-in durable semantic memory. Without it `recursive::memory::
+# default_backends` returns the no-op pair and `recall` stays keyword-only.
+vector-memory = ["recursive/vector-memory"]
 otel = [
   "dep:opentelemetry",
   "dep:opentelemetry_sdk",

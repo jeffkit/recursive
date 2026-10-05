@@ -11,6 +11,13 @@
 //! ```json
 //! { "notes": [ { "id": "N1", "tags": ["rust"], "text": "...", "ts": "..." } ] }
 //! ```
+//!
+//! Writes go through `crate::atomic::atomic_write` so a crash mid-write can
+//! never leave a truncated `memory.json`. Re-remembering identical text
+//! refreshes that note instead of appending a duplicate, and the store is
+//! capped at [`memory_max_notes`] entries (`RECURSIVE_MEMORY_MAX_NOTES`,
+//! default 1000) with the oldest notes evicted first — so the file cannot grow
+//! without bound, and evicted notes are dropped from the vector index too.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -58,6 +65,10 @@ impl MemoryStore {
     }
 
     /// Save to disk, creating parent directories if needed.
+    ///
+    /// Uses the atomic write-then-rename helper: concurrent `remember` calls,
+    /// or a crash mid-write, must never leave a half-written/malformed
+    /// `memory.json` behind (a corrupt file makes every later `recall` fail).
     fn save(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Tool {
@@ -71,7 +82,7 @@ impl MemoryStore {
             call_id: None,
             message: format!("failed to serialize memory: {e}"),
         })?;
-        std::fs::write(path, raw).map_err(|e| Error::Tool {
+        crate::atomic::atomic_write(path, raw.as_bytes()).map_err(|e| Error::Tool {
             name: "memory".into(),
             call_id: None,
             message: format!("failed to write memory file: {e}"),
@@ -92,7 +103,25 @@ impl MemoryStore {
     }
 
     /// Add a note, returning its ID.
+    ///
+    /// Text that is already stored is not duplicated: the existing note keeps
+    /// its ID, gets a fresh timestamp and absorbs any tags it did not have.
+    /// It also moves to the newest position — it was just re-confirmed, so it
+    /// must not be the first thing [`MemoryStore::enforce_capacity`] throws
+    /// away.
     fn add(&mut self, text: String, tags: Vec<String>) -> String {
+        if let Some(pos) = self.notes.iter().position(|n| n.text == text) {
+            let mut note = self.notes.remove(pos);
+            note.ts = chrono_now_rfc3339();
+            for tag in tags {
+                if !note.tags.contains(&tag) {
+                    note.tags.push(tag);
+                }
+            }
+            let id = note.id.clone();
+            self.notes.push(note);
+            return id;
+        }
         let id = self.next_id();
         let ts = chrono_now_rfc3339();
         self.notes.push(Note {
@@ -102,6 +131,20 @@ impl MemoryStore {
             ts,
         });
         id
+    }
+
+    /// Evict the oldest notes until at most `max` remain, returning their IDs
+    /// in eviction order. `max == 0` disables the cap.
+    ///
+    /// Notes are stored in insertion order, so the front of the vector is the
+    /// oldest. Callers must remove the returned IDs from the vector index as
+    /// well, or a semantic `recall` would resurrect an evicted note.
+    fn enforce_capacity(&mut self, max: usize) -> Vec<String> {
+        if max == 0 || self.notes.len() <= max {
+            return Vec::new();
+        }
+        let overflow = self.notes.len() - max;
+        self.notes.drain(..overflow).map(|n| n.id).collect()
     }
 
     /// Remove a note by ID. Returns true if found.
@@ -200,6 +243,15 @@ pub fn memory_path(workspace: &std::path::Path) -> PathBuf {
     workspace.join(".recursive").join("memory.json")
 }
 
+/// Maximum number of notes kept in the store, from
+/// `RECURSIVE_MEMORY_MAX_NOTES` (default 1000). `0` disables the cap.
+pub fn memory_max_notes() -> usize {
+    std::env::var("RECURSIVE_MEMORY_MAX_NOTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1000)
+}
+
 /// Load the memory store from the workspace-relative path.
 pub fn load_memory(workspace: &std::path::Path) -> Result<MemoryStore> {
     let path = memory_path(workspace);
@@ -255,6 +307,8 @@ pub struct Remember {
     workspace: PathBuf,
     /// Mutex for thread-safe access to the memory file.
     lock: Mutex<()>,
+    /// Maximum number of stored notes; older ones are evicted first.
+    max_notes: usize,
     /// Optional vector store for semantic indexing.
     vector_store: Arc<dyn VectorStore>,
     /// Optional embedding provider for generating vectors.
@@ -266,9 +320,16 @@ impl Remember {
         Self {
             workspace: workspace.into(),
             lock: Mutex::new(()),
+            max_notes: memory_max_notes(),
             vector_store: Arc::new(NoopVectorStore::new()),
             embedding_provider: Arc::new(NoopEmbedding),
         }
+    }
+
+    /// Override the capacity cap (see [`memory_max_notes`]).
+    pub fn with_max_notes(mut self, max: usize) -> Self {
+        self.max_notes = max;
+        self
     }
 
     /// Inject a vector store + embedding provider for semantic indexing.
@@ -339,7 +400,18 @@ impl Tool for Remember {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = memory_path(&self.workspace);
         let mut file_store = MemoryStore::load(&path)?;
-        let id = file_store.add(text.clone(), tags.clone());
+        let id = file_store.add(text.clone(), tags);
+        let evicted = file_store.enforce_capacity(self.max_notes);
+        // Index the tags the file store ended up with, not just the ones this
+        // call passed: re-remembering a note merges the new tags into the
+        // existing one, and the two stores must not disagree about what a note
+        // is tagged with.
+        let indexed_tags = file_store
+            .notes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.tags.clone())
+            .unwrap_or_default();
         file_store.save(&path)?;
         drop(_guard);
 
@@ -348,12 +420,17 @@ impl Tool for Remember {
         let entry = MemoryEntry {
             id: id.clone(),
             text: text.clone(),
-            tags,
+            tags: indexed_tags,
             ts,
         };
         let vector = self.embedding_provider.embed(&text).await;
         if let Err(e) = self.vector_store.upsert(&entry, vector).await {
             tracing::warn!(error = %e, note_id = %id, "remember: vector upsert failed");
+        }
+        for evicted_id in evicted {
+            if let Err(e) = self.vector_store.remove(&evicted_id).await {
+                tracing::warn!(error = %e, note_id = %evicted_id, "remember: eviction from vector store failed");
+            }
         }
 
         Ok(format!("saved note {id}"))
@@ -433,34 +510,33 @@ impl Tool for Recall {
         let limit = arguments["limit"].as_i64().unwrap_or(10) as usize;
 
         // Try vector search first; fall back to file-based keyword search
-        // when the vector store or embedding provider is a no-op.
-        let query_vec = self.embedding_provider.embed(query).await;
+        // when the vector store or embedding provider is a no-op. An empty
+        // query is never embedded — an embedding of "" ranks garbage above
+        // real notes, and a tag/limit-only recall must stay a recency listing.
+        let query_vec = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.embedding_provider.embed(query).await
+        };
         let use_vector = !query_vec.is_empty();
 
         if use_vector || tag.is_none() {
-            // Use the vector store (semantic or keyword fallback inside the store).
-            match self.vector_store.search(query_vec, query, limit).await {
+            // Use the vector store (semantic or keyword fallback inside the
+            // store). It applies the tag filter itself, before its `limit`.
+            match self.vector_store.search(query_vec, query, tag, limit).await {
                 Ok(entries) if !entries.is_empty() => {
-                    // Apply tag filter if requested.
-                    let filtered: Vec<_> = entries
+                    let lines: Vec<String> = entries
                         .iter()
-                        .filter(|e| tag.map_or(true, |t| e.tags.iter().any(|et| et == t)))
-                        .take(limit)
+                        .map(|e| {
+                            let tags_str = if e.tags.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{}]", e.tags.join(","))
+                            };
+                            format!("{}{} {}", e.id, tags_str, e.text)
+                        })
                         .collect();
-                    if !filtered.is_empty() {
-                        let lines: Vec<String> = filtered
-                            .iter()
-                            .map(|e| {
-                                let tags_str = if e.tags.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" [{}]", e.tags.join(","))
-                                };
-                                format!("{}{} {}", e.id, tags_str, e.text)
-                            })
-                            .collect();
-                        return Ok(lines.join("\n"));
-                    }
+                    return Ok(lines.join("\n"));
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -498,6 +574,8 @@ impl Tool for Recall {
 pub struct Forget {
     workspace: PathBuf,
     lock: Mutex<()>,
+    /// Optional vector store the note must also be removed from.
+    vector_store: Arc<dyn VectorStore>,
 }
 
 impl Forget {
@@ -505,7 +583,15 @@ impl Forget {
         Self {
             workspace: workspace.into(),
             lock: Mutex::new(()),
+            vector_store: Arc::new(NoopVectorStore::new()),
         }
+    }
+
+    /// Inject the same vector store the note was indexed into, so `forget`
+    /// deletes both copies.
+    pub fn with_vector_store(mut self, store: Arc<dyn VectorStore>) -> Self {
+        self.vector_store = store;
+        self
     }
 }
 
@@ -544,8 +630,20 @@ impl Tool for Forget {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = memory_path(&self.workspace);
         let mut store = MemoryStore::load(&path)?;
-        if store.remove(&id) {
+        let removed = store.remove(&id);
+        if removed {
             store.save(&path)?;
+        }
+        drop(_guard);
+
+        // Drop the vector copy too: otherwise a later semantic `recall` would
+        // resurrect a note the user asked to forget. This is attempted even
+        // when `memory.json` had no such id — the two stores can drift.
+        if let Err(e) = self.vector_store.remove(&id).await {
+            tracing::warn!(error = %e, note_id = %id, "forget: vector removal failed");
+        }
+
+        if removed {
             Ok(format!("removed {id}"))
         } else {
             Ok(format!("no such id: {id}"))
@@ -1164,6 +1262,348 @@ mod tests {
         let ss: u32 = ts[17..19].parse().expect("seconds must parse");
         assert!(mm < 60, "minutes out of range: {mm}");
         assert!(ss < 60, "seconds out of range: {ss}");
+    }
+
+    // ── capacity / dedup / durable write ─────────────────────────────────────
+
+    #[test]
+    fn add_identical_text_refreshes_instead_of_duplicating() {
+        let mut store = fresh_store();
+        let id1 = store.add("same text".into(), vec!["a".into()]);
+        let id2 = store.add("same text".into(), vec!["b".into()]);
+        assert_eq!(id1, id2, "re-remembering the same text must reuse the id");
+        assert_eq!(
+            store.notes.len(),
+            1,
+            "duplicate text must not be stored twice"
+        );
+        assert_eq!(
+            store.notes[0].tags,
+            vec!["a".to_string(), "b".to_string()],
+            "new tags must be merged into the existing note"
+        );
+    }
+
+    #[test]
+    fn add_refreshed_note_moves_to_the_newest_position() {
+        // Re-confirming an old note must not leave it at the front of the
+        // insertion order, where the next eviction would drop a note the user
+        // just wrote.
+        let mut store = fresh_store();
+        store.add("oldest".into(), vec![]);
+        store.add("newer".into(), vec![]);
+        let refreshed = store.add("oldest".into(), vec![]);
+
+        assert_eq!(refreshed, "N1");
+        assert_eq!(store.notes.len(), 2);
+        assert_eq!(store.notes[1].id, "N1", "refreshed note must be newest");
+
+        let evicted = store.enforce_capacity(1);
+        assert_eq!(evicted, vec!["N2".to_string()]);
+        assert_eq!(store.notes[0].id, "N1");
+    }
+
+    #[test]
+    fn add_different_text_still_appends() {
+        let mut store = fresh_store();
+        store.add("one".into(), vec![]);
+        store.add("two".into(), vec![]);
+        assert_eq!(store.notes.len(), 2, "distinct text must keep appending");
+    }
+
+    #[test]
+    fn enforce_capacity_evicts_oldest_first() {
+        let mut store = fresh_store();
+        for i in 0..5 {
+            store.add(format!("note {i}"), vec![]);
+        }
+        let evicted = store.enforce_capacity(3);
+        assert_eq!(evicted, vec!["N1".to_string(), "N2".to_string()]);
+        assert_eq!(store.notes.len(), 3);
+        assert_eq!(store.notes[0].text, "note 2", "oldest notes go first");
+    }
+
+    #[test]
+    fn enforce_capacity_below_cap_is_a_noop() {
+        let mut store = fresh_store();
+        store.add("only".into(), vec![]);
+        assert!(store.enforce_capacity(1).is_empty());
+        assert!(store.enforce_capacity(5).is_empty());
+        assert_eq!(store.notes.len(), 1);
+    }
+
+    #[test]
+    fn enforce_capacity_zero_disables_the_cap() {
+        let mut store = fresh_store();
+        for i in 0..3 {
+            store.add(format!("n{i}"), vec![]);
+        }
+        assert!(store.enforce_capacity(0).is_empty());
+        assert_eq!(store.notes.len(), 3, "0 means unlimited, not 'evict all'");
+    }
+
+    #[test]
+    fn memory_max_notes_defaults_and_reads_env() {
+        const VAR: &str = "RECURSIVE_MEMORY_MAX_NOTES";
+        let _env_lock = crate::test_util::env_lock();
+        let orig = std::env::var(VAR).ok();
+
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(memory_max_notes(), 1000, "absent env var uses the default");
+
+        unsafe { std::env::set_var(VAR, " 7 ") };
+        assert_eq!(memory_max_notes(), 7, "surrounding whitespace is tolerated");
+
+        unsafe { std::env::set_var(VAR, "not-a-number") };
+        assert_eq!(
+            memory_max_notes(),
+            1000,
+            "unparseable value falls back to the default"
+        );
+
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
+    #[test]
+    fn save_replaces_existing_content_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory.json");
+        let mut store = fresh_store();
+        store.add("first version".into(), vec![]);
+        store.save(&path).unwrap();
+        store.notes[0].text = "second version".into();
+        store.save(&path).unwrap();
+
+        let loaded = MemoryStore::load(&path).unwrap();
+        assert_eq!(loaded.notes[0].text, "second version");
+
+        let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write must clean up its temp file: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_evicts_oldest_notes_from_file_and_vector_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = Arc::new(NoopVectorStore::new());
+        let tool = Remember::new(tmp.path())
+            .with_vector_store(vectors.clone(), Arc::new(NoopEmbedding))
+            .with_max_notes(2);
+
+        for text in ["one", "two", "three"] {
+            tool.execute(json!({ "text": text })).await.unwrap();
+        }
+
+        let stored = MemoryStore::load(&memory_path(tmp.path())).unwrap();
+        assert_eq!(stored.notes.len(), 2, "cap must hold");
+        assert_eq!(stored.notes[0].text, "two");
+        assert_eq!(stored.notes[1].text, "three");
+
+        let indexed = vectors.list_all().await.unwrap();
+        assert_eq!(indexed.len(), 2, "evicted note must leave the vector index");
+        assert!(
+            !indexed.iter().any(|e| e.text == "one"),
+            "the evicted note must not be recallable semantically"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_removes_the_vector_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = Arc::new(NoopVectorStore::new());
+        Remember::new(tmp.path())
+            .with_vector_store(vectors.clone(), Arc::new(NoopEmbedding))
+            .execute(json!({ "text": "a secret" }))
+            .await
+            .unwrap();
+        assert_eq!(vectors.list_all().await.unwrap().len(), 1);
+
+        let out = Forget::new(tmp.path())
+            .with_vector_store(vectors.clone())
+            .execute(json!({ "id": "N1" }))
+            .await
+            .unwrap();
+
+        assert_eq!(out, "removed N1");
+        assert!(
+            vectors.list_all().await.unwrap().is_empty(),
+            "forget must delete the indexed copy too, or recall resurrects it"
+        );
+        assert!(MemoryStore::load(&memory_path(tmp.path()))
+            .unwrap()
+            .notes
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_unknown_id_reports_and_still_clears_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = Arc::new(NoopVectorStore::new());
+        vectors
+            .upsert(
+                &MemoryEntry {
+                    id: "N9".into(),
+                    text: "dangling".into(),
+                    tags: vec![],
+                    ts: "2026-01-01T00:00:00Z".into(),
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let out = Forget::new(tmp.path())
+            .with_vector_store(vectors.clone())
+            .execute(json!({ "id": "N9" }))
+            .await
+            .unwrap();
+
+        assert_eq!(out, "no such id: N9");
+        assert!(
+            vectors.list_all().await.unwrap().is_empty(),
+            "the two stores can drift; forget must clear the index anyway"
+        );
+    }
+
+    /// Counts `embed` calls so the empty-query guard in `Recall` is observable.
+    struct CountingEmbedding {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for CountingEmbedding {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            *self.calls.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            vec![1.0, 0.0]
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_does_not_embed_an_empty_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = memory_path(tmp.path());
+        let mut store = MemoryStore::default();
+        store.add("tagged note".into(), vec!["work".into()]);
+        store.save(&path).unwrap();
+
+        let embedding = Arc::new(CountingEmbedding {
+            calls: Mutex::new(0),
+        });
+        let recall = Recall::new(tmp.path())
+            .with_vector_store(Arc::new(NoopVectorStore::new()), embedding.clone());
+
+        let by_tag = recall
+            .execute(json!({ "tag": "work" }))
+            .await
+            .expect("tag-only recall");
+        assert!(
+            by_tag.contains("tagged note"),
+            "tag filter must still work: {by_tag}"
+        );
+        assert_eq!(
+            *embedding.calls.lock().unwrap_or_else(|e| e.into_inner()),
+            0,
+            "an empty query must not be sent to the embedding endpoint"
+        );
+
+        recall
+            .execute(json!({ "query": "tagged" }))
+            .await
+            .expect("query recall");
+        assert_eq!(
+            *embedding.calls.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "a real query must still be embedded"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_indexes_the_tags_merged_into_an_existing_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = Arc::new(NoopVectorStore::new());
+        let remember =
+            Remember::new(tmp.path()).with_vector_store(vectors.clone(), Arc::new(NoopEmbedding));
+
+        remember
+            .execute(json!({ "text": "same note", "tags": ["a"] }))
+            .await
+            .unwrap();
+        remember
+            .execute(json!({ "text": "same note", "tags": ["b"] }))
+            .await
+            .unwrap();
+
+        let indexed = vectors.list_all().await.unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(
+            indexed[0].tags,
+            vec!["a".to_string(), "b".to_string()],
+            "the indexed copy must carry the tags merged into the file note"
+        );
+
+        let stored = MemoryStore::load(&memory_path(tmp.path())).unwrap();
+        assert_eq!(
+            stored.notes[0].tags, indexed[0].tags,
+            "file and index must agree on a note's tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_applies_the_tag_filter_before_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vectors = Arc::new(NoopVectorStore::new());
+        for (id, text, tag) in [
+            ("N1", "note one", "work"),
+            ("N2", "note two", "other"),
+            ("N3", "note three", "work"),
+        ] {
+            vectors
+                .upsert(
+                    &MemoryEntry {
+                        id: id.into(),
+                        text: text.into(),
+                        tags: vec![tag.into()],
+                        ts: "2026-01-01T00:00:00Z".into(),
+                    },
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+
+        let recall = Recall::new(tmp.path()).with_vector_store(
+            vectors,
+            Arc::new(CountingEmbedding {
+                calls: Mutex::new(0),
+            }),
+        );
+
+        let out = recall
+            .execute(json!({ "query": "note", "tag": "work", "limit": 2 }))
+            .await
+            .unwrap();
+
+        assert!(
+            out.contains("note one") && out.contains("note three"),
+            "both tagged notes must survive the limit: {out}"
+        );
+        assert!(
+            !out.contains("note two"),
+            "the untagged note must be filtered out: {out}"
+        );
+        assert_eq!(out.lines().count(), 2);
     }
 
     // ── Scratchpad unit tests ────────────────────────────────────────────────

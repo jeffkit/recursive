@@ -219,10 +219,21 @@ pub(crate) async fn build_tools(
             .with_transport(transport),
     ));
     registry = registry.with_session_roots(session_roots);
+    // Issue #93: share one vector-memory backend across remember/recall/forget
+    // so the index write, semantic read and delete paths stay in sync.
+    let (memory_store, memory_embedding) = recursive::memory::default_backends(root);
     registry = registry
-        .register(Arc::new(Remember::new(root)))
-        .register(Arc::new(Recall::new(root)))
-        .register(Arc::new(Forget::new(root)));
+        .register(Arc::new(Remember::new(root).with_vector_store(
+            memory_store.clone(),
+            memory_embedding.clone(),
+        )))
+        .register(Arc::new(Recall::new(root).with_vector_store(
+            memory_store.clone(),
+            memory_embedding.clone(),
+        )))
+        .register(Arc::new(
+            Forget::new(root).with_vector_store(memory_store.clone()),
+        ));
     registry = registry
         .register(Arc::new(RememberFact::new(root)))
         .register(Arc::new(RecallFact::new(root)))

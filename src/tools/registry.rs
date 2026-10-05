@@ -1018,6 +1018,11 @@ pub fn build_standard_tools_with_transport_opt(
     // their own LocalTransport — that would silently pin them to the host
     // and undo the sandbox.
     let shared_transport = transport;
+    // Issue #93: one vector-memory backend pair per registry, shared by
+    // remember / recall / forget so the write, read and delete paths agree on
+    // the same index. Without this the tools keep their per-instance
+    // `NoopVectorStore`, so semantic recall is dead code.
+    let (memory_store, memory_embedding) = crate::memory::default_backends(workspace);
     let mut registry = ToolRegistry::new(shared_transport.clone())
         .with_read_file_state(read_state.clone())
         .register_with_aliases(
@@ -1081,9 +1086,17 @@ pub fn build_standard_tools_with_transport_opt(
                 .with_extra_roots(extra_roots.iter().cloned())
                 .with_session_roots_opt(session_roots.clone()),
         ))
-        .register(Arc::new(super::memory::Remember::new(workspace)))
-        .register(Arc::new(super::memory::Recall::new(workspace)))
-        .register(Arc::new(super::memory::Forget::new(workspace)))
+        .register(Arc::new(
+            super::memory::Remember::new(workspace)
+                .with_vector_store(memory_store.clone(), memory_embedding.clone()),
+        ))
+        .register(Arc::new(
+            super::memory::Recall::new(workspace)
+                .with_vector_store(memory_store.clone(), memory_embedding.clone()),
+        ))
+        .register(Arc::new(
+            super::memory::Forget::new(workspace).with_vector_store(memory_store.clone()),
+        ))
         .register(Arc::new(super::facts::RememberFact::new(workspace)))
         .register(Arc::new(super::facts::RecallFact::new(workspace)))
         .register(Arc::new(super::facts::ForgetFact::new(workspace)))

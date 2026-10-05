@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rusqlite::Connection;
 
-use super::{MemoryEntry, VectorStore};
+use super::{matches_tag, MemoryEntry, VectorStore};
 use crate::error::{Error, Result};
 
 /// Shorthand: wrap a rusqlite or IO error as `Error::Storage`.
@@ -79,30 +79,60 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// );
 /// ```
 pub struct SqliteVecStore {
-    db: Mutex<Connection>,
+    path: PathBuf,
+    /// Opened on first use — see [`SqliteVecStore::for_workspace`].
+    db: Mutex<Option<Connection>>,
 }
 
 impl SqliteVecStore {
     /// Open (or create) the SQLite database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let store = Self::at(path.as_ref());
+        store.with_conn(|_| Ok(()))?;
+        Ok(store)
+    }
+
+    /// Convenience: build a store at the default path for `workspace`.
+    ///
+    /// The database file is created on first use, so assembling the memory
+    /// backends for a registry that never calls `remember` / `recall` /
+    /// `forget` leaves no `.recursive/memory_vectors.db` behind.
+    pub fn for_workspace(workspace: impl Into<PathBuf>) -> Self {
+        let mut path = workspace.into();
+        path.push(".recursive");
+        path.push("memory_vectors.db");
+        Self::at(path)
+    }
+
+    fn at(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            db: Mutex::new(None),
+        }
+    }
+
+    fn connect(path: &Path) -> Result<Connection> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| storage_err(e.to_string()))?;
         }
         let conn =
             Connection::open(path).map_err(|e| storage_err(format!("sqlite open failed: {e}")))?;
         Self::init_schema(&conn)?;
-        Ok(Self {
-            db: Mutex::new(conn),
-        })
+        Ok(conn)
     }
 
-    /// Convenience: open a store at the default path for `workspace`.
-    pub fn for_workspace(workspace: impl Into<PathBuf>) -> Result<Self> {
-        let mut path = workspace.into();
-        path.push(".recursive");
-        path.push("memory_vectors.db");
-        Self::open(path)
+    /// Run `f` against the connection, opening the database if it is not open
+    /// yet. All access goes through here so the lazy open happens at most once.
+    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
+        let mut guard = self.db.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(Self::connect(&self.path)?);
+        }
+        match guard.as_ref() {
+            Some(conn) => f(conn),
+            None => Err(storage_err("sqlite connection unavailable")),
+        }
     }
 
     fn init_schema(conn: &Connection) -> Result<()> {
@@ -128,135 +158,146 @@ impl SqliteVecStore {
 #[async_trait]
 impl VectorStore for SqliteVecStore {
     async fn upsert(&self, entry: &MemoryEntry, vector: Vec<f32>) -> Result<()> {
-        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-        let conn = self.db.lock().unwrap();
         let tags_json = serde_json::to_string(&entry.tags).unwrap_or_else(|_| "[]".into());
         let blob = if vector.is_empty() {
             None
         } else {
             Some(vec_to_blob(&vector))
         };
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_entries (id, text, tags, ts, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![entry.id, entry.text, tags_json, entry.ts, blob],
-        )
-        .map_err(|e| storage_err(e.to_string()))?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_entries (id, text, tags, ts, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![entry.id, entry.text, tags_json, entry.ts, blob],
+            )
+            .map_err(|e| storage_err(e.to_string()))?;
+            Ok(())
+        })
     }
 
     async fn search(
         &self,
         query_vec: Vec<f32>,
         query_text: &str,
+        tag: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-        let conn = self.db.lock().unwrap();
+        self.with_conn(|conn| {
+            if !query_vec.is_empty() {
+                // Load all rows with embeddings and rank by cosine similarity.
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, text, tags, ts, embedding FROM memory_entries
+                         WHERE embedding IS NOT NULL",
+                    )
+                    .map_err(|e| storage_err(e.to_string()))?;
 
-        if !query_vec.is_empty() {
-            // Load all rows with embeddings and rank by cosine similarity.
+                let query_dim = query_vec.len();
+                let mut scored: Vec<(f32, MemoryEntry)> = stmt
+                    .query_map([], |row| {
+                        let blob: Vec<u8> = row.get(4)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            blob,
+                        ))
+                    })
+                    .map_err(|e| storage_err(e.to_string()))?
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(id, text, tags_json, ts, blob)| {
+                        let vec = blob_to_vec(&blob);
+                        if vec.len() != query_dim {
+                            tracing::warn!(
+                                entry_id = %id,
+                                entry_dim = vec.len(),
+                                query_dim,
+                                "skipping memory entry: embedding dimension mismatch \
+                                 (embedding model may have changed)"
+                            );
+                            return None;
+                        }
+                        let score = cosine_similarity(&query_vec, &vec);
+                        let entry = Self::row_to_entry(id, text, tags_json, ts);
+                        Some((score, entry))
+                    })
+                    .collect();
+
+                // Sort by descending similarity, then drop non-tagged entries
+                // *before* truncating — `limit` counts returned notes, not
+                // candidates.
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let entries: Vec<MemoryEntry> = scored
+                    .into_iter()
+                    .map(|(_, e)| e)
+                    .filter(|e| matches_tag(e, tag))
+                    .take(limit)
+                    .collect();
+                return Ok(entries);
+            }
+
+            // Fallback: keyword scan. Tags live in a JSON array column rather
+            // than a table of their own, so the tag filter runs in Rust after
+            // the text match — which means no SQL LIMIT: truncating in SQL
+            // would drop tagged rows ranked below the cut-off. The scan stays
+            // small because the note store is capped (RECURSIVE_MEMORY_MAX_NOTES).
+            let q = format!("%{}%", query_text.to_lowercase());
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, text, tags, ts, embedding FROM memory_entries
-                     WHERE embedding IS NOT NULL",
+                    "SELECT id, text, tags, ts FROM memory_entries
+                     WHERE lower(text) LIKE ?1
+                     ORDER BY ts DESC",
                 )
                 .map_err(|e| storage_err(e.to_string()))?;
 
-            let query_dim = query_vec.len();
-            let mut scored: Vec<(f32, MemoryEntry)> = stmt
-                .query_map([], |row| {
-                    let blob: Vec<u8> = row.get(4)?;
+            let entries: Vec<MemoryEntry> = stmt
+                .query_map(rusqlite::params![q], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        blob,
                     ))
                 })
                 .map_err(|e| storage_err(e.to_string()))?
                 .filter_map(|r| r.ok())
-                .filter_map(|(id, text, tags_json, ts, blob)| {
-                    let vec = blob_to_vec(&blob);
-                    if vec.len() != query_dim {
-                        tracing::warn!(
-                            entry_id = %id,
-                            entry_dim = vec.len(),
-                            query_dim,
-                            "skipping memory entry: embedding dimension mismatch \
-                             (embedding model may have changed)"
-                        );
-                        return None;
-                    }
-                    let score = cosine_similarity(&query_vec, &vec);
-                    let entry = Self::row_to_entry(id, text, tags_json, ts);
-                    Some((score, entry))
-                })
+                .map(|(id, text, tags_json, ts)| Self::row_to_entry(id, text, tags_json, ts))
+                .filter(|e| matches_tag(e, tag))
+                .take(limit)
                 .collect();
-
-            // Sort by descending similarity.
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let entries: Vec<MemoryEntry> =
-                scored.into_iter().take(limit).map(|(_, e)| e).collect();
-            return Ok(entries);
-        }
-
-        // Fallback: keyword scan.
-        let q = format!("%{}%", query_text.to_lowercase());
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, text, tags, ts FROM memory_entries
-                 WHERE lower(text) LIKE ?1
-                 ORDER BY ts DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| storage_err(e.to_string()))?;
-
-        let entries: Vec<MemoryEntry> = stmt
-            .query_map(rusqlite::params![q, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|e| storage_err(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .map(|(id, text, tags_json, ts)| Self::row_to_entry(id, text, tags_json, ts))
-            .collect();
-        Ok(entries)
+            Ok(entries)
+        })
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
-        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-        let conn = self.db.lock().unwrap();
-        conn.execute("DELETE FROM memory_entries WHERE id = ?1", [id])
-            .map_err(|e| storage_err(e.to_string()))?;
-        Ok(())
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM memory_entries WHERE id = ?1", [id])
+                .map_err(|e| storage_err(e.to_string()))?;
+            Ok(())
+        })
     }
 
     async fn list_all(&self) -> Result<Vec<MemoryEntry>> {
-        #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
-        let conn = self.db.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, text, tags, ts FROM memory_entries ORDER BY ts")
-            .map_err(|e| storage_err(e.to_string()))?;
-        let entries: Vec<MemoryEntry> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|e| storage_err(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .map(|(id, text, tags_json, ts)| Self::row_to_entry(id, text, tags_json, ts))
-            .collect();
-        Ok(entries)
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id, text, tags, ts FROM memory_entries ORDER BY ts")
+                .map_err(|e| storage_err(e.to_string()))?;
+            let entries: Vec<MemoryEntry> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| storage_err(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .map(|(id, text, tags_json, ts)| Self::row_to_entry(id, text, tags_json, ts))
+                .collect();
+            Ok(entries)
+        })
     }
 }
 
@@ -305,7 +346,10 @@ mod tests {
         store.upsert(&e1, vec![1.0, 0.0, 0.0]).await.unwrap();
         store.upsert(&e2, vec![0.0, 1.0, 0.0]).await.unwrap();
 
-        let results = store.search(vec![1.0, 0.0, 0.0], "", 2).await.unwrap();
+        let results = store
+            .search(vec![1.0, 0.0, 0.0], "", None, 2)
+            .await
+            .unwrap();
         assert_eq!(results[0].id, "E1", "E1 should rank first");
     }
 
@@ -323,7 +367,7 @@ mod tests {
         store.upsert(&e, vec![]).await.unwrap();
 
         // Empty query_vec triggers keyword fallback.
-        let results = store.search(vec![], "fast", 5).await.unwrap();
+        let results = store.search(vec![], "fast", None, 5).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -402,12 +446,108 @@ mod tests {
         store.upsert(&e2, vec![1.0, 0.0]).await.unwrap();
 
         // Query with a 2-d vector — E1 (3-d) must be skipped, only E2 returned.
-        let results = store.search(vec![1.0, 0.0], "", 10).await.unwrap();
+        let results = store.search(vec![1.0, 0.0], "", None, 10).await.unwrap();
         assert_eq!(
             results.len(),
             1,
             "mismatched-dimension entry must be excluded"
         );
         assert_eq!(results[0].id, "E2");
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_applies_the_tag_filter_before_the_keyword_limit() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::open(dir.path().join("test.db")).unwrap();
+
+        for (id, tag, ts) in [
+            ("E1", "work", "2026-01-01T00:00:00Z"),
+            ("E2", "other", "2026-01-01T00:00:01Z"),
+            ("E3", "work", "2026-01-01T00:00:02Z"),
+        ] {
+            let e = MemoryEntry {
+                id: id.into(),
+                text: "common keyword".into(),
+                tags: vec![tag.into()],
+                ts: ts.into(),
+            };
+            store.upsert(&e, vec![]).await.unwrap();
+        }
+
+        // Newest first: E3, E2, E1. E1 only survives if the tag filter runs
+        // before the limit.
+        let results = store
+            .search(vec![], "common", Some("work"), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["E3", "E1"],
+            "the tag filter must run before the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_applies_the_tag_filter_before_the_similarity_limit() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::open(dir.path().join("test.db")).unwrap();
+
+        let wanted = MemoryEntry {
+            id: "E1".into(),
+            text: "wanted".into(),
+            tags: vec!["work".into()],
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        let closer = MemoryEntry {
+            id: "E2".into(),
+            text: "closer but untagged".into(),
+            tags: vec!["other".into()],
+            ts: "2026-01-01T00:00:01Z".into(),
+        };
+        store.upsert(&wanted, vec![0.0, 1.0]).await.unwrap();
+        store.upsert(&closer, vec![1.0, 0.0]).await.unwrap();
+
+        // The query is closest to the untagged entry: picking the top 1 by
+        // similarity first would leave nothing to return.
+        let results = store
+            .search(vec![1.0, 0.0], "", Some("work"), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["E1"]
+        );
+    }
+
+    #[test]
+    fn for_workspace_does_not_touch_the_disk_until_first_use() {
+        let dir = TempDir::new().unwrap();
+        let _store = SqliteVecStore::for_workspace(dir.path());
+        assert!(
+            !dir.path().join(".recursive").exists(),
+            "assembling the backends must not create the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn for_workspace_creates_the_database_on_first_write() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::for_workspace(dir.path());
+        let entry = MemoryEntry {
+            id: "E1".into(),
+            text: "hello world".into(),
+            tags: vec![],
+            ts: "2026-01-01T00:00:00Z".into(),
+        };
+        store.upsert(&entry, vec![]).await.unwrap();
+
+        assert!(
+            dir.path()
+                .join(".recursive")
+                .join("memory_vectors.db")
+                .exists(),
+            "the first write must create the database"
+        );
+        assert_eq!(store.list_all().await.unwrap().len(), 1);
     }
 }

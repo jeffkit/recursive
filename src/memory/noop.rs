@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::{EmbeddingProvider, MemoryEntry, VectorStore};
+use super::{matches_tag, EmbeddingProvider, MemoryEntry, VectorStore};
 use crate::error::Result;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -76,6 +76,7 @@ impl VectorStore for NoopVectorStore {
         &self,
         _query_vec: Vec<f32>,
         query_text: &str,
+        tag: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         #[allow(clippy::unwrap_used, reason = "mutex poison is unrecoverable")]
@@ -87,6 +88,7 @@ impl VectorStore for NoopVectorStore {
                 e.text.to_lowercase().contains(&q)
                     || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
             })
+            .filter(|e| matches_tag(e, tag))
             .take(limit)
             .cloned()
             .collect();
@@ -129,11 +131,11 @@ mod tests {
         };
         store.upsert(&entry, vec![]).await.unwrap();
 
-        let results = store.search(vec![], "systems", 5).await.unwrap();
+        let results = store.search(vec![], "systems", None, 5).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "N1");
 
-        let no_results = store.search(vec![], "python", 5).await.unwrap();
+        let no_results = store.search(vec![], "python", None, 5).await.unwrap();
         assert!(no_results.is_empty());
     }
 
@@ -187,7 +189,7 @@ mod tests {
         };
         store.upsert(&e, vec![]).await.unwrap();
         // Search by tag substring (case-insensitive)
-        let results = store.search(vec![], "rustlang", 5).await.unwrap();
+        let results = store.search(vec![], "rustlang", None, 5).await.unwrap();
         assert_eq!(results.len(), 1, "tag match must be returned");
         assert_eq!(results[0].id, "T1");
     }
@@ -205,8 +207,40 @@ mod tests {
             };
             store.upsert(&e, vec![]).await.unwrap();
         }
-        let results = store.search(vec![], "common", 3).await.unwrap();
+        let results = store.search(vec![], "common", None, 3).await.unwrap();
         assert_eq!(results.len(), 3, "search must be capped at the limit");
+    }
+
+    #[tokio::test]
+    async fn noop_store_applies_the_tag_filter_before_the_limit() {
+        // The tag filter must not be applied to an already-truncated result
+        // set, or a tagged search returns fewer notes than `limit`.
+        let store = NoopVectorStore::new();
+        for (i, (id, tag)) in [("E1", "other"), ("E2", "other"), ("E3", "work")]
+            .into_iter()
+            .enumerate()
+        {
+            let e = MemoryEntry {
+                id: id.to_string(),
+                text: "common keyword".into(),
+                tags: vec![tag.to_string()],
+                ts: format!("2026-01-01T00:00:0{i}Z"),
+            };
+            store.upsert(&e, vec![]).await.unwrap();
+        }
+
+        let results = store
+            .search(vec![], "common", Some("work"), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["E3"],
+            "only the tagged entry is eligible, however deep it sits"
+        );
+
+        let untagged = store.search(vec![], "common", None, 2).await.unwrap();
+        assert_eq!(untagged.len(), 2, "no tag filter keeps the plain limit");
     }
 
     #[tokio::test]

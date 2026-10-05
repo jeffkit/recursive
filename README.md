@@ -193,6 +193,38 @@ export RECURSIVE_MODEL="qwen2.5-coder"
 recursive run "explain the repo layout"
 ```
 
+#### Memory (optional)
+
+`remember` / `recall` / `forget` persist notes to
+`<workspace>/.recursive/memory.json` — written atomically, capped at
+`RECURSIVE_MEMORY_MAX_NOTES` (default `1000`, `0` = unlimited) with the oldest
+notes evicted first, and re-remembering identical text refreshes that note
+instead of appending a duplicate.
+
+Semantic recall (cosine search instead of substring matching) additionally
+needs the `vector-memory` feature and an embeddings endpoint:
+
+```bash
+cargo build -p recursive-cli --features vector-memory
+```
+
+| Env | Fallback | Default | Purpose |
+|---|---|---|---|
+| `RECURSIVE_EMBEDDING_API_BASE` | `RECURSIVE_API_BASE` | `https://api.openai.com/v1` | Embeddings endpoint |
+| `RECURSIVE_EMBEDDING_API_KEY` | `RECURSIVE_API_KEY` | _(none)_ | Embeddings bearer token |
+| `RECURSIVE_EMBEDDING_MODEL` | — | `text-embedding-3-small` | Embedding model |
+
+The dedicated vars win, so embeddings can point somewhere other than the chat
+provider — needed when the chat provider is Anthropic or an in-house gateway
+with no OpenAI-compatible credential to reuse. Reusing the shared
+`RECURSIVE_API_KEY` for embeddings logs a warning: a chat credential is not
+necessarily an embeddings credential. Embedding requests are bounded (5 s to
+connect, 30 s in total), so a dead endpoint costs one failed request and then
+falls back to keyword recall rather than stalling the turn. The index at
+`<workspace>/.recursive/memory_vectors.db` is created on the first write, not
+when the workspace is opened. Without the feature or without a key, `recall`
+degrades to the keyword path instead of failing.
+
 #### Adding a custom provider
 
 The bundled catalog (see `providers.toml`) ships presets for OpenAI,
