@@ -411,6 +411,92 @@ def s32_land冲突_agent只解不收尾_复检推完rebase():
                 check=False).returncode == 0, "复检应把 rebase 推完"
 
 
+def _preflight_code() -> str:
+    """编译后 IR 里 preflight（pre）code 节点的源码——kill-stale 不变量断言用。"""
+    def walk(nodes):
+        for n in nodes:
+            yield n
+            cf = n.get("childFlow")
+            if cf:
+                yield from walk(cf.get("nodes", []))
+    for n in walk(self_improve_v2.__plaita_ir__["nodes"]):
+        if n.get("id") == "pre":
+            return n["code"]
+    raise AssertionError("IR 里找不到 preflight（pre）节点")
+
+
+def _spawn_fake_agent(tmp: Path, *argv: str) -> subprocess.Popen:
+    """伪 recursive agent：真 argv 形态（kill-stale 只按 cmdline 识别）+ 独立会话。"""
+    exe = tmp / "recursive"
+    if not exe.exists():
+        exe.write_text("import time\ntime.sleep(300)\n")
+    return subprocess.Popen([sys.executable, str(exe)] + list(argv),
+                            start_new_session=True)
+
+
+def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
+    """#94：preflight kill-stale 只许杀「本仓 .flowcast/runs 归属 + 宿主已死」的
+    recursive agent。旧实现是「全表 pgrep + 逐 pid killpg」：①自匹配（模式字面量
+    就在自身 cmdline 上）→ killpg 打掉自身进程组、子进程 -15、node 重试耗尽
+    engine_error）；②并发下误杀兄弟 run 的 agent。本场景造三条现场（四条真进程）：
+    - 旧 run 孤儿（宿主已死；v2 --workspace 形态与 v1 --transcript-out 形态各一）→ 必杀；
+    - 兄弟 run 的 agent（宿主 bridge 存活，--run-id 在 ps 里）→ 必活；
+    - 自身/自身进程组 → 必活（流程跑到 committed 即证明没自杀）。"""
+    repo, root = make_repo()
+    old_wt = repo / ".flowcast" / "runs" / "pipeline-77-old" / "worktree"
+    live_wt = repo / ".flowcast" / "runs" / "pipeline-88-live" / "worktree"
+    for p in (old_wt, live_wt):
+        p.mkdir(parents=True, exist_ok=True)
+    tmp = root / "fake"; tmp.mkdir()
+    procs = []
+    try:
+        v2_orphan = _spawn_fake_agent(
+            tmp, "--workspace", str(old_wt), "--output-format", "json",
+            "--permission-mode", "auto", "run", "stub")
+        v1_orphan = _spawn_fake_agent(
+            tmp, "--transcript-out", str(old_wt.parent / "transcript.json"),
+            "--workspace", str(repo))
+        sib_agent = _spawn_fake_agent(
+            tmp, "--workspace", str(live_wt), "--output-format", "json",
+            "--permission-mode", "auto", "run", "stub")
+        bridge = tmp / "self_improve_bridge_v2.py"
+        bridge.write_text("import time\ntime.sleep(300)\n")
+        procs = [v2_orphan, v1_orphan, sib_agent,
+                 subprocess.Popen([sys.executable, str(bridge), "--goal-text",
+                                   "sibling", "--run-id", "pipeline-88-live"],
+                                  start_new_session=True)]
+        time.sleep(1.0)
+
+        AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+        GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+        v = run_flow(repo, root)
+        assert v["verdict"] == "committed", v      # 旧实现此处必 engine_error（自杀）
+
+        time.sleep(0.5)
+        assert v2_orphan.poll() is not None, "旧 run 孤儿（--workspace 形态）应被清掉"
+        assert v1_orphan.poll() is not None, "旧 run 孤儿（--transcript-out 形态）应被清掉"
+        assert sib_agent.poll() is None, "兄弟 run 的 agent 不得被杀（跨 run 误杀）"
+
+        log = Path(v["_run_dir"]) / "kill-stale.log"
+        assert log.exists(), "kill-stale 必须留痕（#94 事故无任何留痕）"
+        text = log.read_text()
+        assert f"killed pid={v2_orphan.pid} " in text, f"被杀清单缺 v2 孤儿: {text}"
+        assert f"killed pid={v1_orphan.pid} " in text, f"被杀清单缺 v1 孤儿: {text}"
+        assert f"killed pid={sib_agent.pid} " not in text, f"兄弟 agent 不该在清单: {text}"
+        assert "pipeline-88-live" in text, \
+            f"兄弟 run 必须被识别为存活宿主（保护它的判据，而非碰巧漏杀）: {text}"
+
+        code = _preflight_code()
+        assert "os.killpg(" not in code, "kill-stale 禁 killpg（打整组 = 自杀/跨 run 风险）"
+        assert "os.kill(" in code, "应逐 pid os.kill(SIGTERM)"
+    finally:
+        for p in procs:
+            try:
+                p.kill(); p.wait(timeout=5)
+            except Exception:
+                pass
+
+
 def s18_全部prompt表达式可解析():
     """$F.concat 常量含转义引号时 pyparsing 匹配失败→静默回退 variable→
     KeyError '$F'（49 实证）。编译期不炸、执行期才炸，harness 桩曾吞异常
@@ -1012,6 +1098,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s30_land冲突_当轮修复环解掉_重推committed,
              s31_land冲突_修复无果_preserved保留WIP,
              s32_land冲突_agent只解不收尾_复检推完rebase,
+             s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run,
              s18_全部prompt表达式可解析,
              s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
              s13_v3_节点异常自动重试, s14_v3_重试耗尽_engine_error,
