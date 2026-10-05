@@ -23,6 +23,13 @@ Any model in Anthropic's Claude family: `claude-opus-4-5`, `claude-sonnet-4-5`,
   that support it). Stored in `Message::thinking_content`.
 - **Streaming**: Implements streaming via `ChatProvider::complete_stream`.
 - **Deferred tools**: Implements `supports_deferred_tools() → true`.
+- **Prompt cache**: `build_request` emits `cache_control: {"type": "ephemeral"}`
+  breakpoints on the system block (covering tools + system) and on the
+  second-to-last message, so Anthropic can reuse the stable prefix instead of
+  re-billing it at full input price every step. On by default for
+  `api.anthropic.com`, off for third-party Anthropic-compatible proxies
+  (DeepSeek, MiniMax, …); override with `RECURSIVE_PROMPT_CACHE=1|0` or
+  `AnthropicProvider::with_prompt_cache`.
 - **Token budget**: Respects `max_tokens` config; defaults to model's context window.
 
 ## Config

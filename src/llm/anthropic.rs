@@ -41,6 +41,9 @@ pub struct AnthropicProvider {
         reason = "API parity placeholder; used once Anthropic adds deferred search"
     )]
     max_search_rounds: usize,
+    /// Explicit `cache_control` opt-in/out. `None` (the default) resolves from
+    /// the endpoint + `RECURSIVE_PROMPT_CACHE` — see `supports_prompt_cache`.
+    prompt_cache: Option<bool>,
 }
 
 impl AnthropicProvider {
@@ -70,7 +73,36 @@ impl AnthropicProvider {
             max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
             max_search_rounds: 3,
+            prompt_cache: None,
         })
+    }
+
+    /// Whether to emit Anthropic `cache_control` breakpoints.
+    ///
+    /// Anthropic only caches a prompt prefix when the request marks it with
+    /// `cache_control: {"type": "ephemeral"}`; without it every ReAct step
+    /// re-bills the full system prompt + tool schemas + history at the regular
+    /// input price. Defaults to on for the official `api.anthropic.com`
+    /// endpoint and off for third-party Anthropic-compatible proxies (DeepSeek,
+    /// MiniMax, …), which mostly ignore or reject the field.
+    /// `RECURSIVE_PROMPT_CACHE=1|true|0|false` overrides either way; an explicit
+    /// `with_prompt_cache()` wins over both.
+    pub fn supports_prompt_cache(&self) -> bool {
+        if let Some(explicit) = self.prompt_cache {
+            return explicit;
+        }
+        match std::env::var("RECURSIVE_PROMPT_CACHE") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+            _ => self.base_url.contains("api.anthropic.com"),
+        }
+    }
+
+    /// Force `cache_control` breakpoints on or off, overriding the endpoint and
+    /// env heuristics in `supports_prompt_cache`.
+    pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
+        self.prompt_cache = Some(enabled);
+        self
     }
 
     /// Build an `Error::Llm` with the model name prefixed.
@@ -193,6 +225,7 @@ impl ChatProvider for AnthropicProvider {
             system.as_deref(),
             &messages,
             tools,
+            self.supports_prompt_cache(),
         );
         let url = format!("{}/v1/messages", self.base_url);
         let text = self.post_with_retry(&url, &body).await?;
@@ -234,6 +267,7 @@ impl AnthropicProvider {
             system.as_deref(),
             &messages,
             tools,
+            self.supports_prompt_cache(),
         );
         body["stream"] = Value::Bool(true);
 
@@ -776,6 +810,7 @@ fn build_request(
     system: Option<&str>,
     messages: &[Message],
     tools: &[ToolSpec],
+    prompt_cache: bool,
 ) -> Value {
     let mut req = serde_json::json!({
         "model": model,
@@ -804,7 +839,83 @@ fn build_request(
         req["tools"] = Value::Array(tools_json);
     }
 
+    if prompt_cache {
+        apply_prompt_cache(&mut req);
+    }
+
     req
+}
+
+/// Add `cache_control` breakpoints to a serialized request so Anthropic's
+/// prompt cache can reuse the stable prefix (tools → system → history) instead
+/// of billing it at the full input price on every ReAct step.
+///
+/// A breakpoint caches everything *up to and including* its own block, and the
+/// API allows four of them. We emit at most two:
+///
+/// - the last system block, which covers tools + system in a single entry — or
+///   the last tool when the request carries no system prompt;
+/// - the second-to-last message, leaving the final (still-mutating) message
+///   outside the prefix so the entry stays reusable on the next step.
+fn apply_prompt_cache(req: &mut Value) {
+    let cached_system = req.get("system").and_then(Value::as_str).map(|sys| {
+        serde_json::json!([{
+            "type": "text",
+            "text": sys,
+            "cache_control": { "type": "ephemeral" },
+        }])
+    });
+    let system_cached = cached_system.is_some();
+    if let Some(system) = cached_system {
+        req["system"] = system;
+    }
+
+    // Without a system block nothing precedes the tool schemas in the cache
+    // prefix, so the breakpoint has to sit on the last tool instead.
+    if !system_cached {
+        if let Some(Value::Array(tools)) = req.get_mut("tools") {
+            if let Some(Value::Object(last)) = tools.last_mut() {
+                last.insert(
+                    "cache_control".into(),
+                    serde_json::json!({"type": "ephemeral"}),
+                );
+            }
+        }
+    }
+
+    if let Some(Value::Array(messages)) = req.get_mut("messages") {
+        if let Some(target) = messages.len().checked_sub(2) {
+            mark_last_content_block(&mut messages[target]);
+        }
+    }
+}
+
+/// Attach a `cache_control` breakpoint to a message's final content block.
+/// A bare string content is widened into a single text block first, since
+/// `cache_control` only exists on blocks.
+fn mark_last_content_block(message: &mut Value) {
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    match content {
+        Value::String(text) => {
+            let text = std::mem::take(text);
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
+        Value::Array(blocks) => {
+            if let Some(Value::Object(last)) = blocks.last_mut() {
+                last.insert(
+                    "cache_control".into(),
+                    serde_json::json!({"type": "ephemeral"}),
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Anthropic's Messages API rejects `oneOf` / `allOf` / `anyOf` at the top
@@ -1274,6 +1385,7 @@ mod tests {
             Some("You are helpful."),
             &[Message::user("Hi".to_string())],
             &[],
+            false,
         );
         assert_eq!(req["system"], "You are helpful.");
         assert_eq!(req["model"], "claude-3");
@@ -1288,6 +1400,7 @@ mod tests {
             None,
             &[Message::user("Hi".to_string())],
             &[],
+            false,
         );
         assert!(req.get("system").is_none());
     }
@@ -1306,8 +1419,258 @@ mod tests {
             None,
             &[Message::user("Hi".to_string())],
             &tools,
+            false,
         );
         assert!(req.get("tools").is_some());
+    }
+
+    fn cache_test_tools() -> Vec<ToolSpec> {
+        vec![
+            ToolSpec {
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "write".to_string(),
+                description: "write a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ]
+    }
+
+    fn tool_loop_messages() -> Vec<Message> {
+        vec![
+            Message::user("do the thing".to_string()),
+            Message::assistant_with_tool_calls(
+                String::new(),
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "a"}),
+                }],
+            ),
+            Message::tool_result("call_1".to_string(), "file contents".to_string()),
+        ]
+    }
+
+    #[test]
+    fn prompt_cache_marks_system_and_second_to_last_message() {
+        let msgs = tool_loop_messages();
+        let body = build_request(
+            "claude-3",
+            0.2,
+            4096,
+            Some("You are helpful."),
+            &msgs,
+            &cache_test_tools(),
+            true,
+        );
+
+        // system widens from a bare string into a block array carrying the
+        // breakpoint that covers tools + system in one cache entry.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "You are helpful.");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // …so the tools must NOT carry a redundant (double-billed) breakpoint.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert!(body["tools"][1].get("cache_control").is_none());
+
+        // The second-to-last wire message anchors the history breakpoint…
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        // …and the final, still-mutating message stays outside the prefix.
+        assert!(body["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn prompt_cache_without_system_anchors_on_last_tool() {
+        let body = build_request(
+            "claude-3",
+            0.2,
+            4096,
+            None,
+            &[Message::user("hi".to_string())],
+            &cache_test_tools(),
+            true,
+        );
+        assert!(body.get("system").is_none());
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        // A lone message has no stable prefix to anchor a second breakpoint.
+        assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn prompt_cache_widens_plain_text_message() {
+        let msgs = vec![
+            Message::user("task".to_string()),
+            Message::assistant("answer".to_string()),
+        ];
+        let body = build_request("claude-3", 0.2, 4096, None, &msgs, &[], true);
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "task",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
+        assert_eq!(body["messages"][1]["content"], "answer");
+    }
+
+    #[test]
+    fn prompt_cache_marks_tool_reference_result_message_at_outer_block() {
+        // A ToolSearch marker serializes as a `tool_result` block whose
+        // *content* is the `tool_reference` beta block. The breakpoint belongs
+        // on the outer `tool_result` (the only block on the wire message).
+        let msgs = vec![
+            Message::user("search for foo".to_string()),
+            Message::assistant_with_tool_calls(
+                String::new(),
+                vec![ToolCall {
+                    id: "call_xyz".to_string(),
+                    name: TOOL_SEARCH_TOOL_NAME.to_string(),
+                    arguments: serde_json::json!({"query": "foo"}),
+                }],
+            ),
+            Message {
+                role: Role::User,
+                content: r#"["notebook_edit"]"#.to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_xyz".to_string()),
+                reasoning_content: None,
+                is_compaction_summary: false,
+            },
+            Message::assistant("done".to_string()),
+        ];
+        let body = build_request("claude-3", 0.2, 4096, None, &msgs, &[], true);
+        let block = &body["messages"][2]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["content"][0]["type"], "tool_reference");
+        assert!(block["content"][0].get("cache_control").is_none());
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn prompt_cache_disabled_leaves_request_untouched() {
+        let msgs = tool_loop_messages();
+        let body = build_request(
+            "claude-3",
+            0.2,
+            4096,
+            Some("You are helpful."),
+            &msgs,
+            &cache_test_tools(),
+            false,
+        );
+        assert_eq!(body["system"], "You are helpful.");
+        assert!(body["tools"][1].get("cache_control").is_none());
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn prompt_cache_default_follows_endpoint_and_env_override() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let orig = std::env::var("RECURSIVE_PROMPT_CACHE").ok();
+        std::env::remove_var("RECURSIVE_PROMPT_CACHE");
+
+        let proxy = AnthropicProvider::new("http://third-party:9999", "sk-noop", "m").unwrap();
+        assert!(
+            !proxy.supports_prompt_cache(),
+            "third-party proxy must default off"
+        );
+        let official = AnthropicProvider::new("https://api.anthropic.com", "sk-noop", "m").unwrap();
+        assert!(
+            official.supports_prompt_cache(),
+            "official endpoint must default on"
+        );
+
+        std::env::set_var("RECURSIVE_PROMPT_CACHE", "true");
+        assert!(proxy.supports_prompt_cache(), "env 'true' opts a proxy in");
+        std::env::set_var("RECURSIVE_PROMPT_CACHE", "0");
+        assert!(
+            !official.supports_prompt_cache(),
+            "env '0' opts the official endpoint out"
+        );
+
+        assert!(
+            AnthropicProvider::new("http://third-party:9999", "sk-noop", "m")
+                .unwrap()
+                .with_prompt_cache(true)
+                .supports_prompt_cache(),
+            "explicit override must beat env + endpoint"
+        );
+        assert!(
+            !AnthropicProvider::new("https://api.anthropic.com", "sk-noop", "m")
+                .unwrap()
+                .with_prompt_cache(false)
+                .supports_prompt_cache(),
+            "explicit override must beat env + endpoint"
+        );
+
+        match orig {
+            Some(v) => std::env::set_var("RECURSIVE_PROMPT_CACHE", v),
+            None => std::env::remove_var("RECURSIVE_PROMPT_CACHE"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_request_carries_cache_control_breakpoints() {
+        // Prove the gate is wired into the real call site, not just
+        // `build_request`: capture what actually goes on the wire.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 16384];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            if let Some(body_start) = request.find("\r\n\r\n") {
+                *captured_clone.lock().unwrap() = request[body_start + 4..].trim().to_string();
+            }
+            let body = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "claude-3-sonnet")
+                .unwrap()
+                .with_prompt_cache(true);
+        let msgs = vec![
+            Message::system("sys".to_string()),
+            Message::user("task".to_string()),
+            Message::assistant("answer".to_string()),
+        ];
+        let _ = provider.stream(&msgs, &[], None, None).await;
+
+        let body: serde_json::Value =
+            serde_json::from_str(&captured.lock().unwrap()).expect("captured request body");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
     }
 
     #[tokio::test]
@@ -1977,7 +2340,15 @@ data: {\"type\":\"message_stop\"}
                 parameters: json!({"type": "object"}),
             },
         ];
-        let body = build_request("claude-3", 0.2, 4096, None, &[Message::user("hi")], &specs);
+        let body = build_request(
+            "claude-3",
+            0.2,
+            4096,
+            None,
+            &[Message::user("hi")],
+            &specs,
+            false,
+        );
         let tools = body["tools"].as_array().expect("tools should be array");
         assert_eq!(tools.len(), 2);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -2072,7 +2443,15 @@ data: {\"type\":\"message_stop\"}
                 "anyOf": [{"required": ["text"]}]
             }),
         }];
-        let body = build_request("claude-3", 0.2, 4096, None, &[Message::user("hi")], &specs);
+        let body = build_request(
+            "claude-3",
+            0.2,
+            4096,
+            None,
+            &[Message::user("hi")],
+            &specs,
+            false,
+        );
         let tool = &body["tools"][0];
         assert!(tool["input_schema"].get("anyOf").is_none());
         assert!(tool["input_schema"]["properties"]["text"].is_object());
