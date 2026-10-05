@@ -13,12 +13,16 @@ docker run -p 3000:3000 \
 
 镜像默认执行 `recursive http --addr 0.0.0.0:3000`，暴露 `/health` 健康检查端点。
 
-## Docker Compose（Redis + S3）
+## Docker Compose（S3 + Redis）
 
 ```bash
 cp .env.example .env    # 填写 RECURSIVE_API_KEY
 docker compose up
 ```
+
+`docker-compose.yml` 起三个服务：`recursive`（HTTP API，构建时带
+`--build-arg FEATURES=http,cloud-runtime`）、`redis`（会话热态预留，`recursive http`
+目前不消费）、`localstack`（S3 兼容的对话记录持久化）。详见 `cloud.md`。
 
 ## 健康探针
 

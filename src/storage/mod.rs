@@ -31,6 +31,9 @@ pub mod s3;
 #[cfg(feature = "cloud-runtime")]
 pub use s3::S3StorageBackend;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use crate::error::Result;
 use crate::message::Message;
 use async_trait::async_trait;
@@ -157,6 +160,135 @@ impl SessionStore for NoopSessionStore {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HTTP backend selection (issue #92)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Env var selecting the S3 transcript backend (`cloud-runtime`).
+pub const ENV_S3_BUCKET: &str = "RECURSIVE_S3_BUCKET";
+/// Env var overriding the S3 object-key prefix.
+pub const ENV_S3_PREFIX: &str = "RECURSIVE_S3_PREFIX";
+/// Env var overriding the S3 tenant namespace inside the bucket.
+pub const ENV_S3_TENANT_ID: &str = "RECURSIVE_S3_TENANT_ID";
+/// Env var selecting a Redis session store.
+///
+/// Recognised but not consumed by `recursive http` yet — see
+/// [`warn_unwired_cloud_env`].
+pub const ENV_REDIS_URL: &str = "RECURSIVE_REDIS_URL";
+
+/// Default S3 key prefix when [`ENV_S3_PREFIX`] is unset.
+pub const DEFAULT_S3_PREFIX: &str = "recursive";
+/// Default S3 tenant namespace when [`ENV_S3_TENANT_ID`] is unset.
+pub const DEFAULT_S3_TENANT_ID: &str = "default";
+
+/// The transcript/memory backend `recursive http` should open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpStorage {
+    /// Local filesystem backend under the per-workspace user dir.
+    Local,
+    /// S3 backend — shared across replicas, so cold load works after a
+    /// restart or on a different pod.
+    S3 {
+        bucket: String,
+        prefix: String,
+        tenant_id: String,
+    },
+}
+
+/// Decide the HTTP transcript backend from an environment lookup.
+///
+/// Pure over `lookup`, so the decision is testable without process-global env
+/// vars, the `cloud-runtime` feature, or a live S3 endpoint. A non-blank
+/// [`ENV_S3_BUCKET`] selects S3; [`ENV_S3_PREFIX`] / [`ENV_S3_TENANT_ID`]
+/// fall back to [`DEFAULT_S3_PREFIX`] / [`DEFAULT_S3_TENANT_ID`].
+pub fn select_http_storage(lookup: &dyn Fn(&str) -> Option<String>) -> HttpStorage {
+    match non_blank(lookup, ENV_S3_BUCKET) {
+        None => HttpStorage::Local,
+        Some(bucket) => HttpStorage::S3 {
+            bucket,
+            prefix: non_blank(lookup, ENV_S3_PREFIX)
+                .unwrap_or_else(|| DEFAULT_S3_PREFIX.to_string()),
+            tenant_id: non_blank(lookup, ENV_S3_TENANT_ID)
+                .unwrap_or_else(|| DEFAULT_S3_TENANT_ID.to_string()),
+        },
+    }
+}
+
+fn non_blank(lookup: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    lookup(key).filter(|value| !value.trim().is_empty())
+}
+
+/// Open the transcript/memory backend `recursive http` should use, reading the
+/// process environment (issue #92).
+///
+/// [`ENV_S3_BUCKET`] selects S3 when the `cloud-runtime` feature is compiled
+/// in; otherwise the local filesystem backend rooted at `workspace_root` is
+/// returned. Cloud env vars the HTTP server does not consume are logged by
+/// [`warn_unwired_cloud_env`].
+///
+/// Not mutated: this is environment plumbing whose decision is pinned by
+/// [`select_http_storage`]'s tests, and whose S3 arm needs a live endpoint.
+#[cfg(feature = "cloud-runtime")]
+#[cfg_attr(test, mutants::skip)]
+pub async fn http_storage_backend(workspace_root: PathBuf) -> Result<Arc<dyn StorageBackend>> {
+    warn_unwired_cloud_env();
+    match select_http_storage(&|key| std::env::var(key).ok()) {
+        HttpStorage::Local => Ok(Arc::new(LocalStorageBackend::new(workspace_root))),
+        HttpStorage::S3 {
+            bucket,
+            prefix,
+            tenant_id,
+        } => {
+            tracing::info!(%bucket, %prefix, %tenant_id, "http storage: S3StorageBackend");
+            Ok(Arc::new(
+                S3StorageBackend::new(bucket, prefix, tenant_id).await?,
+            ))
+        }
+    }
+}
+
+/// [`http_storage_backend`] without the `cloud-runtime` feature: always local.
+#[cfg(not(feature = "cloud-runtime"))]
+#[cfg_attr(test, mutants::skip)]
+pub async fn http_storage_backend(workspace_root: PathBuf) -> Result<Arc<dyn StorageBackend>> {
+    warn_unwired_cloud_env();
+    Ok(Arc::new(LocalStorageBackend::new(workspace_root)))
+}
+
+/// Log cloud env knobs the HTTP server does not consume yet (issue #92).
+///
+/// - Redis hot-state: [`ENV_REDIS_URL`] is recognised but no
+///   `RedisSessionStore` is built — the kernel owns the `SessionStore`
+///   injection point but never checkpoints per turn, so a store would be a
+///   no-op today. The type stays reachable through
+///   `AgentRuntimeBuilder::session_store`.
+/// - S3 without the feature: [`ENV_S3_BUCKET`] only takes effect when the
+///   `cloud-runtime` feature is compiled in.
+///
+/// Both checks treat a blank value as unset (via [`non_blank`]), matching
+/// [`select_http_storage`] — `.env.example` ships empty defaults, so a blank
+/// var must not produce a spurious warning. `warn!` so the notice survives a
+/// `--log warn` / `RUST_LOG=warn` filter.
+///
+/// Logging only, no observable behaviour to pin.
+#[cfg_attr(test, mutants::skip)]
+pub fn warn_unwired_cloud_env() {
+    let env = |key: &str| std::env::var(key).ok();
+    if non_blank(&env, ENV_REDIS_URL).is_some() {
+        tracing::warn!(
+            "RECURSIVE_REDIS_URL is set but `recursive http` does not build a \
+             RedisSessionStore: the kernel has no per-turn checkpoint consumer, so it \
+             would be a no-op. Redis stays available through the library API."
+        );
+    }
+    if !cfg!(feature = "cloud-runtime") && non_blank(&env, ENV_S3_BUCKET).is_some() {
+        tracing::warn!(
+            "RECURSIVE_S3_BUCKET is set but this build was compiled without the \
+             `cloud-runtime` feature; using LocalStorageBackend."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -207,5 +339,68 @@ mod tests {
         let rt: AgentCheckpointState = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.step, 0);
         assert_eq!(rt.transcript_len, 0);
+    }
+
+    // ── issue #92: HTTP backend selection ────────────────────────────────
+
+    #[test]
+    fn select_http_storage_defaults_to_local_when_unset() {
+        let env = |_: &str| None;
+        assert_eq!(select_http_storage(&env), HttpStorage::Local);
+    }
+
+    #[test]
+    fn select_http_storage_reads_bucket_and_fills_defaults() {
+        let env = |key: &str| (key == ENV_S3_BUCKET).then(|| "my-bucket".to_string());
+        assert_eq!(
+            select_http_storage(&env),
+            HttpStorage::S3 {
+                bucket: "my-bucket".to_string(),
+                prefix: DEFAULT_S3_PREFIX.to_string(),
+                tenant_id: DEFAULT_S3_TENANT_ID.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn select_http_storage_honours_prefix_and_tenant_overrides() {
+        let env = |key: &str| match key {
+            ENV_S3_BUCKET => Some("b".to_string()),
+            ENV_S3_PREFIX => Some("transcripts".to_string()),
+            ENV_S3_TENANT_ID => Some("acme".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            select_http_storage(&env),
+            HttpStorage::S3 {
+                bucket: "b".to_string(),
+                prefix: "transcripts".to_string(),
+                tenant_id: "acme".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn select_http_storage_ignores_blank_bucket() {
+        let env = |key: &str| (key == ENV_S3_BUCKET).then(|| "   ".to_string());
+        assert_eq!(select_http_storage(&env), HttpStorage::Local);
+    }
+
+    #[test]
+    fn select_http_storage_blank_prefix_and_tenant_fall_back_to_defaults() {
+        let env = |key: &str| match key {
+            ENV_S3_BUCKET => Some("b".to_string()),
+            ENV_S3_PREFIX => Some(String::new()),
+            ENV_S3_TENANT_ID => Some("  ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            select_http_storage(&env),
+            HttpStorage::S3 {
+                bucket: "b".to_string(),
+                prefix: DEFAULT_S3_PREFIX.to_string(),
+                tenant_id: DEFAULT_S3_TENANT_ID.to_string(),
+            }
+        );
     }
 }

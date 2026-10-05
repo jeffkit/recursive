@@ -35,4 +35,4 @@ recursive sessions delete abc123
 
 Sessions are stored as JSONL files in `~/.recursive/sessions/` by default.
 
-With the `cloud-runtime` feature and Redis configured, sessions are stored in Redis and replicated to S3.
+`recursive http` persists transcripts, memory entries and per-session metadata to S3 when the `cloud-runtime` feature is compiled in and `RECURSIVE_S3_BUCKET` is set — written on session teardown and cold-loaded by `GET /sessions/:id`. Redis is not consumed by `recursive http` yet (library API only).

@@ -25,6 +25,8 @@
 ## 云存储 — Redis
 
 > 需要 `cloud-runtime` feature 标志（`--features cloud-runtime`）。
+> `recursive http` 目前不消费它——内核逐轮 checkpoint 落地前热态仍在进程内；该后端可通过
+> 库 API 使用。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -34,7 +36,8 @@
 
 ## 云存储 — S3
 
-> 需要 `cloud-runtime` feature 标志。
+> 需要 `cloud-runtime` feature 标志。设置 `RECURSIVE_S3_BUCKET` 后，`recursive http`
+> 在会话结束路径把对话记录/内存写入 S3，并在内存 miss 时冷加载。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|

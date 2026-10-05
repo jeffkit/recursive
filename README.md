@@ -29,8 +29,9 @@ Around that kernel the platform adds opt-in surfaces:
   plan mode, and command palette (`crates/recursive-tui`)
 - **Multi-agent** — agent pool, shared memory, messaging bus, plan-mode
   coordination (feature `coordinator-mode`)
-- **Cloud runtime** — Redis session store, S3 transcript storage, Docker /
-  E2B sandboxes (features `cloud-runtime` / `e2b-sandbox`)
+- **Cloud runtime** — S3 transcript storage (wired into `recursive http`),
+  Redis session store + Docker / E2B sandboxes (library API / features
+  `cloud-runtime` / `e2b-sandbox`)
 - **Vector memory** — sqlite-vec + OpenAI embeddings for episodic recall
   (feature `vector-memory`)
 - **Loop mode** — `recursive loop` for self-scheduling autonomous agent runs
@@ -265,15 +266,24 @@ The image defaults to `recursive http --addr 0.0.0.0:3000` and exposes `/health`
 > configured. For local dev, set `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` as a
 > debug escape hatch — never use this in production.
 
-### Full cloud stack (Redis + S3)
+### Full cloud stack (S3 + Redis)
 
-Use the bundled `docker-compose.yml` to spin up Redis (session hot-state) and
-LocalStack S3 (transcript persistence) locally:
+Use the bundled `docker-compose.yml` to spin up LocalStack S3 (transcript
+persistence) and Redis (reserved for session hot-state) locally:
 
 ```bash
 cp .env.example .env          # fill in RECURSIVE_API_KEY
 docker compose up
 ```
+
+The compose image is built with `--build-arg FEATURES=http,cloud-runtime`, so
+`RECURSIVE_S3_BUCKET` selects the shared `S3StorageBackend`: transcripts are
+written on session teardown (DELETE / idle eviction / graceful shutdown) and
+cold-loaded by `GET /sessions/:id` on any replica pointed at the same bucket.
+Redis is provisioned for forward compatibility but **not consumed by
+`recursive http` yet** — the kernel owns the `SessionStore` injection point but
+does not checkpoint per turn, so hot-state is still in-process (see the
+cheatsheet below).
 
 Then talk to the agent over HTTP:
 
@@ -326,9 +336,11 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 #### Cloud storage — Redis (session hot-state)
 
 Requires the `cloud-runtime` feature flag (`--features cloud-runtime`).
-**Not yet wired in http mode**: if `RECURSIVE_REDIS_URL` is set, `recursive http`
-logs "recognized but not yet wired in http mode" at startup and keeps using the
-local backend (Goal 396); wiring the actual Redis/S3 backends is future work.
+**Not consumed by `recursive http` yet**: `RedisSessionStore` is available
+through the library API (`AgentRuntimeBuilder::session_store`), but the kernel
+does not checkpoint per turn, so the HTTP server keeps `NoopSessionStore` and
+only logs a note when `RECURSIVE_REDIS_URL` is set (issue #92). Exposing Redis
+as the session table so replicas share in-flight sessions is future work.
 
 | Env | Default | Purpose |
 |-----|---------|---------|
@@ -338,8 +350,12 @@ local backend (Goal 396); wiring the actual Redis/S3 backends is future work.
 
 #### Cloud storage — S3 (transcript + memory)
 
-Requires the `cloud-runtime` feature flag. Same caveat as Redis: **not yet
-wired in http mode** (recognized + startup log only).
+Requires the `cloud-runtime` feature flag. **Wired into `recursive http`**:
+when `RECURSIVE_S3_BUCKET` is set the server uses `S3StorageBackend` for
+transcripts, memory entries and per-session metadata, so sessions survive a
+restart and are visible to sibling replicas pointed at the same bucket. The
+bucket is only consulted when the feature is compiled in; without it the var is
+inert (a warning is logged).
 
 | Env | Default | Purpose |
 |-----|---------|---------|
@@ -365,11 +381,11 @@ wired in http mode** (recognized + startup log only).
 
 | Concern | Local (default) | Cloud (`cloud-runtime` feature) |
 |---------|-----------------|----------------------------------|
-| Transcript persistence | Local JSONL via `LocalStorageBackend`; HTTP sessions persist on delete / idle eviction / graceful shutdown (Goal 396) — at most the turns after the last save are lost | S3 via `S3StorageBackend` (not yet wired in http mode) |
-| Session hot-state | In-memory (`NoopSessionStore`) | Redis via `RedisSessionStore` (not yet wired in http mode) |
+| Transcript persistence | Local JSONL via `LocalStorageBackend`; HTTP sessions persist on delete / idle eviction / graceful shutdown — at most the turns after the last save are lost | S3 via `S3StorageBackend` when `RECURSIVE_S3_BUCKET` is set (same teardown-only timing) |
+| Session hot-state | In-memory (`NoopSessionStore`), owned by the process | Redis via `RedisSessionStore` — library API only; `recursive http` does not checkpoint per turn yet |
 | Tool execution | Host shell | Docker (L2) or E2B microVM (L3) |
-| Horizontal scaling | Single process | Stateless HTTP pods + shared Redis/S3 (blocked on the storage wiring above) |
-| Resume across restarts | Via `--session` flag (CLI/TUI sessions) | Not available yet — HTTP cold-load from storage is pending (Goal 397); there is no `restore_from_storage()` today |
+| Horizontal scaling | Single process | Shared S3 makes transcripts visible to any replica after teardown; in-flight sessions still live on one pod, so route with sticky sessions (Redis session table is future work) |
+| Resume across restarts | Via `--session` flag (CLI/TUI sessions) | HTTP `GET /sessions/:id` cold-loads from the storage backend (Goal 397) |
 
 ## Library API
 

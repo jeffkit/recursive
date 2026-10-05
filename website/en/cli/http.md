@@ -8,7 +8,7 @@ recursive http [OPTIONS]
 
 ## Description
 
-Starts an axum-based HTTP server exposing a REST API with sessions and SSE streaming. The server is stateless in its default configuration; add Redis and S3 for horizontal scaling.
+Starts an axum-based HTTP server exposing a REST API with sessions and SSE streaming. In-flight sessions live in the server process; set `RECURSIVE_S3_BUCKET` (with the `cloud-runtime` feature) to share transcripts across replicas and route with sticky sessions — Redis is not consumed yet.
 
 ## Options
 

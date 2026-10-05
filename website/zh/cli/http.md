@@ -8,7 +8,7 @@ recursive http [选项]
 
 ## 说明
 
-启动基于 axum 的 HTTP 服务器，提供带会话和 SSE 流式输出的 REST API。默认配置为无状态；添加 Redis 和 S3 可支持水平扩展。
+启动基于 axum 的 HTTP 服务器，提供带会话和 SSE 流式输出的 REST API。存活会话在服务器进程内；设置 `RECURSIVE_S3_BUCKET`（配合 `cloud-runtime` feature）可让各副本共享对话记录，并需用 sticky session 路由——Redis 目前未被消费。
 
 ## 选项
 

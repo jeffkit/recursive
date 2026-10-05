@@ -390,8 +390,10 @@ pub struct AppState {
     /// Empty if no skills found. Goal-312.
     pub skills: Vec<crate::skills::Skill>,
     /// Goal 396: shared transcript persistence backend. Chosen once at HTTP
-    /// startup (CLI default: `LocalStorageBackend` under the per-workspace
-    /// user dir) and injected into every session runtime via
+    /// startup by [`crate::storage::http_storage_backend`] — `S3StorageBackend`
+    /// when `RECURSIVE_S3_BUCKET` is set and the `cloud-runtime` feature is
+    /// compiled in (issue #92), otherwise `LocalStorageBackend` under the
+    /// per-workspace user dir. Injected into every session runtime via
     /// `AgentRuntimeBuilder::storage`. The host layer calls
     /// `save_transcript` on session teardown only — DELETE, idle eviction,
     /// and graceful shutdown — never per turn (that would be an O(N²)

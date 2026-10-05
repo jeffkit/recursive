@@ -4,7 +4,9 @@
 #
 # Multi-stage:
 #   1. `builder` — full Rust toolchain, builds release binary with
-#      the `http` feature so the container can serve the HTTP API.
+#      the `http` feature so the container can serve the HTTP API
+#      (`--build-arg FEATURES=http,cloud-runtime` adds the S3/Redis
+#      cloud-storage backends).
 #   2. `runtime` — debian:bookworm-slim, ca-certificates only,
 #      non-root user, single binary copied in.
 #
@@ -46,6 +48,13 @@ COPY crates/ crates/
 # building the examples and bench targets (faster, smaller layer).
 COPY src/ src/
 
+# Cargo features for the gateway binary. Default `http` keeps the image
+# lean; the bundled cloud stack (docker-compose.yml) passes
+# `http,cloud-runtime` so `RECURSIVE_S3_BUCKET` actually selects the shared
+# S3 transcript backend (issue #92 — without the feature the env var is
+# inert and the server silently stays on local disk).
+ARG FEATURES=http
+
 # BuildKit cache mounts speed repeated builds significantly without
 # committing those caches into the final image. `sharing=locked`
 # serialises concurrent access — required for multi-arch builds
@@ -56,7 +65,7 @@ COPY src/ src/
 RUN --mount=type=cache,target=/build/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p recursive-cli --features http --bin recursive && \
+    cargo build --release -p recursive-cli --features "$FEATURES" --bin recursive && \
     cp target/release/recursive /tmp/recursive
 
 # ──────────────────────────────────────────────────────────────────────

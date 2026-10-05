@@ -1,4 +1,4 @@
-# Cloud Deployment (Redis + S3)
+# Cloud Deployment (S3 + Redis)
 
 For production deployments with multiple users and horizontal scaling.
 
@@ -10,11 +10,21 @@ Build with the `cloud-runtime` feature:
 cargo build --release --features cloud-runtime
 ```
 
-Or use the Docker image (cloud-runtime is included).
+The bundled Dockerfile builds `recursive http` with `http` only; pass the
+feature explicitly to enable the cloud backends:
+
+```bash
+docker build -t recursive:dev --target runtime --build-arg FEATURES=http,cloud-runtime .
+```
 
 ## Redis (session hot-state)
 
-Sessions are stored in Redis for fast access and cross-pod sharing.
+`RedisSessionStore` is implemented and integration-tested, but **`recursive http`
+does not consume it yet**: the kernel owns the session-store injection point and
+never checkpoints per turn, so the HTTP server keeps `NoopSessionStore` and only
+logs a note when `RECURSIVE_REDIS_URL` is set. In-flight sessions live in the
+process — route them with sticky sessions. Exposing Redis as a shared session
+table is future work.
 
 ```bash
 RECURSIVE_REDIS_URL=redis://your-redis-host:6379
@@ -22,11 +32,15 @@ RECURSIVE_REDIS_KEY_PREFIX=recursive:    # optional namespace
 RECURSIVE_REDIS_SESSION_TTL_SECS=7200    # 2 hours default
 ```
 
-Sessions automatically expire after TTL. Extend the TTL on each access.
-
 ## S3 (transcript persistence)
 
-Full conversation transcripts and memory are stored in S3.
+When `RECURSIVE_S3_BUCKET` is set, `recursive http` stores full conversation
+transcripts, memory entries and per-session metadata in S3, and `GET
+/sessions/:id` cold-loads them on a memory miss — so a session torn down on one
+pod is visible to a sibling replica sharing the bucket. Transcripts are written
+on session teardown (DELETE / idle eviction / graceful shutdown) only, so a
+hard-killed pod can lose the turns since its last save; there is no per-turn
+write.
 
 ```bash
 RECURSIVE_S3_BUCKET=my-recursive-bucket
@@ -44,6 +58,11 @@ AWS_SECRET_ACCESS_KEY=test
 ```
 
 ## Kubernetes example
+
+`replicas: 3` is only safe with sticky routing (e.g. a session-affinity
+`Service`/ingress): a session is served by the pod that created it until it is
+torn down and cold-loaded from S3 elsewhere. Without affinity, round-robin
+traffic returns 404 for sessions held in another pod's memory.
 
 ```yaml
 apiVersion: apps/v1

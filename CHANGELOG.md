@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- feat(http): wire the S3 transcript backend into `recursive http` (#92). With
+  the `cloud-runtime` feature compiled in, `RECURSIVE_S3_BUCKET` now selects
+  `S3StorageBackend` for transcripts, memory and per-session metadata instead of
+  logging "recognized but not yet wired" and silently staying on local disk, so
+  `GET /sessions/:id` cold-loads a session torn down on a sibling replica that
+  shares the bucket. Selection is a pure, unit-tested function
+  (`storage::select_http_storage`); the decision is made once at startup via
+  `storage::http_storage_backend`. The bundled Dockerfile gained a `FEATURES`
+  build arg (default `http`), and `docker-compose.yml` builds with
+  `http,cloud-runtime`, closing the gap where the "full cloud stack" compose
+  built a binary that could not use the configured bucket. Persistence timing is
+  unchanged (teardown only: DELETE / idle eviction / graceful shutdown).
+  Redis session hot-state remains **not** consumed by `recursive http`:
+  `RedisSessionStore` is available through the library API, but the kernel does
+  not checkpoint per turn, so injecting it would be a no-op — the server logs a
+  precise note instead, and the cloud docs now state the sticky-session
+  requirement for multi-replica deployments.
+
 - fix(http): rate-limit key no longer trusts a client-forged `X-Forwarded-For`
   (#107). The old `extract_client_key` took the **leftmost** XFF entry
   unconditionally, so a direct-connected client could mint a fresh full token

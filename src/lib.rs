@@ -144,7 +144,8 @@ pub use storage::RedisSessionStore;
 #[cfg(feature = "cloud-runtime")]
 pub use storage::S3StorageBackend;
 pub use storage::{
-    AgentCheckpointState, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
+    http_storage_backend, select_http_storage, warn_unwired_cloud_env, AgentCheckpointState,
+    HttpStorage, LocalStorageBackend, NoopSessionStore, SessionStore, StorageBackend,
 };
 pub use system_prompt::{
     assemble_system_prompt, assemble_system_prompt_with_environment, AssembledPrompt,

@@ -241,7 +241,8 @@ impl AgentRuntimeBuilder {
     /// (same forwarding pattern as `compactor`). The HTTP host layer shares
     /// the same `Arc` and persists transcripts on session close/eviction —
     /// the kernel itself does NOT save per-turn (that would be an O(N²)
-    /// full-transcript write on the hot path).
+    /// full-transcript write on the hot path). `recursive http` picks the
+    /// backend with [`crate::storage::http_storage_backend`] (issue #92).
     pub fn storage(mut self, storage: Arc<dyn crate::storage::StorageBackend>) -> Self {
         self.kernel_builder = self.kernel_builder.with_storage(storage);
         self
@@ -249,8 +250,9 @@ impl AgentRuntimeBuilder {
 
     /// Goal 396: inject a session hot-state store, forwarded to the kernel
     /// builder. The local default stays [`crate::storage::NoopSessionStore`]
-    /// (zero cost); cloud deployments inject Redis (wiring still pending —
-    /// recognized-but-unwired at HTTP startup).
+    /// (zero cost). `recursive http` does not inject Redis yet — the kernel
+    /// owns the injection point but never checkpoints per turn, so an HTTP
+    /// store would be a no-op (issue #92).
     pub fn session_store(mut self, store: Arc<dyn crate::storage::SessionStore>) -> Self {
         self.kernel_builder = self.kernel_builder.with_session_store(store);
         self

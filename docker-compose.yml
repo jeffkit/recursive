@@ -1,8 +1,10 @@
 # docker-compose.yml — Local cloud-stack for Recursive
 #
 # Spins up three services:
-#   recursive  — the agent HTTP gateway (recursive serve)
-#   redis      — hot session state (AgentCheckpointState via RedisSessionStore)
+#   recursive  — the agent HTTP gateway (recursive http), built with
+#                `cloud-runtime` so RECURSIVE_S3_BUCKET selects S3
+#   redis      — reserved for session hot-state (see note below; not consumed
+#                by `recursive http` yet)
 #   localstack — AWS-compatible S3 emulation for transcript/memory storage
 #
 # Usage:
@@ -10,7 +12,7 @@
 #   docker compose up recursive # start only the agent (requires external Redis/S3 or defaults)
 #
 # Build the image first (or rely on published image):
-#   docker build -t recursive:dev --target runtime .
+#   docker build -t recursive:dev --target runtime --build-arg FEATURES=http,cloud-runtime .
 #
 # Minimum required env:
 #   RECURSIVE_API_KEY — your LLM provider API key (passed via .env or -e)
@@ -26,6 +28,9 @@ services:
       target: runtime
       args:
         RUST_VERSION: "1.86"
+        # Issue #92: cloud-runtime wires `RECURSIVE_S3_BUCKET` to the shared
+        # S3 transcript backend. Without it the env var below is inert.
+        FEATURES: "http,cloud-runtime"
     ports:
       - "3000:3000"
     environment:
@@ -44,6 +49,9 @@ services:
       RECURSIVE_HTTP_AUTH_KEYS: "${RECURSIVE_HTTP_AUTH_KEYS:-}"
 
       # ── Cloud storage backend (Redis) ──
+      # Set for forward compatibility: `recursive http` recognises the var but
+      # does not build a RedisSessionStore yet (no per-turn checkpoint consumer),
+      # so hot-state is still in-process. See README "Full cloud stack".
       RECURSIVE_REDIS_URL: "redis://redis:6379"
       RECURSIVE_REDIS_KEY_PREFIX: "recursive:dev:"
       RECURSIVE_REDIS_SESSION_TTL_SECS: "7200"

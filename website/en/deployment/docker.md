@@ -21,8 +21,10 @@ docker compose up
 ```
 
 The bundled `docker-compose.yml` spins up:
-- **recursive** — the HTTP API server (port 3000)
-- **redis** — session hot-state
+- **recursive** — the HTTP API server (port 3000), built with
+  `--build-arg FEATURES=http,cloud-runtime`
+- **redis** — reserved for session hot-state (not consumed by `recursive http`
+  yet; see `cloud.md`)
 - **localstack** — S3-compatible transcript persistence (for local development)
 
 ## Environment variables
@@ -36,7 +38,7 @@ RECURSIVE_MODEL=gpt-4o-mini
 RECURSIVE_HTTP_ADDR=0.0.0.0:3000
 ```
 
-For cloud storage, also set:
+For cloud storage, build the image with the `cloud-runtime` feature and set:
 
 ```bash
 RECURSIVE_REDIS_URL=redis://redis:6379
@@ -45,6 +47,10 @@ AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
 ```
+
+`RECURSIVE_S3_BUCKET` selects the S3 transcript backend. `RECURSIVE_REDIS_URL`
+is recognised but the HTTP server does not build a Redis session store yet
+(no per-turn checkpoint consumer).
 
 ## Health probe
 

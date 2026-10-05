@@ -882,32 +882,21 @@ async fn main() -> anyhow::Result<()> {
                     std::sync::Arc::clone(&metrics.runs_in_flight),
                 ),
             ));
-            // Goal 396: session transcript persistence. Default backend is
-            // the local filesystem rooted at the per-workspace user dir, so
-            // HTTP transcripts land as siblings of the CLI session directory
-            // (<user_workspace_dir>/.recursive/sessions/<id>.jsonl). Redis /
-            // S3 backends are recognized but deliberately not wired yet —
-            // half-wired cloud storage is worse than none.
-            for (env_var, backend) in [
-                ("RECURSIVE_REDIS_URL", "RedisSessionStore"),
-                ("RECURSIVE_S3_BUCKET", "S3StorageBackend"),
-            ] {
-                if std::env::var_os(env_var).is_some() {
-                    eprintln!(
-                        "storage: {env_var} is set — {backend} recognized but not yet wired \
-                         in http mode; using LocalStorageBackend"
-                    );
-                }
-            }
-            // Goal 397: transcripts live under
-            // `<workspace-data>/.recursive/sessions/<id>.jsonl` (the
-            // LocalStorageBackend layout). Cold load reads this same backend
-            // to restore sessions after a restart; Goal 396 wires the write
-            // path through it.
+            // Issue #92: session transcript persistence. `http_storage_backend`
+            // picks the backend from the environment: `RECURSIVE_S3_BUCKET`
+            // (with `cloud-runtime` compiled in) selects the shared S3 backend
+            // so sessions survive a restart and are visible to a sibling
+            // replica via cold load; otherwise it stays on the local
+            // filesystem rooted at the per-workspace user dir, where HTTP
+            // transcripts land as siblings of the CLI session directory
+            // (<user_workspace_dir>/.recursive/sessions/<id>.jsonl). Cloud env
+            // vars the HTTP server does not consume (Redis hot-state) are
+            // logged by the resolver.
             let storage: std::sync::Arc<dyn recursive::storage::StorageBackend> =
-                std::sync::Arc::new(recursive::storage::LocalStorageBackend::new(
-                    recursive::user_workspace_dir(&config.workspace)?,
-                ));
+                recursive::storage::http_storage_backend(recursive::user_workspace_dir(
+                    &config.workspace,
+                )?)
+                .await?;
             // Issue #105: bind the notify file-target sandbox root (and the
             // cron/webhook trigger stores derive from the same workspace).
             // One bind at startup; delivery and registration share it.
@@ -4001,5 +3990,34 @@ mod tests {
         if let Some(v) = previous {
             std::env::set_var("RECURSIVE_TRACE_SPANS", v);
         }
+    }
+
+    /// Issue #92: the `recursive http` startup path resolves its storage
+    /// backend through `recursive::storage::http_storage_backend`. With no
+    /// bucket configured it must stay on the local filesystem backend — the
+    /// layout the HTTP cold-load path reads back (`load_transcript`).
+    #[tokio::test]
+    async fn http_storage_backend_defaults_to_local_filesystem() {
+        std::env::remove_var(recursive::storage::ENV_S3_BUCKET);
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let backend = recursive::storage::http_storage_backend(workspace.path().to_path_buf())
+            .await
+            .expect("build backend");
+
+        let messages = vec![recursive::message::Message::user("hello".to_string())];
+        backend
+            .save_transcript("sess", &messages)
+            .await
+            .expect("save transcript");
+
+        let path = workspace.path().join(".recursive/sessions/sess.jsonl");
+        assert!(path.exists(), "expected local layout at {}", path.display());
+        assert_eq!(
+            backend
+                .load_transcript("sess")
+                .await
+                .expect("load transcript"),
+            messages
+        );
     }
 }

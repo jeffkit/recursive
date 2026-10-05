@@ -41,6 +41,7 @@ agent kill rate the same way `.dev/mutant-debt-20260701.md` did for TUI.
 - `serve_with_graceful_shutdown` — e2e/http covered, unit-mutant noise
 - `validate_session_id` path-separator OR — extracted to `session_id_has_path_separator` + `#[mutants::skip]`; slash/backslash unit tests still pin each arm
 - `health` / `generate_session_id` / `openapi_spec` / `list_slash_commands` / `list_tools` — constant / UUID / thin-wrapper / pure clone; soft-skipped
+- `src/storage/mod.rs::{http_storage_backend, warn_unwired_cloud_env}` (issue #92) — env plumbing + logging only; the decision is pinned by `select_http_storage` unit tests (default/prefix/tenant/blank arms), and the S3-construction arm needs a live endpoint; soft-skipped per the `src/llm/openai.rs` warn-helper precedent
 
 ## Cadence
 
