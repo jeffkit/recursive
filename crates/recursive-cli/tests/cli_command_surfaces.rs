@@ -1,6 +1,6 @@
 //! Black-box spawn tests for `recursive`'s *command* surfaces: `doctor`,
-//! `mcp`, `update`, `agents`, `providers`, and the `serve` MCP-stdio
-//! dispatcher.
+//! `mcp`, `update`, `agents`, `providers`, `workspace`, and the `serve`
+//! MCP-stdio dispatcher.
 //!
 //! Every test spawns the real binary in a hermetic `RECURSIVE_HOME` +
 //! workspace and asserts on stdout / stderr / exit code. That is deliberate:
@@ -395,6 +395,141 @@ fn update_reports_non_success_status() {
         stdout.contains("GitHub API returned status 500"),
         "non-success status not reported: {stdout}"
     );
+}
+
+// ─── workspace ───────────────────────────────────────────────────────────────
+
+/// Register `cli`'s workspace directory under a stable display name.
+fn add_demo_workspace(cli: &Cli) {
+    let out = cli.run(&[
+        "workspace",
+        "add",
+        cli.workspace_path().to_str().expect("utf-8 path"),
+        "--name",
+        "demo",
+    ]);
+    assert!(out.status.success(), "workspace add failed: {out:?}");
+}
+
+/// Drop an `Active` session header where the store-backed activity probe looks
+/// it up: the harness pins `RECURSIVE_SESSIONS_DIR`, a hard override the probe
+/// honours for every workspace.
+fn write_active_session(sessions: &Path, session_id: &str) {
+    let dir = sessions.join("slug").join(session_id);
+    std::fs::create_dir_all(&dir).expect("mkdir session");
+    std::fs::write(
+        dir.join(".meta.json"),
+        format!(
+            r#"{{
+                "session_id": "{session_id}",
+                "goal": "working on it",
+                "model": "m",
+                "provider": "openai",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "message_count": 1,
+                "status": "active"
+            }}"#
+        ),
+    )
+    .expect("write meta");
+}
+
+/// The whole lifecycle end to end: add → list (archived hidden) → archive →
+/// list --all → remove, with the registered directory left on disk.
+#[test]
+fn workspace_lifecycle_roundtrips_without_deleting_the_directory() {
+    let cli = Cli::new();
+    add_demo_workspace(&cli);
+
+    let listed = stdout_of(&cli.run(&["workspace", "list"]));
+    assert!(
+        listed.contains("demo"),
+        "added workspace not listed: {listed}"
+    );
+    assert!(
+        listed.contains("[active]"),
+        "not listed as active: {listed}"
+    );
+
+    let archived = cli.run(&["workspace", "archive", "demo"]);
+    assert!(archived.status.success(), "archive failed: {archived:?}");
+    assert!(
+        stdout_of(&archived).contains("Archived"),
+        "archive not reported: {archived:?}"
+    );
+
+    // `list` hides archived workspaces; `list --all` shows them.
+    let active_only = stdout_of(&cli.run(&["workspace", "list"]));
+    assert!(
+        active_only.contains("No workspaces registered."),
+        "archived workspace still shown by default: {active_only}"
+    );
+    let all = stdout_of(&cli.run(&["workspace", "list", "--all"]));
+    assert!(
+        all.contains("demo") && all.contains("[archived]"),
+        "archived workspace missing from --all: {all}"
+    );
+
+    let removed = cli.run(&["workspace", "remove", "demo"]);
+    assert!(removed.status.success(), "remove failed: {removed:?}");
+    let after = stdout_of(&cli.run(&["workspace", "list", "--all"]));
+    assert!(
+        after.contains("No workspaces registered."),
+        "removed workspace still listed: {after}"
+    );
+    assert!(
+        cli.workspace_path().exists(),
+        "remove must not delete the directory"
+    );
+}
+
+/// `Admit` (no `--stop`): a live turn blocks the archive with exit 1 and the
+/// workspace stays active.
+#[test]
+fn workspace_archive_refuses_while_work_is_running() {
+    let cli = Cli::new();
+    add_demo_workspace(&cli);
+    write_active_session(cli.sessions.path(), "sess-1");
+
+    let out = cli.run(&["workspace", "archive", "demo"]);
+    assert_eq!(out.status.code(), Some(1), "archive should refuse: {out:?}");
+    assert!(
+        stderr_of(&out).contains("active work"),
+        "refusal not explained: {out:?}"
+    );
+    let listed = stdout_of(&cli.run(&["workspace", "list"]));
+    assert!(
+        listed.contains("demo") && listed.contains("[active]"),
+        "a refused archive must not archive: {listed}"
+    );
+}
+
+/// `--stop`: the archive lands, but work the probe cannot reach (a live turn)
+/// must be reported as *left running*, never as stopped.
+#[test]
+fn workspace_archive_stop_reports_a_live_turn_as_left_running() {
+    let cli = Cli::new();
+    add_demo_workspace(&cli);
+    write_active_session(cli.sessions.path(), "sess-1");
+
+    let out = cli.run(&["workspace", "archive", "demo", "--stop"]);
+    assert!(out.status.success(), "archive --stop failed: {out:?}");
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("Archived"),
+        "archive not reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("left running turn sess-1"),
+        "live turn not reported honestly: {stdout}"
+    );
+    assert!(
+        !stdout.contains("stopped turn"),
+        "a disk-only probe cannot stop a turn: {stdout}"
+    );
+    let all = stdout_of(&cli.run(&["workspace", "list", "--all"]));
+    assert!(all.contains("[archived]"), "archive not persisted: {all}");
 }
 
 // ─── serve (MCP stdio dispatcher) ────────────────────────────────────────────

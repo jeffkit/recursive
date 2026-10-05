@@ -7,3 +7,4 @@ pub(crate) mod observability;
 pub(crate) mod output;
 pub(crate) mod resume;
 pub(crate) mod session;
+pub(crate) mod workspace;

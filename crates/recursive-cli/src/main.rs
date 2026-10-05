@@ -351,6 +351,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Manage workspaces (projects): register by realpath, index their
+    /// sessions (headers only), archive under an admission gate, and remove
+    /// from the registry without deleting anything on disk.
+    Workspace {
+        #[command(subcommand)]
+        cmd: cli::workspace::WorkspaceCmd,
+    },
     /// View or modify configuration.
     Config {
         #[command(subcommand)]
@@ -1122,6 +1129,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Cmd::Workspace { cmd } => cli::workspace::run(cmd),
         Cmd::Sessions { cmd } => match cmd {
             SessionCmd::List => {
                 let old_sessions = recursive::session::list_sessions(&config.workspace)?;

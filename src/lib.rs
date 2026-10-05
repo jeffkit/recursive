@@ -74,6 +74,7 @@ pub mod transcript;
 pub mod triggers;
 #[cfg(feature = "weixin")]
 pub mod weixin;
+pub mod workspace;
 
 pub use agent::{FinishReason, PermissionDecision};
 pub use checkpoint::{CheckpointId, CheckpointInfo, RestoreStats, ShadowRepo};

@@ -117,6 +117,28 @@ pub enum Error {
         supported: u32,
     },
 
+    /// Workspace registry (issue #135): two distinct request paths realpath-
+    /// resolve to the same canonical directory, and that canonical path is
+    /// already owned by another registered workspace. Registering it again
+    /// would alias two registry entries onto one directory, so it is refused.
+    #[error("workspace realpath conflict: {canonical} is already registered as `{existing}`")]
+    WorkspaceConflict { canonical: String, existing: String },
+
+    /// Workspace registry (issue #135): the on-disk registry is internally
+    /// inconsistent and no pending-mutation marker explains it (duplicate
+    /// canonical paths, a malformed record, a corrupt index file). Recovery
+    /// cannot proceed safely, so the state is reported loud as corrupt rather
+    /// than silently repaired or ignored.
+    #[error("workspace registry corrupt: {message}")]
+    WorkspaceCorrupt { message: String },
+
+    /// Archiving a workspace (issue #135) was refused because it still has
+    /// active work — a live turn, a background job, a subagent, or a scheduled
+    /// wakeup — and the caller asked for admission rather than
+    /// stop-then-archive.
+    #[error("workspace `{id}` has active work: {details}")]
+    WorkspaceActiveWork { id: String, details: String },
+
     /// Internal agent error — unexpected state that does not map to any typed
     /// variant. Prefer a specific variant; use `Internal` only as last resort.
     #[error("internal error ({context}): {message}")]
