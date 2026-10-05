@@ -18,12 +18,12 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 
-use super::{ApiError, AppState, SessionState};
+use super::{ApiError, AppState, AuthIdentity, SessionState};
 use crate::notify::NotifyTarget;
 use crate::triggers::{Trigger, TriggerSpec, TriggerStore};
 
@@ -137,13 +137,35 @@ fn trigger_error(e: crate::error::Error) -> ApiError {
     ApiError::internal(e.to_string())
 }
 
+/// Issue #85: assert the caller may read or mutate this trigger.
+///
+/// A trigger runs agent work server-side (into a session, as an admin
+/// identity), so managing one is managing someone's scheduled work: a foreign
+/// caller must not be able to re-goal another caller's trigger and have it run
+/// inside that caller's session. Checked before any mutation.
+fn ensure_trigger_access(identity: &AuthIdentity, trigger: &Trigger) -> Result<(), ApiError> {
+    if identity.may_access_session(trigger.owner.as_deref(), trigger.tenant.as_deref()) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("trigger belongs to another identity"))
+    }
+}
+
 /// POST /triggers — register a cron or webhook trigger.
+///
+/// Issue #85: a trigger that resumes `session_id` runs turns in that session
+/// server-side (as an admin identity), so registration is ownership-asserted —
+/// otherwise any caller could point a trigger at another caller's session.
 pub(super) async fn create_trigger(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<CreateTriggerRequest>,
 ) -> Result<(StatusCode, Json<TriggerResponse>), ApiError> {
     if body.goal.trim().is_empty() {
         return Err(ApiError::bad_request("missing or empty 'goal' field"));
+    }
+    if let Some(session_id) = body.session_id.as_deref() {
+        super::handlers::ensure_session_access_by_id(&state, session_id, &identity).await?;
     }
     let id = match body.id {
         Some(id) if !id.trim().is_empty() => {
@@ -189,6 +211,10 @@ pub(super) async fn create_trigger(
     }
     let mut trigger = Trigger::new(id, spec, body.goal, body.session_id, body.notify);
     trigger.enabled = body.enabled;
+    // Issue #85: the registrant owns the trigger — the caller that created it
+    // is the only one that may later read, re-goal or remove it.
+    trigger.owner = Some(identity.subject.clone());
+    trigger.tenant = identity.tenant.clone();
     // Compute the first fire time immediately so the caller can echo it.
     if let TriggerSpec::Cron { expr } = &trigger.spec {
         if trigger.next_fire_at.is_none() {
@@ -256,23 +282,34 @@ fn validate_notify_webhook_url(url: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// GET /triggers — list all registered triggers.
+/// GET /triggers — list the caller's registered triggers.
+///
+/// Issue #85: a trigger carries the goal it will run and the session it will
+/// run in, so the list is scoped to the caller (admins see every trigger).
 pub(super) async fn list_triggers(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
 ) -> Result<Json<Vec<TriggerResponse>>, ApiError> {
     let all = store(&state).load().map_err(trigger_error)?;
     Ok(Json(
-        all.iter().map(TriggerResponse::from_trigger).collect(),
+        all.iter()
+            .filter(|t| identity.may_access_session(t.owner.as_deref(), t.tenant.as_deref()))
+            .map(TriggerResponse::from_trigger)
+            .collect(),
     ))
 }
 
 /// GET /triggers/:id — one trigger.
 pub(super) async fn get_trigger(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<Json<TriggerResponse>, ApiError> {
     match store(&state).get(&id).map_err(trigger_error)? {
-        Some(t) => Ok(Json(TriggerResponse::from_trigger(&t))),
+        Some(t) => {
+            ensure_trigger_access(&identity, &t)?;
+            Ok(Json(TriggerResponse::from_trigger(&t)))
+        }
         None => Err(ApiError::not_found(format!("trigger {id} not found"))),
     }
 }
@@ -280,9 +317,15 @@ pub(super) async fn get_trigger(
 /// DELETE /triggers/:id — remove a trigger.
 pub(super) async fn delete_trigger(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    match store(&state).delete(&id).map_err(trigger_error)? {
+    let s = store(&state);
+    let Some(trigger) = s.get(&id).map_err(trigger_error)? else {
+        return Err(ApiError::not_found(format!("trigger {id} not found")));
+    };
+    ensure_trigger_access(&identity, &trigger)?;
+    match s.delete(&id).map_err(trigger_error)? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::not_found(format!("trigger {id} not found"))),
     }
@@ -299,6 +342,7 @@ pub struct PatchTriggerRequest {
 
 pub(super) async fn patch_trigger(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
     Json(body): Json<PatchTriggerRequest>,
 ) -> Result<Json<TriggerResponse>, ApiError> {
@@ -307,6 +351,7 @@ pub(super) async fn patch_trigger(
     let Some(trigger) = all.iter_mut().find(|t| t.id == id) else {
         return Err(ApiError::not_found(format!("trigger {id} not found")));
     };
+    ensure_trigger_access(&identity, trigger)?;
     if let Some(enabled) = body.enabled {
         trigger.enabled = enabled;
         // Re-enabling always recomputes the next window: a cron that sat
@@ -346,8 +391,15 @@ pub struct WebhookKeyQuery {
 /// does not block for the agent run). 401 on key mismatch, 404 unknown id,
 /// 409 when a run for this trigger is already in flight, 409-disabled when
 /// the trigger is registered but disabled.
+///
+/// Issue #85: firing runs the trigger's goal in its session as an admin
+/// identity, so it is ownership-asserted like the management routes — the
+/// `?key=` secret authenticates the *request* to the trigger, not the caller
+/// to the server, and possession of a leaked id must not be enough to drive
+/// someone else's scheduled run. Both credentials are required.
 pub(super) async fn fire_webhook(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
     Query(query): Query<WebhookKeyQuery>,
     body: axum::body::Bytes,
@@ -357,6 +409,7 @@ pub(super) async fn fire_webhook(
         .get(&id)
         .map_err(trigger_error)?
         .ok_or_else(|| ApiError::not_found(format!("trigger {id} not found")))?;
+    ensure_trigger_access(&identity, &trigger)?;
     let TriggerSpec::Webhook { secret } = &trigger.spec else {
         return Err(ApiError::bad_request(format!(
             "trigger {id} is a cron trigger; it fires on schedule"
@@ -495,6 +548,10 @@ fn stamp_result(s: TriggerStore, trigger: &Trigger, result: String) {
 /// in-memory session (transcript persisted through the storage backend
 /// under a `trigger-<id>` key so it remains inspectable).
 ///
+/// Issue #85: a trigger is server-side work with no inbound request, so it
+/// runs as [`AuthIdentity::local`] (an admin identity) — a scheduled turn in a
+/// configured session is not scoped to the session's owner.
+///
 /// Returns (session_id, final_text, finish_reason).
 async fn run_trigger_goal(
     state: &Arc<AppState>,
@@ -502,17 +559,19 @@ async fn run_trigger_goal(
     goal: &str,
 ) -> (String, Option<String>, String) {
     match session_id {
-        Some(id) => match super::cold_load::get_or_load_session(state, id).await {
-            Ok(session) => run_in_session(state, &session, goal).await,
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %id,
-                    error = %e.message,
-                    "trigger: configured session unavailable; falling back to one-shot run"
-                );
-                one_shot_run(state, goal).await
+        Some(id) => {
+            match super::cold_load::get_or_load_session(state, id, &AuthIdentity::local()).await {
+                Ok(session) => run_in_session(state, &session, goal).await,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %e.message,
+                        "trigger: configured session unavailable; falling back to one-shot run"
+                    );
+                    one_shot_run(state, goal).await
+                }
             }
-        },
+        }
         None => one_shot_run(state, goal).await,
     }
 }

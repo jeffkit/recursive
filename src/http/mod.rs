@@ -19,7 +19,10 @@ pub mod triggers;
 // external `recursive::http::AdmissionGate` paths keep working.
 pub use crate::session_host::SessionHost;
 pub use crate::session_host::{AcquireError, AdmissionGate, RunPermit};
-pub use auth::{AuthConfig, JwtConfig, ENV_AUTH_JWT_SECRET, ENV_AUTH_KEYS};
+pub use auth::{
+    AuthConfig, AuthIdentity, JwtConfig, DEFAULT_KEY_SUBJECT, ENV_AUTH_ADMINS, ENV_AUTH_JWT_SECRET,
+    ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS,
+};
 pub use handlers::map_agent_event;
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 
@@ -98,7 +101,8 @@ pub struct Metrics {
 ///
 /// Clone is a handle clone: every mutable field is `Arc`-wrapped, so clones
 /// share runtime / counters / gate with the value stored in the sessions
-/// table (plain metadata fields — id / created_at / title — are copied).
+/// table (plain metadata fields — id / created_at / title / owner / tenant —
+/// are copied).
 /// `http::cold_load` relies on this to hand handlers a table entry without
 /// holding the table lock.
 #[derive(Clone)]
@@ -107,6 +111,16 @@ pub struct SessionState {
     pub created_at: String,
     /// Optional human-readable title, settable via `PATCH /sessions/:id`.
     pub title: Option<String>,
+    /// Issue #85: the subject that created this session (JWT `sub` or an API
+    /// key's configured subject). Every `/sessions/:id*` route asserts the
+    /// caller's identity against it; `/sessions` filters on it.
+    ///
+    /// `None` is a session restored from metadata written before the identity
+    /// model — it belongs to nobody, so only an admin identity may reach it.
+    pub owner: Option<String>,
+    /// Issue #85: the owner's tenant (JWT `tenant` claim), part of the
+    /// ownership key — two tenants can mint the same `sub`.
+    pub tenant: Option<String>,
     /// Runtime is wrapped in a per-session Mutex so concurrent HTTP requests
     /// for the same session are serialized without blocking the global lock.
     pub runtime: Arc<tokio::sync::Mutex<AgentRuntime>>,
@@ -1927,6 +1941,8 @@ mod goal_396_persistence_tests {
             id: id.to_string(),
             created_at: "2026-09-27T00:00:00Z".to_string(),
             title: None,
+            owner: None,
+            tenant: None,
             runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
             plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),

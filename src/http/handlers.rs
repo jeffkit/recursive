@@ -1,7 +1,7 @@
 //! HTTP handler functions for the agent API.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     Json,
@@ -21,17 +21,78 @@ use crate::runtime::AgentRuntimeBuilder;
 use crate::tools::ToolRegistry;
 
 use super::{
-    build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, CreateSessionRequest,
-    CreateSessionResponse, ErrorResponse, ListSessionsQuery, PresetInfo, RunRequest, RunResponse,
-    SessionDetailResponse, SessionInfo, SessionMessageRequest, SessionMessageResponse,
-    SessionOverrides, SessionState, SetGoalRequest, SlashCommandInfo, SseContentBlock, SseEvent,
-    ToolInfo, UsageInfo,
+    build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, AuthIdentity,
+    CreateSessionRequest, CreateSessionResponse, ErrorResponse, ListSessionsQuery, PresetInfo,
+    RunRequest, RunResponse, SessionDetailResponse, SessionInfo, SessionMessageRequest,
+    SessionMessageResponse, SessionOverrides, SessionState, SetGoalRequest, SlashCommandInfo,
+    SseContentBlock, SseEvent, ToolInfo, UsageInfo,
 };
 
 // Constant body — no branching worth scoring.
 #[cfg_attr(test, mutants::skip)]
 pub(super) async fn health() -> &'static str {
     "ok"
+}
+
+/// Issue #85: assert the request's identity may reach this session.
+///
+/// Every `/sessions/:id*` route goes through here, so a credential can only
+/// touch the sessions it created (or every session, when it carries the
+/// `admin` role). 403 — the session exists, the caller is simply not its
+/// owner; ids are UUIDv7, so there is no enumerable id space to protect by
+/// pretending it does not exist.
+///
+/// `pub(super)` so `cold_load` can assert ownership against an entry it just
+/// loaded, before building the runtime for it.
+pub(super) fn ensure_access(
+    identity: &AuthIdentity,
+    session: &SessionState,
+) -> Result<(), ApiError> {
+    ensure_owned(
+        identity,
+        session.owner.as_deref(),
+        session.tenant.as_deref(),
+    )
+}
+
+/// The same decision against a bare (owner, tenant) pair — for callers that
+/// only have the persisted metadata at hand (`POST /triggers` referencing a
+/// session it does not materialize).
+pub(super) fn ensure_owned(
+    identity: &AuthIdentity,
+    owner: Option<&str>,
+    tenant: Option<&str>,
+) -> Result<(), ApiError> {
+    if identity.may_access_session(owner, tenant) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("session belongs to another identity"))
+    }
+}
+
+/// Issue #85: assert the identity may act on the session `id` **without
+/// materializing it** — the live table decides when the session is in memory,
+/// otherwise the ownership recorded in the persisted metadata does.
+///
+/// An id the server knows nothing about is allowed through: there is no
+/// session to hijack, and the caller (trigger registration) has its own
+/// unknown-id behaviour at fire time.
+pub(super) async fn ensure_session_access_by_id(
+    state: &Arc<AppState>,
+    id: &str,
+    identity: &AuthIdentity,
+) -> Result<(), ApiError> {
+    {
+        let sessions_lock = state.host.sessions();
+        let sessions = sessions_lock.read().await;
+        if let Some(session) = sessions.get(id) {
+            return ensure_access(identity, session);
+        }
+    }
+    match super::cold_load::load_session_meta(state, id).await {
+        Some(meta) => ensure_owned(identity, meta.owner.as_deref(), meta.tenant.as_deref()),
+        None => Ok(()),
+    }
 }
 
 /// Map an admission failure to the standardized API error (Goal 398).
@@ -511,8 +572,12 @@ pub(super) fn format_timestamp(t: SystemTime) -> String {
 }
 
 /// POST /sessions — create a new session.
+///
+/// Issue #85: the session is owned by the caller's identity (subject +
+/// tenant). Every later `/sessions/:id*` request is asserted against it.
 pub(super) async fn create_session(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
     let id = generate_session_id();
@@ -616,6 +681,11 @@ pub(super) async fn create_session(
                 max_budget_usd: body.max_budget_usd,
                 thinking_budget: body.thinking_budget,
             },
+            // Issue #85: ownership must survive a restart, otherwise a
+            // cold-loaded session would fall back to admin-only and the
+            // original caller would lose access to its own session.
+            owner: Some(identity.subject.clone()),
+            tenant: identity.tenant.clone(),
         },
     )
     .await;
@@ -628,6 +698,8 @@ pub(super) async fn create_session(
         id: id.clone(),
         created_at: created_at.clone(),
         title: body.session_name,
+        owner: Some(identity.subject.clone()),
+        tenant: identity.tenant.clone(),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -672,14 +744,22 @@ pub(super) struct SessionList {
 ///
 /// Returns a [`SessionList`] envelope (`{ "total": N, "sessions": [...] }`)
 /// so paginated UIs can render total counts without fetching every page.
+///
+/// Issue #85: the list is scoped to the caller's identity — a credential only
+/// sees the sessions it created (admins see every session). `total` counts the
+/// visible sessions, so pagination stays consistent with the page slice.
 pub(super) async fn list_sessions(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     axum::extract::Query(params): axum::extract::Query<ListSessionsQuery>,
 ) -> Json<SessionList> {
     let sessions_lock = state.host.sessions();
     let sessions = sessions_lock.read().await;
     let mut infos = Vec::with_capacity(sessions.len());
     for s in sessions.values() {
+        if !identity.may_access_session(s.owner.as_deref(), s.tenant.as_deref()) {
+            continue;
+        }
         // Read the pre-computed count without acquiring the runtime lock.
         // The count is updated atomically whenever a non-system message is
         // appended, so it remains accurate while a turn is in progress.
@@ -721,11 +801,15 @@ pub(super) async fn list_sessions(
 ///
 /// Goal 397: a session persisted by a previous server process is restored
 /// from the storage backend here (cold load) instead of 404-ing.
+///
+/// Issue #85: ownership is asserted by [`super::cold_load::get_or_load_session`]
+/// before the session is materialized or restored.
 pub(super) async fn get_session(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionDetailResponse>, ApiError> {
-    let session = super::cold_load::get_or_load_session(&state, &id).await?;
+    let session = super::cold_load::get_or_load_session(&state, &id, &identity).await?;
 
     // Read plan status without locking the runtime Mutex so callers can poll
     // while the agent is suspended inside `exit_plan_mode`.
@@ -809,8 +893,11 @@ pub(super) async fn get_session(
 }
 
 /// DELETE /sessions/:id — remove a session.
+///
+/// Issue #85: only the session's owner (or an admin) may delete it.
 pub(super) async fn delete_session(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     // Look up the runtime under a read lock so we can take the per-session
@@ -819,7 +906,13 @@ pub(super) async fn delete_session(
     let session_runtime = {
         let sessions_lock = state.host.sessions();
         let sessions = sessions_lock.read().await;
-        sessions.get(&id).map(|s| s.runtime.clone())
+        match sessions.get(&id) {
+            Some(s) => {
+                ensure_access(&identity, s)?;
+                Some(s.runtime.clone())
+            }
+            None => None,
+        }
     };
     if let Some(runtime) = session_runtime {
         // Fire SessionEnd (no outcome — the client is deleting the session
@@ -890,8 +983,11 @@ pub(super) struct PatchSessionRequest {
 /// PATCH /sessions/abc123
 /// {"title": "Fix login bug"}
 /// ```
+///
+/// Issue #85: only the session's owner (or an admin) may rename it.
 pub(super) async fn patch_session(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
     Json(body): Json<PatchSessionRequest>,
 ) -> Result<Json<SessionInfo>, ApiError> {
@@ -901,6 +997,7 @@ pub(super) async fn patch_session(
         let session = sessions
             .get_mut(&id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
+        ensure_access(&identity, session)?;
 
         if let Some(title) = body.title {
             session.title = if title.is_empty() { None } else { Some(title) };
@@ -947,8 +1044,12 @@ pub(super) struct ForkSessionResponse {
 /// original.
 ///
 /// Returns the new session's ID and metadata.
+///
+/// Issue #85: forking a session copies its transcript, so only its owner (or
+/// an admin) may do it; the fork is owned by the caller.
 pub(super) async fn fork_session(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<ForkSessionResponse>), ApiError> {
     // Snapshot the source transcript while holding the write lock.
@@ -958,6 +1059,7 @@ pub(super) async fn fork_session(
         let src = sessions
             .get(&id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
+        ensure_access(&identity, src)?;
         let rt = src
             .runtime
             .try_lock()
@@ -1006,6 +1108,28 @@ pub(super) async fn fork_session(
     .build()
     .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
 
+    // Issue #85: the fork needs its own metadata blob, exactly like
+    // `create_session` writes one. The fork's transcript is flushed on
+    // shutdown, so without a blob the restarted server cold-loads it with no
+    // owner — the creator's own fork would 403, disappear from `GET /sessions`
+    // and stop being deletable. Best-effort, same contract as creation.
+    super::cold_load::persist_session_meta(
+        &state,
+        &new_id,
+        &super::cold_load::SessionMeta {
+            // The fork is assembled from the server default base prompt and no
+            // permission override, so both stay `None` (= server default) —
+            // persisting them would rebuild it with settings it never ran.
+            // The preset is NOT a default: it is inherited from the source
+            // (issue #127), and a restart must not rewire the fork.
+            preset: Some(preset.id.clone()),
+            owner: Some(identity.subject.clone()),
+            tenant: identity.tenant.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+
     // Count non-system messages BEFORE set_transcript (which moves the
     // snapshot). The new session's `non_system_message_count` atomic and
     // the fork response's `message_count` both use this number so they
@@ -1021,6 +1145,8 @@ pub(super) async fn fork_session(
         id: new_id.clone(),
         created_at: created_at.clone(),
         title: None,
+        owner: Some(identity.subject.clone()),
+        tenant: identity.tenant.clone(),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1066,8 +1192,13 @@ pub(super) struct PlanRejectRequest {
 }
 
 /// POST /sessions/:id/plan/confirm — approve the pending plan.
+///
+/// Issue #85: approving is a mutation of someone's session, so it is asserted
+/// like every other `/sessions/:id*` route — detection of the session alone is
+/// not authorization.
 pub(super) async fn session_plan_confirm(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(session_id): Path<String>,
     Json(body): Json<PlanConfirmRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1076,6 +1207,7 @@ pub(super) async fn session_plan_confirm(
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
+    ensure_access(&identity, session)?;
     let pending = session
         .plan_approval_gate
         .pending_plan
@@ -1099,8 +1231,11 @@ pub(super) async fn session_plan_confirm(
 }
 
 /// POST /sessions/:id/plan/reject — reject the pending plan.
+///
+/// Issue #85: ownership-asserted like `plan/confirm`.
 pub(super) async fn session_plan_reject(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(session_id): Path<String>,
     Json(body): Json<PlanRejectRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1109,6 +1244,7 @@ pub(super) async fn session_plan_reject(
     let session = sessions
         .get(&session_id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
+    ensure_access(&identity, session)?;
     let pending = session
         .plan_approval_gate
         .pending_plan
@@ -1129,8 +1265,11 @@ pub(super) async fn session_plan_reject(
 // ── Goal-168: goal endpoints ──────────────────────────────────────────────
 
 /// POST /sessions/:id/goal — start a condition-based autonomous loop.
+///
+/// Issue #85: only the session's owner (or an admin) may start a loop on it.
 pub(super) async fn session_set_goal(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(session_id): Path<String>,
     Json(body): Json<SetGoalRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1140,6 +1279,7 @@ pub(super) async fn session_set_goal(
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
+        ensure_access(&identity, session)?;
         session.runtime.clone()
     };
 
@@ -1163,8 +1303,11 @@ pub(super) async fn session_set_goal(
 }
 
 /// DELETE /sessions/:id/goal — clear the active goal.
+///
+/// Issue #85: only the session's owner (or an admin) may clear its goal.
 pub(super) async fn session_clear_goal(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runtime_arc = {
@@ -1173,6 +1316,7 @@ pub(super) async fn session_clear_goal(
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
+        ensure_access(&identity, session)?;
         session.runtime.clone()
     };
 
@@ -1237,8 +1381,12 @@ async fn runtime_goal_state_clear(
 /// it): after a restart no turn is running, so there is nothing to cancel —
 /// a restored session would only be built to discover a `None` token. An
 /// unknown id stays 404.
+///
+/// Issue #85: cancelling is a mutation, so only the session's owner (or an
+/// admin) may do it.
 pub(super) async fn session_interrupt(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let token_arc = {
@@ -1247,6 +1395,7 @@ pub(super) async fn session_interrupt(
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| ApiError::not_found("session not found"))?;
+        ensure_access(&identity, session)?;
         session.interrupt_token.clone()
     };
 
@@ -1329,8 +1478,12 @@ fn prior_turn_index(transcript: &[crate::message::Message]) -> u32 {
 }
 
 /// POST /sessions/:id/messages — send a message in a session.
+///
+/// Issue #85: only the session's owner (or an admin) may run a turn in it —
+/// `get_or_load_session` asserts ownership before the session is materialized.
 pub(super) async fn send_session_message(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
     Json(body): Json<SessionMessageRequest>,
 ) -> Result<Json<SessionMessageResponse>, ApiError> {
@@ -1343,7 +1496,7 @@ pub(super) async fn send_session_message(
     // counter, last_active, and token usage counters. The returned handle
     // shares all mutable state with the table entry — no table lock held
     // while the turn runs.
-    let session = super::cold_load::get_or_load_session(&state, &id).await?;
+    let session = super::cold_load::get_or_load_session(&state, &id, &identity).await?;
     // Update last_active_ms timestamp for this session.
     session
         .last_active_ms
@@ -1555,16 +1708,21 @@ pub(super) async fn send_session_message(
 // ── SSE endpoint ─────────────────────────────────────────────────────────
 
 /// GET /sessions/:id/events — subscribe to SSE stream of agent events.
+///
+/// Issue #85: the stream carries the session's transcript-derived events, so
+/// only the session's owner (or an admin) may subscribe.
 pub(super) async fn session_events(
     State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // Verify session exists
+    // Verify session exists (and that the caller may see it)
     {
         let sessions_lock = state.host.sessions();
         let sessions = sessions_lock.read().await;
-        if !sessions.contains_key(&id) {
-            return Err(ApiError::not_found("session not found"));
+        match sessions.get(&id) {
+            Some(session) => ensure_access(&identity, session)?,
+            None => return Err(ApiError::not_found("session not found")),
         }
     }
 
@@ -2439,16 +2597,23 @@ mod tests {
             preset: preset.map(str::to_string),
         };
 
-        let (status, Json(created)) =
-            create_session(State(state.clone()), Json(body(Some("standard"))))
-                .await
-                .expect("session created");
+        let (status, Json(created)) = create_session(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Json(body(Some("standard"))),
+        )
+        .await
+        .expect("create session");
         assert_eq!(status, StatusCode::CREATED);
 
         // GET echoes the effective preset, read off the live runtime.
-        let Json(detail) = get_session(State(state.clone()), Path(created.id.clone()))
-            .await
-            .expect("session detail");
+        let Json(detail) = get_session(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Path(created.id.clone()),
+        )
+        .await
+        .expect("session detail");
         assert_eq!(detail.preset.as_deref(), Some("standard"));
 
         // ...and it is in the #98 metadata blob, so a restart restores it.
@@ -2464,9 +2629,13 @@ mod tests {
         );
 
         // An unknown id is rejected with the list of what does exist.
-        let err = create_session(State(state.clone()), Json(body(Some("no-such-preset"))))
-            .await
-            .expect_err("unknown preset must be rejected");
+        let err = create_session(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Json(body(Some("no-such-preset"))),
+        )
+        .await
+        .expect_err("unknown preset must be rejected");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(
             err.message.contains("standard"),
@@ -3060,6 +3229,8 @@ mod tests {
             id: session_id.clone(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             title: None,
+            owner: None,
+            tenant: None,
             runtime: runtime_arc.clone(),
             plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -3103,9 +3274,13 @@ mod tests {
 
         // Call the handler while the mutex is held → should get 409
         // (Result::Err(ApiError::conflict(...).with_retry_after(5))).
-        let resp = session_clear_goal(State(state.clone()), Path(session_id.clone()))
-            .await
-            .into_response();
+        let resp = session_clear_goal(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Path(session_id.clone()),
+        )
+        .await
+        .into_response();
         let status = resp.status();
         assert_eq!(status, StatusCode::CONFLICT, "expected 409 Conflict");
         let retry_after = resp
@@ -3118,9 +3293,13 @@ mod tests {
 
         // Drop the guard and retry → should get 200.
         drop(guard);
-        let resp = session_clear_goal(State(state), Path(session_id))
-            .await
-            .into_response();
+        let resp = session_clear_goal(
+            State(state),
+            Extension(AuthIdentity::local()),
+            Path(session_id),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 after unlock");
     }
 
@@ -3148,6 +3327,8 @@ mod tests {
             id: session_id.to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             title: Some("old".into()),
+            owner: None,
+            tenant: None,
             runtime: runtime_arc.clone(),
             plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -3209,6 +3390,7 @@ mod tests {
 
         let resp = send_session_message(
             State(state.clone()),
+            Extension(AuthIdentity::local()),
             Path(sid.to_string()),
             Json(SessionMessageRequest {
                 content: "retry the same prompt".into(),
@@ -3251,6 +3433,7 @@ mod tests {
 
         let _ = send_session_message(
             State(state.clone()),
+            Extension(AuthIdentity::local()),
             Path(sid.to_string()),
             Json(SessionMessageRequest {
                 content: "hello".into(),
@@ -3286,7 +3469,13 @@ mod tests {
         let sid = "test-plan-status";
         let (state, _) = test_app_state_with_session(sid).await;
 
-        let idle = match get_session(State(state.clone()), Path(sid.to_string())).await {
+        let idle = match get_session(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Path(sid.to_string()),
+        )
+        .await
+        {
             Ok(Json(v)) => v,
             Err(_) => panic!("get_session idle"),
         };
@@ -3300,7 +3489,13 @@ mod tests {
             let session = sessions.get(sid).unwrap();
             *session.plan_approval_gate.pending_plan.write().unwrap() = Some("do the thing".into());
         }
-        let pending = match get_session(State(state), Path(sid.to_string())).await {
+        let pending = match get_session(
+            State(state),
+            Extension(AuthIdentity::local()),
+            Path(sid.to_string()),
+        )
+        .await
+        {
             Ok(Json(v)) => v,
             Err(_) => panic!("get_session pending"),
         };
@@ -3313,7 +3508,13 @@ mod tests {
         let sid = "test-busy-get";
         let (state, runtime_arc) = test_app_state_with_session(sid).await;
         let _guard = runtime_arc.lock().await;
-        let detail = match get_session(State(state), Path(sid.to_string())).await {
+        let detail = match get_session(
+            State(state),
+            Extension(AuthIdentity::local()),
+            Path(sid.to_string()),
+        )
+        .await
+        {
             Ok(Json(v)) => v,
             Err(_) => panic!("busy get_session must still 200"),
         };
@@ -3331,6 +3532,7 @@ mod tests {
 
         let cleared = match patch_session(
             State(state.clone()),
+            Extension(AuthIdentity::local()),
             Path(sid.to_string()),
             Json(PatchSessionRequest {
                 title: Some("".into()),
@@ -3345,6 +3547,7 @@ mod tests {
 
         let set = match patch_session(
             State(state.clone()),
+            Extension(AuthIdentity::local()),
             Path(sid.to_string()),
             Json(PatchSessionRequest {
                 title: Some("new".into()),
@@ -3360,6 +3563,7 @@ mod tests {
         // Omitting title must leave existing value unchanged.
         let keep = match patch_session(
             State(state),
+            Extension(AuthIdentity::local()),
             Path(sid.to_string()),
             Json(PatchSessionRequest { title: None }),
         )

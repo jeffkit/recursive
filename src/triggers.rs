@@ -12,7 +12,8 @@
 //!   *additional* credential, not a replacement for the server's own
 //!   auth: the route lives on the protected router, so the request must
 //!   also carry the usual API key (unless the server runs with auth
-//!   disabled).
+//!   disabled) — and since issue #85 that credential must be the one that
+//!   registered the trigger (or an admin's).
 //!
 //! # Persistence and delivery contract
 //!
@@ -110,6 +111,16 @@ pub struct Trigger {
     pub last_result: Option<String>,
     #[serde(default)]
     pub enabled: bool,
+    /// Issue #85: subject that registered the trigger. A trigger is work the
+    /// server runs on its own (in a session, as an admin identity), so the
+    /// caller that registered it is the only caller that may read, re-goal or
+    /// remove it. `None` (a blob written by an older build) is unattributed:
+    /// admins only — the same default-deny an unattributed session gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Issue #85: the owner's tenant, part of the ownership key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl Trigger {
@@ -133,6 +144,8 @@ impl Trigger {
             last_fired_at: None,
             last_result: None,
             enabled: false,
+            owner: None,
+            tenant: None,
         }
     }
 

@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- security(http): identity model for the HTTP API (#85). Authentication used to
+  answer only "may this caller in", never "who is this caller": JWT verification
+  discarded every claim (`decode::<serde_json::Value>(...).is_ok()`), and the
+  `RECURSIVE_HTTP_AUTH_KEYS` allowlist was an interchangeable set of secrets —
+  so any keyholder could list, read, rename, fork and delete **every** session
+  on the server, stream anyone's events, and approve anyone's pending plan. A
+  verified credential now resolves to an `AuthIdentity { subject, tenant,
+  admin }` — a JWT's `sub` (scoped by the optional `tenant` claim), or an API
+  key's configured subject — which the auth middleware attaches to the request
+  extensions. Sessions record their owner: created sessions carry it in memory
+  and through the #98 metadata blob (so a restart, and a cold load, preserve
+  it — ownership is asserted *before* a session is materialized from storage);
+  `GET /sessions` is filtered by owner; and every `/sessions/:id*` route
+  (`GET` / `DELETE` / `PATCH` / `messages` / `events` / `fork` /
+  `plan/confirm` / `plan/reject` / `goal` / `interrupt`) asserts it, answering
+  403 for another caller's session. A fork is covered too — it persists its own
+  ownership and the preset it inherited, so a restarted server still serves it
+  to the caller that forked it (previously a fork wrote no metadata, so a cold
+  load found no owner and answered 403). Trigger registration was already
+  ownership-asserted (a trigger resumes its session server-side, as an admin
+  identity) and the registry is scoped the same way: `GET /triggers`,
+  `GET`/`PATCH`/`DELETE /triggers/:id` and `POST /webhooks/:id` require the
+  caller to own the trigger (or be an admin) — knowing a trigger id and its
+  webhook secret is no longer enough to re-goal, delete, or drive someone
+  else's scheduled run. New env knobs:
+  `RECURSIVE_HTTP_AUTH_KEY_OWNERS` (`subject=key` pairs attributing API keys to
+  callers; unattributed keys keep sharing the single `api-key` subject) and
+  `RECURSIVE_HTTP_AUTH_ADMINS` (subjects that may reach every session — the
+  role is the server's decision, never a token's self-declared claim). Three
+  behaviour changes are deliberate: a JWT without a `sub` is rejected with 401
+  (an unattributable token has no owner to scope it to, and collapsing it onto
+  a shared anonymous principal is the hole being closed); a session — or a
+  trigger — restored from metadata written before this change is unattributed,
+  hence reachable by admins only; and the trigger registry is owner-scoped, so
+  no caller manages another caller's triggers any more. Servers with auth
+  disabled (debug escape hatch / single-user) run as the one implicit local
+  operator and are unaffected.
+
 - feat(http): wire the S3 transcript backend into `recursive http` (#92). With
   the `cloud-runtime` feature compiled in, `RECURSIVE_S3_BUCKET` now selects
   `S3StorageBackend` for transcripts, memory and per-session metadata instead of

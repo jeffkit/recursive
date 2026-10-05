@@ -24,6 +24,9 @@
 |---|---|---|
 | `RECURSIVE_HTTP_ADDR` | `0.0.0.0:3000` | 绑定地址 |
 | `RECURSIVE_HTTP_AUTH_KEYS` | *(无——开放)* | 逗号分隔的 `X-API-Key` 白名单 |
+| `RECURSIVE_HTTP_AUTH_KEY_OWNERS` | *(空)* | 逗号分隔的 `subject=key`，把 API key 归属到调用者；会话按 subject 隔离，两个 subject 互相看不到对方会话 |
+| `RECURSIVE_HTTP_AUTH_ADMINS` | *(空)* | 逗号分隔的 `admin` 角色 subject——可访问全部会话 |
+| `RECURSIVE_HTTP_AUTH_JWT_SECRET` | *(未启用)* | `Authorization: Bearer` JWT 的 HS256 密钥；token 的 `sub`（可带 `tenant`）即会话归属者 |
 
 ## 云存储 — Redis
 

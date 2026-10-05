@@ -30,7 +30,8 @@ mod http_tests {
     use tower::ServiceExt;
 
     use crate::common::{
-        mock_config, sample_state, sample_state_with_provider, MemoryStorage, SET_INSECURE_OK,
+        mock_config, sample_state, sample_state_with_provider, sample_state_with_storage,
+        MemoryStorage, SET_INSECURE_OK,
     };
 
     #[tokio::test]
@@ -3185,6 +3186,594 @@ mod http_tests {
         }
     }
 
+    // ── Issue #85: identity & session ownership ───────────────────────────
+
+    /// Two API keys attributed to two distinct callers.
+    fn two_caller_auth() -> AuthConfig {
+        AuthConfig::new(vec!["key-a".into(), "key-b".into()])
+            .with_key_subject("key-a", "alice")
+            .with_key_subject("key-b", "bob")
+    }
+
+    fn api_request(method: &str, uri: &str, key: &str, body: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-API-Key", key)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn bearer_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: &str,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn status(app: &axum::Router, request: axum::http::Request<Body>) -> u16 {
+        app.clone()
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// POST /sessions with an authenticated request, returning the new id.
+    async fn created_session_id(app: &axum::Router, request: axum::http::Request<Body>) -> String {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 201, "session creation must succeed");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["id"].as_str().expect("session id").to_string()
+    }
+
+    fn mint_token_with(secret: &str, claims: serde_json::Value) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("mint jwt")
+    }
+
+    /// Issue #85: every `/sessions/:id*` route mutates or reads one caller's
+    /// data, so a valid credential must not reach another caller's session —
+    /// before the fix any keyholder could read, mutate and delete all of them.
+    #[tokio::test]
+    async fn sessions_are_scoped_to_their_owner() {
+        // A generous limiter: this test drives a dozen requests on one key and
+        // is about authorization, not rate limiting.
+        let app = build_router_with_auth_and_rate_limit(
+            sample_state(),
+            two_caller_auth(),
+            RateLimiter::new(10_000, 10_000.0),
+        );
+        let alice_session =
+            created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+
+        // Bob's list is empty; alice's holds her session.
+        let response = app
+            .clone()
+            .oneshot(api_request("GET", "/sessions", "key-b", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list["total"], 0, "bob must not see alice's sessions");
+        assert_eq!(
+            status(&app, api_request("GET", "/sessions", "key-a", "{}")).await,
+            200
+        );
+
+        // Every per-session route refuses bob…
+        for (method, uri, body) in [
+            (
+                "GET",
+                format!("/sessions/{alice_session}"),
+                "{}".to_string(),
+            ),
+            (
+                "PATCH",
+                format!("/sessions/{alice_session}"),
+                r#"{"title":"hijacked"}"#.to_string(),
+            ),
+            (
+                "DELETE",
+                format!("/sessions/{alice_session}"),
+                "{}".to_string(),
+            ),
+            (
+                "POST",
+                format!("/sessions/{alice_session}/messages"),
+                r#"{"content":"hi"}"#.to_string(),
+            ),
+            (
+                "POST",
+                format!("/sessions/{alice_session}/plan/confirm"),
+                "{}".to_string(),
+            ),
+            (
+                "POST",
+                format!("/sessions/{alice_session}/plan/reject"),
+                "{}".to_string(),
+            ),
+            (
+                "POST",
+                format!("/sessions/{alice_session}/goal"),
+                r#"{"condition":"done"}"#.to_string(),
+            ),
+            (
+                "DELETE",
+                format!("/sessions/{alice_session}/goal"),
+                "{}".to_string(),
+            ),
+            (
+                "POST",
+                format!("/sessions/{alice_session}/interrupt"),
+                "{}".to_string(),
+            ),
+            (
+                "POST",
+                format!("/sessions/{alice_session}/fork"),
+                "{}".to_string(),
+            ),
+            (
+                "GET",
+                format!("/sessions/{alice_session}/events"),
+                "{}".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                status(&app, api_request(method, &uri, "key-b", &body)).await,
+                403,
+                "{method} {uri} must refuse another caller's session"
+            );
+        }
+
+        // …while the owner still reaches it, and bob's refusals changed
+        // nothing (the failed DELETE in particular).
+        assert_eq!(
+            status(
+                &app,
+                api_request("GET", &format!("/sessions/{alice_session}"), "key-a", "{}")
+            )
+            .await,
+            200
+        );
+        let response = app
+            .oneshot(api_request("GET", "/sessions", "key-a", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list["total"], 1, "the refused DELETE must not have run");
+        assert!(
+            list["sessions"][0]["title"].is_null(),
+            "the refused PATCH must not have run"
+        );
+    }
+
+    /// Issue #85: the admin role is the configured escape hatch — an operator
+    /// (or a migration tool) needs to reach sessions it did not create.
+    #[tokio::test]
+    async fn admin_identity_reaches_other_callers_sessions() {
+        let app = build_router_with_auth(sample_state(), two_caller_auth().with_admin("bob"));
+        let alice_session =
+            created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+
+        assert_eq!(
+            status(
+                &app,
+                api_request("GET", &format!("/sessions/{alice_session}"), "key-b", "{}")
+            )
+            .await,
+            200,
+            "an admin identity reaches a foreign session"
+        );
+        let response = app
+            .oneshot(api_request("GET", "/sessions", "key-b", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list["total"], 1, "an admin sees every session");
+    }
+
+    /// Issue #85: JWT callers are scoped by `sub`, exactly like API-key
+    /// callers are scoped by their configured subject.
+    #[tokio::test]
+    async fn jwt_sub_scopes_sessions() {
+        let secret = "test-secret-identity";
+        let jwt = JwtConfig::hs256(secret, None).unwrap();
+        let app = build_router_with_auth(sample_state(), AuthConfig::new(Vec::new()).with_jwt(jwt));
+        let alice = mint_token_with(
+            secret,
+            serde_json::json!({"exp": now_secs() + 60, "sub": "alice"}),
+        );
+        let bob = mint_token_with(
+            secret,
+            serde_json::json!({"exp": now_secs() + 60, "sub": "bob"}),
+        );
+
+        let alice_session =
+            created_session_id(&app, bearer_request("POST", "/sessions", &alice, "{}")).await;
+
+        assert_eq!(
+            status(
+                &app,
+                bearer_request("GET", &format!("/sessions/{alice_session}"), &bob, "{}")
+            )
+            .await,
+            403,
+            "another `sub` must not read the session"
+        );
+        assert_eq!(
+            status(
+                &app,
+                bearer_request("GET", &format!("/sessions/{alice_session}"), &alice, "{}")
+            )
+            .await,
+            200,
+            "the owning `sub` keeps access"
+        );
+        let response = app
+            .oneshot(bearer_request("GET", "/sessions", &bob, "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            list["total"], 0,
+            "bob's list must not contain alice's session"
+        );
+    }
+
+    /// Issue #85: a token without `sub` cannot be attributed to an owner, so
+    /// it is not an identity — 401 rather than a shared anonymous principal.
+    #[tokio::test]
+    async fn jwt_without_sub_is_rejected() {
+        let secret = "test-secret-attribution";
+        let jwt = JwtConfig::hs256(secret, None).unwrap();
+        let app = build_router_with_auth(sample_state(), AuthConfig::new(Vec::new()).with_jwt(jwt));
+        let anonymous = mint_token_with(secret, serde_json::json!({"exp": now_secs() + 60}));
+
+        assert_eq!(
+            status(&app, bearer_request("GET", "/sessions", &anonymous, "{}")).await,
+            401,
+            "a valid but unattributable token must not be accepted"
+        );
+    }
+
+    /// Issue #85: a session written before the identity model (or restored
+    /// from an older build's metadata) belongs to nobody — it is reachable by
+    /// admins only, never by every caller.
+    #[tokio::test]
+    async fn unattributed_sessions_are_admin_only() {
+        let state = sample_state();
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(Arc::new(MockProvider::new(vec![])))
+            .build()
+            .expect("runtime build failed");
+        let gate = runtime.plan_approval_gate();
+        state.host.sessions().write().await.insert(
+            "legacy-session".to_string(),
+            SessionState {
+                id: "legacy-session".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                title: None,
+                owner: None,
+                tenant: None,
+                runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+                plan_approval_gate: gate,
+                interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+                non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+
+        let app = build_router_with_auth(state.clone(), two_caller_auth());
+        assert_eq!(
+            status(
+                &app,
+                api_request("GET", "/sessions/legacy-session", "key-a", "{}")
+            )
+            .await,
+            403,
+            "an unattributed session must not be everyone's"
+        );
+        let response = app
+            .oneshot(api_request("GET", "/sessions", "key-a", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list["total"], 0, "nor appear in a caller's list");
+
+        let admin_app = build_router_with_auth(state, two_caller_auth().with_admin("alice"));
+        assert_eq!(
+            status(
+                &admin_app,
+                api_request("GET", "/sessions/legacy-session", "key-a", "{}")
+            )
+            .await,
+            200,
+            "an admin can still reach a pre-identity session"
+        );
+    }
+
+    /// Issue #85: a fork is a session like any other, so its ownership (and the
+    /// preset it inherited, issue #127) must survive a restart. It used to
+    /// write no metadata blob, so a cold load found no owner: the creator's own
+    /// fork answered 403, vanished from `GET /sessions` and was no longer
+    /// deletable over the API.
+    #[tokio::test]
+    async fn fork_ownership_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("storage tempdir");
+        let backend = Arc::new(recursive::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+        let state = sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![Completion {
+                content: "hello".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            }])),
+            backend.clone(),
+        );
+        let app = build_router_with_auth(state.clone(), two_caller_auth());
+
+        let source =
+            created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+        // One real turn, so the fork's copied transcript is restorable.
+        assert_eq!(
+            status(
+                &app,
+                api_request(
+                    "POST",
+                    &format!("/sessions/{source}/messages"),
+                    "key-a",
+                    r#"{"content":"hi"}"#,
+                )
+            )
+            .await,
+            200
+        );
+        let fork = created_session_id(
+            &app,
+            api_request("POST", &format!("/sessions/{source}/fork"), "key-a", "{}"),
+        )
+        .await;
+
+        // Graceful shutdown: the next process sees only storage.
+        recursive::http::flush_all_sessions(&state).await;
+
+        let restarted =
+            sample_state_with_storage(Arc::new(MockProvider::new(vec![])), backend.clone());
+        let app2 = build_router_with_auth(restarted, two_caller_auth());
+
+        let response = app2
+            .clone()
+            .oneshot(api_request(
+                "GET",
+                &format!("/sessions/{fork}"),
+                "key-a",
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "the fork's creator must keep access after a restart"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            detail["preset"], "standard",
+            "the inherited preset must survive the restart too"
+        );
+
+        assert_eq!(
+            status(
+                &app2,
+                api_request("GET", &format!("/sessions/{fork}"), "key-b", "{}")
+            )
+            .await,
+            403,
+            "another caller must not inherit access to the fork"
+        );
+        let response = app2
+            .clone()
+            .oneshot(api_request("GET", "/sessions", "key-a", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The list is memory-only (cold load is lazy), so the just-restored
+        // fork is the single entry.
+        assert_eq!(
+            list["total"], 1,
+            "the restored fork must reappear in its creator's list"
+        );
+        assert_eq!(list["sessions"][0]["id"], fork.as_str());
+
+        // Reachable means manageable: the restored fork is still deletable by
+        // its creator, and still refused to everyone else.
+        assert_eq!(
+            status(
+                &app2,
+                api_request("DELETE", &format!("/sessions/{fork}"), "key-b", "{}")
+            )
+            .await,
+            403
+        );
+        assert_eq!(
+            status(
+                &app2,
+                api_request("DELETE", &format!("/sessions/{fork}"), "key-a", "{}")
+            )
+            .await,
+            204,
+            "the creator must be able to delete its own restored fork"
+        );
+    }
+
+    /// Issue #85: a trigger that resumes a session runs turns in it
+    /// server-side (as an admin identity), so registration is ownership-
+    /// asserted too — otherwise the `/sessions` scoping would be cosmetic.
+    #[tokio::test]
+    async fn trigger_registration_cannot_target_a_foreign_session() {
+        use crate::trigger_endpoints::state_with_workspace;
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let state = state_with_workspace(ws.path());
+        let app = build_router_with_auth(state, two_caller_auth());
+        let alice_session =
+            created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+        let body =
+            format!(r#"{{"kind":"webhook","goal":"do something","session_id":"{alice_session}"}}"#);
+
+        assert_eq!(
+            status(&app, api_request("POST", "/triggers", "key-b", &body)).await,
+            403,
+            "a trigger must not be pointed at another caller's session"
+        );
+        assert_eq!(
+            status(&app, api_request("POST", "/triggers", "key-a", &body)).await,
+            201,
+            "the owner may resume its own session on a schedule"
+        );
+    }
+
+    /// Issue #85: the trigger registry is workspace-global and a trigger runs
+    /// its goal server-side (in its session, as an admin identity), so every
+    /// route that reads or mutates one is owner-scoped too — otherwise any
+    /// caller could re-goal another caller's trigger and have their work run
+    /// in that caller's session, which is exactly the gap `GET /sessions`
+    /// scoping leaves open.
+    #[tokio::test]
+    async fn triggers_are_scoped_to_their_owner() {
+        use crate::trigger_endpoints::state_with_workspace;
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let state = state_with_workspace(ws.path());
+        let app = build_router_with_auth(state, two_caller_auth());
+
+        let response = app
+            .clone()
+            .oneshot(api_request(
+                "POST",
+                "/triggers",
+                "key-a",
+                r#"{"kind":"webhook","goal":"alice's job"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_str().expect("trigger id").to_string();
+        let keyed_path = created["webhook_path"]
+            .as_str()
+            .expect("webhook path")
+            .to_string();
+
+        // Bob's list does not contain alice's trigger…
+        let response = app
+            .clone()
+            .oneshot(api_request("GET", "/triggers", "key-b", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            list.as_array().unwrap().is_empty(),
+            "a caller must not see another caller's triggers"
+        );
+
+        // …and every route that reaches one refuses him, the fire path
+        // included (knowing the id — and even the webhook secret — is not
+        // authorization).
+        for (method, uri, payload) in [
+            ("GET", format!("/triggers/{id}"), "{}".to_string()),
+            (
+                "PATCH",
+                format!("/triggers/{id}"),
+                r#"{"goal":"bob's job","enabled":true}"#.to_string(),
+            ),
+            ("DELETE", format!("/triggers/{id}"), "{}".to_string()),
+            ("POST", keyed_path.clone(), "{}".to_string()),
+        ] {
+            assert_eq!(
+                status(&app, api_request(method, &uri, "key-b", &payload)).await,
+                403,
+                "{method} {uri} must refuse another caller's trigger"
+            );
+        }
+
+        // The refused PATCH/DELETE changed nothing…
+        let response = app
+            .clone()
+            .oneshot(api_request(
+                "GET",
+                &format!("/triggers/{id}"),
+                "key-a",
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["goal"], "alice's job");
+        assert_eq!(detail["enabled"], false, "the refused PATCH must not run");
+        let response = app
+            .clone()
+            .oneshot(api_request("GET", "/triggers", "key-a", "{}"))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+
+        // …while the owner still manages it.
+        assert_eq!(
+            status(
+                &app,
+                api_request(
+                    "PATCH",
+                    &format!("/triggers/{id}"),
+                    "key-a",
+                    r#"{"goal":"alice v2"}"#
+                )
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            status(
+                &app,
+                api_request("DELETE", &format!("/triggers/{id}"), "key-a", "{}")
+            )
+            .await,
+            204
+        );
+    }
+
     // ── /agui endpoint tests ──────────────────────────────────────────────
 
     /// Drain an SSE response body into a Vec<agui_protocol::Event> by
@@ -3522,6 +4111,8 @@ mod http_tests {
             id: session_id.clone(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             title: None,
+            owner: None,
+            tenant: None,
             runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
             plan_approval_gate: gate,
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),

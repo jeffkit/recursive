@@ -46,8 +46,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::handlers::format_timestamp;
-use super::{ApiError, AppState, SessionState};
+use super::handlers::{ensure_access, format_timestamp};
+use super::{ApiError, AppState, AuthIdentity, SessionState};
 use crate::message::{Message, Role};
 use crate::runtime::AgentRuntime;
 use std::time::SystemTime;
@@ -65,6 +65,11 @@ use std::time::SystemTime;
 /// Returns 404 when the storage has no restorable transcript for `id`
 /// (missing, or empty after normalization) — identical to the pre-restart
 /// semantics for unknown ids.
+///
+/// Issue #85: ownership is asserted here — before the runtime is built and
+/// inserted — so a caller probing a foreign id cannot make the server
+/// materialize someone else's session. Returns 403 for a session the identity
+/// does not own (an unattributed one included: only an admin reaches those).
 /// Storage key for the "this session was deleted" tombstone.
 ///
 /// Goal 396 keeps the transcript snapshot when a session ends (DELETE included —
@@ -114,6 +119,13 @@ pub(super) struct SessionMeta {
         skip_serializing_if = "crate::http::SessionOverrides::is_default"
     )]
     pub overrides: crate::http::SessionOverrides,
+    /// Issue #85: subject that created the session. `None` (older build)
+    /// restores as an unattributed session, reachable by admins only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Issue #85: the owner's tenant, part of the ownership key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Storage key for the per-session metadata blob (issue #98).
@@ -173,6 +185,7 @@ pub(super) async fn update_persisted_title(state: &AppState, id: &str, title: Op
 pub(super) async fn get_or_load_session(
     state: &Arc<AppState>,
     id: &str,
+    identity: &AuthIdentity,
 ) -> Result<Arc<SessionState>, ApiError> {
     // Phase 1: short read lock. All mutable session state lives in Arc
     // fields, so a struct-level clone shares it with the table value.
@@ -180,6 +193,7 @@ pub(super) async fn get_or_load_session(
         let host_sessions = state.host.sessions();
         let sessions = host_sessions.read().await;
         if let Some(existing) = sessions.get(id) {
+            ensure_access(identity, existing)?;
             return Ok(Arc::new(existing.clone()));
         }
     }
@@ -207,6 +221,14 @@ pub(super) async fn get_or_load_session(
     // per-session config (issue #98) drives the rebuild; absent, the server
     // defaults apply.
     let meta = load_session_meta(state, id).await;
+    // Issue #85: the owner recorded at creation decides access. Checked
+    // before the runtime is built so a foreign probe materializes nothing.
+    if !identity.may_access_session(
+        meta.as_ref().and_then(|m| m.owner.as_deref()),
+        meta.as_ref().and_then(|m| m.tenant.as_deref()),
+    ) {
+        return Err(ApiError::forbidden("session belongs to another identity"));
+    }
     let runtime = build_restored_runtime(state, id, seed, meta.as_ref()).await?;
     let plan_approval_gate = runtime.plan_approval_gate();
 
@@ -222,6 +244,8 @@ pub(super) async fn get_or_load_session(
         // per-session override, and was never persisted.
         created_at: format_timestamp(SystemTime::now()),
         title: meta.as_ref().and_then(|m| m.title.clone()),
+        owner: meta.as_ref().and_then(|m| m.owner.clone()),
+        tenant: meta.as_ref().and_then(|m| m.tenant.clone()),
         runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
         plan_approval_gate,
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -571,7 +595,7 @@ mod tests {
         )
         .await;
 
-        let session = get_or_load_session(&state, "sess-cold-1")
+        let session = get_or_load_session(&state, "sess-cold-1", &AuthIdentity::local())
             .await
             .expect("cold load succeeds");
         let rt = session.runtime.lock().await;
@@ -640,6 +664,8 @@ mod tests {
             max_steps: Some(7),
             preset: Some("standard".into()),
             overrides: Default::default(),
+            owner: Some("alice".into()),
+            tenant: Some("acme".into()),
         };
         persist_session_meta(&state, "s1", &meta).await;
         let loaded = load_session_meta(&state, "s1")
@@ -654,6 +680,10 @@ mod tests {
             Some("standard"),
             "issue #127: the session's preset rides the #98 metadata path"
         );
+        // Issue #85: ownership must survive the round-trip — dropping it on
+        // restart would hand the session to the wrong caller (or to nobody).
+        assert_eq!(loaded.owner.as_deref(), Some("alice"));
+        assert_eq!(loaded.tenant.as_deref(), Some("acme"));
     }
 
     #[tokio::test]
@@ -670,6 +700,8 @@ mod tests {
                 max_steps: Some(9),
                 preset: None,
                 overrides: Default::default(),
+                owner: Some("alice".into()),
+                tenant: None,
             },
         )
         .await;
@@ -679,6 +711,11 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("renamed"));
         assert_eq!(loaded.system_prompt.as_deref(), Some("keep me"));
         assert_eq!(loaded.max_steps, Some(9));
+        assert_eq!(
+            loaded.owner.as_deref(),
+            Some("alice"),
+            "a title rename must not drop the session's owner"
+        );
     }
 
     /// Issue #98 acceptance: a session created with a custom `system_prompt`
@@ -730,11 +767,13 @@ mod tests {
                 max_steps: Some(7),
                 preset: Some("standard".into()),
                 overrides: Default::default(),
+                owner: None,
+                tenant: None,
             },
         )
         .await;
 
-        let session = get_or_load_session(&state, "sess-98")
+        let session = get_or_load_session(&state, "sess-98", &AuthIdentity::local())
             .await
             .expect("cold load");
         assert_eq!(
@@ -807,11 +846,13 @@ mod tests {
                 max_steps: None,
                 preset: None,
                 overrides: Default::default(),
+                owner: None,
+                tenant: None,
             },
         )
         .await;
 
-        let session = get_or_load_session(&state, "sess-bypass")
+        let session = get_or_load_session(&state, "sess-bypass", &AuthIdentity::local())
             .await
             .expect("cold load");
         let rt = session.runtime.lock().await;
@@ -829,7 +870,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path().to_path_buf(), vec![]);
 
-        let err = match get_or_load_session(&state, "no-such-session").await {
+        let err = match get_or_load_session(&state, "no-such-session", &AuthIdentity::local()).await
+        {
             Ok(_) => panic!("unknown id must stay 404"),
             Err(e) => e,
         };
@@ -843,6 +885,55 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    /// Issue #85: ownership comes from the persisted metadata, and a foreign
+    /// probe is refused BEFORE the runtime is built — it must not materialize
+    /// someone else's session (nor count it in the sessions gauge).
+    #[tokio::test]
+    async fn cold_load_refuses_a_session_owned_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        seed(dir.path(), "sess-owned", vec![user("hi"), assistant("yo")]).await;
+        persist_session_meta(
+            &state,
+            "sess-owned",
+            &SessionMeta {
+                owner: Some("alice".into()),
+                tenant: Some("acme".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        for (subject, tenant) in [("bob", Some("acme")), ("alice", Some("globex"))] {
+            let foreign = AuthIdentity {
+                subject: subject.into(),
+                tenant: tenant.map(str::to_string),
+                admin: false,
+            };
+            let err = match get_or_load_session(&state, "sess-owned", &foreign).await {
+                Ok(_) => panic!("a foreign identity must be refused"),
+                Err(e) => e,
+            };
+            assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            state.host.sessions().read().await.len(),
+            0,
+            "a refused probe must not materialize the session"
+        );
+
+        let owner = AuthIdentity {
+            subject: "alice".into(),
+            tenant: Some("acme".into()),
+            admin: false,
+        };
+        let session = get_or_load_session(&state, "sess-owned", &owner)
+            .await
+            .expect("the owner cold-loads its own session");
+        assert_eq!(session.owner.as_deref(), Some("alice"));
+        assert_eq!(session.tenant.as_deref(), Some("acme"));
     }
 
     #[tokio::test]
@@ -861,6 +952,8 @@ mod tests {
                 id: "live-session".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 title: Some("live".to_string()),
+                owner: None,
+                tenant: None,
                 runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
                 plan_approval_gate: gate,
                 interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
@@ -871,7 +964,7 @@ mod tests {
             },
         );
 
-        let session = get_or_load_session(&state, "live-session")
+        let session = get_or_load_session(&state, "live-session", &AuthIdentity::local())
             .await
             .expect("memory hit");
         // The live title proves it came from the table, not a rebuild.
@@ -898,7 +991,7 @@ mod tests {
         )
         .await;
 
-        let session = get_or_load_session(&state, "sess-cold-2")
+        let session = get_or_load_session(&state, "sess-cold-2", &AuthIdentity::local())
             .await
             .expect("cold load");
         session

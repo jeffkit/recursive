@@ -24,6 +24,9 @@ All configuration is done via environment variables (or CLI flags where noted). 
 |---|---|---|
 | `RECURSIVE_HTTP_ADDR` | `0.0.0.0:3000` | Bind address |
 | `RECURSIVE_HTTP_AUTH_KEYS` | *(none — open)* | Comma-separated `X-API-Key` allowlist |
+| `RECURSIVE_HTTP_AUTH_KEY_OWNERS` | *(empty)* | Comma-separated `subject=key` pairs attributing an API key to a caller; sessions are scoped per subject, so two subjects cannot see each other's |
+| `RECURSIVE_HTTP_AUTH_ADMINS` | *(empty)* | Comma-separated subjects carrying the `admin` role — they reach every session |
+| `RECURSIVE_HTTP_AUTH_JWT_SECRET` | *(disabled)* | HS256 secret for `Authorization: Bearer` JWTs; a token's `sub` (and optional `tenant`) is the session owner |
 
 ## Cloud Storage — Redis
 

@@ -9,6 +9,13 @@
 //! Docker image or `--release` binary cannot be tricked into running
 //! unauthenticated by an operator "temporarily" setting the env var
 //! in production.
+//!
+//! This module is also the server's **identity** layer (issue #85): a
+//! valid credential resolves to an [`AuthIdentity`], not just a boolean.
+//! The middleware attaches it to the request extensions, and the session
+//! handlers assert session ownership against it — a server that accepts
+//! several credentials must not let each of them read every other
+//! caller's sessions.
 
 use axum::http::StatusCode;
 use std::sync::Arc;
@@ -17,14 +24,84 @@ use std::sync::Arc;
 pub const ENV_AUTH_KEYS: &str = "RECURSIVE_HTTP_AUTH_KEYS";
 /// Env var holding the inbound JWT HMAC secret.
 pub const ENV_AUTH_JWT_SECRET: &str = "RECURSIVE_HTTP_AUTH_JWT_SECRET";
+/// Env var attributing API keys to subjects: a comma-separated list of
+/// `subject=key` entries (split on the first `=`). `/sessions` visibility is
+/// per subject, and the subject of a session is recorded as its owner.
+pub const ENV_AUTH_KEY_OWNERS: &str = "RECURSIVE_HTTP_AUTH_KEY_OWNERS";
+/// Env var listing the subjects carrying the `admin` role — comma-separated,
+/// matched against a JWT `sub` or an API-key subject. Admin identities reach
+/// every session, not just their own.
+pub const ENV_AUTH_ADMINS: &str = "RECURSIVE_HTTP_AUTH_ADMINS";
+
+/// Subject a bare `RECURSIVE_HTTP_AUTH_KEYS` entry authenticates as when
+/// `RECURSIVE_HTTP_AUTH_KEY_OWNERS` does not map it to one. Every unmapped
+/// key therefore resolves to this single principal — configure owners (or use
+/// JWT) when callers must not see each other's sessions.
+pub const DEFAULT_KEY_SUBJECT: &str = "api-key";
+
+/// The authenticated principal behind a request (issue #85).
+///
+/// Resolved from a verified credential by [`AuthConfig::identify`] /
+/// [`AuthConfig::identify_bearer`] and handed to the handlers through the
+/// request extensions. Sessions record their creator's subject and tenant;
+/// access to a session is granted to its owner and to admins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthIdentity {
+    /// Principal id — a JWT `sub` claim, or an API key's configured subject.
+    pub subject: String,
+    /// Tenant the subject belongs to (JWT `tenant` claim). Scopes the
+    /// subject: two tenants can mint the same `sub`, so the same subject in
+    /// another tenant is a different owner.
+    pub tenant: Option<String>,
+    /// Whether the subject carries the `admin` role and may therefore reach
+    /// every session.
+    pub admin: bool,
+}
+
+impl AuthIdentity {
+    /// The unrestricted identity used for requests on a server that has auth
+    /// disabled (the debug escape hatch / single-user deployment) and for
+    /// server-side work with no inbound request (triggers).
+    pub fn local() -> Self {
+        Self {
+            subject: "local".to_string(),
+            tenant: None,
+            admin: true,
+        }
+    }
+
+    /// Whether this identity may read or mutate a session owned by
+    /// (`owner`, `tenant`).
+    ///
+    /// An admin reaches everything. Otherwise both the subject **and** the
+    /// tenant must match. `owner == None` is a session written before the
+    /// identity model existed: it belongs to nobody, so only an admin may
+    /// touch it (default-deny for unattributed data).
+    pub fn may_access_session(&self, owner: Option<&str>, tenant: Option<&str>) -> bool {
+        if self.admin {
+            return true;
+        }
+        match owner {
+            Some(o) => self.subject == o && self.tenant.as_deref() == tenant,
+            None => false,
+        }
+    }
+}
+
+/// One accepted API key and the subject it authenticates as.
+#[derive(Clone, Debug)]
+pub(super) struct ApiKey {
+    pub(super) secret: String,
+    pub(super) subject: String,
+}
 
 /// API key authentication for the HTTP server.
 ///
 /// Configured from `RECURSIVE_HTTP_AUTH_KEYS`, a comma-separated list of
 /// keys the server will accept in the `X-API-Key` request header. An empty
-/// key set (the default) disables auth entirely — every route is reachable
-/// without credentials. This preserves zero-config behavior and keeps the
-/// public default backward-compatible.
+/// key set with no JWT verifier means auth is *not configured*: since
+/// Goal 277 the middleware answers 503 rather than letting requests through
+/// (see [`auth_middleware`]).
 ///
 /// Distinct from `RECURSIVE_API_KEY` (singular): that variable holds the
 /// **outbound** credential the agent uses to talk to its LLM provider.
@@ -34,9 +111,15 @@ pub const ENV_AUTH_JWT_SECRET: &str = "RECURSIVE_HTTP_AUTH_JWT_SECRET";
 ///
 /// `/health` and `/metrics` are always exempt (k8s liveness probes and
 /// Prometheus scrapers must work unauthenticated).
+///
+/// Issue #85: a key is not just a yes/no — it authenticates as a subject
+/// ([`AuthConfig::with_key_subject`], default [`DEFAULT_KEY_SUBJECT`]) which
+/// owns the sessions it creates.
 #[derive(Clone, Default)]
 pub struct AuthConfig {
-    pub(super) keys: Arc<Vec<String>>,
+    pub(super) keys: Arc<Vec<ApiKey>>,
+    /// Subjects carrying the `admin` role (see [`ENV_AUTH_ADMINS`]).
+    pub(super) admins: Arc<Vec<String>>,
     pub(super) jwt: Option<JwtConfig>,
 }
 
@@ -44,11 +127,99 @@ impl AuthConfig {
     /// Build an `AuthConfig` from an explicit key list. Pass an empty
     /// vec to disable API-key auth (a JWT verifier may still be
     /// attached via [`AuthConfig::with_jwt`]).
+    ///
+    /// Every key authenticates as [`DEFAULT_KEY_SUBJECT`]; use
+    /// [`AuthConfig::with_key_subject`] to attribute a key to a caller.
     pub fn new(keys: Vec<String>) -> Self {
         Self {
-            keys: Arc::new(keys),
+            keys: Arc::new(
+                keys.into_iter()
+                    .map(|secret| ApiKey {
+                        secret,
+                        subject: DEFAULT_KEY_SUBJECT.to_string(),
+                    })
+                    .collect(),
+            ),
+            admins: Arc::new(Vec::new()),
             jwt: None,
         }
+    }
+
+    /// Attribute `secret` to `subject`, adding the key when it is not
+    /// configured yet. Two callers sharing one key share one identity; two
+    /// keys mapped to two subjects cannot see each other's sessions.
+    pub fn with_key_subject(
+        mut self,
+        secret: impl Into<String>,
+        subject: impl Into<String>,
+    ) -> Self {
+        let secret = secret.into();
+        let subject = subject.into();
+        let mut keys = (*self.keys).clone();
+        match keys.iter_mut().find(|k| k.secret == secret) {
+            Some(existing) => existing.subject = subject,
+            None => keys.push(ApiKey { secret, subject }),
+        }
+        self.keys = Arc::new(keys);
+        self
+    }
+
+    /// Give `subject` the `admin` role: it may read and mutate every session,
+    /// not only the ones it owns. Applies to JWT `sub` claims and API-key
+    /// subjects alike.
+    pub fn with_admin(mut self, subject: impl Into<String>) -> Self {
+        let subject = subject.into();
+        let mut admins = (*self.admins).clone();
+        if !admins.iter().any(|a| a == &subject) {
+            admins.push(subject);
+        }
+        self.admins = Arc::new(admins);
+        self
+    }
+
+    /// Whether `subject` carries the `admin` role.
+    pub fn is_admin(&self, subject: &str) -> bool {
+        self.admins.iter().any(|a| a == subject)
+    }
+
+    /// Resolve a presented API key to the identity it authenticates as, or
+    /// `None` when it matches no configured key.
+    ///
+    /// The scan runs over **every** configured key regardless of an early
+    /// match, so the comparison stays constant-time and does not leak *which*
+    /// key matched — the property [`AuthConfig::is_valid`] had, kept now that
+    /// a match yields a value rather than a boolean.
+    pub fn identify(&self, presented: &str) -> Option<AuthIdentity> {
+        let presented_bytes = presented.as_bytes();
+        let mut matched: Option<&ApiKey> = None;
+        for k in self.keys.iter() {
+            let k_bytes = k.secret.as_bytes();
+            if k_bytes.len() != presented_bytes.len() {
+                continue;
+            }
+            let mut diff: u8 = 0;
+            for (a, b) in k_bytes.iter().zip(presented_bytes.iter()) {
+                diff |= a ^ b;
+            }
+            if diff == 0 {
+                matched = Some(k);
+            }
+        }
+        matched.map(|k| AuthIdentity {
+            subject: k.subject.clone(),
+            tenant: None,
+            admin: self.is_admin(&k.subject),
+        })
+    }
+
+    /// Resolve a bearer token to an identity, applying the configured admin
+    /// role. `None` when no JWT verifier is attached or the token is not
+    /// authentic (bad signature / expired / wrong audience) or not
+    /// attributable (no `sub` claim).
+    pub fn identify_bearer(&self, token: &str) -> Option<AuthIdentity> {
+        let mut identity = self.jwt.as_ref()?.identity(token)?;
+        identity.admin = self.is_admin(&identity.subject);
+        Some(identity)
     }
 
     /// Attach a JWT verifier. Call after [`AuthConfig::new`] to get
@@ -66,30 +237,8 @@ impl AuthConfig {
     /// Returns `false` when no API keys are configured — callers must
     /// use [`AuthConfig::is_enabled`] first to detect the "auth
     /// disabled" pass-through mode (handled by [`auth_middleware`]).
-    ///
-    /// The loop runs over **every** configured key regardless of an
-    /// early match, to keep the comparison constant-time and avoid
-    /// leaking key-set membership timing.
     pub fn is_valid(&self, presented: &str) -> bool {
-        if self.keys.is_empty() {
-            return false;
-        }
-        let mut found = false;
-        let presented_bytes = presented.as_bytes();
-        for k in self.keys.iter() {
-            let k_bytes = k.as_bytes();
-            if k_bytes.len() != presented_bytes.len() {
-                continue;
-            }
-            let mut diff: u8 = 0;
-            for (a, b) in k_bytes.iter().zip(presented_bytes.iter()) {
-                diff |= a ^ b;
-            }
-            if diff == 0 {
-                found = true;
-            }
-        }
-        found
+        self.identify(presented).is_some()
     }
 
     /// Whether ANY auth modality is enabled — non-empty API key set
@@ -148,27 +297,77 @@ impl JwtConfig {
 
     /// Verify a token. Returns true iff signature, exp, and (when
     /// configured) audience all check out.
+    ///
+    /// This is the *authenticity* question only. The middleware asks the
+    /// attribution question instead ([`AuthConfig::identify_bearer`]), which
+    /// additionally requires a `sub` claim — a token both valid and
+    /// unattributable is rejected there.
     pub fn is_valid(&self, token: &str) -> bool {
         jsonwebtoken::decode::<serde_json::Value>(token, &self.decoding_key, &self.validation)
             .is_ok()
     }
+
+    /// Verify a token and read the identity out of its claims.
+    ///
+    /// `None` when the token is not authentic (bad signature / expired /
+    /// wrong audience) or carries no usable `sub`: a credential the server
+    /// cannot tie to an owner is refused rather than collapsed onto a shared
+    /// anonymous principal — that would hand every such token the same
+    /// sessions.
+    fn identity(&self, token: &str) -> Option<AuthIdentity> {
+        let data =
+            jsonwebtoken::decode::<JwtClaims>(token, &self.decoding_key, &self.validation).ok()?;
+        let subject = data.claims.sub.filter(|s| !s.is_empty())?;
+        Some(AuthIdentity {
+            subject,
+            tenant: data.claims.tenant.filter(|t| !t.is_empty()),
+            // The admin role is a server-side decision
+            // (`RECURSIVE_HTTP_AUTH_ADMINS`), never a token's self-declaration.
+            admin: false,
+        })
+    }
+}
+
+/// The claims the server reads off a verified token (issue #85).
+///
+/// Everything else in the token is deliberately dropped. `sub` identifies the
+/// owner; `tenant` (optional, non-standard) scopes it, because a `sub` is only
+/// unique per issuer/tenant.
+#[derive(serde::Deserialize)]
+struct JwtClaims {
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
 /// Build `AuthConfig` from env vars:
 ///
 /// - `RECURSIVE_HTTP_AUTH_KEYS` — comma-separated API keys (g135).
+/// - `RECURSIVE_HTTP_AUTH_KEY_OWNERS` — `subject=key` pairs attributing keys
+///   to callers (issue #85). An entry for a key that is not in
+///   `RECURSIVE_HTTP_AUTH_KEYS` also adds it.
+/// - `RECURSIVE_HTTP_AUTH_ADMINS` — subjects with the `admin` role.
 /// - `RECURSIVE_HTTP_AUTH_JWT_SECRET` — HMAC secret for JWT (g136).
 /// - `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` — optional `aud` claim.
 ///
 /// All unset = auth disabled (back-compat zero-config default).
 pub(super) fn auth_config_from_env() -> AuthConfig {
-    let raw = std::env::var(ENV_AUTH_KEYS).unwrap_or_default();
-    let keys: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut config = AuthConfig::new(keys);
+    let mut config = AuthConfig::new(comma_list(ENV_AUTH_KEYS));
+    for entry in comma_list(ENV_AUTH_KEY_OWNERS) {
+        match entry.split_once('=') {
+            Some((subject, key)) if !subject.is_empty() && !key.is_empty() => {
+                config = config.with_key_subject(key, subject);
+            }
+            _ => tracing::warn!(
+                "ignoring malformed {ENV_AUTH_KEY_OWNERS} entry (expected \
+                 `subject=key`)"
+            ),
+        }
+    }
+    for subject in comma_list(ENV_AUTH_ADMINS) {
+        config = config.with_admin(subject);
+    }
     let jwt_secret = std::env::var(ENV_AUTH_JWT_SECRET).unwrap_or_default();
     let jwt_audience = std::env::var("RECURSIVE_HTTP_AUTH_JWT_AUDIENCE")
         .ok()
@@ -187,11 +386,23 @@ pub(super) fn auth_config_from_env() -> AuthConfig {
     config
 }
 
-/// Axum middleware: enforce auth on requests.
+/// Parse a comma-separated env var, trimming each entry and dropping blanks.
+fn comma_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Axum middleware: enforce auth on requests and attach the caller's
+/// [`AuthIdentity`] to the request extensions.
 ///
 /// Tries `X-API-Key` first (cheap); falls back to
 /// `Authorization: Bearer <jwt>`. Either valid credential lets the
-/// request through.
+/// request through — and resolves to an identity the session handlers
+/// use for ownership assertions.
 ///
 /// Layered only over the protected sub-router — public routes
 /// (`/health`, `/metrics`, `/openapi.json`) are merged in at the
@@ -224,7 +435,9 @@ pub(super) async fn auth_middleware(
                  ignore this switch and return 503 instead. Never use \
                  this in production."
             );
-            return next.run(req).await;
+            // No credential to attribute: the request runs as the single
+            // implicit local operator, which is also what it is.
+            return run_with_identity(req, AuthIdentity::local(), next).await;
         }
         if insecure_ok_set && cfg!(not(debug_assertions)) {
             tracing::error!(
@@ -249,31 +462,38 @@ pub(super) async fn auth_middleware(
         *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
         return resp;
     }
-    // Try X-API-Key first (cheaper than JWT verify).
-    if !auth.keys.is_empty() {
-        if let Some(presented) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
-            if auth.is_valid(presented) {
-                return next.run(req).await;
-            }
+    // Try X-API-Key first (cheaper than JWT verify), then Authorization.
+    let identity = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|presented| auth.identify(presented))
+        .or_else(|| {
+            req.headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|authz| authz.strip_prefix("Bearer "))
+                .and_then(|token| auth.identify_bearer(token))
+        });
+    match identity {
+        Some(identity) => run_with_identity(req, identity, next).await,
+        None => {
+            let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            resp
         }
     }
-    // Then try Authorization: Bearer <jwt>.
-    if let Some(ref jwt) = auth.jwt {
-        if let Some(authz) = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        {
-            if let Some(token) = authz.strip_prefix("Bearer ") {
-                if jwt.is_valid(token) {
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-    let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
-    *resp.status_mut() = StatusCode::UNAUTHORIZED;
-    resp
+}
+
+/// Hand `req` to the rest of the stack with `identity` attached, where the
+/// session handlers read it via `Extension<AuthIdentity>`.
+async fn run_with_identity(
+    mut req: axum::extract::Request,
+    identity: AuthIdentity,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    req.extensions_mut().insert(identity);
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -339,6 +559,228 @@ mod tests {
         // kills `replace !self.keys.is_empty() with false` or `|| self.jwt.is_some()` mutations
         let cfg = AuthConfig::new(vec![]);
         assert!(!cfg.is_enabled(), "no keys and no JWT must be disabled");
+    }
+
+    // ── Issue #85: identity resolution ──────────────────────────────────────
+
+    #[test]
+    fn identify_defaults_every_bare_key_to_the_shared_subject() {
+        let cfg = AuthConfig::new(vec!["k1".to_string(), "k2".to_string()]);
+        assert_eq!(
+            cfg.identify("k1").map(|i| i.subject),
+            Some(DEFAULT_KEY_SUBJECT.to_string())
+        );
+        assert_eq!(
+            cfg.identify("k2").map(|i| i.subject),
+            Some(DEFAULT_KEY_SUBJECT.to_string())
+        );
+    }
+
+    #[test]
+    fn identify_returns_none_for_an_unknown_key() {
+        // kills `matched = Some(k)` being unconditional
+        let cfg = AuthConfig::new(vec!["k1".to_string()]);
+        assert!(cfg.identify("k2").is_none());
+        assert!(cfg.identify("k").is_none(), "prefix must not match");
+    }
+
+    #[test]
+    fn with_key_subject_attributes_existing_and_new_keys() {
+        // k1 exists (subject overridden), k9 does not (key added).
+        let cfg = AuthConfig::new(vec!["k1".to_string()])
+            .with_key_subject("k1", "alice")
+            .with_key_subject("k9", "carol");
+        assert_eq!(cfg.identify("k1").map(|i| i.subject), Some("alice".into()));
+        assert_eq!(cfg.identify("k9").map(|i| i.subject), Some("carol".into()));
+    }
+
+    #[test]
+    fn admins_are_resolved_from_the_subject() {
+        let cfg = AuthConfig::new(vec!["k1".to_string(), "k2".to_string()])
+            .with_key_subject("k1", "root")
+            .with_admin("root");
+        assert!(cfg.identify("k1").expect("k1").admin, "root is an admin");
+        assert!(!cfg.identify("k2").expect("k2").admin, "unlisted ≠ admin");
+        assert!(cfg.is_admin("root"));
+        assert!(!cfg.is_admin("alice"));
+    }
+
+    #[test]
+    fn with_admin_ignores_duplicates() {
+        let cfg = AuthConfig::new(vec![])
+            .with_admin("root")
+            .with_admin("root");
+        assert_eq!(cfg.admins.len(), 1);
+    }
+
+    #[test]
+    fn may_access_session_requires_the_same_subject() {
+        let alice = AuthIdentity {
+            subject: "alice".into(),
+            tenant: None,
+            admin: false,
+        };
+        assert!(alice.may_access_session(Some("alice"), None));
+        assert!(!alice.may_access_session(Some("bob"), None));
+        // A session written before the identity model belongs to nobody.
+        assert!(!alice.may_access_session(None, None));
+    }
+
+    #[test]
+    fn may_access_session_scopes_the_subject_by_tenant() {
+        // Two tenants can mint the same `sub`, so the tenant is part of the
+        // ownership key — otherwise acme's alice reaches globex's sessions.
+        let alice = AuthIdentity {
+            subject: "alice".into(),
+            tenant: Some("acme".into()),
+            admin: false,
+        };
+        assert!(alice.may_access_session(Some("alice"), Some("acme")));
+        assert!(!alice.may_access_session(Some("alice"), Some("globex")));
+        assert!(!alice.may_access_session(Some("alice"), None));
+    }
+
+    #[test]
+    fn admin_reaches_any_session_including_unattributed_ones() {
+        let root = AuthIdentity {
+            subject: "root".into(),
+            tenant: None,
+            admin: true,
+        };
+        assert!(root.may_access_session(Some("bob"), Some("globex")));
+        assert!(root.may_access_session(None, None));
+    }
+
+    #[test]
+    fn local_identity_is_an_admin_of_its_own_subject() {
+        // The no-auth (debug escape hatch) and server-side (trigger) identity.
+        let local = AuthIdentity::local();
+        assert_eq!(local.subject, "local");
+        assert!(local.admin);
+        assert!(local.may_access_session(Some("alice"), None));
+    }
+
+    fn mint_jwt(secret: &str, claims: serde_json::Value) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("mint jwt")
+    }
+
+    fn exp_in(secs: i64) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        now + secs
+    }
+
+    #[test]
+    fn identify_bearer_reads_sub_and_tenant() {
+        let cfg = AuthConfig::new(Vec::new())
+            .with_jwt(JwtConfig::hs256("s3cret", None).expect("verifier"));
+        let token = mint_jwt(
+            "s3cret",
+            serde_json::json!({"exp": exp_in(60), "sub": "alice", "tenant": "acme"}),
+        );
+        let id = cfg.identify_bearer(&token).expect("valid token");
+        assert_eq!(id.subject, "alice");
+        assert_eq!(id.tenant.as_deref(), Some("acme"));
+        assert!(!id.admin);
+    }
+
+    #[test]
+    fn identify_bearer_rejects_an_unattributable_token() {
+        // Authentic but no `sub`: there is no owner to attribute, so it is not
+        // an identity — the middleware answers 401 rather than collapsing it
+        // onto a shared anonymous principal.
+        let jwt = JwtConfig::hs256("s3cret", None).expect("verifier");
+        let token = mint_jwt("s3cret", serde_json::json!({"exp": exp_in(60)}));
+        assert!(jwt.is_valid(&token), "signature/exp still check out");
+        let cfg = AuthConfig::new(Vec::new()).with_jwt(jwt);
+        assert!(cfg.identify_bearer(&token).is_none());
+    }
+
+    #[test]
+    fn identify_bearer_ignores_bad_tokens() {
+        let cfg = AuthConfig::new(Vec::new())
+            .with_jwt(JwtConfig::hs256("s3cret", None).expect("verifier"));
+        let wrong_secret = mint_jwt("other", serde_json::json!({"exp": exp_in(60), "sub": "a"}));
+        let expired = mint_jwt(
+            "s3cret",
+            serde_json::json!({"exp": exp_in(-300), "sub": "a"}),
+        );
+        assert!(cfg.identify_bearer(&wrong_secret).is_none());
+        assert!(cfg.identify_bearer(&expired).is_none());
+    }
+
+    #[test]
+    fn identify_bearer_is_none_without_a_jwt_verifier() {
+        let cfg = AuthConfig::new(vec!["k".to_string()]);
+        let token = mint_jwt("s3cret", serde_json::json!({"exp": exp_in(60), "sub": "a"}));
+        assert!(cfg.identify_bearer(&token).is_none());
+    }
+
+    #[test]
+    fn jwt_admin_role_comes_from_config_not_from_the_token() {
+        // A token that claims `role: admin` for a subject the server did not
+        // mark as admin must NOT be an admin — the role is the server's call.
+        let cfg = AuthConfig::new(Vec::new())
+            .with_jwt(JwtConfig::hs256("s3cret", None).expect("verifier"))
+            .with_admin("alice");
+        let bob = mint_jwt(
+            "s3cret",
+            serde_json::json!({"exp": exp_in(60), "sub": "bob", "role": "admin", "roles": ["admin"]}),
+        );
+        assert!(!cfg.identify_bearer(&bob).expect("bob").admin);
+        let alice = mint_jwt(
+            "s3cret",
+            serde_json::json!({"exp": exp_in(60), "sub": "alice"}),
+        );
+        assert!(cfg.identify_bearer(&alice).expect("alice").admin);
+    }
+
+    /// Issue #85: the env-driven path — keys, key→subject mapping and the admin
+    /// list. ONE test: `set_var` is process-global and `cargo test` runs tests
+    /// in parallel threads (`.dev/AGENTS.md`).
+    #[test]
+    fn auth_config_from_env_reads_keys_owners_and_admins() {
+        let _guard = crate::test_util::env_lock();
+        let vars = [ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS, ENV_AUTH_ADMINS];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        unsafe {
+            // Trailing commas and blanks must be ignored (the env vars are
+            // hand-written, and an empty entry must never become a key).
+            std::env::set_var(ENV_AUTH_KEYS, "k1, k2,");
+            // One well-formed mapping for an existing key, one that also adds
+            // a key, one malformed entry that must be ignored.
+            std::env::set_var(ENV_AUTH_KEY_OWNERS, "alice=k1, bob=k3,broken");
+            std::env::set_var(ENV_AUTH_ADMINS, "bob");
+        }
+
+        let cfg = auth_config_from_env();
+
+        assert_eq!(cfg.identify("k1").expect("k1").subject, "alice");
+        assert_eq!(
+            cfg.identify("k2").expect("k2").subject,
+            DEFAULT_KEY_SUBJECT,
+            "an unmapped key keeps the shared default subject"
+        );
+        assert_eq!(cfg.identify("k3").expect("k3").subject, "bob");
+        assert!(cfg.identify("broken").is_none(), "malformed entry ignored");
+        assert!(cfg.identify("k3").expect("k3").admin, "bob is an admin");
+        assert!(!cfg.identify("k1").expect("k1").admin);
+
+        for (name, value) in saved {
+            match value {
+                Some(v) => unsafe { std::env::set_var(name, v) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
     }
 
     fn router_with_auth(auth: AuthConfig) -> axum::Router {
