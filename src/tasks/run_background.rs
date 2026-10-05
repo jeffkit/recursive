@@ -460,12 +460,15 @@ impl Tool for RunBackground {
             .to_string());
         }
 
-        // Host path (none / policy tiers): unchanged legacy behaviour.
+        // Host path (none / policy tiers): the default tier scrubs
+        // credential-shaped host env (issue #89) — a background `printenv`
+        // must not leak the service's API keys / JWT secret either.
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(command);
         cmd.current_dir(&cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        crate::tools::transport::scrub_child_env(&mut cmd);
 
         // Apply optional env overrides
         for (key, val) in &env_pairs {
@@ -852,6 +855,60 @@ mod tests {
         let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(5)).await;
         assert_eq!(parsed["status"], "completed");
         assert!(parsed["stdout"].as_str().unwrap().contains("hello"));
+    }
+
+    /// Issue #89: the legacy **host path** (`RunBackground` built without a
+    /// transport) must scrub credential-shaped env too — a background
+    /// `printenv` is otherwise the same exfiltration channel as `Bash`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn run_background_host_path_scrubs_sensitive_env() {
+        let _lock = crate::test_util::env_lock();
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        let prev_key = std::env::var_os("RECURSIVE_API_KEY");
+        let prev_benign = std::env::var_os("BACKGROUND_BENIGN_VAR");
+        unsafe {
+            std::env::set_var("RECURSIVE_API_KEY", "leak-me");
+            std::env::set_var("BACKGROUND_BENIGN_VAR", "keepme");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+        let check_tool = CheckBackground::new(manager.clone());
+
+        let result = run_tool
+            .execute(json!({
+                "command": "printenv | grep -c RECURSIVE; printenv BACKGROUND_BENIGN_VAR"
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let job_id = parsed["job_id"].as_str().unwrap().to_string();
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(10)).await;
+        assert_eq!(parsed["status"], "completed");
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(
+            stdout.lines().next() == Some("0"),
+            "background printenv leaked RECURSIVE_* env: {stdout}"
+        );
+        assert!(
+            stdout.contains("keepme"),
+            "benign env was scrubbed: {stdout}"
+        );
+
+        // Restore the process env for the rest of the suite.
+        unsafe {
+            match prev_key {
+                Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
+                None => std::env::remove_var("RECURSIVE_API_KEY"),
+            }
+            match prev_benign {
+                Some(v) => std::env::set_var("BACKGROUND_BENIGN_VAR", v),
+                None => std::env::remove_var("BACKGROUND_BENIGN_VAR"),
+            }
+        }
     }
 
     #[tokio::test]

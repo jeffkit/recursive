@@ -753,6 +753,49 @@ impl ToolTransport for SshTransport {
 #[derive(Debug, Clone, Default)]
 pub struct LocalTransport;
 
+/// Issue #89: is `name` a credential-bearing environment variable that the
+/// default (`RECURSIVE_SANDBOX` unset / `none` / `policy`) tier must **not**
+/// hand to a child shell?
+///
+/// Without a scrub the child inherits the service process's whole env, so a
+/// prompt-injected `printenv` ships the upstream LLM key
+/// (`RECURSIVE_API_KEY`), the inbound HTTP auth keys
+/// (`RECURSIVE_HTTP_AUTH_KEYS`) and the JWT signing secret
+/// (`RECURSIVE_HTTP_AUTH_JWT_SECRET`) straight into the plaintext transcript.
+///
+/// The `RECURSIVE_` namespace carries this process's own credentials; the
+/// generic tokens catch third-party secrets (`OPENAI_API_KEY`,
+/// `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, …) a deployment may have
+/// exported. `AUTH` is matched only as a whole `_`-delimited segment so a
+/// benign `GIT_AUTHOR_NAME` survives.
+fn is_sensitive_env_var(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("RECURSIVE_") {
+        return true;
+    }
+    upper.contains("KEY")
+        || upper.contains("SECRET")
+        || upper.contains("TOKEN")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
+        || upper.contains("CREDENTIAL")
+        || upper.split('_').any(|segment| segment == "AUTH")
+}
+
+/// Issue #89: apply the default-tier credential scrub to a child command —
+/// clear the inherited env, then re-add only the non-sensitive host vars
+/// (PATH/HOME/toolchain/…) so the local dev loop keeps working. Shared by
+/// [`LocalTransport::exec_shell`] and `run_background`'s host path; the
+/// caller layers any explicit `env` pairs on top afterwards.
+pub(crate) fn scrub_child_env(cmd: &mut Command) {
+    cmd.env_clear();
+    for (key, val) in std::env::vars_os() {
+        if !is_sensitive_env_var(&key.to_string_lossy()) {
+            cmd.env(key, val);
+        }
+    }
+}
+
 #[async_trait]
 impl ToolTransport for LocalTransport {
     async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
@@ -851,6 +894,10 @@ impl ToolTransport for LocalTransport {
         // descendants running after the error is surfaced.
         cmd.kill_on_drop(true);
 
+        // Issue #89: the default tier must not leak the service process's
+        // credentials into LLM-authored commands — scrub the inherited env,
+        // then layer the tool call's explicit pairs on top so they win.
+        scrub_child_env(&mut cmd);
         for (key, val) in env {
             cmd.env(key, val);
         }
@@ -1062,6 +1109,108 @@ mod tests {
             .unwrap();
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("test_value"));
+    }
+
+    /// Issue #89: the default (`none`) tier must not hand the service
+    /// process's credentials to LLM-authored commands — a prompt-injected
+    /// `printenv` used to ship the upstream LLM key / inbound HTTP auth
+    /// keys / JWT signing secret straight into the plaintext transcript.
+    ///
+    /// Env-var checks are consolidated into ONE test (see `.dev/AGENTS.md`):
+    /// `set_var` is process-global and `cargo test` runs tests in parallel.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn local_transport_exec_shell_scrubs_sensitive_env() {
+        let _lock = crate::test_util::env_lock();
+
+        // Names the scrub must drop (RECURSIVE_ namespace + generic
+        // credential patterns).
+        let secret_names = [
+            "RECURSIVE_API_KEY",
+            "RECURSIVE_HTTP_AUTH_KEYS",
+            "RECURSIVE_HTTP_AUTH_JWT_SECRET",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "DB_PASSWORD",
+            "SSH_AUTH_SOCK",
+        ];
+        // Names the scrub must keep — the local dev loop needs PATH/HOME/
+        // toolchain, and `GIT_AUTHOR_NAME` pins that the `AUTH` segment
+        // match does not swallow `AUTHOR`.
+        let benign = [
+            ("CARGO_TEST_BENIGN_VAR", "keepme"),
+            ("GIT_AUTHOR_NAME", "Ada"),
+        ];
+
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = secret_names
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var_os(k)))
+            .chain(
+                benign
+                    .iter()
+                    .map(|(k, _)| ((*k).to_string(), std::env::var_os(k))),
+            )
+            .collect();
+
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        for k in secret_names {
+            unsafe { std::env::set_var(k, "leak-me") };
+        }
+        for (k, v) in benign {
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        let t = LocalTransport;
+        let tmp = TempDir::new().unwrap();
+
+        // Literal acceptance from issue #89: `printenv | grep -c RECURSIVE`
+        // must be 0 in a default-tier session.
+        let count = t
+            .exec_shell(
+                "printenv | grep -c RECURSIVE",
+                tmp.path(),
+                &[],
+                Duration::from_secs(5),
+                128 * 1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.stdout.trim(), "0", "leaked RECURSIVE_* env");
+
+        let out = t
+            .exec_shell(
+                "printenv",
+                tmp.path(),
+                &[],
+                Duration::from_secs(5),
+                256 * 1024,
+            )
+            .await
+            .unwrap();
+        for name in secret_names {
+            assert!(
+                !out.stdout.contains(&format!("{name}=")),
+                "sensitive env `{name}` leaked to the child shell"
+            );
+        }
+        for (k, v) in benign {
+            let expected = format!("{k}={v}");
+            assert!(
+                out.stdout.lines().any(|l| l == expected.as_str()),
+                "benign env `{k}` was scrubbed from the child shell"
+            );
+        }
+
+        // Restore the process env for the rest of the suite.
+        for (k, prev) in saved {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
     }
 
     #[tokio::test]

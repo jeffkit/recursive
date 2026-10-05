@@ -120,8 +120,10 @@ async fn sandbox_shell_does_not_inherit_host_env() {
         "host env var reached the sandbox transport env spec: {seen:?}"
     );
 
-    // --- 3) explicit env arg DOES reach the command (positive control,
-    // LocalTransport inherits host env by design — the `none` tier) ---
+    // --- 3) explicit env arg DOES reach the command (positive control for
+    // the local `none` tier: since issue #89 `LocalTransport` scrubs
+    // credential-shaped *inherited* vars, but an env pair passed in the
+    // tool call is always applied) ---
     std::env::set_var("RECURSIVE_WIP_EXPLICIT_51", "set-by-model");
     let local = RunShell::new(tmp.path()); // default LocalTransport
     let out = local

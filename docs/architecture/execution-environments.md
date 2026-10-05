@@ -65,7 +65,7 @@ instead of hard-coding assumptions.
 | Capability | none | policy | container | microvm (E2B) |
 |---|---|---|---|---|
 | `network` | true | restricted by policy | opt-in (`RECURSIVE_SANDBOX_NETWORK=on`) | opt-in via `RECURSIVE_SANDBOX_NETWORK=on` (host-side startup gate; the `base` template itself has outbound — use a custom no-egress template for untrusted workloads) |
-| inherited env | yes — `Bash`/`run_background` children inherit the host env | yes — commands still run via the host shell | **no** — the in-container env is exactly the tool call's explicit `env` pairs (`K=V` prefix); host env (credentials included) never enters the sandbox | **no** — same contract: only explicit `env` pairs reach the VM |
+| inherited env | partial — `Bash`/`run_background` children inherit the host env **minus credential-shaped variables** (`RECURSIVE_*` and `*KEY*`/`*SECRET*`/`*TOKEN*`/`*AUTH*` names; issue #89) | partial — commands still run via the host shell, same credential scrub | **no** — the in-container env is exactly the tool call's explicit `env` pairs (`K=V` prefix); host env (credentials included) never enters the sandbox | **no** — same contract: only explicit `env` pairs reach the VM |
 | `persistent` | true | true | true | true (sandbox lives for the session; TTL renewed) |
 | `path_root` | *(empty = host-resolved paths)* | host | `/workspace` (bind mount) | `/workspace` (fixed; created at sandbox start; empty unless the agent writes into it — the host workspace is **not** pre-uploaded) |
 | `user` | none | host user | `1000:1000`, non-root | probed via `whoami` |
@@ -137,7 +137,10 @@ Per tier, **who does this tier defend against — and who does it not?**
 
 - **`none`**: defends against nobody. The agent runs with the full
   authority of the host user. Only suitable for trusted code **and**
-  trusted input (a prompt-injected command deletes real files).
+  trusted input (a prompt-injected command deletes real files). One
+  narrow exception: shell exec scrubs credential-shaped env vars before
+  the child runs (issue #89), so a prompt-injected `printenv` cannot walk
+  off with the service's API keys / JWT secret.
 - **`policy`**: defends against the agent's *mistakes* (wrong-path
   deletes, disallowed commands) via path/command allow-lists. Does **not**
   defend against malicious code: same kernel, same user, no syscall
@@ -198,12 +201,21 @@ appends pairs the tool call explicitly passes in its `env` argument;
 and `E2bTransport::exec_shell` (`src/tools/transport_layer/e2b_provider.rs`) build the
 in-sandbox environment solely from that slice (an explicit `K=V`
 prefix). Host credentials such as `RECURSIVE_E2B_API_KEY` therefore
-never enter the sandbox. The `none` tier (`LocalTransport`)
-**intentionally** inherits the host environment — that is the local
-tier's design, not a defect. The `Bash` tool's `env` argument schema
+never enter the sandbox. The `none` tier (`LocalTransport`) inherits the
+host environment **minus credential-shaped variables**: `exec_shell` calls
+`env_clear` and re-adds only the non-sensitive host vars (PATH/HOME/
+toolchain/…), dropping the `RECURSIVE_*` namespace and any name containing
+`KEY`/`SECRET`/`TOKEN`/`PASSWORD`/`PASSWD`/`CREDENTIAL` or an `AUTH`
+segment (issue #89). This keeps the upstream LLM key
+(`RECURSIVE_API_KEY`), the inbound HTTP auth keys
+(`RECURSIVE_HTTP_AUTH_KEYS`) and the JWT signing secret
+(`RECURSIVE_HTTP_AUTH_JWT_SECRET`) out of a prompt-injected `printenv`.
+The `Bash` tool's `env` argument schema
 (`src/tools/execution/shell.rs`) states this per-tier contract; the test
 `env_schema_description_matches_per_tier_reality` pins the wording.
-Regression test: `tests/issue51_sandbox_env_inheritance.rs`.
+Regression tests: `tests/issue51_sandbox_env_inheritance.rs`,
+`local_transport_exec_shell_scrubs_sensitive_env`
+(`src/tools/transport_layer/transport.rs`).
 
 ## Density & default-tier rationale
 

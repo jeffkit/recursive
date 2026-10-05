@@ -89,7 +89,7 @@ impl Tool for RunShell {
                     },
                     "env": {
                         "type": "object",
-                        "description": "Optional extra env vars set for this command only. Values must be strings; non-string values are rejected. Local tiers (RECURSIVE_SANDBOX unset / none / policy) add these to (or override) the inherited host env. Sandboxed tiers (container / microvm) have no inherited env — only these explicitly passed variables exist inside the sandbox; host env (credentials included) is never forwarded.",
+                        "description": "Optional extra env vars set for this command only. Values must be strings; non-string values are rejected. Local tiers (RECURSIVE_SANDBOX unset / none / policy) add these to (or override) the inherited host env, but credential-shaped host variables (`RECURSIVE_*` and `*KEY*`/`*SECRET*`/`*TOKEN*`/`*AUTH*` names) are stripped first. Sandboxed tiers (container / microvm) have no inherited env — only these explicitly passed variables exist inside the sandbox; host env (credentials included) is never forwarded.",
                         "additionalProperties": {
                             "type": "string"
                         }
