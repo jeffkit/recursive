@@ -360,3 +360,77 @@ async fn wall_timeout_zero_keeps_legacy_unlimited_behaviour() {
         "0 budget must never produce WallClockExceeded"
     );
 }
+
+/// Issue #94 acceptance: a goal that would otherwise keep looping stops
+/// mid-run once the turn's spend reaches `max_budget_usd` — as DATA
+/// (invariant #7: `Ok(outcome)`, not `Err`), with the transcript kept and the
+/// reported usage no greater than the ceiling.
+#[tokio::test]
+async fn cost_budget_stops_the_run_mid_goal_with_budget_exceeded() {
+    use recursive::llm::{ModelPricing, TokenUsage};
+    use recursive::runtime::AgentRuntime;
+    use recursive::tools::ToolRegistry;
+
+    // $0.01 per step: 10_000 prompt tokens at $1/M.
+    let step_usage = TokenUsage {
+        prompt_tokens: 10_000,
+        total_tokens: 10_000,
+        ..Default::default()
+    };
+    let script: Vec<Completion> = (0..8)
+        .map(|i| Completion {
+            content: format!("step {i}"),
+            tool_calls: vec![ToolCall {
+                id: format!("c{i}"),
+                name: "noop".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: Some(step_usage),
+            reasoning_content: None,
+        })
+        .collect();
+
+    let pricing = ModelPricing {
+        input_per_million: 1.0,
+        output_per_million: 1.0,
+        cache_hit_input_per_million: 0.1,
+    };
+    let mut runtime = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(script)))
+        .tools(ToolRegistry::local().register(Arc::new(NoopTool)))
+        .system_prompt("test agent")
+        // Far more steps than the budget allows: only the ceiling can stop it.
+        .max_steps(50)
+        .cost_budget(Some(0.03), Some(pricing))
+        .build()
+        .expect("runtime builds");
+
+    let outcome = runtime
+        .run("loop forever")
+        .await
+        .expect("invariant #7: a budget exit is data, not an error");
+
+    assert!(
+        matches!(outcome.finish_reason, FinishReason::BudgetExceeded),
+        "expected BudgetExceeded, got {:?}",
+        outcome.finish_reason
+    );
+    assert_eq!(
+        outcome.steps, 3,
+        "must stop at the step where the ceiling was reached, not at max_steps"
+    );
+    let spent = pricing.cost_usd(outcome.total_usage);
+    assert!(
+        spent <= 0.03 + 1e-9,
+        "reported spend {spent} must not exceed the budget"
+    );
+    assert!(
+        spent >= 0.03 - 1e-9,
+        "the budget must actually have been reached, spent {spent}"
+    );
+    assert!(
+        !runtime.transcript().is_empty(),
+        "transcript must survive a budget exit (auto-resume depends on it)"
+    );
+}

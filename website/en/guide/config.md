@@ -10,7 +10,10 @@ All configuration is done via environment variables (or CLI flags where noted). 
 | `RECURSIVE_API_KEY` | *(required)* | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_PROVIDER_TYPE` | `openai` | Protocol adapter: `openai` or `anthropic` |
-| `RECURSIVE_MAX_STEPS` | `32` | Max tool-call loop iterations per run |
+| `RECURSIVE_MAX_STEPS` | `200` | Max tool-call loop iterations per turn (`0` = unlimited) |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `3600` | Wall-clock budget per turn in seconds (`0` = unlimited) |
+| `RECURSIVE_MAX_BUDGET_USD` | *(unlimited)* | Per-turn USD spend ceiling; the turn stops with `budget_exceeded` once reached |
+| `RECURSIVE_THINKING_BUDGET` | *(model default)* | Anthropic extended-thinking budget (sent as `thinking.budget_tokens`); `0` disables thinking |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | *(built-in)* | Path to a custom system-prompt file |
 | `RECURSIVE_WORKSPACE` | cwd | Filesystem sandbox root |

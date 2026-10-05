@@ -168,8 +168,10 @@ Anything OpenAI-compatible works. Override via env vars (or CLI flags):
 | `RECURSIVE_API_BASE` | `https://api.openai.com/v1` | Chat-completions endpoint |
 | `RECURSIVE_API_KEY` | _(required)_ | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
-| `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Loop budget (0 = unlimited; set to N to cap at N steps) |
-| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds (0 = unlimited). Effective as of Goal 399 — previously parsed but never consumed. **Recommended for multi-worker `agent(mode=parallel)` long tasks** — a stalled worker can otherwise hang the parent turn (issue #40) |
+| `RECURSIVE_MAX_STEPS` | `200` | Loop budget per turn. Issue #94: the default is now a conservative 200 instead of unlimited — set `0` to restore unbounded steps |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `3600` | Wall-clock budget per turn in seconds; expiry finishes with `wall_clock_exceeded`. Issue #94: the default is now a conservative 1 h instead of unlimited — set `0` to restore unbounded runs |
+| `RECURSIVE_MAX_BUDGET_USD` | _(unlimited)_ | Per-turn spend ceiling in USD. Issue #94: the turn stops with `budget_exceeded` at the first step boundary where its spend reaches the ceiling. Unpriced models degrade to a token ceiling at a pessimistic $10/M blend |
+| `RECURSIVE_THINKING_BUDGET` | _(model default)_ | Anthropic extended-thinking budget (`thinking.budget_tokens`). Issue #94: actually sent on the wire; `0` disables thinking, unset leaves the model default |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_WORKSPACE` | cwd | Root all fs/shell tools are sandboxed to |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a system prompt to load |
@@ -299,8 +301,10 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_API_KEY` | _(required)_ | Bearer token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | Model name |
 | `RECURSIVE_PROVIDER_TYPE` | `openai` | Protocol: `openai` or `anthropic` |
-| `RECURSIVE_MAX_STEPS` | `0` (unlimited) | Max tool-call loop iterations per run (0 = unlimited) |
-| `RECURSIVE_WALL_TIMEOUT_SECS` | `0` (unlimited) | Wall-clock budget per turn in seconds; expiry finishes with `wall_clock_exceeded` (`0` = unlimited). Effective as of Goal 399 — previously parsed but never consumed. **Recommended for long-running multi-worker `agent(mode=parallel)` runs**: with the default `0`, one stalled worker LLM call can park the parent turn indefinitely (issue #40) |
+| `RECURSIVE_MAX_STEPS` | `200` | Max tool-call loop iterations per turn. Issue #94: conservative finite default (was unlimited); `0` = unlimited |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `3600` | Wall-clock budget per turn in seconds; expiry finishes with `wall_clock_exceeded`. Issue #94: conservative finite default (was unlimited); `0` = unlimited |
+| `RECURSIVE_MAX_BUDGET_USD` | _(unlimited)_ | Per-turn USD spend ceiling (`--max-budget-usd`). Issue #94: the step loop compares the turn's accumulated spend after every completed step and stops with `budget_exceeded` once it reaches the ceiling — no further LLM call is issued. `0` / unset = no cap. When the model has no entry in `providers.toml` pricing, the ceiling is converted to a token cap at a deliberately pessimistic $10 per million tokens |
+| `RECURSIVE_THINKING_BUDGET` | _(model default)_ | Anthropic extended-thinking budget, sent as `thinking = {type: "enabled", budget_tokens: n}` (`--effort low/normal/high` sets this too). Issue #94: previously stored and never consumed. `0` = disable thinking, unset = model default |
 | `RECURSIVE_HARD_STEP_CAP` | _(unset)_ | Process-level step ceiling. When set (>0), the effective step limit is `min(max_steps, cap)` — an operator ceiling that clamps even `max_steps=0` sessions |
 | `RECURSIVE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | _(built-in)_ | Path to a custom system-prompt file |
@@ -322,6 +326,13 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_COMPACT_THRESHOLD` | auto (from model context window) | Cross-turn compaction char threshold (`0`/`off`/`false` = disable). Goal 393: effective for HTTP sessions too, same semantics as the CLI |
 | `RECURSIVE_MICROCOMPACT_TRIGGER` / `RECURSIVE_MICROCOMPACT_KEEP` | _(disabled)_ / `4` | Opt-in proactive tool-result pruning after N tool messages, keeping the most recent K (`0` = off). Goal 393: effective for HTTP sessions too |
 | `RECURSIVE_MAX_TRANSCRIPT_CHARS` | _(unlimited)_ | Hard transcript char cap per session (Goal 393: honored by HTTP session runtimes; the CLI also takes `--max-transcript-chars`) |
+
+Request bodies carry the per-session run budgets (issue #94): `POST /run` and
+`POST /sessions` accept `max_budget_usd` (per-turn spend ceiling — the turn
+finishes with `finish_reason: "budget_exceeded"` once reached, and omitting it
+falls back to `RECURSIVE_MAX_BUDGET_USD`) and `thinking_budget` (Anthropic
+extended thinking; a request-level value builds a provider for that
+session/run, since the budget is a per-request field in the Anthropic body).
 
 #### Cloud storage — Redis (session hot-state)
 

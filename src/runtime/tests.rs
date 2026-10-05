@@ -2440,6 +2440,36 @@ fn runtime_builder_wall_timeout_defaults_to_zero() {
     assert_eq!(runtime.kernel.wall_timeout_secs, 0);
 }
 
+// ── Issue #94: cost_budget forwarding ──────────────────────────────────────
+
+#[test]
+fn runtime_builder_forwards_cost_budget_to_kernel() {
+    let pricing = crate::llm::ModelPricing {
+        input_per_million: 3.0,
+        output_per_million: 9.0,
+        cache_hit_input_per_million: 0.3,
+    };
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .tools(ToolRegistry::local())
+        .cost_budget(Some(2.5), Some(pricing))
+        .build()
+        .expect("runtime build");
+    assert_eq!(runtime.kernel.max_budget_usd, Some(2.5));
+    assert_eq!(runtime.kernel.budget_pricing, Some(pricing));
+}
+
+#[test]
+fn runtime_builder_cost_budget_defaults_to_none() {
+    let runtime = AgentRuntimeBuilder::new()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .tools(ToolRegistry::local())
+        .build()
+        .expect("runtime build");
+    assert!(runtime.kernel.max_budget_usd.is_none());
+    assert!(runtime.kernel.budget_pricing.is_none());
+}
+
 // ── Issue #99: loop retry safety + wakeup-store wiring ─────────────────────
 
 #[tokio::test]

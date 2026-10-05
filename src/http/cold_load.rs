@@ -99,6 +99,13 @@ pub(super) struct SessionMeta {
     /// Explicit per-session step cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
+    /// Issue #94: per-session run overrides (USD ceiling, thinking budget).
+    /// `default` keeps stored blobs written before this field existed valid.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::http::SessionOverrides::is_default"
+    )]
+    pub overrides: crate::http::SessionOverrides,
 }
 
 /// Storage key for the per-session metadata blob (issue #98).
@@ -307,13 +314,20 @@ async fn build_restored_runtime(
     let max_steps = meta
         .and_then(|m| m.max_steps)
         .unwrap_or(state.config.max_steps);
-    let mut runtime =
-        super::handlers::build_session_runtime(state, tool_registry, full, segments, max_steps)
-            .seed_transcript(seed)
-            .build()
-            .map_err(|e| {
-                ApiError::internal(format!("failed to build restored session runtime: {e}"))
-            })?;
+    // Issue #94: restore the session's run overrides so a cold-loaded session
+    // keeps the budget / thinking budget its creator asked for.
+    let overrides = meta.map(|m| m.overrides).unwrap_or_default();
+    let mut runtime = super::handlers::build_session_runtime(
+        state,
+        tool_registry,
+        full,
+        segments,
+        max_steps,
+        overrides,
+    )
+    .seed_transcript(seed)
+    .build()
+    .map_err(|e| ApiError::internal(format!("failed to build restored session runtime: {e}")))?;
     runtime.set_session_id(id);
     Ok(runtime)
 }
@@ -608,6 +622,7 @@ mod tests {
             permission_mode: Some("auto".into()),
             title: Some("ship it".into()),
             max_steps: Some(7),
+            overrides: Default::default(),
         };
         persist_session_meta(&state, "s1", &meta).await;
         let loaded = load_session_meta(&state, "s1")
@@ -631,6 +646,7 @@ mod tests {
                 permission_mode: None,
                 title: None,
                 max_steps: Some(9),
+                overrides: Default::default(),
             },
         )
         .await;
@@ -684,6 +700,7 @@ mod tests {
                 permission_mode: Some("auto".into()),
                 title: Some("pirate chat".into()),
                 max_steps: Some(7),
+                overrides: Default::default(),
             },
         )
         .await;
@@ -745,6 +762,7 @@ mod tests {
                 permission_mode: Some("bypass".into()),
                 title: None,
                 max_steps: None,
+                overrides: Default::default(),
             },
         )
         .await;

@@ -24,7 +24,8 @@ use super::{
     build_openapi_spec, AcquireError, AdmissionGate, ApiError, AppState, CreateSessionRequest,
     CreateSessionResponse, ErrorResponse, ListSessionsQuery, RunRequest, RunResponse,
     SessionDetailResponse, SessionInfo, SessionMessageRequest, SessionMessageResponse,
-    SessionState, SetGoalRequest, SlashCommandInfo, SseContentBlock, SseEvent, ToolInfo, UsageInfo,
+    SessionOverrides, SessionState, SetGoalRequest, SlashCommandInfo, SseContentBlock, SseEvent,
+    ToolInfo, UsageInfo,
 };
 
 // Constant body — no branching worth scoring.
@@ -93,6 +94,9 @@ pub(super) fn inject_environment_segment(
 /// Callers add what is genuinely request-specific on top of the returned
 /// builder (`seed_transcript` for `/agui` resume, then `build()`).
 ///
+/// `overrides` carries the per-session knobs from the request body (issue
+/// #94: `max_budget_usd`, `thinking_budget`) — see [`SessionOverrides`].
+///
 /// `pub(super)` since issue #98: `http::cold_load` reuses this exact path for
 /// restored sessions so they cannot drift from freshly created ones.
 pub(super) fn build_session_runtime(
@@ -101,6 +105,7 @@ pub(super) fn build_session_runtime(
     system_prompt: String,
     prompt_segments: crate::system_prompt::PromptSegments,
     max_steps: usize,
+    overrides: SessionOverrides,
 ) -> AgentRuntimeBuilder {
     crate::runtime::apply_context_management(
         build_session_runtime_parts(
@@ -115,7 +120,17 @@ pub(super) fn build_session_runtime(
         // per-turn `<system-reminder>` — without this the catalog is
         // computed at startup but never reaches any run's context.
         .skills(state.skills.clone())
-        .llm(state.provider.clone())
+        // Issue #94: a per-request thinking budget needs its own provider
+        // (the budget is a request field in the Anthropic body); everything
+        // else reuses the server's shared provider.
+        .llm(provider_for_request(state, overrides.thinking_budget))
+        // Issue #94: `max_budget_usd` used to be a stored-but-dead field —
+        // the step loop now stops with `BudgetExceeded` once the turn's
+        // spend reaches the ceiling.
+        .cost_budget(
+            overrides.max_budget_usd.or(state.config.max_budget_usd),
+            crate::llm::pricing_for(&state.config.model),
+        )
         // Goal 399: safe wall-clock budget for HTTP sessions
         // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved
         // into state.config at server startup). Exceeding it finishes
@@ -138,6 +153,42 @@ pub(super) fn build_session_runtime(
         .streaming(true),
         &state.config,
     )
+}
+
+/// Issue #94: resolve the provider for one request.
+///
+/// `thinking_budget` is a provider-level setting (Anthropic sends it as
+/// `thinking.budget_tokens`), so a value that differs from the server's
+/// default can only be honoured by building a provider for this request. The
+/// shared server provider is returned for every other case — no explicit
+/// budget, an unauthenticated `Config`, or a failed build — so behaviour is
+/// unchanged apart from a logged warning.
+fn provider_for_request(
+    state: &AppState,
+    thinking_budget: Option<u32>,
+) -> Arc<dyn crate::llm::ChatProvider> {
+    let Some(budget) = thinking_budget.filter(|b| Some(*b) != state.config.thinking_budget) else {
+        return state.provider.clone();
+    };
+    let Some(api_key) = state.config.api_key.as_deref().filter(|k| !k.is_empty()) else {
+        return state.provider.clone();
+    };
+    let retry = crate::llm::RetryPolicy {
+        max_retries: state.config.retry_max,
+        initial_backoff: Duration::from_secs(state.config.retry_initial_backoff_secs),
+        max_backoff: Duration::from_secs(state.config.retry_max_backoff_secs),
+    };
+    match crate::llm::build_llm_provider(&state.config, api_key, retry, None, Some(budget)) {
+        Ok(provider) => provider,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to build provider for per-request thinking_budget; \
+                 falling back to the server provider"
+            );
+            state.provider.clone()
+        }
+    }
 }
 
 /// Provider-agnostic core of [`build_session_runtime`]: context management
@@ -308,6 +359,10 @@ pub(super) async fn run_agent(
         system_prompt,
         prompt_segments,
         max_steps,
+        SessionOverrides {
+            max_budget_usd: body.max_budget_usd,
+            thinking_budget: body.thinking_budget,
+        },
     )
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
@@ -473,6 +528,10 @@ pub(super) async fn create_session(
         system_prompt,
         prompt_segments,
         max_steps,
+        SessionOverrides {
+            max_budget_usd: body.max_budget_usd,
+            thinking_budget: body.thinking_budget,
+        },
     )
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build session runtime: {e}")))?;
@@ -496,6 +555,13 @@ pub(super) async fn create_session(
             permission_mode: body.permission_mode.clone(),
             title: body.session_name.clone(),
             max_steps: body.max_steps.map(|n| n as usize),
+            // Issue #94: keep the per-session budget / thinking overrides
+            // across a cold load — dropping them on restart would silently
+            // remove the client's protection (same drift class as #98).
+            overrides: SessionOverrides {
+                max_budget_usd: body.max_budget_usd,
+                thinking_budget: body.thinking_budget,
+            },
         },
     )
     .await;
@@ -863,6 +929,7 @@ pub(super) async fn fork_session(
         system_prompt,
         prompt_segments,
         state.config.max_steps,
+        SessionOverrides::default(),
     )
     .build()
     .map_err(|_| ApiError::internal("failed to build forked session runtime"))?;
@@ -2063,6 +2130,7 @@ mod tests {
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
+            SessionOverrides::default(),
         );
         let compactor = builder.compactor_for_test().expect("compactor installed");
         assert_eq!(compactor.threshold_chars, 7777);
@@ -2125,6 +2193,7 @@ mod tests {
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
+            SessionOverrides::default(),
         );
         let skills = builder.skills_for_test();
         assert_eq!(skills.len(), 1, "catalog must ride into the runtime");

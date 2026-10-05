@@ -14,6 +14,19 @@ use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
 use tracing::warn;
 
+/// Conservative per-turn step ceiling used when neither `--max-steps` nor
+/// `RECURSIVE_MAX_STEPS` is set (issue #94 — the default used to be `0`,
+/// i.e. unlimited). 200 matches the operational budget documented in
+/// `.dev/OPERATIONS.md`; an explicit `0` restores unlimited steps.
+pub const DEFAULT_MAX_STEPS: usize = 200;
+
+/// Conservative per-turn wall-clock ceiling (seconds) used when neither
+/// `--wall-timeout` nor `RECURSIVE_WALL_TIMEOUT_SECS` is set (issue #94 —
+/// the default used to be `0`, i.e. no cap). Deliberately roomier than the
+/// HTTP session default (1800 s) so a long `recursive run` is not cut before
+/// the step ceiling bites; an explicit `0` restores the uncapped behaviour.
+pub const DEFAULT_WALL_TIMEOUT_SECS: u64 = 3600;
+
 #[derive(Clone)]
 pub struct Config {
     pub workspace: PathBuf,
@@ -25,7 +38,12 @@ pub struct Config {
     /// `None` when the user did not opt in (or the file was absent).
     pub preset: Option<String>,
     /// Maximum agent loop iterations per turn/goal.
-    /// `0` = unlimited (agent stops on `NoMoreToolCalls`, stuck, transcript limit, etc.).
+    ///
+    /// Defaults to [`DEFAULT_MAX_STEPS`] (issue #94 — previously `0`, i.e.
+    /// silently unlimited). `0` = unlimited (agent stops on
+    /// `NoMoreToolCalls`, stuck, transcript limit, etc.); set it explicitly
+    /// via `--max-steps` / `RECURSIVE_MAX_STEPS=0` for unbounded
+    /// `recursive loop` sessions.
     pub max_steps: usize,
     /// Maximum tokens the model may generate per response. Mirrors the
     /// `max_tokens` / `max_output_tokens` field of OpenAI-/Anthropic-style
@@ -50,8 +68,12 @@ pub struct Config {
     /// Wall-clock deadline for the entire agent run (Goal 345).
     /// When > 0, the step loop checks an elapsed-time deadline and
     /// terminates cleanly with [`FinishReason::WallClockExceeded`]
-    /// when exceeded.  Default 0 = unset (no wall-clock cap).
-    /// Set via `--wall-timeout` CLI flag or `RECURSIVE_WALL_TIMEOUT_SECS` env.
+    /// when exceeded.
+    ///
+    /// Defaults to [`DEFAULT_WALL_TIMEOUT_SECS`] (issue #94 — previously
+    /// `0`, i.e. no cap). `0` = unset (no wall-clock cap); set it explicitly
+    /// via `--wall-timeout` / `RECURSIVE_WALL_TIMEOUT_SECS=0` for unbounded
+    /// runs.
     pub wall_timeout_secs: u64,
     /// Run in headless mode: interactive tools go through external hooks
     /// instead of waiting for terminal input. If no hook approves the call,
@@ -60,11 +82,22 @@ pub struct Config {
     pub memory_summary_limit: usize,
     /// Extended thinking budget for models that support it (e.g. Anthropic claude-3-7).
     /// `None` = model default; `Some(0)` = disable thinking; `Some(n)` = budget_tokens.
+    ///
+    /// Issue #94: actually reaches the wire — the Anthropic adapter sends
+    /// `thinking = { type: "enabled", budget_tokens: n }`. Set via the
+    /// `--effort` CLI flag or `RECURSIVE_THINKING_BUDGET` env var.
     pub thinking_budget: Option<u32>,
     /// Optional display name for the session, shown in the /resume picker.
     pub session_name: Option<String>,
-    /// Maximum total API spend in USD for this run. Checked after each turn.
-    /// `None` = no limit.
+    /// Maximum total API spend in USD **per turn**. When > 0 the step loop
+    /// compares the turn's accumulated spend after every completed step and
+    /// stops with [`FinishReason::BudgetExceeded`] before issuing another LLM
+    /// call (issue #94). `None` = no limit.
+    ///
+    /// Models with no pricing entry in `providers.toml` degrade to a token
+    /// ceiling at a deliberately pessimistic blended rate — see
+    /// `run_core::CostBudget`. Set via `--max-budget-usd` /
+    /// `RECURSIVE_MAX_BUDGET_USD`.
     pub max_budget_usd: Option<f64>,
     /// Additional workspace-root directories the agent is allowed to access
     /// (sandbox expansion via `--add-dir` / `[sandbox] extra_dirs`).
@@ -397,9 +430,14 @@ impl Config {
                     .unwrap_or_else(|| "claude-sonnet-4-6".into())
             });
 
+        // Issue #94: a finite default instead of `0` (unlimited). An explicit
+        // `0` — env or `[agent] max_steps = 0` — still means unlimited, which
+        // is the escape hatch for long `recursive loop` sessions.
         let max_steps = parse_env(
             "RECURSIVE_MAX_STEPS",
-            file_agent.and_then(|a| a.max_steps).unwrap_or(0),
+            file_agent
+                .and_then(|a| a.max_steps)
+                .unwrap_or(DEFAULT_MAX_STEPS),
         )?;
 
         // Three-tier max_tokens resolution (env > provider/file config > default).
@@ -462,7 +500,25 @@ impl Config {
             file_agent.and_then(|a| a.shell_timeout_secs).unwrap_or(300),
         )?;
 
-        let wall_timeout_secs = parse_env("RECURSIVE_WALL_TIMEOUT_SECS", 0)?;
+        // Issue #94: finite default (see `DEFAULT_WALL_TIMEOUT_SECS`).
+        // `0` = uncapped, preserved for `recursive loop` / long batch runs.
+        let wall_timeout_secs =
+            parse_env("RECURSIVE_WALL_TIMEOUT_SECS", DEFAULT_WALL_TIMEOUT_SECS)?;
+
+        // Issue #94: extended-thinking budget. Unset (`None`) keeps the
+        // provider's own default; `0` explicitly disables thinking. Parsed
+        // here rather than only from `--effort` so library/HTTP/TUI embedders
+        // that never touch the CLI arg get the same knob.
+        let thinking_budget = match std::env::var("RECURSIVE_THINKING_BUDGET") {
+            Err(_) => None,
+            Ok(_) => Some(parse_env::<u32>("RECURSIVE_THINKING_BUDGET", 0)?),
+        };
+
+        // Issue #94: per-turn USD spend ceiling. Unset or `0` = no limit.
+        let max_budget_usd = match parse_env::<f64>("RECURSIVE_MAX_BUDGET_USD", 0.0)? {
+            v if v > 0.0 => Some(v),
+            _ => None,
+        };
 
         let headless = std::env::var("RECURSIVE_HEADLESS")
             .ok()
@@ -646,9 +702,9 @@ impl Config {
             wall_timeout_secs,
             headless,
             memory_summary_limit,
-            thinking_budget: None,
+            thinking_budget,
             session_name: None,
-            max_budget_usd: None,
+            max_budget_usd,
             extra_dirs: file_extra_dirs,
             extra_readonly_dirs: file_extra_readonly_dirs,
             allow_tools,
@@ -977,7 +1033,9 @@ mod tests {
     }
 
     #[test]
-    fn default_max_steps_is_unlimited() {
+    fn default_max_steps_is_finite_but_zero_still_unlimited() {
+        // Issue #94: the unset default is now a conservative finite ceiling
+        // (200), while an explicit `0` keeps the legacy unlimited behaviour.
         let _env_lock = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
@@ -990,15 +1048,129 @@ mod tests {
         }
         let config = Config::from_env().unwrap();
         assert_eq!(
-            config.max_steps, 0,
-            "default max_steps should be 0 (unlimited)"
+            config.max_steps, DEFAULT_MAX_STEPS,
+            "unset RECURSIVE_MAX_STEPS must fall back to the finite default"
         );
+        assert_eq!(
+            DEFAULT_MAX_STEPS, 200,
+            "conservative default is the documented 200-step budget"
+        );
+
+        // SAFETY: env lock still held. Explicit `0` restores unlimited.
+        unsafe {
+            std::env::set_var("RECURSIVE_MAX_STEPS", "0");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.max_steps, 0, "explicit 0 must stay unlimited");
+
+        // SAFETY: env lock still held.
+        unsafe {
+            std::env::set_var("RECURSIVE_MAX_STEPS", "7");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.max_steps, 7, "explicit N must win over the default");
+
         // SAFETY: env lock still held.
         unsafe {
             if let Some(v) = orig {
                 std::env::set_var("RECURSIVE_MAX_STEPS", v);
             } else {
                 std::env::remove_var("RECURSIVE_MAX_STEPS");
+            }
+        }
+    }
+
+    /// Issue #94: the two budget knobs must be readable from the environment
+    /// (`0` / absent = no limit), not only from their CLI flags.
+    #[test]
+    fn budget_env_knobs_default_and_override() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let orig_wall = std::env::var("RECURSIVE_WALL_TIMEOUT_SECS").ok();
+        let orig_usd = std::env::var("RECURSIVE_MAX_BUDGET_USD").ok();
+        let orig_think = std::env::var("RECURSIVE_THINKING_BUDGET").ok();
+        // SAFETY: env lock held for the whole body.
+        unsafe {
+            std::env::remove_var("RECURSIVE_WALL_TIMEOUT_SECS");
+            std::env::remove_var("RECURSIVE_MAX_BUDGET_USD");
+            std::env::remove_var("RECURSIVE_THINKING_BUDGET");
+        }
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.wall_timeout_secs, DEFAULT_WALL_TIMEOUT_SECS);
+        assert_eq!(config.max_budget_usd, None, "unset budget = no limit");
+        assert_eq!(
+            config.thinking_budget, None,
+            "unset thinking budget = provider default"
+        );
+
+        // SAFETY: env lock held.
+        unsafe {
+            std::env::set_var("RECURSIVE_WALL_TIMEOUT_SECS", "0");
+            std::env::set_var("RECURSIVE_MAX_BUDGET_USD", "0");
+            std::env::set_var("RECURSIVE_THINKING_BUDGET", "0");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.wall_timeout_secs, 0, "0 must disable the wall cap");
+        assert_eq!(config.max_budget_usd, None, "0 must disable the USD cap");
+        assert_eq!(
+            config.thinking_budget,
+            Some(0),
+            "0 is a real thinking-budget value (= disable thinking)"
+        );
+
+        // SAFETY: env lock held.
+        unsafe {
+            std::env::set_var("RECURSIVE_WALL_TIMEOUT_SECS", "42");
+            std::env::set_var("RECURSIVE_MAX_BUDGET_USD", "1.5");
+            std::env::set_var("RECURSIVE_THINKING_BUDGET", "4096");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.wall_timeout_secs, 42);
+        assert_eq!(config.max_budget_usd, Some(1.5));
+        assert_eq!(config.thinking_budget, Some(4096));
+
+        // SAFETY: env lock held; restore originals.
+        unsafe {
+            for (name, prev) in [
+                ("RECURSIVE_WALL_TIMEOUT_SECS", orig_wall),
+                ("RECURSIVE_MAX_BUDGET_USD", orig_usd),
+                ("RECURSIVE_THINKING_BUDGET", orig_think),
+            ] {
+                match prev {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Issue #94: a malformed budget value must surface at startup instead of
+    /// silently becoming "unlimited" (same contract as the other knobs).
+    #[test]
+    fn malformed_max_budget_env_is_a_config_error() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let orig = std::env::var("RECURSIVE_MAX_BUDGET_USD").ok();
+        // SAFETY: env lock held.
+        unsafe {
+            std::env::set_var("RECURSIVE_MAX_BUDGET_USD", "1o0");
+        }
+        let err = Config::from_env().expect_err("garbage budget must error");
+        assert!(
+            format!("{err}").contains("RECURSIVE_MAX_BUDGET_USD"),
+            "error must name the offending var, got: {err}"
+        );
+
+        // SAFETY: env lock held; restore.
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("RECURSIVE_MAX_BUDGET_USD", v),
+                None => std::env::remove_var("RECURSIVE_MAX_BUDGET_USD"),
             }
         }
     }

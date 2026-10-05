@@ -10,7 +10,10 @@
 | `RECURSIVE_API_KEY` | *(必填)* | Bearer Token |
 | `RECURSIVE_MODEL` | `gpt-4o-mini` | 模型名称 |
 | `RECURSIVE_PROVIDER_TYPE` | `openai` | 协议适配器：`openai` 或 `anthropic` |
-| `RECURSIVE_MAX_STEPS` | `32` | 每次运行最大工具调用循环次数 |
+| `RECURSIVE_MAX_STEPS` | `200` | 每轮最大工具调用循环次数（`0` = 不限） |
+| `RECURSIVE_WALL_TIMEOUT_SECS` | `3600` | 每轮墙钟预算（秒，`0` = 不限） |
+| `RECURSIVE_MAX_BUDGET_USD` | *(不限)* | 每轮 USD 花费上限；达到上限该轮以 `budget_exceeded` 停机 |
+| `RECURSIVE_THINKING_BUDGET` | *(模型默认)* | Anthropic 扩展思考预算（以 `thinking.budget_tokens` 发送）；`0` 关闭思考 |
 | `RECURSIVE_TEMPERATURE` | `0.2` | 采样温度 |
 | `RECURSIVE_SYSTEM_PROMPT_FILE` | *(内置)* | 自定义系统提示文件路径 |
 | `RECURSIVE_WORKSPACE` | 当前目录 | 文件系统沙箱根目录 |

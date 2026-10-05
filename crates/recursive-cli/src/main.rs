@@ -165,9 +165,11 @@ struct Cli {
     #[arg(long = "input-format", value_parser = ["text", "stream-json"])]
     input_format: Option<String>,
 
-    /// Maximum total API spend in USD for this run. The run aborts once the
-    /// cumulative cost exceeds this limit. Only checked after each completed turn.
-    #[arg(long = "max-budget-usd")]
+    /// Maximum total API spend in USD per turn. The agent stops with
+    /// `budget_exceeded` at the first step boundary where the turn's
+    /// accumulated spend reaches this limit (issue #94). Unpriced models
+    /// degrade to a token ceiling at a pessimistic blended rate.
+    #[arg(long = "max-budget-usd", env = "RECURSIVE_MAX_BUDGET_USD")]
     max_budget_usd: Option<f64>,
 
     /// Enable debug logging with optional category filter (e.g. "api,hooks" or "trace").
@@ -614,7 +616,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(name) = cli.name {
         config.session_name = Some(name);
     }
-    // --max-budget-usd: store for cost gate (checked after each turn).
+    // --max-budget-usd: per-turn USD ceiling, enforced mid-turn by the step
+    // loop (issue #94 — the field used to be stored and never read).
     if let Some(budget) = cli.max_budget_usd {
         config.max_budget_usd = Some(budget);
     }
@@ -2254,6 +2257,11 @@ async fn run_loop(
         .max_steps(config.max_steps)
         // Goal 399: `RECURSIVE_WALL_TIMEOUT_SECS` now reaches the agent loop.
         .wall_timeout_secs(config.wall_timeout_secs)
+        // Issue #94: same mid-turn USD ceiling as the one-shot run path.
+        .cost_budget(
+            config.max_budget_usd,
+            recursive::llm::pricing_for(&config.model),
+        )
         .streaming(stream)
         .shutdown_token(shutdown.clone());
     if let Some(n) = max_transcript_chars {

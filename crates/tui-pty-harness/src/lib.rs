@@ -347,8 +347,18 @@ pub fn spawn_and_snapshot(spec: &RunSpec) -> Result<Screen> {
                         // (cols×rows, typically ≤ 80×24); lets the main
                         // thread distinguish "still rendering" from "done"
                         // without a wall-clock guess.
+                        //
+                        // A blank grid is not output. Boot emits mode-set
+                        // escapes (alternate screen, mouse capture, bracketed
+                        // paste) before the first frame; counting the None→""
+                        // transition they leave behind as "the child has
+                        // rendered" defeats the guard below — the poll would
+                        // snapshot the still-empty alternate screen a single
+                        // `stable_ms` after those escapes and tear the child
+                        // down mid-boot, recording a slow first frame as a
+                        // blank splash.
                         let cur = screen_text(&p);
-                        if prev.as_deref() != Some(cur.as_str()) {
+                        if !cur.trim().is_empty() && prev.as_deref() != Some(cur.as_str()) {
                             prev = Some(cur);
                             got_output_r.store(true, Ordering::Relaxed);
                             if let Ok(mut lc) = last_change_r.lock() {
@@ -621,6 +631,45 @@ mod tests {
             elapsed < Duration::from_millis(1000),
             "stability poll should return early (got {:?})",
             elapsed
+        );
+    }
+
+    /// The mode-set escapes a TUI emits before its first frame (alternate
+    /// screen, mouse capture, bracketed paste) leave the grid blank, so they
+    /// must not satisfy the "the child has rendered something" guard: the
+    /// poll would then snapshot the empty alternate screen one `stable_ms`
+    /// after boot and kill the child mid-frame. A first frame slower than
+    /// `stable_ms` (cold binary, loaded host) was recorded as a blank splash
+    /// this way — the flake `recursive-tui`'s boot tour hit.
+    ///
+    /// Ignored on Windows for the same reason as the other real-PTY tests
+    /// in this module (portable-pty hangs on `windows-latest`), plus this
+    /// one drives `sh`.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore)]
+    fn stability_poll_waits_for_first_frame_past_mode_escapes() {
+        let spec = RunSpec {
+            prog: "sh",
+            args: &[
+                "-c".to_string(),
+                // Enter the alternate screen immediately, draw nothing for
+                // 600 ms (≫ stable_ms below), then render and hold still.
+                "printf '\\033[?1049h'; sleep 0.6; printf 'SPLASH-READY'; sleep 0.6".to_string(),
+            ],
+            keys: &[],
+            cols: 40,
+            rows: 5,
+            wait_ms: 5000,
+            stable_ms: 150,
+            cwd: None,
+            envs: &[],
+            record_raw: None,
+        };
+        let screen = spawn_and_snapshot(&spec).expect("spawn + snapshot should succeed");
+        let text = screen.lines.join("\n");
+        assert!(
+            text.contains("SPLASH-READY"),
+            "snapshot must wait for the first real frame, got:\n{text:?}"
         );
     }
 

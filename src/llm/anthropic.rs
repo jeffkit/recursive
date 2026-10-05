@@ -41,6 +41,10 @@ pub struct AnthropicProvider {
         reason = "API parity placeholder; used once Anthropic adds deferred search"
     )]
     max_search_rounds: usize,
+    /// Issue #94: extended-thinking budget, sent as
+    /// `thinking = {type: "enabled", budget_tokens: n}`. `None` = provider
+    /// default, `Some(0)` = explicitly disabled, `Some(n)` = budget.
+    thinking_budget: Option<u32>,
 }
 
 impl AnthropicProvider {
@@ -70,6 +74,7 @@ impl AnthropicProvider {
             max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
             max_search_rounds: 3,
+            thinking_budget: None,
         })
     }
 
@@ -101,6 +106,34 @@ impl AnthropicProvider {
     pub fn with_max_search_rounds(mut self, n: usize) -> Self {
         self.max_search_rounds = n;
         self
+    }
+
+    /// Issue #94: enable extended thinking with `budget_tokens = n`.
+    /// `None` keeps the provider default; `Some(0)` disables thinking.
+    pub fn with_thinking_budget(mut self, budget: Option<u32>) -> Self {
+        self.thinking_budget = budget;
+        self
+    }
+
+    /// Build the request body for this provider's configuration. Both the
+    /// streaming and non-streaming paths go through here so extended thinking
+    /// (issue #94) cannot apply to one and not the other.
+    fn request_body(
+        &self,
+        system: Option<&str>,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Value {
+        let mut body = build_request(
+            &self.model,
+            self.temperature,
+            self.max_tokens,
+            system,
+            messages,
+            tools,
+        );
+        apply_thinking_budget(&mut body, self.thinking_budget);
+        body
     }
 
     /// POST `body` to `url` with the standard retry policy.
@@ -186,14 +219,7 @@ impl ChatProvider for AnthropicProvider {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let (system, messages) = extract_system_message(messages);
         let messages = filter_leading_assistant(&messages);
-        let body = build_request(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            system.as_deref(),
-            &messages,
-            tools,
-        );
+        let body = self.request_body(system.as_deref(), &messages, tools);
         let url = format!("{}/v1/messages", self.base_url);
         let text = self.post_with_retry(&url, &body).await?;
         let parsed: AnthropicResponse = serde_json::from_str(&text)
@@ -227,14 +253,7 @@ impl AnthropicProvider {
         let (system, messages) = extract_system_message(messages);
         let messages = filter_leading_assistant(&messages);
 
-        let mut body = build_request(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            system.as_deref(),
-            &messages,
-            tools,
-        );
+        let mut body = self.request_body(system.as_deref(), &messages, tools);
         body["stream"] = Value::Bool(true);
 
         let url = format!("{}/v1/messages", self.base_url);
@@ -767,6 +786,33 @@ fn filter_leading_assistant(messages: &[Message]) -> Vec<Message> {
         result.remove(0);
     }
     result
+}
+
+/// Apply the extended-thinking budget to a request body (issue #94).
+///
+/// `None` and `Some(0)` both leave the body untouched — the former means
+/// "provider default", the latter "thinking explicitly disabled", and
+/// Anthropic's default is thinking-off.
+///
+/// When enabled the Messages API rejects a `temperature` other than `1`, so
+/// the field is dropped and the API default applies; it also requires
+/// `max_tokens > budget_tokens`, so a configured `max_tokens` that would be
+/// rejected is raised just above the budget.
+fn apply_thinking_budget(req: &mut Value, budget: Option<u32>) {
+    let Some(budget_tokens) = budget.filter(|n| *n > 0) else {
+        return;
+    };
+    req["thinking"] = serde_json::json!({
+        "type": "enabled",
+        "budget_tokens": budget_tokens,
+    });
+    if let Value::Object(map) = req {
+        map.remove("temperature");
+    }
+    let max_tokens = req["max_tokens"].as_u64().unwrap_or(0);
+    if max_tokens <= u64::from(budget_tokens) {
+        req["max_tokens"] = Value::from(u64::from(budget_tokens) + 1024);
+    }
 }
 
 fn build_request(
@@ -2056,6 +2102,71 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(
             sanitize_input_schema(&json!("not-a-schema")),
             json!("not-a-schema")
+        );
+    }
+
+    // ── Issue #94: extended thinking (`thinking.budget_tokens`) ────────────
+
+    /// `None` (provider default) and `Some(0)` (explicitly disabled) both
+    /// leave the request untouched — Anthropic's default is thinking-off.
+    #[test]
+    fn thinking_budget_absent_or_zero_leaves_the_request_untouched() {
+        for budget in [None, Some(0)] {
+            let mut req = json!({
+                "model": "claude-3",
+                "max_tokens": 4096,
+                "temperature": 0.2,
+            });
+            let before = req.clone();
+            apply_thinking_budget(&mut req, budget);
+            assert_eq!(req, before, "budget {budget:?} must not change the body");
+            assert!(req.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn thinking_budget_enables_thinking_and_clears_temperature() {
+        let mut req = json!({
+            "model": "claude-3",
+            "max_tokens": 4096,
+            "temperature": 0.2,
+        });
+        apply_thinking_budget(&mut req, Some(2048));
+        assert_eq!(req["thinking"]["type"], "enabled");
+        assert_eq!(req["thinking"]["budget_tokens"], 2048);
+        assert!(
+            req.get("temperature").is_none(),
+            "the Messages API rejects any temperature other than 1 alongside thinking"
+        );
+        assert_eq!(req["max_tokens"], 4096, "budget below max_tokens keeps it");
+    }
+
+    #[test]
+    fn thinking_budget_raises_max_tokens_above_the_budget() {
+        let mut req = json!({ "model": "claude-3", "max_tokens": 1024, "temperature": 0.2 });
+        apply_thinking_budget(&mut req, Some(4096));
+        assert_eq!(
+            req["max_tokens"], 5120,
+            "max_tokens must be strictly greater than budget_tokens"
+        );
+    }
+
+    /// The provider's own `thinking_budget` reaches both wire paths: the
+    /// request body built for `complete()` and for `stream()`.
+    #[test]
+    fn provider_request_body_carries_the_configured_thinking_budget() {
+        let provider = AnthropicProvider::new("https://api.anthropic.com", "sk-noop", "claude-3")
+            .expect("provider")
+            .with_thinking_budget(Some(8192));
+        let body = provider.request_body(None, &[Message::user("hi")], &[]);
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+
+        let plain = AnthropicProvider::new("https://api.anthropic.com", "sk-noop", "claude-3")
+            .expect("provider");
+        let body = plain.request_body(None, &[Message::user("hi")], &[]);
+        assert!(
+            body.get("thinking").is_none(),
+            "an unset budget must not enable thinking"
         );
     }
 
