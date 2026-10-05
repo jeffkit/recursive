@@ -142,7 +142,11 @@ impl OpenAiProvider {
     async fn post_json_with_retry(&self, url: &str, body: &Value, label: &str) -> Result<String> {
         let mut attempt = 0;
         loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {url} ({label})");
+            tracing::debug!(
+                target: "recursive::llm",
+                request = %crate::logging::request_body_for_log(body),
+                "POST {url} ({label})"
+            );
             let result = self
                 .client
                 .post(url)
@@ -291,6 +295,14 @@ impl ChatProvider for OpenAiProvider {
             .await
     }
 
+    #[tracing::instrument(
+        skip(self, messages, eager_tools, deferred_tools, stream_tx, cancel_token),
+        name = "llm.stream",
+        fields(
+            provider = %self.base_url.split('/').next_back().unwrap_or("unknown"),
+            model = %self.model
+        )
+    )]
     async fn stream_with_search(
         &self,
         messages: &[Message],
@@ -317,6 +329,14 @@ impl ChatProvider for OpenAiProvider {
         .await
     }
 
+    #[tracing::instrument(
+        skip(self, messages, tools, stream_tx, cancel_token),
+        name = "llm.stream",
+        fields(
+            provider = %self.base_url.split('/').next_back().unwrap_or("unknown"),
+            model = %self.model
+        )
+    )]
     async fn stream(
         &self,
         messages: &[Message],
@@ -533,6 +553,14 @@ impl OpenAiProvider {
         .await
     }
 
+    #[tracing::instrument(
+        skip(self, messages, tools, stream_tx, cancel_token),
+        name = "llm.stream_inner",
+        fields(
+            provider = %self.base_url.split('/').next_back().unwrap_or("unknown"),
+            model = %self.model
+        )
+    )]
     async fn stream_inner(
         &self,
         messages: &[Message],
@@ -561,7 +589,11 @@ impl OpenAiProvider {
         // non-2xx and network errors; a successful 2xx hands off to parse_sse_stream.
         let mut attempt = 0;
         loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {url} (stream)");
+            tracing::debug!(
+                target: "recursive::llm",
+                request = %crate::logging::request_body_for_log(&body),
+                "POST {url} (stream)"
+            );
             let result = self
                 .client
                 .post(&url)
@@ -2533,6 +2565,37 @@ data: [DONE]
         assert!(
             result.is_err(),
             "stream_inner must give up after max_retries network failures"
+        );
+    }
+
+    /// Issue #122: every host streams by default, so the streaming path is the
+    /// *default* LLM path — it must emit a span. Before `#[instrument]` on
+    /// `stream()` / `stream_inner()` it emitted none.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn stream_emits_llm_stream_span_on_the_default_path() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 0,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(1),
+            });
+        let _ = provider
+            .stream(&[Message::user("hi")], &[], None, None)
+            .await;
+        assert!(
+            logs_contain("llm.stream"),
+            "the default streaming path must emit an llm.stream span"
         );
     }
 

@@ -173,7 +173,11 @@ impl AnthropicProvider {
     async fn post_with_retry(&self, url: &str, body: &Value) -> Result<String> {
         let mut attempt = 0;
         loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {}", url);
+            tracing::debug!(
+                target: "recursive::llm",
+                request = %crate::logging::request_body_for_log(body),
+                "POST {}", url
+            );
             let result = self
                 .client
                 .post(url)
@@ -249,6 +253,11 @@ impl ChatProvider for AnthropicProvider {
         self.base_url.contains("api.anthropic.com")
     }
 
+    #[tracing::instrument(
+        skip(self, messages, tools),
+        name = "llm.complete",
+        fields(provider = "anthropic", model = %self.model)
+    )]
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
         let (system, messages) = extract_system_message(messages);
         let messages = filter_leading_assistant(&messages);
@@ -260,6 +269,11 @@ impl ChatProvider for AnthropicProvider {
         Ok(parse_completion(parsed))
     }
 
+    #[tracing::instrument(
+        skip(self, messages, tools, stream_tx, cancel_token),
+        name = "llm.stream",
+        fields(provider = "anthropic", model = %self.model)
+    )]
     async fn stream(
         &self,
         messages: &[Message],
@@ -276,6 +290,11 @@ impl AnthropicProvider {
     /// Send a pre-built request body as a streaming call and return the
     /// accumulated `Completion`. Handles HTTP retry internally.
     /// Internal streaming implementation.
+    #[tracing::instrument(
+        skip(self, messages, tools, stream_tx, cancel_token),
+        name = "llm.stream_inner",
+        fields(provider = "anthropic", model = %self.model)
+    )]
     async fn stream_inner(
         &self,
         messages: &[Message],
@@ -293,7 +312,11 @@ impl AnthropicProvider {
 
         let mut attempt = 0;
         loop {
-            tracing::debug!(target: "recursive::llm", request = %body, "POST {} (stream)", url);
+            tracing::debug!(
+                target: "recursive::llm",
+                request = %crate::logging::request_body_for_log(&body),
+                "POST {} (stream)", url
+            );
             let result = self
                 .client
                 .post(&url)
@@ -2942,6 +2965,37 @@ data: {\"type\":\"message_stop\"}
         assert!(
             result.is_err(),
             "stream_inner must give up after max_retries network failures"
+        );
+    }
+
+    /// Issue #122: every host streams by default, so the streaming path is the
+    /// *default* LLM path — it must emit a span. The Anthropic adapter emitted
+    /// none at all before `#[instrument]`.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn stream_emits_llm_stream_span_on_the_default_path() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut provider =
+            AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "test-model").unwrap();
+        provider.retry = RetryPolicy {
+            max_retries: 0,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+        let _ = provider
+            .stream(&[Message::user("hi".to_string())], &[], None, None)
+            .await;
+        assert!(
+            logs_contain("llm.stream"),
+            "the default streaming path must emit an llm.stream span"
         );
     }
 

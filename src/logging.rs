@@ -39,6 +39,9 @@ use tracing_subscriber::fmt::MakeWriter;
 
 static TUI_QUIET: AtomicBool = AtomicBool::new(false);
 
+/// Env var that opts back into logging the *full* LLM request body.
+const LOG_REQUEST_BODIES_ENV: &str = "RECURSIVE_LOG_REQUEST_BODIES";
+
 /// Mark the global tracing writer as suppressed (TUI active) or
 /// normal. Called by `tui::run()` via the RAII guard below; exposed
 /// publicly in case other long-running surfaces (e.g. an HTTP
@@ -50,6 +53,43 @@ pub fn set_tui_quiet(quiet: bool) {
 /// Returns the current TUI-quiet state. Exposed for tests.
 pub fn is_tui_quiet() -> bool {
     TUI_QUIET.load(Ordering::Relaxed)
+}
+
+/// Whether the full LLM request body may be written to the debug log.
+///
+/// Off by default: request bodies carry the whole prompt — including any
+/// file contents the agent read into it — so `<provider>.rs` logs a length +
+/// digest instead. Set `RECURSIVE_LOG_REQUEST_BODIES=1` to opt back into
+/// full bodies when debugging a provider integration.
+pub fn log_request_bodies() -> bool {
+    std::env::var(LOG_REQUEST_BODIES_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Redacted summary of an LLM payload: byte length plus a stable digest.
+///
+/// Same shape as the Langfuse collector's `redact` (length + hash, never
+/// plaintext) so the two observability surfaces agree.
+pub fn redact_body(text: &str) -> String {
+    format!(
+        "len={} hash={}",
+        text.len(),
+        blake3::hash(text.as_bytes()).to_hex()
+    )
+}
+
+/// Render an LLM request body for the `recursive::llm` debug log.
+///
+/// Returns `len=<bytes> hash=<digest>` unless
+/// [`log_request_bodies`] opted into plaintext.
+pub fn request_body_for_log(body: &serde_json::Value) -> String {
+    let text = body.to_string();
+    if log_request_bodies() {
+        text
+    } else {
+        redact_body(&text)
+    }
 }
 
 /// RAII guard that flips [`set_tui_quiet(false)`] on drop, ensuring
@@ -224,5 +264,61 @@ mod tests {
             !is_tui_quiet(),
             "dropping the guard must restore quiet=false"
         );
+    }
+
+    // ── request-body redaction ──────────────────────────────────────────
+
+    #[test]
+    fn redact_body_reports_len_and_hash_without_plaintext() {
+        let text = r#"{"messages":[{"role":"user","content":"super secret prompt"}]}"#;
+        let redacted = redact_body(text);
+        assert!(
+            !redacted.contains("super secret"),
+            "redacted body must not leak the payload: {redacted}"
+        );
+        assert!(
+            redacted.contains(&format!("len={}", text.len())),
+            "redacted body must report the byte length: {redacted}"
+        );
+        assert!(
+            redacted.contains("hash="),
+            "redacted body must report a digest: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_body_is_stable_and_input_sensitive() {
+        // Same input → same summary (operators can correlate retries) …
+        assert_eq!(redact_body("same body"), redact_body("same body"));
+        // … different input → different digest (the hash is meaningful).
+        assert_ne!(redact_body("body a"), redact_body("body b"));
+    }
+
+    #[test]
+    fn request_body_for_log_redacts_by_default_and_fulls_out_on_opt_in() {
+        let _env = crate::test_util::env_lock();
+        let previous = std::env::var(LOG_REQUEST_BODIES_ENV).ok();
+        let body = serde_json::json!({"prompt": "top secret prompt"});
+
+        std::env::remove_var(LOG_REQUEST_BODIES_ENV);
+        assert!(!log_request_bodies(), "redaction is the default");
+        let redacted = request_body_for_log(&body);
+        assert!(
+            !redacted.contains("top secret prompt"),
+            "default log line must be redacted: {redacted}"
+        );
+
+        std::env::set_var(LOG_REQUEST_BODIES_ENV, "1");
+        assert!(log_request_bodies(), "=1 must opt into full bodies");
+        let full = request_body_for_log(&body);
+        assert!(
+            full.contains("top secret prompt"),
+            "opt-in must emit the full body: {full}"
+        );
+
+        match previous {
+            Some(v) => std::env::set_var(LOG_REQUEST_BODIES_ENV, v),
+            None => std::env::remove_var(LOG_REQUEST_BODIES_ENV),
+        }
     }
 }

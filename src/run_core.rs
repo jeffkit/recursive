@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 /// Output of a single tool call execution, replacing the anonymous 5-tuple.
 pub(crate) struct ToolCallOutcome {
@@ -1500,8 +1500,9 @@ impl<'a> RunCore<'a> {
 
         let step_cap = effective_step_limit(self.max_steps);
         for step in 1..=step_cap {
+            // Attached with `.instrument()`, not an `enter()` guard: a guard
+            // held across `.await` leaks the span onto other tasks.
             let step_span = tracing::info_span!("agent.step", step);
-            let _guard = step_span.enter();
 
             // ---- shutdown cancellation -------------------------------------------
             // If a CancellationToken fired between steps, finish cleanly
@@ -1522,7 +1523,7 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- mailbox drain (coordinator → worker mid-run messages) -----------
-            self.drain_mailbox().await;
+            self.drain_mailbox().instrument(step_span.clone()).await;
 
             // ---- transcript budget ------------------------------------------------
             if let Some((finish, finish_step)) = self.enforce_transcript_budget(step, &total_usage)
@@ -1537,13 +1538,13 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- compaction -------------------------------------------------------
-            self.maybe_compact(step).await;
+            self.maybe_compact(step).instrument(step_span.clone()).await;
 
             // ---- LLM call (with retry) --------------------------------------------
-            let (completion, new_final_message) = match self
+            let llm_fut = self
                 .dispatch_llm_step_with_retry(&specs, step, &mut total_usage)
-                .await
-            {
+                .instrument(step_span.clone());
+            let (completion, new_final_message) = match llm_fut.await {
                 Ok(v) => v,
                 Err(crate::error::Error::Cancelled) => {
                     // Mid-call cancellation → Cancelled, partial
@@ -1600,7 +1601,8 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- tool execution ---------------------------------------------------
-            let results = self.execute_tool_calls(&completion.tool_calls).await;
+            let tool_fut = self.execute_tool_calls(&completion.tool_calls);
+            let results = tool_fut.instrument(step_span.clone()).await;
 
             if let Some(finish) = self.process_tool_results(
                 &results,
@@ -1664,6 +1666,24 @@ mod tests {
     };
     use crate::context_breakdown::StaticBreakdownCache;
     use crate::message::Message;
+
+    /// Issue #122: the per-step span must be attached with `.instrument()`, not
+    /// entered. A `span.enter()` guard held across `.await` leaks the span onto
+    /// every other task polled on the same worker thread, which pollutes
+    /// attribution in the trace.
+    #[test]
+    fn agent_step_span_is_instrumented_not_entered_across_await() {
+        let src = include_str!("run_core.rs");
+        let forbidden = concat!("step_span", ".enter()");
+        assert!(
+            !src.contains(forbidden),
+            "agent.step must not hold an enter() guard across await points"
+        );
+        assert!(
+            src.contains("instrument(step_span.clone())"),
+            "agent.step must be attached to the awaited step work"
+        );
+    }
 
     // The three `effective_step_limit_*` tests mutate the process-global
     // `RECURSIVE_HARD_STEP_CAP` env var. Running in parallel they race each

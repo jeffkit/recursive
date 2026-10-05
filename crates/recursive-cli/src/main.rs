@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Registry;
+use tracing_subscriber::{EnvFilter, Registry};
 
 use recursive::mcp::{JsonRpcRequest, JsonRpcResponse};
 use recursive::SessionFile;
@@ -82,6 +82,16 @@ struct Cli {
     /// Log level: error|warn|info|debug|trace.
     #[arg(long, default_value = "info")]
     log: String,
+
+    /// Log output format: text|json. `json` writes one JSON object per line
+    /// to stderr, for shipping logs to a collector. Unknown values fall back
+    /// to the human-readable text format.
+    #[arg(
+        long = "log-format",
+        env = "RECURSIVE_LOG_FORMAT",
+        default_value = "text"
+    )]
+    log_format: String,
 
     /// Persist the full transcript to <path> as JSON when the run finishes.
     #[arg(long, env = "RECURSIVE_TRANSCRIPT_OUT")]
@@ -542,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli.log.clone()
     };
-    let _logging_guard = init_logging(&early_log)?;
+    let _logging_guard = init_logging(&early_log, &cli.log_format)?;
     tracing::trace!("recursive main starting");
 
     if cli.session_out.is_some() {
@@ -2004,6 +2014,18 @@ fn trace_spans_requested() -> bool {
     std::env::var("RECURSIVE_TRACE_SPANS").as_deref() == Ok("1")
 }
 
+/// Whether the log sink should emit newline-delimited JSON instead of the
+/// human-readable text format. Anything other than `json` keeps the text
+/// renderer — an unknown value must never silently drop the user's logs.
+fn log_format_is_json(format: &str) -> bool {
+    format.eq_ignore_ascii_case("json")
+}
+
+/// The subscriber stack the log layers attach to, before the optional OTEL
+/// layer. Naming it lets the text and JSON renderers be held behind a single
+/// boxed `Layer` trait object.
+type BaseSubscriber = tracing_subscriber::layer::Layered<EnvFilter, Registry>;
+
 /// Guard returned by `init_logging`. When the `otel` feature is active
 /// and `RECURSIVE_OTEL_ENDPOINT` is set, this guard shuts down the
 /// tracer provider (flushing pending spans) on drop.
@@ -2015,29 +2037,40 @@ pub struct LoggingGuard {
     _inner: Option<otel::OtelGuard>,
 }
 
-fn init_logging(level: &str) -> anyhow::Result<LoggingGuard> {
+fn init_logging(level: &str, format: &str) -> anyhow::Result<LoggingGuard> {
     let lvl: Level = level.parse().context("invalid log level")?;
     let trace_spans = trace_spans_requested();
     // When span timings are requested, the user-provided `--log warn`
     // would suppress the close events (they fire at INFO). Layer an
     // info-level filter for the `recursive` crate's instrumented spans
     // while leaving the rest of the filter alone.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let base = lvl.to_string();
         if trace_spans {
-            tracing_subscriber::EnvFilter::new(format!("{base},recursive=info"))
+            EnvFilter::new(format!("{base},recursive=info"))
         } else {
-            tracing_subscriber::EnvFilter::new(base)
+            EnvFilter::new(base)
         }
     });
 
-    let mut fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_writer(recursive::logging::StderrOrNullMaker)
-        .compact();
-    if trace_spans {
-        fmt_layer = fmt_layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
-    }
+    let fmt_layer: Box<dyn tracing_subscriber::Layer<BaseSubscriber> + Send + Sync> =
+        if log_format_is_json(format) {
+            Box::new(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_target(false)
+                    .with_writer(recursive::logging::StderrOrNullMaker),
+            )
+        } else {
+            let mut layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(recursive::logging::StderrOrNullMaker)
+                .compact();
+            if trace_spans {
+                layer = layer.with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+            }
+            Box::new(layer)
+        };
 
     let subscriber = Registry::default().with(filter).with(fmt_layer);
 
@@ -4018,6 +4051,29 @@ mod tests {
         assert!(!trace_spans_requested());
         if let Some(v) = previous {
             std::env::set_var("RECURSIVE_TRACE_SPANS", v);
+        }
+    }
+
+    #[test]
+    fn log_format_is_json_only_for_the_json_spelling() {
+        assert!(log_format_is_json("json"));
+        assert!(log_format_is_json("JSON"));
+        assert!(!log_format_is_json("text"));
+        // An unknown format must not silently drop logs — it stays text.
+        assert!(!log_format_is_json("logfmt"));
+        assert!(!log_format_is_json(""));
+    }
+
+    #[test]
+    fn log_format_flag_parses_and_defaults_to_text() {
+        let previous = std::env::var("RECURSIVE_LOG_FORMAT").ok();
+        std::env::remove_var("RECURSIVE_LOG_FORMAT");
+        let cli = Cli::parse_from(vec!["recursive", "run", "g"]);
+        assert_eq!(cli.log_format, "text", "--log-format defaults to text");
+        let cli = Cli::parse_from(vec!["recursive", "--log-format", "json", "run", "g"]);
+        assert_eq!(cli.log_format, "json", "--log-format json must be accepted");
+        if let Some(v) = previous {
+            std::env::set_var("RECURSIVE_LOG_FORMAT", v);
         }
     }
 
