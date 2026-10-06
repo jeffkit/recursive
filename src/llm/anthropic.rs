@@ -13,8 +13,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
-    ToolSpec,
+    ChatProvider, Completion, RetryLog, RetryPolicy, StreamChunk, StreamSender, TokenUsage,
+    ToolCall, ToolSpec,
 };
 
 /// Beta header required for `tool_reference` block support in the
@@ -39,6 +39,9 @@ pub struct AnthropicProvider {
     temperature: f64,
     max_tokens: u32,
     retry: RetryPolicy,
+    /// Issue #116: retries performed inside `post_with_retry` / the streaming
+    /// round, drained by `run_core` and re-emitted as `LlmRetry`.
+    retry_log: RetryLog,
     /// Cap on `ToolSearchTool` round-trips. Set via `with_max_search_rounds()`
     /// for API parity with `OpenAiProvider`. Not yet consumed because Anthropic
     /// does not currently have a server-side deferred search loop. Wire it up
@@ -84,6 +87,7 @@ impl AnthropicProvider {
             // from `Config::from_env` (RECURSIVE_MAX_TOKENS) anyway.
             max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
+            retry_log: RetryLog::default(),
             max_search_rounds: 3,
             prompt_cache: None,
             thinking_budget: None,
@@ -234,6 +238,12 @@ impl AnthropicProvider {
                             status = status.as_u16(),
                             "transient HTTP error, retrying"
                         );
+                        self.retry_log.record(
+                            attempt,
+                            backoff,
+                            Some(status.as_u16()),
+                            super::retry_status_reason(status.as_u16()),
+                        );
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -249,6 +259,7 @@ impl AnthropicProvider {
                             error = %e,
                             "network error, retrying"
                         );
+                        self.retry_log.record(attempt, backoff, None, "network");
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -262,6 +273,10 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl ChatProvider for AnthropicProvider {
+    fn take_retry_records(&self) -> Vec<super::RetryRecord> {
+        self.retry_log.take()
+    }
+
     /// Whether to use deferred tool loading via `tool_reference` blocks.
     ///
     /// `tool_reference` is an Anthropic beta feature (`advanced-tool-use-2025-11-20`).
@@ -381,6 +396,12 @@ impl AnthropicProvider {
                             status = status.as_u16(),
                             "transient HTTP error, retrying (stream)"
                         );
+                        self.retry_log.record(
+                            attempt,
+                            backoff,
+                            Some(status.as_u16()),
+                            super::retry_status_reason(status.as_u16()),
+                        );
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -397,6 +418,7 @@ impl AnthropicProvider {
                             error = %e,
                             "network error, retrying (stream)"
                         );
+                        self.retry_log.record(attempt, backoff, None, "network");
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -2888,6 +2910,13 @@ data: {\"type\":\"message_stop\"}
             result.is_err(),
             "must give up after max_retries transient HTTP failures"
         );
+        // Issue #116: every retry must also land in the retry log so
+        // `run_core` can surface it as an `LlmRetry` event.
+        let recs = provider.take_retry_records();
+        assert_eq!(recs.len(), 2, "two retries logged for max_retries=2");
+        assert!(recs
+            .iter()
+            .all(|r| r.status.is_some() && r.reason == "server_error"));
     }
 
     #[tokio::test]

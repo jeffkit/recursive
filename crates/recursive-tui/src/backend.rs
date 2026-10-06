@@ -260,6 +260,16 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
             Some(UiEvent::ContextBreakdown { breakdown })
         }
         AgentEvent::Latency { llm_ms, .. } => Some(UiEvent::Latency { llm_ms }),
+        AgentEvent::LlmRetry {
+            attempt,
+            wait_ms,
+            reason,
+            ..
+        } => Some(UiEvent::LlmRetry {
+            attempt,
+            wait_ms,
+            reason,
+        }),
         AgentEvent::Compacted { removed, kept, .. } => Some(UiEvent::Compacted { removed, kept }),
         AgentEvent::TurnFinished { .. } => Some(UiEvent::TurnFinished),
         AgentEvent::PlanProposed {
@@ -2445,6 +2455,28 @@ mod tests {
     }
 
     #[test]
+    fn map_llm_retry_to_llm_retry() {
+        // Issue #116: the retry event must reach the UI instead of falling
+        // through to `_ => None` (the pre-fix behaviour, where a 429 backoff
+        // was indistinguishable from model latency).
+        let ev = AgentEvent::LlmRetry {
+            step: 3,
+            attempt: 2,
+            wait_ms: 1500,
+            status: Some(429),
+            reason: "rate_limited".into(),
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::LlmRetry {
+                attempt: 2,
+                wait_ms: 1500,
+                reason: "rate_limited".into(),
+            })
+        );
+    }
+
+    #[test]
     fn map_context_breakdown_to_context_breakdown() {
         // Goal-328: the ContextBreakdown match arm must forward the breakdown
         // verbatim (and drop the `step` field). A mutant that deletes this arm
@@ -2637,18 +2669,37 @@ mod tests {
         let sink = TuiEventSink { tx };
         // An event not handled by map_agent_event falls through to `_ => None`
         // and must not send anything on the channel.
-        sink.emit(AgentEvent::LlmRetry {
-            step: 0,
-            attempt: 1,
-            wait_ms: 10,
-            reason: "timeout".into(),
-        })
-        .await;
+        sink.emit(AgentEvent::Microcompact { step: 0, pruned: 1 })
+            .await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
                 .await
                 .is_err(),
             "unmapped event must not be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_event_sink_emit_forwards_llm_retry() {
+        // Issue #116: the retry event reaches the app as a UiEvent.
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let sink = TuiEventSink { tx };
+        sink.emit(AgentEvent::LlmRetry {
+            step: 1,
+            attempt: 1,
+            wait_ms: 250,
+            status: Some(503),
+            reason: "server_error".into(),
+        })
+        .await;
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert_eq!(
+            got,
+            Ok(Some(UiEvent::LlmRetry {
+                attempt: 1,
+                wait_ms: 250,
+                reason: "server_error".into(),
+            }))
         );
     }
 

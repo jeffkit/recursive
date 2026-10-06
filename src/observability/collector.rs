@@ -160,8 +160,35 @@ fn opt_payload(text: Option<&str>, redact_payload: bool) -> Option<String> {
 struct RetryRec {
     attempt: u32,
     wait_ms: u64,
+    status: Option<u16>,
     reason: String,
     time: SystemTime,
+}
+
+/// Issue #116: retries split by class. The plain `retries` total cannot tell a
+/// 429 throttling burst from a 5xx outage, so the trace metadata carries the
+/// breakdown too.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RetryClasses {
+    rate_limited: u32,
+    server_error: u32,
+    timeout: u32,
+    network: u32,
+    empty_body: u32,
+}
+
+impl RetryClasses {
+    fn bump(&mut self, reason: &str) {
+        let slot = match reason {
+            "rate_limited" | "rate_limit" => &mut self.rate_limited,
+            "server_error" => &mut self.server_error,
+            "timeout" => &mut self.timeout,
+            "network" => &mut self.network,
+            "empty_body" => &mut self.empty_body,
+            _ => return,
+        };
+        *slot = slot.saturating_add(1);
+    }
 }
 
 struct ToolState {
@@ -200,6 +227,7 @@ pub struct RunCollector {
     total_usage: TokenUsage,
     total_cost_usd: f64,
     retries: u32,
+    retry_classes: RetryClasses,
     compactions: u32,
     finish_reason: Option<String>,
     error: Option<String>,
@@ -220,6 +248,7 @@ impl RunCollector {
             total_usage: TokenUsage::default(),
             total_cost_usd: 0.0,
             retries: 0,
+            retry_classes: RetryClasses::default(),
             compactions: 0,
             finish_reason: None,
             error: None,
@@ -311,6 +340,7 @@ impl RunCollector {
                 step,
                 attempt,
                 wait_ms,
+                status,
                 reason,
             } => {
                 let idx = self.step_slot(*step, now);
@@ -318,10 +348,12 @@ impl RunCollector {
                 self.steps[idx].retries.push(RetryRec {
                     attempt: *attempt,
                     wait_ms: *wait_ms,
+                    status: *status,
                     reason: reason.clone(),
                     time: now,
                 });
                 self.retries = self.retries.saturating_add(1);
+                self.retry_classes.bump(reason);
             }
             AgentEvent::Compacted { .. }
             | AgentEvent::CompactionBoundary { .. }
@@ -400,6 +432,28 @@ impl RunCollector {
             (
                 format!("{TRACE_METADATA_PREFIX}llm_retries"),
                 AttrValue::Int(i64::from(self.retries)),
+            ),
+            // Issue #116: 429 vs 5xx vs transport are different operational
+            // failures; the total above hides which one is happening.
+            (
+                format!("{TRACE_METADATA_PREFIX}llm_retries_rate_limited"),
+                AttrValue::Int(i64::from(self.retry_classes.rate_limited)),
+            ),
+            (
+                format!("{TRACE_METADATA_PREFIX}llm_retries_server_error"),
+                AttrValue::Int(i64::from(self.retry_classes.server_error)),
+            ),
+            (
+                format!("{TRACE_METADATA_PREFIX}llm_retries_timeout"),
+                AttrValue::Int(i64::from(self.retry_classes.timeout)),
+            ),
+            (
+                format!("{TRACE_METADATA_PREFIX}llm_retries_network"),
+                AttrValue::Int(i64::from(self.retry_classes.network)),
+            ),
+            (
+                format!("{TRACE_METADATA_PREFIX}llm_retries_empty_body"),
+                AttrValue::Int(i64::from(self.retry_classes.empty_body)),
             ),
             (
                 format!("{TRACE_METADATA_PREFIX}compactions"),
@@ -534,10 +588,8 @@ impl RunCollector {
         let events = step
             .retries
             .iter()
-            .map(|r| ObsEvent {
-                name: "llm.retry".to_string(),
-                time: r.time,
-                attrs: vec![
+            .map(|r| {
+                let mut attrs = vec![
                     (
                         format!("{OBSERVATION_METADATA_PREFIX}retry_attempt"),
                         AttrValue::Int(i64::from(r.attempt)),
@@ -550,7 +602,18 @@ impl RunCollector {
                         format!("{OBSERVATION_METADATA_PREFIX}retry_reason"),
                         AttrValue::Str(r.reason.clone()),
                     ),
-                ],
+                ];
+                if let Some(status) = r.status {
+                    attrs.push((
+                        format!("{OBSERVATION_METADATA_PREFIX}retry_status"),
+                        AttrValue::Int(i64::from(status)),
+                    ));
+                }
+                ObsEvent {
+                    name: "llm.retry".to_string(),
+                    time: r.time,
+                    attrs,
+                }
             })
             .collect();
 
@@ -938,6 +1001,7 @@ mod tests {
                 step: 0,
                 attempt: 2,
                 wait_ms: 1500,
+                status: Some(429),
                 reason: "rate_limited".into(),
             },
             at(3),
@@ -949,6 +1013,75 @@ mod tests {
         assert_eq!(
             attr(step, &format!("{OBSERVATION_METADATA_PREFIX}llm_retries")),
             Some(&AttrValue::Int(1))
+        );
+        assert!(
+            step.events[0].attrs.contains(&(
+                format!("{OBSERVATION_METADATA_PREFIX}retry_status"),
+                AttrValue::Int(429),
+            )),
+            "the failed attempt's HTTP status must ride on the retry span event"
+        );
+    }
+
+    /// Issue #116: the trace-level total is split by class, so a 429 burst and
+    /// a 5xx outage are distinguishable in the exported span metadata.
+    #[test]
+    fn retries_are_classified_on_the_root() {
+        let mut c = collector();
+        for (i, (reason, status)) in [
+            ("rate_limited", Some(429)),
+            ("server_error", Some(503)),
+            ("server_error", Some(500)),
+            ("network", None),
+            ("empty_body", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.ingest(
+                &AgentEvent::LlmRetry {
+                    step: i,
+                    attempt: 1,
+                    wait_ms: 10,
+                    status,
+                    reason: reason.into(),
+                },
+                at(i as u64),
+            );
+        }
+        let root = &c.records()[0];
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}llm_retries")),
+            Some(&AttrValue::Int(5))
+        );
+        assert_eq!(
+            attr(
+                root,
+                &format!("{TRACE_METADATA_PREFIX}llm_retries_rate_limited")
+            ),
+            Some(&AttrValue::Int(1))
+        );
+        assert_eq!(
+            attr(
+                root,
+                &format!("{TRACE_METADATA_PREFIX}llm_retries_server_error")
+            ),
+            Some(&AttrValue::Int(2))
+        );
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}llm_retries_network")),
+            Some(&AttrValue::Int(1))
+        );
+        assert_eq!(
+            attr(
+                root,
+                &format!("{TRACE_METADATA_PREFIX}llm_retries_empty_body")
+            ),
+            Some(&AttrValue::Int(1))
+        );
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}llm_retries_timeout")),
+            Some(&AttrValue::Int(0))
         );
     }
 

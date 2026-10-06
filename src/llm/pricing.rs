@@ -113,6 +113,74 @@ impl RetryPolicy {
     }
 }
 
+// ── Provider retry reporting (issue #116) ───────────────────────────────────
+
+/// One retry a provider performed *internally* (its own per-request
+/// `RetryPolicy` loop) before returning a result.
+///
+/// Without this, a provider's backoff is only a `tracing::warn!` line: the
+/// retry, its sleep and the 429/5xx classification never reach the event
+/// stream, so a 40 s step cannot be told apart from "the model was slow".
+/// Providers push records into their [`RetryLog`]; `run_core` drains the log
+/// after each step and re-emits them as
+/// [`crate::event::AgentEvent::LlmRetry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryRecord {
+    /// 1-based retry attempt (1 = first retry after the initial failure).
+    pub attempt: u32,
+    /// Milliseconds the provider slept before re-issuing the request.
+    pub wait_ms: u64,
+    /// HTTP status of the failed attempt, when there was one. `None` for
+    /// transport failures and the empty-body case.
+    pub status: Option<u16>,
+    /// Short classification (see [`retry_status_reason`]).
+    pub reason: String,
+}
+
+/// Reason label for a retried non-2xx response, using the same vocabulary as
+/// `run_core`'s step-level `LlmRetry` events.
+pub fn retry_status_reason(status: u16) -> &'static str {
+    if status == 429 {
+        "rate_limited"
+    } else {
+        "server_error"
+    }
+}
+
+/// A provider's queue of [`RetryRecord`]s accumulated since the last drain.
+///
+/// Interior mutability keeps `ChatProvider` methods on `&self` while letting
+/// `run_core` take the records after the call. Only touched on the retry path,
+/// so the mutex is uncontended on the happy path. `Arc` keeps the log shared
+/// across `Clone`d providers (the providers derive `Clone`).
+#[derive(Debug, Clone, Default)]
+pub struct RetryLog {
+    records: std::sync::Arc<std::sync::Mutex<Vec<RetryRecord>>>,
+}
+
+impl RetryLog {
+    /// Append one retry. Called by the provider immediately before its backoff
+    /// sleep, so `attempt`/`wait_ms` describe the sleep that is about to happen.
+    pub fn record(&self, attempt: usize, wait: Duration, status: Option<u16>, reason: &str) {
+        if let Ok(mut records) = self.records.lock() {
+            records.push(RetryRecord {
+                attempt: (attempt + 1) as u32,
+                wait_ms: wait.as_millis() as u64,
+                status,
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    /// Remove and return every record accumulated so far.
+    pub fn take(&self) -> Vec<RetryRecord> {
+        self.records
+            .lock()
+            .map(|mut records| std::mem::take(&mut *records))
+            .unwrap_or_default()
+    }
+}
+
 // ── Model pricing ────────────────────────────────────────────────────────────
 
 /// Per-million-token pricing for one model. USD.
@@ -628,5 +696,49 @@ mod tests {
                 "token threshold {threshold} must be below context window {window} for {model}"
             );
         }
+    }
+
+    // ── RetryLog / retry_status_reason (issue #116) ─────────────────────────
+
+    #[test]
+    fn retry_status_reason_splits_429_from_5xx() {
+        assert_eq!(retry_status_reason(429), "rate_limited");
+        assert_eq!(retry_status_reason(500), "server_error");
+        assert_eq!(retry_status_reason(503), "server_error");
+    }
+
+    #[test]
+    fn retry_log_records_then_drains_in_order() {
+        let log = RetryLog::default();
+        log.record(0, Duration::from_millis(1000), Some(429), "rate_limited");
+        log.record(1, Duration::from_millis(2000), None, "network");
+        assert_eq!(
+            log.take(),
+            vec![
+                RetryRecord {
+                    attempt: 1,
+                    wait_ms: 1000,
+                    status: Some(429),
+                    reason: "rate_limited".into(),
+                },
+                RetryRecord {
+                    attempt: 2,
+                    wait_ms: 2000,
+                    status: None,
+                    reason: "network".into(),
+                },
+            ]
+        );
+        assert!(log.take().is_empty(), "take must drain the log");
+    }
+
+    #[test]
+    fn retry_log_clone_shares_one_queue() {
+        // Providers derive `Clone`; a clone must not fork the retry log or
+        // `run_core` would lose the retries reported through the clone.
+        let log = RetryLog::default();
+        let clone = log.clone();
+        log.record(0, Duration::from_millis(5), None, "network");
+        assert_eq!(clone.take().len(), 1, "clones observe the same queue");
     }
 }

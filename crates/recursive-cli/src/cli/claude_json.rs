@@ -269,6 +269,7 @@ impl ClaudeJsonEmitter {
             AgentEvent::LlmRetry {
                 attempt,
                 wait_ms,
+                status,
                 reason,
                 ..
             } => {
@@ -283,7 +284,7 @@ impl ClaudeJsonEmitter {
                     "attempt": attempt,
                     "max_retries": attempt, // best-effort; Recursive does not expose the cap here
                     "retry_delay_ms": wait_ms,
-                    "error_status": Value::Null,
+                    "error_status": status,
                     "error": error,
                 }))]
             }
@@ -682,12 +683,28 @@ mod tests {
             step: 1,
             attempt: 2,
             wait_ms: 1500,
+            status: Some(429),
             reason: "rate_limited".into(),
         });
         assert_eq!(outs[0]["type"], "system");
         assert_eq!(outs[0]["subtype"], "api_retry");
         assert_eq!(outs[0]["error"], "rate_limit");
         assert_eq!(outs[0]["retry_delay_ms"], 1500);
+        assert_eq!(outs[0]["error_status"], 429);
+    }
+
+    #[test]
+    fn llm_retry_without_status_keeps_error_status_null() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        let outs = em.on_event(AgentEvent::LlmRetry {
+            step: 1,
+            attempt: 1,
+            wait_ms: 500,
+            status: None,
+            reason: "network".into(),
+        });
+        assert_eq!(outs[0]["error"], "network");
+        assert!(outs[0]["error_status"].is_null());
     }
 
     #[test]

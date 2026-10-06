@@ -1873,6 +1873,62 @@ async fn llm_retry_recovers_and_emits_event() {
     assert!(retried, "an LlmRetry event must be emitted for the backoff");
 }
 
+/// Issue #116: a *provider-internal* retry (the provider's own request loop)
+/// must reach the event stream too. `run_core` drains
+/// [`ChatProvider::take_retry_records`] after every LLM call and re-emits each
+/// record as `LlmRetry`, so a 429 hidden inside the provider is visible instead
+/// of only showing up as extra `Latency::llm_ms`.
+#[tokio::test]
+async fn provider_internal_retries_are_emitted_as_llm_retry_events() {
+    use crate::event::ChannelSink;
+    use crate::llm::RetryRecord;
+
+    let (sink, mut rx) = ChannelSink::new();
+    let provider = Arc::new(
+        MockProvider::new(vec![Completion {
+            content: "Hello!".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }])
+        .with_retry_records(vec![RetryRecord {
+            attempt: 1,
+            wait_ms: 2000,
+            status: Some(429),
+            reason: "rate_limited".into(),
+        }]),
+    );
+
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    while rx.try_recv().is_ok() {}
+
+    rt.run("hi").await.expect("turn must succeed");
+
+    let mut retries = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::LlmRetry {
+            step,
+            attempt,
+            wait_ms,
+            status,
+            reason,
+        } = ev
+        {
+            retries.push((step, attempt, wait_ms, status, reason));
+        }
+    }
+    assert_eq!(
+        retries,
+        vec![(1, 1, 2000, Some(429), "rate_limited".to_string())],
+        "the provider's retry must be emitted once, attributed to step 1"
+    );
+}
+
 // ── P0-2: set_event_sink / replace_event_sink side-effect contract ────
 
 /// `replace_event_sink` swaps the runtime sink but must NOT touch the

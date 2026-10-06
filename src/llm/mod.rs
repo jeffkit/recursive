@@ -43,8 +43,8 @@ pub use crate::message::ToolCall;
 pub use factory::build_llm_provider;
 pub use pricing::{
     context_window_tokens_for_model, context_window_tokens_for_model_effective,
-    default_compact_threshold_chars, default_compact_threshold_tokens, pricing_for, ModelPricing,
-    RetryPolicy,
+    default_compact_threshold_chars, default_compact_threshold_tokens, pricing_for,
+    retry_status_reason, ModelPricing, RetryLog, RetryPolicy, RetryRecord,
 };
 
 // ── Max-output-tokens default ────────────────────────────────────────────────
@@ -208,6 +208,18 @@ pub trait ChatProvider: Send + Sync {
         let messages = vec![Message::user(prompt.to_string())];
         let completion = self.complete(&messages, &[]).await?;
         Ok(completion.content)
+    }
+
+    /// Issue #116: retries this provider performed *internally* since the last
+    /// call, in order. `run_core` drains this after every LLM step and
+    /// re-emits the records as [`crate::event::AgentEvent::LlmRetry`], so a
+    /// provider's own 429/5xx/network backoff is visible to TUI / SDK / OTel
+    /// consumers instead of being a log-only side effect.
+    ///
+    /// Implementors own a [`RetryLog`]; the default (empty) means "this
+    /// provider does not retry internally" (e.g. `MockProvider`).
+    fn take_retry_records(&self) -> Vec<RetryRecord> {
+        Vec::new()
     }
 }
 

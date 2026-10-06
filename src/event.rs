@@ -299,7 +299,8 @@ pub enum AgentEvent {
     HookSystemMessage { text: String },
 
     /// Emitted when the LLM call fails with a retryable error (rate limit or timeout)
-    /// and the agent will back off before retrying.
+    /// and the agent will back off before retrying. Covers both the provider's
+    /// own per-request retry (issue #116) and the cross-step retry loop.
     LlmRetry {
         /// Which step (ReAct iteration) triggered the retry.
         step: usize,
@@ -307,7 +308,12 @@ pub enum AgentEvent {
         attempt: u32,
         /// How many milliseconds the agent will sleep before the next attempt.
         wait_ms: u64,
-        /// Short human-readable description of the error ("rate_limited" or "timeout").
+        /// HTTP status of the failed attempt, when there was one. `None` for
+        /// transport failures and provider empty-body retries.
+        #[serde(default)]
+        status: Option<u16>,
+        /// Short human-readable description of the error, e.g. `"rate_limited"`,
+        /// `"server_error"`, `"timeout"`, `"network"` or `"empty_body"`.
         reason: String,
     },
 
@@ -942,6 +948,7 @@ mod tests {
                 step: 2,
                 attempt: 1,
                 wait_ms: 5000,
+                status: Some(429),
                 reason: "rate_limited".into(),
             },
             AgentEvent::DeliverablesPresented {

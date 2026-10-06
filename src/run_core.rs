@@ -407,7 +407,15 @@ impl<'a> RunCore<'a> {
         } else {
             None
         };
-        let mut completion: Completion = self.call_llm(specs, stream_tx).await?;
+        let result = self.call_llm(specs, stream_tx).await;
+        // Issue #116: a provider retries transient failures inside its own
+        // request loop, before `call_llm` returns — drain those records and
+        // surface them as `LlmRetry` so the backoff is visible to TUI / SDK /
+        // OTel consumers instead of only in a `tracing::warn!` line. Emitted
+        // whether the call ultimately succeeded or failed, so the retries that
+        // the step loop then gives up on are still on the record.
+        self.emit_provider_retries(step);
+        let mut completion: Completion = result?;
         // Drain the partial-token forwarder before emitting any further
         // events. `call_llm` drops `stream_tx` on return, which closes
         // `delta_rx` and lets the spawned task finish; awaiting it
@@ -508,6 +516,32 @@ impl<'a> RunCore<'a> {
         Ok((completion, new_final_message))
     }
 
+    /// Issue #116: re-emit the provider's own per-request retries as
+    /// [`AgentEvent::LlmRetry`].
+    ///
+    /// The provider retries a transient failure (429 / 5xx / network) inside
+    /// its request loop, sleeping a backoff that — unlike the step loop's —
+    /// lands inside the `Latency::llm_ms` measured by [`Self::dispatch_llm_step`].
+    /// Emitting the records with their `wait_ms` lets a consumer tell a slow
+    /// model apart from a retry storm (subtract the waits from `llm_ms`), and
+    /// keeps the 429/5xx classification in the OTel metrics.
+    ///
+    /// The log is provider-scoped, not call-scoped (sub-agents share the
+    /// parent's `Arc<dyn ChatProvider>`), so a drain can hand back a retry
+    /// another in-flight run produced. Every retry is still emitted exactly
+    /// once; only the `step` attribution is best-effort under that sharing.
+    fn emit_provider_retries(&self, step: usize) {
+        for rec in self.llm.take_retry_records() {
+            self.emit(AgentEvent::LlmRetry {
+                step,
+                attempt: rec.attempt,
+                wait_ms: rec.wait_ms,
+                status: rec.status,
+                reason: rec.reason,
+            });
+        }
+    }
+
     /// Issue #100: run one ReAct step's LLM call with a bounded, cancel-aware
     /// cross-step retry.
     ///
@@ -534,6 +568,7 @@ impl<'a> RunCore<'a> {
                             step,
                             attempt: (attempt + 1) as u32,
                             wait_ms: backoff.as_millis() as u64,
+                            status: e.http_status(),
                             reason: retry_reason(&e).to_string(),
                         });
                         warn!(

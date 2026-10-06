@@ -74,6 +74,18 @@ pub enum UiEvent {
     Reasoning { content: String },
     /// Latency (ms) of the latest LLM call.
     Latency { llm_ms: u64 },
+    /// Issue #116: the agent backed off before retrying an LLM request —
+    /// either the provider's own per-request retry or the cross-step retry
+    /// loop. Surfaced so a long step can be attributed to throttling instead
+    /// of "the model is slow".
+    LlmRetry {
+        /// 1-based retry attempt.
+        attempt: u32,
+        /// Backoff before the next attempt, in ms.
+        wait_ms: u64,
+        /// Short classification, e.g. `rate_limited` / `server_error`.
+        reason: String,
+    },
     /// Transcript compaction notification.
     Compacted { removed: usize, kept: usize },
     /// The backend worker finished building the runtime and is ready to accept

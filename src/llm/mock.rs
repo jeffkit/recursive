@@ -42,6 +42,10 @@ pub struct MockProvider {
     /// assert multi-frame delivery. `None` (default) keeps the single-chunk
     /// behaviour every pre-existing test relies on.
     stream_chunk_chars: Option<usize>,
+    /// Issue #116: retries this mock "performed internally", drained by
+    /// `run_core` and re-emitted as `LlmRetry`. Lets runtime tests cover the
+    /// provider-retry path without a real HTTP provider.
+    retry_records: Mutex<Vec<super::RetryRecord>>,
 }
 
 impl MockProvider {
@@ -61,6 +65,7 @@ impl MockProvider {
             on_complete: None,
             on_complete_fn: None,
             stream_chunk_chars: None,
+            retry_records: Mutex::new(Vec::new()),
         }
     }
 
@@ -111,10 +116,22 @@ impl MockProvider {
         *self.structured_responses.lock().unwrap() = responses;
         self
     }
+
+    /// Issue #116: report these retries as "performed internally" on the next
+    /// drain, so a runtime test can assert they surface as
+    /// `AgentEvent::LlmRetry`. See [`ChatProvider::take_retry_records`].
+    pub fn with_retry_records(self, records: Vec<super::RetryRecord>) -> Self {
+        *self.retry_records.lock().unwrap() = records;
+        self
+    }
 }
 
 #[async_trait]
 impl ChatProvider for MockProvider {
+    fn take_retry_records(&self) -> Vec<super::RetryRecord> {
+        std::mem::take(&mut *self.retry_records.lock().unwrap())
+    }
+
     async fn complete(&self, messages: &[Message], _tools: &[ToolSpec]) -> Result<Completion> {
         let span = tracing::info_span!("llm.complete", provider = "mock", model = "mock");
         async move {
@@ -454,5 +471,25 @@ mod tracing_tests {
 
         // Should have created an llm.complete span - check for span name in output
         assert!(logs_contain("llm.complete"));
+    }
+
+    /// Issue #116: `with_retry_records` seeds the queue `run_core` drains to
+    /// emit `LlmRetry`, and the drain is one-shot.
+    #[tokio::test]
+    async fn retry_records_are_reported_once() {
+        let provider =
+            MockProvider::new(vec![]).with_retry_records(vec![crate::llm::RetryRecord {
+                attempt: 2,
+                wait_ms: 500,
+                status: Some(503),
+                reason: "server_error".into(),
+            }]);
+        let drained = provider.take_retry_records();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].attempt, 2);
+        assert!(
+            provider.take_retry_records().is_empty(),
+            "records must be reported exactly once"
+        );
     }
 }

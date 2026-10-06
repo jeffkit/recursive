@@ -32,8 +32,8 @@ use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
 use super::StructuredCompletion;
 use super::StructuredRequest;
 use super::{
-    ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
-    ToolSpec,
+    ChatProvider, Completion, RetryLog, RetryPolicy, StreamChunk, StreamSender, TokenUsage,
+    ToolCall, ToolSpec,
 };
 use crate::credentials::ApiKeySource;
 use crate::error::{Error, Result};
@@ -55,6 +55,9 @@ pub struct OpenAiProvider {
     temperature: f64,
     max_tokens: u32,
     retry: RetryPolicy,
+    /// Issue #116: retries performed inside `post_json_with_retry` /
+    /// `stream_inner`, drained by `run_core` and re-emitted as `LlmRetry`.
+    retry_log: RetryLog,
     stream_tx: Option<StreamSender>,
     /// Algorithm used to resolve a `ToolSearchTool` query into a list of
     /// deferred tool names. Defaults to `KeywordSearchEngine`.
@@ -94,6 +97,7 @@ impl OpenAiProvider {
             // mid-generation (`provider_stop:length` with empty content).
             max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
+            retry_log: RetryLog::default(),
             stream_tx: None,
             search_engine: Arc::new(KeywordSearchEngine::new()),
             max_search_rounds: 3,
@@ -196,6 +200,7 @@ impl OpenAiProvider {
                                     backoff_ms = backoff.as_millis(),
                                     "HTTP 200 but empty body ({label}), retrying"
                                 );
+                                self.retry_log.record(attempt, backoff, None, "empty_body");
                                 tokio::time::sleep(backoff).await;
                                 attempt += 1;
                                 continue;
@@ -219,6 +224,12 @@ impl OpenAiProvider {
                             status = status.as_u16(),
                             "transient HTTP error, retrying ({label})"
                         );
+                        self.retry_log.record(
+                            attempt,
+                            backoff,
+                            Some(status.as_u16()),
+                            super::retry_status_reason(status.as_u16()),
+                        );
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -235,6 +246,7 @@ impl OpenAiProvider {
                             error = %e,
                             "network error, retrying ({label})"
                         );
+                        self.retry_log.record(attempt, backoff, None, "network");
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -248,6 +260,10 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl ChatProvider for OpenAiProvider {
+    fn take_retry_records(&self) -> Vec<super::RetryRecord> {
+        self.retry_log.take()
+    }
+
     #[tracing::instrument(skip(self, messages, tools), fields(
         provider = %self.base_url.split('/').next_back().unwrap_or("unknown"),
         model = %self.model
@@ -656,6 +672,12 @@ impl OpenAiProvider {
                             status = status.as_u16(),
                             "transient HTTP error, retrying (stream)"
                         );
+                        self.retry_log.record(
+                            attempt,
+                            backoff,
+                            Some(status.as_u16()),
+                            super::retry_status_reason(status.as_u16()),
+                        );
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -671,6 +693,7 @@ impl OpenAiProvider {
                             error = %e,
                             "network error, retrying (stream)"
                         );
+                        self.retry_log.record(attempt, backoff, None, "network");
                         tokio::time::sleep(backoff).await;
                         attempt += 1;
                         continue;
@@ -2490,6 +2513,18 @@ data: [DONE]
         assert!(
             result.is_err(),
             "must give up after max_retries transient HTTP failures"
+        );
+        // Issue #116: every retry must also land in the retry log so
+        // `run_core` can surface it as an `LlmRetry` event.
+        let recs = provider.take_retry_records();
+        assert_eq!(recs.len(), 2, "two retries logged for max_retries=2");
+        assert_eq!((recs[0].attempt, recs[1].attempt), (1, 2));
+        assert!(recs
+            .iter()
+            .all(|r| r.status == Some(503) && r.reason == "server_error"));
+        assert!(
+            provider.take_retry_records().is_empty(),
+            "draining must clear the log"
         );
     }
 

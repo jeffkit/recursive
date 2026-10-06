@@ -178,6 +178,17 @@ impl App {
                 self.blocks
                     .push(TranscriptBlock::Compacted { removed, kept });
             }
+            // Issue #116: surface provider / step retries so a stalled turn is
+            // attributable to throttling rather than looking like model latency.
+            UiEvent::LlmRetry {
+                attempt,
+                wait_ms,
+                reason,
+            } => {
+                self.blocks.push(TranscriptBlock::System {
+                    text: format!("LLM retry #{attempt} in {wait_ms}ms ({reason})"),
+                });
+            }
             UiEvent::TurnStarted => {
                 // (Re)arm the spinner for the turn the backend is starting.
                 // Idempotent for a freshly-submitted turn (the UI already
@@ -1097,6 +1108,24 @@ mod tests {
                 removed: 12,
                 kept: 1
             })
+        ));
+    }
+
+    // ── llm retry (issue #116) ─────────────────────────────────────
+
+    #[test]
+    fn llm_retry_event_pushes_a_system_block() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::LlmRetry {
+            attempt: 2,
+            wait_ms: 1500,
+            reason: "rate_limited".into(),
+        });
+        assert!(matches!(
+            app.blocks.last(),
+            Some(TranscriptBlock::System { text })
+                if text == "LLM retry #2 in 1500ms (rate_limited)"
         ));
     }
 
