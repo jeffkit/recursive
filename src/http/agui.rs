@@ -1164,12 +1164,24 @@ pub(crate) fn spawn_agui_run(
         // messages this run produced are appended (drv_pre_run_len skips
         // the seeded history on resume runs).
         {
-            let status = if client_denied.is_some() || test_was_interrupted {
-                crate::session::SessionStatus::Interrupted
+            // Issue #111: the status alone collapses six failure modes into
+            // `Crashed` and the `Err` arm used to swallow the error text —
+            // carry both onto the persisted session.
+            let (status, finish_reason, error) = if client_denied.is_some() || test_was_interrupted
+            {
+                (crate::session::SessionStatus::Interrupted, None, None)
             } else {
                 match &outcome {
-                    Ok(o) => crate::session::SessionStatus::for_finish(&o.finish_reason),
-                    Err(_) => crate::session::SessionStatus::Crashed,
+                    Ok(o) => {
+                        let (status, reason) =
+                            crate::session::SessionStatus::for_finish(&o.finish_reason);
+                        (status, reason, None)
+                    }
+                    Err(e) => (
+                        crate::session::SessionStatus::Crashed,
+                        None,
+                        Some(e.to_string()),
+                    ),
                 }
             };
             let transcript = runtime.transcript();
@@ -1185,6 +1197,8 @@ pub(crate) fn spawn_agui_run(
                 provider: &drv_provider,
                 preset: drv_preset.as_deref(),
                 status,
+                finish_reason,
+                error,
                 // Issue #115: a crashed run still burned its completed steps'
                 // tokens — persist them so the session's cost record is not
                 // systematically low. Zero means "nothing to record", which

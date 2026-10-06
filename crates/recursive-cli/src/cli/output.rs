@@ -165,33 +165,33 @@ pub(crate) fn exit_for_finish(finish: &FinishReason, steps: usize) -> anyhow::Re
     }
 }
 
-/// Map a turn's `FinishReason` to the `SessionStatus` written to `.meta.json`.
+/// Map a turn's `FinishReason` to the `(SessionStatus, finish_reason)` pair
+/// written to `.meta.json`.
 ///
 /// Used by `run_loop`: the loop's *last* turn decides the whole session's
 /// status. `NoMoreToolCalls` → `Completed`; `Cancelled` (SIGINT/SIGTERM via
 /// the shutdown token) → `Interrupted` (user-initiated, resumable); every
 /// other finish (budget / stuck / transcript-limit / provider-stop / …) →
-/// `Crashed`. `run_once` uses a simpler Completed/Crashed split because a
-/// single `run` that gets cancelled returns `Err` before reaching finalize;
-/// loop runs multiple turns and surfaces `Cancelled` as a normal last
-/// outcome, so it deserves the resumable `Interrupted` label.
-pub(crate) fn finish_to_session_status(finish: &FinishReason) -> SessionStatus {
-    match finish {
-        FinishReason::NoMoreToolCalls => SessionStatus::Completed,
-        FinishReason::Cancelled => SessionStatus::Interrupted,
-        _ => SessionStatus::Crashed,
-    }
+/// `Crashed` **plus** the canonical reason string that keeps those causes
+/// apart on disk (issue #111).
+///
+/// Delegates to the session crate's exhaustive mapping rather than keeping
+/// a second `_ => Crashed` table here, so the two cannot drift.
+pub(crate) fn finish_to_session_status(finish: &FinishReason) -> (SessionStatus, Option<String>) {
+    SessionStatus::for_finish(finish)
 }
 
 pub(crate) fn finalize_session_writer(
     session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
     status: SessionStatus,
+    finish_reason: Option<String>,
+    error: Option<String>,
 ) {
     let Some(sw) = session_writer else { return };
     match Arc::into_inner(sw) {
         Some(mutex) => match mutex.lock() {
             Ok(mut w) => {
-                if let Err(e) = w.finish(status) {
+                if let Err(e) = w.finish_with_details(status, finish_reason, error) {
                     eprintln!("session: failed to finalize: {e}");
                 } else {
                     eprintln!(
@@ -520,7 +520,7 @@ mod tests {
     fn finish_to_session_status_maps_cancelled_to_interrupted() {
         assert_eq!(
             finish_to_session_status(&FinishReason::Cancelled),
-            SessionStatus::Interrupted
+            (SessionStatus::Interrupted, None)
         );
     }
 
@@ -545,26 +545,31 @@ mod tests {
     fn finish_to_session_status_maps_success_to_completed() {
         assert_eq!(
             finish_to_session_status(&FinishReason::NoMoreToolCalls),
-            SessionStatus::Completed
+            (SessionStatus::Completed, None)
         );
     }
 
     #[test]
-    fn finish_to_session_status_maps_errors_to_crashed() {
+    fn finish_to_session_status_maps_errors_to_crashed_with_reason() {
+        // Issue #111: the failure variants all share `Crashed`, so the
+        // reason string is the only thing that tells them apart on disk.
         assert_eq!(
             finish_to_session_status(&FinishReason::BudgetExceeded),
-            SessionStatus::Crashed
+            (SessionStatus::Crashed, Some("budget_exceeded".to_string()))
         );
         assert_eq!(
             finish_to_session_status(&FinishReason::Stuck {
                 repeated_call: "x".into(),
                 repeats: 3,
             }),
-            SessionStatus::Crashed
+            (SessionStatus::Crashed, Some("stuck:x:3".to_string()))
         );
         assert_eq!(
             finish_to_session_status(&FinishReason::ProviderStop("boom".into())),
-            SessionStatus::Crashed
+            (
+                SessionStatus::Crashed,
+                Some("provider_stop:boom".to_string())
+            )
         );
     }
 

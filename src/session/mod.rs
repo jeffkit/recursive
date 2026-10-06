@@ -155,24 +155,31 @@ impl std::fmt::Display for SessionStatus {
 }
 
 impl SessionStatus {
-    /// Map a [`FinishReason`] to the canonical `SessionStatus` written
-    /// when the writer is finalised.
+    /// Map a [`FinishReason`] to the canonical `(SessionStatus,
+    /// finish_reason)` pair written when the writer is finalised.
+    ///
+    /// The second element is what goes into
+    /// [`SessionMeta::finish_reason`]: [`FinishReason`]'s `Display`
+    /// string for the six failure variants that all collapse into
+    /// `Crashed` (issue #111), and `None` for the outcomes whose
+    /// status is already unambiguous — a `NoMoreToolCalls` run
+    /// completed, a `Cancelled` run was interrupted by the user.
     ///
     /// The mapping is EXHAUSTIVE: there is no wildcard arm, so
     /// adding a new variant to `FinishReason` becomes a compile error
     /// in this function rather than silently falling back to
     /// `Crashed`. The compiler is the safety net.
-    pub fn for_finish(reason: &crate::agent::FinishReason) -> Self {
+    pub fn for_finish(reason: &crate::agent::FinishReason) -> (Self, Option<String>) {
         use crate::agent::FinishReason;
         match reason {
-            FinishReason::NoMoreToolCalls => Self::Completed,
+            FinishReason::NoMoreToolCalls => (Self::Completed, None),
             FinishReason::BudgetExceeded
             | FinishReason::ProviderStop(_)
             | FinishReason::Stuck { .. }
             | FinishReason::TranscriptLimit { .. }
             | FinishReason::PermissionDenialLimit
-            | FinishReason::WallClockExceeded { .. } => Self::Crashed,
-            FinishReason::Cancelled => Self::Interrupted,
+            | FinishReason::WallClockExceeded { .. } => (Self::Crashed, Some(reason.to_string())),
+            FinishReason::Cancelled => (Self::Interrupted, None),
         }
     }
 }
@@ -596,6 +603,27 @@ pub struct SessionMeta {
     /// for every session file written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<String>,
+    /// Why the session last stopped, when the stop was a failure
+    /// (issue #111): the canonical
+    /// [`FinishReason`](crate::agent::FinishReason) string from its
+    /// `Display` impl, e.g. `"budget_exceeded"`, `"stuck:Read:3"`,
+    /// `"provider_stop:length"`. `SessionStatus` alone collapses those
+    /// six failure modes into `Crashed`, which made a budget-stopped
+    /// session indistinguishable on disk from a provider 400.
+    ///
+    /// `None` for a session that is still `Active` or that ended
+    /// *normally* (`Completed` / `Interrupted` — the status already
+    /// says everything there is to say), and for every session file
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// Failure text when the session ended abnormally — the
+    /// provider/transport/IO error that aborted the run instead of
+    /// producing a [`FinishReason`](crate::agent::FinishReason)
+    /// (issue #111). `None` when the run ended through a finish
+    /// reason, since those are data, not errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +642,15 @@ pub struct ExportedTranscript {
     /// — the same enum is used in both structs to keep the
     /// wire shape consistent for external SDK consumers.
     pub status: SessionStatus,
+    /// Why the session stopped, when that was a failure (issue #111).
+    /// Mirrors `SessionMeta::finish_reason` so an exported transcript
+    /// keeps the data that tells the six `Crashed` causes apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// Failure text when the session ended abnormally (issue #111).
+    /// Mirrors `SessionMeta::error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Every persisted message in on-disk order, including those that
     /// were folded into a compaction summary (older `messages.len()` of
     /// these were superseded by the corresponding [`Self::compact_boundaries`]
@@ -675,6 +712,8 @@ impl ExportedTranscript {
             goal: meta.goal,
             created_at: meta.created_at,
             status: meta.status,
+            finish_reason: meta.finish_reason,
+            error: meta.error,
             messages,
             compact_boundaries,
             message_count,
@@ -1372,37 +1411,53 @@ mod tests {
         use crate::agent::FinishReason;
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::NoMoreToolCalls),
-            SessionStatus::Completed
+            (SessionStatus::Completed, None)
         );
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::BudgetExceeded),
-            SessionStatus::Crashed
+            (SessionStatus::Crashed, Some("budget_exceeded".to_string()))
         );
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::ProviderStop("rate_limited".into())),
-            SessionStatus::Crashed
+            (
+                SessionStatus::Crashed,
+                Some("provider_stop:rate_limited".to_string())
+            )
         );
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::Stuck {
                 repeated_call: "Read".into(),
                 repeats: 5
             }),
-            SessionStatus::Crashed
+            (SessionStatus::Crashed, Some("stuck:Read:5".to_string()))
         );
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::TranscriptLimit {
                 chars: 100_000,
                 limit: 80_000
             }),
-            SessionStatus::Crashed
+            (
+                SessionStatus::Crashed,
+                Some("transcript_limit:100000/80000".to_string())
+            )
         );
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::Cancelled),
-            SessionStatus::Interrupted
+            (SessionStatus::Interrupted, None)
         );
         assert_eq!(
             SessionStatus::for_finish(&FinishReason::PermissionDenialLimit),
-            SessionStatus::Crashed
+            (
+                SessionStatus::Crashed,
+                Some("permission_denial_limit".to_string())
+            )
+        );
+        assert_eq!(
+            SessionStatus::for_finish(&FinishReason::WallClockExceeded { secs: 600 }),
+            (
+                SessionStatus::Crashed,
+                Some("wall_clock_exceeded:600".to_string())
+            )
         );
     }
 
@@ -1433,6 +1488,8 @@ mod tests {
             preset: None,
             name: None,
             derived_from: None,
+            finish_reason: None,
+            error: None,
         }
     }
 
@@ -1796,5 +1853,26 @@ mod tests {
         assert_eq!(b.removed, 2);
         assert_eq!(b.turn, Some(1));
         assert_eq!(b.message_index, 2, "boundary precedes the summary message");
+    }
+
+    // Issue #111: an exported transcript must carry the failure detail —
+    // once the session directory is copied off a machine, the six causes
+    // that collapse into `Crashed` are otherwise unrecoverable.
+    #[test]
+    fn export_carries_finish_reason_and_error() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create(ws, "export failure", "model", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+        w.append(&Message::user("do the thing".to_string()), None, None)
+            .unwrap();
+        let (status, reason) =
+            SessionStatus::for_finish(&crate::agent::FinishReason::BudgetExceeded);
+        w.finish_with_details(status, reason, None).unwrap();
+
+        let exported = ExportedTranscript::from_session_dir(&session_dir).unwrap();
+        assert_eq!(exported.status, SessionStatus::Crashed);
+        assert_eq!(exported.finish_reason.as_deref(), Some("budget_exceeded"));
+        assert_eq!(exported.error, None);
     }
 }

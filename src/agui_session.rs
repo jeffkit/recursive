@@ -135,6 +135,13 @@ pub struct RunRecord<'a> {
     pub provider: &'a str,
     pub preset: Option<&'a str>,
     pub status: SessionStatus,
+    /// Why the run stopped when that was a failure (issue #111), taken
+    /// from `SessionStatus::for_finish`. `None` for a run that
+    /// completed, was interrupted, or has no reason to record.
+    pub finish_reason: Option<String>,
+    /// Failure text when the run aborted with an error rather than a
+    /// finish reason (issue #111).
+    pub error: Option<String>,
     /// Total token usage of the run (`None` when the run failed before
     /// any completed LLM call — nothing to bill).
     pub usage: Option<TokenUsage>,
@@ -175,7 +182,7 @@ pub fn persist_run(record: RunRecord<'_>) -> std::io::Result<PathBuf> {
     if let Some(usage) = record.usage {
         writer.add_usage(&UsageMeta::from_token_usage(&usage));
     }
-    writer.finish(record.status)?;
+    writer.finish_with_details(record.status, record.finish_reason, record.error)?;
 
     if let Some(usage) = record.usage {
         let mut tracker = crate::cost::CostTracker::new(dir.clone(), record.model, record.provider);
@@ -259,8 +266,13 @@ pub fn apply_resume_tool_results(
                 let msg = crate::message::Message::tool_result(tool_call_id, content);
                 let _ = writer.append(&msg, None, None);
             }
-            // Keep the lifecycle status the session already had.
-            let _ = writer.finish(meta.status);
+            // Keep the lifecycle status — and the failure detail (issue
+            // #111) — the session already had.
+            let _ = writer.finish_with_details(
+                meta.status,
+                meta.finish_reason.clone(),
+                meta.error.clone(),
+            );
         }
     }
 }
@@ -398,6 +410,8 @@ fn synthesize_meta_if_missing(dir: &Path, thread_id: &str) {
         preset: None,
         name,
         derived_from: None,
+        finish_reason: None,
+        error: None,
     };
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
         let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
@@ -458,6 +472,8 @@ mod tests {
             provider: "deepseek",
             preset: None,
             status: SessionStatus::Completed,
+            finish_reason: None,
+            error: None,
             usage,
             llm_latency_ms: 7,
         }

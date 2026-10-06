@@ -1010,6 +1010,8 @@ mod tests {
             preset: None,
             name: Some("focused".into()),
             derived_from: None,
+            finish_reason: None,
+            error: None,
         };
         std::fs::write(
             session_dir.join(".meta.json"),

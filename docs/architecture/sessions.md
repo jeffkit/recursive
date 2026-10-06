@@ -42,7 +42,28 @@ Session ID format: `<ISO8601-start>-<workspace-slug>` (e.g. `2026-05-28T03:41:37
 }
 ```
 
-`status`: `"incomplete"` while running, `"complete"` on clean finish, `"failed"` on crash.
+`status`: `"active"` while running, `"completed"` on clean finish,
+`"interrupted"` on SIGINT/SIGTERM or `recursive pause`, `"paused"`, and
+`"crashed"` for every abnormal stop.
+
+Because `"crashed"` alone cannot tell a step-budget stop from a provider
+error, a failed session also records *why* (issue #111):
+
+```json
+{
+  "status": "crashed",
+  "finish_reason": "budget_exceeded"
+}
+```
+
+`finish_reason` is the canonical `FinishReason` string
+(`budget_exceeded`, `stuck:<tool>:<n>`, `transcript_limit:<chars>/<limit>`,
+`provider_stop:<reason>`, `permission_denial_limit`,
+`wall_clock_exceeded:<secs>`) and is absent for a session that ended
+normally. `error` carries the failure text when the run aborted with an
+`Err` (provider/transport/IO) instead of a finish reason. Both fields are
+optional — a `.meta.json` written before they existed loads unchanged —
+and both are also carried by `ExportedTranscript` (`sessions export`).
 
 ## transcript.jsonl
 

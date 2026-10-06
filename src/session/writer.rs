@@ -171,6 +171,8 @@ impl SessionWriter {
             preset: preset.map(|s| s.to_string()),
             name: None,
             derived_from: None,
+            finish_reason: None,
+            error: None,
         };
 
         // Write initial meta file (atomic: temp + rename to prevent corruption).
@@ -246,6 +248,8 @@ impl SessionWriter {
             preset: preset.map(|s| s.to_string()),
             name: None,
             derived_from: None,
+            finish_reason: None,
+            error: None,
         };
         let meta_path = session_dir.join(".meta.json");
         let meta_json = serde_json::to_string_pretty(&meta)
@@ -525,10 +529,33 @@ impl SessionWriter {
     ///
     /// `status` is a [`SessionStatus`] enum value. Callers that have a
     /// `FinishReason` in hand should prefer
-    /// `SessionStatus::for_finish(&reason)` so the mapping stays
-    /// exhaustive — adding a new `FinishReason` variant will not
+    /// `SessionStatus::for_finish(&reason)` — which returns both the
+    /// status and the reason string to pass to
+    /// [`SessionWriter::finish_with_details`] — so the mapping stays
+    /// exhaustive: adding a new `FinishReason` variant will not
     /// silently fall back to `Crashed`.
+    ///
+    /// Shorthand for [`SessionWriter::finish_with_details`] with no
+    /// detail attached.
     pub fn finish(&mut self, status: SessionStatus) -> std::io::Result<()> {
+        self.finish_with_details(status, None, None)
+    }
+
+    /// Finalise the session, additionally recording *why* it stopped
+    /// (issue #111).
+    ///
+    /// `finish_reason` is the canonical
+    /// [`FinishReason`](crate::agent::FinishReason) string — take it
+    /// from `SessionStatus::for_finish` — and `error` is the failure
+    /// text when the run aborted with an `Err` rather than a finish
+    /// reason. Both **replace** whatever is on disk, so a session
+    /// re-finalised by a later resume never keeps a stale reason.
+    pub fn finish_with_details(
+        &mut self,
+        status: SessionStatus,
+        finish_reason: Option<String>,
+        error: Option<String>,
+    ) -> std::io::Result<()> {
         self.writer.flush()?;
 
         // Read-modify-write so we preserve fields we don't own here
@@ -540,6 +567,10 @@ impl SessionWriter {
         meta.updated_at = chrono_lite_now();
         meta.message_count = self.message_count;
         meta.status = status;
+        // Issue #111: the status alone cannot tell a budget stop from a
+        // provider 400 — persist the finish reason / error alongside it.
+        meta.finish_reason = finish_reason;
+        meta.error = error;
         // g157: final prompt snapshot.
         if self.first_prompt.is_some() {
             meta.first_prompt = self.first_prompt.clone();
@@ -833,6 +864,59 @@ mod tests {
         let cost = SessionReader::load_meta(&dir).unwrap().cost.unwrap();
         assert_eq!(cost.total_input_tokens, 30);
         assert_eq!(cost.total_output_tokens, 12);
+    }
+
+    // Issue #111 acceptance: a session killed by the step budget must be
+    // readable as such from `.meta.json` — `status: "crashed"` alone cannot
+    // tell it apart from a provider 400 or a stuck loop.
+    #[test]
+    fn finish_with_details_persists_finish_reason() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("budget-stopped");
+
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        writer.append(&Message::user("hi"), None, None).unwrap();
+        let (status, reason) =
+            SessionStatus::for_finish(&crate::agent::FinishReason::BudgetExceeded);
+        writer.finish_with_details(status, reason, None).unwrap();
+        drop(writer);
+
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.status, SessionStatus::Crashed);
+        assert_eq!(meta.finish_reason.as_deref(), Some("budget_exceeded"));
+
+        // A later finish without detail must REPLACE the stale reason — a
+        // resumed-and-completed session that still claims `budget_exceeded`
+        // would be worse than no reason at all.
+        let mut writer = SessionWriter::open_existing(&dir).unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+        drop(writer);
+
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.status, SessionStatus::Completed);
+        assert_eq!(meta.finish_reason, None);
+    }
+
+    #[test]
+    fn finish_with_details_persists_error_text() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("provider-error");
+
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        writer.append(&Message::user("hi"), None, None).unwrap();
+        writer
+            .finish_with_details(
+                SessionStatus::Crashed,
+                None,
+                Some("http 400: bad request".to_string()),
+            )
+            .unwrap();
+        drop(writer);
+
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.status, SessionStatus::Crashed);
+        assert_eq!(meta.error.as_deref(), Some("http 400: bad request"));
+        assert_eq!(meta.finish_reason, None);
     }
 
     #[test]

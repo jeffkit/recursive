@@ -13,8 +13,8 @@ use recursive::{
 use crate::cli::builder::{build_runtime, build_tools};
 use crate::cli::claude_json::{ClaudeJsonContext, JsonOutputMode};
 use crate::cli::output::{
-    exit_for_finish, finalize_cost_tracker, finalize_session_writer, print_finish_note,
-    print_usage, save_session, save_transcript, stream_events, JsonEventTask,
+    exit_for_finish, finalize_cost_tracker, finalize_session_writer, finish_to_session_status,
+    print_finish_note, print_usage, save_session, save_transcript, stream_events, JsonEventTask,
 };
 use crate::cli::session::resolve_session_path;
 
@@ -919,12 +919,11 @@ pub(crate) async fn run_resumed(
         }
     }
 
-    let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-        SessionStatus::Completed
-    } else {
-        SessionStatus::Crashed
-    };
-    finalize_session_writer(session_writer, finish_status);
+    // Issue #111: use the shared exhaustive mapping — a resumed run that
+    // stops on the budget / a provider stop must land the same status *and*
+    // the same reason string as a fresh run.
+    let (finish_status, finish_reason) = finish_to_session_status(&outcome.finish_reason);
+    finalize_session_writer(session_writer, finish_status, finish_reason, None);
     finalize_cost_tracker(
         cost_tracker,
         outcome.total_usage,

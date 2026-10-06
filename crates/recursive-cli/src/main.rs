@@ -2501,7 +2501,14 @@ async fn run_loop(
         Ok(o) => o,
         Err(e) => {
             drop(runtime);
-            cli::output::finalize_session_writer(session_writer, SessionStatus::Crashed);
+            // Issue #111: `Err` bypasses the finish-reason mapping, so carry
+            // the error text itself onto the session.
+            cli::output::finalize_session_writer(
+                session_writer,
+                SessionStatus::Crashed,
+                None,
+                Some(e.to_string()),
+            );
             return Err(e.into());
         }
     };
@@ -2534,10 +2541,10 @@ async fn run_loop(
         total_usage = total_usage.accumulate(o.total_usage);
         total_llm_latency_ms = total_llm_latency_ms.saturating_add(o.llm_latency_ms);
     }
-    let finish_status = outcomes
+    let (finish_status, finish_reason) = outcomes
         .last()
         .map(|o| cli::output::finish_to_session_status(&o.finish_reason))
-        .unwrap_or(SessionStatus::Completed);
+        .unwrap_or((SessionStatus::Completed, None));
 
     // Drop the runtime BEFORE finalizing the writer: SessionPersistenceSink
     // holds a clone of the writer Arc, so the writer can't be uniquely
@@ -2545,7 +2552,7 @@ async fn run_loop(
     // gone. Same pattern as run_once (main.rs drop(runtime) before finalize).
     drop(runtime);
 
-    cli::output::finalize_session_writer(session_writer, finish_status);
+    cli::output::finalize_session_writer(session_writer, finish_status, finish_reason, None);
     cli::output::finalize_cost_tracker(
         cost_tracker,
         total_usage,
@@ -2951,12 +2958,11 @@ async fn run_once(
         }
     }
 
-    let finish_status = if matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls) {
-        SessionStatus::Completed
-    } else {
-        SessionStatus::Crashed
-    };
-    cli::output::finalize_session_writer(session_writer, finish_status);
+    // Issue #111: the exhaustive mapping carries the failure reason too, so
+    // a `run` stopped by the budget is distinguishable from a provider 400.
+    let (finish_status, finish_reason) =
+        cli::output::finish_to_session_status(&outcome.finish_reason);
+    cli::output::finalize_session_writer(session_writer, finish_status, finish_reason, None);
     cli::output::finalize_cost_tracker(
         cost_tracker,
         outcome.total_usage,
