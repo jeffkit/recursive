@@ -283,6 +283,32 @@ def self_improve_v2(INPUT):
         "            cands.sort()\n"
         "            last_sid = cands[-1][1]\n"
         "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n"))
+    # ── 门禁选择（2026-10-06，多仓支持）：本 flow 原为 recursive(Rust) 专用，
+    # gate 段硬编码 cargo fmt/clippy/test。现由独立 code 节点按 INPUT.gates
+    # 选命令——调用方注入则用之，缺省回退 cargo 三段（**recursive 自身路径
+    # 逐字节不变**，零回归）。DSL 限制（表达式无条件赋值/无列表字面量/
+    # 变量名即节点 id 不可重赋）使此逻辑必须落在 code 节点内。
+    gates = CODE(id="gate_select", lang="python",
+                 input={"gates": INPUT.gates if INPUT.gates else None}, code=(
+        "def run(input):\n"
+        "    g = input.get(\"gates\")\n"
+        "    # 注入的 gate 数量可变（如 plaita 只有 lint+tests 两道）：按序填入\n"
+        "    # fmt/lint/test 三个语义位，**缺位用 \"true\" 占位**（恒绿 no-op，\n"
+        "    # 不带语义）。不注入 = 回退 cargo 三段（recursive 零回归）。\n"
+        "    if g:\n"
+        "        cmds = [(x.get(\"name\") or \"gate\") if isinstance(x, dict) else \"gate\"\n"
+        "                for x in g]\n"
+        "        runs = [(x[\"cmd\"]) if isinstance(x, dict) and x.get(\"cmd\") else \"true\"\n"
+        "                for x in g]\n"
+        "        while len(cmds) < 3:\n"
+        "            cmds.append(\"noop\"); runs.append(\"true\")\n"
+        "        return {\"fmt\": runs[0], \"lint\": runs[1], \"test\": runs[2],\n"
+        "                \"fmt_name\": cmds[0], \"lint_name\": cmds[1], \"test_name\": cmds[2]}\n"
+        "    return {\"fmt\": \"cargo fmt --all\","
+        " \"lint\": \"cargo clippy --workspace --all-targets --all-features -- -D warnings\","
+        " \"test\": \"cargo test --workspace --no-fail-fast\","
+        " \"fmt_name\": \"fmt\", \"lint_name\": \"clippy\", \"test_name\": \"test\"}\n"))
+
     if pre.ok == False:
         # 磁盘守卫等环境性失败 → retry-later：keeper 不消费、自动重派（写回
         # failure-context 无意义——现场还没建）。worktree add 等持久性失败仍走
@@ -325,7 +351,7 @@ def self_improve_v2(INPUT):
     # 等于喂空串——fix-loop 收到「--- output tail ---」后面什么都没有，只能瞎猜
     # （2026-10-05 pipeline-93-1005122022 实证：clippy 门红、g2.out 长度 0，
     # 修复 agent 拿到空清单）。失败落盘分支早已是 out+err 双写，提示词对齐即可。
-    g1 = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
+    g1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
                       "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
@@ -334,7 +360,7 @@ def self_improve_v2(INPUT):
                 "before stopping.\nFix the source, never silence with #[allow]."
                 "\n--- stdout ---\n", g1.out, "\n--- stderr ---\n", g1.err),
             repo=pre.worktree, timeout_secs=7200)
-        g1b = CHILD(input={"name": "fmt", "cmd": "cargo fmt --all",
+        g1b = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
                            "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
         if g1b.passed == False:
             wgf1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-fmt.log"),
@@ -347,8 +373,8 @@ def self_improve_v2(INPUT):
     # 并发抢 CPU 时 1200s 跑不完，门被 kill 在半途，输出里连一条 lint 都没有
     # （2026-10-05 pipeline-93-1005122022 实证：g2 = 1200.8s、err 全是 Checking/
     # Compiling 进度、零 error 行）。keeper 侧 gates.json 对该命令本就给 1800s。
-    g2 = CHILD(input={"name": "clippy",
-                      "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    g2 = CHILD(input={"name": gates.lint_name,
+                      "cmd": gates.lint,
                       "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
@@ -358,8 +384,7 @@ def self_improve_v2(INPUT):
                 "\nFix the source, never silence with #[allow]."
                 "\n--- stdout ---\n", g2.out, "\n--- stderr ---\n", g2.err),
             repo=pre.worktree, timeout_secs=7200)
-        g2b = CHILD(input={"name": "clippy",
-                           "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        g2b = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
                            "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
         if g2b.passed == False:
             wgf2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-clippy.log"),
@@ -367,7 +392,7 @@ def self_improve_v2(INPUT):
                                               g2b.out, "\n--- stderr ---\n", g2b.err))
             return {"verdict": "failed-preserved", "stage": "gates", "gate": g2b.gate,
                     "out": g2b.out}
-    g3 = CHILD(input={"name": "test", "cmd": "cargo test --workspace",
+    g3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
                       "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
     if g3.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
@@ -377,7 +402,7 @@ def self_improve_v2(INPUT):
                 "\nFix the source, never silence with #[allow]."
                 "\n--- stdout ---\n", g3.out, "\n--- stderr ---\n", g3.err),
             repo=pre.worktree, timeout_secs=7200)
-        g3b = CHILD(input={"name": "test", "cmd": "cargo test --workspace",
+        g3b = CHILD(input={"name": gates.test_name, "cmd": gates.test,
                            "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
         if g3b.passed == False:
             wgf3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-test.log"),

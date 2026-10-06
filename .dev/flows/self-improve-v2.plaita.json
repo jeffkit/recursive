@@ -62,8 +62,19 @@
         "repo": "$NODE.repo",
         "run_dir": "$NODE.run_dir"
       },
-      "next": "ok_eq_false",
+      "next": "gates",
       "source_line": 109
+    },
+    {
+      "type": "code",
+      "id": "gates",
+      "language": "python",
+      "code": "def run(input):\n    g = input.get(\"gates\")\n    # 注入的 gate 数量可变（如 plaita 只有 lint+tests 两道）：按序填入\n    # fmt/lint/test 三个语义位，**缺位用 \"true\" 占位**（恒绿 no-op，\n    # 不带语义）。不注入 = 回退 cargo 三段（recursive 零回归）。\n    if g:\n        cmds = [(x.get(\"name\") or \"gate\") if isinstance(x, dict) else \"gate\"\n                for x in g]\n        runs = [(x[\"cmd\"]) if isinstance(x, dict) and x.get(\"cmd\") else \"true\"\n                for x in g]\n        while len(cmds) < 3:\n            cmds.append(\"noop\"); runs.append(\"true\")\n        return {\"fmt\": runs[0], \"lint\": runs[1], \"test\": runs[2],\n                \"fmt_name\": cmds[0], \"lint_name\": cmds[1], \"test_name\": cmds[2]}\n    return {\"fmt\": \"cargo fmt --all\", \"lint\": \"cargo clippy --workspace --all-targets --all-features -- -D warnings\", \"test\": \"cargo test --workspace --no-fail-fast\", \"fmt_name\": \"fmt\", \"lint_name\": \"clippy\", \"test_name\": \"test\"}\n",
+      "input": {
+        "gates": "$F.ifelse($INPUT.gates, $INPUT.gates, null)"
+      },
+      "next": "ok_eq_false",
+      "source_line": 291
     },
     {
       "type": "if",
@@ -74,8 +85,8 @@
         "value": false
       },
       "name": "pre.ok == False?",
-      "desc": "if pre.ok == False（第 286 行）",
-      "source_line": 286,
+      "desc": "if pre.ok == False（第 312 行）",
+      "source_line": 312,
       "next": "contains_str_why_or_disk",
       "else_next": "impl"
     },
@@ -88,7 +99,7 @@
       "timeout_secs": "$NODE.impl_timeout",
       "session": "$NODE.pre.last_sid",
       "next": "chg",
-      "source_line": 302
+      "source_line": 328
     },
     {
       "type": "child",
@@ -141,7 +152,7 @@
         }
       },
       "next": "any_eq_false",
-      "source_line": 304
+      "source_line": 330
     },
     {
       "type": "if",
@@ -152,8 +163,8 @@
         "value": false
       },
       "name": "chg.any == False?",
-      "desc": "if chg.any == False（第 305 行）",
-      "source_line": 305,
+      "desc": "if chg.any == False（第 331 行）",
+      "source_line": 331,
       "next": "_n15",
       "else_next": "g1"
     },
@@ -161,8 +172,8 @@
       "type": "child",
       "id": "g1",
       "input": {
-        "name": "fmt",
-        "cmd": "cargo fmt --all",
+        "name": "$NODE.gates.fmt_name",
+        "cmd": "$NODE.gates.fmt",
         "timeout_secs": 120,
         "wt": "$NODE.pre.worktree"
       },
@@ -213,7 +224,7 @@
         }
       },
       "next": "passed_eq_false",
-      "source_line": 328
+      "source_line": 354
     },
     {
       "type": "if",
@@ -224,8 +235,8 @@
         "value": false
       },
       "name": "g1.passed == False?",
-      "desc": "if g1.passed == False（第 330 行）",
-      "source_line": 330,
+      "desc": "if g1.passed == False（第 356 行）",
+      "source_line": 356,
       "next": "_n14",
       "else_next": "g2"
     },
@@ -233,8 +244,8 @@
       "type": "child",
       "id": "g2",
       "input": {
-        "name": "clippy",
-        "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "name": "$NODE.gates.lint_name",
+        "cmd": "$NODE.gates.lint",
         "timeout_secs": 1800,
         "wt": "$NODE.pre.worktree"
       },
@@ -285,7 +296,7 @@
         }
       },
       "next": "passed_eq_false_2",
-      "source_line": 350
+      "source_line": 376
     },
     {
       "type": "if",
@@ -296,8 +307,8 @@
         "value": false
       },
       "name": "g2.passed == False?",
-      "desc": "if g2.passed == False（第 353 行）",
-      "source_line": 353,
+      "desc": "if g2.passed == False（第 379 行）",
+      "source_line": 379,
       "next": "_n11",
       "else_next": "g3"
     },
@@ -305,8 +316,8 @@
       "type": "child",
       "id": "g3",
       "input": {
-        "name": "test",
-        "cmd": "cargo test --workspace",
+        "name": "$NODE.gates.test_name",
+        "cmd": "$NODE.gates.test",
         "timeout_secs": 1800,
         "wt": "$NODE.pre.worktree"
       },
@@ -357,7 +368,7 @@
         }
       },
       "next": "passed_eq_false_3",
-      "source_line": 370
+      "source_line": 395
     },
     {
       "type": "if",
@@ -368,8 +379,8 @@
         "value": false
       },
       "name": "g3.passed == False?",
-      "desc": "if g3.passed == False（第 372 行）",
-      "source_line": 372,
+      "desc": "if g3.passed == False（第 397 行）",
+      "source_line": 397,
       "next": "_n9",
       "else_next": "review_prompt"
     },
@@ -378,7 +389,7 @@
       "id": "review_prompt",
       "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff $(git merge-base main HEAD)` to see the full change (relative to the branch point: covers both uncommitted edits and commits inherited from a resumed run, while excluding main-side commits that landed after this branch was cut — plain `git diff main` would show those as inverted deletions and waste your attention), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
       "next": "rev1",
-      "source_line": 395
+      "source_line": 420
     },
     {
       "type": "agentrun",
@@ -388,7 +399,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa",
-      "source_line": 407
+      "source_line": 432
     },
     {
       "type": "if",
@@ -399,8 +410,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 409 行）",
-      "source_line": 409,
+      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 434 行）",
+      "source_line": 434,
       "next": "contains_text_verdict_ne",
       "else_next": "pub"
     },
@@ -414,7 +425,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true",
-      "source_line": 442
+      "source_line": 467
     },
     {
       "type": "if",
@@ -425,8 +436,8 @@
         "value": true
       },
       "name": "pub.merged == True?",
-      "desc": "if pub.merged == True（第 445 行）",
-      "source_line": 445,
+      "desc": "if pub.merged == True（第 470 行）",
+      "source_line": 470,
       "next": "_n4",
       "else_next": "land_rebase"
     },
@@ -440,7 +451,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_2",
-      "source_line": 458
+      "source_line": 483
     },
     {
       "type": "if",
@@ -451,8 +462,8 @@
         "value": false
       },
       "name": "land_rebase.ok == False?",
-      "desc": "if land_rebase.ok == False（第 486 行）",
-      "source_line": 486,
+      "desc": "if land_rebase.ok == False（第 511 行）",
+      "source_line": 511,
       "next": "wlp",
       "else_next": "pub2"
     },
@@ -466,7 +477,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true_2",
-      "source_line": 570
+      "source_line": 595
     },
     {
       "type": "if",
@@ -477,8 +488,8 @@
         "value": true
       },
       "name": "pub2.merged == True?",
-      "desc": "if pub2.merged == True（第 573 行）",
-      "source_line": 573,
+      "desc": "if pub2.merged == True（第 598 行）",
+      "source_line": 598,
       "next": "_n2",
       "else_next": "wfp3"
     },
@@ -488,7 +499,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
       "next": "_n1",
-      "source_line": 576
+      "source_line": 601
     },
     {
       "type": "end",
@@ -502,7 +513,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 579
+      "source_line": 604
     },
     {
       "type": "end",
@@ -515,7 +526,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish-retry',…",
-      "source_line": 574
+      "source_line": 599
     },
     {
       "type": "writefile",
@@ -523,7 +534,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why, \"\\n\\n\", $NODE.land_rebase.scene)",
       "next": "land_fix",
-      "source_line": 487
+      "source_line": 512
     },
     {
       "type": "agentrun",
@@ -533,7 +544,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "land_rebase2",
-      "source_line": 490
+      "source_line": 515
     },
     {
       "type": "code",
@@ -545,7 +556,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_3",
-      "source_line": 503
+      "source_line": 528
     },
     {
       "type": "if",
@@ -556,8 +567,8 @@
         "value": false
       },
       "name": "land_rebase2.ok == False?",
-      "desc": "if land_rebase2.ok == False（第 563 行）",
-      "source_line": 563,
+      "desc": "if land_rebase2.ok == False（第 588 行）",
+      "source_line": 588,
       "next": "wlp2",
       "else_next": "pub2"
     },
@@ -567,7 +578,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict (fix round done): \", $NODE.land_rebase2.why, \"\\n\\n\", $NODE.land_rebase2.scene)",
       "next": "_n3",
-      "source_line": 564
+      "source_line": 589
     },
     {
       "type": "end",
@@ -580,7 +591,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 568
+      "source_line": 593
     },
     {
       "type": "end",
@@ -593,7 +604,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish', 'note…",
-      "source_line": 446
+      "source_line": 471
     },
     {
       "type": "if",
@@ -604,8 +615,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 410 行）",
-      "source_line": 410,
+      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 435 行）",
+      "source_line": 435,
       "next": "wfr",
       "else_next": "fix_prompt"
     },
@@ -614,7 +625,7 @@
       "id": "fix_prompt",
       "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
       "next": "_n6",
-      "source_line": 415
+      "source_line": 440
     },
     {
       "type": "agentrun",
@@ -624,7 +635,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev2",
-      "source_line": 419
+      "source_line": 444
     },
     {
       "type": "agentrun",
@@ -634,7 +645,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_2",
-      "source_line": 420
+      "source_line": 445
     },
     {
       "type": "if",
@@ -645,8 +656,8 @@
         "value": true
       },
       "name": "F.contains(rev2.text, 'VERD…",
-      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 422 行）",
-      "source_line": 422,
+      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 447 行）",
+      "source_line": 447,
       "next": "fix_prompt2",
       "else_next": "pub"
     },
@@ -655,7 +666,7 @@
       "id": "fix_prompt2",
       "output": "$F.concat(\"An independent reviewer still rejects this change after one fix round. \", \"Address every remaining issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev2.text)",
       "next": "fix2",
-      "source_line": 427
+      "source_line": 452
     },
     {
       "type": "agentrun",
@@ -665,7 +676,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev3",
-      "source_line": 431
+      "source_line": 456
     },
     {
       "type": "agentrun",
@@ -675,7 +686,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_3",
-      "source_line": 433
+      "source_line": 458
     },
     {
       "type": "if",
@@ -686,8 +697,8 @@
         "value": true
       },
       "name": "F.contains(rev3.text, 'VERD…",
-      "desc": "if F.contains(rev3.text, 'VERDICT:PASS') != True（第 435 行）",
-      "source_line": 435,
+      "desc": "if F.contains(rev3.text, 'VERDICT:PASS') != True（第 460 行）",
+      "source_line": 460,
       "next": "wfr3",
       "else_next": "pub"
     },
@@ -697,7 +708,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
       "content": "$NODE.rev3.text",
       "next": "_n5",
-      "source_line": 436
+      "source_line": 461
     },
     {
       "type": "end",
@@ -710,7 +721,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 438
+      "source_line": 463
     },
     {
       "type": "writefile",
@@ -718,7 +729,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
       "content": "$NODE.rev1.text",
       "next": "_n7",
-      "source_line": 411
+      "source_line": 436
     },
     {
       "type": "end",
@@ -731,7 +742,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 413
+      "source_line": 438
     },
     {
       "type": "agentrun",
@@ -741,14 +752,14 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g3b",
-      "source_line": 373
+      "source_line": 398
     },
     {
       "type": "child",
       "id": "g3b",
       "input": {
-        "name": "test",
-        "cmd": "cargo test --workspace",
+        "name": "$NODE.gates.test_name",
+        "cmd": "$NODE.gates.test",
         "timeout_secs": 1800,
         "wt": "$NODE.pre.worktree"
       },
@@ -799,7 +810,7 @@
         }
       },
       "next": "passed_eq_false_4",
-      "source_line": 380
+      "source_line": 405
     },
     {
       "type": "if",
@@ -810,8 +821,8 @@
         "value": false
       },
       "name": "g3b.passed == False?",
-      "desc": "if g3b.passed == False（第 382 行）",
-      "source_line": 382,
+      "desc": "if g3b.passed == False（第 407 行）",
+      "source_line": 407,
       "next": "wgf3",
       "else_next": "review_prompt"
     },
@@ -821,7 +832,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-test.log\")",
       "content": "$F.concat(\"cmd: cargo test --workspace\\n--- stdout ---\\n\", $NODE.g3b.out, \"\\n--- stderr ---\\n\", $NODE.g3b.err)",
       "next": "_n8",
-      "source_line": 383
+      "source_line": 408
     },
     {
       "type": "end",
@@ -835,7 +846,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 386
+      "source_line": 411
     },
     {
       "type": "agentrun",
@@ -845,14 +856,14 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g2b",
-      "source_line": 354
+      "source_line": 380
     },
     {
       "type": "child",
       "id": "g2b",
       "input": {
-        "name": "clippy",
-        "cmd": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "name": "$NODE.gates.lint_name",
+        "cmd": "$NODE.gates.lint",
         "timeout_secs": 1800,
         "wt": "$NODE.pre.worktree"
       },
@@ -903,7 +914,7 @@
         }
       },
       "next": "passed_eq_false_5",
-      "source_line": 361
+      "source_line": 387
     },
     {
       "type": "if",
@@ -914,8 +925,8 @@
         "value": false
       },
       "name": "g2b.passed == False?",
-      "desc": "if g2b.passed == False（第 364 行）",
-      "source_line": 364,
+      "desc": "if g2b.passed == False（第 389 行）",
+      "source_line": 389,
       "next": "wgf2",
       "else_next": "g3"
     },
@@ -925,7 +936,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-clippy.log\")",
       "content": "$F.concat(\"cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\\n--- stdout ---\\n\", $NODE.g2b.out, \"\\n--- stderr ---\\n\", $NODE.g2b.err)",
       "next": "_n10",
-      "source_line": 365
+      "source_line": 390
     },
     {
       "type": "end",
@@ -939,7 +950,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 368
+      "source_line": 393
     },
     {
       "type": "agentrun",
@@ -949,14 +960,14 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g1b",
-      "source_line": 331
+      "source_line": 357
     },
     {
       "type": "child",
       "id": "g1b",
       "input": {
-        "name": "fmt",
-        "cmd": "cargo fmt --all",
+        "name": "$NODE.gates.fmt_name",
+        "cmd": "$NODE.gates.fmt",
         "timeout_secs": 120,
         "wt": "$NODE.pre.worktree"
       },
@@ -1007,7 +1018,7 @@
         }
       },
       "next": "_n12",
-      "source_line": 337
+      "source_line": 363
     },
     {
       "type": "if",
@@ -1018,8 +1029,8 @@
         "value": false
       },
       "name": "g1b.passed == False?",
-      "desc": "if g1b.passed == False（第 339 行）",
-      "source_line": 339,
+      "desc": "if g1b.passed == False（第 365 行）",
+      "source_line": 365,
       "next": "wgf1",
       "else_next": "g2"
     },
@@ -1029,7 +1040,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-fmt.log\")",
       "content": "$F.concat(\"cmd: cargo fmt --all\\n--- stdout ---\\n\", $NODE.g1b.out, \"\\n--- stderr ---\\n\", $NODE.g1b.err)",
       "next": "_n13",
-      "source_line": 340
+      "source_line": 366
     },
     {
       "type": "end",
@@ -1043,7 +1054,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 343
+      "source_line": 369
     },
     {
       "type": "end",
@@ -1057,7 +1068,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'skip-co…",
       "desc": "return {'verdict': 'skip-commit', 'stage': 'commit', 'why':…",
-      "source_line": 306
+      "source_line": 332
     },
     {
       "type": "if",
@@ -1068,8 +1079,8 @@
         "value": true
       },
       "name": "F.contains(str(pre.why or '…",
-      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 292 行）",
-      "source_line": 292,
+      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 318 行）",
+      "source_line": 318,
       "next": "_n17",
       "else_next": "wf"
     },
@@ -1079,7 +1090,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-context.md\")",
       "content": "$F.concat(\"## preflight failed\\n\\nreason: \", $NODE.pre.why)",
       "next": "_n16",
-      "source_line": 294
+      "source_line": 320
     },
     {
       "type": "end",
@@ -1092,7 +1103,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'preflight'…",
-      "source_line": 296
+      "source_line": 322
     },
     {
       "type": "end",
@@ -1105,7 +1116,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'retry-l…",
       "desc": "return {'verdict': 'retry-later', 'stage': 'preflight', 'wh…",
-      "source_line": 293
+      "source_line": 319
     }
   ]
 }
