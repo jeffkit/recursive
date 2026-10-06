@@ -396,6 +396,7 @@ fn synthesize_meta_if_missing(dir: &Path, thread_id: &str) {
         cost: None,
         preset: None,
         name,
+        derived_from: None,
     };
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
         let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());

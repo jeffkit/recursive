@@ -15,10 +15,19 @@
 //! - `orphan`   — `OrphanToolCall`
 //! - `reader`   — `SessionReader`
 //! - `writer`   — `SessionWriter`, `SessionPersistenceSink`
+//! - `index`    — `SessionIndex` (derived FTS5 read model, issue #131)
+//! - `relations`— replacement/source chains over a session's history
+//! - `export`   — streaming ZIP export of a whole session tree
 
+#[cfg(feature = "session-index")]
+pub mod export;
+#[cfg(feature = "session-index")]
+pub mod index;
 pub mod lifecycle;
 pub mod orphan;
 pub mod reader;
+#[cfg(feature = "session-index")]
+pub mod relations;
 pub mod serialize;
 pub mod writer;
 
@@ -579,6 +588,14 @@ pub struct SessionMeta {
     /// Shown in the /resume picker and `sessions list` output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Session this one was derived from (issue #131): a fork copies another
+    /// session's transcript, a migrated session comes from a legacy directory.
+    /// The relation is *declared* at creation through
+    /// [`SessionWriter::set_derived_from`] and read back by the session-tree
+    /// export and the relation trace. `None` for sessions with no source, and
+    /// for every session file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1432,7 @@ mod tests {
             cost: None,
             preset: None,
             name: None,
+            derived_from: None,
         }
     }
 

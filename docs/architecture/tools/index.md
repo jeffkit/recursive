@@ -41,6 +41,7 @@ sandbox-enforced via `resolve_within` (Invariant #3 — see
 * [Memory Tools](memory-tools.md) — `remember`, `recall`, `forget`, scratchpad
 * [Facts Tools](facts-tools.md) — `remember_fact`, `recall_fact`, `forget_fact`, `update_fact`
 * [Episodic Tool](episodic-tool.md) — `episodic_recall`
+* [Session Query Tools](session-query.md) — `session_search`, `session_event_search`, `session_trace`, `session_event_trace`, `session_event_read`
 
 ## Skills
 

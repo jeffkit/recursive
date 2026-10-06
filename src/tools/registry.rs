@@ -1296,6 +1296,25 @@ pub fn build_standard_tools_with_transport_opt(
             .with_session_roots_opt(session_roots.clone()),
     ));
 
+    // Issue #131: the session retrieval family. All five tools share ONE
+    // `SessionQuery` — hence one SQLite connection and one cold-read cache —
+    // and all of them are read-only over this workspace's session directory,
+    // so they are registered in every tier exactly like `episodic_recall`.
+    #[cfg(feature = "session-index")]
+    {
+        use super::session_query::{
+            SessionEventRead, SessionEventSearch, SessionEventTraceTool, SessionQuery,
+            SessionSearch, SessionTraceTool,
+        };
+        let query = Arc::new(SessionQuery::new(workspace.to_path_buf()));
+        registry = registry
+            .register(Arc::new(SessionSearch::new(Arc::clone(&query))))
+            .register(Arc::new(SessionEventSearch::new(Arc::clone(&query))))
+            .register(Arc::new(SessionTraceTool::new(Arc::clone(&query))))
+            .register(Arc::new(SessionEventTraceTool::new(Arc::clone(&query))))
+            .register(Arc::new(SessionEventRead::new(Arc::clone(&query))));
+    }
+
     if let Some(roots) = session_roots {
         registry = registry.with_session_roots(roots);
     }
@@ -1925,6 +1944,27 @@ mod tests {
     }
 
     // --- build_standard_tools produces a non-empty registry ---
+
+    /// Issue #131: the session retrieval family must be part of the standard
+    /// tool set — the model can only search past sessions if the tools exist.
+    #[cfg(feature = "session-index")]
+    #[test]
+    fn build_standard_tools_registers_the_session_query_family() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = build_standard_tools(tmp.path(), &[], 30);
+        for name in [
+            "session_search",
+            "session_event_search",
+            "session_trace",
+            "session_event_trace",
+            "session_event_read",
+        ] {
+            assert!(
+                registry.find_by_name(name).is_some(),
+                "{name} must be registered by build_standard_tools"
+            );
+        }
+    }
 
     #[test]
     fn build_standard_tools_is_nonempty() {

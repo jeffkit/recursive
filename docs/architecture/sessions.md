@@ -92,6 +92,51 @@ so a second restart cannot replay it. Loops started with `--no-session` have no
 directory to write to, keep the previous in-memory-only behaviour, and do not
 consume another session's record.
 
+## Derived search index and the retrieval tools (issue #131)
+
+`episodic_recall` scans the JSONL logs on every call. The session retrieval
+family (`src/session/index.rs`, `src/session/relations.rs`,
+`src/session/export.rs`, `src/knowledge/session_query.rs`, feature
+`session-index`) adds a **discardable** read model instead:
+
+- **`SessionIndex`** — SQLite FTS5 over every session of the workspace, at
+  `~/.recursive/workspaces/<hash>/session-index.sqlite3` (0600, in the 0700
+  workspace dir). The database carries `application_id` (`RCS1`) +
+  `user_version`; a database with a foreign stamp is **rebuilt in place**, never
+  migrated. A session is re-indexed only when its directory path plus the
+  `transcript.jsonl` / `.meta.json` stat revision changed, and rows for vanished
+  sessions are swept. The index also exposes an active-**lease** seam
+  (`SessionIndex::lease` / `release`, a `TEMP` table that dies with the
+  connection): a leased session is re-read on every refresh and is never
+  evicted by the parsed-transcript cold-read cache's LRU. **No producer calls it
+  yet** — today every refresh is driven by the stat revision, which is what
+  catches a session being appended to.
+- **Relation tracing** — a cross-turn compaction drains the *oldest* messages
+  of the model context, summarises that prefix, and writes the summary behind a
+  `compact_boundary` marker; `replacements` rebuilds that chain from the log
+  (each marker folding the oldest messages no earlier marker already folded) and
+  `trace_session` / `trace_event` answer "what replaced this / what did it
+  replace". `session_trace` also reports sessions that start from the same
+  origin transcript (recursive persists no explicit fork lineage, so transcript
+  identity is the derived signal).
+- **Tools** — `session_search`, `session_event_search` (eager, read-only),
+  plus the deferred `session_trace`, `session_event_trace`,
+  `session_event_read`. All five share one `SessionQuery`, cap results at 100,
+  and enforce the **workspace boundary**: an explicit `cwd` outside the calling
+  session's workspace is refused (`Error::ToolRejected`) instead of silently
+  narrowed. A `cwd` inside the workspace is accepted but does not narrow
+  anything — the index only ever covers the one workspace.
+- **Export** — `export_session_tree` streams a ZIP (`ZipWriter::new_stream`)
+  containing the root session, the sessions that declare it as their
+  `derived_from`, and the session directory's attachments, plus a
+  `manifest.json`. One export per session may be in flight (process-wide
+  `ExportGuard`); a second is refused with `Error::ExportInProgress`. The tree
+  is a stated seam as much as a feature: `derived_from` is read from
+  `.meta.json`, and **no producer declares it yet** (`SessionWriter::set_derived_from`
+  has no caller in-tree), so today an export is one session plus its
+  attachments. There is no CLI/HTTP entry point either — `export_session_tree`
+  is the library entry point a channel can call.
+
 ## Migration
 
 `src/migrate.rs` handles migration of legacy `.recursive/sessions/` and

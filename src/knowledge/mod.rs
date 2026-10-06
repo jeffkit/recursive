@@ -13,6 +13,9 @@
 //!   legacy note-store tools (`remember`/`recall`/`forget`,
 //!   `scratchpad_*`).
 //! - [`episodic_recall`] — Memory Layer 3: search past session transcripts.
+//! - [`session_query`] — the session retrieval family (issue #131): a derived
+//!   FTS5 index (`session_search` / `session_event_search` / `session_trace` /
+//!   `session_event_trace` / `session_event_read`).
 //! - [`estimate_tokens`] / [`count_lines`] — read-only inspection tools.
 //! - [`search`] — the `Grep` tool (workspace substring/regex search).
 //!
@@ -25,3 +28,5 @@ pub mod estimate_tokens;
 pub mod facts;
 pub mod memory;
 pub mod search;
+#[cfg(feature = "session-index")]
+pub mod session_query;

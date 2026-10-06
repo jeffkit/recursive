@@ -152,6 +152,13 @@ pub enum Error {
     #[error("workspace `{id}` has active work: {details}")]
     WorkspaceActiveWork { id: String, details: String },
 
+    /// A session-tree export (issue #131) was refused because another export of
+    /// the same session is already streaming: two concurrent downloads of a
+    /// session whose writer is mid-append would each capture a different
+    /// prefix.
+    #[error("session {session_id} is already being exported")]
+    ExportInProgress { session_id: String },
+
     /// Internal agent error — unexpected state that does not map to any typed
     /// variant. Prefer a specific variant; use `Internal` only as last resort.
     #[error("internal error ({context}): {message}")]

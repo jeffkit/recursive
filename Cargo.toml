@@ -26,7 +26,7 @@ categories = ["development-tools", "command-line-utilities"]
 rust-version = "1.75"
 exclude = [".dev/", "journal/", "goals/"]
 [features]
-default = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub", "acp"]
+default = ["cli", "mcp", "web_fetch", "web_search", "anthropic", "http", "skill-hub", "acp", "session-index"]
 acp = ["dep:agent-client-protocol-schema", "mcp"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:anyhow"]
 test-utils = ["dep:tempfile"]
@@ -49,6 +49,12 @@ openai-embedding = []
 # Cosine similarity is computed in Rust; suitable for typical agent memory sizes (<10k entries).
 vector-memory = ["openai-embedding", "dep:rusqlite"]
 skill-hub = ["dep:zip"]
+# Issue #131: session retrieval (借 DSH `session-query`) — the discardable
+# FTS5 session index plus the streaming ZIP session-tree export. Pulls in
+# no new third-party crate: `rusqlite` (bundled SQLite, FTS5 enabled by
+# `libsqlite3-sys`) is already used by `vector-memory` and `zip` by
+# `skill-hub`; both are already in `Cargo.lock`.
+session-index = ["dep:rusqlite", "dep:zip"]
 # Issue #124: Langfuse / OTLP observability export. When compiled in, a
 # Langfuse run trace is produced at runtime whenever the `LANGFUSE_*`
 # (or `RECURSIVE_OTEL_TRACES_URL`) env vars are set — no rebuild needed.

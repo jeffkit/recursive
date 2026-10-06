@@ -214,6 +214,7 @@ mod tests {
             cost: None,
             preset: None,
             name: None,
+            derived_from: None,
         };
         std::fs::write(
             session_dir.join(".meta.json"),

@@ -117,6 +117,8 @@ pub use crate::knowledge::estimate_tokens;
 pub use crate::knowledge::facts;
 pub use crate::knowledge::memory;
 pub use crate::knowledge::search;
+#[cfg(feature = "session-index")]
+pub use crate::knowledge::session_query;
 
 // ── Re-exports from registry ────────────────────────────────────────────────
 
@@ -182,6 +184,11 @@ pub use run_background::{
 pub use schedule_wakeup::{ScheduleWakeup, WakeupRequest, WakeupSlot};
 pub use search::SearchFiles;
 pub use send_message::{ListWorkersTool, SendMessageTool, WorkerMailbox, WorkerRegistry};
+#[cfg(feature = "session-index")]
+pub use session_query::{
+    SessionEventRead, SessionEventSearch, SessionEventTraceTool, SessionQuery, SessionSearch,
+    SessionTraceTool,
+};
 pub use shell::RunShell;
 pub use stop_loop::StopLoop;
 #[cfg(feature = "coordinator-mode")]

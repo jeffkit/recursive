@@ -170,6 +170,7 @@ impl SessionWriter {
             cost: None,
             preset: preset.map(|s| s.to_string()),
             name: None,
+            derived_from: None,
         };
 
         // Write initial meta file (atomic: temp + rename to prevent corruption).
@@ -244,6 +245,7 @@ impl SessionWriter {
             cost: None,
             preset: preset.map(|s| s.to_string()),
             name: None,
+            derived_from: None,
         };
         let meta_path = session_dir.join(".meta.json");
         let meta_json = serde_json::to_string_pretty(&meta)
@@ -558,6 +560,31 @@ impl SessionWriter {
     /// The name is persisted to `.meta.json` on the next `finish()` call.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = Some(name.into());
+    }
+
+    /// Record the session this one was derived from (issue #131) — a fork's
+    /// source, a migrated session's origin.
+    ///
+    /// Written straight to `.meta.json` (read-modify-write, best-effort like
+    /// [`SessionWriter::update_identity`]) rather than held until `finish()`:
+    /// provenance is a creation-time fact, and a fork that crashes before its
+    /// first `finish()` should still know where it came from.
+    pub fn set_derived_from(&mut self, source: impl Into<String>) {
+        let source = source.into();
+        let meta_path = self.session_dir.join(".meta.json");
+        let Ok(bytes) = std::fs::read(&meta_path) else {
+            return;
+        };
+        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+            return;
+        };
+        if meta.derived_from.as_deref() == Some(source.as_str()) {
+            return;
+        }
+        meta.derived_from = Some(source);
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
+        }
     }
 
     /// Feed run-level token usage into the writer's cumulative total
@@ -1059,6 +1086,31 @@ mod tests {
             content.contains("uuid-summary-1"),
             "transcript must contain the summary UUID"
         );
+    }
+
+    #[test]
+    fn set_derived_from_is_persisted_immediately() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut writer = SessionWriter::create(tmp.path(), "fork", "gpt-4o", "openai").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        // Provenance is a creation-time fact: it must survive a crash before
+        // the first `finish()`, so it is written straight to `.meta.json`.
+        writer.set_derived_from("parent-session");
+
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(meta.derived_from.as_deref(), Some("parent-session"));
+
+        // Idempotent: re-declaring the same source does not rewrite the file.
+        let before = std::fs::metadata(session_dir.join(".meta.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        writer.set_derived_from("parent-session");
+        let after = std::fs::metadata(session_dir.join(".meta.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after);
     }
 
     fn make_isolated_writer() -> (
