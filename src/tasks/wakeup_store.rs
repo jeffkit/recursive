@@ -369,7 +369,7 @@ mod tests {
         let slug_dir = crate::paths::user_sessions_dir(&workspace)
             .unwrap()
             .join(crate::session::workspace_slug(&workspace));
-        let session = slug_dir.join("2026-01-01T00:00:00Z-slug");
+        let session = slug_dir.join("2026-01-01T00-00-00Z-slug");
         let now = 5_000_000i64;
         persist(
             &session,
@@ -396,7 +396,7 @@ mod tests {
         let slug_dir = crate::paths::user_sessions_dir(&workspace)
             .unwrap()
             .join(crate::session::workspace_slug(&workspace));
-        let session = slug_dir.join("2026-01-01T00:00:00Z-slug");
+        let session = slug_dir.join("2026-01-01T00-00-00Z-slug");
         let now = 5_000_000i64;
         persist(
             &session,
@@ -413,7 +413,7 @@ mod tests {
         let slug_dir = crate::paths::user_sessions_dir(&workspace)
             .unwrap()
             .join(crate::session::workspace_slug(&workspace));
-        let session = slug_dir.join("2026-01-01T00:00:00Z-live");
+        let session = slug_dir.join("2026-01-01T00-00-00Z-live");
         let now = 5_000_000i64;
         persist(
             &session,
