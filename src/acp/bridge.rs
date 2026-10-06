@@ -404,6 +404,7 @@ impl EventSink for AcpBridge {
                 output,
                 step: _step,
                 is_error,
+                duration_ms: _duration_ms,
             } => {
                 // Sprint 2 contract: suppress tool_call_update notifications.
                 if !self.tool_call_notifications_enabled {
@@ -869,6 +870,7 @@ mod tests {
                 output: "file contents".into(),
                 step: 0,
                 is_error: false,
+                duration_ms: 0,
             })
             .await;
 
@@ -920,6 +922,7 @@ mod tests {
                 output: "command not found".into(),
                 step: 0,
                 is_error: true,
+                duration_ms: 0,
             })
             .await;
 
@@ -970,6 +973,7 @@ mod tests {
                 output: "hi".into(),
                 step: 0,
                 is_error: false,
+                duration_ms: 0,
             })
             .await;
         bridge
@@ -979,6 +983,7 @@ mod tests {
                 output: "content".into(),
                 step: 0,
                 is_error: true,
+                duration_ms: 0,
             })
             .await;
 
@@ -1077,6 +1082,7 @@ mod tests {
                 output: "".into(),
                 step: 0,
                 is_error: false,
+                duration_ms: 0,
             })
             .await;
 
@@ -1112,6 +1118,7 @@ mod tests {
                 output: "data".into(),
                 step: 0,
                 is_error: false,
+                duration_ms: 0,
             })
             .await;
         bridge

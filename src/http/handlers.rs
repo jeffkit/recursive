@@ -6,7 +6,6 @@ use axum::{
     response::sse::{Event, Sse},
     Json,
 };
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1844,14 +1843,13 @@ pub(super) async fn send_session_message(
     runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(event_sinks)));
 
     // Spawn a forwarder: EnvelopedEvent → SseFrame → broadcast channel.
-    // SDK Phase B: track tool call start times so we can emit tool_progress
-    // events with elapsed_ms when each tool finishes.
+    // SDK Phase B: emit a tool_progress frame per finished tool, carrying the
+    // duration the runtime measured for that tool (issue #118).
     // Goal 274: also maintain the non_system_message_count atomic so the
     // count stays correct even when the turn errors out mid-run.
     let initial_count = msg_count_arc.load(std::sync::atomic::Ordering::Relaxed);
     let count_arc = msg_count_arc.clone();
     let forward_handle = tokio::spawn(async move {
-        let mut tool_start_times: HashMap<String, std::time::Instant> = HashMap::new();
         let mut count: usize = initial_count;
         while let Some(envelope) = event_rx.recv().await {
             // Issue #117: the frame id is the envelope key, so it is reused for
@@ -1869,30 +1867,18 @@ pub(super) async fn send_session_message(
                 }
                 _ => {}
             }
-            // Record start time for each tool call so we can compute elapsed
-            // when the result arrives.
-            if let AgentEvent::ToolCall { id, .. } = agent_event {
-                tool_start_times.insert(id.clone(), std::time::Instant::now());
-            }
             if let Some(sse_event) = map_agent_event(agent_event) {
                 let _ = broadcast_tx.send(SseFrame {
                     id: frame_id.clone(),
                     event: sse_event,
                 });
             }
-            // After forwarding the tool_result, emit tool_progress with timing.
-            if let AgentEvent::ToolResult { id, name, .. } = agent_event {
-                let elapsed_ms = tool_start_times
-                    .remove(id)
-                    .map(|start| start.elapsed().as_millis() as u64)
-                    .unwrap_or(0);
+            // After forwarding the tool_result, emit tool_progress with the
+            // duration the runtime measured for this tool.
+            if let Some(sse_event) = tool_progress_event(agent_event) {
                 let _ = broadcast_tx.send(SseFrame {
                     id: format!("{frame_id}:progress"),
-                    event: SseEvent::ToolProgress {
-                        tool_use_id: id.clone(),
-                        tool_name: name.clone(),
-                        elapsed_ms,
-                    },
+                    event: sse_event,
                 });
             }
         }
@@ -2130,6 +2116,29 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
         // AssistantText, Latency, Usage, Compacted, PlanConfirmed,
         // PlanRejected don't have SSE equivalents (AssistantText is
         // intentionally suppressed in favour of MessageAppended above).
+        _ => None,
+    }
+}
+
+/// Build the `tool_progress` frame for a finished tool call.
+///
+/// Issue #118: `elapsed_ms` is the duration the runtime measured for *this*
+/// tool, forwarded verbatim. The HTTP layer used to derive it from the
+/// `ToolCall` / `ToolResult` arrival times, which made every tool of a step
+/// report the same number — results are emitted only after the whole batch
+/// finished — and folded the `TuiPermissionHook` approval wait into it.
+fn tool_progress_event(event: &AgentEvent) -> Option<SseEvent> {
+    match event {
+        AgentEvent::ToolResult {
+            id,
+            name,
+            duration_ms,
+            ..
+        } => Some(SseEvent::ToolProgress {
+            tool_use_id: id.clone(),
+            tool_name: name.clone(),
+            elapsed_ms: *duration_ms,
+        }),
         _ => None,
     }
 }
@@ -2679,6 +2688,7 @@ mod tests {
     use super::*;
     use crate::event::{AgentEvent, EventSink};
     use crate::http::SseEvent;
+    use std::collections::HashMap;
 
     /// Issue #117: every SSE frame derived from an event carries that event's
     /// envelope key as its `id:` — so a client can order/dedupe frames across
@@ -3048,96 +3058,68 @@ mod tests {
 
     // ── SDK Phase B: tool_progress forwarder ─────────────────────────────
 
-    /// Verify that the stateful forwarder logic correctly emits ToolProgress
-    /// after ToolResult with the right tool_name.  We simulate the forwarder's
-    /// HashMap bookkeeping without spinning up a full Tokio task.
+    /// Issue #118: the forwarder must emit ToolProgress carrying the duration
+    /// the runtime measured for that tool — not a value re-derived from event
+    /// arrival times.
     #[test]
-    fn tool_progress_emitted_after_tool_result() {
-        use std::collections::HashMap;
-        use std::time::Instant;
-
-        let mut tool_start_times: HashMap<String, Instant> = HashMap::new();
-        let mut emitted: Vec<SseEvent> = Vec::new();
-
-        // Simulate ToolCall arrival
-        let call_event = AgentEvent::ToolCall {
-            name: "Bash".to_string(),
-            id: "tc-1".to_string(),
-            arguments: "{}".to_string(),
-            step: 0,
-        };
-        if let AgentEvent::ToolCall { id, .. } = &call_event {
-            tool_start_times.insert(id.clone(), Instant::now());
-        }
-        if let Some(ev) = map_agent_event(&call_event) {
-            emitted.push(ev);
-        }
-
-        // Simulate ToolResult arrival (no sleep needed — elapsed_ms ≥ 0)
+    fn tool_progress_forwards_runtime_duration() {
         let result_event = AgentEvent::ToolResult {
             id: "tc-1".to_string(),
             name: "Bash".to_string(),
             output: "ok".to_string(),
             step: 0,
             is_error: false,
+            duration_ms: 137,
         };
-        if let Some(ev) = map_agent_event(&result_event) {
-            emitted.push(ev);
-        }
-        if let AgentEvent::ToolResult { id, name, .. } = &result_event {
-            let elapsed_ms = tool_start_times
-                .remove(id)
-                .map(|start| start.elapsed().as_millis() as u64)
-                .unwrap_or(0);
-            emitted.push(SseEvent::ToolProgress {
-                tool_use_id: id.clone(),
-                tool_name: name.clone(),
-                elapsed_ms,
-            });
-        }
 
-        // Expect: ToolCall, ToolResult, ToolProgress
-        assert_eq!(emitted.len(), 3, "expected 3 events");
-        assert!(matches!(emitted[0], SseEvent::ToolCall { .. }));
-        assert!(matches!(emitted[1], SseEvent::ToolResult { .. }));
         let SseEvent::ToolProgress {
             tool_use_id,
             tool_name,
             elapsed_ms,
-        } = &emitted[2]
+        } = tool_progress_event(&result_event).expect("tool_progress expected")
         else {
-            panic!("third event should be ToolProgress");
+            panic!("expected ToolProgress");
         };
         assert_eq!(tool_use_id, "tc-1");
         assert_eq!(tool_name, "Bash");
-        let _ = elapsed_ms; // ≥ 0 is trivially true for u64
+        assert_eq!(elapsed_ms, 137);
     }
 
-    /// Verify that tool_start_times does NOT grow if a ToolResult arrives
-    /// without a matching ToolCall (e.g. replayed events).
+    /// Only `ToolResult` produces a `tool_progress` frame; the ToolCall that
+    /// preceded it must not.
     #[test]
-    fn tool_progress_elapsed_is_zero_for_unmatched_result() {
-        use std::collections::HashMap;
-        use std::time::Instant;
+    fn tool_progress_only_for_tool_result() {
+        let call_event = AgentEvent::ToolCall {
+            name: "Bash".to_string(),
+            id: "tc-1".to_string(),
+            arguments: "{}".to_string(),
+            step: 0,
+        };
+        assert!(tool_progress_event(&call_event).is_none());
+        assert!(tool_progress_event(&AgentEvent::TurnFinished {
+            reason: "no_more_tool_calls".to_string(),
+            steps: 1,
+        })
+        .is_none());
+    }
 
-        let mut tool_start_times: HashMap<String, Instant> = HashMap::new();
-
+    /// A call rejected before dispatch (duration 0) is forwarded as 0 — the
+    /// forwarder must not substitute a batch wall clock.
+    #[test]
+    fn tool_progress_forwards_zero_for_undispatched_call() {
         let result_event = AgentEvent::ToolResult {
             id: "tc-orphan".to_string(),
             name: "Read".to_string(),
-            output: "data".to_string(),
+            output: "ERROR: denied".to_string(),
             step: 0,
-            is_error: false,
+            is_error: true,
+            duration_ms: 0,
         };
-        let elapsed_ms = if let AgentEvent::ToolResult { id, .. } = &result_event {
-            tool_start_times
-                .remove(id)
-                .map(|start| start.elapsed().as_millis() as u64)
-                .unwrap_or(0)
-        } else {
-            unreachable!()
+        let SseEvent::ToolProgress { elapsed_ms, .. } =
+            tool_progress_event(&result_event).expect("tool_progress expected")
+        else {
+            panic!("expected ToolProgress");
         };
-        // No panic; elapsed defaults to 0 when no matching ToolCall.
         assert_eq!(elapsed_ms, 0);
     }
 
@@ -4944,6 +4926,7 @@ mod tests {
             output: "ok".into(),
             step: 0,
             is_error: false,
+            duration_ms: 0,
         };
         let err = AgentEvent::ToolResult {
             id: "tc-2".into(),
@@ -4951,6 +4934,7 @@ mod tests {
             output: "fail".into(),
             step: 0,
             is_error: true,
+            duration_ms: 0,
         };
         match map_agent_event(&ok) {
             Some(SseEvent::ToolResult { success, .. }) => assert!(success),

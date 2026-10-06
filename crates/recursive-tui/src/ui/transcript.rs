@@ -347,7 +347,14 @@ fn render_tool_call(
     };
     let size = result
         .as_ref()
-        .map(|r| format_size(r.output.len()))
+        .map(|r| match r.duration_ms {
+            Some(ms) => format!(
+                "{} · {}",
+                format_size(r.output.len()),
+                format_duration_ms(ms)
+            ),
+            None => format_size(r.output.len()),
+        })
         .unwrap_or_default();
     let args_display = if args_preview.is_empty() {
         String::new()
@@ -392,6 +399,7 @@ fn render_tool_call(
             success: _,
             output,
             expanded,
+            duration_ms: _,
         }) => {
             // Only the first result line gets the ⎿ connector; subsequent lines
             // use plain indentation to match Claude's single-connector style.
@@ -452,6 +460,16 @@ fn format_size(bytes: usize) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Issue #118: tool duration for the result row — `42ms` below a second,
+/// `1.5s` above (a raw ms count stops being readable for slow tools).
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
     }
 }
 
@@ -947,6 +965,7 @@ mod tests {
                     success: true,
                     output: "abc".into(),
                     expanded: false,
+                    duration_ms: None,
                 }),
             },
             &theme::DARK,
@@ -972,6 +991,7 @@ mod tests {
                     success: false,
                     output: "boom".into(),
                     expanded: false,
+                    duration_ms: None,
                 }),
             },
             &theme::DARK,
@@ -997,6 +1017,7 @@ mod tests {
                     success: true,
                     output,
                     expanded: false,
+                    duration_ms: None,
                 }),
             },
             &theme::DARK,
@@ -1022,6 +1043,7 @@ mod tests {
                     success: true,
                     output,
                     expanded: true,
+                    duration_ms: None,
                 }),
             },
             &theme::DARK,
@@ -1323,6 +1345,7 @@ mod tests {
             success: false,
             output: "boom".into(),
             expanded: false,
+            duration_ms: None,
         };
         let lines = render_tool_call("Read", "args", &Some(result), th);
         let args_span = lines[0]
@@ -1346,10 +1369,56 @@ mod tests {
             success: true,
             output: "x".into(),
             expanded: false,
+            duration_ms: Some(7),
+        };
+        let lines = render_tool_call("Read", "args", &Some(result), th);
+        let text = full_text(&lines);
+        assert!(
+            text.contains("1 B · 7ms"),
+            "expected size + duration row; got {text}"
+        );
+    }
+
+    /// Issue #118: the duration shown is the tool's own measured time.
+    #[test]
+    fn render_tool_call_shows_seconds_for_slow_tool() {
+        let th = &theme::DARK;
+        let result = ToolResultData {
+            success: true,
+            output: "x".into(),
+            expanded: false,
+            duration_ms: Some(1500),
+        };
+        let lines = render_tool_call("Read", "args", &Some(result), th);
+        let text = full_text(&lines);
+        assert!(text.contains("1.5s"), "expected 1.5s; got {text}");
+    }
+
+    /// Issue #118: blocks rebuilt from a resumed session have no timing, so
+    /// the row must not claim a duration.
+    #[test]
+    fn render_tool_call_without_duration_shows_size_only() {
+        let th = &theme::DARK;
+        let result = ToolResultData {
+            success: true,
+            output: "x".into(),
+            expanded: false,
+            duration_ms: None,
         };
         let lines = render_tool_call("Read", "args", &Some(result), th);
         let text = full_text(&lines);
         assert!(text.contains("1 B"), "expected size row; got {text}");
+        assert!(!text.contains("ms"), "no duration expected; got {text}");
+    }
+
+    /// Unit-level pin of the ms/s boundary.
+    #[test]
+    fn format_duration_ms_switches_at_one_second() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(42), "42ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+        assert_eq!(format_duration_ms(1000), "1.0s");
+        assert_eq!(format_duration_ms(1500), "1.5s");
     }
 
     #[test]
@@ -1363,6 +1432,7 @@ mod tests {
             success: true,
             output: output.into(),
             expanded: false,
+            duration_ms: Some(12),
         };
         let lines = render_tool_call("Read", "args", &Some(result), th);
         // lines[0] = header ("⏺ Read(args)"), lines[1] = size row (connector),
@@ -1388,6 +1458,7 @@ mod tests {
             success: true,
             output: output.into(),
             expanded: false,
+            duration_ms: None,
         };
         let lines = render_tool_call("Read", "args", &Some(result), th);
         let text = full_text(&lines);

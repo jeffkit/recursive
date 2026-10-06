@@ -465,8 +465,11 @@ pub enum SseEvent {
     GoalContinuing { reason: String, turns: u32 },
     /// Goal-168: judge confirmed condition met.
     GoalAchieved { condition: String, turns: u32 },
-    /// SDK Phase B: a tool call just completed; elapsed_ms is wall-clock time
-    /// from when the ToolCall event was received to when ToolResult arrived.
+    /// SDK Phase B: a tool call just completed; `elapsed_ms` is the wall-clock
+    /// time that tool itself spent executing, as measured by the runtime
+    /// (issue #118). It excludes the permission-approval wait and any
+    /// queueing behind other tools of the same step, and is forwarded as-is
+    /// rather than re-derived from event arrival times.
     /// Emitted in addition to (and after) the `tool_result` event.
     ToolProgress {
         tool_use_id: String,

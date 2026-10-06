@@ -122,6 +122,9 @@ fn push_blocks_for_message(blocks: &mut Vec<TranscriptBlock>, msg: &recursive::m
                     success: true,
                     output: msg.content.clone(),
                     expanded: false,
+                    // Rebuilt from a persisted transcript — the per-call
+                    // duration is not stored there (issue #118).
+                    duration_ms: None,
                 });
             } else {
                 blocks.push(TranscriptBlock::ToolCall {
@@ -132,6 +135,7 @@ fn push_blocks_for_message(blocks: &mut Vec<TranscriptBlock>, msg: &recursive::m
                         success: true,
                         output: msg.content.clone(),
                         expanded: false,
+                        duration_ms: None,
                     }),
                 });
             }

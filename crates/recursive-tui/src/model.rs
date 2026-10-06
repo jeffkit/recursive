@@ -64,6 +64,11 @@ pub struct ToolResultData {
     /// `true` = full output. Toggled by Ctrl+E on the chat
     /// surface when the input buffer is empty.
     pub expanded: bool,
+    /// Wall-clock ms the tool itself spent executing (issue #118), rendered
+    /// next to the output size. `None` when there is no timing to show —
+    /// notably blocks rebuilt from a resumed session, whose transcripts do
+    /// not persist durations.
+    pub duration_ms: Option<u64>,
 }
 
 /// One renderable transcript block.

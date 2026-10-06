@@ -65,6 +65,7 @@ impl App {
                 name,
                 output,
                 success,
+                duration_ms,
             } => {
                 // For write_file, render a synthesised Diff stub
                 // ("Created/Updated path (N bytes)") alongside the
@@ -89,6 +90,7 @@ impl App {
                                 success: true,
                                 output: String::new(),
                                 expanded: false,
+                                duration_ms: Some(duration_ms),
                             });
                         }
                         return;
@@ -113,6 +115,7 @@ impl App {
                                 success,
                                 output: output.clone(),
                                 expanded: false,
+                                duration_ms: Some(duration_ms),
                             });
                             // Backfill name/args if the matching
                             // ToolCall was synthesised by the
@@ -137,6 +140,7 @@ impl App {
                             success,
                             output,
                             expanded: false,
+                            duration_ms: Some(duration_ms),
                         }),
                     });
                 }
@@ -999,6 +1003,7 @@ mod tests {
             name: "Read".into(),
             output: "ok".into(),
             success: true,
+            duration_ms: 42,
         });
 
         // ToolResult now merges into the matching ToolCall block
@@ -1021,6 +1026,8 @@ mod tests {
                 assert_eq!(id, "abc");
                 assert!(r.success);
                 assert_eq!(r.output, "ok");
+                // Issue #118: the per-tool duration reaches the block.
+                assert_eq!(r.duration_ms, Some(42));
             }
             other => panic!("expected ToolCall with Some(result), got {other:?}"),
         }
@@ -1040,6 +1047,7 @@ mod tests {
             name: "Write".into(),
             output: "Wrote 42 bytes to src/new.rs".into(),
             success: true,
+            duration_ms: 1,
         });
         let has_diff = app.blocks.iter().any(
             |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),
@@ -1065,6 +1073,7 @@ mod tests {
             name: "Write".into(),
             output: "Failed to write to src/new.rs: permission denied".into(),
             success: false,
+            duration_ms: 1,
         });
         let has_diff = app.blocks.iter().any(
             |b| matches!(b, TranscriptBlock::Diff { path, .. } if path.contains("src/new.rs")),

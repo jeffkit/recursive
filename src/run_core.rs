@@ -18,6 +18,11 @@ pub(crate) struct ToolCallOutcome {
     pub name: String,
     pub result: String,
     pub audit: Option<crate::tools::AuditMeta>,
+    /// Wall-clock ms spent *inside* the tool dispatch (issue #118). `0` for
+    /// calls rejected before dispatch (plan mode / permission / hook), which
+    /// never entered the tool. Excludes the approval wait and the queueing
+    /// time this call saw before its turn came.
+    pub duration_ms: u64,
 }
 
 /// Sentinel returned in the tool-result string when the permission denial
@@ -613,6 +618,7 @@ impl<'a> RunCore<'a> {
                     output: o.result.clone(),
                     step,
                     is_error,
+                    duration_ms: o.duration_ms,
                 });
                 self.push_tool_result(
                     step,
@@ -641,6 +647,7 @@ impl<'a> RunCore<'a> {
             name,
             result,
             audit,
+            duration_ms,
         } in results
         {
             let is_error = result.starts_with("ERROR: ");
@@ -650,6 +657,7 @@ impl<'a> RunCore<'a> {
                 output: result.clone(),
                 step,
                 is_error,
+                duration_ms: *duration_ms,
             });
             if let Some(a) = &audit {
                 tool_audits.insert((self.turn, id.clone()), a.clone());
@@ -1342,6 +1350,7 @@ impl<'a> RunCore<'a> {
                         call.name
                     ),
                     audit: None,
+                    duration_ms: 0,
                 });
                 continue;
             }
@@ -1363,6 +1372,7 @@ impl<'a> RunCore<'a> {
                         call.name
                     ),
                     audit: None,
+                    duration_ms: 0,
                 });
                 continue;
             }
@@ -1377,6 +1387,7 @@ impl<'a> RunCore<'a> {
                             name: call.name.clone(),
                             result,
                             audit: None,
+                            duration_ms: 0,
                         });
                         continue;
                     }
@@ -1398,6 +1409,7 @@ impl<'a> RunCore<'a> {
                         name: call.name.clone(),
                         result,
                         audit: None,
+                        duration_ms: 0,
                     });
                     continue;
                 }
@@ -1408,6 +1420,7 @@ impl<'a> RunCore<'a> {
                         name: call.name.clone(),
                         result,
                         audit: None,
+                        duration_ms: 0,
                     });
                     continue;
                 }
@@ -1490,6 +1503,7 @@ impl<'a> RunCore<'a> {
                             result: "ERROR: tool task panicked during parallel execution"
                                 .to_string(),
                             audit: None,
+                            duration_ms: 0,
                         });
                         continue;
                     };
@@ -1498,6 +1512,7 @@ impl<'a> RunCore<'a> {
                         name: pc.name.clone(),
                         result: result.clone(),
                         audit: Some(audit.clone()),
+                        duration_ms: *duration_ms,
                     });
                     self.hooks.dispatch(HookEvent::PostToolCall {
                         name: &pc.name,
@@ -1526,6 +1541,7 @@ impl<'a> RunCore<'a> {
                     name: pc.name.clone(),
                     result: result.clone(),
                     audit: Some(dispatch.audit),
+                    duration_ms,
                 });
                 self.hooks.dispatch(HookEvent::PostToolCall {
                     name: &pc.name,
@@ -3772,6 +3788,215 @@ mod tests {
             denial_is_error,
             Some(true),
             "ToolResult for DENIAL_LIMIT_SENTINEL must have is_error = true; events: {events:?}"
+        );
+    }
+
+    /// Issue #118: each `ToolResult` carries the time *its own* tool spent
+    /// executing. The slow read (parallel batch) and the fast write (serial
+    /// path) must report different numbers — before the fix every tool of a
+    /// step reported the same batch wall clock, so consumers could not tell
+    /// which tool was slow.
+    #[tokio::test]
+    async fn tool_result_events_carry_per_tool_duration() {
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, ToolCall, ToolSpec};
+        use crate::tools::{Tool, ToolRegistry};
+        use async_trait::async_trait;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        struct SlowReadTool;
+        struct FastWriteTool;
+
+        #[async_trait]
+        impl Tool for SlowReadTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "SlowReadTool".to_string(),
+                    description: "Reads slowly".to_string(),
+                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                }
+            }
+            fn is_readonly(&self) -> bool {
+                true
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok("read".to_string())
+            }
+        }
+
+        #[async_trait]
+        impl Tool for FastWriteTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "FastWriteTool".to_string(),
+                    description: "Writes quickly".to_string(),
+                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                }
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok("wrote".to_string())
+            }
+        }
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let registry = ToolRegistry::default()
+            .register(Arc::new(SlowReadTool))
+            .register(Arc::new(FastWriteTool));
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            Completion {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "tc-read".to_string(),
+                        name: "SlowReadTool".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "tc-write".to_string(),
+                        name: "FastWriteTool".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "done".to_string(),
+                tool_calls: vec![],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let messages = vec![Message::user("run both".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+        core.tools = Arc::new(registry);
+        core.events = Some(tx);
+
+        let _ = core.run_inner().await.expect("run_inner must not error");
+
+        let mut durations = std::collections::HashMap::new();
+        while let Ok(e) = rx.try_recv() {
+            if let AgentEvent::ToolResult {
+                name, duration_ms, ..
+            } = e
+            {
+                durations.insert(name, duration_ms);
+            }
+        }
+        let read_ms = *durations.get("SlowReadTool").expect("read result");
+        let write_ms = *durations.get("FastWriteTool").expect("write result");
+        assert!(
+            read_ms >= 40,
+            "read tool slept 50ms, expected >= 40ms; events: {durations:?}"
+        );
+        assert!(
+            write_ms >= 4,
+            "write tool slept 5ms, expected >= 4ms; events: {durations:?}"
+        );
+        assert!(
+            write_ms < read_ms,
+            "each tool must report its own duration, not the batch wall clock; \
+             read={read_ms}ms write={write_ms}ms"
+        );
+    }
+
+    /// Issue #118: a call rejected before dispatch (plan mode here) never
+    /// entered the tool, so its duration is 0 — not a batch timing.
+    #[tokio::test]
+    async fn tool_result_duration_is_zero_for_undispatched_call() {
+        use crate::event::AgentEvent;
+        use crate::llm::{Completion, ToolCall, ToolSpec};
+        use crate::tools::{Tool, ToolRegistry};
+        use async_trait::async_trait;
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
+
+        struct WriteTool;
+
+        #[async_trait]
+        impl Tool for WriteTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "WriteTool".to_string(),
+                    description: "Writes".to_string(),
+                    parameters: serde_json::json!({ "type": "object", "properties": {} }),
+                }
+            }
+            async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+                // Slow enough that a dispatch would be visible in the reported
+                // duration — the rejected call must report 0, not "0 because
+                // the tool happened to be instant".
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Ok("wrote".to_string())
+            }
+        }
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let registry = ToolRegistry::default().register(Arc::new(WriteTool));
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![
+            Completion {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "tc1".to_string(),
+                    name: "WriteTool".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "done".to_string(),
+                tool_calls: vec![],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let messages = vec![Message::user("try to write".to_string())];
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+        core.tools = Arc::new(registry);
+        core.events = Some(tx);
+        core.exploring_plan_mode.store(true, Ordering::Relaxed);
+
+        let _ = core.run_inner().await.expect("run_inner must not error");
+
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let (output, duration) = events
+            .iter()
+            .find_map(|e| {
+                if let AgentEvent::ToolResult {
+                    name,
+                    duration_ms,
+                    output,
+                    ..
+                } = e
+                {
+                    (name == "WriteTool").then_some((output.clone(), *duration_ms))
+                } else {
+                    None
+                }
+            })
+            .expect("WriteTool result event");
+        assert!(
+            output.starts_with("ERROR: Cannot execute"),
+            "the write must have been blocked by plan mode; got {output}"
+        );
+        assert_eq!(
+            duration, 0,
+            "a plan-mode-rejected call must report duration_ms = 0"
         );
     }
 

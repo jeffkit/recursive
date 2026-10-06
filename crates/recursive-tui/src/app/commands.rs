@@ -1684,6 +1684,7 @@ mod tests {
             name: "Read".into(),
             output: "long output".into(),
             success: true,
+            duration_ms: 0,
         });
         let _ = app.handle_key(ctrl('e'));
         match app.blocks.last() {
@@ -2594,6 +2595,7 @@ mod prompt_input_tests {
             name: "Read".into(),
             output: "ok".into(),
             success: true,
+            duration_ms: 0,
         });
         let _ = app.handle_key(ctrl('e'));
         match app.blocks.last() {

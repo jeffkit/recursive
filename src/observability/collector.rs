@@ -879,6 +879,7 @@ mod tests {
                 output: "ok".into(),
                 step: 0,
                 is_error: false,
+                duration_ms: 50,
             },
             at(60),
         );
@@ -917,6 +918,7 @@ mod tests {
                 output: "ERROR: nope".into(),
                 step: 0,
                 is_error: true,
+                duration_ms: 1,
             },
             at(2),
         );

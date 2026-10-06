@@ -2369,6 +2369,7 @@ mod http_tests {
             output: "file contents here".into(),
             step: 1,
             is_error: false,
+            duration_ms: 0,
         };
         let sse = map_agent_event(&event).unwrap();
         assert_eq!(
@@ -2390,6 +2391,7 @@ mod http_tests {
             output: "ERROR: permission denied".into(),
             step: 3,
             is_error: true,
+            duration_ms: 0,
         };
         let sse = map_agent_event(&event).unwrap();
         assert_eq!(

@@ -44,6 +44,9 @@ pub enum UiEvent {
         name: String,
         output: String,
         success: bool,
+        /// Wall-clock ms this tool spent executing (issue #118) — measured by
+        /// the runtime around the dispatch, excluding approval/queueing.
+        duration_ms: u64,
     },
     /// Token usage for the latest LLM call.
     Usage {

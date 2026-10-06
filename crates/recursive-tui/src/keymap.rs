@@ -63,6 +63,7 @@ mod tests {
                 success: true,
                 output: "abc".into(),
                 expanded: false,
+                duration_ms: None,
             }),
         });
         let _ = dispatch(&mut app, ctrl('e'));

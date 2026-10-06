@@ -620,6 +620,7 @@ mod tests {
             output: "ok".into(),
             step: 0,
             is_error: false,
+            duration_ms: 0,
         });
         assert_eq!(outs[0]["type"], "user");
         assert_eq!(outs[0]["message"]["content"][0]["type"], "tool_result");

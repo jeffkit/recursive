@@ -51,7 +51,7 @@ export interface ToolProgressMessage {
   toolUseId: string;
   /** Name of the tool that was called. */
   toolName: string;
-  /** Wall-clock milliseconds from tool call start to result receipt. */
+  /** Milliseconds the tool itself spent executing (excludes approval wait). */
   elapsedMs: number;
   sessionId: string;
 }

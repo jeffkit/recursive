@@ -99,7 +99,7 @@ class ToolProgressMessage:
     tool_name: str
     """Name of the tool that was called."""
     elapsed_ms: int
-    """Wall-clock milliseconds from tool call start to result receipt."""
+    """Milliseconds the tool itself spent executing (excludes approval wait)."""
     session_id: str = ""
 
 

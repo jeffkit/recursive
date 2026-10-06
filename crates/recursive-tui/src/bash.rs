@@ -46,16 +46,19 @@ pub async fn run_bash_command(
         arguments: arguments_str,
     });
 
+    let started = std::time::Instant::now();
     let (output, success) = match registry.invoke("Bash", arguments).await {
         Ok(out) => (out, true),
         Err(e) => (format!("ERROR: {e}"), false),
     };
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     let _ = event_tx.send(UiEvent::ToolResult {
         id,
         name: "Bash".into(),
         output,
         success,
+        duration_ms,
     });
 }
 

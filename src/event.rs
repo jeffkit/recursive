@@ -51,6 +51,20 @@ pub enum AgentEvent {
         /// this field instead of inspecting the `output` string prefix.
         #[serde(default)]
         is_error: bool,
+        /// Wall-clock time this tool spent executing, in ms.
+        ///
+        /// Measured around the tool dispatch itself, so it excludes the
+        /// permission-approval wait and the time the call spent queued
+        /// behind other tools in the same step. `0` for calls that were
+        /// never dispatched (plan-mode / permission / hook rejection).
+        ///
+        /// Issue #118: consumers must use this instead of diffing the
+        /// `ToolCall` / `ToolResult` arrival times — every result in a step
+        /// is emitted after the whole batch completes, so that diff gives
+        /// all tools of a batch the same number and folds in approval
+        /// waiting.
+        #[serde(default)]
+        duration_ms: u64,
     },
     /// Token usage statistics from the LLM provider.
     Usage {
@@ -689,6 +703,7 @@ mod tests {
                 output: "ok".into(),
                 step: 3,
                 is_error: false,
+                duration_ms: 7,
             },
             AgentEvent::Usage {
                 input_tokens: 10,
@@ -830,14 +845,33 @@ mod tests {
             output: "ERROR: oops".into(),
             step: 3,
             is_error: true,
+            duration_ms: 42,
         };
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(
             json.contains("\"is_error\":true"),
             "is_error=true must be in JSON; got: {json}"
         );
+        assert!(
+            json.contains("\"duration_ms\":42"),
+            "duration_ms must be in JSON; got: {json}"
+        );
         let restored: AgentEvent = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(restored, event);
+    }
+
+    /// Issue #118: the per-tool duration is optional on the wire so older
+    /// producers (and the ACP bridge's synthesised events) still deserialize.
+    #[test]
+    fn tool_result_duration_defaults_to_zero_when_absent() {
+        let json = r#"{"type":"tool_result","id":"x","name":"y","output":"ok","step":0}"#;
+        let event: AgentEvent = serde_json::from_str(json).expect("must deserialize");
+        match event {
+            AgentEvent::ToolResult { duration_ms, .. } => {
+                assert_eq!(duration_ms, 0, "duration_ms must default to 0 when absent");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     /// Regression test for Goal 278: MessageAppended no longer has parent_uuid field.

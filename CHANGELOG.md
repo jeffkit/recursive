@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- fix(events): the tool's own execution time is now carried end to end (#118).
+  `run_core` measured each tool call's duration only to hand it to the
+  `PostToolCall` hook and then dropped it; `AgentEvent::ToolResult` had no
+  timing field, so the HTTP layer reconstructed `tool_progress.elapsed_ms` from
+  the gap between the `ToolCall` and `ToolResult` events. Every result of a step
+  is emitted *after* the whole batch returns, so all tools of a batch reported
+  the same number — and that number also contained the `TuiPermissionHook`
+  approval wait. `ToolCallOutcome` now keeps the measured duration and
+  `AgentEvent::ToolResult` carries it as `duration_ms` (wall clock around the
+  dispatch, `0` for calls rejected before dispatch), which the SSE forwarder
+  emits verbatim as `tool_progress.elapsed_ms` — no more arrival-time
+  arithmetic, and each tool reports its own number (`duration_ms` is
+  `#[serde(default)]`, so older producers and the ACP bridge's synthesised
+  events still deserialize). The TUI renders it in the result row
+  (`1.2 KB · 42ms`, `1.5s` above a second); blocks rebuilt from a resumed
+  transcript show no duration rather than a fake `0ms`, since transcripts do
+  not persist timings. Queue-vs-execute-vs-approval segmentation is not
+  attempted: a single honest number already answers "which tool is slow", and
+  nothing consumes a finer split yet.
 - feat(events): timeline envelope for the whole event chain (#117). An
   `AgentEvent` carried no wall clock, no turn, no session id, and no global
   sequence, so events, SSE frames, spans and log lines could not be stitched

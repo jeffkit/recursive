@@ -232,6 +232,7 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
             name,
             output,
             is_error,
+            duration_ms,
             ..
         } => {
             let success = !is_error;
@@ -240,6 +241,7 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
                 name,
                 output,
                 success,
+                duration_ms,
             })
         }
         AgentEvent::Usage {
@@ -1617,10 +1619,28 @@ mod tests {
             output: "ERROR: missing".into(),
             step: 0,
             is_error: true,
+            duration_ms: 0,
         };
         let mapped = map_agent_event(ev).unwrap();
         match mapped {
             UiEvent::ToolResult { success, .. } => assert!(!success),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// Issue #118: the runtime-measured tool duration reaches the UI layer.
+    #[test]
+    fn map_tool_result_forwards_duration() {
+        let ev = AgentEvent::ToolResult {
+            id: "1".into(),
+            name: "Bash".into(),
+            output: "ok".into(),
+            step: 0,
+            is_error: false,
+            duration_ms: 33,
+        };
+        match map_agent_event(ev).unwrap() {
+            UiEvent::ToolResult { duration_ms, .. } => assert_eq!(duration_ms, 33),
             other => panic!("expected ToolResult, got {other:?}"),
         }
     }
