@@ -123,16 +123,30 @@ async fn sandbox_shell_does_not_inherit_host_env() {
     // --- 3) explicit env arg DOES reach the command (positive control for
     // the local `none` tier: since issue #89 `LocalTransport` scrubs
     // credential-shaped *inherited* vars, but an env pair passed in the
-    // tool call is always applied) ---
-    std::env::set_var("RECURSIVE_WIP_EXPLICIT_51", "set-by-model");
-    let local = RunShell::new(tmp.path()); // default LocalTransport
-    let out = local
-        .execute(json!({
-            "command": "printenv RECURSIVE_WIP_EXPLICIT_51",
-            "env": {"RECURSIVE_WIP_EXPLICIT_51": "set-by-model"}
-        }))
-        .await
-        .unwrap();
-    std::env::remove_var("RECURSIVE_WIP_EXPLICIT_51");
-    assert!(out.contains("set-by-model"));
+    // tool call is always applied).
+    //
+    // Unix-only: this arm's subject is the REAL host shell, and
+    // `LocalTransport::exec_shell` spawns `/bin/sh`. On Windows that
+    // absolute POSIX path is unsatisfiable — the spawn dies with
+    // `The system cannot find the path specified. (os error 3)`, which
+    // `transport_io_error` renders as `<cwd>: <io error>` and thereby
+    // *looks* like a missing temp dir though `TempDir` created it. Parts
+    // 1–2 above carry the invariant on every platform; this host-shell arm
+    // is gated for the same reason the transport's own `exec_shell` tests
+    // (`src/tools/transport_layer/transport.rs`) are
+    // `#[cfg(not(target_os = "windows"))]`. ---
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::set_var("RECURSIVE_WIP_EXPLICIT_51", "set-by-model");
+        let local = RunShell::new(tmp.path()); // default LocalTransport
+        let out = local
+            .execute(json!({
+                "command": "printenv RECURSIVE_WIP_EXPLICIT_51",
+                "env": {"RECURSIVE_WIP_EXPLICIT_51": "set-by-model"}
+            }))
+            .await
+            .unwrap();
+        std::env::remove_var("RECURSIVE_WIP_EXPLICIT_51");
+        assert!(out.contains("set-by-model"));
+    }
 }
