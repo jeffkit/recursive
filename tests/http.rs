@@ -714,8 +714,9 @@ mod http_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Should hit budget exceeded at 2 steps
-        assert_eq!(resp["status"], "success");
+        // Should hit budget exceeded at 2 steps. Issue #113: `status` reports
+        // the terminal finish reason — it used to be a hardcoded "success".
+        assert_eq!(resp["status"], "budget_exceeded");
         assert!(resp["finish_reason"]
             .as_str()
             .unwrap()
@@ -2696,9 +2697,25 @@ mod http_tests {
             "recursive_runs_waiting",
             "recursive_runs_in_flight",
             "recursive_transcript_bytes_total",
+            // Issue #113: labelled families and histograms.
+            "recursive_agent_runs_finished_total",
+            "recursive_cost_usd_total",
+            "recursive_tool_errors_total",
+            "recursive_llm_retries_total",
+            "recursive_compactions_total",
+            "recursive_compaction_skipped_total",
+            "recursive_llm_latency_ms",
+            "recursive_run_steps",
+            "recursive_admission_wait_ms",
         ] {
             assert!(text.contains(name), "missing metric: {name}");
         }
+
+        // NB: the scrape request itself is counted *after* this handler
+        // returns (the middleware records the status once the response
+        // exists), so the labelled `recursive_requests_total` series appear
+        // from the second scrape onwards — see
+        // `metrics_middleware_increments_requests_total`.
     }
 
     #[tokio::test]
@@ -2707,8 +2724,14 @@ mod http_tests {
         let metrics = state.metrics.clone();
         let app = build_router(state);
 
-        // Hit two non-/metrics endpoints to drive the middleware.
-        for uri in ["/health", "/tools"] {
+        // Hit two non-/metrics endpoints to drive the middleware, plus an
+        // unmatched path (route label fallback) and a 4xx (status label).
+        for uri in [
+            "/health",
+            "/tools",
+            "/definitely-not-a-route",
+            "/sessions/does-not-exist",
+        ] {
             let _ = app
                 .clone()
                 .oneshot(
@@ -2721,10 +2744,59 @@ mod http_tests {
                 .unwrap();
         }
 
-        let n = metrics
-            .requests_total
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Issue #113: requests are counted per matched route + status.
+        let n = metrics.requests_by_route.total();
         assert!(n >= 2, "expected requests_total >= 2, got {n}");
+        let routes: Vec<String> = metrics
+            .requests_by_route
+            .snapshot()
+            .into_iter()
+            .map(|(labels, _)| labels[0].clone())
+            .collect();
+        assert!(
+            routes.contains(&"/health".to_string()) && routes.contains(&"/tools".to_string()),
+            "route label must be the matched route template, got {routes:?}"
+        );
+        let statuses: Vec<String> = metrics
+            .requests_by_route
+            .snapshot()
+            .into_iter()
+            .map(|(labels, _)| labels[1].clone())
+            .collect();
+        assert!(
+            statuses.contains(&"200".to_string()),
+            "the successful probes must be labelled 200, got {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&"404".to_string()),
+            "the failed lookups must be labelled with their status: {statuses:?}"
+        );
+        assert!(
+            routes.contains(&"unmatched".to_string()),
+            "a path no route matched must fall back to the `unmatched` label: {routes:?}"
+        );
+
+        // Issue #113: the exposition renders the labelled series, so a
+        // per-route 5xx rate is computable from a scrape.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("recursive_requests_total{route=\"/health\",status=\"200\"} 1"),
+            "missing labelled request series: {text}"
+        );
+        assert!(
+            text.contains("recursive_requests_total{route=\"/tools\",status=\"200\"} 1"),
+            "missing labelled request series: {text}"
+        );
     }
 
     #[tokio::test]

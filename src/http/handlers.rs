@@ -295,6 +295,27 @@ pub(super) async fn readyz(
     )
 }
 
+/// Acquire a run permit, observing how long the request waited (issue #113).
+///
+/// The wait — how long the request sat queued before a run slot freed up — is
+/// the latency the `runs_waiting` gauge cannot express. A timed-out wait is
+/// observed too (`result="timeout"`), so the histogram's `timeout` series
+/// lines up with the 503s the caller returns.
+pub(super) async fn acquire_run_timed(state: &AppState) -> Result<super::RunPermit, AcquireError> {
+    let started = std::time::Instant::now();
+    let result = state.host.admission().acquire_run().await;
+    let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    state.metrics.admission_wait_ms.observe(
+        &[if result.is_ok() {
+            "admitted"
+        } else {
+            "timeout"
+        }],
+        waited_ms,
+    );
+    result
+}
+
 /// Map an admission failure to the standardized API error (Goal 398).
 ///
 /// `Timeout` → `503 Service Unavailable` with a `Retry-After` hint; a closed
@@ -504,23 +525,37 @@ pub(super) fn build_session_runtime_parts(
     crate::preset::apply(builder, preset, &assets, channel)
 }
 
-/// Update metrics after a successful agent run.
+/// Update metrics after a run that returned an outcome.
+///
+/// Issue #113: the run is also filed under its terminal
+/// [`crate::agent::FinishReason`] and its step count / LLM latency are
+/// observed under the model and finish-reason labels. `agent_runs_success`
+/// still counts every `Ok` outcome — a finish reason is *data, not an error*
+/// (invariant #7) — but `agent_runs_finished{finish_reason}` is what tells a
+/// budget stop from a natural completion.
 pub(super) fn record_run_success(
     metrics: &super::Metrics,
-    steps: usize,
-    usage: &crate::llm::TokenUsage,
+    model: &str,
+    outcome: &crate::runtime::RuntimeOutcome,
 ) {
+    let reason = super::finish_reason_label(&outcome.finish_reason);
     metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
     metrics.agent_runs_success.fetch_add(1, Ordering::Relaxed);
     metrics
         .agent_steps_total
-        .fetch_add(steps as u64, Ordering::Relaxed);
+        .fetch_add(outcome.steps as u64, Ordering::Relaxed);
     metrics
         .tokens_prompt_total
-        .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+        .fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
+    metrics.tokens_completion_total.fetch_add(
+        outcome.total_usage.completion_tokens as u64,
+        Ordering::Relaxed,
+    );
+    metrics.agent_runs_finished.inc(&[reason]);
+    metrics.run_steps.observe(&[reason], outcome.steps as u64);
     metrics
-        .tokens_completion_total
-        .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+        .llm_latency_ms
+        .observe(&[model], outcome.llm_latency_ms);
 }
 
 /// Update metrics after a failed agent run.
@@ -534,13 +569,26 @@ pub(super) fn record_run_success(
 /// so readiness is driven by [`record_llm_failure`] instead (a client
 /// cancellation or a tool/storage fault must not take a healthy pod out of
 /// rotation).
-pub(super) fn record_run_failed(metrics: &super::Metrics, usage: &crate::llm::TokenUsage) {
+///
+/// `finish_reason` is the run's terminal reason when there was one — the AG-UI
+/// driver counts a cancelled run as a failure but still knows *why* it
+/// stopped. `None` (an `Err` out of the runtime) files the run under
+/// [`FINISH_REASON_ERROR`](super::FINISH_REASON_ERROR).
+pub(super) fn record_run_failed(
+    metrics: &super::Metrics,
+    usage: &crate::llm::TokenUsage,
+    finish_reason: Option<&crate::agent::FinishReason>,
+) {
     metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
     let wasted = (usage.prompt_tokens as u64).saturating_add(usage.completion_tokens as u64);
     metrics
         .tokens_wasted_on_failure_total
         .fetch_add(wasted, Ordering::Relaxed);
+    metrics.agent_runs_finished.inc(&[match finish_reason {
+        Some(reason) => super::finish_reason_label(reason),
+        None => super::FINISH_REASON_ERROR,
+    }]);
 }
 
 /// Issue #123: a run that really completed proves the LLM endpoint answered —
@@ -652,10 +700,8 @@ pub(super) async fn run_agent(
 
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
-    let _permit = state
-        .host
-        .admission()
-        .acquire_run()
+    // Issue #113: the wait is observed in `admission_wait_ms`.
+    let _permit = acquire_run_timed(&state)
         .await
         .map_err(|e| admission_error(e, &state.host.admission()))?;
     let max_steps = body.max_steps.unwrap_or(state.config.max_steps as u32) as usize;
@@ -712,6 +758,11 @@ pub(super) async fn run_agent(
     .build()
     .map_err(|e| ApiError::internal(format!("failed to build runtime: {e}")))?;
 
+    // Issue #113: a one-shot run has no other sink, so the metrics sink
+    // supplies the only visibility into its tool errors / retries /
+    // compactions.
+    runtime.set_event_sink(Arc::new(super::MetricsSink::new(state.metrics.clone())));
+
     // Issue #31 §B: this one-shot run owns its environment (container tier
     // creates one per run) — destroy it on BOTH exits so no container
     // outlives the request.
@@ -719,7 +770,7 @@ pub(super) async fn run_agent(
         Ok(o) => o,
         Err(e) => {
             runtime.destroy_environment().await;
-            record_run_failed(&state.metrics, &runtime.last_failed_usage());
+            record_run_failed(&state.metrics, &runtime.last_failed_usage(), None);
             // Issue #123: only a failure of the LLM call itself says the
             // endpoint is down — a tool or storage error must not.
             if e.is_llm_failure() {
@@ -730,7 +781,7 @@ pub(super) async fn run_agent(
     };
     runtime.destroy_environment().await;
 
-    record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
+    record_run_success(&state.metrics, &state.config.model, &outcome);
     // Issue #114: one-shot runs have no session to accumulate into, so their
     // USD goes straight into the global counter.
     state
@@ -750,7 +801,10 @@ pub(super) async fn run_agent(
     let usage = UsageInfo::from_turn(&state.config.model, &outcome);
 
     Ok(Json(RunResponse {
-        status: "success".into(),
+        // Issue #113: `status` reflects the terminal finish reason. Every
+        // termination used to report `"success"` — a run stopped by its budget
+        // was indistinguishable from one the model answered.
+        status: super::run_status_label(&outcome.finish_reason).to_string(),
         finish_reason,
         messages,
         usage,
@@ -1828,10 +1882,8 @@ pub(super) async fn send_session_message(
 
     // Acquire a run permit with a bounded wait (Goal 398): a saturated pool
     // now fails fast with 503 + Retry-After instead of hanging the request.
-    let _permit = state
-        .host
-        .admission()
-        .acquire_run()
+    // Issue #113: the wait is observed in `admission_wait_ms`.
+    let _permit = acquire_run_timed(&state)
         .await
         .map_err(|e| admission_error(e, &state.host.admission()))?;
     // Lock the runtime for this turn. The fence above already serializes the
@@ -1868,6 +1920,9 @@ pub(super) async fn send_session_message(
         .with_turn(turn),
     );
     let mut event_sinks: Vec<Box<dyn crate::event::EventSink>> = vec![Box::new(sink)];
+    // Issue #113: fold tool errors / retries / compactions into `/metrics`
+    // alongside the SSE and Langfuse sinks — never instead of them.
+    event_sinks.push(Box::new(super::MetricsSink::new(state.metrics.clone())));
     crate::observability::with_sink(&langfuse_run, &mut event_sinks);
     runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(event_sinks)));
 
@@ -1945,7 +2000,7 @@ pub(super) async fn send_session_message(
     let outcome = match run_result {
         Ok(outcome) => outcome,
         Err(e) => {
-            record_run_failed(&state.metrics, &failed_usage);
+            record_run_failed(&state.metrics, &failed_usage, None);
             // Issue #114: a failed turn still burned the tokens of every step
             // that completed — fold them into the session ledger too, or the
             // session books stay low exactly where issue #115 fixed the global
@@ -1969,7 +2024,7 @@ pub(super) async fn send_session_message(
     // session accumulator and update the global counters, then persist the
     // snapshot so it survives a restart — a cold load restores it.
     usage_arc.record(outcome.total_usage, outcome.llm_latency_ms);
-    record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
+    record_run_success(&state.metrics, usage_arc.model(), &outcome);
     state
         .metrics
         .record_cost_usd(usage_arc.model(), &outcome.total_usage);
@@ -2318,6 +2373,10 @@ pub(super) async fn agui_run(
     // its admission slot (and `runs_in_flight` stays truthful) until the run
     // actually finishes, instead of releasing it when the handler returns
     // while the agent keeps running in the background.
+    //
+    // Issue #113: this path deliberately does NOT feed
+    // `admission_wait_ms` — a non-blocking acquire waits zero by
+    // construction, so every `/agui` run would only add a 0 ms sample.
     let permit = state.host.admission().try_acquire_run().map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2614,7 +2673,7 @@ fn agui_prepare_error_response(
 /// GET /metrics — Prometheus exposition format.
 pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
     let metrics = &state.metrics;
-    let requests_total = metrics.requests_total.load(Ordering::Relaxed);
+
     let requests_active = metrics.requests_active.load(Ordering::Relaxed);
     let agent_runs_total = metrics.agent_runs_total.load(Ordering::Relaxed);
     let agent_runs_success = metrics.agent_runs_success.load(Ordering::Relaxed);
@@ -2624,9 +2683,6 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let tokens_wasted_on_failure_total = metrics
         .tokens_wasted_on_failure_total
         .load(Ordering::Relaxed);
-    // Issue #114: total billed USD across completed runs (micro-USD stored,
-    // exposed as a float counter).
-    let cost_usd_total = metrics.cost_usd_total();
     let agent_steps_total = metrics.agent_steps_total.load(Ordering::Relaxed);
     let sessions_active = metrics.sessions_active.load(Ordering::Relaxed);
     let rate_limits_rejected = metrics.rate_limits_rejected.load(Ordering::Relaxed);
@@ -2678,11 +2734,8 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let last_llm_success_ms = metrics.last_llm_success_ms.load(Ordering::Relaxed);
     let llm_failures_consecutive = metrics.llm_failures_consecutive.load(Ordering::Relaxed);
 
-    format!(
-        "# HELP recursive_requests_total Total HTTP requests\n\
-         # TYPE recursive_requests_total counter\n\
-         recursive_requests_total {requests_total}\n\
-         # HELP recursive_requests_active Currently active HTTP requests\n\
+    let mut out = format!(
+        "# HELP recursive_requests_active Currently active HTTP requests\n\
          # TYPE recursive_requests_active gauge\n\
          recursive_requests_active {requests_active}\n\
          # HELP recursive_agent_runs_total Total agent runs\n\
@@ -2703,9 +2756,6 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_tokens_wasted_on_failure_total Tokens burned by failed agent runs\n\
          # TYPE recursive_tokens_wasted_on_failure_total counter\n\
          recursive_tokens_wasted_on_failure_total {tokens_wasted_on_failure_total}\n\
-         # HELP recursive_cost_usd_total Total billed USD across completed runs (issue #114)\n\
-         # TYPE recursive_cost_usd_total counter\n\
-         recursive_cost_usd_total {cost_usd_total:.6}\n\
          # HELP recursive_agent_steps_total Total agent steps executed\n\
          # TYPE recursive_agent_steps_total counter\n\
          recursive_agent_steps_total {agent_steps_total}\n\
@@ -2745,7 +2795,62 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_llm_failures_consecutive Failed LLM runs since the last success; decayed by /readyz once the streak is older than the readiness window (issue #123)\n\
          # TYPE recursive_llm_failures_consecutive gauge\n\
          recursive_llm_failures_consecutive {llm_failures_consecutive}\n"
-    )
+    );
+    // ── Issue #113: labelled families and histograms ───────────────────
+    // The `route` label is the matched route *template*, so a 5xx / 503 rate
+    // is computable per endpoint without unbounded cardinality.
+    out.push_str(&metrics.requests_by_route.render(
+        "recursive_requests_total",
+        "Total HTTP requests by matched route template and response status (issue #113)",
+        &["route", "status"],
+    ));
+    out.push_str(&metrics.agent_runs_finished.render(
+        "recursive_agent_runs_finished_total",
+        "Agent runs by terminal finish_reason — success/failure alone cannot tell a budget stop from a stuck loop (issue #113)",
+        &["finish_reason"],
+    ));
+    out.push_str(&metrics.cost_micro_usd_by_model.render_scaled(
+        "recursive_cost_usd_total",
+        "Billed USD across completed runs, by model (issue #113)",
+        &["model"],
+        1_000_000.0,
+    ));
+    out.push_str(&metrics.tool_errors.render(
+        "recursive_tool_errors_total",
+        "Tool results that came back as errors, by tool (issue #113)",
+        &["tool"],
+    ));
+    out.push_str(&metrics.llm_retries.render(
+        "recursive_llm_retries_total",
+        "LLM retries by reason (issue #113)",
+        &["reason"],
+    ));
+    out.push_str(&metrics.compactions.render(
+        "recursive_compactions_total",
+        "Compaction attempts by kind (issue #113)",
+        &["kind"],
+    ));
+    out.push_str(&metrics.compaction_skipped.render(
+        "recursive_compaction_skipped_total",
+        "Compactions skipped by reason (issue #113)",
+        &["reason"],
+    ));
+    out.push_str(&metrics.llm_latency_ms.render(
+        "recursive_llm_latency_ms",
+        "LLM latency of a completed run in milliseconds, by model (issue #113)",
+        &["model"],
+    ));
+    out.push_str(&metrics.run_steps.render(
+        "recursive_run_steps",
+        "Steps taken by a completed run, by finish_reason (issue #113)",
+        &["finish_reason"],
+    ));
+    out.push_str(&metrics.admission_wait_ms.render(
+        "recursive_admission_wait_ms",
+        "Time a request waited for an admission permit, by outcome (issue #113)",
+        &["result"],
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -4117,8 +4222,27 @@ mod tests {
         storage: Arc<dyn crate::storage::StorageBackend>,
         max_concurrent: usize,
     ) -> Arc<AppState> {
-        use crate::tools::ToolRegistry;
         use std::sync::atomic::AtomicU64;
+        readyz_state_with_gate(
+            metrics,
+            storage,
+            crate::http::AdmissionGate::new(
+                max_concurrent,
+                Duration::ZERO,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+        )
+    }
+
+    /// [`readyz_state`] with an explicit admission gate — lets a test pin a
+    /// saturated (0-permit) pool.
+    fn readyz_state_with_gate(
+        metrics: crate::http::Metrics,
+        storage: Arc<dyn crate::storage::StorageBackend>,
+        gate: crate::http::AdmissionGate,
+    ) -> Arc<AppState> {
+        use crate::tools::ToolRegistry;
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         let config = crate::config::Config::from_env().unwrap();
@@ -4132,18 +4256,55 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             host: Arc::new(crate::session_host::SessionHost::new(
                 Duration::from_secs(3600),
-                crate::http::AdmissionGate::new(
-                    max_concurrent,
-                    Duration::ZERO,
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)),
-                ),
+                gate,
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Issue #113: a saturated pool's *wait* is observed — both when a permit
+    /// eventually arrives and when the wait times out, so the histogram's
+    /// `timeout` series lines up with the 503s callers receive.
+    #[tokio::test]
+    async fn acquire_run_timed_observes_admitted_and_timed_out_waits() {
+        use std::sync::atomic::AtomicU64;
+
+        let saturated = readyz_state_with_gate(
+            crate::http::Metrics::default(),
+            readyz_local_storage("admission-timeout"),
+            crate::http::AdmissionGate::from_semaphore(
+                Arc::new(tokio::sync::Semaphore::new(0)),
+                Duration::from_millis(1),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+        );
+        let err = match acquire_run_timed(&saturated).await {
+            Ok(_) => panic!("a 0-permit gate must time out"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, crate::http::AcquireError::Timeout { .. }));
+        let timed_out = saturated.metrics.admission_wait_ms.snapshot();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].labels, vec!["timeout".to_string()]);
+        assert_eq!(timed_out[0].count, 1);
+
+        let free = readyz_state(
+            crate::http::Metrics::default(),
+            readyz_local_storage("admission-admitted"),
+            8,
+        );
+        let permit = acquire_run_timed(&free)
+            .await
+            .expect("an idle pool admits immediately");
+        drop(permit);
+        let admitted = free.metrics.admission_wait_ms.snapshot();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].labels, vec!["admitted".to_string()]);
+        assert_eq!(admitted[0].count, 1);
     }
 
     fn readyz_local_storage(tag: &str) -> Arc<dyn crate::storage::StorageBackend> {
@@ -4524,6 +4685,60 @@ mod tests {
         }
     }
 
+    /// An outcome with `steps` steps and an LLM latency of 42 ms.
+    fn outcome_with(
+        finish_reason: crate::agent::FinishReason,
+        steps: usize,
+    ) -> crate::runtime::RuntimeOutcome {
+        crate::runtime::RuntimeOutcome {
+            final_text: Some("done".into()),
+            finish_reason,
+            total_usage: crate::llm::TokenUsage::default(),
+            steps,
+            llm_latency_ms: 42,
+            checkpoint_id: None,
+        }
+    }
+
+    /// A natural completion.
+    fn success_outcome(steps: usize) -> crate::runtime::RuntimeOutcome {
+        outcome_with(crate::agent::FinishReason::NoMoreToolCalls, steps)
+    }
+
+    /// Issue #113: a completed run is filed under its terminal finish reason,
+    /// and its step count / LLM latency are observed under the labels a
+    /// dashboard would group by — including the `budget_exceeded` variant,
+    /// which `agent_runs_success` alone cannot distinguish from a model answer.
+    #[test]
+    fn record_run_success_files_finish_reason_steps_and_latency() {
+        let metrics = crate::http::Metrics::default();
+        record_run_success(&metrics, "deepseek-chat", &success_outcome(3));
+        record_run_success(
+            &metrics,
+            "deepseek-chat",
+            &outcome_with(crate::agent::FinishReason::BudgetExceeded, 12),
+        );
+
+        assert_eq!(
+            metrics.agent_runs_finished.snapshot(),
+            vec![
+                (vec!["budget_exceeded".to_string()], 1),
+                (vec!["no_more_tool_calls".to_string()], 1),
+            ]
+        );
+        let steps = metrics.run_steps.snapshot();
+        assert_eq!(steps.len(), 2, "one series per finish reason: {steps:?}");
+        assert!(
+            steps.iter().all(|s| s.count == 1 && s.sum >= 3),
+            "every series must carry its own observations: {steps:?}"
+        );
+        let latency = metrics.llm_latency_ms.snapshot();
+        assert_eq!(latency.len(), 1, "latency is labelled by model only");
+        assert_eq!(latency[0].labels, vec!["deepseek-chat".to_string()]);
+        assert_eq!(latency[0].sum, 84, "both runs observed 42 ms");
+        assert_eq!(latency[0].count, 2);
+    }
+
     /// Issue #123: a run that completed resets the failure streak and stamps
     /// the success instant; an LLM *call* failure bumps the streak and stamps
     /// its own instant — while a plain run failure (a cancellation, a tool or
@@ -4537,7 +4752,7 @@ mod tests {
     fn record_run_metrics_track_llm_streak() {
         let metrics = crate::http::Metrics::default();
         let none = crate::llm::TokenUsage::default();
-        record_run_failed(&metrics, &none);
+        record_run_failed(&metrics, &none, None);
         // Issue #115: a failed run that burned tokens must move the wasted
         // counter — the failure path used to record zero usage.
         let wasted = crate::llm::TokenUsage {
@@ -4546,11 +4761,17 @@ mod tests {
             total_tokens: 42,
             ..Default::default()
         };
-        record_run_failed(&metrics, &wasted);
+        record_run_failed(&metrics, &wasted, None);
         assert_eq!(
             metrics.agent_runs_failed.load(Ordering::Relaxed),
             2,
             "run failures are still counted"
+        );
+        // Issue #113: an `Err` out of the runtime has no finish reason, so it
+        // is filed under the sentinel label — never dropped.
+        assert_eq!(
+            metrics.agent_runs_finished.snapshot(),
+            vec![(vec![crate::http::FINISH_REASON_ERROR.to_string()], 2)]
         );
         assert_eq!(
             metrics
@@ -4577,7 +4798,7 @@ mod tests {
             "an LLM failure stamps its instant"
         );
 
-        record_run_success(&metrics, 1, &crate::llm::TokenUsage::default());
+        record_run_success(&metrics, "test-model", &success_outcome(1));
         record_llm_success(&metrics);
         assert_eq!(
             metrics.llm_failures_consecutive.load(Ordering::Relaxed),
@@ -4631,7 +4852,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(small.cost_micro_usd_total.load(Ordering::Relaxed), 1);
+        // Issue #113: the micro-USD total is kept per model.
+        assert_eq!(
+            small.cost_micro_usd_by_model.snapshot(),
+            vec![(vec!["deepseek-chat".to_string()], 1)]
+        );
 
         // A total above $1 exercises the micro→USD division: 10M input tokens
         // at $0.14/M = $1.40. (A `% 1e6` mutant would report the remainder.)
@@ -4652,27 +4877,31 @@ mod tests {
         );
     }
 
-    /// Issue #114: the cost counter is always exposed on `/metrics`, even at
-    /// zero (Prometheus consumers need the series to exist).
+    /// Issue #113: the cost counter is exposed per model — a single grand
+    /// total could not answer "which model burns the budget". Micro-USD is
+    /// scaled to dollars at render time.
     #[tokio::test]
-    async fn metrics_handler_exposes_cost_usd_total() {
+    async fn metrics_handler_exposes_cost_usd_total_per_model() {
         let metrics = crate::http::Metrics::default();
+        // $0.28 worth of deepseek-chat input tokens.
+        metrics.record_cost_usd(
+            "deepseek-chat",
+            &crate::llm::TokenUsage {
+                prompt_tokens: 2_000_000,
+                total_tokens: 2_000_000,
+                cache_miss_tokens: 2_000_000,
+                ..Default::default()
+            },
+        );
         let state = readyz_state(metrics, readyz_local_storage("cost"), 8);
         let output = metrics_handler(State(state)).await;
         assert!(
-            output.contains("recursive_cost_usd_total 0.000000"),
-            "a fresh server must still expose the USD counter: {output}"
+            output.contains("recursive_cost_usd_total{model=\"deepseek-chat\"} 0.280000"),
+            "micro-USD must render as dollars under the model label: {output}"
         );
-
-        let metrics = crate::http::Metrics {
-            cost_micro_usd_total: AtomicU64::new(280_000),
-            ..crate::http::Metrics::default()
-        };
-        let state = readyz_state(metrics, readyz_local_storage("cost2"), 8);
-        let output = metrics_handler(State(state)).await;
         assert!(
-            output.contains("recursive_cost_usd_total 0.280000"),
-            "280000 micro-USD must render as 0.28: {output}"
+            output.contains("# HELP recursive_cost_usd_total"),
+            "a billed server must expose the USD counter: {output}"
         );
     }
 

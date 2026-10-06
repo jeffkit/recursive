@@ -11,6 +11,7 @@ mod cold_load;
 #[cfg(test)]
 mod environment_binding_tests;
 mod handlers;
+mod metrics;
 mod rate_limit;
 pub mod triggers;
 mod usage;
@@ -25,6 +26,12 @@ pub use auth::{
     ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS,
 };
 pub use handlers::map_agent_event;
+// Issue #113: labelled counter / histogram families, the bounded finish-reason
+// labels and the run-event metrics sink.
+pub use metrics::{
+    finish_reason_label, run_status_label, CounterFamily, HistogramFamily, HistogramSnapshot,
+    MetricsSink, FINISH_REASON_ERROR,
+};
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 // Issue #114: per-session usage / cost accounting shared by the HTTP handlers
 // and visible to SDK consumers constructing [`SessionState`] directly.
@@ -71,22 +78,38 @@ use crate::tools::ToolRegistry;
 
 // ── Metrics ────────────────────────────────────────────────────────────────
 
-/// Prometheus-compatible metrics collector using lock-free atomic counters.
-#[derive(Default)]
+/// Prometheus-compatible metrics collector.
+///
+/// Scalar gauges / totals stay `AtomicU64`; anything the exposition needs to
+/// split by a dimension is a [`CounterFamily`] or [`HistogramFamily`]
+/// (issue #113). `Default` is implemented by hand because the histograms need
+/// their bucket ladders configured — `#[derive(Default)]` would silently build
+/// them with no buckets at all.
 pub struct Metrics {
-    pub requests_total: AtomicU64,
+    /// Issue #113: HTTP requests by **matched route template** (`route`) and
+    /// response status (`status`). The route label is axum's `MatchedPath`
+    /// (`/sessions/{id}/messages`), never the concrete path — a session id
+    /// would make the cardinality unbounded. This is what makes a per-route
+    /// 5xx / 503 (admission saturation) *rate* computable.
+    pub requests_by_route: CounterFamily,
+    /// Requests currently being served (gauge).
     pub requests_active: AtomicU64,
     pub agent_runs_total: AtomicU64,
     pub agent_runs_success: AtomicU64,
     pub agent_runs_failed: AtomicU64,
     pub tokens_prompt_total: AtomicU64,
     pub tokens_completion_total: AtomicU64,
-    /// Issue #114: total billed USD across completed runs, stored in
-    /// **micro-USD** (`1e-6 USD`) because `AtomicU64` cannot hold an `f64`.
-    /// Exposed as the float counter `recursive_cost_usd_total` via
-    /// [`Metrics::cost_usd_total`]. Unpriced models contribute nothing —
-    /// only runs priced by `crate::llm::pricing_for` move it.
-    pub cost_micro_usd_total: AtomicU64,
+    /// Issue #113: completed runs by terminal `finish_reason` (bounded
+    /// vocabulary, see [`finish_reason_label`]). `agent_runs_success` counts
+    /// every turn that returned an outcome; this family says *how* each one
+    /// ended, so a `budget_exceeded` stop is visible instead of hiding inside
+    /// "success".
+    pub agent_runs_finished: CounterFamily,
+    /// Issue #113: billed USD per `model`, stored in **micro-USD** (`1e-6
+    /// USD`) because [`CounterFamily`] holds integers. Exposed (scaled) as
+    /// `recursive_cost_usd_total{model="…"}`. Unpriced models contribute
+    /// nothing — only runs priced by `crate::llm::pricing_for` move it.
+    pub cost_micro_usd_by_model: CounterFamily,
     /// Issue #115: tokens burned by runs that ended in an error. A failed
     /// turn still spent its completed steps' tokens; before this counter the
     /// failure path recorded nothing, so quota/budget calibration was
@@ -143,26 +166,96 @@ pub struct Metrics {
     pub persist_failures: AtomicU64,
     /// Issue #123: sessions removed by the idle reaper (counter).
     pub sessions_evicted: AtomicU64,
+    // ── Issue #113: histograms ─────────────────────────────────────────
+    /// Per-`model` LLM latency of a completed run, fed from
+    /// [`crate::runtime::RuntimeOutcome::llm_latency_ms`] — the runtime
+    /// measured it all along, but it only ever reached the `/run` response
+    /// body, never a Prometheus series.
+    pub llm_latency_ms: HistogramFamily,
+    /// Per-`finish_reason` step count of a completed run.
+    pub run_steps: HistogramFamily,
+    /// How long a request waited for an admission permit, by outcome
+    /// (`admitted` / `timeout`). The queue depth gauges said *that* a pool was
+    /// saturated; this says how long the latency actually was. `/agui` is
+    /// excluded: its non-blocking acquire waits zero by construction.
+    pub admission_wait_ms: HistogramFamily,
+    // ── Issue #113: runtime-event counters (see [`MetricsSink`]) ───────
+    /// Tool results that came back as errors, by tool name.
+    pub tool_errors: CounterFamily,
+    /// LLM retries by reason (`rate_limited` / `server_error` / `timeout` /
+    /// `network` / `empty_body`) — a retry storm was previously invisible.
+    pub llm_retries: CounterFamily,
+    /// Compaction attempts by kind (`summary` / `micro` / `boundary`).
+    pub compactions: CounterFamily,
+    /// Compactions that were skipped, by reason (`circuit_breaker` / `error`).
+    pub compaction_skipped: CounterFamily,
+}
+
+/// Upper bounds (milliseconds) for [`Metrics::llm_latency_ms`].
+const LLM_LATENCY_MS_BUCKETS: &[u64] = &[
+    25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000,
+];
+/// Upper bounds (steps) for [`Metrics::run_steps`].
+const RUN_STEPS_BUCKETS: &[u64] = &[1, 2, 3, 5, 8, 13, 21, 34, 55, 100, 200];
+/// Upper bounds (milliseconds) for [`Metrics::admission_wait_ms`]. The default
+/// admission timeout is 30 s, so every bounded wait lands inside the ladder.
+const ADMISSION_WAIT_MS_BUCKETS: &[u64] = &[
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000,
+];
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            requests_by_route: CounterFamily::default(),
+            requests_active: AtomicU64::new(0),
+            agent_runs_total: AtomicU64::new(0),
+            agent_runs_success: AtomicU64::new(0),
+            agent_runs_failed: AtomicU64::new(0),
+            tokens_prompt_total: AtomicU64::new(0),
+            tokens_completion_total: AtomicU64::new(0),
+            agent_runs_finished: CounterFamily::default(),
+            cost_micro_usd_by_model: CounterFamily::default(),
+            tokens_wasted_on_failure_total: AtomicU64::new(0),
+            agent_steps_total: AtomicU64::new(0),
+            sessions_active: AtomicU64::new(0),
+            rate_limits_rejected: AtomicU64::new(0),
+            runs_waiting: Arc::new(AtomicU64::new(0)),
+            runs_in_flight: Arc::new(AtomicU64::new(0)),
+            last_llm_success_ms: AtomicU64::new(0),
+            llm_failures_consecutive: AtomicU64::new(0),
+            last_llm_failure_ms: AtomicU64::new(0),
+            readyz_storage_probed_ms: AtomicU64::new(0),
+            readyz_storage_ok: AtomicBool::new(false),
+            persist_failures: AtomicU64::new(0),
+            sessions_evicted: AtomicU64::new(0),
+            llm_latency_ms: HistogramFamily::new(LLM_LATENCY_MS_BUCKETS),
+            run_steps: HistogramFamily::new(RUN_STEPS_BUCKETS),
+            admission_wait_ms: HistogramFamily::new(ADMISSION_WAIT_MS_BUCKETS),
+            tool_errors: CounterFamily::default(),
+            llm_retries: CounterFamily::default(),
+            compactions: CounterFamily::default(),
+            compaction_skipped: CounterFamily::default(),
+        }
+    }
 }
 
 impl Metrics {
-    /// Issue #114: fold a completed run's USD cost into the global counter,
-    /// using the same pricing the per-session accounting bills with. An
-    /// unpriced model contributes nothing (`pricing_for` → `None` → $0.00),
-    /// and the float → integer cast saturates, so a NaN / negative value
-    /// (which the pricing tables never produce) cannot poison the total.
+    /// Issue #114 / #113: fold a completed run's USD cost into the per-model
+    /// counter, using the same pricing the per-session accounting bills with.
+    /// An unpriced model contributes nothing (`pricing_for` → `None` →
+    /// $0.00), and the float → integer cast saturates, so a NaN / negative
+    /// value (which the pricing tables never produce) cannot poison the total.
     pub fn record_cost_usd(&self, model: &str, usage: &crate::llm::TokenUsage) {
         let usd = crate::llm::pricing_for(model)
             .map(|p| p.cost_usd(*usage))
             .unwrap_or(0.0);
         let micro_usd = (usd * 1_000_000.0).round() as u64;
-        self.cost_micro_usd_total
-            .fetch_add(micro_usd, Ordering::Relaxed);
+        self.cost_micro_usd_by_model.add(&[model], micro_usd);
     }
 
-    /// Total billed USD across all completed runs.
+    /// Total billed USD across all completed runs (all models combined).
     pub fn cost_usd_total(&self) -> f64 {
-        self.cost_micro_usd_total.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        self.cost_micro_usd_by_model.total() as f64 / 1_000_000.0
     }
 }
 
@@ -745,7 +838,13 @@ pub struct RunRequest {
     pub max_budget_usd: Option<f64>,
 }
 
-/// Successful response from `POST /run`.
+/// Response from `POST /run` (issue #113 redefined `status`).
+///
+/// `status` is derived from `finish_reason`: `"success"` only when the model
+/// answered (`no_more_tool_calls`), otherwise the terminal reason
+/// (`"budget_exceeded"`, `"stuck"`, `"cancelled"`, `"wall_clock_exceeded"`, …)
+/// — it used to be a hardcoded `"success"` for every termination. A finish
+/// reason is data, not an error (invariant #7), so the HTTP status stays 200.
 #[derive(serde::Serialize, Debug)]
 pub struct RunResponse {
     pub status: String,
@@ -1478,8 +1577,16 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         the capacity/data-loss series `recursive_sse_clients`, \
                         `recursive_agui_runs`, `recursive_persist_failures`, \
                         `recursive_sessions_evicted`, `recursive_llm_last_success_ms` and \
-                        `recursive_llm_failures_consecutive`. Issue #114 adds \
-                        `recursive_cost_usd_total` (counter, USD billed across completed runs).",
+                        `recursive_llm_failures_consecutive`. \
+                        Issue #113 adds the labelled series `recursive_requests_total` \
+                        (`route` = matched route template, `status`), \
+                        `recursive_agent_runs_finished_total` (`finish_reason`), \
+                        `recursive_cost_usd_total` (`model`), `recursive_tool_errors_total` \
+                        (`tool`), `recursive_llm_retries_total` (`reason`), \
+                        `recursive_compactions_total` (`kind`) / \
+                        `recursive_compaction_skipped_total` (`reason`), plus the histograms \
+                        `recursive_llm_latency_ms` (`model`), `recursive_run_steps` \
+                        (`finish_reason`) and `recursive_admission_wait_ms` (`result`).",
                     "responses": {
                         "200": {
                             "description": "Prometheus text format",
@@ -1600,7 +1707,10 @@ pub fn build_openapi_spec() -> serde_json::Value {
                 "RunResponse": {
                     "type": "object",
                     "properties": {
-                        "status": { "type": "string" },
+                        "status": {
+                            "type": "string",
+                            "description": "issue #113: derived from finish_reason — `success` only for `no_more_tool_calls`, otherwise the terminal reason (`budget_exceeded`, `stuck`, `cancelled`, `wall_clock_exceeded`, …)."
+                        },
                         "finish_reason": { "type": "string" },
                         "messages": { "type": "array", "items": { "type": "object" } },
                         "usage": { "$ref": "#/components/schemas/UsageInfo" }

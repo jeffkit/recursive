@@ -1032,7 +1032,14 @@ pub(crate) fn spawn_agui_run(
     }));
 
     let (sink, mut event_rx) = ChannelSink::new();
-    runtime.set_event_sink(Arc::new(sink));
+    // Issue #113: the AG-UI channel sink fans out to the metrics sink too, so
+    // an AG-UI run's tool errors / retries / compactions reach `/metrics` the
+    // same way a session run's do.
+    let sinks: Vec<Box<dyn crate::event::EventSink>> = vec![
+        Box::new(sink),
+        Box::new(super::MetricsSink::new(metrics.clone())),
+    ];
+    runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(sinks)));
 
     // Converter task: forward AgentEvents → AG-UI Events. Owns the
     // AguiConverter so framing state survives across the whole run.
@@ -1132,7 +1139,7 @@ pub(crate) fn spawn_agui_run(
         );
         match &outcome {
             Ok(o) if !cancelled => {
-                super::handlers::record_run_success(&metrics, o.steps, &o.total_usage);
+                super::handlers::record_run_success(&metrics, &drv_model, o);
                 // Issue #114: an `/agui` run is a completed run like any other
                 // — without this the USD counter silently excluded AG-UI
                 // spend while `agent_runs_total` / `tokens_prompt_total`
@@ -1146,13 +1153,16 @@ pub(crate) fn spawn_agui_run(
             Err(e) => {
                 // Issue #115: a failed turn still burned its completed steps'
                 // tokens — account for them instead of dropping the spend.
-                super::handlers::record_run_failed(&metrics, &runtime.last_failed_usage());
+                super::handlers::record_run_failed(&metrics, &runtime.last_failed_usage(), None);
                 if e.is_llm_failure() {
                     super::handlers::record_llm_failure(&metrics);
                 }
             }
-            // A cancelled run did not complete, so its tokens are wasted too.
-            Ok(o) => super::handlers::record_run_failed(&metrics, &o.total_usage),
+            // A cancelled run did not complete, so its tokens are wasted too —
+            // but it is still filed under `cancelled`, not `error`.
+            Ok(o) => {
+                super::handlers::record_run_failed(&metrics, &o.total_usage, Some(&o.finish_reason))
+            }
         }
 
         // Persist the run into the thread's native session (issue #57):

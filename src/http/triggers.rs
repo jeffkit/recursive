@@ -586,7 +586,7 @@ async fn run_in_session(
     session
         .last_active_ms
         .store(super::now_session_ms(), Ordering::Relaxed);
-    let _permit = match state.host.admission().acquire_run().await {
+    let _permit = match super::handlers::acquire_run_timed(state).await {
         Ok(p) => p,
         Err(e) => {
             return (session.id.clone(), None, format!("admission failed: {e:?}"));
@@ -605,7 +605,7 @@ async fn run_in_session(
 /// persisted under a deterministic `trigger-<id>-<timestamp>` key so
 /// post-hoc inspection works; the in-memory session is not registered.
 async fn one_shot_run(state: &Arc<AppState>, goal: &str) -> (String, Option<String>, String) {
-    let _permit = match state.host.admission().acquire_run().await {
+    let _permit = match super::handlers::acquire_run_timed(state).await {
         Ok(p) => p,
         Err(e) => return (String::new(), None, format!("admission failed: {e:?}")),
     };

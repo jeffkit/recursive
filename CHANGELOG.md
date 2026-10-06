@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- feat(http): `/metrics` grew the labels, histograms and finish-reason
+  breakdown an operator needs (#113). `Metrics` was a flat set of bare
+  atomics, so a per-route 5xx rate did not exist, spend could not be attributed
+  to a model, `BudgetExceeded` was billed as a success, and compaction /
+  retry / tool-error activity was invisible. `recursive_requests_total` now
+  carries `route` (the axum **matched route template**, so `/sessions/{id}/…`
+  never mints a series per session id) and `status`, which makes a per-route
+  5xx — including the 503 an admission-saturated pool returns —
+  computable. `recursive_cost_usd_total` is split by `model`,
+  `recursive_agent_runs_finished_total{finish_reason}` files every
+  termination under its (bounded) variant, `recursive_tool_errors_total`,
+  `recursive_llm_retries_total`, `recursive_compactions_total` /
+  `recursive_compaction_skipped_total` are fed by a new `MetricsSink` wired
+  into `/run`, session turns and `/agui`, and three histograms —
+  `recursive_llm_latency_ms{model}` (the latency the runtime always measured
+  but never exposed as a series), `recursive_run_steps{finish_reason}` and
+  `recursive_admission_wait_ms{result}` — make tail latency visible.
+  `POST /run`'s `status` is now derived from `finish_reason` (`"success"`
+  only for a natural `no_more_tool_calls`; HTTP stays 200 — a finish reason is
+  data, not an error). No new dependency.
 - feat(http): the HTTP channel now accounts token usage and USD cost per
   session, and clients can finally read a price (#114). `SessionState` held
   only two in-memory atomics (`prompt_tokens` / `completion_tokens`): no cache

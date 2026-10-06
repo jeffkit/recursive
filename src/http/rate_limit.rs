@@ -422,16 +422,35 @@ fn pick_eviction_victim(
     best.map(|(k, _)| k.clone())
 }
 
-/// Middleware that increments request counters.
+/// Middleware that counts every request by matched route and response status
+/// (issue #113) and tracks the in-flight gauge.
+///
+/// The route label comes from [`axum::extract::MatchedPath`], which the router
+/// inserts before the per-route layers run — so it is the **route template**
+/// (`/sessions/{id}/messages`), not the concrete path. That is what keeps the
+/// `route` dimension bounded; labelling by `req.uri().path()` would mint one
+/// series per session id. A request no route matched (404) is labelled
+/// `unmatched`.
+///
+/// The status is read *after* the inner service runs, so a 5xx — including the
+/// 503 an admission-saturated pool returns — is recorded against the route
+/// that produced it.
 pub(super) async fn metrics_middleware(
     axum::extract::State(metrics): axum::extract::State<Arc<Metrics>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
     metrics.requests_active.fetch_add(1, Ordering::Relaxed);
     let response = next.run(req).await;
     metrics.requests_active.fetch_sub(1, Ordering::Relaxed);
+    metrics
+        .requests_by_route
+        .inc(&[&route, &response.status().as_u16().to_string()]);
     response
 }
 
