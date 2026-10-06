@@ -25,6 +25,9 @@ use super::RunMeta;
 pub const ATTR_TRACE_NAME: &str = "langfuse.trace.name";
 /// `langfuse.trace.sessionId` — groups traces by session.
 pub const ATTR_TRACE_SESSION_ID: &str = "langfuse.trace.sessionId";
+/// `session.id` — Langfuse v4 native session key (alias of the trace-level
+/// `langfuse.trace.sessionId`; sent on every span so the Sessions view groups).
+pub const ATTR_SESSION_ID: &str = "session.id";
 /// `langfuse.trace.tags` — string-array tag list.
 pub const ATTR_TRACE_TAGS: &str = "langfuse.trace.tags";
 /// `langfuse.observation.type` — `"span"` or `"generation"`.
@@ -35,6 +38,9 @@ pub const ATTR_OBSERVATION_MODEL: &str = "langfuse.observation.model.name";
 pub const ATTR_OBSERVATION_INPUT: &str = "langfuse.observation.input";
 /// `langfuse.observation.output` — (redacted) observation output.
 pub const ATTR_OBSERVATION_OUTPUT: &str = "langfuse.observation.output";
+/// `langfuse.observation.cost_details` — Langfuse v4 native cost key: a JSON
+/// object such as `{"total": 0.0009}` (USD).
+pub const ATTR_OBSERVATION_COST_DETAILS: &str = "langfuse.observation.cost_details";
 /// `langfuse.observation.level` — `DEFAULT` / `ERROR`.
 pub const ATTR_OBSERVATION_LEVEL: &str = "langfuse.observation.level";
 /// `gen_ai.usage.input_tokens`.
@@ -500,10 +506,18 @@ impl RunCollector {
                 format!("{OBSERVATION_METADATA_PREFIX}cost_usd"),
                 AttrValue::Float(self.total_cost_usd),
             ),
+            (
+                ATTR_OBSERVATION_COST_DETAILS.to_string(),
+                AttrValue::Str(cost_details_json(self.total_cost_usd)),
+            ),
         ];
         if !self.meta.session_id.is_empty() {
             attrs.push((
                 ATTR_TRACE_SESSION_ID.to_string(),
+                AttrValue::Str(self.meta.session_id.clone()),
+            ));
+            attrs.push((
+                ATTR_SESSION_ID.to_string(),
                 AttrValue::Str(self.meta.session_id.clone()),
             ));
         }
@@ -599,7 +613,17 @@ impl RunCollector {
                 format!("{OBSERVATION_METADATA_PREFIX}cost_usd"),
                 AttrValue::Float(step.cost_usd),
             ),
+            (
+                ATTR_OBSERVATION_COST_DETAILS.to_string(),
+                AttrValue::Str(cost_details_json(step.cost_usd)),
+            ),
         ];
+        if !self.meta.session_id.is_empty() {
+            attrs.push((
+                ATTR_SESSION_ID.to_string(),
+                AttrValue::Str(self.meta.session_id.clone()),
+            ));
+        }
         if let Some(latency) = step.latency_ms {
             attrs.push((
                 format!("{OBSERVATION_METADATA_PREFIX}llm_latency_ms"),
@@ -732,6 +756,12 @@ fn is_success_finish(reason: &str) -> bool {
 
 fn cost_usd(model: &str, usage: TokenUsage) -> f64 {
     pricing_for(model).map(|p| p.cost_usd(usage)).unwrap_or(0.0)
+}
+
+/// Langfuse v4 `langfuse.observation.cost_details` payload: a JSON object
+/// carrying the total USD, which populates the native cost column/aggregates.
+fn cost_details_json(cost_usd: f64) -> String {
+    serde_json::json!({ "total": cost_usd }).to_string()
 }
 
 #[cfg(test)]
@@ -1254,6 +1284,74 @@ mod tests {
             attr(root, &format!("{OBSERVATION_METADATA_PREFIX}cost_usd")),
             Some(&AttrValue::Float(0.0))
         );
+    }
+
+    #[test]
+    fn v4_native_session_and_cost_keys_populate_grouping_and_cost() {
+        let mut c = collector();
+        c.ingest(
+            &AgentEvent::Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 1_000_000,
+                step: 0,
+            },
+            at(1),
+        );
+        let records = c.records();
+        let root = &records[0];
+        let step = &records[1];
+
+        // Langfuse v4 maps `session.id` → session grouping.
+        assert_eq!(
+            attr(root, ATTR_SESSION_ID),
+            Some(&AttrValue::Str("sess-1".into()))
+        );
+        assert_eq!(
+            attr(step, ATTR_SESSION_ID),
+            Some(&AttrValue::Str("sess-1".into()))
+        );
+
+        // v4 maps `langfuse.observation.cost_details.total` → the cost column.
+        let root_cost = json_total(root);
+        let step_cost = json_total(step);
+        let total_usd = match attr(root, &format!("{OBSERVATION_METADATA_PREFIX}cost_usd")) {
+            Some(AttrValue::Float(v)) => *v,
+            other => panic!("expected root cost_usd float, got {other:?}"),
+        };
+        assert!(total_usd > 0.0);
+        assert_eq!(root_cost, total_usd);
+        assert_eq!(step_cost, total_usd);
+    }
+
+    #[test]
+    fn empty_session_omits_both_session_keys() {
+        let mut c = RunCollector::new(RunMeta::new("", "deepseek-chat", "deepseek"), true, t0());
+        c.ingest(&AgentEvent::Latency { step: 0, llm_ms: 1 }, at(1));
+        let records = c.records();
+        assert!(attr(&records[0], ATTR_SESSION_ID).is_none());
+        assert!(attr(&records[1], ATTR_SESSION_ID).is_none());
+    }
+
+    #[test]
+    fn cost_details_is_json_with_a_numeric_total() {
+        assert_eq!(cost_details_json(0.0), "{\"total\":0.0}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&cost_details_json(0.5)).expect("valid JSON");
+        assert_eq!(parsed["total"].as_f64(), Some(0.5));
+    }
+
+    /// Parse `langfuse.observation.cost_details` off `obs` and return its
+    /// `total` in USD.
+    fn json_total(obs: &Observation) -> f64 {
+        let raw = match attr(obs, ATTR_OBSERVATION_COST_DETAILS) {
+            Some(AttrValue::Str(s)) => s,
+            other => panic!("expected cost_details string, got {other:?}"),
+        };
+        serde_json::from_str::<serde_json::Value>(raw).expect("cost_details is JSON")["total"]
+            .as_f64()
+            .expect("total is a number")
     }
 
     #[test]

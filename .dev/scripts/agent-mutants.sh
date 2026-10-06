@@ -35,7 +35,12 @@ CRATE="recursive-agent"
 # Feature set: enable test-utils so test helpers compile, plus common
 # optional features that unlock more code paths / mutant candidates.
 # weixin is excluded here (UI-only, no agent-kernel logic under test).
-FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,acp,coordinator-mode"
+# `otel` is REQUIRED: src/observability/{collector,config,exporter}.rs are
+# #[cfg(feature = "otel")]-gated, so without it those files are not compiled —
+# cargo-mutants still generates mutants there (it walks the AST, not the build
+# graph) but every mutation is a no-op and is reported MISSED, failing the gate
+# on any change to the observability module.
+FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,acp,coordinator-mode,otel"
 
 # Default: parallel copy mode. --jobs N runs N cargo build/test jobs
 # concurrently; JOBS>1 drops --in-place (parallel in-place mutation would
