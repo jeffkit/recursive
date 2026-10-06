@@ -63,6 +63,11 @@ pub struct AgentRuntimeBuilder {
     /// into the runtime so `GET /sessions/:id` can report the effective preset
     /// without re-deriving it.
     preset_id: Option<String>,
+    /// Issue #119: shared bridge to the `agent` tool's worker runtimes. The
+    /// host creates one slot, hands it to both
+    /// [`crate::register_subagent_if_enabled`] and the runtime, and the
+    /// runtime publishes its sink / drains worker usage through it.
+    worker_telemetry: Option<crate::tools::WorkerTelemetrySlot>,
 }
 
 impl std::fmt::Debug for AgentRuntimeBuilder {
@@ -110,6 +115,7 @@ impl AgentRuntimeBuilder {
             loop_retry: crate::runtime::LoopRetryPolicy::default(),
             wakeup_store_dir: None,
             preset_id: None,
+            worker_telemetry: None,
         }
     }
 
@@ -268,6 +274,19 @@ impl AgentRuntimeBuilder {
     /// Issue #127: stamp the agent preset this session is assembled from.
     pub fn with_preset_id(mut self, id: String) -> Self {
         self.preset_id = Some(id);
+        self
+    }
+
+    /// Issue #119: attach the worker telemetry bridge shared with the
+    /// `agent` tool. The runtime publishes its event sink into the bridge
+    /// (so delegated workers emit through the same consumer, attributed) and
+    /// drains the usage workers burned into each turn's accounting.
+    ///
+    /// Pass the same slot to
+    /// [`crate::register_subagent_if_enabled`]; a runtime whose bridge has no
+    /// matching `agent` tool simply drains nothing.
+    pub fn worker_telemetry(mut self, slot: crate::tools::WorkerTelemetrySlot) -> Self {
+        self.worker_telemetry = Some(slot);
         self
     }
 
@@ -552,7 +571,7 @@ impl AgentRuntimeBuilder {
             kernel.tools_mut().freeze_deferred_specs();
         }
 
-        Ok(AgentRuntime {
+        let runtime = AgentRuntime {
             kernel,
             transcript: Arc::new(transcript),
             event_sink,
@@ -583,7 +602,12 @@ impl AgentRuntimeBuilder {
             deliverables,
             last_failed_usage: TokenUsage::default(),
             pending_compact_usage: TokenUsage::default(),
-        })
+            worker_telemetry: self.worker_telemetry,
+        };
+        // Issue #119: publish the freshly built sink into the bridge so any
+        // already-registered `agent` tool's workers emit through it.
+        runtime.publish_worker_event_sink();
+        Ok(runtime)
     }
 }
 

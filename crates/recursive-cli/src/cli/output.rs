@@ -234,9 +234,44 @@ pub(crate) fn format_cost_line(cost: Option<f64>, model: &str) -> String {
     }
 }
 
+/// Issue #119: render a delegated worker's forwarded event for the human CLI
+/// stream. Returns `None` for the worker's internal events (step-level noise
+/// stays out of the parent's stream). Kept pure so the mapping is unit-testable
+/// without capturing stdout.
+fn format_worker_event(worker_id: &str, event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => Some(format!(
+            "[worker {worker_id}] tokens: prompt={input_tokens} completion={output_tokens}"
+        )),
+        AgentEvent::AssistantText { text, .. } if !text.trim().is_empty() => {
+            Some(format!("[worker {worker_id}] {text}"))
+        }
+        AgentEvent::ToolCall { name, .. } => Some(format!("[worker {worker_id}] -> {name}")),
+        AgentEvent::TurnFinished { reason, steps } => Some(format!(
+            "[worker {worker_id}] done after {steps} steps (reason: {reason})"
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) async fn stream_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
+            // Issue #119: a delegated worker's activity was previously lost
+            // with its `NullSink`; surface the interesting parts, attributed.
+            AgentEvent::WorkerEvent {
+                ref worker_id,
+                ref event,
+                ..
+            } => {
+                if let Some(line) = format_worker_event(worker_id, event) {
+                    println!("{line}");
+                }
+            }
             AgentEvent::AssistantText { ref text, step } if !text.trim().is_empty() => {
                 println!("[step {step}] assistant: {text}");
             }
@@ -312,6 +347,16 @@ pub(crate) async fn stream_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
 pub(crate) async fn stream_events_repl(mut rx: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
+            // Issue #119: surface delegated-worker activity in the REPL too.
+            AgentEvent::WorkerEvent {
+                ref worker_id,
+                ref event,
+                ..
+            } => {
+                if let Some(line) = format_worker_event(worker_id, event) {
+                    println!("{line}");
+                }
+            }
             AgentEvent::AssistantText { ref text, .. } if !text.trim().is_empty() => {
                 println!("{text}");
             }
@@ -614,5 +659,92 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("provider stopped"), "unexpected: {msg}");
         assert!(msg.contains("rate_limited"), "missing reason: {msg}");
+    }
+
+    // ── Issue #119: delegated-worker events on the human CLI stream ──────────
+
+    #[test]
+    fn format_worker_event_renders_usage_with_worker_id() {
+        let line = format_worker_event(
+            "coder",
+            &AgentEvent::Usage {
+                input_tokens: 123,
+                output_tokens: 45,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 123,
+                step: 2,
+            },
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("[worker coder] tokens: prompt=123 completion=45")
+        );
+    }
+
+    #[test]
+    fn format_worker_event_renders_text_tool_call_and_turn_finish() {
+        assert_eq!(
+            format_worker_event(
+                "planner",
+                &AgentEvent::AssistantText {
+                    text: "on it".into(),
+                    step: 0,
+                }
+            )
+            .as_deref(),
+            Some("[worker planner] on it")
+        );
+        assert_eq!(
+            format_worker_event(
+                "planner",
+                &AgentEvent::ToolCall {
+                    name: "Read".into(),
+                    id: "c1".into(),
+                    arguments: "{}".into(),
+                    step: 0,
+                }
+            )
+            .as_deref(),
+            Some("[worker planner] -> Read")
+        );
+        assert_eq!(
+            format_worker_event(
+                "planner",
+                &AgentEvent::TurnFinished {
+                    reason: "no_more_tool_calls".into(),
+                    steps: 3,
+                }
+            )
+            .as_deref(),
+            Some("[worker planner] done after 3 steps (reason: no_more_tool_calls)")
+        );
+    }
+
+    #[test]
+    fn format_worker_event_drops_internal_and_blank_events() {
+        // Internal worker events must stay out of the parent's stream.
+        assert_eq!(
+            format_worker_event(
+                "w",
+                &AgentEvent::Compacted {
+                    removed: 1,
+                    kept: 2,
+                    summary_chars: 3,
+                    step: 0,
+                }
+            ),
+            None
+        );
+        // Blank assistant text is not worth a line.
+        assert_eq!(
+            format_worker_event(
+                "w",
+                &AgentEvent::AssistantText {
+                    text: "   ".into(),
+                    step: 0,
+                }
+            ),
+            None
+        );
     }
 }

@@ -143,7 +143,10 @@ pub use dispatch::{new_shared_sandbox_roots, resolve_within_any, AccessTier, Sha
 // ── Re-exports from individual tool modules ─────────────────────────────────
 
 pub use a2a::{A2aCallTool, A2aCardTool, A2aTaskCheckTool};
-pub use agent::{AgentTool, SharedMemoryRead, SharedMemoryWrite};
+pub use agent::{
+    AgentTool, SharedMemoryRead, SharedMemoryWrite, WorkerTelemetry, WorkerTelemetrySlot,
+    WorkerUsage,
+};
 pub use agent_defs::{AgentDefinition, AgentDefinitions};
 pub use artifacts::{ArtifactListTool, ArtifactReadTool, ArtifactStore};
 pub use checkpoint::{

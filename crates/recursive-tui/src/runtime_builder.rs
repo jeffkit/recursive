@@ -333,11 +333,17 @@ pub fn build_runtime() -> TuiRuntime {
     )));
     // Channel-agnostic sub-agent tool registration, in lockstep with the
     // coordinator prompt injected by `assemble_system_prompt`.
+    // Issue #119: one telemetry bridge shared by the `agent` tool and this
+    // runtime, so TUI workers report their events and usage to the session.
+    let worker_telemetry: recursive::tools::WorkerTelemetrySlot = Arc::new(std::sync::Mutex::new(
+        recursive::tools::WorkerTelemetry::new(),
+    ));
     let tools = register_subagent_if_enabled(
         tools,
         &config,
         provider.clone(),
         Some(subagent_token_slot.clone()),
+        Some(worker_telemetry.clone()),
     );
     // Issue #127: the session's agent preset is resolved once, up front —
     // both the prompt profile and the builder consume it. `RECURSIVE_AGENT_PRESET`
@@ -373,6 +379,8 @@ pub fn build_runtime() -> TuiRuntime {
     // preset — the same single assembly point the CLI and HTTP channels use,
     // so the three can no longer drift apart.
     let builder = apply_preset(builder, &preset, read_state, skills.clone());
+    // Issue #119: publish the TUI's sink to workers and bill their usage.
+    let builder = builder.worker_telemetry(worker_telemetry);
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {
@@ -491,11 +499,17 @@ fn build_runtime_with_skill_tx(
 
     // Channel-agnostic sub-agent tool registration, in lockstep with the
     // coordinator prompt injected by `assemble_system_prompt`.
+    // Issue #119: one telemetry bridge shared by the `agent` tool and this
+    // runtime, so TUI workers report their events and usage to the session.
+    let worker_telemetry: recursive::tools::WorkerTelemetrySlot = Arc::new(std::sync::Mutex::new(
+        recursive::tools::WorkerTelemetry::new(),
+    ));
     tools = register_subagent_if_enabled(
         tools,
         &config,
         provider.clone(),
         Some(subagent_token_slot.clone()),
+        Some(worker_telemetry.clone()),
     );
     // Issue #127: the session's agent preset is resolved once, up front —
     // both the prompt profile and the builder consume it. `RECURSIVE_AGENT_PRESET`
@@ -531,6 +545,8 @@ fn build_runtime_with_skill_tx(
     // preset — the same single assembly point the CLI and HTTP channels use,
     // so the three can no longer drift apart.
     let builder = apply_preset(builder, &preset, read_state, skills.clone());
+    // Issue #119: publish the TUI's sink to workers and bill their usage.
+    let builder = builder.worker_telemetry(worker_telemetry);
     let build = match builder.build() {
         Ok(rt) => RuntimeBuild::Ready(Some(Box::new(rt))),
         Err(e) => RuntimeBuild::Offline {

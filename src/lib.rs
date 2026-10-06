@@ -89,7 +89,7 @@ pub use config::Config;
 pub use error::{Error, Result};
 pub use event::{
     AgentEvent, ChannelSink, CompositeSink, EnvelopeSink, EnvelopedEvent, EventMeta, EventSink,
-    NullSink,
+    NullSink, WorkerEventSink,
 };
 pub use hooks::ExternalHookRunner;
 pub use hooks::ToolTimingHook;

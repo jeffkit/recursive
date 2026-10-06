@@ -336,6 +336,31 @@ impl RunCollector {
                 self.total_usage = self.total_usage.accumulate(usage);
                 self.total_cost_usd += cost_usd(&self.meta.model, usage);
             }
+            // Issue #119: a delegated worker's usage counts toward the parent
+            // trace's totals — worker spend used to be dropped entirely — but
+            // its steps stay out of the parent's step list: the worker's
+            // `step` numbers are its own and would collide with the parent's.
+            AgentEvent::WorkerEvent { event: inner, .. } => {
+                if let AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_hit_tokens,
+                    cache_miss_tokens,
+                    ..
+                } = inner.as_ref()
+                {
+                    let usage = TokenUsage {
+                        prompt_tokens: *input_tokens,
+                        completion_tokens: *output_tokens,
+                        total_tokens: input_tokens.saturating_add(*output_tokens),
+                        cache_hit_tokens: *cache_hit_tokens,
+                        cache_miss_tokens: *cache_miss_tokens,
+                        reasoning_tokens: 0,
+                    };
+                    self.total_usage = self.total_usage.accumulate(usage);
+                    self.total_cost_usd += cost_usd(&self.meta.model, usage);
+                }
+            }
             AgentEvent::LlmRetry {
                 step,
                 attempt,
@@ -1237,5 +1262,56 @@ mod tests {
         assert!(!c.is_finished());
         c.finish(Some("stuck"), None, at(9));
         assert!(c.is_finished());
+    }
+
+    /// Issue #119: a delegated worker's `Usage` reaches the parent trace's
+    /// totals (worker spend used to be dropped entirely) without polluting the
+    /// parent's step list — the worker's `step` numbers are its own.
+    #[test]
+    fn worker_usage_counts_toward_trace_totals_but_not_steps() {
+        let mut c = collector();
+        c.ingest(
+            &AgentEvent::WorkerEvent {
+                worker_id: "coder".into(),
+                task_id: None,
+                event: Box::new(AgentEvent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 40,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 100,
+                    step: 0,
+                }),
+            },
+            at(5),
+        );
+        assert_eq!(c.total_usage.prompt_tokens, 100);
+        assert_eq!(c.total_usage.completion_tokens, 40);
+        assert!(c.total_cost_usd > 0.0, "worker cost must be counted");
+        assert!(
+            c.steps.is_empty(),
+            "a worker's steps must not enter the parent's step list"
+        );
+    }
+
+    /// A worker's non-usage events are ignored rather than corrupting the
+    /// parent trace (e.g. a worker `TurnFinished` must not advance the parent's
+    /// turn counter).
+    #[test]
+    fn worker_non_usage_events_do_not_touch_parent_trace() {
+        let mut c = collector();
+        c.ingest(
+            &AgentEvent::WorkerEvent {
+                worker_id: "w".into(),
+                task_id: None,
+                event: Box::new(AgentEvent::TurnFinished {
+                    reason: "no_more_tool_calls".into(),
+                    steps: 3,
+                }),
+            },
+            at(5),
+        );
+        assert_eq!(c.turn, 0, "worker TurnFinished must not advance the turn");
+        assert_eq!(c.finish_reason, None);
+        assert_eq!(c.total_usage.prompt_tokens, 0);
     }
 }

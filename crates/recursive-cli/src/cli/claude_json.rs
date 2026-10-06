@@ -373,6 +373,12 @@ impl ClaudeJsonEmitter {
             | AgentEvent::GoalAchieved { .. }
             | AgentEvent::GoalCleared
             | AgentEvent::HookSystemMessage { .. } => Vec::new(),
+            // Issue #119: a delegated worker's events stay off the Claude wire.
+            // The worker's token usage is already folded into the parent
+            // runtime's outcome, so it reaches the terminal `result` envelope;
+            // its assistant text / tool calls must not become parent
+            // `assistant` / `tool_use` frames, and its step numbers are its own.
+            AgentEvent::WorkerEvent { .. } => Vec::new(),
             // `AgentEvent` is `#[non_exhaustive]` — ignore future variants.
             _ => Vec::new(),
         }

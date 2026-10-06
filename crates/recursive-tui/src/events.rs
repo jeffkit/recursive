@@ -57,6 +57,23 @@ pub enum UiEvent {
         /// Tokens written to the provider's prompt cache.
         cache_miss_tokens: u64,
     },
+    /// Issue #119: token usage reported by a delegated worker's own runtime.
+    ///
+    /// Kept separate from [`Self::Usage`] because a worker's numbers describe
+    /// *its* context, not the session's: they accumulate into the session
+    /// totals (so worker spend shows up in the status bar and cost estimate)
+    /// but must not move the live per-turn cache-hit rate or the
+    /// "context window in use" gauge — those read the parent's most recent
+    /// LLM call, and blending a worker's much smaller prompt into them would
+    /// misreport the session.
+    WorkerUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        /// Tokens served from the provider's prompt cache.
+        cache_hit_tokens: u64,
+        /// Tokens written to the provider's prompt cache.
+        cache_miss_tokens: u64,
+    },
     /// Goal-328: locally-estimated per-component breakdown of the
     /// prompt sent to the provider. Mirrors the kernel's
     /// [`AgentEvent::ContextBreakdown`] event but in the TUI's

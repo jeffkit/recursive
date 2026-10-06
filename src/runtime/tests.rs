@@ -2816,3 +2816,203 @@ fn drive_turn_creates_instrumented_correlated_span() {
         "the dead Span::current().record(session_id) write must be gone"
     );
 }
+
+// ── Issue #119: delegated-worker usage folds into the parent turn ──────────
+
+#[tokio::test]
+async fn worker_telemetry_usage_is_folded_into_the_turn() {
+    let llm = Arc::new(MockProvider::new(vec![
+        Completion {
+            content: "ok".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+        Completion {
+            content: "again".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        },
+    ]));
+    let telemetry: crate::tools::WorkerTelemetrySlot =
+        Arc::new(std::sync::Mutex::new(crate::tools::WorkerTelemetry::new()));
+    telemetry.lock().unwrap_or_else(|e| e.into_inner()).record(
+        crate::llm::TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+            total_tokens: 42,
+            ..Default::default()
+        },
+        250,
+    );
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .worker_telemetry(telemetry.clone())
+        .build()
+        .unwrap();
+
+    // The runtime publishes its own sink into the shared bridge at build time.
+    assert!(
+        telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .event_sink()
+            .is_some(),
+        "build() must publish the runtime's event sink for workers"
+    );
+
+    let out = rt.run("hi").await.unwrap();
+    assert_eq!(out.total_usage.prompt_tokens, 30);
+    assert_eq!(out.total_usage.completion_tokens, 12);
+    // The parent's own (wall-clock) latency is non-deterministic; only the
+    // worker's 250 ms is guaranteed to be included.
+    assert!(
+        out.llm_latency_ms >= 250,
+        "worker latency must fold into the turn, got {}",
+        out.llm_latency_ms
+    );
+
+    // Drained: the bridge is empty and a second turn does not re-bill.
+    assert_eq!(
+        telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_usage(),
+        crate::tools::WorkerUsage::default()
+    );
+    let out2 = rt.run("again").await.unwrap();
+    assert_eq!(
+        out2.total_usage.prompt_tokens, 0,
+        "worker usage must not be re-billed on the next turn"
+    );
+}
+
+#[tokio::test]
+async fn set_event_sink_republishes_to_the_worker_bridge() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let telemetry: crate::tools::WorkerTelemetrySlot =
+        Arc::new(std::sync::Mutex::new(crate::tools::WorkerTelemetry::new()));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .worker_telemetry(telemetry.clone())
+        .build()
+        .unwrap();
+
+    let (sink, _rx) = crate::event::ChannelSink::new();
+    rt.set_event_sink(Arc::new(sink));
+
+    let published = telemetry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .event_sink();
+    assert!(
+        published.is_some(),
+        "set_event_sink must keep the worker bridge pointing at a live sink"
+    );
+}
+
+/// Issue #119 regression: a `background: true` worker outlives the run that
+/// spawned it. The bridge must therefore hold the run's sink only weakly —
+/// with a strong reference the run-scoped channel never closes and the CLI
+/// printer blocks forever on `rx.recv()` at the end of the run.
+#[tokio::test]
+async fn worker_bridge_does_not_pin_the_parent_sink() {
+    let llm = Arc::new(MockProvider::new(vec![]));
+    let telemetry: crate::tools::WorkerTelemetrySlot =
+        Arc::new(std::sync::Mutex::new(crate::tools::WorkerTelemetry::new()));
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    {
+        let mut rt = AgentRuntime::builder()
+            .llm(llm)
+            .worker_telemetry(telemetry.clone())
+            .build()
+            .unwrap();
+        rt.set_event_sink(Arc::new(sink));
+        assert!(
+            telemetry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .event_sink()
+                .is_some(),
+            "the bridge must see the run's live sink"
+        );
+    }
+
+    assert!(
+        telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .event_sink()
+            .is_none(),
+        "a dropped runtime must release the sink a live worker would otherwise pin"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the run's channel must close with the runtime, not stay pinned by the bridge"
+    );
+}
+
+/// Issue #119: a turn that ends in an error returns before `drive_turn_inner`
+/// drains the worker bridge, so the failure path must drain it itself —
+/// otherwise the failed turn's worker spend is reported as zero by the CLI
+/// cost tracker and silently re-billed on the next turn.
+#[tokio::test]
+async fn failed_turn_bills_worker_usage_to_last_failed_usage() {
+    // Step 1 succeeds with a tool call carrying usage; step 2 finds the
+    // scripted queue empty and fails (same shape as
+    // `failed_turn_exposes_last_failed_usage`).
+    let llm = Arc::new(MockProvider::new(vec![Completion {
+        content: String::new(),
+        tool_calls: vec![crate::llm::ToolCall {
+            id: "call_1".into(),
+            name: "nonexistent_tool".into(),
+            arguments: json!({}),
+        }],
+        finish_reason: Some("tool_calls".into()),
+        usage: Some(crate::llm::TokenUsage {
+            prompt_tokens: 77,
+            completion_tokens: 21,
+            total_tokens: 98,
+            ..Default::default()
+        }),
+        reasoning_content: None,
+    }]));
+    let telemetry: crate::tools::WorkerTelemetrySlot =
+        Arc::new(std::sync::Mutex::new(crate::tools::WorkerTelemetry::new()));
+    telemetry.lock().unwrap_or_else(|e| e.into_inner()).record(
+        crate::llm::TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+            total_tokens: 42,
+            ..Default::default()
+        },
+        250,
+    );
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .worker_telemetry(telemetry.clone())
+        .build()
+        .unwrap();
+
+    let result = rt.run("hello").await;
+    assert!(result.is_err(), "expected the second LLM call to fail");
+
+    let wasted = rt.last_failed_usage();
+    assert_eq!(
+        wasted.prompt_tokens, 107,
+        "the failed turn's account must include the workers it dispatched"
+    );
+    assert_eq!(wasted.completion_tokens, 33);
+
+    // Drained: nothing is left to re-bill on the next turn.
+    assert_eq!(
+        telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_usage(),
+        crate::tools::WorkerUsage::default()
+    );
+}

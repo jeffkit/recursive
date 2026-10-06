@@ -106,6 +106,27 @@ impl UsageStats {
         self.last_prompt_tokens = input_tokens.max(cache_sum);
     }
 
+    /// Fold a delegated worker's `Usage` into the accumulated session totals
+    /// (issue #119).
+    ///
+    /// Only the cumulative counters move: a worker reports its *own* context,
+    /// so its per-call readings must not set `input_tokens` / `output_tokens`
+    /// / `last_prompt_tokens` (the parent's live figures) nor its per-turn
+    /// cache counters (which would blend two different prompts into one
+    /// cache-hit rate).
+    pub fn record_worker_usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_hit_tokens: u64,
+        cache_miss_tokens: u64,
+    ) {
+        self.total_input = self.total_input.saturating_add(input_tokens);
+        self.total_output = self.total_output.saturating_add(output_tokens);
+        self.total_cache_hit = self.total_cache_hit.saturating_add(cache_hit_tokens);
+        self.total_cache_miss = self.total_cache_miss.saturating_add(cache_miss_tokens);
+    }
+
     /// Reset the per-turn cache counters. Called when a new turn starts so the
     /// status bar reports the cache-hit rate for the current turn rather than
     /// the whole session.

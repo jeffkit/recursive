@@ -31,7 +31,8 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::agent::FinishReason;
 use crate::error::{Error, Result};
-use crate::llm::{ChatProvider, ToolSpec};
+use crate::event::{EventSink, WorkerEventSink};
+use crate::llm::{ChatProvider, TokenUsage, ToolSpec};
 use crate::multi::{AgentManifest, AgentMode, AgentPool, WorkerManifestEntry};
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder};
 use crate::tasks::{TaskId, TaskRegistry, TaskState};
@@ -272,6 +273,73 @@ impl Drop for WorkerMailboxDoneGuard {
     }
 }
 
+/// Issue #119: token usage and latency burned by delegated worker runs
+/// since the last drain.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct WorkerUsage {
+    /// Token usage summed across every worker turn since the last drain.
+    pub usage: TokenUsage,
+    /// LLM latency summed across every worker turn since the last drain.
+    pub llm_latency_ms: u64,
+}
+
+/// Issue #119: the bridge between a parent runtime and the tools that
+/// dispatch delegated workers.
+///
+/// Without it a worker's runtime runs against [`crate::event::NullSink`] and
+/// its `RuntimeOutcome` usage is dropped on the floor, so worker activity is
+/// invisible to the parent's event consumers and worker spend never reaches
+/// the parent's cost accounting.
+///
+/// The parent runtime publishes its event sink here (workers then emit
+/// through [`WorkerEventSink`], attributed to the worker) and drains the
+/// accumulated [`WorkerUsage`] into the turn that dispatched the workers.
+///
+/// The sink is held **weakly** for the same reason [`WorkerEventSink`] is: a
+/// `background: true` worker outlives the run that spawned it, and a strong
+/// reference here would keep the run-scoped sink (and so the CLI printer's
+/// channel) alive forever.
+#[derive(Default)]
+pub struct WorkerTelemetry {
+    event_sink: Option<std::sync::Weak<dyn EventSink>>,
+    usage: WorkerUsage,
+}
+
+/// A shared [`WorkerTelemetry`] handle, installed on both an [`AgentTool`]
+/// and the runtime that owns it.
+pub type WorkerTelemetrySlot = Arc<Mutex<WorkerTelemetry>>;
+
+impl WorkerTelemetry {
+    /// Create an empty bridge (no sink published, zero usage).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the parent session's event sink for worker runtimes to emit
+    /// through. Overwrites any previously published sink.
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = Some(Arc::downgrade(&sink));
+    }
+
+    /// The currently published parent sink, if the parent still holds it.
+    ///
+    /// `None` once the run that published it has ended and dropped its sink.
+    pub fn event_sink(&self) -> Option<Arc<dyn EventSink>> {
+        self.event_sink.as_ref()?.upgrade()
+    }
+
+    /// Add one worker turn's usage and LLM latency.
+    pub fn record(&mut self, usage: TokenUsage, llm_latency_ms: u64) {
+        self.usage.usage = self.usage.usage.accumulate(usage);
+        self.usage.llm_latency_ms = self.usage.llm_latency_ms.saturating_add(llm_latency_ms);
+    }
+
+    /// Take (and reset to zero) the usage recorded since the last drain.
+    pub fn take_usage(&mut self) -> WorkerUsage {
+        std::mem::take(&mut self.usage)
+    }
+}
+
 /// The unified `agent` delegation tool.
 ///
 /// Spawns one or more specialist sub-agents (workers) according to a
@@ -311,6 +379,10 @@ pub struct AgentTool {
     /// Per-turn token slot (TUI): the host refreshes the token at each turn
     /// start. Only consulted when `shutdown_token` is unset (static wins).
     shutdown_token_slot: Option<crate::multi::SharedTokenSlot>,
+    /// Issue #119: shared bridge to the parent runtime. When set, worker
+    /// runtimes emit through the parent's event sink (attributed) and their
+    /// usage is accumulated for the parent turn to drain.
+    telemetry: Option<WorkerTelemetrySlot>,
 }
 
 impl AgentTool {
@@ -339,6 +411,7 @@ impl AgentTool {
             fallback_deadline_secs: DEFAULT_FALLBACK_DEADLINE_SECS,
             shutdown_token: None,
             shutdown_token_slot: None,
+            telemetry: None,
         }
     }
 
@@ -424,6 +497,45 @@ impl AgentTool {
     pub fn with_shutdown_token_slot(mut self, slot: crate::multi::SharedTokenSlot) -> Self {
         self.shutdown_token_slot = Some(slot);
         self
+    }
+
+    /// Attach the parent runtime's telemetry bridge (issue #119). When set,
+    /// worker runtimes emit their events through the parent's event sink
+    /// (wrapped in [`crate::event::AgentEvent::WorkerEvent`]) and accumulate
+    /// their token usage for the parent turn to drain.
+    pub fn with_worker_telemetry(mut self, slot: WorkerTelemetrySlot) -> Self {
+        self.telemetry = Some(slot);
+        self
+    }
+
+    /// The parent sink a worker should emit through, if the parent runtime
+    /// published one. `None` when no telemetry bridge is attached or the
+    /// parent has not set a sink yet.
+    fn worker_event_sink(
+        &self,
+        worker_id: &str,
+        task_id: Option<&str>,
+    ) -> Option<Arc<dyn EventSink>> {
+        let sink = self
+            .telemetry
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .event_sink()?;
+        let mut wrapped = WorkerEventSink::new(sink, worker_id);
+        if let Some(task_id) = task_id {
+            wrapped = wrapped.with_task_id(task_id);
+        }
+        Some(Arc::new(wrapped))
+    }
+
+    /// Record one worker turn's usage into the telemetry bridge (issue #119).
+    fn record_worker_usage(&self, outcome: &crate::runtime::RuntimeOutcome) {
+        if let Some(slot) = &self.telemetry {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(outcome.total_usage, outcome.llm_latency_ms);
+        }
     }
 
     /// Resolve the effective parent token: a static `shutdown_token` (if set)
@@ -522,9 +634,12 @@ impl AgentTool {
     /// worker: each follow-up prompt is a new turn on the same runtime.
     ///
     /// `worker_id` is used only for shared-memory tool namespacing.
+    /// `task_id` is the background task id when the worker runs as one, used
+    /// only to attribute its forwarded events (issue #119).
     async fn build_worker_runtime(
         &self,
         worker_id: &str,
+        task_id: Option<&str>,
         entry: &WorkerManifestEntry,
         max_steps: usize,
         child_depth: usize,
@@ -571,6 +686,11 @@ impl AgentTool {
             .with_wall_timeout_secs(self.wall_timeout_secs);
         if let Some(token) = self.effective_shutdown_token() {
             child_agent = child_agent.with_shutdown_token(token.child_token());
+        }
+        // Issue #119: descendants report their workers' telemetry up the same
+        // bridge, so a nested dispatch's usage still lands on the root turn.
+        if let Some(telemetry) = &self.telemetry {
+            child_agent = child_agent.with_worker_telemetry(telemetry.clone());
         }
         sub_registry = sub_registry.register(Arc::new(child_agent));
 
@@ -621,6 +741,12 @@ impl AgentTool {
         if let Some(token) = self.effective_shutdown_token() {
             builder = builder.shutdown_token(token.child_token());
         }
+        // Issue #119: emit the worker's events through the parent's sink,
+        // attributed to this worker, instead of dropping them into the
+        // default `NullSink`.
+        if let Some(sink) = self.worker_event_sink(worker_id, task_id) {
+            builder = builder.event_sink(sink);
+        }
         builder.build().map_err(|e| Error::Tool {
             name: "agent".into(),
             call_id: None,
@@ -653,13 +779,16 @@ impl AgentTool {
         let _done_guard = WorkerMailboxDoneGuard { mailbox };
 
         let mut runtime = self
-            .build_worker_runtime(worker_id, entry, max_steps, child_depth)
+            .build_worker_runtime(worker_id, None, entry, max_steps, child_depth)
             .await?;
         let outcome = runtime.run(prompt).await.map_err(|e| Error::Tool {
             name: "agent".into(),
             call_id: None,
             message: format!("worker '{}' failed: {e}", worker_id),
         })?;
+
+        // Issue #119: bill the worker's spend to the parent turn.
+        self.record_worker_usage(&outcome);
 
         let finish_label = match outcome.finish_reason {
             FinishReason::NoMoreToolCalls => "NoMoreToolCalls".to_string(),
@@ -721,14 +850,24 @@ impl AgentTool {
         max_steps: usize,
         child_depth: usize,
     ) -> Result<TaskId> {
-        let runtime = self
-            .build_worker_runtime(worker_id, entry, max_steps, child_depth)
-            .await?;
-        let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
-
-        // Register a TaskState so task_* tools can observe/cancel this worker.
+        // Issue #119: mint the task id before building the runtime (the
+        // worker's forwarded events carry it), but register the `TaskState`
+        // only after a successful build — a failed build must not leave a
+        // registered task behind (the deregister guard lives in the spawned
+        // task, which never runs on that path).
         let (state, task_id) =
             TaskState::new(format!("worker '{worker_id}'"), String::new(), worker_id);
+
+        let runtime = self
+            .build_worker_runtime(
+                worker_id,
+                Some(task_id.0.as_str()),
+                entry,
+                max_steps,
+                child_depth,
+            )
+            .await?;
+        let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
         let state = self.task_registry.register(state).await;
 
         // Continuation channel: the first prompt is enqueued by the spawner;
@@ -749,6 +888,10 @@ impl AgentTool {
 
         // Spawn the long-lived worker task.
         let state_for_task = state.clone();
+        // Issue #119: the spawned task records each worker turn's usage into
+        // the parent's telemetry bridge, so background-worker spend lands on
+        // the parent turn too.
+        let telemetry = self.telemetry.clone();
         // Clone the table + key so the task can deregister itself on EVERY
         // exit path. A `WorkerDeregisterGuard` is a local of the spawned
         // async block, so its `Drop` runs on normal exit (failure return,
@@ -773,6 +916,11 @@ impl AgentTool {
                 let mut rt = runtime.lock().await;
                 match rt.run(&msg).await {
                     Ok(outcome) => {
+                        if let Some(slot) = &telemetry {
+                            slot.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .record(outcome.total_usage, outcome.llm_latency_ms);
+                        }
                         let text = outcome
                             .final_text
                             .unwrap_or_else(|| "(no final message)".to_string());
@@ -907,6 +1055,9 @@ impl AgentTool {
         let workers = self.workers.clone();
         let wall_timeout_secs = self.wall_timeout_secs;
         let fallback_deadline_secs = self.fallback_deadline_secs;
+        // Issue #119: every parallel worker shares the parent's telemetry
+        // bridge so their events and usage all report up.
+        let telemetry = self.telemetry.clone();
         // Child token: cancelling the parent cancels all workers at once;
         // a single worker's runtime never cancels its siblings.
         let child_token = self.effective_shutdown_token().map(|t| t.child_token());
@@ -938,6 +1089,7 @@ impl AgentTool {
             let token_slot = token_slot.clone();
             let rescued = rescued.clone();
             let artifacts = artifacts.clone();
+            let telemetry = telemetry.clone();
 
             handles.push(tokio::spawn(async move {
                 // Deregister on every exit path, including the abort path of
@@ -975,6 +1127,7 @@ impl AgentTool {
                     fallback_deadline_secs,
                     shutdown_token: worker_token,
                     shutdown_token_slot: token_slot,
+                    telemetry,
                 };
                 let result = agent
                     .run_worker(&worker_id, &entry, &prompt, max_steps, child_depth)
@@ -1479,7 +1632,7 @@ impl Tool for AgentTool {
 mod tests {
     use super::*;
     use crate::deliverables::{Budgets, Deliverables};
-    use crate::event::NullSink;
+    use crate::event::{AgentEvent, NullSink};
     use crate::llm::{Completion, MockProvider};
     use crate::tools::{
         ChangeLedgerTool, GlobTool, LocalTransport, PresentTool, ReadFile, SearchFiles,
@@ -1863,6 +2016,57 @@ allowed_tools:
         let output = tasks[0].output_snapshot().await;
         let joined = output.join("\n");
         assert!(joined.contains("first turn done"), "output was: {joined}");
+    }
+
+    /// Issue #119 regression (review blocker): a `background: true` worker
+    /// parks on its prompt channel and outlives the run that spawned it. It
+    /// must not pin the run's sink — with a strong reference the CLI's channel
+    /// printer never sees the channel close and `recursive run` hangs at the
+    /// end of any run that dispatched a background worker.
+    #[tokio::test]
+    async fn background_worker_does_not_pin_the_parent_sink() {
+        let provider = mock_provider(vec![Completion {
+            content: "done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let telemetry: WorkerTelemetrySlot = Arc::new(Mutex::new(WorkerTelemetry::new()));
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        let parent: Arc<dyn crate::event::EventSink> = Arc::new(sink);
+        telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_event_sink(parent.clone());
+
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_worker_telemetry(telemetry.clone());
+        let result = agent
+            .execute(json!({
+                "mode": "single",
+                "background": true,
+                "manifest": { "w1": { "system_prompt": "You are a helper." } },
+                "prompt": "do the first thing"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("spawned as task"), "{result}");
+
+        // The spawning run is over. Draining the channel must terminate even
+        // though the worker task is still alive and parked on its prompt
+        // channel — this is the CLI printer's loop.
+        drop(parent);
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "a live background worker is still pinning the run's sink"
+        );
     }
 
     #[tokio::test]
@@ -2633,7 +2837,7 @@ allowed_tools:
             allowed_tools: vec![],
         };
         let runtime = agent
-            .build_worker_runtime("ro", &entry, 3, 0)
+            .build_worker_runtime("ro", None, &entry, 3, 0)
             .await
             .expect("worker runtime");
         assert!(
@@ -2645,5 +2849,147 @@ allowed_tools:
             !Arc::ptr_eq(&ledger, &worker_ledger),
             "the worker runtime must run on its own ledger"
         );
+    }
+
+    // ── Issue #119: worker telemetry bridge ───────────────────────────────
+
+    #[test]
+    fn worker_telemetry_records_and_takes_usage() {
+        let mut telemetry = WorkerTelemetry::new();
+        assert_eq!(telemetry.take_usage(), WorkerUsage::default());
+
+        telemetry.record(
+            TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                total_tokens: 14,
+                ..Default::default()
+            },
+            100,
+        );
+        telemetry.record(
+            TokenUsage {
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                total_tokens: 6,
+                ..Default::default()
+            },
+            30,
+        );
+        let taken = telemetry.take_usage();
+        assert_eq!(taken.usage.prompt_tokens, 15);
+        assert_eq!(taken.usage.completion_tokens, 5);
+        assert_eq!(taken.llm_latency_ms, 130);
+        // take_usage resets the accumulator.
+        assert_eq!(telemetry.take_usage(), WorkerUsage::default());
+    }
+
+    #[test]
+    fn worker_telemetry_event_sink_round_trips() {
+        let mut telemetry = WorkerTelemetry::new();
+        assert!(telemetry.event_sink().is_none());
+        // The bridge holds the sink weakly, so the owner (here the test, in
+        // production the runtime) must outlive it for the lookup to succeed.
+        let parent: Arc<dyn EventSink> = Arc::new(NullSink);
+        telemetry.set_event_sink(parent.clone());
+        assert!(telemetry.event_sink().is_some());
+        // …and a released sink is reported as gone rather than resurrected.
+        drop(parent);
+        assert!(telemetry.event_sink().is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_telemetry_records_usage_and_forwards_events() {
+        let provider = mock_provider(vec![Completion {
+            content: "done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(TokenUsage {
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                total_tokens: 18,
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        }]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let telemetry: WorkerTelemetrySlot = Arc::new(Mutex::new(WorkerTelemetry::new()));
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        // The bridge holds the sink weakly; in production the runtime owns it.
+        let parent: Arc<dyn EventSink> = Arc::new(sink);
+        telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_event_sink(parent.clone());
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_worker_telemetry(telemetry.clone());
+
+        agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": {
+                    "helper": {
+                        "system_prompt": "You are a helper.",
+                        "allowed_tools": ["Read"]
+                    }
+                },
+                "prompt": "say hi"
+            }))
+            .await
+            .unwrap();
+
+        // Usage reached the bridge…
+        let recorded = telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_usage();
+        assert_eq!(recorded.usage.prompt_tokens, 11);
+        assert_eq!(recorded.usage.completion_tokens, 7);
+
+        // …and the worker's events were forwarded, attributed (issue #119).
+        let mut forwarded = 0usize;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::WorkerEvent {
+                    worker_id, task_id, ..
+                } => {
+                    assert_eq!(worker_id, "helper");
+                    assert_eq!(task_id, None, "foreground worker has no task id");
+                    forwarded += 1;
+                }
+                other => panic!("worker sink must only forward WorkerEvent, got {other:?}"),
+            }
+        }
+        assert!(forwarded > 0, "worker events must reach the parent sink");
+    }
+
+    #[tokio::test]
+    async fn worker_without_telemetry_uses_the_null_sink() {
+        let provider = mock_provider(vec![Completion {
+            content: "done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None);
+        let result = agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": {
+                    "helper": {
+                        "system_prompt": "You are a helper.",
+                        "allowed_tools": ["Read"]
+                    }
+                },
+                "prompt": "say hi"
+            }))
+            .await
+            .unwrap();
+        assert!(result.contains("done"));
     }
 }

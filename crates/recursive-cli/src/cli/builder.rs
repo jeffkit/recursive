@@ -751,7 +751,19 @@ pub(crate) async fn build_runtime(
             .clone()
             .map(|token| Arc::new(Mutex::new(Some(token))))
     });
-    tools = register_subagent_if_enabled(tools, config, provider.clone(), subagent_token_slot);
+    // Issue #119: one bridge shared by the `agent` tool and this runtime, so
+    // worker events reach the session's sink and worker usage lands on the
+    // session's cost accounting. The runtime fills the sink half at build
+    // (and on every `set_event_sink` swap).
+    let worker_telemetry: recursive::tools::WorkerTelemetrySlot =
+        Arc::new(Mutex::new(recursive::tools::WorkerTelemetry::new()));
+    tools = register_subagent_if_enabled(
+        tools,
+        config,
+        provider.clone(),
+        subagent_token_slot,
+        Some(worker_telemetry.clone()),
+    );
     // Issue #65: the operator allow-list is the last word — applied after
     // sub-agent registration so the surface is exactly the allowed set.
     apply_operator_allow_list(&mut tools, config);
@@ -858,6 +870,9 @@ pub(crate) async fn build_runtime(
     if let Some(sink) = event_sink {
         builder = builder.event_sink(sink);
     }
+    // Issue #119: hand the runtime the bridge it shares with the `agent`
+    // tool, so it can publish its sink and drain worker usage per turn.
+    builder = builder.worker_telemetry(worker_telemetry);
     builder.build().map_err(Into::into)
 }
 

@@ -158,6 +158,22 @@ impl App {
                     cache_miss_tokens,
                 );
             }
+            UiEvent::WorkerUsage {
+                input_tokens,
+                output_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
+            } => {
+                // Issue #119: worker spend joins the session totals, but a
+                // worker's context is not the session's — it must not move the
+                // live per-turn cache rate or the context gauge.
+                self.usage.record_worker_usage(
+                    input_tokens,
+                    output_tokens,
+                    cache_hit_tokens,
+                    cache_miss_tokens,
+                );
+            }
             UiEvent::ContextBreakdown { breakdown } => {
                 self.usage.record_breakdown(breakdown);
             }
@@ -1193,6 +1209,41 @@ mod tests {
         });
         assert_eq!(app.usage.turn_cache_hit, 200);
         assert_eq!(app.usage.turn_cache_miss, 5);
+    }
+
+    /// Issue #119: a delegated worker's spend joins the session totals but
+    /// must not touch the parent's most-recent-call figures (`input_tokens`
+    /// drive the context gauge via `last_prompt_tokens`) or the per-turn cache
+    /// rate — a worker runs in its own context, so blending it in would
+    /// misreport the session.
+    #[test]
+    fn worker_usage_updates_totals_only() {
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.handle_ui_event(UiEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_hit_tokens: 60,
+            cache_miss_tokens: 40,
+        });
+
+        app.handle_ui_event(UiEvent::WorkerUsage {
+            input_tokens: 7,
+            output_tokens: 8,
+            cache_hit_tokens: 1,
+            cache_miss_tokens: 6,
+        });
+
+        assert_eq!(app.usage.total_input, 107);
+        assert_eq!(app.usage.total_output, 58);
+        assert_eq!(app.usage.total_cache_hit, 61);
+        assert_eq!(app.usage.total_cache_miss, 46);
+        // The parent's own last call is untouched.
+        assert_eq!(app.usage.input_tokens, 100);
+        assert_eq!(app.usage.output_tokens, 50);
+        assert_eq!(app.usage.last_prompt_tokens, 100);
+        assert_eq!(app.usage.turn_cache_hit, 60);
+        assert_eq!(app.usage.turn_cache_miss, 40);
     }
 
     // ── error event ─────────────────────────────────────────────────

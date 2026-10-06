@@ -329,6 +329,28 @@ pub fn map_agent_event(event: AgentEvent) -> Option<UiEvent> {
         }),
         AgentEvent::HookSystemMessage { text } => Some(UiEvent::HookSystemMessage { text }),
 
+        // Issue #119: a delegated worker's token usage counts toward this
+        // session's spend, so it reaches the usage panel — as `WorkerUsage`,
+        // which updates the session totals without disturbing the parent's
+        // per-turn cache rate or context gauge. Only `Usage` is mapped —
+        // a worker's assistant text / tool calls / turn boundaries must not
+        // be interleaved into the parent's transcript.
+        AgentEvent::WorkerEvent { event, .. } => match event.as_ref() {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
+                ..
+            } => Some(UiEvent::WorkerUsage {
+                input_tokens: *input_tokens as u64,
+                output_tokens: *output_tokens as u64,
+                cache_hit_tokens: *cache_hit_tokens as u64,
+                cache_miss_tokens: *cache_miss_tokens as u64,
+            }),
+            _ => None,
+        },
+
         _ => None,
     }
 }
@@ -2650,6 +2672,68 @@ mod tests {
         );
     }
 
+    /// Issue #119: a delegated worker's token usage reaches the session's
+    /// usage panel (worker spend used to be dropped entirely), mapped to the
+    /// worker-specific variant so it updates the session totals without
+    /// masquerading as a parent LLM call. Distinct field values pin each field
+    /// of the mapping.
+    #[test]
+    fn map_worker_usage_reaches_the_usage_panel() {
+        let ev = AgentEvent::WorkerEvent {
+            worker_id: "coder".into(),
+            task_id: Some("task-3".into()),
+            event: Box::new(AgentEvent::Usage {
+                input_tokens: 11,
+                output_tokens: 22,
+                cache_hit_tokens: 3,
+                cache_miss_tokens: 4,
+                step: 0,
+            }),
+        };
+        assert_eq!(
+            map_agent_event(ev),
+            Some(UiEvent::WorkerUsage {
+                input_tokens: 11,
+                output_tokens: 22,
+                cache_hit_tokens: 3,
+                cache_miss_tokens: 4,
+            })
+        );
+    }
+
+    /// Issue #119: a worker's non-usage events must NOT leak into the parent's
+    /// transcript / status bar — only `Usage` is re-mapped.
+    #[test]
+    fn map_worker_non_usage_event_is_dropped() {
+        for inner in [
+            AgentEvent::AssistantText {
+                text: "worker chatter".into(),
+                step: 1,
+            },
+            AgentEvent::ToolCall {
+                name: "Read".into(),
+                id: "call-1".into(),
+                arguments: "{}".into(),
+                step: 1,
+            },
+            AgentEvent::TurnFinished {
+                reason: "done".into(),
+                steps: 2,
+            },
+        ] {
+            let ev = AgentEvent::WorkerEvent {
+                worker_id: "w".into(),
+                task_id: None,
+                event: Box::new(inner),
+            };
+            assert_eq!(
+                map_agent_event(ev),
+                None,
+                "only worker Usage may reach the parent UI"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn tui_event_sink_emit_forwards_mapped_event() {
         let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -2661,6 +2745,37 @@ mod tests {
         .await;
         let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
         assert_eq!(got, Ok(Some(UiEvent::TurnFinished)));
+    }
+
+    /// Issue #119: end-to-end over the TUI sink — a worker's usage event must
+    /// land on the UI channel (previously `map_agent_event` turned it into
+    /// `None`, so worker spend never reached the panel).
+    #[tokio::test]
+    async fn tui_event_sink_emit_forwards_worker_usage() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
+        let sink = TuiEventSink { tx };
+        sink.emit(AgentEvent::WorkerEvent {
+            worker_id: "coder".into(),
+            task_id: None,
+            event: Box::new(AgentEvent::Usage {
+                input_tokens: 7,
+                output_tokens: 8,
+                cache_hit_tokens: 1,
+                cache_miss_tokens: 6,
+                step: 0,
+            }),
+        })
+        .await;
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert_eq!(
+            got,
+            Ok(Some(UiEvent::WorkerUsage {
+                input_tokens: 7,
+                output_tokens: 8,
+                cache_hit_tokens: 1,
+                cache_miss_tokens: 6,
+            }))
+        );
     }
 
     #[tokio::test]

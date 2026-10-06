@@ -841,6 +841,12 @@ async fn main() -> anyhow::Result<()> {
                 Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                     http_shutdown.clone(),
                 )))),
+                // Issue #119: the HTTP server shares one `agent` tool across
+                // sessions, so a single bridge cannot route worker telemetry to
+                // a per-session sink without leaking across sessions. Worker
+                // usage/events stay off for HTTP until the tool is built
+                // per session.
+                None,
             );
             // Issue #65: the operator allow-list is the last word — applied
             // after sub-agent registration so /tools is exactly the allowed
@@ -2386,6 +2392,11 @@ async fn run_loop(
     // Sub-agent tool registration (channel-agnostic) + common prompt assembly,
     // matching every other agent-loop surface. Issue #40: one-shot filled
     // slot with the loop's static shutdown token (never refreshed).
+    // Issue #119: the loop owns one runtime, so one telemetry bridge is safe
+    // to share with the `agent` tool.
+    let worker_telemetry: recursive::tools::WorkerTelemetrySlot = std::sync::Arc::new(
+        std::sync::Mutex::new(recursive::tools::WorkerTelemetry::new()),
+    );
     tools = recursive::register_subagent_if_enabled(
         tools,
         &config,
@@ -2393,6 +2404,7 @@ async fn run_loop(
         Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
             shutdown.clone(),
         )))),
+        Some(worker_telemetry.clone()),
     );
     // Issue #65: the operator allow-list is the last word — applied after
     // sub-agent registration so the loop's surface is exactly the allowed set
@@ -2461,6 +2473,8 @@ async fn run_loop(
     if let Some(sink) = event_sink {
         builder = builder.event_sink(sink);
     }
+    // Issue #119: publish the loop's sink to its workers and bill their usage.
+    builder = builder.worker_telemetry(worker_telemetry);
     // Issue #99: persist the pending wakeup into this loop's session
     // directory, so a process that dies (or is upgraded) mid-wait can be
     // resumed by the next start. `--no-session` has no directory and keeps

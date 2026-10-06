@@ -807,11 +807,19 @@ pub fn coordinator_system_prompt() -> &'static str {
 /// Cancellation wiring (issue #40): pass a static token via `shutdown_token`
 /// (CLI loop / HTTP-serve mint the token once), or a per-turn
 /// [`SharedTokenSlot`] (TUI refreshes it each turn), or both (static wins).
+///
+/// Telemetry wiring (issue #119): pass a [`WorkerTelemetrySlot`] that the
+/// owning runtime also holds, so worker runtimes emit through the parent's
+/// event sink (attributed) and their usage is billed to the parent turn.
+/// Pass `None` when the caller cannot route worker telemetry per session
+/// (the HTTP server shares one `Agent` tool across sessions) — workers then
+/// keep the previous [`crate::event::NullSink`] behaviour.
 pub fn register_subagent_if_enabled(
     tools: ToolRegistry,
     config: &Config,
     provider: Arc<dyn ChatProvider>,
     shutdown_token: Option<SharedTokenSlot>,
+    telemetry: Option<crate::tools::WorkerTelemetrySlot>,
 ) -> ToolRegistry {
     if !config.subagent_enabled {
         return tools;
@@ -865,6 +873,12 @@ pub fn register_subagent_if_enabled(
     .with_wall_timeout_secs(config.wall_timeout_secs);
     let agent = match shutdown_token {
         Some(slot) => agent.with_shutdown_token_slot(slot),
+        None => agent,
+    };
+    // Issue #119: wire the parent runtime's telemetry bridge so worker events
+    // and usage reach the parent instead of being dropped.
+    let agent = match telemetry {
+        Some(slot) => agent.with_worker_telemetry(slot),
         None => agent,
     };
 
@@ -1842,7 +1856,7 @@ mod tests {
         let config = test_config(); // subagent_enabled: false
         let tools = crate::tools::ToolRegistry::local();
         let initial_names = tools.names();
-        let result = register_subagent_if_enabled(tools, &config, provider, None);
+        let result = register_subagent_if_enabled(tools, &config, provider, None, None);
         assert_eq!(
             result.names(),
             initial_names,
@@ -1860,7 +1874,7 @@ mod tests {
         config.subagent_enabled = true;
         config.workspace = ws.path().to_path_buf();
         let tools = crate::tools::ToolRegistry::local();
-        let result = register_subagent_if_enabled(tools, &config, provider, None);
+        let result = register_subagent_if_enabled(tools, &config, provider, None, None);
         let names = result.names();
         for expected in ["agent", "artifact_read", "artifact_list"] {
             assert!(

@@ -8,6 +8,8 @@
 //! * [`BroadcastSink`] — delivers events into a `tokio::sync::broadcast` channel.
 //! * [`NullSink`] — discards every event (no-op).
 //! * [`CompositeSink`] — fans out to multiple inner sinks.
+//! * [`WorkerEventSink`] — attributes a delegated worker's events and forwards
+//!   them to a parent sink, held weakly (issue #119).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -344,6 +346,37 @@ pub enum AgentEvent {
         /// Added / modified / deleted files plus the turn's declarations.
         changes: crate::deliverables::TurnChanges,
     },
+
+    /// Issue #119: one event produced by a delegated worker's own runtime and
+    /// forwarded to the parent session's sink.
+    ///
+    /// Delegated workers used to run against a [`NullSink`] and their events
+    /// vanished with them, so a coordinator's parent could neither see a
+    /// worker's activity nor bill its spend. Live consumers:
+    ///
+    /// * the run collector folds a worker's inner [`AgentEvent::Usage`] into
+    ///   the parent trace's totals (Langfuse),
+    /// * the TUI maps a worker's inner `Usage` onto the session's usage panel,
+    /// * the CLI human stream prints a `[worker <id>] …` line for a worker's
+    ///   `Usage` / assistant text / tool call / turn finish.
+    ///
+    /// Wrapping — rather than re-emitting the inner event at the top level —
+    /// is what makes the forwarding safe: a consumer can tell worker activity
+    /// apart from the parent's own, and a transcript-persistence sink
+    /// (`SessionPersistenceSink`, which matches only the top-level
+    /// `MessageAppended` variants) cannot write a worker's messages
+    /// into the parent session file. `step` numbers inside `event` are the
+    /// worker's own and must not be interleaved with the parent's steps.
+    WorkerEvent {
+        /// Manifest id of the worker that produced the event.
+        worker_id: String,
+        /// Background task id, when the worker runs as a background task
+        /// (`task_*` tools); `None` for foreground dispatches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        /// The event the worker's own runtime emitted.
+        event: Box<AgentEvent>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +649,67 @@ impl EventSink for CompositeSink {
         for sink in &self.sinks {
             sink.emit(event.clone()).await;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkerEventSink
+// ---------------------------------------------------------------------------
+
+/// Issue #119: an [`EventSink`] that attributes every event a delegated
+/// worker's runtime emits to that worker and forwards it to a parent sink.
+///
+/// Install it as a worker runtime's sink (via
+/// [`AgentRuntimeBuilder::event_sink`](crate::AgentRuntimeBuilder::event_sink))
+/// so worker events reach the same consumer as the parent's — wrapped in
+/// [`AgentEvent::WorkerEvent`] so the parent can tell them apart and so
+/// transcript persistence ignores them.
+///
+/// The parent sink is held **weakly**. A `background: true` worker outlives
+/// the run that spawned it (its task parks on a prompt channel until it is
+/// cancelled or the process exits), so a strong reference would pin the
+/// run-scoped sink — including a [`ChannelSink`]'s sender — forever and a
+/// consumer that drains until the channel closes (the CLI's run / REPL
+/// printers) would never finish. Once the parent drops its sink the worker's
+/// events are discarded.
+pub struct WorkerEventSink {
+    inner: std::sync::Weak<dyn EventSink>,
+    worker_id: String,
+    task_id: Option<String>,
+}
+
+impl WorkerEventSink {
+    /// Wrap `inner`, attributing every forwarded event to `worker_id`.
+    pub fn new(inner: Arc<dyn EventSink>, worker_id: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::downgrade(&inner),
+            worker_id: worker_id.into(),
+            task_id: None,
+        }
+    }
+
+    /// Attach the background task id this worker runs under, when it has one.
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for WorkerEventSink {
+    async fn emit(&self, event: AgentEvent) {
+        // Dropped, not buffered: the parent run that would have consumed this
+        // event is already over.
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        inner
+            .emit(AgentEvent::WorkerEvent {
+                worker_id: self.worker_id.clone(),
+                task_id: self.task_id.clone(),
+                event: Box::new(event),
+            })
+            .await;
     }
 }
 
@@ -975,6 +1069,17 @@ mod tests {
                     ..Default::default()
                 },
             },
+            AgentEvent::WorkerEvent {
+                worker_id: "coder".into(),
+                task_id: Some("task-7".into()),
+                event: Box::new(AgentEvent::Usage {
+                    input_tokens: 5,
+                    output_tokens: 6,
+                    cache_hit_tokens: 1,
+                    cache_miss_tokens: 4,
+                    step: 2,
+                }),
+            },
         ];
 
         for event in &events {
@@ -1130,5 +1235,111 @@ mod tests {
         let third = rx2.recv().await.expect("third event");
         assert_eq!(third.meta.seq, 2, "seq must stay monotonic across turns");
         assert_eq!(third.meta.turn, 5);
+    }
+
+    // -- Issue #119: worker event attribution ------------------------------
+
+    #[test]
+    fn worker_event_round_trips_with_and_without_task_id() {
+        for task_id in [Some("task-1".to_string()), None] {
+            let event = AgentEvent::WorkerEvent {
+                worker_id: "reviewer".into(),
+                task_id,
+                event: Box::new(AgentEvent::ToolCall {
+                    name: "Read".into(),
+                    id: "call-9".into(),
+                    arguments: "{}".into(),
+                    step: 0,
+                }),
+            };
+            let json = serde_json::to_string(&event).expect("serialize");
+            assert!(json.contains("\"type\":\"worker_event\""), "json: {json}");
+            assert!(json.contains("\"worker_id\":\"reviewer\""), "json: {json}");
+            let back: AgentEvent = serde_json::from_str(&json).expect("round-trip");
+            assert_eq!(back, event);
+        }
+    }
+
+    #[test]
+    fn worker_event_omits_absent_task_id() {
+        let event = AgentEvent::WorkerEvent {
+            worker_id: "w".into(),
+            task_id: None,
+            event: Box::new(AgentEvent::PlanConfirmed),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(
+            !json.contains("task_id"),
+            "a foreground worker must not serialise a task_id: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_event_sink_wraps_and_attributes_every_event() {
+        let (inner, mut rx) = ChannelSink::new();
+        let parent: Arc<dyn EventSink> = Arc::new(inner);
+        let sink = WorkerEventSink::new(parent.clone(), "planner").with_task_id("task-42");
+
+        sink.emit(AgentEvent::AssistantText {
+            text: "hi".into(),
+            step: 1,
+        })
+        .await;
+
+        match rx.recv().await.expect("forwarded") {
+            AgentEvent::WorkerEvent {
+                worker_id,
+                task_id,
+                event,
+            } => {
+                assert_eq!(worker_id, "planner");
+                assert_eq!(task_id.as_deref(), Some("task-42"));
+                assert_eq!(
+                    *event,
+                    AgentEvent::AssistantText {
+                        text: "hi".into(),
+                        step: 1,
+                    }
+                );
+            }
+            other => panic!("expected WorkerEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_event_sink_without_task_id_forwards_none() {
+        let (inner, mut rx) = ChannelSink::new();
+        let parent: Arc<dyn EventSink> = Arc::new(inner);
+        let sink = WorkerEventSink::new(parent.clone(), "w");
+        sink.emit(AgentEvent::TurnFinished {
+            reason: "done".into(),
+            steps: 2,
+        })
+        .await;
+        match rx.recv().await.expect("forwarded") {
+            AgentEvent::WorkerEvent { task_id, .. } => assert_eq!(task_id, None),
+            other => panic!("expected WorkerEvent, got {other:?}"),
+        }
+    }
+
+    /// Issue #119 regression: a `background: true` worker is still alive when
+    /// the parent run ends. Holding the parent sink strongly pinned the CLI
+    /// printer's channel open forever; the worker must only hold it weakly so
+    /// dropping the parent sink closes the channel.
+    #[tokio::test]
+    async fn worker_event_sink_releases_the_parent_sink() {
+        let (inner, mut rx) = ChannelSink::new();
+        let parent: Arc<dyn EventSink> = Arc::new(inner);
+        let sink = WorkerEventSink::new(parent.clone(), "w");
+
+        sink.emit(AgentEvent::PlanConfirmed).await;
+        assert!(rx.try_recv().is_ok(), "a live parent sink must receive");
+
+        drop(parent);
+        sink.emit(AgentEvent::PlanConfirmed).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a worker must not be able to emit once the parent sink is gone"
+        );
     }
 }

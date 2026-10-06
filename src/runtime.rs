@@ -250,6 +250,11 @@ pub struct AgentRuntime {
     /// outside any turn's LLM calls. Folded into the next turn's usage so it
     /// still reaches the cost tracker instead of being dropped.
     pending_compact_usage: TokenUsage,
+    /// Issue #119: shared bridge to the `agent` tool's worker runtimes. The
+    /// runtime publishes its event sink here (workers emit through it,
+    /// attributed) and drains the usage workers burned into the turn that
+    /// dispatched them, so worker spend is no longer invisible.
+    worker_telemetry: Option<crate::tools::WorkerTelemetrySlot>,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -281,6 +286,7 @@ impl std::fmt::Debug for AgentRuntime {
             .field("plan_todo_reinjector", &self.plan_todo_reinjector.is_some())
             .field("preset_id", &self.preset_id)
             .field("deliverables", &self.deliverables.is_some())
+            .field("worker_telemetry", &self.worker_telemetry.is_some())
             .finish()
     }
 }
@@ -530,6 +536,16 @@ impl AgentRuntime {
             .usage
             .accumulate(compact_usage)
             .accumulate(std::mem::take(&mut self.pending_compact_usage));
+
+        // Issue #119: fold the token usage delegated workers burned into this
+        // turn. Without this the parent's `RuntimeOutcome.total_usage` (the
+        // CLI cost tracker, the HTTP run metrics) counted only the main
+        // agent, systematically under-reporting every multi-agent run.
+        let worker_usage = self.take_worker_usage();
+        turn_outcome.usage = turn_outcome.usage.accumulate(worker_usage.usage);
+        turn_outcome.llm_latency_ms = turn_outcome
+            .llm_latency_ms
+            .saturating_add(worker_usage.llm_latency_ms);
 
         let outcome: RuntimeOutcome = turn_outcome.into();
 
@@ -993,7 +1009,14 @@ impl AgentRuntime {
                 Arc::make_mut(&mut self.transcript).extend(committed);
                 // Issue #115: recover the tokens the failed turn burned (the
                 // steps that completed before the failing LLM call).
-                self.last_failed_usage = failure_usage.lock().map(|u| *u).unwrap_or_default();
+                //
+                // Issue #119: this branch returns before `drive_turn_inner`'s
+                // drain, so the workers the failed turn dispatched must be
+                // drained here — otherwise their spend is never billed (the CLI
+                // accounts a failed run from `last_failed_usage`) and would
+                // silently reappear on the next turn instead.
+                let failed_usage = failure_usage.lock().map(|u| *u).unwrap_or_default();
+                self.last_failed_usage = failed_usage.accumulate(self.take_worker_usage().usage);
                 return Err(e);
             }
         };
@@ -1290,6 +1313,28 @@ impl AgentRuntime {
         // regardless of how many sink swaps happened this turn.
         // Issue #65: same presence guard — re-point, never re-introduce.
         self.refresh_plan_tool();
+        // Issue #119: keep the worker bridge pointing at the live sink.
+        self.publish_worker_event_sink();
+    }
+
+    /// Issue #119: publish the current event sink into the worker telemetry
+    /// bridge (when one is attached) so `agent`-tool workers emit through the
+    /// same consumer as the parent.
+    fn publish_worker_event_sink(&self) {
+        if let Some(slot) = &self.worker_telemetry {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_event_sink(self.event_sink.clone());
+        }
+    }
+
+    /// Issue #119: take (and reset) the usage delegated workers burned since
+    /// the last drain. Zero when no bridge is attached.
+    fn take_worker_usage(&self) -> crate::tools::WorkerUsage {
+        match &self.worker_telemetry {
+            Some(slot) => slot.lock().unwrap_or_else(|e| e.into_inner()).take_usage(),
+            None => crate::tools::WorkerUsage::default(),
+        }
     }
 
     /// Enable a bounded approval wait for `exit_plan_mode` when the event
@@ -1344,6 +1389,8 @@ impl AgentRuntime {
     /// sibling.
     pub fn replace_event_sink(&mut self, sink: Arc<dyn EventSink>) {
         self.event_sink = sink;
+        // Issue #119: keep the worker bridge in lockstep with the swap.
+        self.publish_worker_event_sink();
     }
 
     /// Goal-167: return a snapshot of the current agent task list.

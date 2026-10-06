@@ -184,6 +184,7 @@ async fn repl_runtime(
         &test_config(workspace.clone()),
         provider_dyn.clone(),
         slot,
+        None,
     );
     let runtime = AgentRuntime::builder()
         .llm(provider_dyn)
