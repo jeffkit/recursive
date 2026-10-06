@@ -1413,6 +1413,7 @@ pub(crate) fn spawn_agui_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::IsolatedWorkspace;
 
     fn run_input(
         thread: &str,
@@ -1440,8 +1441,22 @@ mod tests {
         }
     }
 
+    /// Persist an interrupt fixture and prove it landed.
+    ///
+    /// `save_open_interrupts` is a best-effort product write (no `Result`,
+    /// no log), so a failed write used to surface only much later as a
+    /// misleading "expected conflict, got Ok" at the assertion site. Read
+    /// the file back here instead, while the cause is still visible.
     fn write_interrupts(dir: &Path, interrupts: &[OpenInterrupt]) {
         save_open_interrupts(dir, interrupts);
+        let fixture = dir.join(".interrupts.json");
+        let raw = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("interrupt fixture {fixture:?} not written: {e}"));
+        assert_eq!(
+            load_open_interrupts(dir).len(),
+            interrupts.len(),
+            "interrupt fixture {fixture:?} did not round-trip: {raw}"
+        );
     }
 
     // ── converter: #66 anti-double-render ────────────────────────────────
@@ -1650,6 +1665,18 @@ mod tests {
     }
 
     // ── resume / interrupt state machine (Issue #56: no HTTP needed) ───────
+    //
+    // These tests write a fixture into the session dir and expect
+    // `prepare_run` to read it back, so both ends must resolve the *same*
+    // directory. `agui_session_dir` derives its base from the process env
+    // (`RECURSIVE_SESSIONS_DIR`, else `RECURSIVE_HOME`/`$HOME`) — env that
+    // sibling tests redirect (and whose tempdir they tear down) while this
+    // module runs in parallel. Without `IsolatedWorkspace` the two resolves
+    // can straddle such a switch: the write lands under one base, the read
+    // looks under another, and the test fails as "expected conflict, got
+    // Ok" (issue #142 — reproducible on Windows CI because its slower fs
+    // widens the window). `IsolatedWorkspace` holds the global env lock for
+    // the test's lifetime and pins both vars inside a tempdir it owns.
 
     #[test]
     fn prepare_run_rejects_empty_goal() {
@@ -1667,8 +1694,9 @@ mod tests {
 
     #[test]
     fn prepare_run_interrupt_before_conflict_without_resume() {
-        let ws = tempfile::tempdir().unwrap();
-        let dir = agui_session_dir(ws.path(), "t-conflict").unwrap();
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-conflict").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         write_interrupts(
             &dir,
@@ -1681,7 +1709,7 @@ mod tests {
             }],
         );
         match prepare_run(AguiRunInput {
-            workspace: ws.path(),
+            workspace: ws,
             input: &run_input("t-conflict", None),
         }) {
             Err(PrepareAguiError::InterruptBeforeConflict { open, .. }) => assert_eq!(open, 1),
@@ -1691,14 +1719,15 @@ mod tests {
 
     #[test]
     fn prepare_run_resume_without_prior_run_is_bad_request() {
-        let ws = tempfile::tempdir().unwrap();
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
         let resume = vec![agui_protocol::Resume {
             interrupt_id: "i1".into(),
             status: agui_protocol::ResumeStatus::Resolved,
             payload: Some(serde_json::json!({"ok": true})),
         }];
         match prepare_run(AguiRunInput {
-            workspace: ws.path(),
+            workspace: ws,
             input: &run_input("t-fresh", Some(resume)),
         }) {
             Err(PrepareAguiError::BadRequest(m)) => assert!(m.contains("no prior run"), "{m}"),
@@ -1708,8 +1737,9 @@ mod tests {
 
     #[test]
     fn prepare_run_resume_must_cover_all_open_interrupts() {
-        let ws = tempfile::tempdir().unwrap();
-        let dir = agui_session_dir(ws.path(), "t-cover").unwrap();
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-cover").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         write_interrupts(
             &dir,
@@ -1745,7 +1775,7 @@ mod tests {
             payload: Some(serde_json::json!("done")),
         }];
         match prepare_run(AguiRunInput {
-            workspace: ws.path(),
+            workspace: ws,
             input: &run_input("t-cover", Some(partial)),
         }) {
             Err(PrepareAguiError::BadRequest(m)) => assert!(m.contains("missing 'i2'"), "{m}"),
@@ -1767,7 +1797,7 @@ mod tests {
             },
         ];
         let prepared = prepare_run(AguiRunInput {
-            workspace: ws.path(),
+            workspace: ws,
             input: &run_input("t-cover", Some(full)),
         })
         .expect("resume prepares");
@@ -1793,8 +1823,9 @@ mod tests {
 
     #[test]
     fn prepare_run_resume_with_no_open_interrupts_is_bad_request() {
-        let ws = tempfile::tempdir().unwrap();
-        let dir = agui_session_dir(ws.path(), "t-none").unwrap();
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-none").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("transcript.jsonl"), "").unwrap();
         let resume = vec![agui_protocol::Resume {
@@ -1803,7 +1834,7 @@ mod tests {
             payload: None,
         }];
         match prepare_run(AguiRunInput {
-            workspace: ws.path(),
+            workspace: ws,
             input: &run_input("t-none", Some(resume)),
         }) {
             Err(PrepareAguiError::BadRequest(m)) => {
