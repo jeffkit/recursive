@@ -23,6 +23,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 
+use tracing::Instrument;
+
 use crate::agent::FinishReason;
 use crate::checkpoint::{CheckpointId, ShadowRepo};
 use crate::checkpoint_log::CheckpointLogWriter;
@@ -301,10 +303,11 @@ impl AgentRuntime {
         let user_text = user_text.into();
 
         let turn = self.checkpoints.turn_index.load(Ordering::Relaxed);
-        tracing::Span::current().record(
-            "session_id",
-            self.checkpoints.session_id.as_deref().unwrap_or(""),
-        );
+        // Issue #117: per-turn correlation is established by the `agent.turn`
+        // span created in `drive_turn` (fields declared there, so `record`
+        // sticks) — the previous `Span::current().record("session_id", ..)`
+        // here was a dead write: no enclosing span declared the field, and
+        // `tracing` silently ignores records for undeclared fields.
         tracing::debug!(
             session_id = self.checkpoints.session_id.as_deref().unwrap_or(""),
             turn,
@@ -388,13 +391,36 @@ impl AgentRuntime {
     /// stopped (`execute_kernel_turn` folds the attempt's committed messages
     /// back in), so the re-drive resumes there rather than starting over.
     async fn drive_turn(&mut self) -> Result<RuntimeOutcome> {
+        // Issue #117: a real per-turn root span with the correlation fields
+        // *declared*. Every `agent.step` span (and therefore every
+        // `agent.run.complete` / `agent.turn: finished` log line) nested under
+        // it inherits `session_id` and `turn`, so a multi-session server can
+        // attribute each line to its session. Instrumented (not `enter()`d) so
+        // the span does not leak onto other tasks across an await.
+        let turn = self.checkpoints.turn_index.load(Ordering::Relaxed) as u32;
+        let session_id = self.checkpoints.session_id.clone().unwrap_or_default();
+        let span = tracing::info_span!(
+            "agent.turn",
+            session_id = %session_id,
+            turn,
+            steps = tracing::field::Empty,
+        );
+        let outcome = self.drive_turn_inner(turn).instrument(span.clone()).await;
+        if let Ok(outcome) = &outcome {
+            span.record("steps", outcome.steps);
+        }
+        outcome
+    }
+
+    /// Body of [`drive_turn`](AgentRuntime::drive_turn), split out so the
+    /// per-turn span can wrap the whole turn without an `enter()` guard.
+    async fn drive_turn_inner(&mut self, turn: u32) -> Result<RuntimeOutcome> {
         let mut turn_outcome = self.execute_kernel_turn().await?;
         // Goal #133: close the change ledger for this turn and announce it.
         // Emitted BEFORE `TurnFinished` (which `emit_turn_messages` releases)
         // so a consumer reacting to the turn boundary already has the ledger,
         // and before the turn counter advances so the ledger is keyed by the
         // turn it describes. Best-effort — a failed ledger never fails a turn.
-        let turn = self.checkpoints.turn_index.load(Ordering::Relaxed) as u32;
         self.finalize_deliverables(turn).await;
         self.emit_turn_messages(&turn_outcome).await;
         // Goal 289: cross-turn compaction runs AFTER the turn so the
@@ -423,7 +449,11 @@ impl AgentRuntime {
 
         let outcome: RuntimeOutcome = turn_outcome.into();
 
+        // Issue #117: carry the correlation fields explicitly so the line is
+        // attributable even when emitted outside the `agent.turn` span.
         tracing::info!(
+            session_id = self.checkpoints.session_id.as_deref().unwrap_or(""),
+            turn,
             steps = outcome.steps,
             finish_reason = ?outcome.finish_reason,
             "agent.turn: finished"

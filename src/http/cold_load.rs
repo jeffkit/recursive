@@ -253,6 +253,7 @@ pub(super) async fn get_or_load_session(
         last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(super::now_session_ms())),
         prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     // All mutable state lives in Arc fields, so this handle shares everything
     // that matters with the table value.
@@ -961,6 +962,7 @@ mod tests {
                 last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
                 prompt_tokens: Arc::new(AtomicU64::new(0)),
                 completion_tokens: Arc::new(AtomicU64::new(0)),
+                event_seq: Arc::new(AtomicU64::new(0)),
             },
         );
 

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- feat(events): timeline envelope for the whole event chain (#117). An
+  `AgentEvent` carried no wall clock, no turn, no session id, and no global
+  sequence, so events, SSE frames, spans and log lines could not be stitched
+  back into one timeline — a goal-loop's `step` restarts at 1 every turn, and
+  the SSE `id:` field the spec reserves for exactly this was never set. Adds
+  `EventMeta { ts_ms, seq, session_id, turn }` and `EnvelopedEvent`, which
+  keeps the meta *nested* under `"meta"` (`{"meta": .., "event": ..}`) rather
+  than flattened — `serde` cannot deserialise the internally-tagged
+  `AgentEvent` through `#[serde(flatten)]` — plus an `EnvelopeSink` that stamps
+  a monotonic per-session `seq` (shared across a session's turns) and forwards
+  envelopes to consumers. The HTTP session path now wires an `EnvelopeSink`,
+  and each event-derived SSE frame carries `id: <ts_ms>-<turn>-<seq>` (frames
+  derived from one event, e.g. `tool_progress`, append a `:progress` suffix),
+  so a client can order and dedupe frames across turns and learn where it left
+  off. On the tracing side the per-turn `agent.turn` span now *declares*
+  `session_id` /
+  `turn` and is attached with `.instrument()` (the old
+  `Span::current().record("session_id", ..)` was a dead write — tracing drops
+  records for undeclared fields), so every `agent.step` span, the
+  `agent.run.complete` lines and `agent.turn: finished` inherit the session
+  identity a multi-session HTTP server needs.
 - security(http): identity model for the HTTP API (#85). Authentication used to
   answer only "may this caller in", never "who is this caller": JWT verification
   discarded every claim (`decode::<serde_json::Value>(...).is_ok()`), and the

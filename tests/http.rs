@@ -3528,6 +3528,7 @@ mod http_tests {
                 last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
 
@@ -4166,6 +4167,7 @@ mod http_tests {
             last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state
             .host

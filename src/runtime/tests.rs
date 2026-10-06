@@ -2578,3 +2578,64 @@ fn loop_retry_and_wakeup_store_dir_default_to_off_and_bounded() {
     });
     rt.clear_pending_wakeup();
 }
+
+/// Issue #117: a full turn runs inside an `agent.turn` span that carries the
+/// session id, and the `agent.run.complete` line emitted by the kernel
+/// inherits it — so a multi-session server can attribute log lines.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn agent_turn_span_carries_session_id() {
+    let provider = MockProvider::new(vec![Completion {
+        content: "ok".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }]);
+    let mut rt = AgentRuntimeBuilder::new()
+        .llm(Arc::new(provider))
+        .build()
+        .expect("runtime build");
+    rt.set_session_id("sess-117-rt");
+
+    rt.run("hello").await.expect("turn must succeed");
+
+    // `logs_contain` is injected into the test body by the `traced_test`
+    // attribute (same as the other tracing assertions in this crate).
+    assert!(
+        logs_contain("agent.turn"),
+        "the per-turn span must be emitted"
+    );
+    assert!(
+        logs_contain("session_id=sess-117-rt"),
+        "the agent.turn span (and the run-complete line under it) must carry session_id"
+    );
+}
+
+/// Issue #117: `drive_turn` must create the `agent.turn` span with its
+/// correlation fields declared and attach it with `.instrument()` (an
+/// `enter()` guard held across an await would leak the span onto other tasks).
+/// Without the declared fields, `Span::record` is a silent no-op.
+#[test]
+fn drive_turn_creates_instrumented_correlated_span() {
+    let src = include_str!("../runtime.rs");
+    assert!(
+        src.contains(
+            r#"info_span!(
+            "agent.turn","#
+        ),
+        "drive_turn must create an `agent.turn` span"
+    );
+    assert!(
+        src.contains("session_id = %session_id") && src.contains("turn,"),
+        "agent.turn must declare the session_id and turn fields so record() sticks"
+    );
+    assert!(
+        src.contains("drive_turn_inner(turn).instrument(span.clone())"),
+        "the turn work must be instrumented with the agent.turn span"
+    );
+    assert!(
+        !src.contains("Span::current().record(\n            \"session_id\""),
+        "the dead Span::current().record(session_id) write must be gone"
+    );
+}

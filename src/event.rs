@@ -9,6 +9,9 @@
 //! * [`NullSink`] — discards every event (no-op).
 //! * [`CompositeSink`] — fans out to multiple inner sinks.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -302,6 +305,94 @@ pub enum AgentEvent {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Event envelope (issue #117)
+// ---------------------------------------------------------------------------
+
+/// Timeline / correlation metadata that places one [`AgentEvent`] on a
+/// session's single timeline.
+///
+/// Without it, the raw events, the SSE frames, the tracing spans and the log
+/// lines of a session cannot be stitched back together: `step` restarts at 1
+/// every turn, and nothing else carries a wall-clock or turn identity.
+///
+/// The four fields together are the correlation key:
+///
+/// * `ts_ms` — wall clock, so events can be interleaved with logs/traces.
+/// * `seq` — a monotonic per-session counter, so events from the same turn
+///   keep a total order even when two share a millisecond.
+/// * `session_id` — which session emitted the event (`None` for sessionless
+///   runs such as one-shot CLI runs and unit tests).
+/// * `turn` — the 0-based turn index, so a `step` number only has to be
+///   unique *within* a turn, not across a whole session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EventMeta {
+    /// Wall-clock emission time, milliseconds since the Unix epoch.
+    pub ts_ms: u64,
+    /// Monotonic, per-session event counter (starts at 0).
+    pub seq: u64,
+    /// Session the event belongs to, when the run is bound to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// 0-based turn index within the session.
+    pub turn: u32,
+}
+
+impl EventMeta {
+    /// Wall-clock now, in milliseconds since the Unix epoch. `0` when the
+    /// system clock is before the epoch (never in practice).
+    pub fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Compact, monotonically-ordered key for this meta.
+    ///
+    /// Carried by SSE frames as their `id:` field (and echoed back by a client
+    /// via `Last-Event-ID`). The `ts_ms` prefix makes it wall-clock anchored,
+    /// the `turn` segment gives it turn semantics; format is
+    /// `<ts_ms>-<turn>-<seq>`.
+    pub fn id(&self) -> String {
+        format!("{}-{}-{}", self.ts_ms, self.turn, self.seq)
+    }
+}
+
+/// An [`AgentEvent`] paired with the [`EventMeta`] that anchors it to a
+/// session timeline. This is what flows out of the [`EnvelopeSink`].
+///
+/// The two fields stay nested (`{"meta": .., "event": ..}`) rather than
+/// flattened: `serde` cannot deserialise an *internally tagged* enum through
+/// `#[serde(flatten)]`, and `AgentEvent` is exactly that. The envelope is an
+/// in-process/host-side type — the HTTP wire still carries an [`SseEvent`]
+/// plus the frame `id:` — so nesting costs nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvelopedEvent {
+    pub meta: EventMeta,
+    pub event: AgentEvent,
+}
+
+impl EnvelopedEvent {
+    /// Pair an event with its metadata.
+    pub fn new(meta: EventMeta, event: AgentEvent) -> Self {
+        Self { meta, event }
+    }
+
+    /// Wrap an event with default (all-zero / unbound) metadata.
+    pub fn unstamped(event: AgentEvent) -> Self {
+        Self {
+            meta: EventMeta::default(),
+            event,
+        }
+    }
+
+    /// The SSE `id:` / correlation key for this event.
+    pub fn id(&self) -> String {
+        self.meta.id()
+    }
+}
+
 /// Why a proactive compaction was skipped.
 ///
 /// See [`AgentEvent::CompactionSkipped`].
@@ -359,6 +450,60 @@ impl ChannelSink {
 impl EventSink for ChannelSink {
     async fn emit(&self, event: AgentEvent) {
         let _ = self.tx.send(event);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EnvelopeSink
+// ---------------------------------------------------------------------------
+
+/// An [`EventSink`] that stamps a monotonic [`EventMeta`] onto every event and
+/// forwards the resulting [`EnvelopedEvent`] into an `mpsc` channel.
+///
+/// This is the boundary where a raw [`AgentEvent`] becomes a timeline entry:
+/// the producer (runtime, kernel, tools) never has to know the session or the
+/// turn — the sink already holds them — and every consumer downstream of the
+/// channel sees the same `(ts_ms, seq, session_id, turn)` key.
+pub struct EnvelopeSink {
+    tx: mpsc::UnboundedSender<EnvelopedEvent>,
+    session_id: Option<String>,
+    turn: u32,
+    /// Shared with the rest of the session so `seq` keeps climbing across
+    /// turns instead of restarting whenever a fresh per-turn sink is built.
+    seq: Arc<AtomicU64>,
+}
+
+impl EnvelopeSink {
+    /// Create a sink bound to `session_id` / `turn`, sharing `seq` with the
+    /// rest of the session.
+    pub fn with_correlation(
+        session_id: Option<String>,
+        turn: u32,
+        seq: Arc<AtomicU64>,
+    ) -> (Self, mpsc::UnboundedReceiver<EnvelopedEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                session_id,
+                turn,
+                seq,
+            },
+            rx,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for EnvelopeSink {
+    async fn emit(&self, event: AgentEvent) {
+        let meta = EventMeta {
+            ts_ms: EventMeta::now_ms(),
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            session_id: self.session_id.clone(),
+            turn: self.turn,
+        };
+        let _ = self.tx.send(EnvelopedEvent::new(meta, event));
     }
 }
 
@@ -832,5 +977,85 @@ mod tests {
             !arm.contains("parent_uuid"),
             "MessageAppended arm must not reference parent_uuid: {arm}"
         );
+    }
+
+    // -- Issue #117: event envelope ----------------------------------------
+
+    #[test]
+    fn event_meta_id_carries_wall_clock_turn_and_seq() {
+        // The SSE `id:` must be wall-clock anchored and carry turn semantics
+        // (issue #117): `<ts_ms>-<turn>-<seq>`.
+        let meta = EventMeta {
+            ts_ms: 1_700_000_000_123,
+            seq: 7,
+            session_id: Some("sess-1".into()),
+            turn: 3,
+        };
+        assert_eq!(meta.id(), "1700000000123-3-7");
+    }
+
+    #[test]
+    fn enveloped_event_round_trips_meta_and_payload() {
+        let env = EnvelopedEvent::new(
+            EventMeta {
+                ts_ms: 42,
+                seq: 1,
+                session_id: Some("s".into()),
+                turn: 2,
+            },
+            AgentEvent::AssistantText {
+                text: "hi".into(),
+                step: 5,
+            },
+        );
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(json.contains("\"ts_ms\":42"), "json: {json}");
+        assert!(json.contains("\"seq\":1"), "json: {json}");
+        assert!(json.contains("\"session_id\":\"s\""), "json: {json}");
+        assert!(json.contains("\"turn\":2"), "json: {json}");
+        assert!(json.contains("\"type\":\"assistant_text\""), "json: {json}");
+
+        let back: EnvelopedEvent = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, env);
+    }
+
+    #[test]
+    fn enveloped_event_omits_absent_session_id() {
+        let env = EnvelopedEvent::unstamped(AgentEvent::PlanConfirmed);
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            !json.contains("session_id"),
+            "unbound session must not serialise a session_id: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_sink_stamps_monotonic_seq_and_correlation() {
+        let seq = Arc::new(AtomicU64::new(0));
+        let (sink, mut rx) = EnvelopeSink::with_correlation(Some("sess-a".into()), 4, seq.clone());
+        sink.emit(AgentEvent::PlanConfirmed).await;
+        sink.emit(AgentEvent::PlanModeApproved).await;
+
+        let first = rx.recv().await.expect("first event");
+        let second = rx.recv().await.expect("second event");
+        assert_eq!(first.meta.seq, 0);
+        assert_eq!(second.meta.seq, 1);
+        assert_eq!(first.meta.turn, 4);
+        assert_eq!(second.meta.session_id.as_deref(), Some("sess-a"));
+        assert!(first.meta.ts_ms > 0, "ts_ms must be stamped");
+        assert_eq!(first.event, AgentEvent::PlanConfirmed);
+        assert_eq!(second.event, AgentEvent::PlanModeApproved);
+
+        // The shared counter keeps climbing across turns (fresh sinks).
+        let (sink2, mut rx2) =
+            EnvelopeSink::with_correlation(Some("sess-a".into()), 5, seq.clone());
+        sink2
+            .emit(AgentEvent::PlanRejected {
+                reason: "no".into(),
+            })
+            .await;
+        let third = rx2.recv().await.expect("third event");
+        assert_eq!(third.meta.seq, 2, "seq must stay monotonic across turns");
+        assert_eq!(third.meta.turn, 5);
     }
 }

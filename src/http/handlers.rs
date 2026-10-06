@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, wrappers::IntervalStream, StreamExt};
 
-use crate::event::{AgentEvent, ChannelSink, NullSink};
+use crate::event::{AgentEvent, EnvelopeSink, NullSink};
 use crate::message::Role;
 use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
 use crate::runtime::AgentRuntimeBuilder;
@@ -25,7 +25,7 @@ use super::{
     CreateSessionRequest, CreateSessionResponse, ErrorResponse, ListSessionsQuery, PresetInfo,
     RunRequest, RunResponse, SessionDetailResponse, SessionInfo, SessionMessageRequest,
     SessionMessageResponse, SessionOverrides, SessionState, SetGoalRequest, SlashCommandInfo,
-    SseContentBlock, SseEvent, ToolInfo, UsageInfo,
+    SseContentBlock, SseEvent, SseFrame, ToolInfo, UsageInfo,
 };
 
 // Constant body — no branching worth scoring.
@@ -955,6 +955,7 @@ pub(super) async fn create_session(
         last_active_ms: Arc::new(AtomicU64::new(super::now_session_ms())),
         prompt_tokens: Arc::new(AtomicU64::new(0)),
         completion_tokens: Arc::new(AtomicU64::new(0)),
+        event_seq: Arc::new(AtomicU64::new(0)),
     };
 
     state
@@ -1414,6 +1415,7 @@ pub(super) async fn fork_session(
         last_active_ms: Arc::new(AtomicU64::new(super::now_session_ms())),
         prompt_tokens: Arc::new(AtomicU64::new(0)),
         completion_tokens: Arc::new(AtomicU64::new(0)),
+        event_seq: Arc::new(AtomicU64::new(0)),
     };
 
     state
@@ -1818,13 +1820,17 @@ pub(super) async fn send_session_message(
     }
     runtime.set_interrupt_token(interrupt_token);
 
-    // Wire a ChannelSink so events are forwarded to SSE subscribers.
-    let (sink, mut event_rx) = ChannelSink::new();
     // Issue #124: one Langfuse trace per HTTP turn when the observability env
     // vars are set; an inert no-op otherwise. The turn index is the count of
     // prior user messages still in the transcript, so multi-turn sessions get
     // distinct `langfuse.trace.metadata.turn` values.
     let turn = prior_turn_index(runtime.transcript());
+    // Issue #117: wire an EnvelopeSink so every event forwarded to SSE
+    // subscribers carries the session timeline key — wall clock + monotonic
+    // per-session seq + session id + turn. `step` alone restarts every turn,
+    // so without this a goal-loop's frames cannot be stitched to one timeline.
+    let (sink, mut event_rx) =
+        EnvelopeSink::with_correlation(Some(id.clone()), turn, session.event_seq.clone());
     let langfuse_run = crate::observability::LangfuseRun::try_new(
         crate::observability::RunMeta::new(
             id.clone(),
@@ -1837,7 +1843,7 @@ pub(super) async fn send_session_message(
     crate::observability::with_sink(&langfuse_run, &mut event_sinks);
     runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(event_sinks)));
 
-    // Spawn a forwarder: AgentEvent → SseEvent → broadcast channel.
+    // Spawn a forwarder: EnvelopedEvent → SseFrame → broadcast channel.
     // SDK Phase B: track tool call start times so we can emit tool_progress
     // events with elapsed_ms when each tool finishes.
     // Goal 274: also maintain the non_system_message_count atomic so the
@@ -1847,7 +1853,11 @@ pub(super) async fn send_session_message(
     let forward_handle = tokio::spawn(async move {
         let mut tool_start_times: HashMap<String, std::time::Instant> = HashMap::new();
         let mut count: usize = initial_count;
-        while let Some(ref agent_event) = event_rx.recv().await {
+        while let Some(envelope) = event_rx.recv().await {
+            // Issue #117: the frame id is the envelope key, so it is reused for
+            // every frame derived from this one event.
+            let frame_id = envelope.id();
+            let agent_event = &envelope.event;
             // Increment the count for every non-System message appended.
             match agent_event {
                 AgentEvent::MessageAppended { message, .. }
@@ -1865,7 +1875,10 @@ pub(super) async fn send_session_message(
                 tool_start_times.insert(id.clone(), std::time::Instant::now());
             }
             if let Some(sse_event) = map_agent_event(agent_event) {
-                let _ = broadcast_tx.send(sse_event);
+                let _ = broadcast_tx.send(SseFrame {
+                    id: frame_id.clone(),
+                    event: sse_event,
+                });
             }
             // After forwarding the tool_result, emit tool_progress with timing.
             if let AgentEvent::ToolResult { id, name, .. } = agent_event {
@@ -1873,10 +1886,13 @@ pub(super) async fn send_session_message(
                     .remove(id)
                     .map(|start| start.elapsed().as_millis() as u64)
                     .unwrap_or(0);
-                let _ = broadcast_tx.send(SseEvent::ToolProgress {
-                    tool_use_id: id.clone(),
-                    tool_name: name.clone(),
-                    elapsed_ms,
+                let _ = broadcast_tx.send(SseFrame {
+                    id: format!("{frame_id}:progress"),
+                    event: SseEvent::ToolProgress {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        elapsed_ms,
+                    },
                 });
             }
         }
@@ -2014,8 +2030,8 @@ pub(super) async fn session_events(
 
     // Map real agent events to SSE data events, dropping lagged-receiver errors.
     let agent_stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(sse_event) => {
-            let event_type = match &sse_event {
+        Ok(SseFrame { id, event }) => {
+            let event_type = match &event {
                 SseEvent::Message { .. } => "message",
                 SseEvent::PartialMessage { .. } => "partial_message",
                 SseEvent::ToolCall { .. } => "tool_call",
@@ -2027,9 +2043,11 @@ pub(super) async fn session_events(
                 SseEvent::GoalAchieved { .. } => "goal_achieved",
                 SseEvent::ToolProgress { .. } => "tool_progress",
             };
-            let data = serde_json::to_string(&sse_event).unwrap_or_default();
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            // Issue #117: the frame carries its timeline id so clients can
+            // order/dedupe across turns and know where they left off.
             Some(Ok::<Event, Infallible>(
-                Event::default().event(event_type).data(data),
+                Event::default().id(id).event(event_type).data(data),
             ))
         }
         Err(_) => None,
@@ -2054,10 +2072,16 @@ pub(super) async fn session_events(
 /// Map an [`AgentEvent`] to an [`SseEvent`] for broadcasting to SSE clients.
 ///
 /// Returns `None` for events that have no SSE equivalent (latency, tokens, etc.).
+///
+/// The resulting frame's `id:` (issue #117) is the originating event's
+/// envelope key — `<ts_ms>-<turn>-<seq>` — not the per-turn `step` number,
+/// which restarts every turn. Within one turn the `step`-keyed deltas are
+/// still unambiguous; across a goal-loop's turns, key on the frame `id`.
 pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
     match event {
         // Streaming token deltas — clients reconstruct the final text by
-        // concatenating deltas keyed on `step`.
+        // concatenating deltas keyed on `step` (see the frame `id:` for
+        // cross-turn ordering).
         AgentEvent::PartialToken { text, step } => Some(SseEvent::PartialMessage {
             text: text.clone(),
             step: *step,
@@ -2653,8 +2677,41 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::AgentEvent;
+    use crate::event::{AgentEvent, EventSink};
     use crate::http::SseEvent;
+
+    /// Issue #117: every SSE frame derived from an event carries that event's
+    /// envelope key as its `id:` — so a client can order/dedupe frames across
+    /// turns (the per-turn `step` alone cannot).
+    #[tokio::test]
+    async fn sse_frame_id_is_the_event_envelope_key() {
+        let seq = Arc::new(AtomicU64::new(0));
+        let (sink, mut rx) =
+            crate::event::EnvelopeSink::with_correlation(Some("sess-9".into()), 3, seq.clone());
+        sink.emit(AgentEvent::ToolCall {
+            name: "Bash".into(),
+            id: "tc-1".into(),
+            arguments: "{}".into(),
+            step: 0,
+        })
+        .await;
+
+        let envelope = rx.recv().await.expect("envelope");
+        assert_eq!(envelope.meta.turn, 3);
+        assert_eq!(envelope.meta.session_id.as_deref(), Some("sess-9"));
+        assert_eq!(envelope.meta.seq, 0);
+
+        let frame = SseFrame {
+            id: envelope.id(),
+            event: map_agent_event(&envelope.event).expect("tool_call maps to an SSE event"),
+        };
+        assert!(matches!(frame.event, SseEvent::ToolCall { .. }));
+        assert_eq!(
+            frame.id,
+            format!("{}-3-0", envelope.meta.ts_ms),
+            "frame id must be <ts_ms>-<turn>-<seq>"
+        );
+    }
 
     /// Issue #100: a `RateLimited` that exhausts the step-level retry budget
     /// must still map to 429 + `Retry-After`. The `/run` integration test now
@@ -3560,6 +3617,7 @@ mod tests {
             last_active_ms: Arc::new(AtomicU64::new(0)),
             prompt_tokens: Arc::new(AtomicU64::new(0)),
             completion_tokens: Arc::new(AtomicU64::new(0)),
+            event_seq: Arc::new(AtomicU64::new(0)),
         };
 
         let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
@@ -3658,6 +3716,7 @@ mod tests {
             last_active_ms: Arc::new(AtomicU64::new(0)),
             prompt_tokens: Arc::new(AtomicU64::new(0)),
             completion_tokens: Arc::new(AtomicU64::new(0)),
+            event_seq: Arc::new(AtomicU64::new(0)),
         };
         let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
         let host = Arc::new(crate::session_host::SessionHost::new(

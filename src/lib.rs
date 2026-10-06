@@ -87,7 +87,10 @@ pub use compact::reinject::{build_file_reinjector_from_env, build_skill_reinject
 pub use compact::{Compactor, FileReinjector, Microcompactor, SkillReinjector};
 pub use config::Config;
 pub use error::{Error, Result};
-pub use event::{AgentEvent, ChannelSink, CompositeSink, EventSink, NullSink};
+pub use event::{
+    AgentEvent, ChannelSink, CompositeSink, EnvelopeSink, EnvelopedEvent, EventMeta, EventSink,
+    NullSink,
+};
 pub use hooks::ExternalHookRunner;
 pub use hooks::ToolTimingHook;
 pub use hooks::{Hook, HookAction, HookEvent, HookRegistry, SdkHookForwarder};

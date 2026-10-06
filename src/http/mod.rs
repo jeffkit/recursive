@@ -186,6 +186,10 @@ pub struct SessionState {
     pub prompt_tokens: Arc<AtomicU64>,
     /// Cumulative completion tokens generated in this session.
     pub completion_tokens: Arc<AtomicU64>,
+    /// Issue #117: monotonic per-session counter shared with each turn's
+    /// [`crate::event::EnvelopeSink`], so event `seq` numbers keep climbing
+    /// across turns instead of restarting at 0 every turn.
+    pub event_seq: Arc<AtomicU64>,
 }
 
 /// Reference instant for session last_active timestamps.
@@ -440,7 +444,9 @@ pub enum SseEvent {
         content: Vec<SseContentBlock>,
     },
     /// A partial text delta during streaming. Concatenate `text` deltas
-    /// keyed by `step` to reconstruct the eventual `Message::Text` block.
+    /// keyed by `step` within a turn to reconstruct the eventual
+    /// `Message::Text` block; use the enclosing [`SseFrame::id`] to order
+    /// deltas across turns (issue #117), since `step` restarts every turn.
     PartialMessage { text: String, step: usize },
     /// A tool is being called.
     ToolCall { name: String, step: usize },
@@ -469,6 +475,22 @@ pub enum SseEvent {
     },
 }
 
+/// One SSE frame: an [`SseEvent`] plus the `id:` that pins it to the session
+/// timeline (issue #117).
+///
+/// The `id` is the [`crate::event::EventMeta::id`] of the originating
+/// [`crate::event::AgentEvent`] — `<ts_ms>-<turn>-<seq>` — so a client can order/dedupe
+/// frames (and echo it back via `Last-Event-ID`) without reconstructing a
+/// timeline from the per-turn `step` numbers, which restart every turn.
+/// Frames *derived* from one event (e.g. `tool_progress`) append a suffix —
+/// `<ts_ms>-<turn>-<seq>:progress` — so they stay ordered next to their origin.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SseFrame {
+    /// The SSE `id:` field for this frame.
+    pub id: String,
+    pub event: SseEvent,
+}
+
 // ── App state ──────────────────────────────────────────────────────────────
 
 /// Shared application state for the HTTP server.
@@ -485,8 +507,9 @@ pub struct AppState {
     /// registry, the run-admission gate (Goal 398) and the session TTL.
     /// Session SSE channels stay here: they are an HTTP transport concept.
     pub host: Arc<SessionHost<SessionState>>,
-    /// Per-session SSE broadcast channels.
-    pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseEvent>>>>,
+    /// Per-session SSE broadcast channels. Each entry carries an [`SseFrame`]
+    /// so subscribers get the frame's timeline `id:` alongside the payload.
+    pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<SseFrame>>>>,
     pub metrics: Arc<Metrics>,
     /// Goal-169: registered slash commands (built-in + skill-backed).
     /// Pre-built at startup for cheap `GET /slash-commands` responses.
@@ -2104,6 +2127,7 @@ mod goal_396_persistence_tests {
             last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
             prompt_tokens: Arc::new(AtomicU64::new(0)),
             completion_tokens: Arc::new(AtomicU64::new(0)),
+            event_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
