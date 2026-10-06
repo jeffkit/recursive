@@ -354,17 +354,23 @@ impl SessionWriter {
         parent_uuid_override: Option<&str>,
         usage: Option<&UsageMeta>,
     ) -> std::io::Result<String> {
-        self.append_with_audit(msg, None, parent_uuid_override, usage)
+        self.append_with_audit(msg, None, parent_uuid_override, usage, None)
     }
 
     /// Append a message with optional audit metadata (Goal 153).
     /// `audit` should only be `Some` for `Role::Tool` messages.
+    ///
+    /// `step` — issue #120: the 1-based ReAct step that produced the message,
+    /// stamped onto the [`TranscriptEntry`] when it came from the kernel's step
+    /// loop. `None` for runtime-level messages (user turns, compaction
+    /// summaries) and callers that don't track a step.
     pub fn append_with_audit(
         &mut self,
         msg: &Message,
         audit: Option<crate::tools::AuditMeta>,
         parent_uuid_override: Option<&str>,
         usage: Option<&UsageMeta>,
+        step: Option<usize>,
     ) -> std::io::Result<String> {
         self.message_count += 1;
         let msg_id = format!("msg_{:03}", self.message_count);
@@ -432,6 +438,7 @@ impl SessionWriter {
             usage: usage.cloned(),
             timestamp: chrono_lite_now(),
             audit,
+            step,
         };
 
         let line = serde_json::to_string(&entry)
@@ -682,13 +689,19 @@ impl SessionPersistenceSink {
 impl EventSink for SessionPersistenceSink {
     async fn emit(&self, event: AgentEvent) {
         match event {
-            AgentEvent::MessageAppended { message, usage } => {
+            AgentEvent::MessageAppended {
+                message,
+                usage,
+                step,
+            } => {
                 let result = {
                     match self.writer.lock() {
-                        Ok(mut w) => w.append_with_audit(&message, None, None, usage.as_ref()),
+                        Ok(mut w) => {
+                            w.append_with_audit(&message, None, None, usage.as_ref(), step)
+                        }
                         Err(poisoned) => {
                             let mut w = poisoned.into_inner();
-                            w.append_with_audit(&message, None, None, usage.as_ref())
+                            w.append_with_audit(&message, None, None, usage.as_ref(), step)
                         }
                     }
                 };
@@ -696,14 +709,18 @@ impl EventSink for SessionPersistenceSink {
                     tracing::error!("session persistence: failed to append message: {e}");
                 }
             }
-            AgentEvent::MessageAppendedWithAudit { message, audit } => {
+            AgentEvent::MessageAppendedWithAudit {
+                message,
+                audit,
+                step,
+            } => {
                 // Goal 153: tool result with audit metadata.
                 let result = {
                     match self.writer.lock() {
-                        Ok(mut w) => w.append_with_audit(&message, Some(audit), None, None),
+                        Ok(mut w) => w.append_with_audit(&message, Some(audit), None, None, step),
                         Err(poisoned) => {
                             let mut w = poisoned.into_inner();
-                            w.append_with_audit(&message, Some(audit), None, None)
+                            w.append_with_audit(&message, Some(audit), None, None, step)
                         }
                     }
                 };
@@ -1148,6 +1165,7 @@ mod tests {
         sink.emit(AgentEvent::MessageAppended {
             message: msg.clone(),
             usage: None,
+            step: Some(2),
         })
         .await;
 
@@ -1168,6 +1186,11 @@ mod tests {
         );
         assert_eq!(loaded.tool_calls.len(), 1);
         assert_eq!(loaded.tool_calls[0].name, "my_tool");
+
+        // Issue #120: the step rides through the sink onto the persisted row.
+        let raw = std::fs::read_to_string(session_dir.join("transcript.jsonl")).unwrap();
+        let entry: TranscriptEntry = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.step, Some(2), "step must be persisted to the row");
     }
 
     /// A poisoned mutex is recovered gracefully: subsequent `emit` calls
@@ -1192,6 +1215,7 @@ mod tests {
         sink.emit(AgentEvent::MessageAppended {
             message: Message::user("after poison"),
             usage: None,
+            step: None,
         })
         .await;
 
@@ -1250,7 +1274,7 @@ mod tests {
         // constructing all fields manually.
         let audit = crate::tools::AuditMeta::synthetic_unknown_tool("Read");
         let tool_msg = Message::tool_result("tc-audit-1", "file contents");
-        w.append_with_audit(&tool_msg, Some(audit), None, None)
+        w.append_with_audit(&tool_msg, Some(audit), None, None, None)
             .unwrap();
         w.finish(SessionStatus::Completed).unwrap();
 

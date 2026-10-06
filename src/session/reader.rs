@@ -1049,6 +1049,7 @@ mod tests {
                 usage: None,
                 timestamp: String::new(),
                 audit: None,
+                step: None,
             };
             if tools {
                 e.tool_calls = vec![crate::llm::ToolCall {

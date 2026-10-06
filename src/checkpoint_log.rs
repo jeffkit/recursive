@@ -70,6 +70,14 @@ fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 
+/// Current Unix timestamp in seconds (0 if the clock is before the epoch).
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TouchedVia {

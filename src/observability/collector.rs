@@ -1037,6 +1037,7 @@ mod tests {
             &AgentEvent::MessageAppended {
                 message,
                 usage: None,
+                step: None,
             },
             at(1),
         );

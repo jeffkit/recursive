@@ -302,7 +302,7 @@ impl<'a> RunCore<'a> {
     /// message produced by that call — mirroring the on-disk contract that
     /// assistant rows carry usage — and is consumed here so it can never
     /// leak onto a later row.
-    fn push_message(&mut self, msg: Message) {
+    fn push_message(&mut self, step: usize, msg: Message) {
         let usage = if matches!(msg.role, crate::message::Role::Assistant) {
             self.pending_step_usage.take()
         } else {
@@ -311,6 +311,7 @@ impl<'a> RunCore<'a> {
         self.emit(AgentEvent::MessageAppended {
             message: msg.clone(),
             usage,
+            step: Some(step),
         });
         Arc::make_mut(&mut self.messages).push(msg);
     }
@@ -321,15 +322,22 @@ impl<'a> RunCore<'a> {
     /// the push-time event — unlike assistant messages, tool rows would
     /// otherwise lose their audit field entirely once `emit_turn_messages`
     /// stopped re-emitting the turn batch.
-    fn push_tool_result(&mut self, msg: Message, audit: Option<crate::tools::AuditMeta>) {
+    fn push_tool_result(
+        &mut self,
+        step: usize,
+        msg: Message,
+        audit: Option<crate::tools::AuditMeta>,
+    ) {
         let event = match audit {
             Some(audit) => AgentEvent::MessageAppendedWithAudit {
                 message: msg.clone(),
                 audit,
+                step: Some(step),
             },
             None => AgentEvent::MessageAppended {
                 message: msg.clone(),
                 usage: None,
+                step: Some(step),
             },
         };
         self.emit(event);
@@ -607,6 +615,7 @@ impl<'a> RunCore<'a> {
                     is_error,
                 });
                 self.push_tool_result(
+                    step,
                     Message::tool_result(o.id.clone(), o.result.clone()),
                     o.audit.clone(),
                 );
@@ -646,6 +655,7 @@ impl<'a> RunCore<'a> {
                 tool_audits.insert((self.turn, id.clone()), a.clone());
             }
             self.push_tool_result(
+                step,
                 Message::tool_result(id.clone(), result.clone()),
                 audit.clone(),
             );
@@ -713,9 +723,12 @@ impl<'a> RunCore<'a> {
         // references a path matching a Globs-mode skill. Inject once per skill.
         let result_strings: Vec<String> = results.iter().map(|r| r.result.clone()).collect();
         for (skill_name, skill_body) in skill_injector.check(&result_strings) {
-            self.push_message(Message::system(format!(
-                "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
-            )));
+            self.push_message(
+                step,
+                Message::system(format!(
+                    "<!-- skill:{skill_name} injected by globs match -->\n{skill_body}"
+                )),
+            );
         }
         None
     }
@@ -725,13 +738,13 @@ impl<'a> RunCore<'a> {
     /// sinks. Reasoning is attached before the push so the push-time
     /// `MessageAppended` event — and the transcript row it produces —
     /// carries it.
-    fn push_assistant_tool_call_message(&mut self, completion: &Completion) {
+    fn push_assistant_tool_call_message(&mut self, step: usize, completion: &Completion) {
         let mut msg = Message::assistant_with_tool_calls(
             completion.content.clone(),
             completion.tool_calls.clone(),
         );
         msg.reasoning_content = completion.reasoning_content.clone();
-        self.push_message(msg);
+        self.push_message(step, msg);
     }
 
     /// Finalise a step whose LLM completion carried no tool calls. Pushes
@@ -753,7 +766,7 @@ impl<'a> RunCore<'a> {
         // `MessageAppended` event (and transcript row) carries it.
         let mut msg = Message::assistant(completion.content.clone());
         msg.reasoning_content = completion.reasoning_content.clone();
-        self.push_message(msg);
+        self.push_message(step, msg);
         let finish = match completion.finish_reason.as_deref() {
             Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r.to_string()),
             _ => FinishReason::NoMoreToolCalls,
@@ -769,20 +782,23 @@ impl<'a> RunCore<'a> {
     /// since the last step, appending each as a user-role turn so the
     /// LLM sees coordinator instructions on the next reasoning step.
     /// No-op when no mailbox is configured.
-    async fn drain_mailbox(&mut self) {
+    async fn drain_mailbox(&mut self, step: usize) {
         let Some(mailbox) = self.mailbox.as_ref() else {
             return;
         };
         let pending = mailbox.drain_all().await;
         for msg_text in pending {
-            self.push_message(Message {
-                role: crate::message::Role::User,
-                content: format!("[coordinator]: {msg_text}"),
-                tool_calls: vec![],
-                tool_call_id: None,
-                reasoning_content: None,
-                is_compaction_summary: false,
-            });
+            self.push_message(
+                step,
+                Message {
+                    role: crate::message::Role::User,
+                    content: format!("[coordinator]: {msg_text}"),
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    is_compaction_summary: false,
+                },
+            );
         }
     }
 
@@ -938,6 +954,7 @@ impl<'a> RunCore<'a> {
     /// supplied.
     fn fail_step(
         &self,
+        step: usize,
         error: crate::error::Error,
         total_usage: TokenUsage,
     ) -> Result<RunInnerOutcome> {
@@ -948,6 +965,14 @@ impl<'a> RunCore<'a> {
                 Err(poisoned) => *poisoned.into_inner() = usage,
             }
         }
+        // Issue #120: announce the failure on the event stream so observers do
+        // not have to infer it from a `TurnFinished` that never arrives. Emitted
+        // *after* the folded usage is published so a consumer reading both sees
+        // consistent spend.
+        self.emit(AgentEvent::TurnFailed {
+            step,
+            error: error.to_string(),
+        });
         Err(error)
     }
 
@@ -1030,7 +1055,7 @@ impl<'a> RunCore<'a> {
         // `MessageAppended` event carries it.
         let mut msg = Message::assistant(completion.content.clone());
         msg.reasoning_content = completion.reasoning_content.clone();
-        self.push_message(msg);
+        self.push_message(step, msg);
         self.make_cancelled_outcome(
             step,
             Some(completion.content), // partial reply becomes final_message
@@ -1267,6 +1292,7 @@ impl<'a> RunCore<'a> {
                     self.emit(AgentEvent::MessageAppended {
                         message: summary.clone(),
                         usage: None,
+                        step: Some(step),
                     });
                 }
             }
@@ -1556,7 +1582,7 @@ impl<'a> RunCore<'a> {
             }
 
             // ---- mailbox drain (coordinator → worker mid-run messages) -----------
-            self.drain_mailbox().instrument(step_span.clone()).await;
+            self.drain_mailbox(step).instrument(step_span.clone()).await;
 
             // ---- transcript budget ------------------------------------------------
             if let Some((finish, finish_step)) = self.enforce_transcript_budget(step, &total_usage)
@@ -1600,7 +1626,7 @@ impl<'a> RunCore<'a> {
                         tool_audits,
                     ));
                 }
-                Err(e) => return self.fail_step(e, total_usage),
+                Err(e) => return self.fail_step(step, e, total_usage),
             };
             // Goal 382: a stream-interrupted completion (finish_reason
             // "interrupted") persists the partial reply as a Cancelled turn.
@@ -1622,7 +1648,7 @@ impl<'a> RunCore<'a> {
                 ));
             }
 
-            self.push_assistant_tool_call_message(&completion);
+            self.push_assistant_tool_call_message(step, &completion);
 
             for call in &completion.tool_calls {
                 self.emit(AgentEvent::ToolCall {
@@ -3281,6 +3307,118 @@ mod tests {
         assert!(
             matches!(err, crate::error::Error::Llm { .. }),
             "expected Error::Llm, got {err:?}",
+        );
+    }
+
+    /// Issue #120: a failed step must announce `TurnFailed { step, error }` on
+    /// the event stream so a consumer does not have to infer the failure from
+    /// a `TurnFinished` that never arrives.
+    #[tokio::test]
+    async fn fail_step_emits_turn_failed_with_step() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]).with_errors(vec![
+            crate::error::Error::Llm {
+                provider: "mock".to_string(),
+                message: "kaboom".to_string(),
+            },
+        ]));
+        let mut core = make_run_core_for_inner(
+            vec![Message::user("hello".to_string())],
+            &hooks,
+            provider,
+            3,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        core.events = Some(tx);
+
+        match core.run_inner().await {
+            Ok(_) => panic!("the LLM error must bubble"),
+            Err(e) => assert!(matches!(e, crate::error::Error::Llm { .. }), "got {e:?}"),
+        }
+
+        let mut failed = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::event::AgentEvent::TurnFailed { step, error } = ev {
+                failed = Some((step, error));
+            }
+        }
+        let (step, error) = failed.expect("TurnFailed must be emitted on failure");
+        assert_eq!(step, 1, "the first step's LLM call failed");
+        assert!(
+            error.contains("kaboom"),
+            "error text must ride along: {error}"
+        );
+    }
+
+    /// Issue #120: messages produced inside the step loop must carry their
+    /// 1-based step so persistence can reconstruct which step they belong to.
+    #[tokio::test]
+    async fn pushed_messages_carry_their_step() {
+        use crate::llm::{Completion, MockProvider, ToolCall};
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: "thinking".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "nonexistent_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                finish_reason: Some("tool_calls".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "done".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+        let mut core =
+            make_run_core_for_inner(vec![Message::user("hi".to_string())], &hooks, provider, 5);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        core.events = Some(tx);
+
+        let outcome = core.run_inner().await.expect("turn must succeed");
+        assert!(matches!(
+            outcome.finish_reason,
+            crate::agent::FinishReason::NoMoreToolCalls
+        ));
+
+        let mut appended: Vec<(Role, Option<usize>)> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::event::AgentEvent::MessageAppended { message, step, .. }
+                | crate::event::AgentEvent::MessageAppendedWithAudit { message, step, .. } => {
+                    appended.push((message.role, step));
+                }
+                _ => {}
+            }
+        }
+
+        // Step 1: the assistant tool-call message and its tool result.
+        assert!(
+            appended
+                .iter()
+                .any(|(role, step)| *role == Role::Assistant && *step == Some(1)),
+            "step-1 assistant message must carry step 1: {appended:?}"
+        );
+        assert!(
+            appended
+                .iter()
+                .any(|(role, step)| *role == Role::Tool && *step == Some(1)),
+            "step-1 tool result must carry step 1: {appended:?}"
+        );
+        // Step 2: the final assistant message with no tool calls.
+        assert!(
+            appended
+                .iter()
+                .any(|(role, step)| *role == Role::Assistant && *step == Some(2)),
+            "step-2 assistant message must carry step 2: {appended:?}"
         );
     }
 

@@ -336,6 +336,7 @@ fn rewrite_legacy_transcript(path: &Path) {
                     usage: None,
                     timestamp: crate::session::chrono_lite_now(),
                     audit: None,
+                    step: None,
                 };
                 chain_parent = Some(uuid);
                 if let Ok(json) = serde_json::to_string(&entry) {

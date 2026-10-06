@@ -38,6 +38,14 @@ pub struct TranscriptEntry {
     /// [`entry_to_message`] which drops this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit: Option<crate::tools::AuditMeta>,
+    /// Issue #120: the 1-based ReAct step that produced this message, when it
+    /// was produced inside the kernel's step loop. `None` for messages the
+    /// runtime appends outside a step (the turn's user message, compaction
+    /// summaries, post-compaction re-injections) and for pre-#120 entries.
+    /// Lets a session be read back step-by-step instead of by counting
+    /// assistant rows. Persistence-only — dropped by [`entry_to_message`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<usize>,
 }
 
 /// A compact-boundary system entry written to the JSONL when cross-turn
@@ -136,7 +144,28 @@ mod tests {
             usage: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             audit: None,
+            step: None,
         }
+    }
+
+    /// Issue #120: the `step` field survives a JSON round-trip and defaults
+    /// to `None` for entries written before the field existed.
+    #[test]
+    fn step_field_round_trips_and_defaults_to_none() {
+        let mut e = make_entry("assistant");
+        e.step = Some(4);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"step\":4"),
+            "step must serialize; got {json}"
+        );
+        let back: TranscriptEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.step, Some(4));
+
+        // A pre-#120 entry (no `step` key) must deserialize to `None`.
+        let legacy = r#"{"id":"m1","role":"assistant","content":"hi","timestamp":"t"}"#;
+        let parsed: TranscriptEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.step, None, "absent step must default to None");
     }
 
     #[test]

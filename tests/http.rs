@@ -2454,6 +2454,7 @@ mod http_tests {
                 is_compaction_summary: false,
             },
             usage: None,
+            step: None,
         };
         let sse = map_agent_event(&event).unwrap();
         assert_eq!(
@@ -2488,6 +2489,7 @@ mod http_tests {
                 is_compaction_summary: false,
             },
             usage: None,
+            step: None,
         };
         let sse = map_agent_event(&event).unwrap();
         let SseEvent::Message { role, content } = sse else {
@@ -2518,6 +2520,7 @@ mod http_tests {
                     is_compaction_summary: false,
                 },
                 usage: None,
+                step: None,
             };
             assert!(
                 map_agent_event(&event).is_none(),

@@ -112,6 +112,15 @@ pub enum HookEvent<'a> {
         /// The outcome that will be returned.
         outcome: &'a RuntimeOutcome,
     },
+    /// Fired when a turn ends in `Err` instead of a [`RuntimeOutcome`]
+    /// (issue #120). Pairs with [`HookEvent::SessionEnd`], which only fires
+    /// for data-shaped terminations; this is the failure counterpart so a hook
+    /// can observe a crashed turn rather than infer it from a `SessionEnd`
+    /// that never arrives.
+    SessionEndErr {
+        /// Human-readable error message from the failed run.
+        error: &'a str,
+    },
     /// Fired after the user submits a message, before the LLM processes it.
     UserPromptSubmit {
         /// The user's input content.

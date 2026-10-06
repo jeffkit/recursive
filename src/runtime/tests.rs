@@ -306,6 +306,127 @@ async fn runtime_no_auto_snapshots_with_checkpoints_enabled() {
     assert_eq!(recs.len(), 0, "no auto log entries");
 }
 
+/// Issue #120: a turn that ends in `Err` must be observable on three
+/// surfaces — the event stream (`TurnFailed`), the hook surface
+/// (`SessionEndErr`), and the checkpoint log (a fallback snapshot so
+/// `sessions rewind` has something to restore to even when the agent never
+/// called `checkpoint_save`).
+#[tokio::test]
+async fn failed_turn_reports_on_event_hook_and_checkpoint_surfaces() {
+    if !has_git() {
+        return;
+    }
+    use crate::event::ChannelSink;
+
+    struct RecordingHook(Arc<Mutex<Vec<String>>>);
+    impl crate::hooks::Hook for RecordingHook {
+        fn on_event(&self, event: crate::hooks::HookEvent) -> crate::hooks::HookAction {
+            if let crate::hooks::HookEvent::SessionEndErr { error } = event {
+                self.0.lock().map(|mut v| v.push(error.to_string())).ok();
+            }
+            crate::hooks::HookAction::Continue
+        }
+    }
+
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Arc::new(RecordingHook(recorded.clone())));
+
+    let (sink, mut rx) = ChannelSink::new();
+    let provider =
+        Arc::new(
+            MockProvider::new(vec![]).with_errors(vec![crate::error::Error::Llm {
+                provider: "mock".into(),
+                message: "kaboom".into(),
+            }]),
+        );
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .event_sink(Arc::new(sink))
+        .hooks(hooks)
+        .build()
+        .unwrap();
+
+    let dir = shadow_ws();
+    std::fs::write(dir.path().join("seed.txt"), "v0").unwrap();
+    let shadow = Arc::new(crate::ShadowRepo::open_at(dir.path(), dir.shadow_dir()).unwrap());
+    let log_path = dir.path().join("checkpoints.jsonl");
+    rt.enable_checkpoints(shadow, "sess", log_path.clone(), None)
+        .unwrap();
+
+    // Drain any registration events.
+    while rx.try_recv().is_ok() {}
+
+    let err = rt
+        .run("doomed turn")
+        .await
+        .expect_err("a permanent LLM error must propagate");
+    assert!(
+        matches!(err, crate::error::Error::Llm { .. }),
+        "got {err:?}"
+    );
+
+    // 1. `TurnFailed` on the event surface.
+    let mut saw_failed = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::TurnFailed { step, error } = ev {
+            assert_eq!(step, 1, "the failure happened on the first step");
+            assert!(error.contains("kaboom"), "error message must ride along");
+            saw_failed = true;
+        }
+    }
+    assert!(saw_failed, "TurnFailed must be emitted for a failed run");
+
+    // 2. `SessionEndErr` on the hook surface, exactly once.
+    let errs = recorded.lock().unwrap().clone();
+    assert_eq!(errs.len(), 1, "SessionEndErr must fire exactly once");
+    assert!(errs[0].contains("kaboom"));
+
+    // 3. A fallback checkpoint so `sessions rewind` is not left with an empty log.
+    let recs = crate::read_checkpoint_log(&log_path).unwrap();
+    assert_eq!(recs.len(), 1, "failure must leave a fallback checkpoint");
+    assert!(
+        recs[0]
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("failure:"),
+        "fallback record must be labelled as a failure: {:?}",
+        recs[0].message
+    );
+}
+
+/// Issue #120: a *successful* turn must not leave a fallback checkpoint —
+/// the failure snapshot is failure-only, so an agent that never calls
+/// `checkpoint_save` still has an empty log on the happy path.
+#[tokio::test]
+async fn successful_turn_leaves_no_failure_checkpoint() {
+    if !has_git() {
+        return;
+    }
+    let dir = shadow_ws();
+    std::fs::write(dir.path().join("seed.txt"), "v0").unwrap();
+    let llm = Arc::new(MockProvider::new(vec![Completion {
+        content: "ok".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }]));
+    let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+    let shadow = Arc::new(crate::ShadowRepo::open_at(dir.path(), dir.shadow_dir()).unwrap());
+    let log_path = dir.path().join("checkpoints.jsonl");
+    rt.enable_checkpoints(shadow, "sess", log_path.clone(), None)
+        .unwrap();
+
+    rt.run("fine").await.unwrap();
+    let recs = crate::read_checkpoint_log(&log_path).unwrap();
+    assert!(
+        recs.is_empty(),
+        "a successful turn must not write a failure checkpoint"
+    );
+}
+
 /// Goal 284: verify that `checkpoint_save` tool is registered
 /// when checkpoints are enabled.
 #[tokio::test]

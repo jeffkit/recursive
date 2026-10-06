@@ -333,7 +333,7 @@ impl AgentRuntime {
         });
         self.append_user_message(&user_text).await;
 
-        match self.drive_turn().await {
+        let result = match self.drive_turn().await {
             Ok(outcome) => Ok(outcome),
             Err(e) if is_context_window_exceeded(&e) => {
                 // The LLM rejected the request because the transcript exceeded its
@@ -350,8 +350,12 @@ impl AgentRuntime {
                 // The retry resets `last_failed_usage`, so snapshot it here and
                 // fold it into whichever account the retry lands in.
                 let first_attempt_usage = self.last_failed_usage;
-                match self.compact_on_overflow().await? {
-                    Some(overflow_usage) => match self.drive_turn().await {
+                match self.compact_on_overflow().await {
+                    // The overflow-recovery summary itself failed. Surface it
+                    // through the same failure path as any other turn error so
+                    // #120's hook/checkpoint surfacing still fires.
+                    Err(compact_err) => Err(compact_err),
+                    Ok(Some(overflow_usage)) => match self.drive_turn().await {
                         // The emergency summary is a real, expensive call —
                         // bill it (and the rejected attempt) to the turn it
                         // rescued (issue #115).
@@ -374,10 +378,90 @@ impl AgentRuntime {
                     },
                     // Compaction was rejected — `last_failed_usage` already
                     // holds the rejected attempt's spend.
-                    None => Err(e),
+                    Ok(None) => Err(e),
                 }
             }
             Err(e) => Err(e),
+        };
+        // Issue #120: surface a failed run on both the hook surface and the
+        // checkpoint log. An `Err` from the kernel bypasses `TurnFinished`,
+        // `emit_turn_messages`, and the summary log — so without this the
+        // only trace of *why* a run died is the process's stderr tail.
+        if let Err(err) = &result {
+            self.record_turn_failure(err);
+        }
+        result
+    }
+
+    /// Issue #120: fire [`HookEvent::SessionEndErr`] and write a fallback
+    /// checkpoint snapshot after a turn ends in `Err`.
+    ///
+    /// Both effects are best-effort — a failed snapshot must never mask the
+    /// original error the caller is about to return. The snapshot exists so
+    /// an on-demand checkpoint log (Goal 284) is never left empty by a crash:
+    /// a session that failed before the agent ever called `checkpoint_save`
+    /// still has one recoverable restore point for `sessions rewind`.
+    fn record_turn_failure(&self, err: &crate::error::Error) {
+        let message = err.to_string();
+        self.kernel
+            .hooks()
+            .dispatch(HookEvent::SessionEndErr { error: &message });
+        self.write_failure_checkpoint(&message);
+    }
+
+    /// Issue #120: snapshot the workspace and append a fallback
+    /// [`CheckpointRecord`] so `checkpoints.jsonl` is never empty when a turn
+    /// fails. No-op when checkpoints are disabled. Errors are logged, never
+    /// propagated (the caller is already returning the run's own error).
+    fn write_failure_checkpoint(&self, reason: &str) {
+        let (Some(shadow), Some(session_id), Some(writer), Some(log_path)) = (
+            self.checkpoints.shadow.as_ref(),
+            self.checkpoints.session_id.as_ref(),
+            self.checkpoints.writer.as_ref(),
+            self.checkpoints.log_path.as_ref(),
+        ) else {
+            return;
+        };
+        let turn = self.checkpoints.turn_index.load(Ordering::Relaxed);
+        let message = format!("failure: {reason}");
+        let last_id = crate::checkpoint_log::read_log(log_path)
+            .ok()
+            .and_then(|recs| recs.last().map(|r| r.id.clone()));
+        let id = match shadow.snapshot_for_session(session_id, &message) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failure fallback checkpoint: snapshot failed"
+                );
+                return;
+            }
+        };
+        let touched_files = self
+            .checkpoints
+            .touched_files
+            .as_ref()
+            .and_then(|slot| slot.lock().ok().map(|t| t.paths_sorted()))
+            .unwrap_or_default();
+        let rec = crate::checkpoint_log::CheckpointRecord {
+            turn,
+            pre: last_id,
+            id,
+            message: Some(message),
+            touched_files,
+            touched_via: crate::checkpoint_log::TouchedVia::Structured,
+            started_at: 0,
+            finished_at: 0,
+            saved_at: crate::checkpoint_log::unix_now(),
+        };
+        match writer.lock() {
+            Ok(w) => {
+                if let Err(e) = w.append(&rec) {
+                    tracing::warn!(error = %e, "failure fallback checkpoint: append failed");
+                }
+            }
+            Err(_) => tracing::warn!("failure fallback checkpoint: log writer lock poisoned"),
         }
     }
 
@@ -525,6 +609,7 @@ impl AgentRuntime {
             .emit(AgentEvent::MessageAppended {
                 message: user_msg,
                 usage: None,
+                step: None,
             })
             .await;
     }
@@ -642,6 +727,7 @@ impl AgentRuntime {
                         .emit(AgentEvent::MessageAppended {
                             message: summary,
                             usage: None,
+                            step: None,
                         })
                         .await;
                 }
@@ -660,6 +746,7 @@ impl AgentRuntime {
                             .emit(AgentEvent::MessageAppended {
                                 message: att,
                                 usage: None,
+                                step: None,
                             })
                             .await;
                     }
@@ -688,6 +775,7 @@ impl AgentRuntime {
                             .emit(AgentEvent::MessageAppended {
                                 message: att,
                                 usage: None,
+                                step: None,
                             })
                             .await;
                     }
@@ -714,6 +802,7 @@ impl AgentRuntime {
                                 .emit(AgentEvent::MessageAppended {
                                     message: att,
                                     usage: None,
+                                    step: None,
                                 })
                                 .await;
                         }
@@ -805,6 +894,7 @@ impl AgentRuntime {
                 .emit(AgentEvent::MessageAppended {
                     message: summary,
                     usage: None,
+                    step: None,
                 })
                 .await;
         }

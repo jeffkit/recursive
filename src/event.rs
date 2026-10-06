@@ -124,6 +124,17 @@ pub enum AgentEvent {
         /// Number of iterations executed.
         steps: usize,
     },
+    /// Issue #120: the turn ended because the kernel returned an error
+    /// (network, provider transport, JSON, IO) rather than a data-shaped
+    /// finish reason. Distinct from [`Self::TurnFinished`], which is reserved
+    /// for terminations the agent chose; consumers use this to surface *why*
+    /// a run died instead of inferring it from a missing `TurnFinished`.
+    TurnFailed {
+        /// 1-based step at which the failure occurred.
+        step: usize,
+        /// Human-readable error message.
+        error: String,
+    },
     /// Goal-202: Agent is requesting permission to enter plan mode.
     /// Emitted by `RequestPlanModeTool` before any exploration begins.
     /// The TUI / HTTP surface should prompt the user and call
@@ -163,6 +174,13 @@ pub enum AgentEvent {
         message: crate::message::Message,
         /// Token usage for this message (g156).
         usage: Option<crate::session::UsageMeta>,
+        /// Issue #120: 1-based ReAct step that produced this message, when it
+        /// was produced inside the kernel's step loop. `None` for messages the
+        /// runtime appends outside a step (the turn's user message, compaction
+        /// summaries, post-compaction re-injections). Persisted to the
+        /// transcript row so a session can be read back step-by-step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<usize>,
     },
 
     /// Variant of [`MessageAppended`] specifically for `Role::Tool` messages
@@ -176,6 +194,9 @@ pub enum AgentEvent {
     MessageAppendedWithAudit {
         message: crate::message::Message,
         audit: crate::tools::AuditMeta,
+        /// Issue #120: 1-based ReAct step that produced this tool result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<usize>,
     },
 
     /// Cross-turn compaction just fired; a compact_boundary marker should be
@@ -691,6 +712,10 @@ mod tests {
                 reason: "done".into(),
                 steps: 7,
             },
+            AgentEvent::TurnFailed {
+                step: 3,
+                error: "provider transport error".into(),
+            },
             AgentEvent::PlanProposed {
                 plan_text: "plan".into(),
                 tool_calls: vec![],
@@ -733,11 +758,16 @@ mod tests {
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),
             usage: None,
+            step: Some(3),
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: AgentEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
-        if let AgentEvent::MessageAppended { message: m, .. } = deserialized {
+        if let AgentEvent::MessageAppended {
+            message: m, step, ..
+        } = deserialized
+        {
+            assert_eq!(step, Some(3), "step must survive the round-trip");
             assert_eq!(m.content, "some text");
             assert_eq!(m.reasoning_content.as_deref(), Some("my reasoning"));
             assert_eq!(m.tool_calls.len(), 1);
@@ -763,6 +793,7 @@ mod tests {
         let event = AgentEvent::MessageAppended {
             message: msg.clone(),
             usage: None,
+            step: None,
         };
         composite.emit(event.clone()).await;
 
@@ -935,6 +966,7 @@ mod tests {
         let event2 = AgentEvent::MessageAppendedWithAudit {
             message: msg,
             audit,
+            step: Some(2),
         };
         let json2 = serde_json::to_string(&event2).unwrap();
         let back2: AgentEvent = serde_json::from_str(&json2).unwrap();

@@ -287,7 +287,7 @@ impl Tool for CheckpointSave {
                 touched_via: via,
                 started_at: 0,
                 finished_at: 0,
-                saved_at: unix_now(),
+                saved_at: crate::checkpoint_log::unix_now(),
             };
             writer.append(&rec).map_err(|e| Error::Tool {
                 name: "checkpoint_save".into(),
@@ -317,14 +317,6 @@ pub fn build_checkpoint_save_tool(
         turn_index,
         log_path,
     })
-}
-
-/// Current Unix timestamp in seconds.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 // ── helper ────────────────────────────────────────────────────────────────────
@@ -418,7 +410,7 @@ mod tests {
     #[test]
     fn unix_now_is_positive() {
         // kills `map(|d| d.as_secs() as i64)` → `map(|_| 0)` or `unwrap_or(0)` mutations
-        let ts = unix_now();
+        let ts = crate::checkpoint_log::unix_now();
         // Unix epoch was in 1970; any value < 1_000_000_000 is clearly wrong
         assert!(
             ts > 1_000_000_000,

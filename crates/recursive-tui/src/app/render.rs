@@ -375,6 +375,7 @@ mod tests {
             usage: None,
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             audit: None,
+            step: None,
         }))
     }
 
@@ -412,6 +413,41 @@ mod tests {
         assert!(
             matches!(&blocks[4], TranscriptBlock::Assistant { text, .. } if text == "new reply")
         );
+    }
+
+    /// Issue #120: resume-loaded entries may carry a `step` (1-based ReAct
+    /// step). Rendering must accept the field and produce the same blocks —
+    /// the TUI ignores `step`, so a step-carrying transcript renders exactly
+    /// like one without.
+    #[test]
+    fn blocks_from_loaded_history_accepts_step_carrying_entries() {
+        use recursive::session::TranscriptEntry;
+        let with_step = |role: &str, content: &str, step: usize| {
+            recursive::session::LoadedEntry::Message(Box::new(TranscriptEntry {
+                uuid: String::new(),
+                parent_uuid: None,
+                source_tool_assistant_uuid: None,
+                id: format!("id-{role}"),
+                parent_id: None,
+                role: role.to_string(),
+                content: content.to_string(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                usage: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                audit: None,
+                step: Some(step),
+            }))
+        };
+
+        let entries = vec![
+            with_step("user", "question", 1),
+            with_step("assistant", "answer", 1),
+        ];
+        let blocks = blocks_from_loaded_history(&entries);
+        assert!(matches!(&blocks[0], TranscriptBlock::User { text } if text == "question"));
+        assert!(matches!(&blocks[1], TranscriptBlock::Assistant { text, .. } if text == "answer"));
     }
 
     #[test]
