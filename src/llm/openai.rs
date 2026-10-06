@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::search::{KeywordSearchEngine, SpecWithHint, ToolSearchEngine};
+use super::StructuredCompletion;
 use super::StructuredRequest;
 use super::{
     ChatProvider, Completion, RetryPolicy, StreamChunk, StreamSender, TokenUsage, ToolCall,
@@ -271,7 +272,7 @@ impl ChatProvider for OpenAiProvider {
         Ok(parse_completion(choice, parsed.usage))
     }
 
-    async fn complete_structured(&self, req: StructuredRequest) -> Result<Value> {
+    async fn complete_structured(&self, req: StructuredRequest) -> Result<StructuredCompletion> {
         let mut body = build_request(
             &self.model,
             self.temperature,
@@ -300,11 +301,15 @@ impl ChatProvider for OpenAiProvider {
         if completion.content.trim().is_empty() {
             return Err(self.make_err("structured response had empty content"));
         }
-        serde_json::from_str(&completion.content).map_err(|e| {
+        let value = serde_json::from_str(&completion.content).map_err(|e| {
             self.make_err(format!(
                 "failed to parse structured response as JSON: {e}; content: {}",
                 completion.content
             ))
+        })?;
+        Ok(StructuredCompletion {
+            value,
+            usage: completion.usage,
         })
     }
 
@@ -2292,7 +2297,7 @@ data: [DONE]
 
         let result = provider.complete_structured(req).await;
         assert!(result.is_ok(), "got error: {:?}", result.err());
-        let value = result.unwrap();
+        let value = result.unwrap().value;
         assert_eq!(value["summary"], "test");
         assert_eq!(value["kept_facts"][0], "a");
         assert_eq!(value["kept_facts"][1], "b");

@@ -178,6 +178,21 @@ pub struct StructuredRequest {
     pub schema_name: String,
 }
 
+/// Result of a structured-output completion: the parsed JSON value plus the
+/// provider-reported usage.
+///
+/// The usage used to be dropped (issue #115): `complete_structured` returned
+/// only the `Value`, so a compaction summary — one of the most expensive
+/// single calls in a session — was never billed. Carrying it here lets the
+/// caller fold it into the turn's cost.
+#[derive(Debug, Clone)]
+pub struct StructuredCompletion {
+    /// The value parsed from the model's structured response.
+    pub value: Value,
+    /// Provider-reported token usage, when the provider reports it.
+    pub usage: Option<TokenUsage>,
+}
+
 /// One step of model output.
 #[derive(Debug, Clone, Default)]
 pub struct Completion {

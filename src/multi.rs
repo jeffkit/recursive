@@ -638,6 +638,8 @@ impl AgentPool {
             // Goal 399: sub-agents inherit the parent session's wall-clock
             // budget (never unlimited while the parent is bounded).
             wall_timeout_secs: self.wall_timeout_secs,
+            // Issue #115: sub-agent turns are not billed separately.
+            failure_usage: None,
         };
 
         kernel.run(ctx).await

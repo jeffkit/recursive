@@ -28,8 +28,25 @@ pub use retry::{truncate_head_for_retry, MAX_PTL_RETRIES};
 pub const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
 
 use crate::error::Result;
-use crate::llm::{ChatProvider, StructuredRequest, ToolSpec};
+use crate::llm::{ChatProvider, StructuredRequest, TokenUsage, ToolSpec};
 use crate::message::Message;
+
+/// Result of a successful compaction pass.
+///
+/// `usage` is the token spend of the summarisation call(s) — the whole older
+/// history is re-sent, so this is one of the most expensive single calls in a
+/// session. It used to be dropped (issue #115); the caller now folds it into
+/// the turn's cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    /// Number of older messages removed from the transcript.
+    pub removed: usize,
+    /// Rendered length (chars) of the summary message that replaced them.
+    pub summary_chars: usize,
+    /// Token usage reported by the summarisation call(s) — summed across PTL
+    /// retries. `Default` when the provider reported none.
+    pub usage: TokenUsage,
+}
 
 /// Configuration for LLM-driven transcript compaction.
 #[derive(Debug, Clone)]
@@ -151,14 +168,15 @@ impl Compactor {
         rendered
     }
 
-    /// Try structured compaction, returning the rendered string on success.
-    /// Returns None if the provider doesn't support it or the response is invalid.
+    /// Try structured compaction, returning the rendered string and the
+    /// provider's reported usage on success. Returns None if the provider
+    /// doesn't support it or the response is invalid.
     async fn try_structured_compact(
         &self,
         provider: &dyn ChatProvider,
         older_text: &str,
         step: usize,
-    ) -> Option<String> {
+    ) -> Option<(String, TokenUsage)> {
         let structured_prompt = format!(
             "Summarize the following conversation. \
              Preserve: file paths modified, key technical decisions, test \
@@ -180,13 +198,15 @@ impl Compactor {
             schema_name: "compaction_result".to_string(),
         };
 
-        let json_val = match provider.complete_structured(structured_req).await {
+        let structured = match provider.complete_structured(structured_req).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::info!(error = %e, "structured compaction not available, falling back to free-text");
                 return None;
             }
         };
+        let usage = structured.usage.unwrap_or_default();
+        let json_val = structured.value;
 
         let obj = match json_val.as_object() {
             Some(o) => o,
@@ -228,11 +248,9 @@ impl Compactor {
             })
             .unwrap_or_default();
 
-        Some(Self::render_structured(
-            &summary,
-            &kept_facts,
-            &next_steps,
-            step,
+        Some((
+            Self::render_structured(&summary, &kept_facts, &next_steps, step),
+            usage,
         ))
     }
 
@@ -342,7 +360,7 @@ impl Compactor {
         provider: &dyn ChatProvider,
         transcript: &mut Vec<Message>,
         step: usize,
-    ) -> Result<Option<(usize, usize)>> {
+    ) -> Result<Option<CompactionOutcome>> {
         // Goal 345: delegate the "is this worth compacting?" decision to
         // `split_for_compaction` (shared with `would_compact`) so callers can
         // pre-check without dispatching `PreCompact` into the void.
@@ -351,12 +369,16 @@ impl Compactor {
             return Ok(None);
         }
 
-        let summary_msg = self.compact(provider, transcript, step).await?;
+        let (summary_msg, usage) = self.compact(provider, transcript, step).await?;
         let summary_chars = summary_msg.content.len();
         let removed = split;
         transcript.drain(..split);
         transcript.insert(0, summary_msg);
-        Ok(Some((removed, summary_chars)))
+        Ok(Some(CompactionOutcome {
+            removed,
+            summary_chars,
+            usage,
+        }))
     }
 
     /// Render a slice of messages into a single text block for the
@@ -387,14 +409,15 @@ impl Compactor {
             .join("\n")
     }
 
-    /// Ask the provider to summarise the given messages.
+    /// Ask the provider to summarise the given messages, returning the
+    /// rendered summary plus the token usage the call burned.
     /// Tries structured output first, falls back to free-text completion.
     async fn summarize(
         &self,
         provider: &dyn ChatProvider,
         messages: &[Message],
         step: usize,
-    ) -> Result<String> {
+    ) -> Result<(String, TokenUsage)> {
         let older_text = Self::render_for_summarize(messages);
 
         // Try structured output first
@@ -402,7 +425,7 @@ impl Compactor {
             .try_structured_compact(provider, &older_text, step)
             .await
         {
-            Some(rendered) => Ok(rendered),
+            Some((rendered, usage)) => Ok((rendered, usage)),
             None => {
                 // Fall back to free-text path with structured 9-section template
                 let summary_prompt = format!(
@@ -413,8 +436,10 @@ impl Compactor {
                 let completion = provider
                     .complete(&[Message::user(summary_prompt)], &[] as &[ToolSpec])
                     .await?;
-                Ok(crate::compact::prompt::format_compact_summary(
-                    &completion.content,
+                let usage = completion.usage.unwrap_or_default();
+                Ok((
+                    crate::compact::prompt::format_compact_summary(&completion.content),
+                    usage,
                 ))
             }
         }
@@ -426,8 +451,10 @@ impl Compactor {
     /// `step` is the current turn number and is embedded in the compaction
     /// header for debuggability.
     ///
-    /// Returns the summary `Message` that should replace the older portion.
-    /// The caller is responsible for splicing it into the transcript.
+    /// Returns the summary `Message` that should replace the older portion,
+    /// together with the token usage the summarisation call(s) burned. The
+    /// caller is responsible for splicing the message into the transcript and
+    /// folding the usage into the turn's cost.
     ///
     /// If the summarisation call returns a context-window-exceeded error,
     /// the oldest message groups are dropped (via [`truncate_head_for_retry`])
@@ -438,7 +465,7 @@ impl Compactor {
         provider: &dyn ChatProvider,
         transcript: &[Message],
         step: usize,
-    ) -> Result<Message> {
+    ) -> Result<(Message, TokenUsage)> {
         let split = Self::safe_split_point(transcript, self.keep_recent_n);
         let older = &transcript[..split];
         let _recent = &transcript[split..];
@@ -447,10 +474,16 @@ impl Compactor {
         // window, drop oldest message groups and try again.
         let mut to_summarize: Vec<Message> = older.to_vec();
         let mut ptl_attempts = 0_usize;
+        // A PTL retry re-sends a shorter history, but the failed attempt
+        // still burned tokens — accumulate across attempts so none are lost.
+        let mut total_usage = TokenUsage::default();
 
         let summary = loop {
             match self.summarize(provider, &to_summarize, step).await {
-                Ok(text) => break text,
+                Ok((text, usage)) => {
+                    total_usage = total_usage.accumulate(usage);
+                    break text;
+                }
                 Err(e) if crate::error::is_context_window_exceeded(&e) => {
                     ptl_attempts += 1;
                     if ptl_attempts > MAX_PTL_RETRIES {
@@ -487,7 +520,10 @@ impl Compactor {
             summary
         );
 
-        Ok(Message::system(header).with_compaction_summary())
+        Ok((
+            Message::system(header).with_compaction_summary(),
+            total_usage,
+        ))
     }
 }
 
@@ -515,7 +551,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(200).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         assert!(
@@ -550,7 +586,7 @@ mod tests {
 
         // keep_recent_n=2 should keep the last 2 messages verbatim
         let compactor = Compactor::new(100).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript, 5).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 5).await.unwrap();
 
         assert!(summary_msg.content.contains("[compacted: 3 messages →"));
         // The summary should mention the older messages
@@ -571,7 +607,7 @@ mod tests {
 
         // keep_recent_n=5 means all messages are "recent", none to compact
         let compactor = Compactor::new(100).keep_recent_n(5);
-        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         // Should still produce a summary (even if older portion is empty-ish)
         assert_eq!(summary_msg.role, crate::message::Role::System);
@@ -734,7 +770,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(200).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript, 3).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 3).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should contain the structured rendering format with the step number
@@ -770,7 +806,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(100).keep_recent_n(1);
-        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should have fallen back to free-text format
@@ -806,7 +842,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(100).keep_recent_n(1);
-        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Should have fallen back to free-text format
@@ -849,7 +885,7 @@ mod tests {
         ];
 
         let compactor = Compactor::new(100).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+        let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         // Must carry the [compacted: header from compact()
@@ -1045,7 +1081,12 @@ mod tests {
             content: "summary of first three".to_string(),
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
-            usage: None,
+            usage: Some(TokenUsage {
+                prompt_tokens: 1234,
+                completion_tokens: 56,
+                total_tokens: 1290,
+                ..Default::default()
+            }),
             reasoning_content: None,
         }]);
 
@@ -1065,11 +1106,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Should have returned Some((removed, summary_chars))
-        let (removed, summary_chars) =
-            result.expect("should compact when transcript is long enough");
-        assert!(removed > 0, "removed must be > 0 when compaction ran");
-        assert!(summary_chars > 0, "summary_chars must be > 0");
+        // Should have returned Some(outcome)
+        let outcome = result.expect("should compact when transcript is long enough");
+        assert!(
+            outcome.removed > 0,
+            "removed must be > 0 when compaction ran"
+        );
+        assert!(outcome.summary_chars > 0, "summary_chars must be > 0");
+        // Issue #115: the summarisation call's usage must ride on the outcome.
+        assert_eq!(
+            outcome.usage.prompt_tokens, 1234,
+            "compaction outcome must carry the summarisation call's usage"
+        );
+        assert_eq!(outcome.usage.completion_tokens, 56);
 
         // Transcript must start with the compaction summary
         assert_eq!(transcript[0].role, crate::message::Role::System);
@@ -1379,10 +1428,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (removed, summary_chars) =
-            result.expect("should compact when older has real conversation");
-        assert!(removed > 0);
-        assert!(summary_chars > 0);
+        let outcome = result.expect("should compact when older has real conversation");
+        assert!(outcome.removed > 0);
+        assert!(outcome.summary_chars > 0);
         assert_eq!(transcript[0].role, crate::message::Role::System);
         assert!(transcript[0].is_compaction_summary);
     }
@@ -1447,9 +1495,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (removed, _summary_chars) =
-            result.expect("should compact when older has exactly 2 conversational msgs");
-        assert!(removed > 0);
+        let outcome = result.expect("should compact when older has exactly 2 conversational msgs");
+        assert!(outcome.removed > 0);
     }
 
     // ========================================================================
@@ -1463,7 +1510,12 @@ mod tests {
             content: "Second attempt summary.".to_string(),
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
-            usage: None,
+            usage: Some(TokenUsage {
+                prompt_tokens: 700,
+                completion_tokens: 30,
+                total_tokens: 730,
+                ..Default::default()
+            }),
             reasoning_content: None,
         }])
         .with_errors(vec![crate::error::Error::Llm {
@@ -1486,13 +1538,24 @@ mod tests {
         ];
 
         let compactor = Compactor::new(0).keep_recent_n(2);
-        let summary_msg = compactor.compact(&provider, &transcript, 0).await.unwrap();
+        let (summary_msg, usage) = compactor.compact(&provider, &transcript, 0).await.unwrap();
 
         assert_eq!(summary_msg.role, crate::message::Role::System);
         assert!(
             summary_msg.content.contains("Second attempt summary."),
             "should contain the retry's summary, got: {}",
             summary_msg.content
+        );
+
+        // Issue #115: the successful attempt's usage must be reported, not
+        // dropped on the floor.
+        assert_eq!(
+            usage.prompt_tokens, 700,
+            "compaction must report the summarisation call's prompt tokens"
+        );
+        assert_eq!(
+            usage.completion_tokens, 30,
+            "compaction must report the summarisation call's completion tokens"
         );
 
         // The provider should have been called twice (first error → retry).

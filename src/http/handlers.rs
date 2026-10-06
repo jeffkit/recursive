@@ -526,13 +526,22 @@ pub(super) fn record_run_success(
 
 /// Update metrics after a failed agent run.
 ///
+/// `usage` is the token spend of the steps that completed before the failure
+/// (`AgentRuntime::last_failed_usage`) — issue #115: a failed turn still burns
+/// real tokens, so they are added to `tokens_wasted_on_failure_total` instead
+/// of vanishing with the error.
+///
 /// Run bookkeeping only — a failure here says nothing about the LLM endpoint,
 /// so readiness is driven by [`record_llm_failure`] instead (a client
 /// cancellation or a tool/storage fault must not take a healthy pod out of
 /// rotation).
-pub(super) fn record_run_failed(metrics: &super::Metrics) {
+pub(super) fn record_run_failed(metrics: &super::Metrics, usage: &crate::llm::TokenUsage) {
     metrics.agent_runs_total.fetch_add(1, Ordering::Relaxed);
     metrics.agent_runs_failed.fetch_add(1, Ordering::Relaxed);
+    let wasted = (usage.prompt_tokens as u64).saturating_add(usage.completion_tokens as u64);
+    metrics
+        .tokens_wasted_on_failure_total
+        .fetch_add(wasted, Ordering::Relaxed);
 }
 
 /// Issue #123: a run that really completed proves the LLM endpoint answered —
@@ -711,7 +720,7 @@ pub(super) async fn run_agent(
         Ok(o) => o,
         Err(e) => {
             runtime.destroy_environment().await;
-            record_run_failed(&state.metrics);
+            record_run_failed(&state.metrics, &runtime.last_failed_usage());
             // Issue #123: only a failure of the LLM call itself says the
             // endpoint is down — a tool or storage error must not.
             if e.is_llm_failure() {
@@ -1899,8 +1908,11 @@ pub(super) async fn send_session_message(
         // Issue #124: mark the Langfuse trace failed on provider/transport errors.
         langfuse_run.finish(None, Some(&e.to_string())).await;
     }
+    // Issue #115: snapshot the failed turn's spend before the error is mapped
+    // — the runtime keeps it out of band because `Err` cannot carry it.
+    let failed_usage = runtime.last_failed_usage();
     let outcome = run_result.map_err(|e| {
-        record_run_failed(&state.metrics);
+        record_run_failed(&state.metrics, &failed_usage);
         // Issue #123: as in `/run`, only a failure of the LLM call itself
         // counts against readiness.
         if e.is_llm_failure() {
@@ -2517,6 +2529,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let agent_runs_failed = metrics.agent_runs_failed.load(Ordering::Relaxed);
     let tokens_prompt_total = metrics.tokens_prompt_total.load(Ordering::Relaxed);
     let tokens_completion_total = metrics.tokens_completion_total.load(Ordering::Relaxed);
+    let tokens_wasted_on_failure_total = metrics
+        .tokens_wasted_on_failure_total
+        .load(Ordering::Relaxed);
     let agent_steps_total = metrics.agent_steps_total.load(Ordering::Relaxed);
     let sessions_active = metrics.sessions_active.load(Ordering::Relaxed);
     let rate_limits_rejected = metrics.rate_limits_rejected.load(Ordering::Relaxed);
@@ -2590,6 +2605,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_tokens_completion_total Total completion tokens generated\n\
          # TYPE recursive_tokens_completion_total counter\n\
          recursive_tokens_completion_total {tokens_completion_total}\n\
+         # HELP recursive_tokens_wasted_on_failure_total Tokens burned by failed agent runs\n\
+         # TYPE recursive_tokens_wasted_on_failure_total counter\n\
+         recursive_tokens_wasted_on_failure_total {tokens_wasted_on_failure_total}\n\
          # HELP recursive_agent_steps_total Total agent steps executed\n\
          # TYPE recursive_agent_steps_total counter\n\
          recursive_agent_steps_total {agent_steps_total}\n\
@@ -4414,12 +4432,28 @@ mod tests {
     #[test]
     fn record_run_metrics_track_llm_streak() {
         let metrics = crate::http::Metrics::default();
-        record_run_failed(&metrics);
-        record_run_failed(&metrics);
+        let none = crate::llm::TokenUsage::default();
+        record_run_failed(&metrics, &none);
+        // Issue #115: a failed run that burned tokens must move the wasted
+        // counter — the failure path used to record zero usage.
+        let wasted = crate::llm::TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+            total_tokens: 42,
+            ..Default::default()
+        };
+        record_run_failed(&metrics, &wasted);
         assert_eq!(
             metrics.agent_runs_failed.load(Ordering::Relaxed),
             2,
             "run failures are still counted"
+        );
+        assert_eq!(
+            metrics
+                .tokens_wasted_on_failure_total
+                .load(Ordering::Relaxed),
+            42,
+            "wasted tokens (prompt + completion) from failed runs must be counted"
         );
         assert_eq!(
             metrics.llm_failures_consecutive.load(Ordering::Relaxed),

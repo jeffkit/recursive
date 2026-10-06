@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::event::{EventSink, NullSink};
 use crate::hooks::HookRegistry;
 use crate::kernel::AgentKernelBuilder;
-use crate::llm::ChatProvider;
+use crate::llm::{ChatProvider, TokenUsage};
 use crate::message::Message;
 use crate::tools::plan_mode::{
     EnterPlanModeTool, ExitPlanModeTool, PlanApprovalGate, PlanModeRequestGate, RequestPlanModeTool,
@@ -581,6 +581,8 @@ impl AgentRuntimeBuilder {
             wakeup_store_dir: self.wakeup_store_dir,
             preset_id: self.preset_id,
             deliverables,
+            last_failed_usage: TokenUsage::default(),
+            pending_compact_usage: TokenUsage::default(),
         })
     }
 }

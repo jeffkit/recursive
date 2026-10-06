@@ -236,6 +236,18 @@ pub struct AgentRuntime {
     /// Every ledger failure is logged and swallowed: a broken ledger must
     /// never take a turn down with it.
     deliverables: Option<Arc<crate::deliverables::Deliverables>>,
+    /// Issue #115: token usage burned by the most recent turn that ended in
+    /// an error. The kernel's `total_usage` is dropped when it returns `Err`;
+    /// it publishes the value to the sink carried by
+    /// [`TurnContext::failure_usage`] and the wrapper reads it here so a
+    /// failed run can still be accounted for (the HTTP
+    /// `tokens_wasted_on_failure_total` counter, the CLI cost tracker).
+    last_failed_usage: TokenUsage,
+    /// Issue #115: compaction usage not attributable to a turn — a manual
+    /// `/compact` (`compact_now` / `compact_partial_*`) burned these tokens
+    /// outside any turn's LLM calls. Folded into the next turn's usage so it
+    /// still reaches the cost tracker instead of being dropped.
+    pending_compact_usage: TokenUsage,
 }
 
 impl std::fmt::Debug for AgentRuntime {
@@ -331,10 +343,35 @@ impl AgentRuntime {
                     error = %e,
                     "context window exceeded; attempting emergency compaction before retry"
                 );
-                if self.compact_on_overflow().await? {
-                    self.drive_turn().await
-                } else {
-                    Err(e)
+                // Issue #115: the rejected first attempt already burned tokens.
+                // The retry resets `last_failed_usage`, so snapshot it here and
+                // fold it into whichever account the retry lands in.
+                let first_attempt_usage = self.last_failed_usage;
+                match self.compact_on_overflow().await? {
+                    Some(overflow_usage) => match self.drive_turn().await {
+                        // The emergency summary is a real, expensive call —
+                        // bill it (and the rejected attempt) to the turn it
+                        // rescued (issue #115).
+                        Ok(mut outcome) => {
+                            outcome.total_usage = outcome
+                                .total_usage
+                                .accumulate(first_attempt_usage)
+                                .accumulate(overflow_usage);
+                            Ok(outcome)
+                        }
+                        // Both attempts failed: add their spend to the failed
+                        // turn's account.
+                        Err(retry_err) => {
+                            self.last_failed_usage = self
+                                .last_failed_usage
+                                .accumulate(first_attempt_usage)
+                                .accumulate(overflow_usage);
+                            Err(retry_err)
+                        }
+                    },
+                    // Compaction was rejected — `last_failed_usage` already
+                    // holds the rejected attempt's spend.
+                    None => Err(e),
                 }
             }
             Err(e) => Err(e),
@@ -351,7 +388,7 @@ impl AgentRuntime {
     /// stopped (`execute_kernel_turn` folds the attempt's committed messages
     /// back in), so the re-drive resumes there rather than starting over.
     async fn drive_turn(&mut self) -> Result<RuntimeOutcome> {
-        let turn_outcome = self.execute_kernel_turn().await?;
+        let mut turn_outcome = self.execute_kernel_turn().await?;
         // Goal #133: close the change ledger for this turn and announce it.
         // Emitted BEFORE `TurnFinished` (which `emit_turn_messages` releases)
         // so a consumer reacting to the turn boundary already has the ledger,
@@ -375,7 +412,14 @@ impl AgentRuntime {
         //
         // Pass the full TokenUsage so cache_hit_tokens / cache_miss_tokens
         // land on the CompactionBoundary event (g336).
-        self.maybe_compact_cross_turn(&turn_outcome.usage).await?;
+        let compact_usage = self.maybe_compact_cross_turn(&turn_outcome.usage).await?;
+        // Issue #115: cross-turn compaction re-sends the whole transcript —
+        // fold its spend (plus any manual `/compact` spend parked since the
+        // last turn) into this turn's usage so the cost tracker sees it.
+        turn_outcome.usage = turn_outcome
+            .usage
+            .accumulate(compact_usage)
+            .accumulate(std::mem::take(&mut self.pending_compact_usage));
 
         let outcome: RuntimeOutcome = turn_outcome.into();
 
@@ -470,7 +514,14 @@ impl AgentRuntime {
     /// underestimates token density). The `cache_hit_tokens` /
     /// `cache_miss_tokens` fields are forwarded to the emitted
     /// `CompactionBoundary` event for cache-telemetry (g336).
-    pub async fn maybe_compact_cross_turn(&mut self, last_usage: &TokenUsage) -> Result<()> {
+    ///
+    /// Returns the token usage the summarisation call burned (`Default` when
+    /// no compaction ran) — issue #115: the whole transcript is re-sent, so
+    /// the caller must bill it.
+    pub async fn maybe_compact_cross_turn(
+        &mut self,
+        last_usage: &TokenUsage,
+    ) -> Result<TokenUsage> {
         // Goal 333: run microcompact before the LLM-summary check so that
         // count-based pruning of old tool results may drop the transcript
         // below the compaction threshold, skipping the expensive summary.
@@ -485,7 +536,7 @@ impl AgentRuntime {
         }
 
         let Some(ref compactor) = self.compactor else {
-            return Ok(());
+            return Ok(TokenUsage::default());
         };
 
         // Circuit breaker: stop trying after too many consecutive failures.
@@ -496,19 +547,19 @@ impl AgentRuntime {
                     reason: crate::event::CompactionSkipReason::CircuitBreaker,
                 })
                 .await;
-            return Ok(());
+            return Ok(TokenUsage::default());
         }
 
         let bytes = Compactor::estimate_bytes(&self.transcript);
         if !compactor.should_compact(bytes, last_usage.prompt_tokens) {
-            return Ok(());
+            return Ok(TokenUsage::default());
         }
         // Goal 345: only dispatch PreCompact when compaction will actually run,
         // so PreCompact / PostCompact stay balanced (mirrors run_core's
         // maybe_compact). Without this the degenerate-slice Ok(None) path
         // fired PreCompact with no matching PostCompact.
         if !compactor.would_compact(&self.transcript) {
-            return Ok(());
+            return Ok(TokenUsage::default());
         }
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: bytes,
@@ -524,8 +575,11 @@ impl AgentRuntime {
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
             .await;
+        let mut compact_usage = TokenUsage::default();
         match result {
-            Ok(Some((removed, summary_chars))) => {
+            Ok(Some(outcome)) => {
+                let (removed, summary_chars) = (outcome.removed, outcome.summary_chars);
+                compact_usage = outcome.usage;
                 // Success — reset the circuit breaker.
                 self.consecutive_compact_failures = 0;
                 self.kernel.hooks().dispatch(HookEvent::PostCompact {
@@ -651,7 +705,7 @@ impl AgentRuntime {
                     .await;
             }
         }
-        Ok(())
+        Ok(compact_usage)
     }
 
     /// Force compact the transcript regardless of the configured threshold.
@@ -660,18 +714,19 @@ impl AgentRuntime {
     /// the turn already failed we have no `prompt_tokens` reading; we bypass
     /// the threshold check entirely and compact immediately.
     ///
-    /// Returns `true` when compaction succeeded (the transcript was long enough),
-    /// `false` when the transcript was too short to compact or no compactor is
-    /// configured. A `false` return means the caller should propagate the
-    /// original error rather than retrying.
-    async fn compact_on_overflow(&mut self) -> Result<bool> {
+    /// Returns `Some(usage)` when compaction succeeded (the transcript was
+    /// long enough) — `usage` is the summarisation call's token spend, so the
+    /// caller can bill it (issue #115). Returns `None` when the transcript
+    /// was too short to compact or no compactor is configured; the caller
+    /// should then propagate the original error rather than retrying.
+    async fn compact_on_overflow(&mut self) -> Result<Option<TokenUsage>> {
         let Some(ref compactor) = self.compactor else {
-            return Ok(false);
+            return Ok(None);
         };
         // Keep the compaction lifecycle balanced: a rejected transcript must
         // not emit PreCompact because it has no matching PostCompact event.
         if !compactor.would_compact(&self.transcript) {
-            return Ok(false);
+            return Ok(None);
         }
         let bytes = Compactor::estimate_bytes(&self.transcript);
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
@@ -681,7 +736,7 @@ impl AgentRuntime {
             .checkpoints
             .turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        let Some((removed, summary_chars)) = compactor
+        let Some(outcome) = compactor
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
@@ -689,20 +744,23 @@ impl AgentRuntime {
             )
             .await?
         else {
-            return Ok(false);
+            return Ok(None);
         };
+        let (removed, summary_chars) = (outcome.removed, outcome.summary_chars);
         self.kernel.hooks().dispatch(HookEvent::PostCompact {
             removed,
             summary_chars,
         });
-        // The turn failed before reporting usage, so cache metrics are 0.
+        // Issue #115: the turn failed before reporting usage, but the
+        // summarisation call itself reported cache counts — carry those
+        // instead of the old hardcoded 0.
         self.event_sink
             .emit(AgentEvent::CompactionBoundary {
                 turn: turn as u32,
                 compacted_count: removed,
                 summary_uuid: None,
-                cache_hit_tokens: 0,
-                cache_miss_tokens: 0,
+                cache_hit_tokens: outcome.usage.cache_hit_tokens,
+                cache_miss_tokens: outcome.usage.cache_miss_tokens,
                 is_recompaction_in_chain: self.last_compact_turn.is_some(),
                 turns_since_previous_compact: match self.last_compact_turn {
                     Some(prev) => (turn as u32).saturating_sub(prev),
@@ -726,7 +784,7 @@ impl AgentRuntime {
             summary_chars,
             "emergency compaction complete; retrying turn"
         );
-        Ok(true)
+        Ok(Some(outcome.usage))
     }
 
     /// Build a `TurnContext`, run the kernel, and return the outcome.
@@ -760,6 +818,10 @@ impl AgentRuntime {
             (deferred_finished, committed)
         });
 
+        // Issue #115: the kernel publishes the turn's accumulated usage here
+        // when it exits with `Err`, so the spend survives the error return.
+        let failure_usage: crate::kernel::FailureUsage =
+            Arc::new(std::sync::Mutex::new(TokenUsage::default()));
         let ctx = TurnContext {
             messages: Arc::clone(&self.transcript),
             tool_specs: self.kernel.tools().specs(),
@@ -775,6 +837,7 @@ impl AgentRuntime {
             // budget (set via `AgentRuntimeBuilder::wall_timeout_secs`).
             // `AgentKernel::run` resolves the effective value; 0 = unlimited.
             wall_timeout_secs: self.kernel.wall_timeout_secs,
+            failure_usage: Some(Arc::clone(&failure_usage)),
         };
 
         let turn_outcome = self.kernel.run(ctx).await;
@@ -789,7 +852,11 @@ impl AgentRuntime {
         };
         self.deferred_turn_finished = deferred_finished;
         let turn_outcome = match turn_outcome {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                // A clean turn has nothing wasted to account for.
+                self.last_failed_usage = TokenUsage::default();
+                outcome
+            }
             Err(e) => {
                 // Issue #99: the kernel runs on a copy-on-write clone of the
                 // transcript, so a failed turn's already-committed messages
@@ -804,6 +871,9 @@ impl AgentRuntime {
                 // pushed, so the fold can never end mid-way through a
                 // tool_call/tool_result pair (invariant #8).
                 Arc::make_mut(&mut self.transcript).extend(committed);
+                // Issue #115: recover the tokens the failed turn burned (the
+                // steps that completed before the failing LLM call).
+                self.last_failed_usage = failure_usage.lock().map(|u| *u).unwrap_or_default();
                 return Err(e);
             }
         };
@@ -895,6 +965,15 @@ impl AgentRuntime {
     /// Return a reference to the accumulated transcript.
     pub fn transcript(&self) -> &[Message] {
         &self.transcript
+    }
+
+    /// Issue #115: token usage burned by the most recent turn that ended in
+    /// an error — zero after a successful turn. Callers that account for a
+    /// failed run (the HTTP `tokens_wasted_on_failure_total` counter, the
+    /// CLI cost tracker) read it here instead of losing the spend with the
+    /// returned `Err`.
+    pub fn last_failed_usage(&self) -> TokenUsage {
+        self.last_failed_usage
     }
 
     /// Return the most-recent `n` transcript messages, or the full
@@ -1211,7 +1290,7 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        if compactor
+        if let Some(outcome) = compactor
             .apply_to_transcript(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
@@ -1220,8 +1299,10 @@ impl AgentRuntime {
                     .load(std::sync::atomic::Ordering::Relaxed),
             )
             .await?
-            .is_some()
         {
+            // Issue #115: a manual `/compact` burns real tokens outside any
+            // turn — park the spend so the next turn's cost still includes it.
+            self.pending_compact_usage = self.pending_compact_usage.accumulate(outcome.usage);
             self.last_compact_turn =
                 Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
         }
@@ -1262,11 +1343,12 @@ impl AgentRuntime {
             keep_recent_n: 0,
         };
         let step = self.checkpoints.turn_index.load(Ordering::Relaxed);
-        let summary_msg = zero_keep
+        let (summary_msg, usage) = zero_keep
             .compact(self.kernel.llm().as_ref(), &transcript[..split], step)
             .await?;
         transcript.drain(..split);
         transcript.insert(0, summary_msg);
+        self.pending_compact_usage = self.pending_compact_usage.accumulate(usage);
         self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
         Ok(())
     }
@@ -1326,11 +1408,12 @@ impl AgentRuntime {
             keep_recent_n: 0,
         };
         let step = self.checkpoints.turn_index.load(Ordering::Relaxed);
-        let summary_msg = zero_keep
+        let (summary_msg, usage) = zero_keep
             .compact(self.kernel.llm().as_ref(), &suffix, step)
             .await?;
         transcript.truncate(start);
         transcript.push(summary_msg);
+        self.pending_compact_usage = self.pending_compact_usage.accumulate(usage);
         self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
         Ok(())
     }

@@ -2860,6 +2860,14 @@ async fn run_once(
             // Issue #124: mark the Langfuse trace failed before returning so
             // the root span carries the provider/transport error.
             langfuse_run.finish(None, Some(&err.to_string())).await;
+            // Issue #115: a failed turn still burned the tokens of the steps
+            // that completed before the error. Fold them into the run's cost
+            // (and the control session's cumulative usage) instead of losing
+            // the spend with the returned `Err`.
+            let failed_usage = runtime.last_failed_usage();
+            if let Some(ref cs) = control_session {
+                cs.record_usage(failed_usage, 0);
+            }
             // Drop the runtime first so its event-sink sender releases the
             // stream task's `rx` — otherwise `task.finish()` would await a
             // handle that never completes. Then emit a terminal error
@@ -2869,20 +2877,17 @@ async fn run_once(
             let reason = recursive::FinishReason::ProviderStop(err.to_string());
             match printer {
                 RunPrinter::Json(task) => {
-                    task.finish(
-                        &reason,
-                        None,
-                        recursive::llm::TokenUsage::default(),
-                        0,
-                        0,
-                        control_bridge.as_deref(),
-                    )
-                    .await;
+                    task.finish(&reason, None, failed_usage, 0, 0, control_bridge.as_deref())
+                        .await;
                 }
                 RunPrinter::Text(handle) => {
                     handle.await.ok();
                 }
             }
+            // Issue #115: write a cost record even for a failed run so the
+            // wasted tokens are visible (`cost.json` / `.meta.json`), not
+            // silently absent.
+            cli::output::finalize_cost_tracker(cost_tracker, failed_usage, 0, &config.model);
             return Err(err);
         }
     };

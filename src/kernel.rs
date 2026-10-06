@@ -109,7 +109,19 @@ pub struct TurnContext {
     /// loop checks elapsed time and terminates cleanly with
     /// [`FinishReason::WallClockExceeded`]. Default 0 = unset.
     pub wall_timeout_secs: u64,
+
+    /// Issue #115: where the kernel publishes the turn's accumulated token
+    /// usage when it returns `Err` — a turn's `total_usage` would otherwise
+    /// be dropped with the error, so the whole run counted as zero and budget
+    /// accounting was systematically optimistic.
+    ///
+    /// `None` (tests, sub-agents) is fine: the usage is simply not reported.
+    pub failure_usage: Option<FailureUsage>,
 }
+
+/// Issue #115: shared cell a [`TurnContext`] carries so the wrapper can read
+/// back the token usage of a turn that ended in `Err`.
+pub type FailureUsage = Arc<std::sync::Mutex<TokenUsage>>;
 
 // ---------------------------------------------------------------------------
 // TurnOutcome
@@ -373,6 +385,8 @@ impl AgentKernel {
                     self.max_budget_usd,
                     self.budget_pricing,
                 ),
+                compaction_usage: TokenUsage::default(),
+                failure_usage: ctx.failure_usage,
             }
         };
 

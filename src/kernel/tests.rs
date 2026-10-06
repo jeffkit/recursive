@@ -100,6 +100,7 @@ fn make_minimal_ctx(messages: Vec<Message>) -> TurnContext {
         turn: 0,
         prompt_segments: None,
         wall_timeout_secs: 0,
+        failure_usage: None,
     }
 }
 

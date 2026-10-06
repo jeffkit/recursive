@@ -275,6 +275,13 @@ pub(crate) struct RunCore<'a> {
     /// Issue #94: mid-turn USD spend ceiling (from
     /// [`crate::kernel::AgentKernelBuilder::cost_budget`]). `None` = unbudgeted.
     pub(crate) cost_budget: Option<CostBudget>,
+    /// Issue #115: token usage burned by intra-turn compaction. Folded into
+    /// the turn's `total_usage` in [`Self::make_outcome`] (the compaction call
+    /// re-sends the whole history, so dropping it undercounted every run).
+    pub(crate) compaction_usage: TokenUsage,
+    /// Issue #115: where to publish the accumulated usage when the loop exits
+    /// with `Err` instead of an outcome. `None` (tests) drops it as before.
+    pub(crate) failure_usage: Option<crate::kernel::FailureUsage>,
 }
 
 impl<'a> RunCore<'a> {
@@ -909,6 +916,8 @@ impl<'a> RunCore<'a> {
         total_usage: TokenUsage,
         tool_audits: std::collections::HashMap<crate::tools::AuditKey, crate::tools::AuditMeta>,
     ) -> RunInnerOutcome {
+        // Issue #115: intra-turn compaction spend rides on the turn's usage.
+        let total_usage = total_usage.accumulate(self.compaction_usage);
         RunInnerOutcome {
             messages: self.messages,
             final_message,
@@ -919,6 +928,27 @@ impl<'a> RunCore<'a> {
             tool_audits,
             last_prompt_tokens: self.last_prompt_tokens,
         }
+    }
+
+    /// Issue #115: publish the turn's accumulated usage, then propagate
+    /// `error`. `run_inner` used to return the bare `Err`, dropping
+    /// `total_usage` so every failed run counted as zero tokens; the sink lets
+    /// the wrapper still account for the spend. Extracted from the loop body
+    /// to keep it under the invariant-#1 line budget — no-op when no sink was
+    /// supplied.
+    fn fail_step(
+        &self,
+        error: crate::error::Error,
+        total_usage: TokenUsage,
+    ) -> Result<RunInnerOutcome> {
+        if let Some(slot) = &self.failure_usage {
+            let usage = total_usage.accumulate(self.compaction_usage);
+            match slot.lock() {
+                Ok(mut guard) => *guard = usage,
+                Err(poisoned) => *poisoned.into_inner() = usage,
+            }
+        }
+        Err(error)
     }
 
     /// Goal 353 — translate a mid-stream [`Error::Cancelled`] from the
@@ -1211,7 +1241,10 @@ impl<'a> RunCore<'a> {
             .apply_to_transcript(self.llm.as_ref(), Arc::make_mut(&mut self.messages), step)
             .await
         {
-            Ok(Some((removed, summary_chars))) => {
+            Ok(Some(outcome)) => {
+                let (removed, summary_chars) = (outcome.removed, outcome.summary_chars);
+                // Issue #115: bill the summarisation call to this turn.
+                self.compaction_usage = self.compaction_usage.accumulate(outcome.usage);
                 // Success — reset the circuit breaker.
                 self.consecutive_compact_failures = 0;
                 let kept = kept_before - removed;
@@ -1567,7 +1600,7 @@ impl<'a> RunCore<'a> {
                         tool_audits,
                     ));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return self.fail_step(e, total_usage),
             };
             // Goal 382: a stream-interrupted completion (finish_reason
             // "interrupted") persists the partial reply as a Cancelled turn.
@@ -1915,6 +1948,8 @@ mod tests {
             wall_start: None,
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
+            compaction_usage: TokenUsage::default(),
+            failure_usage: None,
         }
     }
 
@@ -2044,6 +2079,8 @@ mod tests {
             wall_start: None,
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
+            compaction_usage: TokenUsage::default(),
+            failure_usage: None,
         }
     }
 
@@ -2929,6 +2966,8 @@ mod tests {
             wall_start: None,
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
+            compaction_usage: TokenUsage::default(),
+            failure_usage: None,
         }
     }
 
@@ -3242,6 +3281,100 @@ mod tests {
         assert!(
             matches!(err, crate::error::Error::Llm { .. }),
             "expected Error::Llm, got {err:?}",
+        );
+    }
+
+    /// Issue #115: a turn that errors after a completed step must still report
+    /// the tokens it burned. `run_inner` used to drop `total_usage` with the
+    /// `Err`, so every failed run counted as zero.
+    #[tokio::test]
+    async fn run_inner_publishes_partial_usage_when_the_turn_errors() {
+        use crate::llm::{Completion, MockProvider, ToolCall};
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let step_usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 40,
+            total_tokens: 140,
+            ..Default::default()
+        };
+        // Step 1 succeeds with a tool call; step 2 finds the scripted queue
+        // empty and errors — the "burned tokens then died" shape.
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "nonexistent_tool".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: Some(step_usage),
+            reasoning_content: None,
+        }]));
+        let mut core =
+            make_run_core_for_inner(vec![Message::user("hi".to_string())], &hooks, provider, 5);
+        let sink: crate::kernel::FailureUsage =
+            Arc::new(std::sync::Mutex::new(TokenUsage::default()));
+        core.failure_usage = Some(Arc::clone(&sink));
+
+        let err = match core.run_inner().await {
+            Ok(_) => panic!("the second LLM call must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, crate::error::Error::Llm { .. }),
+            "got {err:?}"
+        );
+
+        let published = *sink.lock().expect("sink lock");
+        assert_eq!(
+            published.prompt_tokens, 100,
+            "partial prompt tokens must survive the error return"
+        );
+        assert_eq!(
+            published.completion_tokens, 40,
+            "partial completion tokens must survive the error return"
+        );
+    }
+
+    /// Issue #115: intra-turn compaction spend must be folded into the turn's
+    /// `total_usage` — the summary call re-sends the whole history and used to
+    /// vanish from the account.
+    #[tokio::test]
+    async fn make_outcome_folds_intra_turn_compaction_usage_into_total() {
+        use crate::agent::FinishReason;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![]));
+        let mut core =
+            make_run_core_for_inner(vec![Message::user("hi".to_string())], &hooks, provider, 1);
+        core.compaction_usage = TokenUsage {
+            prompt_tokens: 900,
+            completion_tokens: 100,
+            total_tokens: 1000,
+            ..Default::default()
+        };
+        let turn_usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+
+        let outcome = core.make_outcome(
+            FinishReason::NoMoreToolCalls,
+            1,
+            None,
+            turn_usage,
+            std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            outcome.total_usage.prompt_tokens, 910,
+            "compaction prompt tokens must be added to the turn total"
+        );
+        assert_eq!(
+            outcome.total_usage.completion_tokens, 105,
+            "compaction completion tokens must be added to the turn total"
         );
     }
 

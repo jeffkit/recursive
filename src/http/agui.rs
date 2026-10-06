@@ -1139,12 +1139,15 @@ pub(crate) fn spawn_agui_run(
             // against `/readyz` — a tool/storage fault or a client
             // cancellation says nothing about the endpoint.
             Err(e) => {
-                super::handlers::record_run_failed(&metrics);
+                // Issue #115: a failed turn still burned its completed steps'
+                // tokens — account for them instead of dropping the spend.
+                super::handlers::record_run_failed(&metrics, &runtime.last_failed_usage());
                 if e.is_llm_failure() {
                     super::handlers::record_llm_failure(&metrics);
                 }
             }
-            Ok(_) => super::handlers::record_run_failed(&metrics),
+            // A cancelled run did not complete, so its tokens are wasted too.
+            Ok(o) => super::handlers::record_run_failed(&metrics, &o.total_usage),
         }
 
         // Persist the run into the thread's native session (issue #57):
@@ -1177,7 +1180,18 @@ pub(crate) fn spawn_agui_run(
                 provider: &drv_provider,
                 preset: drv_preset.as_deref(),
                 status,
-                usage: outcome.as_ref().ok().map(|o| o.total_usage),
+                // Issue #115: a crashed run still burned its completed steps'
+                // tokens — persist them so the session's cost record is not
+                // systematically low. Zero means "nothing to record", which
+                // keeps a crash before the first LLM call from writing an
+                // all-zero `cost.json`.
+                usage: match &outcome {
+                    Ok(o) => Some(o.total_usage),
+                    Err(_) => {
+                        let wasted = runtime.last_failed_usage();
+                        (wasted.prompt_tokens > 0 || wasted.completion_tokens > 0).then_some(wasted)
+                    }
+                },
                 llm_latency_ms: outcome.as_ref().ok().map(|o| o.llm_latency_ms).unwrap_or(0),
             };
             if let Err(e) = crate::agui_session::persist_run(record) {

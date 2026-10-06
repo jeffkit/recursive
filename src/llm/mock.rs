@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use super::StructuredCompletion;
 use super::StructuredRequest;
 use super::{ChatProvider, Completion, StreamSender, ToolSpec};
 use crate::error::{Error, Result};
@@ -149,7 +150,7 @@ impl ChatProvider for MockProvider {
         .await
     }
 
-    async fn complete_structured(&self, _req: StructuredRequest) -> Result<serde_json::Value> {
+    async fn complete_structured(&self, _req: StructuredRequest) -> Result<StructuredCompletion> {
         let mut queue = self.structured_responses.lock().unwrap();
         if queue.is_empty() {
             // Default: return error to trigger fallback
@@ -157,7 +158,9 @@ impl ChatProvider for MockProvider {
                 message: "MockProvider: no structured responses configured".into(),
             });
         }
-        queue.remove(0)
+        queue
+            .remove(0)
+            .map(|value| StructuredCompletion { value, usage: None })
     }
 
     async fn stream(
@@ -301,7 +304,7 @@ mod tracing_tests {
         };
         let result = provider.complete_structured(req).await.unwrap();
         assert_eq!(
-            result["key"], "val",
+            result.value["key"], "val",
             "must return the scripted structured value"
         );
     }

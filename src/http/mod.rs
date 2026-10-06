@@ -76,6 +76,11 @@ pub struct Metrics {
     pub agent_runs_failed: AtomicU64,
     pub tokens_prompt_total: AtomicU64,
     pub tokens_completion_total: AtomicU64,
+    /// Issue #115: tokens burned by runs that ended in an error. A failed
+    /// turn still spent its completed steps' tokens; before this counter the
+    /// failure path recorded nothing, so quota/budget calibration was
+    /// systematically optimistic.
+    pub tokens_wasted_on_failure_total: AtomicU64,
     pub agent_steps_total: AtomicU64,
     /// Number of currently open sessions (gauge).
     pub sessions_active: AtomicU64,

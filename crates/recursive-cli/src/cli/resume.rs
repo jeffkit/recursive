@@ -843,7 +843,19 @@ pub(crate) async fn run_resumed(
         None => RunPrinter::Text(tokio::spawn(stream_events(event_rx))),
     };
 
-    let mut outcome = runtime.run(message.clone()).await?;
+    let mut outcome = match runtime.run(message.clone()).await {
+        Ok(o) => o,
+        Err(err) => {
+            // Issue #115: a failed turn still burned the tokens of the steps
+            // that completed before the error — bill them before propagating.
+            let failed_usage = runtime.last_failed_usage();
+            if let Some(ref cs) = control_session {
+                cs.record_usage(failed_usage, 0);
+            }
+            finalize_cost_tracker(cost_tracker, failed_usage, 0, &config.model);
+            return Err(err.into());
+        }
+    };
 
     if let Some(ref cs) = control_session {
         cs.record_usage(outcome.total_usage, outcome.llm_latency_ms);

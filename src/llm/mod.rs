@@ -12,7 +12,6 @@
 //! - `openai` / `anthropic` / `mock` — concrete provider implementations
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::message::Message;
@@ -30,8 +29,8 @@ pub mod openai;
 // ── Re-exports: chat types ────────────────────────────────────────────────────
 
 pub use chat::{
-    estimate_tokens, Completion, ContextBreakdown, StreamChunk, StreamSender, StructuredRequest,
-    TokenUsage, ToolSpec,
+    estimate_tokens, Completion, ContextBreakdown, StreamChunk, StreamSender, StructuredCompletion,
+    StructuredRequest, TokenUsage, ToolSpec,
 };
 
 // `ToolCall` moved to `crate::message` (it is part of the assistant message
@@ -130,7 +129,11 @@ pub trait ChatProvider: Send + Sync {
     /// Request a JSON response conforming to a caller-supplied schema.
     /// Default impl returns an error. Providers that support structured
     /// output (e.g. OpenAI-compatible) override this.
-    async fn complete_structured(&self, _req: StructuredRequest) -> Result<Value> {
+    ///
+    /// The returned [`StructuredCompletion`] carries both the parsed value and
+    /// the provider-reported usage, so a caller (compaction) can bill the call
+    /// (issue #115).
+    async fn complete_structured(&self, _req: StructuredRequest) -> Result<StructuredCompletion> {
         Err(Error::Config {
             message: "provider does not support structured output".into(),
         })

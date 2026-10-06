@@ -1179,6 +1179,40 @@ async fn drain_queue_stops_on_first_error() {
     );
 }
 
+/// Issue #115: the runtime must expose the token spend of a turn that ended
+/// in an error so callers can still account for it.
+#[tokio::test]
+async fn failed_turn_exposes_last_failed_usage() {
+    // Step 1 succeeds with a tool call carrying usage; step 2 finds the
+    // scripted queue empty and fails.
+    let llm = Arc::new(MockProvider::new(vec![Completion {
+        content: String::new(),
+        tool_calls: vec![crate::llm::ToolCall {
+            id: "call_1".into(),
+            name: "nonexistent_tool".into(),
+            arguments: json!({}),
+        }],
+        finish_reason: Some("tool_calls".into()),
+        usage: Some(crate::llm::TokenUsage {
+            prompt_tokens: 77,
+            completion_tokens: 21,
+            total_tokens: 98,
+            ..Default::default()
+        }),
+        reasoning_content: None,
+    }]));
+    let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
+    let result = rt.run("hello").await;
+    assert!(result.is_err(), "expected the second LLM call to fail");
+
+    let wasted = rt.last_failed_usage();
+    assert_eq!(
+        wasted.prompt_tokens, 77,
+        "the failed turn's completed step must still be accounted for"
+    );
+    assert_eq!(wasted.completion_tokens, 21);
+}
+
 #[tokio::test]
 async fn drain_queue_preserves_remaining_messages_on_error() {
     // Goal-259: 3 messages queued, only 1 completion available. The
@@ -2159,7 +2193,10 @@ async fn compact_on_overflow_compacts_long_transcript() {
     let before = rt.transcript.len();
 
     let compacted = rt.compact_on_overflow().await.unwrap();
-    assert!(compacted, "should return true when compaction ran");
+    assert!(
+        compacted.is_some(),
+        "should return Some(usage) when compaction ran"
+    );
     assert!(
         rt.transcript.len() < before,
         "transcript must shrink after compaction"
@@ -2176,7 +2213,7 @@ async fn compact_on_overflow_returns_false_without_compactor() {
     let llm = Arc::new(MockProvider::new(vec![]));
     let mut rt = AgentRuntime::builder().llm(llm).build().unwrap();
     let ok = rt.compact_on_overflow().await.unwrap();
-    assert!(!ok, "no compactor → must return false");
+    assert!(ok.is_none(), "no compactor → must return None");
 }
 
 #[tokio::test]
@@ -2224,7 +2261,7 @@ async fn compact_on_overflow_rejects_degenerate_transcript_without_hook_events()
     ];
 
     assert!(
-        !rt.compact_on_overflow().await.unwrap(),
+        rt.compact_on_overflow().await.unwrap().is_none(),
         "a degenerate transcript must reject emergency compaction"
     );
     assert!(

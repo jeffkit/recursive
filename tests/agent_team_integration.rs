@@ -312,6 +312,7 @@ async fn worker_receives_coordinator_message_via_mailbox() {
         turn: 0,
         prompt_segments: None,
         wall_timeout_secs: 0,
+        failure_usage: None,
     };
 
     let outcome = kernel.run(ctx).await.unwrap();
