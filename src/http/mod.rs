@@ -13,6 +13,7 @@ mod environment_binding_tests;
 mod handlers;
 mod rate_limit;
 pub mod triggers;
+mod usage;
 
 // Goal 395: the admission gate moved to the transport-agnostic
 // `session_host` module; re-exported here so front-end call sites and
@@ -25,13 +26,17 @@ pub use auth::{
 };
 pub use handlers::map_agent_event;
 pub use rate_limit::{rate_limiter_from_env, RateLimiter};
+// Issue #114: per-session usage / cost accounting shared by the HTTP handlers
+// and visible to SDK consumers constructing [`SessionState`] directly.
+pub use usage::{SessionUsage, UsageResponse, UsageTotals};
 
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
-    agui_cancel, agui_run, create_session, delete_session, fork_session, get_session, health,
-    list_presets, list_sessions, list_skills, list_slash_commands, list_tools, metrics_handler,
-    openapi_spec, patch_session, readyz, run_agent, send_session_message, session_clear_goal,
-    session_events, session_interrupt, session_plan_confirm, session_plan_reject, session_set_goal,
+    agui_cancel, agui_run, create_session, delete_session, fork_session, get_session,
+    get_session_usage, health, list_presets, list_sessions, list_skills, list_slash_commands,
+    list_tools, metrics_handler, openapi_spec, patch_session, readyz, run_agent,
+    send_session_message, session_clear_goal, session_events, session_interrupt,
+    session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
 
@@ -76,6 +81,12 @@ pub struct Metrics {
     pub agent_runs_failed: AtomicU64,
     pub tokens_prompt_total: AtomicU64,
     pub tokens_completion_total: AtomicU64,
+    /// Issue #114: total billed USD across completed runs, stored in
+    /// **micro-USD** (`1e-6 USD`) because `AtomicU64` cannot hold an `f64`.
+    /// Exposed as the float counter `recursive_cost_usd_total` via
+    /// [`Metrics::cost_usd_total`]. Unpriced models contribute nothing —
+    /// only runs priced by `crate::llm::pricing_for` move it.
+    pub cost_micro_usd_total: AtomicU64,
     /// Issue #115: tokens burned by runs that ended in an error. A failed
     /// turn still spent its completed steps' tokens; before this counter the
     /// failure path recorded nothing, so quota/budget calibration was
@@ -134,6 +145,27 @@ pub struct Metrics {
     pub sessions_evicted: AtomicU64,
 }
 
+impl Metrics {
+    /// Issue #114: fold a completed run's USD cost into the global counter,
+    /// using the same pricing the per-session accounting bills with. An
+    /// unpriced model contributes nothing (`pricing_for` → `None` → $0.00),
+    /// and the float → integer cast saturates, so a NaN / negative value
+    /// (which the pricing tables never produce) cannot poison the total.
+    pub fn record_cost_usd(&self, model: &str, usage: &crate::llm::TokenUsage) {
+        let usd = crate::llm::pricing_for(model)
+            .map(|p| p.cost_usd(*usage))
+            .unwrap_or(0.0);
+        let micro_usd = (usd * 1_000_000.0).round() as u64;
+        self.cost_micro_usd_total
+            .fetch_add(micro_usd, Ordering::Relaxed);
+    }
+
+    /// Total billed USD across all completed runs.
+    pub fn cost_usd_total(&self) -> f64 {
+        self.cost_micro_usd_total.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+}
+
 // ── Session types ──────────────────────────────────────────────────────────
 
 /// Internal session state (not directly serialized to clients).
@@ -182,10 +214,11 @@ pub struct SessionState {
     /// Milliseconds since [`SESSION_EPOCH`] when this session was last active.
     /// Updated atomically on every message. Used by the session reaper.
     pub last_active_ms: Arc<AtomicU64>,
-    /// Cumulative prompt tokens consumed in this session (all turns combined).
-    pub prompt_tokens: Arc<AtomicU64>,
-    /// Cumulative completion tokens generated in this session.
-    pub completion_tokens: Arc<AtomicU64>,
+    /// Issue #114: cumulative token usage + cost accounting for this session
+    /// (all turns combined), updated lock-free at the end of every turn. The
+    /// snapshot is persisted to the storage backends' key/value space after
+    /// each turn, so it survives a restart and a cold load can restore it.
+    pub usage: Arc<SessionUsage>,
     /// Issue #117: monotonic per-session counter shared with each turn's
     /// [`crate::event::EnvelopeSink`], so event `seq` numbers keep climbing
     /// across turns instead of restarting at 0 every turn.
@@ -476,6 +509,20 @@ pub enum SseEvent {
         tool_name: String,
         elapsed_ms: u64,
     },
+    /// Issue #114: per-step provider-reported token usage, including the
+    /// cache hit / miss split. Previously the underlying
+    /// [`crate::event::AgentEvent::Usage`] had no SSE mapping and was
+    /// silently dropped, so streaming clients could not see cost accumulate
+    /// until the run ended. Emitted once per LLM step.
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+        /// Tokens served from the provider's prompt cache.
+        cache_hit_tokens: u32,
+        /// Tokens billed at the full input rate.
+        cache_miss_tokens: u32,
+        step: usize,
+    },
 }
 
 /// One SSE frame: an [`SseEvent`] plus the `id:` that pins it to the session
@@ -707,11 +754,47 @@ pub struct RunResponse {
     pub usage: UsageInfo,
 }
 
-/// Token/step usage information.
+/// Token/step usage information for the one-shot `POST /run` response.
+///
+/// Issue #114: carries the full billing breakdown — the provider's cache hit
+/// / miss split plus the computed USD — so a caller can bill the run without
+/// a second request. `cost_usd` is `null` when the model has no pricing
+/// entry (never a silent `0.0`).
 #[derive(serde::Serialize, Debug)]
 pub struct UsageInfo {
     pub total_steps: u32,
     pub total_tokens: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Input tokens served from the provider's prompt cache.
+    pub cache_hit_tokens: u64,
+    /// Input tokens billed at the full rate (`prompt = hit + miss`).
+    pub cache_miss_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// Measured LLM latency for the run, in milliseconds.
+    pub llm_latency_ms: u64,
+    /// Model the run was billed against.
+    pub model: String,
+    pub cost_usd: Option<f64>,
+}
+
+impl UsageInfo {
+    /// Build the response block from a completed turn's outcome.
+    pub fn from_turn(model: &str, outcome: &crate::runtime::RuntimeOutcome) -> Self {
+        let totals = UsageTotals::from_token_usage(&outcome.total_usage);
+        Self {
+            total_steps: outcome.steps as u32,
+            total_tokens: totals.total_tokens,
+            prompt_tokens: totals.prompt_tokens,
+            completion_tokens: totals.completion_tokens,
+            cache_hit_tokens: totals.cache_hit_tokens,
+            cache_miss_tokens: totals.cache_miss_tokens,
+            reasoning_tokens: totals.reasoning_tokens,
+            llm_latency_ms: outcome.llm_latency_ms,
+            model: model.to_string(),
+            cost_usd: usage::cost_usd(model, &totals),
+        }
+    }
 }
 
 /// Error response body.
@@ -846,6 +929,7 @@ pub struct ListSessionsQuery {
 /// - `GET /sessions` — list all sessions
 /// - `GET /sessions/:id` — get session detail with messages
 /// - `POST /sessions/:id/messages` — send a message in a session
+/// - `GET /sessions/:id/usage` — cumulative token usage + USD cost (issue #114)
 /// - `DELETE /sessions/:id` — remove a session
 /// - `GET /sessions/:id/events` — SSE stream of agent events for a session
 /// - `GET /openapi.json` — returns the OpenAPI 3.0.3 specification
@@ -961,6 +1045,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}", axum::routing::delete(delete_session))
         .route("/sessions/{id}", axum::routing::patch(patch_session))
         .route("/sessions/{id}/messages", post(send_session_message))
+        .route("/sessions/{id}/usage", get(get_session_usage))
         .route("/sessions/{id}/events", get(session_events))
         .route("/sessions/{id}/plan/confirm", post(session_plan_confirm))
         .route("/sessions/{id}/plan/reject", post(session_plan_reject))
@@ -1272,6 +1357,36 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/sessions/{id}/usage": {
+                "get": {
+                    "summary": "Get session usage and cost",
+                    "description": "Issue #114: cumulative token usage for the session \
+                        (prompt / completion / cache hit / cache miss / reasoning split) \
+                        and the USD cost billed from the same pricing the CLI and AG-UI \
+                        channels use. Survives a server restart: the accumulator is \
+                        persisted after every turn and restored on cold load. `cost_usd` \
+                        is summed per turn at the model that ran it, so a restart onto a \
+                        different model does not reprice history; `model` is the model new \
+                        turns bill at.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Session usage and cost",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/UsageResponse" }
+                                }
+                            }
+                        },
+                        "404": { "description": "Session not found" }
+                    }
+                }
+            },
             "/sessions/{id}/events": {
                 "get": {
                     "summary": "Subscribe to session events",
@@ -1363,7 +1478,8 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         the capacity/data-loss series `recursive_sse_clients`, \
                         `recursive_agui_runs`, `recursive_persist_failures`, \
                         `recursive_sessions_evicted`, `recursive_llm_last_success_ms` and \
-                        `recursive_llm_failures_consecutive`.",
+                        `recursive_llm_failures_consecutive`. Issue #114 adds \
+                        `recursive_cost_usd_total` (counter, USD billed across completed runs).",
                     "responses": {
                         "200": {
                             "description": "Prometheus text format",
@@ -1493,11 +1609,40 @@ pub fn build_openapi_spec() -> serde_json::Value {
                 },
                 "UsageInfo": {
                     "type": "object",
+                    "description": "Token/step usage for a POST /run response (issue #114 adds the cache split and USD cost).",
                     "properties": {
                         "total_steps": { "type": "integer" },
-                        "total_tokens": { "type": "integer" }
+                        "total_tokens": { "type": "integer" },
+                        "prompt_tokens": { "type": "integer" },
+                        "completion_tokens": { "type": "integer" },
+                        "cache_hit_tokens": { "type": "integer" },
+                        "cache_miss_tokens": { "type": "integer" },
+                        "reasoning_tokens": { "type": "integer" },
+                        "llm_latency_ms": { "type": "integer" },
+                        "model": { "type": "string" },
+                        "cost_usd": { "type": "number", "nullable": true }
                     },
                     "required": ["total_steps", "total_tokens"]
+                },
+                "UsageResponse": {
+                    "type": "object",
+                    "description": "GET /sessions/:id/usage (issue #114): cumulative token usage with the cache split plus the USD cost. `cost_usd` is null while nothing billable has accrued and `model` has no pricing entry; `model` is the model new turns bill at.",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "model": { "type": "string", "description": "Model this session's new turns are billed at." },
+                        "prompt_tokens": { "type": "integer" },
+                        "completion_tokens": { "type": "integer" },
+                        "cache_hit_tokens": { "type": "integer" },
+                        "cache_miss_tokens": { "type": "integer" },
+                        "reasoning_tokens": { "type": "integer" },
+                        "total_tokens": { "type": "integer" },
+                        "llm_latency_ms": { "type": "integer" },
+                        "cost_usd": { "type": "number", "nullable": true }
+                    },
+                    "required": [
+                        "session_id", "model", "prompt_tokens", "completion_tokens",
+                        "cache_hit_tokens", "cache_miss_tokens", "total_tokens"
+                    ]
                 },
                 "ErrorResponse": {
                     "type": "object",
@@ -2128,8 +2273,7 @@ mod goal_396_persistence_tests {
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
-            prompt_tokens: Arc::new(AtomicU64::new(0)),
-            completion_tokens: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
         }
     }

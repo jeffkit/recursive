@@ -229,8 +229,27 @@ pub(super) async fn get_or_load_session(
     ) {
         return Err(ApiError::forbidden("session belongs to another identity"));
     }
+    // Issue #114: the persisted usage snapshot (token totals + the USD already
+    // billed) rides the storage key/value space like the #98 blob.
+    let persisted_usage = super::usage::load_persisted_usage(&state.storage, id).await;
     let runtime = build_restored_runtime(state, id, seed, meta.as_ref()).await?;
     let plan_approval_gate = runtime.plan_approval_gate();
+
+    // Issue #114: restore the session's accumulated usage so a server restart
+    // does not zero it (the pre-#114 behaviour). A transcript written before
+    // this field existed — or a corrupt blob — restores an empty accumulator.
+    //
+    // The accumulator bills at the *current* server model: the restored cost is
+    // frozen at the rates history actually cost, so a restart onto another
+    // model prices neither the restored history nor the new turns wrongly.
+    let restored_usage = {
+        let usage = super::SessionUsage::new(state.config.model.clone());
+        if let Some(persisted) = &persisted_usage {
+            usage.restore(&persisted.usage);
+            usage.restore_cost(persisted.cost_micro_usd);
+        }
+        Arc::new(usage)
+    };
 
     // Phase 4: short write lock — first insert wins a concurrent race.
     let host_sessions = state.host.sessions();
@@ -251,8 +270,7 @@ pub(super) async fn get_or_load_session(
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
         last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(super::now_session_ms())),
-        prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        usage: restored_usage,
         event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     // All mutable state lives in Arc fields, so this handle shares everything
@@ -960,8 +978,7 @@ mod tests {
                 interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
                 non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
-                prompt_tokens: Arc::new(AtomicU64::new(0)),
-                completion_tokens: Arc::new(AtomicU64::new(0)),
+                usage: Arc::new(crate::http::SessionUsage::new("test-model")),
                 event_seq: Arc::new(AtomicU64::new(0)),
             },
         );
@@ -1029,5 +1046,111 @@ mod tests {
                     .any(|c| Some(&c.id) == m.tool_call_id.as_ref()));
             }
         }
+    }
+
+    // ── issue #114: usage survives a restart ──────────────────────────────
+
+    /// Before #114 the restored token counters were hardcoded to 0 — a restart
+    /// silently zeroed every session's usage. A cold load must now restore the
+    /// persisted snapshot, billed USD included; the accumulator then prices
+    /// *new* turns at the current server model.
+    #[tokio::test]
+    async fn cold_load_restores_persisted_usage() {
+        // Pin RECURSIVE_HOME so the effective catalog collapses to the bundled
+        // prices (a stray providers cache must not change the asserted USD).
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        seed(dir.path(), "sess-usage", vec![user("hi"), assistant("yo")]).await;
+
+        let usage = super::super::SessionUsage::new("deepseek-chat");
+        usage.record(
+            crate::llm::TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                cache_hit_tokens: 40,
+                cache_miss_tokens: 60,
+                reasoning_tokens: 0,
+            },
+            777,
+        );
+        crate::http::usage::persist_usage(&state.storage, "sess-usage", &usage).await;
+
+        let session = get_or_load_session(&state, "sess-usage", &AuthIdentity::local())
+            .await
+            .expect("cold load");
+        let totals = session.usage.snapshot();
+        assert_eq!(totals.prompt_tokens, 100);
+        assert_eq!(totals.completion_tokens, 50);
+        assert_eq!(totals.total_tokens, 150);
+        assert_eq!(totals.cache_hit_tokens, 40);
+        assert_eq!(totals.cache_miss_tokens, 60);
+        assert_eq!(totals.llm_latency_ms, 777);
+        assert_eq!(
+            session.usage.cost_usd(),
+            Some(0.000_023),
+            "the USD the turn was billed at must survive the restart"
+        );
+        assert_eq!(
+            session.usage.model(),
+            state.config.model,
+            "a restored session bills its new turns at the current server model"
+        );
+    }
+
+    /// Issue #114: USD is frozen at the rates history was billed at, so a
+    /// restart onto a *different* model neither re-bills history nor prices
+    /// new turns at the stale rate.
+    #[tokio::test]
+    async fn cold_load_does_not_reprice_history_at_the_new_model() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), vec![]);
+        Arc::get_mut(&mut state)
+            .expect("unique state handle")
+            .config
+            .model = "MiniMax-M3".into();
+        seed(dir.path(), "sess-model", vec![user("hi"), assistant("yo")]).await;
+
+        // 1M completion tokens at deepseek-chat's $0.28/M is $0.28.
+        let usage = super::super::SessionUsage::new("deepseek-chat");
+        usage.record(
+            crate::llm::TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 1_000_000,
+                total_tokens: 1_000_000,
+                ..Default::default()
+            },
+            0,
+        );
+        crate::http::usage::persist_usage(&state.storage, "sess-model", &usage).await;
+
+        let session = get_or_load_session(&state, "sess-model", &AuthIdentity::local())
+            .await
+            .expect("cold load");
+        assert_eq!(
+            session.usage.cost_usd(),
+            Some(0.28),
+            "history keeps the rate it was billed at"
+        );
+        assert_eq!(session.usage.model(), "MiniMax-M3");
+    }
+
+    /// A transcript written before #114 has no usage blob — it must restore at
+    /// zero (priced at the current server model), not fail.
+    #[tokio::test]
+    async fn cold_load_without_persisted_usage_starts_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        seed(dir.path(), "sess-legacy", vec![user("hi"), assistant("yo")]).await;
+
+        let session = get_or_load_session(&state, "sess-legacy", &AuthIdentity::local())
+            .await
+            .expect("cold load");
+        assert!(session.usage.snapshot().is_zero());
+        assert_eq!(session.usage.model(), state.config.model);
     }
 }

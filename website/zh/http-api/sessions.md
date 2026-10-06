@@ -34,6 +34,32 @@ GET /sessions
 GET /sessions/:id
 ```
 
+## 获取会话用量与成本
+
+```http
+GET /sessions/:id/usage
+```
+
+**响应**：
+```json
+{
+  "session_id": "a1b2c3d4-e5f6-...",
+  "model": "deepseek-chat",
+  "prompt_tokens": 600,
+  "completion_tokens": 40,
+  "cache_hit_tokens": 512,
+  "cache_miss_tokens": 88,
+  "reasoning_tokens": 0,
+  "total_tokens": 640,
+  "llm_latency_ms": 1200,
+  "cost_usd": 0.000025
+}
+```
+
+该值按会话累计，并在服务重启后仍然保留。`cost_usd` 按每一轮当时所用的模型计价
+（无法计价时为 `null`），而 `model` 是后续轮次计费所用的模型——重启后换了模型
+不会重算历史成本。
+
 ## 删除会话
 
 ```http

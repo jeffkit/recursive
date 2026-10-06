@@ -21,9 +21,24 @@ Content-Type: application/json
   "status": "finished",
   "finish_reason": "NoMoreToolCalls",
   "messages": [...],
-  "usage": { "total_steps": 2, "total_tokens": 640 }
+  "usage": {
+    "total_steps": 2,
+    "total_tokens": 640,
+    "prompt_tokens": 600,
+    "completion_tokens": 40,
+    "cache_hit_tokens": 512,
+    "cache_miss_tokens": 88,
+    "reasoning_tokens": 0,
+    "llm_latency_ms": 1200,
+    "model": "deepseek-chat",
+    "cost_usd": 0.000025
+  }
 }
 ```
+
+`usage.cost_usd` is the price of the run in USD; it is `null` when the model has
+no pricing entry. A session's *cumulative* usage and cost is available from
+`GET /sessions/:id/usage`.
 
 ## Session run (SSE streaming)
 
@@ -60,6 +75,7 @@ data: {"finish_reason":"NoMoreToolCalls","total_steps":1}
 | `partial_message` | `{ text, step }` — streaming text delta |
 | `tool_call` | `{ name, step }` |
 | `tool_result` | `{ name, success }` |
+| `usage` | `{ input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens, step }` — provider-reported usage of one LLM step |
 | `done` | `{ finish_reason, total_steps }` |
 | `error` | `{ message }` |
 | `plan_proposed` | `{ plan }` — agent awaiting plan approval |

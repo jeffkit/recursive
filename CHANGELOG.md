@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- feat(http): the HTTP channel now accounts token usage and USD cost per
+  session, and clients can finally read a price (#114). `SessionState` held
+  only two in-memory atomics (`prompt_tokens` / `completion_tokens`): no cache
+  split, no USD, nothing persisted — `cost.json` / `.meta.json` existed on the
+  CLI and AG-UI paths only, so a restart zeroed every session's counters
+  (`cold_load` re-initialised them to 0) and no HTTP client ever saw a dollar
+  figure. The channel now accumulates the provider's full `TokenUsage`
+  (cache hit / miss + reasoning) plus LLM latency lock-free, prices it with the
+  same `pricing_for` + `ModelPricing::cost_usd` pair `CostTracker` bills with,
+  and exposes it as `GET /sessions/:id/usage` (cumulative, owner-scoped,
+  survives a restart: the snapshot — token totals **and** the USD already
+  billed — is persisted after every turn and restored by cold load). `POST /run`
+  returns the same breakdown in its `usage` object (`cost_usd` is `null` when
+  the model has no pricing entry), the per-step `AgentEvent::Usage` is now
+  forwarded to SSE clients as a `usage` event instead of being dropped, and the
+  new `recursive_cost_usd_total` counter totals billed USD across completed
+  runs (`/run`, sessions and `/agui` alike). USD is summed per turn at the model
+  that ran it, so a restart onto a different server model prices neither the
+  restored history nor the new turns at the wrong rate; a failed turn's
+  completed steps are folded into both the global and the session books
+  (issue #115's gap, at session scope). The in-tree Python client
+  (`sdk/python/recursive_client`) gained the new `UsageInfo` fields with
+  defaults and now ignores usage keys it does not know, so a newer server no
+  longer raises `TypeError` on `client.run(...)`.
 - fix(events): the tool's own execution time is now carried end to end (#118).
   `run_core` measured each tool call's duration only to hand it to the
   `PostToolCall` hook and then dropped it; `AgentEvent::ToolResult` had no

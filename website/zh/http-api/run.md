@@ -21,9 +21,23 @@ Content-Type: application/json
   "status": "finished",
   "finish_reason": "NoMoreToolCalls",
   "messages": [...],
-  "usage": { "total_steps": 2, "total_tokens": 640 }
+  "usage": {
+    "total_steps": 2,
+    "total_tokens": 640,
+    "prompt_tokens": 600,
+    "completion_tokens": 40,
+    "cache_hit_tokens": 512,
+    "cache_miss_tokens": 88,
+    "reasoning_tokens": 0,
+    "llm_latency_ms": 1200,
+    "model": "deepseek-chat",
+    "cost_usd": 0.000025
+  }
 }
 ```
+
+`usage.cost_usd` 是本次运行折算的美元成本；模型没有价格表时为 `null`。
+会话的**累计**用量与成本见 `GET /sessions/:id/usage`。
 
 ## 会话运行（SSE 流式）
 
@@ -60,6 +74,7 @@ data: {"finish_reason":"NoMoreToolCalls","total_steps":1}
 | `partial_message` | `{ text, step }` — 流式文本增量 |
 | `tool_call` | `{ name, step }` |
 | `tool_result` | `{ name, success }` |
+| `usage` | `{ input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens, step }` — 单次 LLM 步骤的用量 |
 | `done` | `{ finish_reason, total_steps }` |
 | `error` | `{ message }` |
 | `plan_proposed` | `{ plan }` — Agent 等待计划审批 |

@@ -19,7 +19,7 @@ mod http_tests {
     use recursive::http::{
         build_router, build_router_with_auth, build_router_with_auth_and_rate_limit,
         map_agent_event, AppState, AuthConfig, JwtConfig, Metrics, RateLimiter, SessionState,
-        SseEvent, ToolInfo,
+        SessionUsage, SseEvent, ToolInfo,
     };
     use recursive::llm::{Completion, MockProvider};
     use recursive::runtime::AgentRuntimeBuilder;
@@ -3531,8 +3531,7 @@ mod http_tests {
                 interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
                 non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                usage: Arc::new(SessionUsage::new("test-model")),
                 event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
@@ -4138,6 +4137,266 @@ mod http_tests {
         }
     }
 
+    /// Issue #114: an `/agui` run is a completed run, so its USD must reach the
+    /// same global counter as `/run` and the session path — otherwise the
+    /// "across completed runs" HELP text quietly excludes AG-UI spend.
+    #[tokio::test]
+    async fn agui_run_feeds_the_global_cost_counter() {
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "hello from mock".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(recursive::llm::TokenUsage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 500_000,
+                total_tokens: 1_500_000,
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        }]));
+        let mut state = sample_state_with_provider(provider);
+        state.config.model = "deepseek-chat".into();
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let body = agui_request_body(
+            serde_json::json!([{"id": "u1", "role": "user", "content": "say hello"}]),
+            serde_json::json!([]),
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agui")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let events = collect_agui_events(response).await;
+        assert!(
+            matches!(events.last(), Some(agui_protocol::Event::RunFinished(_))),
+            "the run must finish before its metrics are asserted"
+        );
+
+        assert_eq!(
+            metrics
+                .agent_runs_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(
+            metrics.cost_usd_total() > 0.0,
+            "an AG-UI run must feed recursive_cost_usd_total too"
+        );
+    }
+
+    // ── Issue #114: session usage / cost over HTTP ────────────────────────
+
+    /// GET `uri` with `key` and parse the JSON body, asserting 200.
+    async fn get_json(app: &axum::Router, uri: &str, key: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(api_request("GET", uri, key, "{}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "GET {uri} must succeed");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn priced_completion() -> Completion {
+        Completion {
+            content: "hello".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: Some(recursive::llm::TokenUsage {
+                reasoning_tokens: 0,
+                prompt_tokens: 1_000_000,
+                completion_tokens: 500_000,
+                total_tokens: 1_500_000,
+                cache_hit_tokens: 600_000,
+                cache_miss_tokens: 400_000,
+            }),
+            reasoning_content: None,
+        }
+    }
+
+    /// Issue #114 acceptance: `GET /sessions/:id/usage` reports the cache hit
+    /// / miss split and USD, and (unlike before) the numbers survive a server
+    /// restart — the accumulator is persisted after every turn and restored by
+    /// the cold-load path.
+    #[tokio::test]
+    async fn session_usage_reports_and_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("storage tempdir");
+        let backend = Arc::new(recursive::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+        let mut state = sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![priced_completion()])),
+            backend.clone(),
+        );
+        // A priced model so `cost_usd` is a number, not null.
+        state.config.model = "deepseek-chat".into();
+        let app = build_router_with_auth(state.clone(), two_caller_auth());
+
+        let sid = created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+        assert_eq!(
+            status(
+                &app,
+                api_request(
+                    "POST",
+                    &format!("/sessions/{sid}/messages"),
+                    "key-a",
+                    r#"{"content":"hi"}"#
+                )
+            )
+            .await,
+            200
+        );
+
+        let usage = get_json(&app, &format!("/sessions/{sid}/usage"), "key-a").await;
+        assert_eq!(usage["prompt_tokens"], 1_000_000);
+        assert_eq!(usage["completion_tokens"], 500_000);
+        assert_eq!(usage["cache_hit_tokens"], 600_000);
+        assert_eq!(usage["cache_miss_tokens"], 400_000);
+        assert_eq!(usage["total_tokens"], 1_500_000);
+        assert_eq!(usage["model"], "deepseek-chat");
+        let live_cost = usage["cost_usd"].as_f64().expect("priced cost");
+        assert!(live_cost > 0.0, "priced session must report USD");
+
+        // Graceful shutdown: the next process sees only storage.
+        recursive::http::flush_all_sessions(&state).await;
+        let mut restarted =
+            sample_state_with_storage(Arc::new(MockProvider::new(vec![])), backend.clone());
+        restarted.config.model = "deepseek-chat".into();
+        let app2 = build_router_with_auth(restarted, two_caller_auth());
+
+        let restored = get_json(&app2, &format!("/sessions/{sid}/usage"), "key-a").await;
+        assert_eq!(
+            restored["prompt_tokens"], 1_000_000,
+            "usage must survive a restart (was zeroed before issue #114)"
+        );
+        assert_eq!(restored["completion_tokens"], 500_000);
+        assert_eq!(restored["cache_hit_tokens"], 600_000);
+        assert_eq!(restored["cache_miss_tokens"], 400_000);
+        assert_eq!(restored["model"], "deepseek-chat");
+        assert_eq!(restored["cost_usd"].as_f64(), Some(live_cost));
+    }
+
+    /// The usage endpoint honours the same ownership contract as every other
+    /// `/sessions/:id*` route, and an unknown id stays a 404.
+    #[tokio::test]
+    async fn session_usage_is_owner_scoped() {
+        let state = sample_state_with_provider(Arc::new(MockProvider::new(vec![])));
+        let app = build_router_with_auth(state, two_caller_auth());
+        let sid = created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+
+        assert_eq!(
+            status(
+                &app,
+                api_request("GET", &format!("/sessions/{sid}/usage"), "key-b", "{}")
+            )
+            .await,
+            403,
+            "another caller must not read the usage"
+        );
+        assert_eq!(
+            status(
+                &app,
+                api_request("GET", "/sessions/does-not-exist/usage", "key-a", "{}")
+            )
+            .await,
+            404
+        );
+    }
+
+    /// Issue #114: the one-shot `POST /run` response carries the cache split
+    /// and USD too, so a caller can bill without a second request.
+    #[tokio::test]
+    async fn run_response_reports_cache_split_and_cost() {
+        let mut state =
+            sample_state_with_provider(Arc::new(MockProvider::new(vec![priced_completion()])));
+        state.config.model = "deepseek-chat".into();
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"goal":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(resp["usage"]["total_tokens"], 1_500_000);
+        assert_eq!(resp["usage"]["prompt_tokens"], 1_000_000);
+        assert_eq!(resp["usage"]["completion_tokens"], 500_000);
+        assert_eq!(resp["usage"]["cache_hit_tokens"], 600_000);
+        assert_eq!(resp["usage"]["cache_miss_tokens"], 400_000);
+        assert_eq!(resp["usage"]["model"], "deepseek-chat");
+        let cost = resp["usage"]["cost_usd"].as_f64().expect("priced cost");
+        assert!(cost > 0.0, "priced run must report USD");
+        // The global USD counter moved with the run.
+        assert!(metrics.cost_usd_total() > 0.0);
+    }
+
+    /// Issue #115 fixed the global books for a failed turn; the session ledger
+    /// must not silently drop the same spend.
+    #[tokio::test]
+    async fn session_usage_keeps_a_failed_turns_spend() {
+        // Step 1 succeeds with a tool call carrying usage; step 2's LLM call
+        // finds the scripted queue empty and fails — the runtime stashes the
+        // completed step's tokens in `last_failed_usage`.
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![recursive::llm::ToolCall {
+                id: "call_1".into(),
+                name: "nonexistent_tool".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: Some("tool_calls".into()),
+            usage: Some(recursive::llm::TokenUsage {
+                prompt_tokens: 77,
+                completion_tokens: 21,
+                total_tokens: 98,
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        }]));
+        let state = sample_state_with_provider(provider);
+        let app = build_router_with_auth(state, two_caller_auth());
+        let sid = created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+
+        let code = status(
+            &app,
+            api_request(
+                "POST",
+                &format!("/sessions/{sid}/messages"),
+                "key-a",
+                r#"{"content":"go"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(code, 500, "the failing turn must surface as an error");
+
+        let usage = get_json(&app, &format!("/sessions/{sid}/usage"), "key-a").await;
+        assert_eq!(
+            usage["prompt_tokens"], 77,
+            "a failed turn still spent its completed steps' tokens"
+        );
+        assert_eq!(usage["completion_tokens"], 21);
+    }
+
     // ── Plan-mode HTTP endpoint tests ─────────────────────────────────────
 
     /// Helper: build a state that has one pre-inserted session whose gate has
@@ -4170,8 +4429,7 @@ mod http_tests {
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            prompt_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            completion_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            usage: Arc::new(SessionUsage::new("test-model")),
             event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         state

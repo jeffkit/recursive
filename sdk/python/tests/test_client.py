@@ -69,11 +69,25 @@ class TestRecursiveClient(unittest.TestCase):
     def test_run(self):
         client = self._make_client()
         mock_resp = MagicMock()
+        # Issue #114 payload: the cache split + USD the server now sends must
+        # not break the client (this fixture used to be stale, which hid the
+        # regression).
         mock_resp.json.return_value = {
             "status": "success",
             "finish_reason": "Complete",
             "messages": [{"role": "assistant", "content": "Done."}],
-            "usage": {"total_steps": 3, "total_tokens": 1500},
+            "usage": {
+                "total_steps": 3,
+                "total_tokens": 1500,
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "cache_hit_tokens": 256,
+                "cache_miss_tokens": 744,
+                "reasoning_tokens": 0,
+                "llm_latency_ms": 812,
+                "model": "deepseek-chat",
+                "cost_usd": 0.19768,
+            },
         }
         mock_resp.raise_for_status = MagicMock()
         client.session.post.return_value = mock_resp
@@ -87,10 +101,38 @@ class TestRecursiveClient(unittest.TestCase):
         self.assertIsInstance(result.usage, UsageInfo)
         self.assertEqual(result.usage.total_steps, 3)
         self.assertEqual(result.usage.total_tokens, 1500)
+        self.assertEqual(result.usage.prompt_tokens, 1000)
+        self.assertEqual(result.usage.completion_tokens, 500)
+        self.assertEqual(result.usage.cache_hit_tokens, 256)
+        self.assertEqual(result.usage.cache_miss_tokens, 744)
+        self.assertEqual(result.usage.llm_latency_ms, 812)
+        self.assertEqual(result.usage.model, "deepseek-chat")
+        self.assertAlmostEqual(result.usage.cost_usd, 0.19768)
         client.session.post.assert_called_once_with(
             "http://localhost:3000/run",
             json={"goal": "Write hello.txt", "max_steps": 10},
         )
+
+    def test_run_tolerates_unknown_usage_keys_and_legacy_payloads(self):
+        """A field this client does not know yet must not raise."""
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "success",
+            "finish_reason": "Complete",
+            "messages": [],
+            "usage": {"total_steps": 1, "total_tokens": 10, "future_field": 7},
+        }
+        mock_resp.raise_for_status = MagicMock()
+        client.session.post.return_value = mock_resp
+
+        result = client.run("hi")
+
+        self.assertIsInstance(result.usage, UsageInfo)
+        self.assertEqual(result.usage.total_tokens, 10)
+        self.assertEqual(result.usage.extra, {"future_field": 7})
+        self.assertEqual(result.usage.model, "")
+        self.assertIsNone(result.usage.cost_usd)
 
     def test_create_session(self):
         client = self._make_client()

@@ -731,6 +731,11 @@ pub(super) async fn run_agent(
     runtime.destroy_environment().await;
 
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
+    // Issue #114: one-shot runs have no session to accumulate into, so their
+    // USD goes straight into the global counter.
+    state
+        .metrics
+        .record_cost_usd(&state.config.model, &outcome.total_usage);
     record_llm_success(&state.metrics);
 
     // Serialize transcript messages to JSON values
@@ -741,15 +746,14 @@ pub(super) async fn run_agent(
         .collect();
 
     let finish_reason = outcome.finish_reason.to_string();
+    // Issue #114: report the cache split + USD of this run to the caller.
+    let usage = UsageInfo::from_turn(&state.config.model, &outcome);
 
     Ok(Json(RunResponse {
         status: "success".into(),
         finish_reason,
         messages,
-        usage: UsageInfo {
-            total_steps: outcome.steps as u32,
-            total_tokens: outcome.total_usage.total_tokens as u64,
-        },
+        usage,
     }))
 }
 
@@ -952,8 +956,9 @@ pub(super) async fn create_session(
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         last_active_ms: Arc::new(AtomicU64::new(super::now_session_ms())),
-        prompt_tokens: Arc::new(AtomicU64::new(0)),
-        completion_tokens: Arc::new(AtomicU64::new(0)),
+        // Issue #114: usage is priced against the server's model; the
+        // snapshot is persisted after every turn.
+        usage: Arc::new(super::SessionUsage::new(state.config.model.clone())),
         event_seq: Arc::new(AtomicU64::new(0)),
     };
 
@@ -1118,9 +1123,10 @@ pub(super) async fn get_session(
         (first, last)
     };
 
-    // Read token usage directly from atomic counters — no lock needed.
-    let prompt_tokens = session.prompt_tokens.load(Ordering::Relaxed);
-    let completion_tokens = session.completion_tokens.load(Ordering::Relaxed);
+    // Read token usage from the lock-free accumulator — no lock needed. A
+    // cold-loaded session was seeded from its persisted snapshot (issue #114).
+    let usage = session.usage.snapshot();
+    let (prompt_tokens, completion_tokens) = (usage.prompt_tokens, usage.completion_tokens);
 
     Ok(Json(SessionDetailResponse {
         id: session.id.clone(),
@@ -1138,6 +1144,29 @@ pub(super) async fn get_session(
         permission_mode,
         preset,
     }))
+}
+
+/// GET /sessions/:id/usage — cumulative token usage and USD cost.
+///
+/// Issue #114: before this endpoint the only usage visible over HTTP was the
+/// bare `prompt_tokens` / `completion_tokens` pair on `GET /sessions/:id`,
+/// with no cache split and no dollar figure — and a restart zeroed even those.
+/// This returns the full accumulator (cache hit / miss split included) priced
+/// at `crate::llm::pricing_for`, exactly like the CLI and AG-UI channels.
+///
+/// Cold loading a session restores its persisted usage snapshot, so the
+/// numbers survive a server restart. Ownership is asserted by
+/// [`super::cold_load::get_or_load_session`] before the session materializes.
+pub(super) async fn get_session_usage(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<Json<super::UsageResponse>, ApiError> {
+    let session = super::cold_load::get_or_load_session(&state, &id, &identity).await?;
+    Ok(Json(super::UsageResponse::from_usage(
+        &session.id,
+        &session.usage,
+    )))
 }
 
 /// DELETE /sessions/:id — remove a session.
@@ -1412,8 +1441,9 @@ pub(super) async fn fork_session(
         interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
         last_active_ms: Arc::new(AtomicU64::new(super::now_session_ms())),
-        prompt_tokens: Arc::new(AtomicU64::new(0)),
-        completion_tokens: Arc::new(AtomicU64::new(0)),
+        // Issue #114: a fork starts its own accounting from zero — the copied
+        // transcript is history, not usage this session incurred.
+        usage: Arc::new(super::SessionUsage::new(state.config.model.clone())),
         event_seq: Arc::new(AtomicU64::new(0)),
     };
 
@@ -1762,12 +1792,11 @@ pub(super) async fn send_session_message(
     session
         .last_active_ms
         .store(super::now_session_ms(), Ordering::Relaxed);
-    let (runtime_arc, interrupt_token_arc, msg_count_arc, prompt_tokens_arc, completion_tokens_arc) = (
+    let (runtime_arc, interrupt_token_arc, msg_count_arc, usage_arc) = (
         session.runtime.clone(),
         session.interrupt_token.clone(),
         session.non_system_message_count.clone(),
-        session.prompt_tokens.clone(),
-        session.completion_tokens.clone(),
+        session.usage.clone(),
     );
 
     // Ensure broadcast channel exists for this session before we lock the runtime.
@@ -1913,27 +1942,38 @@ pub(super) async fn send_session_message(
     // Issue #115: snapshot the failed turn's spend before the error is mapped
     // — the runtime keeps it out of band because `Err` cannot carry it.
     let failed_usage = runtime.last_failed_usage();
-    let outcome = run_result.map_err(|e| {
-        record_run_failed(&state.metrics, &failed_usage);
-        // Issue #123: as in `/run`, only a failure of the LLM call itself
-        // counts against readiness.
-        if e.is_llm_failure() {
-            record_llm_failure(&state.metrics);
+    let outcome = match run_result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            record_run_failed(&state.metrics, &failed_usage);
+            // Issue #114: a failed turn still burned the tokens of every step
+            // that completed — fold them into the session ledger too, or the
+            // session books stay low exactly where issue #115 fixed the global
+            // ones.
+            usage_arc.record(failed_usage, 0);
+            super::usage::persist_usage(&state.storage, &id, &usage_arc).await;
+            // Issue #123: as in `/run`, only a failure of the LLM call itself
+            // counts against readiness.
+            if e.is_llm_failure() {
+                record_llm_failure(&state.metrics);
+            }
+            return Err(map_run_error(&e));
         }
-        map_run_error(&e)
-    })?;
+    };
     // Issue #124: close the run trace with its terminal finish reason.
     langfuse_run
         .finish(Some(&outcome.finish_reason.to_string()), None)
         .await;
 
-    // Update per-session token counters and global metrics.
-    prompt_tokens_arc.fetch_add(outcome.total_usage.prompt_tokens as u64, Ordering::Relaxed);
-    completion_tokens_arc.fetch_add(
-        outcome.total_usage.completion_tokens as u64,
-        Ordering::Relaxed,
-    );
+    // Issue #114: fold this turn's usage (cache split included) into the
+    // session accumulator and update the global counters, then persist the
+    // snapshot so it survives a restart — a cold load restores it.
+    usage_arc.record(outcome.total_usage, outcome.llm_latency_ms);
     record_run_success(&state.metrics, outcome.steps, &outcome.total_usage);
+    state
+        .metrics
+        .record_cost_usd(usage_arc.model(), &outcome.total_usage);
+    super::usage::persist_usage(&state.storage, &id, &usage_arc).await;
     // Issue #123: an interrupted turn may have been cancelled before the
     // provider ever answered, so it must not clear the readiness streak.
     if !matches!(
@@ -2028,6 +2068,7 @@ pub(super) async fn session_events(
                 SseEvent::GoalContinuing { .. } => "goal_continuing",
                 SseEvent::GoalAchieved { .. } => "goal_achieved",
                 SseEvent::ToolProgress { .. } => "tool_progress",
+                SseEvent::Usage { .. } => "usage",
             };
             let data = serde_json::to_string(&event).unwrap_or_default();
             // Issue #117: the frame carries its timeline id so clients can
@@ -2057,7 +2098,9 @@ pub(super) async fn session_events(
 
 /// Map an [`AgentEvent`] to an [`SseEvent`] for broadcasting to SSE clients.
 ///
-/// Returns `None` for events that have no SSE equivalent (latency, tokens, etc.).
+/// Returns `None` for events that have no SSE equivalent (latency, context
+/// breakdown, compaction bookkeeping, etc.). Per-step token usage IS mapped
+/// (issue #114).
 ///
 /// The resulting frame's `id:` (issue #117) is the originating event's
 /// envelope key — `<ts_ms>-<turn>-<seq>` — not the per-turn `step` number,
@@ -2113,9 +2156,25 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
             condition: condition.clone(),
             turns: *turns,
         }),
-        // AssistantText, Latency, Usage, Compacted, PlanConfirmed,
-        // PlanRejected don't have SSE equivalents (AssistantText is
-        // intentionally suppressed in favour of MessageAppended above).
+        // Issue #114: forward the per-step provider usage (cache split
+        // included) so a streaming client can watch cost accrue during the
+        // run instead of only at the end.
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_hit_tokens,
+            cache_miss_tokens,
+            step,
+        } => Some(SseEvent::Usage {
+            input_tokens: *input_tokens,
+            output_tokens: *output_tokens,
+            cache_hit_tokens: *cache_hit_tokens,
+            cache_miss_tokens: *cache_miss_tokens,
+            step: *step,
+        }),
+        // AssistantText, Latency, Compacted, PlanConfirmed, PlanRejected
+        // don't have SSE equivalents (AssistantText is intentionally
+        // suppressed in favour of MessageAppended above).
         _ => None,
     }
 }
@@ -2565,6 +2624,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let tokens_wasted_on_failure_total = metrics
         .tokens_wasted_on_failure_total
         .load(Ordering::Relaxed);
+    // Issue #114: total billed USD across completed runs (micro-USD stored,
+    // exposed as a float counter).
+    let cost_usd_total = metrics.cost_usd_total();
     let agent_steps_total = metrics.agent_steps_total.load(Ordering::Relaxed);
     let sessions_active = metrics.sessions_active.load(Ordering::Relaxed);
     let rate_limits_rejected = metrics.rate_limits_rejected.load(Ordering::Relaxed);
@@ -2641,6 +2703,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_tokens_wasted_on_failure_total Tokens burned by failed agent runs\n\
          # TYPE recursive_tokens_wasted_on_failure_total counter\n\
          recursive_tokens_wasted_on_failure_total {tokens_wasted_on_failure_total}\n\
+         # HELP recursive_cost_usd_total Total billed USD across completed runs (issue #114)\n\
+         # TYPE recursive_cost_usd_total counter\n\
+         recursive_cost_usd_total {cost_usd_total:.6}\n\
          # HELP recursive_agent_steps_total Total agent steps executed\n\
          # TYPE recursive_agent_steps_total counter\n\
          recursive_agent_steps_total {agent_steps_total}\n\
@@ -3597,8 +3662,7 @@ mod tests {
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active_ms: Arc::new(AtomicU64::new(0)),
-            prompt_tokens: Arc::new(AtomicU64::new(0)),
-            completion_tokens: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(crate::http::SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
         };
 
@@ -3696,8 +3760,7 @@ mod tests {
             interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
             non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_active_ms: Arc::new(AtomicU64::new(0)),
-            prompt_tokens: Arc::new(AtomicU64::new(0)),
-            completion_tokens: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(crate::http::SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
         };
         let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
@@ -4527,6 +4590,92 @@ mod tests {
         );
     }
 
+    /// Issue #114: the global USD counter is priced with the same function the
+    /// session accounting uses — priced models move it, unpriced ones and
+    /// empty runs do not (a silent free entry would be worse than no entry).
+    #[test]
+    fn record_cost_usd_tracks_priced_runs_only() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let metrics = crate::http::Metrics::default();
+        let usage = crate::llm::TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 500_000,
+            total_tokens: 1_500_000,
+            cache_miss_tokens: 1_000_000,
+            ..Default::default()
+        };
+        metrics.record_cost_usd("deepseek-chat", &usage);
+        assert!(
+            (metrics.cost_usd_total() - 0.28).abs() < 1e-6,
+            "deepseek-chat 1.5M tokens must bill $0.28, got {}",
+            metrics.cost_usd_total()
+        );
+        // An unpriced model contributes nothing — never a silent zero entry.
+        metrics.record_cost_usd("no-such-model-v42", &usage);
+        assert!((metrics.cost_usd_total() - 0.28).abs() < 1e-6);
+        // A run that reported no usage moves nothing either.
+        metrics.record_cost_usd("deepseek-chat", &crate::llm::TokenUsage::default());
+        assert!((metrics.cost_usd_total() - 0.28).abs() < 1e-6);
+
+        // A sub-micro-USD cost rounds to the nearest micro (5 input tokens at
+        // $0.14/M = $0.0000007 → 0.7 µ$ → 1 µ$). A truncated conversion would
+        // silently record 0 and lose the run.
+        let small = crate::http::Metrics::default();
+        small.record_cost_usd(
+            "deepseek-chat",
+            &crate::llm::TokenUsage {
+                prompt_tokens: 5,
+                total_tokens: 5,
+                cache_miss_tokens: 5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(small.cost_micro_usd_total.load(Ordering::Relaxed), 1);
+
+        // A total above $1 exercises the micro→USD division: 10M input tokens
+        // at $0.14/M = $1.40. (A `% 1e6` mutant would report the remainder.)
+        let big = crate::http::Metrics::default();
+        big.record_cost_usd(
+            "deepseek-chat",
+            &crate::llm::TokenUsage {
+                prompt_tokens: 10_000_000,
+                total_tokens: 10_000_000,
+                cache_miss_tokens: 10_000_000,
+                ..Default::default()
+            },
+        );
+        assert!(
+            (big.cost_usd_total() - 1.4).abs() < 1e-6,
+            "got {}",
+            big.cost_usd_total()
+        );
+    }
+
+    /// Issue #114: the cost counter is always exposed on `/metrics`, even at
+    /// zero (Prometheus consumers need the series to exist).
+    #[tokio::test]
+    async fn metrics_handler_exposes_cost_usd_total() {
+        let metrics = crate::http::Metrics::default();
+        let state = readyz_state(metrics, readyz_local_storage("cost"), 8);
+        let output = metrics_handler(State(state)).await;
+        assert!(
+            output.contains("recursive_cost_usd_total 0.000000"),
+            "a fresh server must still expose the USD counter: {output}"
+        );
+
+        let metrics = crate::http::Metrics {
+            cost_micro_usd_total: AtomicU64::new(280_000),
+            ..crate::http::Metrics::default()
+        };
+        let state = readyz_state(metrics, readyz_local_storage("cost2"), 8);
+        let output = metrics_handler(State(state)).await;
+        assert!(
+            output.contains("recursive_cost_usd_total 0.280000"),
+            "280000 micro-USD must render as 0.28: {output}"
+        );
+    }
+
     /// Goal-292: sessions_active increments on create_session and
     /// decrements on delete_session.
     #[tokio::test]
@@ -4716,12 +4865,51 @@ mod tests {
             "recursive_sessions_evicted",
             "recursive_llm_last_success_ms",
             "recursive_llm_failures_consecutive",
+            // Issue #114: the USD counter must be documented too.
+            "recursive_cost_usd_total",
         ] {
             assert!(
                 description.contains(series),
                 "metrics description should mention {series}: {description}"
             );
         }
+    }
+
+    /// Issue #114: the usage endpoint and its schema must be in the spec —
+    /// an undocumented endpoint is invisible to generated SDK clients.
+    #[test]
+    fn openapi_documents_the_session_usage_endpoint() {
+        let spec = super::super::build_openapi_spec();
+        assert!(
+            spec["paths"]["/sessions/{id}/usage"]["get"].is_object(),
+            "GET /sessions/{{id}}/usage must be documented"
+        );
+        let props = &spec["components"]["schemas"]["UsageResponse"]["properties"];
+        for field in [
+            "session_id",
+            "model",
+            "prompt_tokens",
+            "completion_tokens",
+            "cache_hit_tokens",
+            "cache_miss_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "llm_latency_ms",
+            "cost_usd",
+        ] {
+            assert!(
+                props.get(field).is_some(),
+                "UsageResponse.{field} missing from the spec"
+            );
+        }
+        // And `POST /run`'s usage block advertises the new billing fields.
+        let run_usage = &spec["components"]["schemas"]["UsageInfo"]["properties"];
+        assert!(
+            run_usage.get("cache_hit_tokens").is_some()
+                && run_usage.get("cost_usd").is_some()
+                && run_usage.get("model").is_some(),
+            "UsageInfo must document the cache split + USD + model"
+        );
     }
 
     // ── Goal-303: sort GET /sessions results by created_at ───────────
@@ -4948,21 +5136,41 @@ mod tests {
 
     #[test]
     fn map_agent_event_suppresses_non_sse_variants() {
-        // Latency / Usage / AssistantText have no SSE equivalent.
+        // Latency / AssistantText have no SSE equivalent.
         assert!(map_agent_event(&AgentEvent::Latency { step: 0, llm_ms: 1 }).is_none());
-        assert!(map_agent_event(&AgentEvent::Usage {
-            input_tokens: 1,
-            output_tokens: 1,
-            cache_hit_tokens: 0,
-            cache_miss_tokens: 0,
-            step: 0,
-        })
-        .is_none());
         assert!(map_agent_event(&AgentEvent::AssistantText {
             text: "hi".into(),
             step: 0
         })
         .is_none());
+    }
+
+    /// Issue #114: the per-step provider usage (cache split included) used to
+    /// be dropped on the floor; it must now reach SSE clients.
+    #[test]
+    fn map_agent_event_forwards_per_step_usage() {
+        match map_agent_event(&AgentEvent::Usage {
+            input_tokens: 120,
+            output_tokens: 34,
+            cache_hit_tokens: 90,
+            cache_miss_tokens: 30,
+            step: 4,
+        }) {
+            Some(SseEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_hit_tokens,
+                cache_miss_tokens,
+                step,
+            }) => {
+                assert_eq!(input_tokens, 120);
+                assert_eq!(output_tokens, 34);
+                assert_eq!(cache_hit_tokens, 90);
+                assert_eq!(cache_miss_tokens, 30);
+                assert_eq!(step, 4);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 
     #[test]

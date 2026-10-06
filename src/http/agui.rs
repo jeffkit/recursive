@@ -1133,6 +1133,11 @@ pub(crate) fn spawn_agui_run(
         match &outcome {
             Ok(o) if !cancelled => {
                 super::handlers::record_run_success(&metrics, o.steps, &o.total_usage);
+                // Issue #114: an `/agui` run is a completed run like any other
+                // — without this the USD counter silently excluded AG-UI
+                // spend while `agent_runs_total` / `tokens_prompt_total`
+                // included it.
+                metrics.record_cost_usd(&drv_model, &o.total_usage);
                 super::handlers::record_llm_success(&metrics);
             }
             // Issue #123: only a failure of the LLM call itself may count

@@ -1,6 +1,6 @@
 """Data models for Recursive Agent API responses."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Literal, Optional
 
 
@@ -15,10 +15,35 @@ class ToolInfo:
 
 @dataclass
 class UsageInfo:
-    """Token and step usage information."""
+    """Token and step usage information.
 
-    total_steps: int
-    total_tokens: int
+    ``POST /run`` grew the cache split and the priced USD cost in issue #114,
+    so every billing field beyond ``total_steps`` / ``total_tokens`` carries a
+    default: a response from an older server still parses. Use
+    :meth:`from_dict` rather than ``UsageInfo(**payload)`` — it drops keys the
+    client does not know yet instead of raising, so a newer server cannot break
+    an older client.
+    """
+
+    total_steps: int = 0
+    total_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    reasoning_tokens: int = 0
+    llm_latency_ms: int = 0
+    model: str = ""
+    cost_usd: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "UsageInfo":
+        """Build from a server payload, keeping unknown keys in ``extra``."""
+        known = {f.name for f in fields(cls)} - {"extra"}
+        kwargs = {k: v for k, v in payload.items() if k in known}
+        extra = {k: v for k, v in payload.items() if k not in known}
+        return cls(extra=extra, **kwargs)
 
 
 @dataclass
@@ -32,7 +57,7 @@ class RunResponse:
 
     def __post_init__(self):
         if isinstance(self.usage, dict):
-            self.usage = UsageInfo(**self.usage)
+            self.usage = UsageInfo.from_dict(self.usage)
 
 
 @dataclass
