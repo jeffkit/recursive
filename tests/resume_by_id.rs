@@ -17,7 +17,8 @@ use std::sync::Arc;
 use recursive::llm::ToolSpec;
 use recursive::message::{Message, Role};
 use recursive::session::{
-    hash_tool_specs, SessionLock, SessionMeta, SessionReader, SessionStatus, SessionWriter,
+    hash_tool_specs, SessionLock, SessionLockBusy, SessionMeta, SessionReader, SessionStatus,
+    SessionWriter,
 };
 use recursive::test_util::env_lock;
 
@@ -327,8 +328,11 @@ fn load_messages_round_trips_tool_calls_and_reasoning() {
 
 #[test]
 fn lock_thread_safety_serialises_open_existing() {
-    // Two threads racing on the same session_dir: only one wins
-    // open_existing; the other must observe SessionLockBusy.
+    // Two threads race on the same session_dir: thread 1 must win
+    // open_existing; thread 2 — started only after thread 1 is known
+    // to hold the lock — must observe SessionLockBusy. The handoff is
+    // an explicit channel rendezvous rather than a sleep, so the
+    // outcome cannot depend on scheduler timing.
     let _h = HomeOverride::new();
     let ws = workspace();
 
@@ -339,31 +343,44 @@ fn lock_thread_safety_serialises_open_existing() {
     let dir1 = Arc::new(dir.clone());
     let dir2 = Arc::new(dir);
 
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
     let h1 = std::thread::spawn(move || {
-        // Hold the lock briefly so the other thread sees BUSY.
-        let w = SessionWriter::open_existing(&dir1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        let w = SessionWriter::open_existing(&dir1).expect("thread 1 must win the lock");
+        // Tell the main thread the lock is held, then keep holding it
+        // until the main thread's attempt has been made.
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
         drop(w);
     });
 
-    // Give thread 1 a head start on the lock.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    locked_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("thread 1 should acquire the lock and signal the main thread");
 
     let result2 = SessionWriter::open_existing(&dir2);
+    release_tx.send(()).unwrap();
     h1.join().unwrap();
 
-    // Thread 2 should have hit BUSY (since thread 1 was holding).
-    // Note: this is timing-dependent — accept either an error or
-    // a successful open if thread 1 ran exceedingly fast.
-    if let Err(e) = result2 {
-        assert!(
-            e.to_string().contains("pid"),
-            "expected lock error to mention pid, got: {e}"
-        );
-    }
-    // If result2 was Ok, thread 1 finished before our open_existing
-    // — also fine; the goal is to demonstrate no deadlock and
-    // correct serialisation, not to require timing.
+    let err = result2
+        .err()
+        .expect("thread 2 must see BUSY while thread 1 holds the lock");
+    let busy = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<SessionLockBusy>())
+        .expect("expected an io::Error wrapping SessionLockBusy");
+    assert_eq!(
+        busy.pid,
+        std::process::id(),
+        "the reported holder must be thread 1 (this process)"
+    );
+
+    // Once thread 1 drops its writer the lock is free again — proves
+    // serialisation released rather than deadlocked.
+    let w3 =
+        SessionWriter::open_existing(&dir2).expect("lock must be free after thread 1 drops it");
+    drop(w3);
 }
 
 #[test]
