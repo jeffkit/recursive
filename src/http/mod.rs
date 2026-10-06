@@ -763,7 +763,9 @@ impl AppState {
     ///
     /// Container tier: a fresh registry with its own container (issue §3 —
     /// one container per session, not one per process). Other tiers: a
-    /// handle-clone of the shared startup registry (previous behaviour).
+    /// handle-clone of the shared startup registry (previous behaviour), with
+    /// a per-session permission-hook slot (issue #134 review) so a
+    /// request-scoped hook cannot escape into other sessions.
     /// Issue #31 §C: Result-shaped — container creation failure is a
     /// per-session error mapped by handlers to 503/500, not a process exit.
     ///
@@ -775,8 +777,18 @@ impl AppState {
     /// `rebind_per_session_registry` re-attaches the process-wide MCP tools
     /// to the fresh container registry before the surface filters run.
     pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
+        // Issue #134 review: each session gets its OWN permission-hook slot.
+        // On the clone path the registry would otherwise share the
+        // process-wide base's slot, so a request-scoped hook — AG-UI installs
+        // the client-tool / `interrupt_before` deny hook per run — would
+        // outlive its run and silently deny those tool names in the base and
+        // in every later session. Views of THIS session (e.g. `run_code`'s
+        // invoker registry) still share the slot, so a late install reaches
+        // them.
         let mut registry =
-            rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills).await?;
+            rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills)
+                .await?
+                .isolate_permission_hook();
         crate::coordinator::filter_registry(&mut registry);
         if !self.config.allow_tools.is_empty() {
             registry.retain_tools(&self.config.allow_tools);
@@ -2744,6 +2756,45 @@ mod goal_396_persistence_tests {
                  into per-session registries"
             );
         }
+    }
+
+    /// Issue #134 review: the server hands ONE process-wide registry to every
+    /// session, and AG-UI installs a *request-scoped* permission hook on the
+    /// registry it gets (`interrupt_before` / client tools). With a shared
+    /// hook slot that hook outlives the run — denying its names in the base
+    /// and in every later session. The slot must be per session, while views
+    /// of one session still share it.
+    #[tokio::test]
+    async fn session_tool_registry_isolates_request_scoped_permission_hooks() {
+        let state = test_state(test_host(0), RecordingStorage::new()).await;
+        let base = state.tool_registry.clone();
+
+        let mut first = state.session_tool_registry().await.expect("registry");
+        first.set_permission_hook(Arc::new(crate::tools::registry::PermissionHookDisabled));
+        assert!(first.permission_hook().is_some());
+
+        assert!(
+            base.permission_hook().is_none(),
+            "a request-scoped hook must not leak into the process-wide base"
+        );
+        let second = state.session_tool_registry().await.expect("registry");
+        assert!(
+            second.permission_hook().is_none(),
+            "a request-scoped hook must not leak into the next session"
+        );
+
+        // Views of ONE session (run_code's invoker registry) still share the
+        // slot, in both directions.
+        let mut view = first.clone();
+        assert!(
+            view.permission_hook().is_some(),
+            "a view of the session must see the hook installed after it was taken"
+        );
+        view.clear_permission_hook();
+        assert!(
+            first.permission_hook().is_none(),
+            "the session and its views must share the slot"
+        );
     }
 
     #[tokio::test]

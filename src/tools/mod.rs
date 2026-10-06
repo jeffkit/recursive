@@ -40,6 +40,7 @@ pub mod execution;
 pub use execution::edit;
 pub use execution::fs;
 pub use execution::glob;
+pub use execution::run_code;
 pub use execution::shell;
 
 // ── Transport layer (src/tools/transport_layer/, issue #82) ────────────────

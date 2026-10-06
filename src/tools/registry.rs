@@ -150,6 +150,25 @@ pub trait PermissionHook: Send + Sync {
     async fn check(&self, tool_name: &str, args: &serde_json::Value) -> PermissionDecision;
 }
 
+/// Shared, always-present slot holding the runtime [`PermissionHook`].
+///
+/// The hook is installed after the registry is built, via
+/// [`AgentRuntime::set_permission_hook`](crate::runtime::AgentRuntime::set_permission_hook),
+/// while clones and `fork_session` results — `run_code`'s invoker registry,
+/// sub-agent registries — are taken earlier. Sharing the slot is what makes a
+/// late install visible to every view of the session; a plain
+/// `Option<Arc<_>>` field would freeze each view at the moment it was taken.
+///
+/// Sharing is scoped to ONE session: a host that hands the same process-wide
+/// registry to many independent sessions breaks the link with
+/// [`ToolRegistry::isolate_permission_hook`].
+pub type SharedPermissionHook = Arc<std::sync::RwLock<Option<Arc<dyn PermissionHook>>>>;
+
+/// An empty hook slot.
+fn empty_permission_hook() -> SharedPermissionHook {
+    Arc::new(std::sync::RwLock::new(None))
+}
+
 /// No-op permission hook that allows every tool call.
 ///
 /// Used as the default when no ACP permission bridge is configured.
@@ -164,10 +183,13 @@ impl PermissionHook for PermissionHookDisabled {
 }
 
 /// NOTE: `Clone` shares every `Arc` with the source registry — including the
-/// read-before-edit guard, the touched-files collector, and the
-/// runtime-mutable sandbox-roots slot. Use [`ToolRegistry::fork_session`]
-/// (Goal 394) when per-session isolation is required; [`ToolRegistry::fork`]
-/// is a legacy alias for `clone()`.
+/// read-before-edit guard, the touched-files collector, the runtime-mutable
+/// sandbox-roots slot, the deliverables ledger and the permission-hook slot.
+/// Use [`ToolRegistry::fork_session`] (Goal 394) when per-session isolation
+/// is required; [`ToolRegistry::fork`] is a legacy alias for `clone()`.
+///
+/// `Clone` is what `run_code` uses for its invoker registry (issue #134): a
+/// program's tool calls must join the session's state, not run in a copy.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
@@ -194,10 +216,16 @@ pub struct ToolRegistry {
     /// Shared MCP elicitation handler slot (Claude control `elicitation`).
     #[cfg(feature = "mcp")]
     elicitation: Option<crate::tools::elicitation::SharedElicitationHandler>,
-    /// Goal-161: optional runtime permission hook. When `Some`, called
-    /// before every tool invocation. `None` means allow all (backward-
-    /// compatible default).
-    pub(crate) permission_hook: Option<Arc<dyn PermissionHook>>,
+    /// Goal-161: runtime permission hook slot. Called before every tool
+    /// invocation; an empty slot means allow all (backward-compatible
+    /// default). The slot itself is always present and is SHARED by every
+    /// clone / `fork_session` of this registry, because the hook is installed
+    /// *after* the registry is built ([`AgentRuntime::set_permission_hook`])
+    /// — a view taken earlier (e.g. `run_code`'s invoker registry) must still
+    /// observe it, or programmatic tool calls would skip the interactive gate.
+    ///
+    /// [`AgentRuntime::set_permission_hook`]: crate::runtime::AgentRuntime::set_permission_hook
+    pub(crate) permission_hook: SharedPermissionHook,
     /// Goal-184: optional L1 policy config. Stored here so individual tools
     /// can query it at call time. Does not enforce anything by itself;
     /// tools must call `registry.policy()` and check before executing.
@@ -254,7 +282,7 @@ impl ToolRegistry {
             session_roots: None,
             #[cfg(feature = "mcp")]
             elicitation: None,
-            permission_hook: None,
+            permission_hook: empty_permission_hook(),
             policy: None,
             headless: false,
             hook_runner: crate::hooks::ExternalHookRunner::discover(&[]),
@@ -347,7 +375,9 @@ impl ToolRegistry {
     ///   immutable configuration, one instance per registry by design.
     /// - `permissions` / `permission_mode` / `permission_hook` / `policy` /
     ///   `auto_classifier` / `headless` / `hook_runner` — permission
-    ///   configuration is a property of the process, not of a session.
+    ///   configuration is a property of the process, not of a session. (A
+    ///   channel that installs a *request-scoped* hook per run isolates the
+    ///   slot with [`Self::isolate_permission_hook`] instead of forking.)
     /// - MCP client(s) and the elicitation handler — MCP servers are
     ///   external resources, deliberately shared per server (they are
     ///   startup-time connections; a fork must not reconnect).
@@ -462,9 +492,13 @@ impl ToolRegistry {
     /// Attach a [`PermissionHook`] (Goal 161). When set, `ask_permission`
     /// is called before every tool invocation; returning `false` causes
     /// `invoke` to return `Error::PermissionDenied` without running the tool.
-    pub fn with_permission_hook(mut self, hook: Arc<dyn PermissionHook>) -> Self {
-        self.permission_hook = Some(hook);
-        self
+    ///
+    /// The hook is written into the registry's shared slot, so clones and
+    /// `fork_session` views taken earlier observe it too.
+    pub fn with_permission_hook(self, hook: Arc<dyn PermissionHook>) -> Self {
+        let mut this = self;
+        this.set_permission_hook(hook);
+        this
     }
 
     /// Attach (or clear) the deliverables ledger (goal #133). The registry
@@ -487,12 +521,51 @@ impl ToolRegistry {
     /// Attach a permission hook via mutable reference.
     /// Equivalent to [`with_permission_hook`] but usable on existing registries.
     pub fn set_permission_hook(&mut self, hook: Arc<dyn PermissionHook>) {
-        self.permission_hook = Some(hook);
+        if let Ok(mut slot) = self.permission_hook.write() {
+            *slot = Some(hook);
+            return;
+        }
+        // Poisoned slot: replace it outright rather than lose the hook.
+        self.permission_hook = Arc::new(std::sync::RwLock::new(Some(hook)));
     }
 
     /// Remove any previously attached permission hook.
     pub fn clear_permission_hook(&mut self) {
-        self.permission_hook = None;
+        if let Ok(mut slot) = self.permission_hook.write() {
+            *slot = None;
+        }
+    }
+
+    /// The permission hook currently installed, if any. Reads through the
+    /// shared slot (see [`SharedPermissionHook`]), so a hook installed after
+    /// this registry view was taken is still returned.
+    pub(crate) fn permission_hook(&self) -> Option<Arc<dyn PermissionHook>> {
+        self.permission_hook
+            .read()
+            .map(|slot| (*slot).clone())
+            .unwrap_or(None)
+    }
+
+    /// A clone whose permission-hook slot is **its own**, seeded with the hook
+    /// installed right now.
+    ///
+    /// [`Clone`] and [`fork_session`](Self::fork_session) share the slot on
+    /// purpose: the hook installed after the registry was built must still
+    /// gate nested calls (that is what lets `run_code`'s invoker registry — a
+    /// `clone` of the session registry — observe the session's hook).
+    ///
+    /// A host that hands ONE process-wide registry to many independent
+    /// sessions must break that link instead. The HTTP server's
+    /// `session_tool_registry` is exactly that host: AG-UI installs a
+    /// *request-scoped* hook (client tools / `interrupt_before`) on the
+    /// registry it gets, and with a shared slot that hook would outlive the
+    /// run — denying its names in the process-wide base and in every later
+    /// session. Seeding from the current value keeps a hook installed on the
+    /// base *before* the session was created.
+    pub fn isolate_permission_hook(&self) -> Self {
+        let mut view = self.clone();
+        view.permission_hook = Arc::new(std::sync::RwLock::new(self.permission_hook()));
+        view
     }
 
     /// Attach an L1 policy config. The registry stores the policy so that
@@ -2290,14 +2363,97 @@ mod tests {
     #[test]
     fn with_permission_hook_installs_hook() {
         let reg = make_registry().with_permission_hook(Arc::new(DenyAllHook));
-        assert!(reg.permission_hook.is_some(), "hook must be installed");
+        assert!(reg.permission_hook().is_some(), "hook must be installed");
     }
 
     #[test]
     fn clear_permission_hook_removes_hook() {
         let mut reg = make_registry().with_permission_hook(Arc::new(DenyAllHook));
         reg.clear_permission_hook();
-        assert!(reg.permission_hook.is_none(), "hook must be cleared");
+        assert!(reg.permission_hook().is_none(), "hook must be cleared");
+    }
+
+    /// Issue #134 review: the hook is installed AFTER the registry is built
+    /// (the TUI / CLI call `AgentRuntime::set_permission_hook` on the built
+    /// runtime), so a view taken earlier — `run_code`'s invoker registry,
+    /// a sub-agent registry — must still observe it. A per-view
+    /// `Option<Arc<_>>` snapshot would silently skip the interactive gate
+    /// for every nested call.
+    #[test]
+    fn a_clone_taken_before_install_observes_the_permission_hook() {
+        let reg = make_registry();
+        let earlier_view = reg.clone();
+        let mut reg = reg;
+        assert!(earlier_view.permission_hook().is_none());
+        reg.set_permission_hook(Arc::new(DenyAllHook));
+        assert!(
+            earlier_view.permission_hook().is_some(),
+            "a registry view taken before the install must see the hook"
+        );
+
+        // `fork_session` shares permission configuration by contract, and the
+        // hook travels with it.
+        let fork = reg.fork_session();
+        assert!(fork.permission_hook().is_some(), "forks keep the hook");
+
+        // Clearing is likewise visible everywhere.
+        reg.clear_permission_hook();
+        assert!(earlier_view.permission_hook().is_none());
+        assert!(fork.permission_hook().is_none());
+    }
+
+    /// Issue #134 review: the reverse side of the shared slot — a host that
+    /// hands one process-wide registry to many sessions (the HTTP server) must
+    /// be able to break the link, or a request-scoped hook escapes the run.
+    /// Views of the isolated clone still share it.
+    #[test]
+    fn isolate_permission_hook_splits_the_slot_without_losing_the_hook() {
+        let reg = make_registry();
+        let mut isolated = reg.isolate_permission_hook();
+        assert!(
+            isolated.permission_hook().is_none(),
+            "an empty base seeds an empty slot"
+        );
+
+        isolated.set_permission_hook(Arc::new(DenyAllHook));
+        assert!(
+            reg.permission_hook().is_none(),
+            "the isolated hook must not leak back into the base"
+        );
+        let view_of_isolated = isolated.clone();
+        assert!(
+            view_of_isolated.permission_hook().is_some(),
+            "views of the isolated registry still share its slot"
+        );
+
+        // A hook installed on the base BEFORE the isolation is inherited.
+        let mut seeded = make_registry();
+        seeded.set_permission_hook(Arc::new(DenyAllHook));
+        let mut isolated = seeded.isolate_permission_hook();
+        assert!(isolated.permission_hook().is_some());
+        isolated.clear_permission_hook();
+        assert!(
+            seeded.permission_hook().is_some(),
+            "clearing the isolated slot must not clear the base"
+        );
+    }
+
+    /// The installed hook actually gates an invocation, from a view taken
+    /// before the install.
+    #[tokio::test]
+    async fn a_late_installed_hook_gates_calls_through_an_earlier_view() {
+        let reg = make_registry().register(Arc::new(ReadOnlyTool { name: "Alpha" }));
+        let earlier_view = reg.clone();
+        let mut reg = reg;
+        reg.set_permission_hook(Arc::new(DenyAllHook));
+        let err = earlier_view
+            .invoke("Alpha", serde_json::json!({}))
+            .await
+            .expect_err("the shared hook must deny the call");
+        assert!(
+            matches!(err, crate::error::Error::PermissionDenied { .. }),
+            "{err:?}"
+        );
     }
 
     // ── with_policy / policy ──────────────────────────────────────────────────

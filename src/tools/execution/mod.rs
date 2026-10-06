@@ -10,6 +10,7 @@
 //! - [`shell`] — `Bash` (`RunShell`), routed through the [`ToolTransport`]
 //!   abstraction (`crate::tools::transport_layer::transport`).
 //! - [`glob`] — `Glob` (pattern-based file listing).
+//! - [`run_code`] — `RunCode` (programmatic tool calling, issue #134).
 //!
 //! `src/tools/mod.rs` keeps `pub use` re-exports so existing paths
 //! (`crate::tools::shell`, …) keep resolving.
@@ -17,4 +18,5 @@
 pub mod edit;
 pub mod fs;
 pub mod glob;
+pub mod run_code;
 pub mod shell;

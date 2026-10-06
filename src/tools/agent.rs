@@ -610,6 +610,19 @@ impl AgentTool {
             reg = reg.register(tool);
         }
         reg.retain_tools(tool_names);
+        // Issue #134: `RunCode` carries the registry a program may call, and
+        // the instance inherited above holds the PARENT's registry — a program
+        // would reach tools outside this worker's `allowed_tools`. Rebuild it
+        // over the restricted registry (no-op when the worker was not given
+        // `RunCode`; `binding_names` excludes `RunCode` itself, so a program
+        // can never recurse).
+        if reg
+            .find_by_name(crate::tools::run_code::RUN_CODE_TOOL_NAME)
+            .is_some()
+        {
+            let restricted = reg.clone();
+            reg = reg.register(Arc::new(crate::tools::run_code::RunCode::new(restricted)));
+        }
         reg
     }
 
@@ -1635,8 +1648,8 @@ mod tests {
     use crate::event::{AgentEvent, NullSink};
     use crate::llm::{Completion, MockProvider};
     use crate::tools::{
-        ChangeLedgerTool, GlobTool, LocalTransport, PresentTool, ReadFile, SearchFiles,
-        ToolTransport, WebFetch, WriteFile,
+        run_code::RunCode, ChangeLedgerTool, GlobTool, LocalTransport, PresentTool, ReadFile,
+        SearchFiles, ToolTransport, WebFetch, WriteFile,
     };
 
     fn mock_provider(script: Vec<Completion>) -> Arc<dyn ChatProvider> {
@@ -2993,5 +3006,48 @@ allowed_tools:
             .await
             .unwrap();
         assert!(result.contains("done"));
+    }
+
+    /// Issue #134 review: `RunCode` carries the registry a program may call,
+    /// so a manifest that *explicitly* lists it must not hand the worker the
+    /// PARENT's instance — a program would then reach tools outside the
+    /// worker's `allowed_tools`. The worker gets a rebuild over its own
+    /// registry; without the entry it gets no `RunCode` at all.
+    #[tokio::test]
+    async fn a_worker_given_run_code_gets_its_own_binding_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let parent =
+            full_tool_registry(&ws).register(Arc::new(RunCode::new(full_tool_registry(&ws))));
+        let parent_view = parent.clone();
+        let agent = AgentTool::new(&ws, mock_provider(vec![]), parent, 2, 0, None);
+
+        let sub = agent.build_sub_registry(&["Read".to_string(), "RunCode".to_string()]);
+        let run_code = sub
+            .find_by_name("RunCode")
+            .expect("an explicit allow-list entry keeps RunCode");
+        assert!(
+            !Arc::ptr_eq(
+                &run_code,
+                &parent_view
+                    .find_by_name("RunCode")
+                    .expect("the parent has a RunCode")
+            ),
+            "the worker must not share the parent's RunCode instance"
+        );
+        let description = run_code.spec().description;
+        let available = description
+            .split("Available bindings: ")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(available.starts_with("Read"), "{description}");
+        assert!(
+            !available.contains("Write") && !available.contains("WebFetch"),
+            "a program must only reach the worker's allow-list: {description}"
+        );
+
+        let plain = agent.build_sub_registry(&["Read".to_string()]);
+        assert!(plain.find_by_name("RunCode").is_none());
     }
 }

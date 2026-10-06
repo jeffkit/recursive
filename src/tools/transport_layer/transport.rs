@@ -302,6 +302,19 @@ pub trait ToolTransport: Send + Sync + std::fmt::Debug {
         EnvironmentCapabilities::local()
     }
 
+    /// Whether this transport executes **on the same machine as the agent
+    /// process**. Fail-closed by default: `false` means "commands run
+    /// somewhere else — or this implementation has not said" (container,
+    /// microVM, SSH). Only [`LocalTransport`] returns `true`.
+    ///
+    /// A tool that cannot route its work through the transport — because it
+    /// spawns a process of its own, e.g. `run_code`'s JavaScript runtime —
+    /// MUST be gated on this. Registering one for a non-host transport would
+    /// execute model-authored code on the host, outside the sandbox.
+    fn executes_on_host(&self) -> bool {
+        false
+    }
+
     /// Destroy this environment (terminal, idempotent reclamation).
     ///
     /// Called by session teardown paths (delete / idle eviction / shutdown)
@@ -798,6 +811,12 @@ pub(crate) fn scrub_child_env(cmd: &mut Command) {
 
 #[async_trait]
 impl ToolTransport for LocalTransport {
+    /// The one transport whose commands run in this process's own
+    /// environment — the only tier where a host-spawning tool is honest.
+    fn executes_on_host(&self) -> bool {
+        true
+    }
+
     async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         tokio::fs::read(path).await
     }
@@ -1307,6 +1326,22 @@ mod tests {
         // Test doubles that don't opt in keep working (Goal 400 requirement).
         let caps = BareTransport(LocalTransport).capabilities();
         assert_eq!(caps, EnvironmentCapabilities::local());
+    }
+
+    /// Issue #134: host execution is opt-in and fail-closed. Only the local
+    /// tier may permit a tool that spawns a process of its own (`run_code`);
+    /// everything else — container, microVM, SSH, or a transport that simply
+    /// has not said — is treated as sandboxed.
+    #[test]
+    fn host_execution_is_opt_in_and_fail_closed() {
+        assert!(
+            LocalTransport.executes_on_host(),
+            "the local tier runs commands in this process's environment"
+        );
+        assert!(
+            !BareTransport(LocalTransport).executes_on_host(),
+            "a transport that has not opted in must not be treated as the host"
+        );
     }
 
     #[test]

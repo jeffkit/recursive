@@ -41,6 +41,11 @@ pub struct AgentRuntimeBuilder {
     /// callers must leave this `false` (the default) — the tools simply do not
     /// exist in the registry, so the model cannot invoke them.
     with_plan_mode_tools: bool,
+    /// Issue #134: when `true`, register the `run_code` tool (programmatic
+    /// tool calling). Off by default — it executes model-authored code in a
+    /// subprocess, so it is opted into through the preset tier
+    /// ([`crate::preset::ToolProfile::run_code`] / `RECURSIVE_RUN_CODE`).
+    with_run_code: bool,
     /// Goal-291: goal-evaluator judge tail-window size. Default 12.
     goal_eval_transcript_tail: usize,
     /// Goal-318: skills passed through to AgentKernel for Globs-mode injection.
@@ -111,6 +116,7 @@ impl AgentRuntimeBuilder {
             compactor: None,
             microcompactor: None,
             with_plan_mode_tools: false,
+            with_run_code: false,
             goal_eval_transcript_tail: 12,
             skills: Vec::new(),
             prompt_segments: None,
@@ -148,6 +154,17 @@ impl AgentRuntimeBuilder {
     /// the tools block indefinitely waiting for `confirm_plan()`.
     pub fn with_plan_mode_tools(mut self, enabled: bool) -> Self {
         self.with_plan_mode_tools = enabled;
+        self
+    }
+
+    /// Issue #134: register the `run_code` tool (programmatic tool calling).
+    ///
+    /// `run_code` executes a model-authored program in a fresh runtime
+    /// subprocess, so it is off by default and only the preset tier
+    /// ([`crate::preset::ToolProfile::run_code`], overridable with
+    /// `RECURSIVE_RUN_CODE`) turns it on.
+    pub fn with_run_code(mut self, enabled: bool) -> Self {
+        self.with_run_code = enabled;
         self
     }
 
@@ -281,6 +298,12 @@ impl AgentRuntimeBuilder {
     #[cfg(test)]
     pub(crate) fn tool_allow_for_test(&self) -> Option<&[String]> {
         self.tool_allow.as_deref()
+    }
+
+    /// Inspect whether a builder chain asked for `run_code` (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_run_code_for_test(&self) -> bool {
+        self.with_run_code
     }
 
     /// Issue #127: stamp the agent preset this session is assembled from.
@@ -585,6 +608,44 @@ impl AgentRuntimeBuilder {
                 )));
         }
 
+        // Issue #134: `run_code` (programmatic tool calling). Like the
+        // plan-mode tools it may only ADD to a surface that was never
+        // explicitly filtered (issue #65).
+        //
+        // Two conditions beyond the preset opt-in:
+        //
+        // - the runtime spawns a *host* Node process, so it may only be
+        //   registered for a host-bound transport. On the container / microVM
+        //   tiers the transport runs elsewhere and `run_code` would be a
+        //   sandbox bypass (see `ToolTransport::executes_on_host`).
+        //
+        //   The `policy` tier is host-bound too (`LocalTransport`), so this
+        //   gate does NOT exclude it: there the L1 policy is enforced by the
+        //   tools that query it, i.e. over the program's *tool calls*, not
+        //   over the program's own fs/network use — an opted-in program is a
+        //   full host process. The preset opt-in is the real gate for that
+        //   tier;
+        // - the invoker registry is a *shared view* of the session registry
+        //   (`clone()` shares every session-scoped Arc — the read-before-edit
+        //   guard, the touched-files collector, the deliverables ledger, the
+        //   permission-hook slot), so a program's `Read` satisfies the
+        //   session's `Edit` and its files land in the session's turn ledger.
+        if self.with_run_code && !kernel.tools().surface_filtered() {
+            if kernel.tools().transport().executes_on_host() {
+                let invoker_registry = kernel.tools().clone();
+                kernel
+                    .tools_mut()
+                    .register_mut(Arc::new(crate::tools::run_code::RunCode::new(
+                        invoker_registry,
+                    )));
+            } else {
+                tracing::warn!(
+                    "run_code: not registered — it executes model-authored code in a host \
+                     subprocess, which this session's sandboxed transport does not allow"
+                );
+            }
+        }
+
         // Goal-340: plan/todo re-injector shares the same todo_list and
         // plan_approval_gate arcs already constructed above.
         let plan_todo_reinjector = Some(crate::compact::PlanTodoReinjector::new(
@@ -644,9 +705,62 @@ mod tests {
     use super::*;
     use crate::llm::MockProvider;
     use crate::message::Role;
+    use crate::tools::{DirEntry, ExecResult, LocalTransport, ToolTransport};
 
     fn mock_llm() -> Arc<dyn ChatProvider> {
         Arc::new(MockProvider::new(vec![]))
+    }
+
+    /// Behaves exactly like [`LocalTransport`] but reports itself as
+    /// sandboxed — the cheapest way to exercise the host-execution gate
+    /// without a live container.
+    #[derive(Debug)]
+    struct SandboxTransport(LocalTransport);
+
+    #[async_trait::async_trait]
+    impl ToolTransport for SandboxTransport {
+        fn executes_on_host(&self) -> bool {
+            false
+        }
+
+        async fn read_file(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            self.0.read_file(path).await
+        }
+
+        async fn write_file(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+            self.0.write_file(path, contents).await
+        }
+
+        async fn list_dir(&self, path: &std::path::Path) -> std::io::Result<Vec<DirEntry>> {
+            self.0.list_dir(path).await
+        }
+
+        async fn create_dir_all(&self, path: &std::path::Path) -> std::io::Result<()> {
+            self.0.create_dir_all(path).await
+        }
+
+        async fn exec_shell(
+            &self,
+            command: &str,
+            cwd: &std::path::Path,
+            env: &[(String, String)],
+            timeout: std::time::Duration,
+            max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            self.0
+                .exec_shell(command, cwd, env, timeout, max_output_bytes)
+                .await
+        }
+    }
+
+    /// Whether a `node` runtime is reachable — the cross-boundary test below
+    /// needs one; it skips (loudly) when the image has none.
+    fn node_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
     }
 
     /// Goal 396: minimal fake backend that only records its own identity —
@@ -833,5 +947,133 @@ mod tests {
             Arc::ptr_eq(&store, &rt.kernel().session_store),
             "kernel.session_store must be the exact Arc passed to the builder"
         );
+    }
+
+    /// Issue #134 review: `run_code` executes model-authored code in a *host*
+    /// subprocess, so it may only exist for a host-bound transport. On a
+    /// sandboxed transport (container / microVM / SSH) registering it would
+    /// hand the model a way around the sandbox.
+    #[test]
+    fn run_code_is_only_registered_on_a_host_transport() {
+        let host = crate::tools::ToolRegistry::local();
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(host)
+            .with_run_code(true)
+            .build()
+            .expect("host build must succeed");
+        assert!(
+            rt.kernel().tools().find_by_name("RunCode").is_some(),
+            "a host transport must get run_code"
+        );
+
+        let sandboxed = crate::tools::ToolRegistry::new(Arc::new(SandboxTransport(LocalTransport)));
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(sandboxed)
+            .with_run_code(true)
+            .build()
+            .expect("sandboxed build must succeed");
+        assert!(
+            rt.kernel().tools().find_by_name("RunCode").is_none(),
+            "a sandboxed transport must NOT get a host-executing tool"
+        );
+
+        // Off by default: without the preset opt-in nothing is registered.
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(crate::tools::ToolRegistry::local())
+            .build()
+            .expect("default build must succeed");
+        assert!(rt.kernel().tools().find_by_name("RunCode").is_none());
+    }
+
+    /// Issue #134 review: like the plan-mode tools, `run_code` may only ADD
+    /// to a surface that was never explicitly filtered (issue #65).
+    #[test]
+    fn run_code_respects_an_explicit_tool_surface() {
+        let mut filtered = crate::tools::build_standard_tools(std::path::Path::new("."), &[], 30);
+        filtered.retain_tools(&["Read".to_string()]);
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(filtered)
+            .with_run_code(true)
+            .build()
+            .expect("build() with a filtered registry must succeed");
+        assert!(
+            rt.kernel().tools().find_by_name("RunCode").is_none(),
+            "an allow-list must not be widened by the preset"
+        );
+    }
+
+    /// Issue #134 review: a program's tool calls must participate in the
+    /// SESSION's read-before-edit guard — `run_code`'s invoker registry is a
+    /// shared `clone` of the session registry, not a `fork_session` snapshot.
+    /// With a fork, the program's `Edit` on a file the session read would be
+    /// rejected ("has not been read yet") and the session's own `Edit` would
+    /// not see the program's `Read`.
+    #[tokio::test]
+    async fn run_code_shares_the_session_read_guard_both_ways() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "hello\n").expect("seed a.txt");
+        std::fs::write(&b, "world\n").expect("seed b.txt");
+
+        let tools = crate::tools::build_standard_tools(dir.path(), &[], 30);
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(tools)
+            .with_run_code(true)
+            .build()
+            .expect("build must succeed");
+        let session = rt.kernel().tools();
+
+        // Direction 1: the session reads `a.txt`, the program edits it.
+        session
+            .invoke("Read", serde_json::json!({"path": a.to_string_lossy()}))
+            .await
+            .expect("session Read must succeed");
+        let code = format!(
+            "await Edit({{ file_path: {path:?}, old_string: \"hello\", new_string: \"goodbye\" }}); \
+             return \"edited\";",
+            path = a.to_string_lossy()
+        );
+        let out = session
+            .invoke("RunCode", serde_json::json!({"code": code}))
+            .await
+            .expect("RunCode must succeed");
+        assert!(out.contains("status=ok"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("read a.txt"),
+            "goodbye\n"
+        );
+
+        // Direction 2: the program reads `b.txt`, the session edits it.
+        let code = format!(
+            "await Read({{ path: {path:?} }}); return \"read\";",
+            path = b.to_string_lossy()
+        );
+        let out = session
+            .invoke("RunCode", serde_json::json!({"code": code}))
+            .await
+            .expect("RunCode must succeed");
+        assert!(out.contains("status=ok"), "{out}");
+        session
+            .invoke(
+                "Edit",
+                serde_json::json!({
+                    "file_path": b.to_string_lossy(),
+                    "old_string": "world",
+                    "new_string": "there"
+                }),
+            )
+            .await
+            .expect("session Edit must see the program's Read");
+        assert_eq!(std::fs::read_to_string(&b).expect("read b.txt"), "there\n");
     }
 }

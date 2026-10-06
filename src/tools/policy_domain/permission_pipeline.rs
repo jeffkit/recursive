@@ -184,7 +184,7 @@ impl<'a> PermissionPipeline<'a> {
 
             // Phase 5: hook delegation (non-headless + interactive + Unknown).
             if perm_is_unknown && !self.registry.headless && is_interactive_tool {
-                if let Some(hook) = &self.registry.permission_hook {
+                if let Some(hook) = self.registry.permission_hook() {
                     drop(guard);
                     match hook.check(tool_name, &arguments).await {
                         PermissionDecision::Deny(reason) => {

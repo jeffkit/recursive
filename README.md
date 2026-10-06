@@ -376,6 +376,7 @@ curl -X POST http://localhost:3000/sessions/$SESSION/run \
 | `RECURSIVE_MAX_TRANSCRIPT_CHARS` | _(unlimited)_ | Hard transcript char cap per session (Goal 393: honored by HTTP session runtimes; the CLI also takes `--max-transcript-chars`) |
 | `RECURSIVE_REINJECT_FILES` / `RECURSIVE_REINJECT_FILE_BUDGET` | `5` / `50000` | Post-compaction re-injection of recently-read files (`0`/`off`/`false` = off). Issue #127: the CLI/TUI contract now applies to HTTP, AG-UI and trigger runs too |
 | `RECURSIVE_REINJECT_SKILLS` / `RECURSIVE_REINJECT_SKILL_BUDGET` | _(enabled)_ / `25000` | Post-compaction re-injection of invoked skills (`0`/`off`/`false` = off, a positive integer = token budget) |
+| `RECURSIVE_RUN_CODE` | _(preset: off)_ | Programmatic tool calling (`run_code`, issue #134): one program calls tools as async functions, replacing many ReAct round-trips. Off by default — it executes model-authored code in a **host** subprocess, so it is only mounted when the transport executes on the host (never on the container / microVM tiers). `0` / `off` / `false` / empty = off |
 | `RECURSIVE_AGENT_PRESET` | `standard` | Session preset (issue #127) selecting the whole assembly — prompt profile, tool profile, context management, re-injection. `GET /presets` lists the built-in presets with their capability inventory (including what is off by default); `POST /sessions` takes a per-session `preset` which `GET /sessions/:id` echoes. The variables above override the preset's declaration |
 
 Request bodies carry the per-session run budgets (issue #94): `POST /run` and

@@ -17,7 +17,10 @@ use crate::tools::Tool;
 /// Hard ceiling for the LLM-supplied `max_output_bytes` arg. Generous
 /// enough for a full `cargo build` diagnostic dump, small enough that a
 /// runaway command can't exhaust the agent's memory.
-const MAX_OUTPUT_BYTES_HARD_CAP: usize = 2 * 1024 * 1024;
+///
+/// Also the ceiling every other observation-producing tool aligns to —
+/// `run_code`'s default output budget is exactly this (issue #134).
+pub(crate) const MAX_OUTPUT_BYTES_HARD_CAP: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RunShell {

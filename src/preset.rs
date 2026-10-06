@@ -58,6 +58,10 @@ pub const REINJECT_FILE_BUDGET_ENV: &str = "RECURSIVE_REINJECT_FILE_BUDGET";
 pub const REINJECT_SKILLS_ENV: &str = "RECURSIVE_REINJECT_SKILLS";
 /// Token budget for the skill re-injection.
 pub const REINJECT_SKILL_BUDGET_ENV: &str = "RECURSIVE_REINJECT_SKILL_BUDGET";
+/// Programmatic tool calling, `run_code` (issue #134). `0`/`off`/`false` (or
+/// an empty value) = off, any other value = on, unset takes the preset
+/// declaration.
+pub const RUN_CODE_ENV: &str = "RECURSIVE_RUN_CODE";
 
 /// File re-injection defaults (mirrors [`FileReinjector`]'s).
 pub const DEFAULT_REINJECT_FILES: usize = 5;
@@ -113,6 +117,10 @@ pub struct ToolProfile {
     /// channel's full surface. Names are the LLM-facing tool names
     /// (`Read` / `Write` / …), which are also the registry keys.
     pub allow: Option<&'static [&'static str]>,
+    /// Register `run_code` (issue #134): a program that calls tools as async
+    /// functions in one step. Off by default — it executes model-authored code
+    /// in a subprocess, which an operator opts into; see `RECURSIVE_RUN_CODE`.
+    pub run_code: bool,
 }
 
 /// How the cross-turn compactor's threshold is derived.
@@ -202,8 +210,29 @@ impl AgentPreset {
         ResolvedPreset {
             id: self.id.to_string(),
             prompt: self.prompt,
-            tools: self.tools,
+            tools: self.resolve_tools(env),
             context: self.resolve_context(&config.model, env),
+        }
+    }
+
+    /// The tool profile with the environment overlaid. `RECURSIVE_RUN_CODE`
+    /// is the operator escape hatch for the one capability here that executes
+    /// model-authored code: unset takes the declaration, `0`/`off`/`false`
+    /// forces it off, anything else forces it on.
+    ///
+    /// A set-but-empty value (`RECURSIVE_RUN_CODE=` in a Dockerfile / compose
+    /// file) is OFF, matching [`parse_toggle`]'s tolerance everywhere else in
+    /// this file — the alternative silently opts a deployment into host code
+    /// execution.
+    fn resolve_tools(&self, env: &PresetEnv) -> ToolProfile {
+        let run_code = match env.run_code.as_deref().map(str::trim) {
+            None => self.tools.run_code,
+            Some("") | Some("0") | Some("off") | Some("false") => false,
+            Some(_) => true,
+        };
+        ToolProfile {
+            run_code,
+            ..self.tools
         }
     }
 
@@ -370,6 +399,8 @@ pub struct PresetEnv {
     pub reinject_file_budget: Option<String>,
     pub reinject_skills: Option<String>,
     pub reinject_skill_budget: Option<String>,
+    /// `RECURSIVE_RUN_CODE`: overrides the preset's `run_code` declaration.
+    pub run_code: Option<String>,
 }
 
 impl PresetEnv {
@@ -385,6 +416,7 @@ impl PresetEnv {
             reinject_file_budget: var(REINJECT_FILE_BUDGET_ENV),
             reinject_skills: var(REINJECT_SKILLS_ENV),
             reinject_skill_budget: var(REINJECT_SKILL_BUDGET_ENV),
+            run_code: var(RUN_CODE_ENV),
         }
     }
 }
@@ -464,6 +496,14 @@ static STANDARD_CAPABILITIES: &[Capability] = &[
                interactive channel to answer the approval prompt.",
     },
     Capability {
+        name: "programmatic-tool-calling",
+        default: CapabilityDefault::Disabled,
+        toggle: RUN_CODE_ENV,
+        note: "`run_code`: the model writes a program that calls tools as async functions, \
+               so a batch of ≥5 calls plus its aggregation costs one step instead of many. \
+               Opt-in because it executes model-authored code in a subprocess.",
+    },
+    Capability {
         name: "goal-based-skill-injection",
         default: CapabilityDefault::Enabled,
         toggle: "",
@@ -513,6 +553,7 @@ pub static STANDARD: AgentPreset = AgentPreset {
     tools: ToolProfile {
         plan_mode_tools: true,
         allow: None,
+        run_code: false,
     },
     context: ContextProfile {
         compaction: Some(CompactionMode::Auto),
@@ -815,6 +856,7 @@ pub fn apply(
 
     builder
         .with_plan_mode_tools(preset.tools.plan_mode_tools && channel.interactive)
+        .with_run_code(preset.tools.run_code)
         .with_preset_id(preset.id.clone())
 }
 
@@ -1158,6 +1200,7 @@ mod tests {
             MAX_TRANSCRIPT_CHARS_ENV,
             REINJECT_FILES_ENV,
             REINJECT_SKILLS_ENV,
+            RUN_CODE_ENV,
         ] {
             assert!(toggled.contains(&env), "{env} must appear in a row");
         }
@@ -1187,6 +1230,7 @@ mod tests {
             "transcript-char-cap",
             "subagent-delegation",
             "self-scheduling-wakeup",
+            "programmatic-tool-calling",
         ] {
             assert!(
                 disabled.contains(&expected),
@@ -1287,6 +1331,7 @@ mod tests {
             tools: ToolProfile {
                 plan_mode_tools: false,
                 allow: Some(&["Read"]),
+                run_code: true,
             },
             context: ContextProfile {
                 compaction: Some(CompactionMode::Chars(1000)),
@@ -1311,6 +1356,10 @@ mod tests {
         assert_eq!(builder.context_management_facts(), resolved.context);
         assert_eq!(builder.preset_id(), Some("lean-test-only"));
         assert!(!builder.with_plan_mode_tools_for_test());
+        assert!(
+            builder.with_run_code_for_test(),
+            "the `lean` declaration opted into run_code"
+        );
         assert_eq!(
             apply_prompt(assembled("base"), &resolved).full,
             "base\nbe terse"
@@ -1629,5 +1678,53 @@ mod tests {
         assert!(assets.read_state.is_some());
         let without = assets_from_registry(&crate::tools::ToolRegistry::default(), Vec::new());
         assert!(without.read_state.is_none());
+    }
+
+    /// Issue #134: `run_code` is mounted through the preset tier, off by
+    /// default, with the env var as the operator's escape hatch. The row must
+    /// also appear in the capability inventory (that is #127's discoverability
+    /// contract for off-by-default capabilities).
+    #[test]
+    fn run_code_is_off_by_default_and_env_overridable() {
+        let config = config_for("preset-test-model");
+        assert!(
+            !STANDARD
+                .resolve(&config, &PresetEnv::default())
+                .tools
+                .run_code,
+            "run_code must be opt-in"
+        );
+
+        let row = STANDARD
+            .capabilities
+            .iter()
+            .find(|c| c.name == "programmatic-tool-calling")
+            .expect("capability row must exist");
+        assert_eq!(row.default, CapabilityDefault::Disabled);
+        assert_eq!(row.toggle, RUN_CODE_ENV);
+
+        for on in ["1", "on", "true", "yes"] {
+            let env = PresetEnv {
+                run_code: Some(on.to_string()),
+                ..PresetEnv::default()
+            };
+            assert!(
+                STANDARD.resolve(&config, &env).tools.run_code,
+                "{on} must enable run_code"
+            );
+        }
+        // A set-but-empty value is OFF, like every other toggle in this file:
+        // `RECURSIVE_RUN_CODE=` in a Dockerfile must not opt a deployment into
+        // host code execution.
+        for off in ["0", "off", "false", "", " ", "  "] {
+            let env = PresetEnv {
+                run_code: Some(off.to_string()),
+                ..PresetEnv::default()
+            };
+            assert!(
+                !STANDARD.resolve(&config, &env).tools.run_code,
+                "{off:?} must disable run_code"
+            );
+        }
     }
 }

@@ -54,7 +54,7 @@ impl ToolRegistry {
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
         // Goal-161: runtime permission hook — checked first, before static
         // config, so the user gets the chance to allow/deny at call time.
-        let effective_args = if let Some(hook) = &self.permission_hook {
+        let effective_args = if let Some(hook) = self.permission_hook() {
             match hook.check(name, &arguments).await {
                 PermissionDecision::Allow => arguments,
                 PermissionDecision::Transform(new_args) => new_args,
