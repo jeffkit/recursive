@@ -84,6 +84,9 @@ def _node_type(n: dict) -> str:
         ("code" in ks and "language" in ks, "code"),
         ("child_flow" in ks, "child"),
         ("error" in ks and "result_type" in ks, "end"),
+        # sandbox_agent 与 agentrun 同带 agent 字段：靠 sandbox/ws_key 判别键
+        # 先行区分（沙箱变体 flow 的 type 归属）
+        ("sandbox" in ks or "ws_key" in ks, "sandbox_agent"),
         ("agent" in ks, "agentrun"),
         ("base_branch" in ks, "git_publish"),
         ("path" in ks and "content" in ks, "writefile"),
@@ -104,6 +107,8 @@ _KEY_ORDER = {
     "if": ("condition", "name", "desc", "source_line", "next", "else_next"),
     "agentrun": ("agent", "prompt", "repo", "timeout_secs", "session",
                  "next", "source_line"),
+    "sandbox_agent": ("agent", "prompt", "repo", "sandbox", "ws_key",
+                      "timeout_secs", "session", "details", "next", "source_line"),
     "child": ("input", "childFlow", "next", "source_line"),
     "git_publish": ("worktree_dir", "branch_name", "commit_message",
                     "merge_mode", "main_clone", "base_branch",
@@ -144,11 +149,11 @@ def _to_canonical(n: dict, off: int, sub_offs: dict[str, int]) -> dict:
     return out
 
 
-def canonical_ir() -> dict:
+def canonical_ir(module: str = FLOW_MODULE, flow_attr: str = "self_improve_v2") -> dict:
     """编译 self_improve_flow_v2 并产出 console 形态 IR dict（不落盘）。"""
     import importlib
-    mod = importlib.import_module(FLOW_MODULE)
-    flow_obj = getattr(mod, "self_improve_v2")
+    mod = importlib.import_module(module)
+    flow_obj = getattr(mod, flow_attr)
     md = flow_obj.model_dump(by_alias=True, mode="json")
 
     root_off = _deco_line(flow_obj.__wrapped__)
@@ -182,11 +187,19 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="不落盘；校验现有产物与重编译结果逐字节一致")
+    ap.add_argument("--module", default=FLOW_MODULE,
+                    help="flow 源模块名（默认 v2；沙箱变体传 self_improve_flow_v2_sbx）")
+    ap.add_argument("--flow-attr", default="self_improve_v2",
+                    help="模块内 @flow 函数名（默认 self_improve_v2）")
+    ap.add_argument("--out", default="",
+                    help="产物路径（默认随模块名：v2-sbx 落 self-improve-v2-sbx.plaita.json）")
     args = ap.parse_args()
 
-    text = serialize(canonical_ir())
+    out_path = Path(args.out) if args.out else (
+        OUT if args.module == FLOW_MODULE else HERE / f"{args.module.replace('_', '-')}.plaita.json")
+    text = serialize(canonical_ir(args.module, args.flow_attr))
     if args.check:
-        current = OUT.read_text(encoding="utf-8")
+        current = out_path.read_text(encoding="utf-8")
         if current != text:
             import difflib
             diff = list(difflib.unified_diff(
@@ -196,15 +209,15 @@ def main() -> int:
                              f"\n… ({len(diff)} diff lines) 产物落后源码，"
                              f"重跑 python3 {FLOW_MODULE}.py 同步\n")
             return 1
-        print(f"OK {OUT.name} 与源码逐字节一致（{len(text)} bytes）")
+        print(f"OK {out_path.name} 与源码逐字节一致（{len(text)} bytes）")
         return 0
 
-    OUT.write_text(text, encoding="utf-8")
+    out_path.write_text(text, encoding="utf-8")
     doc = json.loads(text)
     n_top = len(doc["nodes"])
     n_sub = sum(len(n.get("childFlow", {}).get("nodes", []))
                 for n in doc["nodes"] if "childFlow" in n)
-    print(f"compiled -> {OUT} ({n_top} top + {n_sub} subflow nodes, {len(text)} bytes)")
+    print(f"compiled -> {out_path} ({n_top} top + {n_sub} subflow nodes, {len(text)} bytes)")
     return 0
 
 
