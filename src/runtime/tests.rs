@@ -3125,7 +3125,7 @@ impl crate::storage::StorageBackend for FlakyStorage {
     ) -> crate::error::Result<()> {
         let failing = self
             .fail_appends
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         if failing.is_ok() {
             return Err(crate::error::Error::Storage {
                 message: "transient append failure".into(),
