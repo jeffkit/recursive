@@ -2795,7 +2795,10 @@ async fn agent_turn_span_carries_session_id() {
 /// Without the declared fields, `Span::record` is a silent no-op.
 #[test]
 fn drive_turn_creates_instrumented_correlated_span() {
-    let src = include_str!("../runtime.rs");
+    // Windows checkout 是 CRLF（git autocrlf），而 include_str! 原样嵌入文件——
+    // 多行源码断言必须先归一化行尾，否则只在 windows-latest 上挂
+    // （同 src/http/mod.rs 的 `sessions_rebind_their_own_registry_in_container_tier`）。
+    let src = include_str!("../runtime.rs").replace("\r\n", "\n");
     assert!(
         src.contains(
             r#"info_span!(

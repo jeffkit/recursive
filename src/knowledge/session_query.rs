@@ -763,13 +763,33 @@ mod tests {
 
     #[test]
     fn normalize_falls_back_to_lexical_for_missing_paths() {
-        let missing = "/definitely/does/not/exist/anywhere";
-        assert_eq!(normalize(Path::new(missing)), PathBuf::from(missing));
+        // The input has to be *platform-absolute*: a POSIX `/…` literal is
+        // rooted but drive-less on Windows, so `normalize` would join it onto
+        // the current drive (`D:\definitely\…`) instead of passing it through.
+        let (missing, with_parent, resolved) = if cfg!(windows) {
+            (
+                r"D:\definitely\does\not\exist\anywhere",
+                r"D:\definitely\does\..\elsewhere",
+                r"D:\definitely\elsewhere",
+            )
+        } else {
+            (
+                "/definitely/does/not/exist/anywhere",
+                "/definitely/does/../elsewhere",
+                "/definitely/elsewhere",
+            )
+        };
+        assert_eq!(
+            normalize(Path::new(missing)),
+            PathBuf::from(missing),
+            "a missing absolute path must be passed through lexically"
+        );
         // A `..` in a non-existent path is resolved lexically, so it cannot
         // smuggle the caller out of the workspace.
         assert_eq!(
-            normalize(Path::new("/definitely/does/../elsewhere")),
-            PathBuf::from("/definitely/elsewhere")
+            normalize(Path::new(with_parent)),
+            PathBuf::from(resolved),
+            "`..` in a missing absolute path must be resolved lexically"
         );
     }
 
