@@ -2766,7 +2766,7 @@ mod goal_396_persistence_tests {
     /// of one session still share it.
     #[tokio::test]
     async fn session_tool_registry_isolates_request_scoped_permission_hooks() {
-        let state = test_state(test_host(0), RecordingStorage::new()).await;
+        let state = test_state(test_host(0), RecordingStorage::new(), None).await;
         let base = state.tool_registry.clone();
 
         let mut first = state.session_tool_registry().await.expect("registry");

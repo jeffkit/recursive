@@ -681,6 +681,7 @@ pub static MINIMAL: AgentPreset = AgentPreset {
     tools: ToolProfile {
         plan_mode_tools: false,
         allow: Some(MINIMAL_TOOLS),
+        run_code: false,
     },
     context: ContextProfile {
         compaction: None,
