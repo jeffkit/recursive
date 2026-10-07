@@ -3205,6 +3205,17 @@ async fn run_once(
                     handle.await.ok();
                 }
             }
+            // Issue #110: the `Err` path used to skip the session envelope
+            // entirely, leaving `.meta.json` at `active` forever — a dead run
+            // indistinguishable from a live one, and resume treats it as a
+            // candidate. Finalize as `Crashed` with the provider/transport
+            // error text (same contract as `run_loop`).
+            cli::output::finalize_session_writer(
+                session_writer,
+                SessionStatus::Crashed,
+                None,
+                Some(err.to_string()),
+            );
             // Issue #115: write a cost record even for a failed run so the
             // wasted tokens are visible (`cost.json` / `.meta.json`), not
             // silently absent.

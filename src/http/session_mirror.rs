@@ -183,6 +183,8 @@ fn build_meta(input: &MirrorInput<'_>) -> SessionMeta {
         preset: input.preset.map(|s| s.to_string()),
         name: input.name.map(|s| s.to_string()),
         derived_from: None,
+        finish_reason: None,
+        error: None,
     }
 }
 

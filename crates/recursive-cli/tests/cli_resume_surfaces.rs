@@ -30,19 +30,29 @@ const OPENAI_TEXT: &str = concat!(
     r#""usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#
 );
 
-/// Minimal fake OpenAI endpoint: answers every request with a final text turn.
+/// Minimal fake OpenAI endpoint: answers every request with a final text turn,
+/// or — in `fail` mode — a 400 so the provider surfaces an error to the caller.
 struct Stub {
     addr: SocketAddr,
 }
 
 impl Stub {
     fn start() -> Self {
+        Self::start_with(false)
+    }
+
+    /// A stub whose every request is answered with an OpenAI-shaped 400.
+    fn start_failing() -> Self {
+        Self::start_with(true)
+    }
+
+    fn start_with(fail: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let addr = listener.local_addr().expect("stub addr");
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                std::thread::spawn(move || serve(stream));
+                std::thread::spawn(move || serve(stream, fail));
             }
         });
         Self { addr }
@@ -53,7 +63,7 @@ impl Stub {
     }
 }
 
-fn serve(mut stream: TcpStream) {
+fn serve(mut stream: TcpStream, fail: bool) {
     // An accepted socket inherits non-blocking mode on macOS: put it back to
     // blocking before reading the request, or the read races the client write.
     let _ = stream.set_nonblocking(false);
@@ -85,6 +95,17 @@ fn serve(mut stream: TcpStream) {
             Err(_) => break,
         }
     }
+    if fail {
+        let body = r#"{"error":{"message":"stub provider failure","type":"server_error"}}"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.flush();
+        return;
+    }
     let _ = write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -102,10 +123,14 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
+        Self::with_stub(Stub::start())
+    }
+
+    fn with_stub(stub: Stub) -> Self {
         Self {
             home: tempfile::tempdir().expect("home tempdir"),
             workspace: tempfile::tempdir().expect("workspace tempdir"),
-            stub: Stub::start(),
+            stub,
         }
     }
 
@@ -502,5 +527,38 @@ fn resume_does_not_write_session_out_after_a_clean_finish() {
     assert!(
         !session_out.exists(),
         "--session-out records *interrupted* runs only; a NoMoreToolCalls finish must not write it"
+    );
+}
+
+// ── issue #110: a failed resume still closes its session envelope ──────────
+
+/// A provider failure during `resume` must finalize the session it is
+/// appending to — `?` used to return before the finalize, so the session
+/// stayed `active` forever. The failure text must land on `.meta.json`.
+#[test]
+fn resume_finalizes_the_session_as_crashed_when_the_provider_fails() {
+    let rig = Rig::with_stub(Stub::start_failing());
+    let dir = rig.session_dir("sess-fail", &[]);
+
+    let out = rig.run(&as_refs(&resume_args(&dir, &[], &[])), None);
+    assert!(
+        !out.status.success(),
+        "a failing provider must fail the resume, got:\n{}",
+        stdout_of(&out)
+    );
+
+    let raw = std::fs::read(dir.join(".meta.json")).expect("read .meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&raw).expect(".meta.json must be valid JSON");
+    assert_eq!(
+        meta["status"], "crashed",
+        "a failed resume must close the session envelope, got: {meta}"
+    );
+    assert!(
+        meta["error"]
+            .as_str()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false),
+        "the provider failure must be carried onto the session, got: {meta}"
     );
 }

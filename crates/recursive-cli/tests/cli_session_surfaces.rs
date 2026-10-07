@@ -620,3 +620,96 @@ fn agents_separates_live_stale_and_finished_sessions() {
         "a finished, unheld session must not be listed"
     );
 }
+
+// ── issue #110: a failed run still closes its session envelope ──────────────
+
+/// The only session directory under the sessions root.
+fn find_session_dir(root: &Path) -> std::path::PathBuf {
+    for slug in std::fs::read_dir(root).expect("read sessions root") {
+        let slug = slug.expect("slug entry").path();
+        if !slug.is_dir() {
+            continue;
+        }
+        for session in std::fs::read_dir(&slug).expect("read slug dir") {
+            let session = session.expect("session entry").path();
+            if session.join(".meta.json").is_file() {
+                return session;
+            }
+        }
+    }
+    panic!("no session directory found under {}", root.display());
+}
+
+/// `recursive run` against an unreachable provider, with `globals` placed
+/// before the subcommand (e.g. an `--output-format`). The session writer is
+/// created before the first LLM call, so the failure lands inside the run.
+fn run_against_unreachable_provider(rig: &Rig, globals: &[&str]) -> Output {
+    let mut cmd = rig.cmd();
+    cmd.args(globals);
+    cmd.arg("--api-base").arg("http://127.0.0.1:1");
+    cmd.arg("--api-key").arg("sk-test-key");
+    cmd.arg("--model").arg("test-model");
+    cmd.arg("--provider").arg("openai");
+    cmd.args(["run", "do", "something"]);
+    cmd.output().expect("spawn recursive")
+}
+
+/// Assert the only session under the root closed as `crashed` with the error
+/// text on `.meta.json`.
+fn assert_session_crashed_with_error(rig: &Rig) -> std::path::PathBuf {
+    let dir = find_session_dir(rig.sessions_root());
+    let raw = std::fs::read(dir.join(".meta.json")).expect("read .meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&raw).expect(".meta.json must be valid JSON");
+    assert_eq!(
+        meta["status"], "crashed",
+        "a failed run must close its session envelope, got: {meta}"
+    );
+    assert!(
+        meta["error"]
+            .as_str()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false),
+        "the failure text must be carried onto the session, got: {meta}"
+    );
+    dir
+}
+
+/// A provider failure inside `run` must leave a *closed* session — status
+/// `crashed` plus the error text on `.meta.json`, and `cost.json` on disk.
+/// Before #110 the `Err` path returned before finalization, so every failed
+/// run stayed `active`: a dead session indistinguishable from a live one.
+#[test]
+fn run_finalizes_the_session_as_crashed_when_the_provider_fails() {
+    let rig = Rig::new();
+    let out = run_against_unreachable_provider(&rig, &[]);
+    assert!(
+        !out.status.success(),
+        "an unreachable provider must fail the run, got stdout:\n{}",
+        stdout_of(&out)
+    );
+
+    let dir = assert_session_crashed_with_error(&rig);
+    assert!(
+        dir.join("cost.json").is_file(),
+        "the run's spend record must still land as cost.json in {}",
+        dir.display()
+    );
+}
+
+/// The same contract in JSON mode. There the control session (and its stdin
+/// demux) holds a writer clone that outlives the runtime, so finalization
+/// must lock the shared writer instead of demanding unique ownership — the
+/// old `Arc::into_inner` path refused and left these sessions `active`.
+#[test]
+fn run_finalizes_a_json_mode_session_as_crashed_when_the_provider_fails() {
+    let rig = Rig::new();
+    let out = run_against_unreachable_provider(&rig, &["--output-format", "stream-json"]);
+    assert!(
+        !out.status.success(),
+        "an unreachable provider must fail the run, got stdout:\n{}",
+        stdout_of(&out)
+    );
+
+    assert_session_crashed_with_error(&rig);
+}

@@ -181,6 +181,15 @@ pub(crate) fn finish_to_session_status(finish: &FinishReason) -> (SessionStatus,
     SessionStatus::for_finish(finish)
 }
 
+/// Close a run's session envelope (`status` + failure detail on
+/// `.meta.json`), then report where it landed.
+///
+/// The writer is *shared*: JSON-mode runs hand a clone to the control session
+/// (and its stdin demux), which outlives the runtime. Requiring unique
+/// ownership here silently skipped every such finalize — the session stayed
+/// `active` forever (issue #110). Locking the mutex is enough: every caller
+/// drops the runtime — and thus the persistence sink — first, so no append
+/// can interleave, and the mutex serializes us against any straggler.
 pub(crate) fn finalize_session_writer(
     session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
     status: SessionStatus,
@@ -188,22 +197,21 @@ pub(crate) fn finalize_session_writer(
     error: Option<String>,
 ) {
     let Some(sw) = session_writer else { return };
-    match Arc::into_inner(sw) {
-        Some(mutex) => match mutex.lock() {
-            Ok(mut w) => {
-                if let Err(e) = w.finish_with_details(status, finish_reason, error) {
-                    eprintln!("session: failed to finalize: {e}");
-                } else {
-                    eprintln!(
-                        "session: saved {} message(s) to {}",
-                        w.message_count(),
-                        w.session_dir().display()
-                    );
-                }
-            }
-            Err(e) => eprintln!("session: failed to lock writer: {e}"),
-        },
-        None => eprintln!("session: writer still has other references; cannot finalize"),
+    let mut w = match sw.lock() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("session: failed to lock writer: {e}");
+            return;
+        }
+    };
+    if let Err(e) = w.finish_with_details(status, finish_reason, error) {
+        eprintln!("session: failed to finalize: {e}");
+    } else {
+        eprintln!(
+            "session: saved {} message(s) to {}",
+            w.message_count(),
+            w.session_dir().display()
+        );
     }
 }
 

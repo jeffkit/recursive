@@ -852,6 +852,17 @@ pub(crate) async fn run_resumed(
             if let Some(ref cs) = control_session {
                 cs.record_usage(failed_usage, 0);
             }
+            // Issue #110: the `?`-shaped error path used to skip the session
+            // envelope, leaving `.meta.json` at `active` forever. Drop the
+            // runtime first (its event sink holds a writer clone), then
+            // finalize as `Crashed` with the error text.
+            drop(runtime);
+            finalize_session_writer(
+                session_writer,
+                SessionStatus::Crashed,
+                None,
+                Some(err.to_string()),
+            );
             finalize_cost_tracker(cost_tracker, failed_usage, 0, &config.model);
             return Err(err.into());
         }
@@ -868,7 +879,24 @@ pub(crate) async fn run_resumed(
                     break;
                 }
                 if let Some(msg) = cs.pop_inbound_user() {
-                    let turn = runtime.run(msg).await?;
+                    let turn = match runtime.run(msg).await {
+                        Ok(turn) => turn,
+                        Err(err) => {
+                            // Issue #110: a mid-turn failure must still close
+                            // the session envelope.
+                            let failed_usage = runtime.last_failed_usage();
+                            cs.record_usage(failed_usage, 0);
+                            drop(runtime);
+                            finalize_session_writer(
+                                session_writer,
+                                SessionStatus::Crashed,
+                                None,
+                                Some(err.to_string()),
+                            );
+                            finalize_cost_tracker(cost_tracker, failed_usage, 0, &config.model);
+                            return Err(err.into());
+                        }
+                    };
                     cs.record_usage(turn.total_usage, turn.llm_latency_ms);
                     outcome.steps = outcome.steps.saturating_add(turn.steps);
                     outcome.total_usage = outcome.total_usage.accumulate(turn.total_usage);

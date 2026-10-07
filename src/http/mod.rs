@@ -1975,8 +1975,9 @@ fn mirror_closing_session(
     let Some(root) = mirror_root else {
         return;
     };
-    let prompt = session.prompt_tokens.load(Ordering::Relaxed);
-    let completion = session.completion_tokens.load(Ordering::Relaxed);
+    let totals = session.usage.snapshot();
+    let prompt = totals.prompt_tokens;
+    let completion = totals.completion_tokens;
     let cost = if prompt == 0 && completion == 0 {
         None
     } else {
@@ -2506,6 +2507,56 @@ mod goal_396_persistence_tests {
             usage: Arc::new(SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Issue #121 (repaired after #114): the mirror prices the closing
+    /// session from its accumulated `SessionUsage`, so a session with tokens
+    /// still lands `meta.cost` — the per-counter atomics #114 replaced.
+    #[test]
+    fn mirror_closing_session_maps_session_usage_onto_meta_cost() {
+        use crate::llm::TokenUsage;
+
+        let root = tempfile::tempdir().unwrap();
+        let session = test_session("sess-mirror-cost", 0);
+        session.usage.record(
+            TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                ..Default::default()
+            },
+            0,
+        );
+        let transcript = vec![Message {
+            role: Role::User,
+            content: "hello".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            is_compaction_summary: false,
+        }];
+        mirror_closing_session(
+            Some(root.path()),
+            std::path::Path::new("/tmp/ws"),
+            "test-model",
+            "openai",
+            &session,
+            &transcript,
+            crate::session::SessionStatus::Completed,
+        );
+
+        let dir = root
+            .path()
+            .join(crate::session::workspace_slug(std::path::Path::new(
+                "/tmp/ws",
+            )))
+            .join("sess-mirror-cost");
+        let meta = crate::session::SessionReader::load_meta(&dir).expect("mirrored meta loads");
+        let cost = meta
+            .cost
+            .expect("accumulated usage must reach the mirror's .meta.json cost");
+        assert_eq!(cost.total_input_tokens, 10);
+        assert_eq!(cost.total_output_tokens, 5);
     }
 
     /// Session host with the given idle TTL — the eviction tests need the
