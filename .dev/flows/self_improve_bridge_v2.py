@@ -164,6 +164,31 @@ def main() -> int:
         sessions_root.mkdir(parents=True, exist_ok=True)
         os.environ["RECURSIVE_SESSIONS_DIR"] = str(sessions_root)
 
+    # #83：AGENTRUN 活性检测（宿主层接线）。图内 AGENTRUN 是同步库节点、图无法
+    # 旁路轮询，守护线程只能在宿主层按调用起收——见 .dev/flows/agent_watchdog.py。
+    # RECURSIVE_STALL_SECS 显式配置才装；缺省直接返回 False，AGENTRUN 执行路径
+    # 一个字节都不动（存量行为逐字节一致）。
+    try:
+        import agent_watchdog
+        if agent_watchdog.install_agentrun_watchdog():
+            if agent_watchdog.watch_root():
+                print("[stall-watchdog] 已启用：%s=%s，观测 %s"
+                      % (agent_watchdog.STALL_ENV,
+                         os.environ.get(agent_watchdog.STALL_ENV),
+                         agent_watchdog.watch_root()),
+                      file=sys.stderr, flush=True)
+            else:
+                # 观测面为空 = 守护恒惰性（observing=False 永不触发）。run-id 非
+                # pipeline-<n>-* 时上面不设 RECURSIVE_SESSIONS_DIR——必须说出来，
+                # 否则「已启用」会被值守读成「有看门狗」。
+                print("[stall-watchdog] 已启用，但 RECURSIVE_SESSIONS_DIR 未设置"
+                      "（本 run-id 不匹配 pipeline-<n>-*）→ 观测面为空，守护恒惰性、"
+                      "永不击杀；请显式设 RECURSIVE_SESSIONS_DIR 后再启用",
+                      file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — 观测/接线失败不得吃掉 run
+        print("[stall-watchdog] 安装失败（按未启用继续）：%s: %s"
+              % (type(e).__name__, e), file=sys.stderr, flush=True)
+
     from plaita.core.flow import Flow
     from plaita.node import register_code_node
     register_code_node(default_backend="subprocess")
@@ -343,6 +368,24 @@ def main() -> int:
 
 
 # ═══ v3 本地分布式宿主（DESIGN-local-distributed-host.md v2 §2/§3/§4）═══════
+
+def _timeout_class(why: str) -> bool:
+    """失败节点的错误是否属 timeout 类（D4：不原地重试）。
+
+    两类来源，判定位置同此一处：
+    - agentproc 的墙钟超时 → 错误文本含 "timed out after"（agentproc/runner.py）；
+    - #83 宿主层活性检测击杀 → 节点错误带 `agent_watchdog.KILL_MARKER`（击杀后的
+      SIGTERM 产物是 `exited 143`，不含超时串；漏判即把「早杀换 L2 续跑」错成
+      「原地重跑一整轮预算、二次挂死再升人工」）。
+    agent_watchdog 缺席（标记无从产生）→ 只认 agentproc 的超时串。"""
+    if "timed out after" in why:
+        return True
+    try:
+        import agent_watchdog as aw
+    except Exception:                                    # noqa: BLE001
+        return False
+    return aw.is_stall_kill(why)
+
 
 def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: Path,
                 state_path: Path, max_node_retries: int = 1,
@@ -613,7 +656,7 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
                 nid = (_failed_node_id(e) or last_started["id"]
                        or ck_last or "unknown")
                 why = str(e)[:200]
-                if "timed out after" in why:                     # 超时类不重试（D4）
+                if _timeout_class(why):                          # 超时类不重试（D4）
                     raise
                 node_retries[nid] = node_retries.get(nid, 0) + 1
                 if node_retries[nid] > max_node_retries:

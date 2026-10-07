@@ -25,8 +25,10 @@
   （#144 + 2026-10-07 补齐干净路径），不过即 failed-preserved 不发布
 
 v2 与 v1 引擎的有意差异：
-- watchdog（journal 增长/后代活性）暂由 AGENTRUN timeout_secs 硬墙替代——
-  agentrun 同步执行，图内无法旁路轮询；挂起检测待 agentproc 层补
+- watchdog（转录增长/后代活性）已补在宿主层（#83）：agent_watchdog + env
+  RECURSIVE_STALL_SECS 显式启用；agentrun 同步执行，图内无法旁路轮询。
+  击杀在节点错误上打 KILL_MARKER，宿主 `run_host_v3._timeout_class` 与 agentproc
+  的 "timed out after" 同判 timeout 类（D4：不原地重试 → engine_error 保树续跑）
 - 预算续跑（BudgetExceeded replay）暂缺——agentrun 不暴露 replay，同上待补
 - 项目 gates.json 门未接（builtin 三门已够主链）；接法=赋值节点扩表
 

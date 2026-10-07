@@ -70,6 +70,37 @@ fn timeout_result(worker_id: &str) -> Error {
     }
 }
 
+/// A finished synchronous worker dispatch: the rendered text plus the reason
+/// the worker's runtime stopped.
+///
+/// `execute_single` needs the reason, not just the text: the dispatch's
+/// aggregate deadline and the worker runtime's own wall-clock budget are
+/// derived from the same configured value, so which timer fires first is a
+/// scheduling race under load. Whenever the worker's own runtime reports a
+/// cut-off, single mode surfaces its report as the `Err` — same `Err` outcome
+/// as the aggregate branch, so the cut-off does not depend on the race.
+struct WorkerReport {
+    text: String,
+    finish_reason: FinishReason,
+}
+
+/// Return value of a single-worker dispatch: a worker-runtime cut-off becomes
+/// the same `Err` the aggregate branch produces (whichever timer fired first
+/// must not change the shape), and its message is the worker's own report —
+/// which names the reason and carries the worker's text/artifact reference,
+/// unlike the aggregate placeholder.
+fn single_worker_result(report: WorkerReport) -> Result<String> {
+    match report.finish_reason {
+        FinishReason::WallClockExceeded { .. } | FinishReason::Cancelled => {
+            Err(Error::BadToolArgs {
+                name: "agent".into(),
+                message: report.text,
+            })
+        }
+        _ => Ok(report.text),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SharedMemoryRead
 // ---------------------------------------------------------------------------
@@ -767,7 +798,8 @@ impl AgentTool {
         })
     }
 
-    /// Run a single worker synchronously and return its final text.
+    /// Run a single worker synchronously and return its report (rendered text
+    /// plus why the runtime stopped).
     ///
     /// The worker runs exactly one turn (the initial prompt) on a fresh
     /// runtime; it is NOT registered for continuation. Use
@@ -779,7 +811,7 @@ impl AgentTool {
         prompt: &str,
         max_steps: usize,
         child_depth: usize,
-    ) -> Result<String> {
+    ) -> Result<WorkerReport> {
         // Snapshot the mailbox this worker was pre-registered with (parallel
         // mode) and flag it done however this call ends — every return path,
         // including the `?` on a runtime-build failure and the cut-off
@@ -803,10 +835,10 @@ impl AgentTool {
         // Issue #119: bill the worker's spend to the parent turn.
         self.record_worker_usage(&outcome);
 
-        let finish_label = match outcome.finish_reason {
+        let finish_label = match &outcome.finish_reason {
             FinishReason::NoMoreToolCalls => "NoMoreToolCalls".to_string(),
             FinishReason::BudgetExceeded => "BudgetExceeded".to_string(),
-            FinishReason::ProviderStop(r) => r,
+            FinishReason::ProviderStop(r) => r.clone(),
             FinishReason::Stuck { .. } => "Stuck".to_string(),
             FinishReason::TranscriptLimit { .. } => "TranscriptLimit".to_string(),
             FinishReason::Cancelled => "Cancelled".to_string(),
@@ -828,10 +860,13 @@ impl AgentTool {
                 .await
             {
                 Ok(meta) => {
-                    return Ok(format!(
-                        "[worker '{worker_id}' finished: {finish_label}]\n{}",
-                        artifact_reference_text(&meta, &final_text)
-                    ));
+                    return Ok(WorkerReport {
+                        text: format!(
+                            "[worker '{worker_id}' finished: {finish_label}]\n{}",
+                            artifact_reference_text(&meta, &final_text)
+                        ),
+                        finish_reason: outcome.finish_reason,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -842,9 +877,10 @@ impl AgentTool {
             }
         }
 
-        Ok(format!(
-            "[worker '{worker_id}' finished: {finish_label}]\n{final_text}"
-        ))
+        Ok(WorkerReport {
+            text: format!("[worker '{worker_id}' finished: {finish_label}]\n{final_text}"),
+            finish_reason: outcome.finish_reason,
+        })
     }
 
     /// Spawn a worker into a background tokio task that drains an mpsc channel
@@ -1023,7 +1059,10 @@ impl AgentTool {
                 t.cancel();
             }
         }
-        result
+        match result {
+            Ok(report) => single_worker_result(report),
+            Err(e) => Err(e),
+        }
     }
 
     /// Parallel mode: all workers run concurrently via `futures_util::future::join_all`.
@@ -1144,9 +1183,10 @@ impl AgentTool {
                 };
                 let result = agent
                     .run_worker(&worker_id, &entry, &prompt, max_steps, child_depth)
-                    .await;
+                    .await
+                    .map(|report| report.text);
                 let entry = match &result {
-                    Ok(t) => Ok(t.clone()),
+                    Ok(text) => Ok(text.clone()),
                     Err(e) => Err(e.to_string()),
                 };
                 rescued
@@ -1338,7 +1378,7 @@ impl AgentTool {
                 result_parts.push(timeout_result(worker_id).to_string());
                 break;
             }
-            result_parts.push(result?);
+            result_parts.push(result?.text);
         }
 
         Ok(result_parts.join("\n\n"))
@@ -2724,6 +2764,41 @@ allowed_tools:
         // not an Err — matching parallel-mode semantics.
         let out = result.expect("timed-out sequential dispatch returns labelled parts");
         assert!(out.contains("WallClockExceeded"), "got: {out}");
+    }
+
+    /// Single mode cut-offs (issue #47②) must not leak *which* of the two
+    /// same-budget timers fired first into the result shape, and the message
+    /// must be the worker's own report — the aggregate placeholder
+    /// ("aggregate deadline; worker did not finish") used to be reused here
+    /// while the worker's text/artifact reference was dropped.
+    #[test]
+    fn single_worker_cutoffs_are_errors_carrying_the_worker_report() {
+        let cut_off = WorkerReport {
+            text: "[worker 'w0' finished: WallClockExceeded]\n(no final message)".to_string(),
+            finish_reason: FinishReason::WallClockExceeded { secs: 1 },
+        };
+        let err = single_worker_result(cut_off).expect_err("wall-clock cut-off must be an Err");
+        assert!(err.to_string().contains("WallClockExceeded"), "got: {err}");
+        assert!(
+            !err.to_string().contains("aggregate deadline"),
+            "the worker's own report is the message, not the aggregate placeholder: {err}"
+        );
+
+        let cancelled = WorkerReport {
+            text: "[worker 'w0' finished: Cancelled]\n(no final message)".to_string(),
+            finish_reason: FinishReason::Cancelled,
+        };
+        let err = single_worker_result(cancelled).expect_err("cancellation must be an Err");
+        assert!(err.to_string().contains("Cancelled"), "got: {err}");
+
+        let finished = WorkerReport {
+            text: "[worker 'w0' finished: NoMoreToolCalls]\ndone".to_string(),
+            finish_reason: FinishReason::NoMoreToolCalls,
+        };
+        assert_eq!(
+            single_worker_result(finished).expect("a normal finish is the worker's text"),
+            "[worker 'w0' finished: NoMoreToolCalls]\ndone"
+        );
     }
 
     /// Test helper (issue #47): an AgentTool whose provider never returns —

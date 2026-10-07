@@ -450,6 +450,38 @@ Operational notes:
   stuck). The keeper-side run budget (`pipeline_timeout_secs`, default 8h in
   production config) remains the outer wall; the v3 host winds down
   gracefully 300s before it via the injected `RECURSIVE_RUN_DEADLINE`.
+- **Stall liveness for AGENTRUN (optional)**: `RECURSIVE_STALL_SECS`
+  (seconds; **unset = disabled**) adds an early kill *inside* the AGENTRUN
+  nodes' flat wall — `.dev/flows/agent_watchdog.py`. The flat `timeout_secs`
+  wall (per node) and `RECURSIVE_IMPL_TIMEOUT` stay the outer bounds; this
+  only decides **when a stuck impl dies early**. When the run's session
+  transcript (`$RECURSIVE_SESSIONS_DIR/**/transcript.jsonl`) has not grown for
+  that long AND the `recursive` agent process under the run's worktree has no
+  living descendants (a long gate/compile legitimately produces no transcript
+  turn — g349), the host SIGTERMs it. Kill semantics are timeout-class, and
+  that is enforced at one classification point: the wrapper re-raises the
+  AGENTRUN failure tagged with `agent_watchdog.KILL_MARKER`, and
+  `run_host_v3._timeout_class` treats that marker like agentproc's own
+  `timed out after` (D4: no in-place retry). The kill therefore ends the run
+  `engine_error` with the checkpoint/worktree exemption kept, so keeper
+  re-dispatch resumes the session (L2) instead of redoing a full budget —
+  the SIGTERM's own `executor 'recursive' exited 143` text would otherwise be
+  read as an ordinary node failure and retried in place. A growing transcript
+  is never killed early — 10-03's 566-turn impl runs out its full budget.
+  Pick it above the longest legitimate quiet stretch (one slow LLM
+  round-trip, or a long gate with no transcript turn); 600 (= the JS flow
+  watchdog's 10 min `RECURSIVE_WATCHDOG_IDLE_MS` default) is the calibrated
+  analogue. Wiring: the v2 graph's AGENTRUN is a synchronous library node, so
+  the guard lives in the host layer — `self_improve_bridge_v2.main()` wraps
+  `plaita_nodes.AgentRunNode.execute` before starting the flow and logs the
+  scene to `<run_dir>/stall-kill.log` (mirrors preflight's `kill-stale.log`).
+  Two no-op guards to know about: an AGENTRUN whose worktree cannot be
+  resolved is left unwrapped (process ownership unknowable — never kill), and
+  if `RECURSIVE_SESSIONS_DIR` is unset the observation surface is empty, so
+  the guard can never fire and the install line says so (run-ids outside
+  `pipeline-<n>-*` never get it set). Boundary: console-dispatched runs
+  execute the published definition on the console worker, where the local
+  host's install does not apply.
 - **Known window (console dispatch mode only)**: if the POST
   /api/executions times out after the server committed, keeper's re-dispatch
   creates a second execution (the in-flight anchor is written after the POST

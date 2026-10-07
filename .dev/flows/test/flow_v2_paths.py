@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1221,6 +1222,307 @@ def s29_v3_恢复轮刷新agent_reviewer():
     assert not (run_new / "worktree").exists(), "不应走 L1 在新 run_dir 重建 worktree"
 
 
+# ═══ #83 AGENTRUN 活性检测（转录停更早杀 / 持续增长不误杀 / 缺省零变化）═══
+
+def _stall_fixture():
+    """活性检测场景公共装配：(tmp, worktree, transcript, sessions_root)。
+
+    会话存储形态照生产（`<root>/<slug>/<sid>/transcript.jsonl`，见
+    self_improve_flow_v2 preflight 的 L2 检索与 bridge main() 的
+    RECURSIVE_SESSIONS_DIR）。"""
+    tmp = Path(tempfile.mkdtemp(prefix="flowv2t-stall-"))
+    wt = tmp / "worktree"
+    wt.mkdir()
+    sess = tmp / "sessions" / "slug" / "sid"
+    sess.mkdir(parents=True)
+    tp = sess / "transcript.jsonl"
+    tp.write_text("x" * 512 + "\n")
+    return tmp, wt, tp, tmp / "sessions"
+
+
+def _kill_quietly(proc) -> None:
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def s37_活性检测_转录停更_提前击杀():
+    """#83 验收①：显式配置 RECURSIVE_STALL_SECS 后，转录停更 + 无活跃子进程 →
+    提前 SIGTERM 击杀（真 ps 匹配 + 真信号；假 agent 以 recursive argv 形态挂起）。
+
+    修复前红：agent_watchdog 模块不存在（ImportError）。"""
+    import agent_watchdog as aw
+    tmp, wt, tp, sessions_root = _stall_fixture()
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    agent = _spawn_fake_agent(bindir, "--workspace", str(wt),
+                              "--output-format", "json", "run", "stub")
+    try:
+        time.sleep(0.5)
+        wd = aw.StallWatchdog(
+            worktree=str(wt),
+            paths=lambda: aw.transcript_paths(sessions_root),
+            stall_secs=1.0, poll_secs=0.2,
+            kill_log=tmp / "stall-kill.log")
+        t0 = time.time()
+        wd.start()
+        deadline = t0 + 20
+        while agent.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        elapsed = time.time() - t0
+        wd.stop()
+        assert agent.poll() is not None, "转录停更 + 无子进程 应触发提前击杀"
+        assert elapsed < 15, f"应在 stall 阈值附近击杀，实际 {elapsed:.1f}s（预算远大于此）"
+        assert wd.reason == "no-growth-hung", f"击杀理由: {wd.reason!r}"
+        log = tmp / "stall-kill.log"
+        assert log.exists() and "no-growth-hung" in log.read_text(), "击杀必须留痕"
+    finally:
+        _kill_quietly(agent)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def s38_活性检测_转录持续增长_跑满预算不误杀():
+    """#83 验收①反面：转录持续增长（agent 真在推进）→ 不出手，跑满预算。
+
+    阈值取得远小于「预算」，只要转录在长就不许击杀。"""
+    import agent_watchdog as aw
+    tmp, wt, tp, sessions_root = _stall_fixture()
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    agent = _spawn_fake_agent(bindir, "--workspace", str(wt), "run", "stub")
+    stop = threading.Event()
+
+    def _grow():
+        while not stop.wait(0.2):
+            with open(tp, "a") as fh:
+                fh.write("y" * 256 + "\n")
+
+    try:
+        time.sleep(0.5)
+        wd = aw.StallWatchdog(
+            worktree=str(wt),
+            paths=lambda: aw.transcript_paths(sessions_root),
+            stall_secs=0.6, poll_secs=0.2,
+            kill_log=tmp / "stall-kill.log")
+        t0 = time.time()
+        wd.start()
+        grower = threading.Thread(target=_grow, daemon=True)
+        grower.start()
+        while time.time() - t0 < 2.4:          # 4 倍 stall 阈值 ≈ 一圈「预算」
+            time.sleep(0.05)
+        fired = wd.reason
+        wd.stop()
+        stop.set()
+        grower.join(timeout=2)
+        assert fired is None, f"转录在增长不得击杀: {fired!r}"
+        assert agent.poll() is None, "agent 应仍存活（未被误杀）"
+        assert not (tmp / "stall-kill.log").exists(), "未触发不得留击杀痕迹"
+        assert tp.stat().st_size > 512, "fixture 自检：转录确实在增长"
+    finally:
+        _kill_quietly(agent)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def s39_活性检测_缺省关闭_不动AGENTRUN():
+    """#83 验收②：未配 RECURSIVE_STALL_SECS → 不装任何包装，AGENTRUN 执行路径
+    原样（缺省行为与现状逐字节一致）；显式配置 → 装且幂等。"""
+    import agent_watchdog as aw
+    import plaita_nodes.agent_run as ar
+    env = {k: v for k, v in os.environ.items()}
+    env.pop(aw.STALL_ENV, None)
+    before = ar.AgentRunNode.execute
+    assert aw.stall_secs_from_env(env) == 0
+    assert aw.install_agentrun_watchdog(env=env, node_cls=ar.AgentRunNode) is False
+    assert ar.AgentRunNode.execute is before, "缺省不得改动 AGENTRUN 执行路径"
+    env[aw.STALL_ENV] = "1"
+    try:
+        assert aw.install_agentrun_watchdog(env=env, node_cls=ar.AgentRunNode) is True
+        wrapped = ar.AgentRunNode.execute
+        assert wrapped is not before, "显式配置应包一层"
+        assert getattr(wrapped, "_stall_watchdog", False), "包装须带标记（幂等判据）"
+        assert aw.install_agentrun_watchdog(env=env, node_cls=ar.AgentRunNode) is True
+        assert ar.AgentRunNode.execute is wrapped, "重复安装应幂等"
+    finally:
+        ar.AgentRunNode.execute = before        # 后续场景仍吃 harness 桩
+
+
+def s40_活性检测_判据表_ps解析与停更决策():
+    """#83：判据纯函数表（ps 解析 / 本 worktree 匹配 / 后代活性 / 停更决策）。
+
+    离线可判，不依赖真进程——真链路（ps+SIGTERM）由 s37/s38 覆盖。"""
+    import agent_watchdog as aw
+    procs = aw.parse_ps(
+        "  10   1   1 /usr/local/bin/recursive --workspace /wt/worktree run x\n"
+        "  11  10  10 sh -c cargo test\n"
+        "  12   1   1 /usr/local/bin/recursive --workspace /elsewhere/wt run y\n"
+        "  13   1   1 tail -f /var/log/system.log\n"
+        "not-a-ps-line\n")
+    assert len(procs) == 4, procs
+    assert aw.agent_pids(procs, "/wt/worktree") == [10], "只认本 worktree 的 agent"
+    assert aw.agent_pids(procs, "/elsewhere/wt") == [12], "兄弟 run 各认各的（#94）"
+    assert aw.agent_pids(procs, "/nowhere") == [], "无主的 recursive（无 workspace）不认"
+    assert aw.agent_pids(procs, "") == [], \
+        "worktree 求值不出来时不得按 abspath(\"\")=宿主 cwd 认亲（#94 误杀面）"
+    assert aw.has_live_descendants(procs, [10]) is True, "10 有后代 11（长命令仍在跑）"
+    assert aw.has_live_descendants(procs, [12]) is False
+    assert aw.has_live_descendants(procs, []) is False
+    d = aw.stall_decision
+    assert d(now=100, started_at=0, last_growth_at=0, stall_secs=60,
+             active=False, observing=True) == "no-growth-hung"
+    assert d(now=100, started_at=0, last_growth_at=95, stall_secs=60,
+             active=False, observing=True) is None, "转录刚长过 → 不判挂死"
+    assert d(now=100, started_at=0, last_growth_at=0, stall_secs=60,
+             active=True, observing=True) is None, "有活跃子进程 = 健康工作（g349）"
+    assert d(now=100, started_at=0, last_growth_at=0, stall_secs=60,
+             active=False, observing=False) is None, "观测不到（无进程/无转录）→ 惰性"
+    assert d(now=30, started_at=0, last_growth_at=0, stall_secs=60,
+             active=False, observing=True) is None, "刚起步不足阈值"
+    assert d(now=100, started_at=0, last_growth_at=0, stall_secs=0,
+             active=False, observing=True) is None, "未启用"
+    assert aw.transcript_paths("/nonexistent-root") == [], "存储缺失 → 观测面为空"
+    assert aw.stall_secs_from_env({aw.STALL_ENV: "abc"}) == 0, "非法值 → 关闭"
+    # 观测根解析：未配 RECURSIVE_SESSIONS_DIR = 观测面恒为空 → 安装日志须如实说
+    assert aw.watch_root(env={}) == "", "未配会话存储 → 守护恒惰性，不得报「已启用」了事"
+    assert aw.watch_root(env={"RECURSIVE_SESSIONS_DIR": "/s"}) == "/s"
+    assert aw.watch_root(sessions_root="/explicit", env={}) == "/explicit", "显式根优先"
+
+
+def s41_活性检测_宿主包装_真链路提前击杀():
+    """#83 验收①端到端：`install_agentrun_watchdog` 包出的 AGENTRUN 执行路径
+    在真机上提前击杀挂死的 agent，现场落 <run_dir>/stall-kill.log。
+
+    与 s37 的差别：s37 只验守护线程，本场景验宿主接线（worktree 从节点 repo
+    参数求值、转录目录取 RECURSIVE_SESSIONS_DIR、现场落 run_dir）。"""
+    import agent_watchdog as aw
+    import plaita_nodes.agent_run as ar
+    tmp, wt, tp, sessions_root = _stall_fixture()
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    seen = {}
+
+    def fake_execute(self, execution):
+        p = _spawn_fake_agent(bindir, "--workspace", str(wt),
+                              "--output-format", "json", "run", "x")
+        seen["pid"] = p.pid
+        while p.poll() is None:
+            time.sleep(0.05)
+        seen["rc"] = p.returncode
+        return {"text": "killed", "cli": "stub", "model": "stub",
+                "session_id": "s", "usage": {}, "dry_run": False}
+
+    class _Node:
+        id = "impl"
+        repo = str(wt)
+
+    class _Exec:
+        def evaluate(self, raw):
+            return raw
+
+    before = ar.AgentRunNode.execute
+    ar.AgentRunNode.execute = fake_execute
+    try:
+        assert aw.install_agentrun_watchdog(
+            env={aw.STALL_ENV: "1"}, node_cls=ar.AgentRunNode,
+            sessions_root=str(sessions_root), poll_secs=0.2) is True
+        t0 = time.time()
+        out = ar.AgentRunNode.execute(_Node(), _Exec())
+        elapsed = time.time() - t0
+        assert out["text"] == "killed", out
+        assert seen.get("rc") is not None, "假 agent 应已被击杀退出"
+        assert elapsed < 15, f"应在 stall 阈值附近收口，实际 {elapsed:.1f}s"
+        log = tmp / "stall-kill.log"                   # worktree 同级 = run_dir
+        assert log.exists() and "no-growth-hung" in log.read_text(), "现场未留痕"
+        assert str(seen["pid"]) in log.read_text(), "留痕应含被杀 pid"
+    finally:
+        ar.AgentRunNode.execute = before               # 后续场景仍吃 harness 桩
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def s42_活性检测_击杀归timeout类_不原地重试():
+    """#83 验收③（评审 blocker 回归）：活性检测击杀必须被宿主判成 **timeout 类**
+    ——直接上抛（D4：不原地重试、impl 恰一次、无 node_retries 记账、checkpoint
+    保留待 L2 续跑），而不是当普通节点失败原地重跑一整轮预算、二次挂死再升人工。
+
+    链路：真 SIGTERM → 假 agent 退出 → 桩按生产形态抛 `exited -15: (no stderr)`
+    （agentproc 对 143 的原样转述）→ wrapper 用 KILL_MARKER 重抛 → `_timeout_class`
+    命中 → `raise`。修复前红：击杀原样透传（`exited 143` 不含 "timed out after"）
+    → 走重试分支，impl 2 次 + node_retry_exhausted（与 D4/文档相反）。"""
+    import agent_watchdog as aw
+    import plaita_nodes.agent_run as ar
+    import plaita.node.code as pcode
+    import self_improve_bridge_v2 as bridge
+
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root, run_dir, state_path = _v3_setup(repo, root)
+    tmp = Path(tempfile.mkdtemp(prefix="flowv2t-stallcls-"))
+    sess = tmp / "sessions" / "slug" / "sid"
+    sess.mkdir(parents=True)
+    (sess / "transcript.jsonl").write_text("x" * 512 + "\n")   # 停更的活转录
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    procs = []
+    attempts = []
+    real_route = _route_agent
+    # 本场景主题是失败分类不是磁盘：preflight 的磁盘守卫按宿主可用空间判，
+    # 本地小盘会让整条 v3 链路停在 pre（与本次改动无关）——把门槛收到 1GiB。
+    old_disk = os.environ.get("RECURSIVE_MIN_FREE_DISK_GIB")
+    os.environ["RECURSIVE_MIN_FREE_DISK_GIB"] = "1"
+    pcode.SUBPROCESS_ENV_EXTRA["RECURSIVE_MIN_FREE_DISK_GIB"] = "1"
+
+    def execute(self, execution):
+        if self.id != "impl":
+            return real_route(self, execution)
+        attempts.append(self.id)
+        wt = _eval(self, execution, "repo")            # 真 worktree（flow 的 pre 建的）
+        p = _spawn_fake_agent(bindir, "--workspace", str(wt),
+                              "--output-format", "json", "run", "x")
+        procs.append(p)
+        deadline = time.time() + 30                    # 守护没杀成不许把套件挂死
+        while p.poll() is None and time.time() < deadline:
+            time.sleep(0.02)
+        raise RuntimeError(f"executor 'recursive' exited {p.returncode}: (no stderr)")
+
+    before = ar.AgentRunNode.execute
+    ar.AgentRunNode.execute = execute
+    try:
+        assert aw.install_agentrun_watchdog(
+            env={aw.STALL_ENV: "1"}, node_cls=ar.AgentRunNode,
+            sessions_root=str(tmp / "sessions"), poll_secs=0.2) is True
+        raised = None
+        try:
+            _drive_v3(issue_root, run_dir, state_path)
+        except Exception as e:      # 超时类：宿主上抛（生产 main() 兜成 engine_error
+            raised = e              # + 保树待续 → keeper 重派 L2，见 s23）
+        assert raised is not None, "击杀应判 timeout 类：宿主上抛而非原地重试"
+        why = str(raised)[:200]                        # 宿主只看前 200 字符
+        assert aw.is_stall_kill(why), f"标记须落在 str(e)[:200] 之内: {why!r}"
+        assert bridge._timeout_class(why) is True, f"宿主须认 timeout 类: {why!r}"
+        assert bridge._timeout_class(
+            "执行节点impl出错了: RuntimeError: executor 'recursive' exited 143: "
+            "(no stderr)") is False, "普通节点失败不得被误判 timeout 类（仍原地重试）"
+    finally:
+        ar.AgentRunNode.execute = before
+        for p in procs:
+            _kill_quietly(p)
+        pcode.SUBPROCESS_ENV_EXTRA.pop("RECURSIVE_MIN_FREE_DISK_GIB", None)
+        if old_disk is None:
+            os.environ.pop("RECURSIVE_MIN_FREE_DISK_GIB", None)
+        else:
+            os.environ["RECURSIVE_MIN_FREE_DISK_GIB"] = old_disk
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    assert len(attempts) == 1, f"timeout 类不得原地重试，impl 实际 {len(attempts)} 次"
+    nr = json.loads(state_path.read_text()).get("node_retries") or {}
+    assert "impl" not in nr, f"timeout 类不得记节点重试: {nr}"
+    assert (issue_root / "checkpoint.json").exists(), \
+        "engine_error + checkpoint 保留 = keeper 重派 L2 续跑的判据，不得删"
+    log = run_dir / "stall-kill.log"
+    assert log.exists() and "no-growth-hung" in log.read_text(), "击杀必须留痕"
+
+
 SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_failed_preserved,
              s4_评审NEEDS_FIX_修后过, s5_评审UNAVAILABLE, s6_impl无改动_无继承_skip,
              s7_无改动但有继承提交_照走门禁, s8_磁盘守卫_retry_later,
@@ -1245,7 +1547,13 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s26_v3_异常终态_on_flow_end恰为引擎版_宿主不重复,
              s27_v3_dryrun冒烟_真bridge无桩全图,
              s28_state_json原子写_永不截断,
-             s29_v3_恢复轮刷新agent_reviewer]
+             s29_v3_恢复轮刷新agent_reviewer,
+             s37_活性检测_转录停更_提前击杀,
+             s38_活性检测_转录持续增长_跑满预算不误杀,
+             s39_活性检测_缺省关闭_不动AGENTRUN,
+             s40_活性检测_判据表_ps解析与停更决策,
+             s41_活性检测_宿主包装_真链路提前击杀,
+             s42_活性检测_击杀归timeout类_不原地重试]
 
 if __name__ == "__main__":
     _patch()
