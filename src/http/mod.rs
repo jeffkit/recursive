@@ -6,6 +6,7 @@
 //! endpoints for multi-turn conversations, and SSE streaming of agent events.
 
 mod agui;
+mod audit;
 mod auth;
 mod cold_load;
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub use rate_limit::{rate_limiter_from_env, RateLimiter};
 // and visible to SDK consumers constructing [`SessionState`] directly.
 pub use usage::{SessionUsage, UsageResponse, UsageTotals};
 
+use audit::{audit_middleware, export_audit, list_audit};
 use auth::{auth_config_from_env, auth_middleware};
 use handlers::{
     agui_cancel, agui_run, create_session, delete_session, fork_session, get_session,
@@ -1206,8 +1208,14 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/slash-commands", get(list_slash_commands))
         .route("/skills", get(list_skills))
+        .route("/audit", get(list_audit))
+        .route("/audit/export", get(export_audit))
         .route("/agui", post(agui_run))
         .route("/agui/{thread_id}/cancel", post(agui_cancel))
+        // Issue #101: the audit layer sits *inside* auth (added before the
+        // auth layer, so it wraps the routes but is wrapped by auth) — it must
+        // see the resolved `AuthIdentity` to attribute approval/admin events.
+        .layer(axum::middleware::from_fn(audit_middleware))
         .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
         .layer(axum::middleware::from_fn_with_state(
             (limiter.clone(), state_arc.metrics.clone()),
@@ -1713,6 +1721,50 @@ pub fn build_openapi_spec() -> serde_json::Value {
                                         "items": { "$ref": "#/components/schemas/SkillInfo" }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            },
+            "/audit": {
+                "get": {
+                    "summary": "Query the audit log",
+                    "description": "Issue #101: retrieve the append-only, hash-chained audit \
+                        stream. Filter by `from`/`to` (epoch millis), `actor`, `tenant`, \
+                        `session` and `limit` (default 1000, keeping the most recent \
+                        matches); pass `verify=true` to recompute the BLAKE3 chain and \
+                        report whether it is intact. The stream is process-global, so a \
+                        non-admin caller sees only its own records (same subject and tenant).",
+                    "parameters": [
+                        { "name": "from", "in": "query", "required": false, "schema": { "type": "integer" } },
+                        { "name": "to", "in": "query", "required": false, "schema": { "type": "integer" } },
+                        { "name": "actor", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "tenant", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "session", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer" } },
+                        { "name": "verify", "in": "query", "required": false, "schema": { "type": "boolean" } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Filtered audit records plus chain status",
+                            "content": {
+                                "application/json": { "schema": { "type": "object" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "/audit/export": {
+                "get": {
+                    "summary": "Export the audit log as NDJSON",
+                    "description": "Issue #101: the same filtering and caller scoping as \
+                        `/audit` (default limit 1000), returned as newline-delimited JSON \
+                        (`application/x-ndjson`) for SIEM ingestion.",
+                    "responses": {
+                        "200": {
+                            "description": "One JSON audit record per line",
+                            "content": {
+                                "application/x-ndjson": { "schema": { "type": "string" } }
                             }
                         }
                     }

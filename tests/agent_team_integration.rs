@@ -310,6 +310,7 @@ async fn worker_receives_coordinator_message_via_mailbox() {
         permission_mode: PermissionMode::Default,
         mailbox: Some(mailbox.clone()),
         turn: 0,
+        audit_session: None,
         prompt_segments: None,
         wall_timeout_secs: 0,
         failure_outcome: None,

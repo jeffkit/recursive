@@ -454,6 +454,15 @@ pub(super) async fn auth_middleware(
                  for local dev.)"
             );
         }
+        // Issue #101: a request refused because the server has no auth
+        // configured is also a security-relevant rejection.
+        crate::audit_log::emit(
+            crate::audit_log::AuditActor::anonymous(),
+            None,
+            crate::audit_log::AuditAction::AuthFailure {
+                reason: "auth not configured".to_string(),
+            },
+        );
         let mut resp = axum::response::Response::new(axum::body::Body::from(
             "auth not configured; set RECURSIVE_HTTP_AUTH_KEYS or \
              RECURSIVE_HTTP_AUTH_JWT_SECRET (release builds ignore \
@@ -478,6 +487,16 @@ pub(super) async fn auth_middleware(
     match identity {
         Some(identity) => run_with_identity(req, identity, next).await,
         None => {
+            // Issue #101: a rejected credential is a security event — record
+            // it (attributed to no one, since nothing resolved to an identity)
+            // before answering 401.
+            crate::audit_log::emit(
+                crate::audit_log::AuditActor::anonymous(),
+                None,
+                crate::audit_log::AuditAction::AuthFailure {
+                    reason: "invalid or missing credential".to_string(),
+                },
+            );
             let mut resp = axum::response::Response::new(axum::body::Body::from("unauthorized"));
             *resp.status_mut() = StatusCode::UNAUTHORIZED;
             resp

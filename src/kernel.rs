@@ -99,6 +99,11 @@ pub struct TurnContext {
     /// audit metadata to be overwritten or lost.
     pub turn: u32,
 
+    /// Issue #101: session this turn belongs to, forwarded to `RunCore` so
+    /// tool calls can be attributed in the process audit stream. `None` for
+    /// runs without a session (sub-agents, tests).
+    pub audit_session: Option<String>,
+
     /// Goal-328: structured prompt segments from `assemble_system_prompt`,
     /// forwarded to `RunCore` so it can size the static breakdown
     /// buckets. `None` when the caller did not provide one (legacy
@@ -385,6 +390,7 @@ impl AgentKernel {
                 stuck_window: self.stuck_window,
                 stuck_error_rate: self.stuck_error_rate,
                 turn: ctx.turn,
+                audit_session: ctx.audit_session,
                 globs_skills: self.globs_skills.clone(),
                 prompt_segments: None, // Goal-396: preserved on TurnOutcome via TurnContext
                 static_breakdown,

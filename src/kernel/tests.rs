@@ -98,6 +98,7 @@ fn make_minimal_ctx(messages: Vec<Message>) -> TurnContext {
         permission_mode: crate::permissions::PermissionMode::Default,
         mailbox: None,
         turn: 0,
+        audit_session: None,
         prompt_segments: None,
         wall_timeout_secs: 0,
         failure_outcome: None,

@@ -231,6 +231,10 @@ pub(crate) struct RunCore<'a> {
     /// Turn index (0-based), scopes [`crate::tools::AuditKey`] prefixes so
     /// that cross-turn tool_call_id reuse cannot corrupt audit metadata.
     pub(crate) turn: u32,
+    /// Issue #101: session this turn belongs to, used to attribute tool-call
+    /// events appended to the process audit stream. `None` for a run with no
+    /// session (sub-agents, tests) — those fall back to the local operator.
+    pub(crate) audit_session: Option<String>,
     /// Goal-318: `Globs`-mode skills for path-triggered injection.
     /// Injected as system messages after tool calls match a skill's glob patterns.
     pub(crate) globs_skills: Vec<Skill>,
@@ -638,6 +642,27 @@ impl<'a> RunCore<'a> {
         >,
         skill_injector: &mut SkillInjector,
     ) -> Option<FinishReason> {
+        // Issue #101: mirror every tool invocation into the append-only,
+        // hash-chained process audit stream, attributed to the caller behind
+        // this session. The per-turn `AuditMeta` rides inside the (rewritable)
+        // transcript; this is the tamper-evident enterprise record. Emission
+        // is best-effort — a disabled or failing audit sink never affects the
+        // turn.
+        {
+            let actor = crate::audit_log::resolve_session_actor(self.audit_session.as_deref());
+            for outcome in results {
+                let Some(meta) = &outcome.audit else { continue };
+                crate::audit_log::emit(
+                    actor.clone(),
+                    self.audit_session.clone(),
+                    crate::audit_log::AuditAction::ToolCall {
+                        tool: outcome.name.clone(),
+                        side_effect: meta.side_effect.as_str().to_string(),
+                        ok: matches!(meta.exit_status, crate::tools::ExitStatus::Ok),
+                    },
+                );
+            }
+        }
         // Goal-285: sentinel pre-pass — detect before any push_message calls.
         // When the sentinel appears at index N > 0, flushing incrementally
         // would duplicate results[0..N] in the transcript; scan first, flush
@@ -2022,6 +2047,7 @@ mod tests {
             stuck_window: 3,
             stuck_error_rate: 1.0,
             turn: 0,
+            audit_session: None,
             globs_skills: vec![],
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
@@ -2153,6 +2179,7 @@ mod tests {
             stuck_window: 3,
             stuck_error_rate: 1.0,
             turn: 0,
+            audit_session: None,
             globs_skills: vec![],
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),
@@ -3044,6 +3071,7 @@ mod tests {
             stuck_window: 3,
             stuck_error_rate: 1.0,
             turn: 0,
+            audit_session: None,
             globs_skills: vec![],
             prompt_segments: None,
             static_breakdown: StaticBreakdownCache::default(),

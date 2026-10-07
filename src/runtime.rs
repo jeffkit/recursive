@@ -972,6 +972,9 @@ impl AgentRuntime {
             permission_mode: self.kernel.tools().permission_mode(),
             mailbox: None,
             turn: self.checkpoints.turn_index.load(Ordering::Relaxed) as u32,
+            // Issue #101: tool calls from this turn are attributed to the
+            // session's caller in the process audit stream.
+            audit_session: self.checkpoints.session_id.clone(),
             prompt_segments: self.prompt_segments.clone(),
             // Goal 399: seed the per-turn context from the kernel-level
             // budget (set via `AgentRuntimeBuilder::wall_timeout_secs`).

@@ -31,6 +31,19 @@ pub enum ToolSideEffect {
     External,
 }
 
+impl ToolSideEffect {
+    /// Stable snake_case label, matching the serde representation. Used by the
+    /// append-only audit stream (issue #101) so records stay readable without
+    /// depending on the enum's `Debug` repr.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Mutating => "mutating",
+            Self::External => "external",
+        }
+    }
+}
+
 /// Maximum length of the persisted error message in [`ExitStatus::Err`].
 /// Anything longer is UTF-8 char-boundary clipped and `truncated` is set.
 pub const AUDIT_ERR_MAX_BYTES: usize = 512;
@@ -157,6 +170,20 @@ pub(crate) fn blake3_canonical_json(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ToolSideEffect::as_str ---
+
+    #[test]
+    fn tool_side_effect_as_str_matches_serde_label() {
+        for se in [
+            ToolSideEffect::ReadOnly,
+            ToolSideEffect::Mutating,
+            ToolSideEffect::External,
+        ] {
+            let json = serde_json::to_value(se).expect("serialize");
+            assert_eq!(json.as_str(), Some(se.as_str()), "labels must agree");
+        }
+    }
 
     // --- is_false (serde skip helper) ---
 

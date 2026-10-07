@@ -961,6 +961,11 @@ async fn main() -> anyhow::Result<()> {
             // cron/webhook trigger stores derive from the same workspace).
             // One bind at startup; delivery and registration share it.
             recursive::notify::set_file_context(&config.workspace);
+            // Issue #101: bind the process audit stream (append-only,
+            // hash-chained) under the same per-workspace user dir, so
+            // approval / admin / auth events have a durable home independent
+            // of the mutable transcripts.
+            recursive::audit_log::set_file_context(&config.workspace);
             // Issue #121: resolve the native session-mirror root once, here,
             // so session teardown mirrors into a fixed tree instead of
             // re-reading `RECURSIVE_SESSIONS_DIR` / `RECURSIVE_HOME` from a

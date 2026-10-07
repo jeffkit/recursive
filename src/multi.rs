@@ -634,6 +634,11 @@ impl AgentPool {
             permission_mode: PermissionMode::Default,
             mailbox: None,
             turn: 0,
+            // Issue #101: a role run has no session of its own, so its tool
+            // calls reach the audit stream as the local operator rather than
+            // as the caller who requested them (see `crate::audit_log`, which
+            // records this as a known limit).
+            audit_session: None,
             prompt_segments: None,
             // Goal 399: sub-agents inherit the parent session's wall-clock
             // budget (never unlimited while the parent is bounded).
