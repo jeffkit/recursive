@@ -5,20 +5,24 @@
 - agent 实现/门禁修复/评审/评审修复 → **AGENTRUN**（plaita-nodes agent_run，
   prompt 用赋值节点声明，repo/timeout_secs 参数化，timeout 即预算墙）
 - 质量门 → **GATE** 库节点（自带 start_new_session + killpg 超时击杀）
-- 落地 → **GIT_PUBLISH** 库节点（幂等 commit + main 模式 ff 合并推送）
+- 落地 → **GIT_PUBLISH**（幂等 commit，merge_mode="none"）+ **land_push 直推**
+  （2026-10-07 origin 化：`git push origin HEAD:<base>` 由服务端做 ff 校验，
+  不依赖本地 clone 的分支位置——本地 main 被并行会话推动时旧路径必炸，
+  见 plaita#27/#35）；推送前有「捆绑本地未推提交」护栏（拒推交人工，绝不代推）
 - 失败现场 → **WRITEFILE** 库节点
-- code 只剩两处真正没有库节点的叶子：preflight（worktree/disk/kill-stale/
-  baseline）与 has_changes（git status 非空判断，做成 childflow 复用）
+- code 只剩三处真正没有库节点的叶子：preflight（worktree/disk/kill-stale/
+  baseline/land_base）与 has_changes（git status + 领先 land 基线判断，childflow
+  复用）、land_push（推分支 + 直推基支 + 捆绑护栏）
 
 图结构（WHILE 语义见 plaita 087bdfe；「体 return = 下一轮 item = 节点输出」）：
 - gate_with_fix 子流程：跑门 → 绿则过；红则 fix（≤3 轮，prompt 喂 stdout 尾部）
 - 评审环：reviewer AGENTRUN → F.contains 判 VERDICT → NEEDS_FIX 喂回修复 ≤3 轮
-- 落地：GIT_PUBLISH main 模式；merged=False → worktree rebase 新 main 后重推
+- 落地：commit（GIT_PUBLISH none）→ land_push 直推（先 push 分支，再
+  `push HEAD:<base>`）；非 ff（基支已前进）→ worktree rebase 新 main 后重推
   一次（rebase-retry，2026-10-01）；rebase 冲突进 AGENTRUN 修复环（#137）——
   现场落 land-failure.log → 当轮 agent 就地解 → rebase 推完再重推；修复轮用尽
-  仍冲突才 failed-preserved；解完冲突的树必须复跑门（#144，门禁位点在 impl 后、
-  首次 pub 前，此前解冲突后的新树从不验证即发布）——不过即 failed-preserved
-  不发布
+  仍冲突才 failed-preserved；**任何 rebase 后（干净或解完冲突）的树必须复跑门**
+  （#144 + 2026-10-07 补齐干净路径），不过即 failed-preserved 不发布
 
 v2 与 v1 引擎的有意差异：
 - watchdog（journal 增长/后代活性）暂由 AGENTRUN timeout_secs 硬墙替代——
@@ -54,13 +58,14 @@ JAIL = "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import 
 def has_changes(INPUT):
     """是否有待落地的改动（impl/fix 后的落门前置判断）。
 
-    两类都算：① worktree 未提交改动（git status）；② 分支领先 main 的已提交
-    （断点续跑继承的 WIP 快照提交，#61 实证：被 429 杀掉的前一轮工作完整躺在
-    WIP 提交里，旧版只看 status → 假 skip-commit → 不过门禁、不推远端、
-    issue 被消费后工作滞留本地分支）。继承工作照走三门+评审+GIT_PUBLISH，
+    两类都算：① worktree 未提交改动（git status）；② 分支领先 land 基线
+    （`input["base"]`，= preflight 解析的 origin/<base>；缺省回退本地 main）
+    的已提交（断点续跑继承的 WIP 快照提交，#61 实证：被 429 杀掉的前一轮工作
+    完整躺在 WIP 提交里，旧版只看 status → 假 skip-commit → 不过门禁、不推远端、
+    issue 被消费后工作滞留本地分支）。继承工作照走三门+评审+落地，
     验证不过自然 failed-preserved。
     """
-    ch = CODE(id="has_changes", lang="python", input={"wt": INPUT.wt}, code=(
+    ch = CODE(id="has_changes", lang="python", input={"wt": INPUT.wt, "base": INPUT.base}, code=(
         "import subprocess\n"
         "def run(input):\n"
         "    def git(*a):\n"
@@ -70,7 +75,8 @@ def has_changes(INPUT):
         "    dirty = bool(git(\"status\", \"--porcelain\"))\n"
         "    ahead = 0\n"
         "    try:\n"
-        "        ahead = int(git(\"rev-list\", \"--count\", \"main..HEAD\") or 0)\n"
+        "        ahead = int(git(\"rev-list\", \"--count\",\n"
+        "                        (input.get(\"base\") or \"main\") + \"..HEAD\") or 0)\n"
         "    except ValueError:\n"
         "        ahead = 0\n"
         "    return {\"any\": dirty or ahead > 0}\n"))
@@ -113,7 +119,8 @@ def self_improve_v2(INPUT):
 
     # ── preflight（唯一复杂 code 节点）──
     pre = CODE(id="preflight", lang="python",
-               input={"repo": repo, "run_dir": run_dir, "setup": setup_command}, code=(
+               input={"repo": repo, "run_dir": run_dir, "setup": setup_command,
+                      "gates_spec": INPUT.gates_spec or ""}, code=(
         "import json, os, re, signal, subprocess, sys, time\n"
         "from pathlib import Path\n"
         "\n"
@@ -236,6 +243,30 @@ def self_improve_v2(INPUT):
         "            base_ref = newest\n"
         "            branch = \"v2-\" + rd.name + \"-cont\"\n"
         "    resumed = base_ref != \"HEAD\"\n"
+        "    # ── 落地基线 origin 化（2026-10-07，plaita#27/#35 land 失败根因）──\n"
+        "    # 本地 clone 的 <base> 可能领先/落后/被并行会话推动：fresh run 若直接以\n"
+        "    # 本地 HEAD 建树，会把本地未推提交捆进 run 分支 → land ff 必败\n"
+        "    # （needs-human）。改为先 fetch、以 origin/<base> 建树；fetch 或解析失败\n"
+        "    # 退回 HEAD（离线仍可跑）。base 名取自 keeper 注入的 gates_spec（缺省 main）。\n"
+        "    # land 阶段也复用同一 land_base（直推服务端 ff 校验，不碰本地 clone）。\n"
+        "    base_branch = \"main\"\n"
+        "    try:\n"
+        "        base_branch = (json.loads(input.get(\"gates_spec\") or \"{}\").get(\"base\")\n"
+        "                       or \"main\").strip() or \"main\"\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    try:\n"
+        "        subprocess.run([\"git\", \"-C\", repo, \"fetch\", \"--prune\", \"origin\", base_branch],\n"
+        "                       capture_output=True, text=True, timeout=120)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    land_base = \"HEAD\"\n"
+        "    _ob = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"--verify\", \"-q\",\n"
+        "                          \"origin/\" + base_branch], capture_output=True, text=True)\n"
+        "    if _ob.returncode == 0 and _ob.stdout.strip():\n"
+        "        land_base = \"origin/\" + base_branch\n"
+        "    if base_ref == \"HEAD\":\n"
+        "        base_ref = land_base\n"
         "    if not Path(wt).exists():\n"
         "        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n"
         "                           capture_output=True, text=True)\n"
@@ -275,7 +306,7 @@ def self_improve_v2(INPUT):
         "The flow runs these again as a backstop. Fix the source, never `#[allow]`.\n"
         "Only stop once fmt + clippy + test are all green by your own hand.\"\"\")\n"
         "    if resumed:\n"
-        "        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n"
+        "        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff origin/main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n"
         "        import glob as _glob\n"
         "        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', '*failure.log')))\n"
         "        if _rf:\n"
@@ -301,7 +332,8 @@ def self_improve_v2(INPUT):
         "        if cands:\n"
         "            cands.sort()\n"
         "            last_sid = cands[-1][1]\n"
-        "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n"))
+        "    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head,\n"
+        "            \"land_base\": land_base, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n"))
     # ── 门禁选择（2026-10-06，多仓支持）：本 flow 原为 recursive(Rust) 专用，
     # gate 段硬编码 cargo fmt/clippy/test。现由独立 code 节点按 INPUT.gates
     # 选命令——调用方注入则用之，缺省回退 cargo 三段（**recursive 自身路径
@@ -373,7 +405,7 @@ def self_improve_v2(INPUT):
     # 单节点无分支。
     impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
                     session=pre.last_sid)
-    chg = CHILD(input={"wt": pre.worktree}, flow=has_changes)
+    chg = CHILD(input={"wt": pre.worktree, "base": pre.land_base}, flow=has_changes)
     if chg.any == False:
         return {"verdict": "skip-commit", "stage": "commit",
                 "why": "agent made no changes", "impl_text": impl.text}
@@ -471,11 +503,11 @@ def self_improve_v2(INPUT):
     # UNAVAILABLE / 修后仍不过均 failed-preserved 并落盘评审原文。
     review_prompt = (
         "You are an independent reviewer (different provider). In the current "
-        "workspace, run `git diff $(git merge-base main HEAD)` to see the full "
+        "workspace, run `git diff $(git merge-base origin/main HEAD)` to see the full "
         "change (relative to the branch point: covers both uncommitted edits and "
         "commits inherited from a resumed run, while excluding main-side commits "
-        "that landed after this branch was cut — plain `git diff main` would show "
-        "those as inverted deletions and waste your attention), and Read any "
+        "that landed after this branch was cut — plain `git diff origin/main` would "
+        "show those as inverted deletions and waste your attention), and Read any "
         "source files you need to cross-check claims.\n"
         "Review for correctness, regressions and contract violations.\n"
         'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
@@ -515,13 +547,66 @@ def self_improve_v2(INPUT):
                 return {"verdict": "failed-preserved", "stage": "review",
                         "why": "review did not pass after two fix rounds"}
 
-    # ── 落地：GIT_PUBLISH（幂等 commit + main 模式 ff 推送）──
+    # ── 落地（2026-10-07 origin 化改造，B 班）──
+    # 幂等 commit 仍走 GIT_PUBLISH，但 merge_mode="none"——不动本地 clone、不推；
+    # 推送与落主支由 land_push **直推** `git push origin HEAD:<base>`（服务端做
+    # ff 校验）。旧路径在本地 clone 里 `merge --ff-only` 再推，并行会话持续推动
+    # 本地 main 时必炸（plaita#27/#35 needs-human 根因），故废弃该载体。
     pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
                       commit_message=F.concat("self-improve: ", goal),
-                      merge_mode="main", main_clone=repo, base_branch="main")
-    if pub.merged == True:
-        return {"verdict": "committed", "via": "git-publish",
-                "note": pub.note}
+                      merge_mode="none", main_clone=repo, base_branch="main")
+    land_push = CODE(id="land_push", lang="python",
+              input={"wt": pre.worktree, "branch": pre.branch,
+                     "land_base": pre.land_base, "repo": repo}, code=(
+        "import subprocess\n"
+        "\n"
+        "\n"
+        "def run(input):\n"
+        "    wt, branch = input[\"wt\"], input[\"branch\"]\n"
+        "    land_base = input.get(\"land_base\") or \"HEAD\"\n"
+        "    base_branch = land_base.split(\"/\", 1)[1] if \"/\" in land_base else \"main\"\n"
+        "    repo = input.get(\"repo\") or wt\n"
+        "\n"
+        "    def git(*a):\n"
+        "        return subprocess.run([\"git\", \"-C\", wt] + list(a),\n"
+        "                              capture_output=True, text=True)\n"
+        "\n"
+        "    git(\"fetch\", \"origin\")\n"
+        "    # 护栏（绝不代推他人提交）：本地 clone 的 <base> 领先 origin 的提交若\n"
+        "    # 出现在待落地集合里，说明本分支捆绑了本地未推工作 → 拒推交人工。\n"
+        "    # 本地与 origin 持平时护栏自然放行（自愈，无需人工改分支）。\n"
+        "    if land_base != \"HEAD\":\n"
+        "        loc = subprocess.run([\"git\", \"-C\", repo, \"rev-list\",\n"
+        "                              \"origin/\" + base_branch + \"..\" + base_branch],\n"
+        "                             capture_output=True, text=True).stdout.split()\n"
+        "        to_land = set(git(\"rev-list\", land_base + \"..HEAD\").stdout.split())\n"
+        "        bundled = [c for c in loc if c in to_land]\n"
+        "        if bundled:\n"
+        "            return {\"ok\": False, \"refuse\": True, \"note\": \"\",\n"
+        "                    \"why\": \"分支捆绑本地未推提交 %d 条，已拒推（交人工）：%s\" % (\n"
+        "                        len(bundled), \" \".join(bundled[:8]))}\n"
+        "    # 推分支（先删远端同名旧分支：rebase 后续推会分叉被拒，best-effort）\n"
+        "    git(\"push\", \"origin\", \"--delete\", branch)\n"
+        "    r1 = git(\"push\", \"-u\", \"origin\", branch)\n"
+        "    if r1.returncode != 0:\n"
+        "        return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
+        "                \"why\": (\"push branch: \" + (r1.stderr or r1.stdout))[-400:]}\n"
+        "    # 直推基线：服务端 ff 校验；非 ff（基支已前进）→ ok=False 走 rebase 重试\n"
+        "    r2 = git(\"push\", \"origin\", \"HEAD:\" + base_branch)\n"
+        "    if r2.returncode == 0:\n"
+        "        return {\"ok\": True, \"refuse\": False,\n"
+        "                \"note\": \"已直推 \" + base_branch + \"（分支 \" + branch + \"）\",\n"
+        "                \"why\": \"\"}\n"
+        "    return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
+        "            \"why\": (\"push \" + base_branch + \": \" + (r2.stderr or r2.stdout))[-400:]}\n"))
+    if land_push.refuse == True:
+        # 捆绑护栏命中：不 rebase 不重试（重试仍会撞同一护栏），直接人工
+        w_land_push0 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+                         content=F.concat("bundled local commits: ", land_push.why))
+        return {"verdict": "failed-preserved", "stage": "land", "why": land_push.why}
+    if land_push.ok == True:
+        return {"verdict": "committed", "via": "direct-push",
+                "note": land_push.note}
 
     # ── rebase-retry（2026-10-01 jeffkit 拍板；#65/#70 实证 ff 失败即弃单浪费）──
     # ff 合并失败（main 已前进）→ worktree rebase 新 main → 删远端旧同名分支
@@ -638,20 +723,20 @@ def self_improve_v2(INPUT):
             "    git(\"push\", \"origin\", \"--delete\", input[\"branch\"])\n"
             "    return {\"ok\": True, \"scene\": \"\", \"why\": \"\"}\n"))
         if land_rebase2.ok == False:
-            wlp2 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+            w_land_fail2 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
                              content=F.concat("rebase conflict (fix round done): ",
                                               land_rebase2.why, "\n\n",
                                               land_rebase2.scene))
             return {"verdict": "failed-preserved", "stage": "land",
                     "why": F.concat("rebase conflict: ", land_rebase2.why)}
         # #144：解冲突后的树从未过门——fmt/clippy/test 的位点在 impl 之后、
-        # 首次 pub 之前，land_fix 就地改的是 rebase 后的**新树**，解完直接
-        # pub2 = 把一棵没验证过的树推上 main（#134 实证：E0063/E0061 编译错
+        # 首次落推之前，land_fix 就地改的是 rebase 后的**新树**，解完直接
+        # land_push2 = 把一棵没验证过的树推上 main（#134 实证：E0063/E0061 编译错
         # 直达 main、CI 全红）。这里把同一套门（同一 gate_runner/spec，gate_once
         # 单发）在解完冲突、rebase 推完后复跑一遍；任何一道不过即
-        # failed-preserved（stage=land），绝不走 pub2。命令/预算与 g1/g2/g3
-        # 同源，非 Rust 仓的 spec 路径下 fmt 槽即整组门。干净 rebase 路径的
-        # 重跑是另一单（#39 同类）。
+        # failed-preserved（stage=land），绝不走 land_push2。命令/预算与 g1/g2/g3
+        # 同源，非 Rust 仓的 spec 路径下 fmt 槽即整组门。
+        # （2026-10-07：干净 rebase 路径同样复跑，见下方 else 分支——#39 同类缺口已补。）
         lg1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
                            "timeout_secs": gates.fmt_timeout, "wt": pre.worktree},
                     flow=gate_once)
@@ -685,16 +770,88 @@ def self_improve_v2(INPUT):
                                               "\n--- stderr ---\n", lg3.err))
             return {"verdict": "failed-preserved", "stage": "land",
                     "gate": lg3.gate, "out": lg3.out}
-    pub2 = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
-                       commit_message=F.concat("self-improve: ", goal),
-                       merge_mode="main", main_clone=repo, base_branch="main")
-    if pub2.merged == True:
-        return {"verdict": "committed", "via": "git-publish-retry",
-                "note": pub2.note}
+    else:
+        # 干净 rebase（基支已前进、无冲突）：树相对首次门禁已变 → 同样复跑门禁
+        # （2026-10-07 补齐 #39 同类缺口：任何 rebase 后都不得把未验证的树推上 main）。
+        rg1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
+                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree},
+                    flow=gate_once)
+        if rg1.passed == False:
+            wrg1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
+                             content=F.concat("gate: ", gates.fmt_name,
+                                              "\ncmd: ", gates.fmt,
+                                              "\n--- stdout ---\n", rg1.out,
+                                              "\n--- stderr ---\n", rg1.err))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "gate": rg1.gate, "out": rg1.out}
+        rg2 = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
+                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree},
+                    flow=gate_once)
+        if rg2.passed == False:
+            wrg2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
+                             content=F.concat("gate: ", gates.lint_name,
+                                              "\ncmd: ", gates.lint,
+                                              "\n--- stdout ---\n", rg2.out,
+                                              "\n--- stderr ---\n", rg2.err))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "gate": rg2.gate, "out": rg2.out}
+        rg3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
+                           "timeout_secs": gates.test_timeout, "wt": pre.worktree},
+                    flow=gate_once)
+        if rg3.passed == False:
+            wrg3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
+                             content=F.concat("gate: ", gates.test_name,
+                                              "\ncmd: ", gates.test,
+                                              "\n--- stdout ---\n", rg3.out,
+                                              "\n--- stderr ---\n", rg3.err))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "gate": rg3.gate, "out": rg3.out}
+    land_push2 = CODE(id="land_push2", lang="python",
+               input={"wt": pre.worktree, "branch": pre.branch,
+                      "land_base": pre.land_base, "repo": repo}, code=(
+        "import subprocess\n"
+        "\n"
+        "\n"
+        "def run(input):\n"
+        "    wt, branch = input[\"wt\"], input[\"branch\"]\n"
+        "    land_base = input.get(\"land_base\") or \"HEAD\"\n"
+        "    base_branch = land_base.split(\"/\", 1)[1] if \"/\" in land_base else \"main\"\n"
+        "    repo = input.get(\"repo\") or wt\n"
+        "\n"
+        "    def git(*a):\n"
+        "        return subprocess.run([\"git\", \"-C\", wt] + list(a),\n"
+        "                              capture_output=True, text=True)\n"
+        "\n"
+        "    git(\"fetch\", \"origin\")\n"
+        "    if land_base != \"HEAD\":\n"
+        "        loc = subprocess.run([\"git\", \"-C\", repo, \"rev-list\",\n"
+        "                              \"origin/\" + base_branch + \"..\" + base_branch],\n"
+        "                             capture_output=True, text=True).stdout.split()\n"
+        "        to_land = set(git(\"rev-list\", land_base + \"..HEAD\").stdout.split())\n"
+        "        bundled = [c for c in loc if c in to_land]\n"
+        "        if bundled:\n"
+        "            return {\"ok\": False, \"refuse\": True, \"note\": \"\",\n"
+        "                    \"why\": \"分支捆绑本地未推提交 %d 条，已拒推（交人工）：%s\" % (\n"
+        "                        len(bundled), \" \".join(bundled[:8]))}\n"
+        "    git(\"push\", \"origin\", \"--delete\", branch)\n"
+        "    r1 = git(\"push\", \"-u\", \"origin\", branch)\n"
+        "    if r1.returncode != 0:\n"
+        "        return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
+        "                \"why\": (\"push branch: \" + (r1.stderr or r1.stdout))[-400:]}\n"
+        "    r2 = git(\"push\", \"origin\", \"HEAD:\" + base_branch)\n"
+        "    if r2.returncode == 0:\n"
+        "        return {\"ok\": True, \"refuse\": False,\n"
+        "                \"note\": \"已直推 \" + base_branch + \"（分支 \" + branch + \"）\",\n"
+        "                \"why\": \"\"}\n"
+        "    return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
+        "            \"why\": (\"push \" + base_branch + \": \" + (r2.stderr or r2.stdout))[-400:]}\n"))
+    if land_push2.ok == True:
+        return {"verdict": "committed", "via": "direct-push-retry",
+                "note": land_push2.note}
     wfp3 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
-                     content=F.concat("retry merged=False\nnote: ", str(pub2.note),
-                                      "\npush_note: ", str(pub2.push_note)))
-    return {"verdict": "failed-preserved", "stage": "land", "why": pub2.note,
+                     content=F.concat("land retry failed\nwhy: ", str(land_push2.why),
+                                      "\nnote: ", str(land_push2.note)))
+    return {"verdict": "failed-preserved", "stage": "land", "why": land_push2.why,
             "preserved": True}
 
 
@@ -747,6 +904,7 @@ CHILDFLOW_BY_NODE = {
     "g1": "gate_once", "g2": "gate_once", "g3": "gate_once",
     "g1b": "gate_once", "g2b": "gate_once", "g3b": "gate_once",
     "lg1": "gate_once", "lg2": "gate_once", "lg3": "gate_once",
+    "rg1": "gate_once", "rg2": "gate_once", "rg3": "gate_once",
 }
 
 

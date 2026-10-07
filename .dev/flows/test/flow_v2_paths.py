@@ -139,11 +139,16 @@ def _main_repo_of(wt: str) -> str:
 
 
 def _add_origin(repo: Path, root: Path) -> None:
-    """land 场景前置：加裸仓 origin 并推 main（land_rebase 要 fetch origin）。"""
+    """land 场景前置：加裸仓 origin 并推 main（land_rebase/land_push 要 fetch/push origin）。
+
+    幂等：origin 已存在（make_repo 已建）则只确保 main 已推。"""
     origin = root / "origin.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)],
-                   check=True, capture_output=True)
-    _git(repo, "remote", "add", "origin", str(origin))
+    r = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)],
+                       check=True, capture_output=True)
+        _git(repo, "remote", "add", "origin", str(origin))
     _git(repo, "push", "-q", "-u", "origin", "main")
 
 
@@ -198,6 +203,9 @@ def make_repo(legacy_branch: str | None = None) -> tuple[Path, Path]:
         (repo / "inherited.txt").write_text("prior work\n")
         git("add", "-A"); git("commit", "-qm", "prior attempt")
         git("checkout", "-q", "main")
+    # 2026-10-07：land 走 origin 直推（land_push 真代码）——fixture 一律带真实
+    # origin：preflight 的 origin 基线解析、land_push 的直推/护栏全程可真跑。
+    _add_origin(repo, root)
     return repo, root
 
 
@@ -354,28 +362,28 @@ def s10_全新run会话存储存在但不取():
 
 
 def _land_fixture(landfix: str, gates: dict | None = None) -> dict:
-    """land 场景公共装配：真冲突 + ff 先败（pub）后成（pub2）。
+    """land 场景公共装配：真冲突 + 首次直推必败（origin 已前进）→ rebase 后重推。
+
+    2026-10-07 origin 化：GIT_PUBLISH 只做 commit（merge_mode=none），推送/落地走
+    land_push/land_push2 **真代码**（真 git origin）——「ff 先败」由 fixture 的
+    `_make_land_conflict`（main 侧真前进并推 origin）自然造成，不再用桩脚本模拟。
 
     gates：逐道门的退出码序列（默认全绿）；复检复用同一序列——[0, 1] 即
     「首检绿、land 复检红」（#144 失败路径）。"""
     repo, root = make_repo()
-    _add_origin(repo, root)
     AGENT_SCRIPT.update({"impl": "@LAND_CONFLICT", "review": "VERDICT:PASS",
                          "landfix": landfix})
     GATE_SCRIPT.update(gates or {"fmt": [0], "clippy": [0], "test": [0]})
-    PUBLISH_SCRIPT[:] = [
-        dict(PUBLISH_RESULT, merged=False, note="stub-ff-failed"),
-        dict(PUBLISH_RESULT, merged=True, note="stub-retry")]
-    return run_flow(repo, root)
+    return run_flow(repo, root) | {"_repo": str(repo), "_root": str(root)}
 
 
 def s30_land冲突_当轮修复环解掉_重推committed():
     """#137 主路：rebase 冲突 → 当轮 AGENTRUN 就地解 → rebase 推完 → 重推 committed。
 
     判据：无重派（同一 run 内 committed）、修复环节点被调、现场落 land-failure.log、
-    rebase 后 origin/main 是 HEAD 祖先。"""
+    rebase 后 origin/main 是 HEAD 祖先、**origin/main 真被推入分支侧内容**（直推生效）。"""
     v = _land_fixture("@RESOLVE")
-    assert v["verdict"] == "committed" and v["via"] == "git-publish-retry", v
+    assert v["verdict"] == "committed" and v["via"] == "direct-push-retry", v
     rd = Path(v["_run_dir"])
     wt = rd / "worktree"
     log = rd / "land-failure.log"
@@ -384,13 +392,15 @@ def s30_land冲突_当轮修复环解掉_重推committed():
     assert "unmerged files" in txt and "README.md" in txt, txt[:400]
     fix_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "land_fix"]
     assert len(fix_calls) == 1, f"land 修复环应恰一次 AGENTRUN: {CALLS}"
-    assert len([c for c in CALLS if c[0] == "publish"]) == 2, "冲突解完应重推一次"
-    # #144：解冲突后的树必须先复跑同一套门，才允许 pub2。
+    assert len([c for c in CALLS if c[0] == "publish"]) == 1, \
+        "GIT_PUBLISH 只做 commit（推送/落地已迁 land_push）"
+    # 重推落地证据：origin/main 顶部 = 分支侧内容（land_push2 直推真生效）
+    assert _git(v["_root"] + "/origin.git", "log", "-1", "--format=%s",
+                "main").stdout.strip() == "land conflict branch side"
+    # #144：解冲突后的树必须先复跑同一套门，才允许 land_push2。
     fix_i = next(i for i, c in enumerate(CALLS)
                  if c[0] == "agentrun" and c[1] == "land_fix")
-    pub2_i = next(i for i, c in enumerate(CALLS)
-                  if c[0] == "publish" and c[1] == "pub2")
-    landed = [c[1] for c in CALLS[fix_i:pub2_i] if c[0] == "gate"]
+    landed = [c[1] for c in CALLS[fix_i:] if c[0] == "gate"]
     assert landed == ["fmt", "clippy", "test"], \
         f"解冲突后、重推前必须复跑 fmt/clippy/test（#144）: {CALLS}"
     assert _git(wt, "merge-base", "--is-ancestor", "origin/main", "HEAD",
@@ -405,8 +415,10 @@ def s31_land冲突_修复无果_preserved保留WIP():
     wt = rd / "worktree"
     log = rd / "land-failure.log"
     assert log.exists() and "unmerged files" in log.read_text()
-    assert not [c for c in CALLS if c[0] == "publish" and c[1] == "pub2"], \
-        "冲突未解不应走到重推"
+    assert len([c for c in CALLS if c[0] == "publish"]) == 1, CALLS
+    # 未落地证据：origin/main 顶部仍是 fixture 的 main 侧提交（land_push2 未跑）
+    assert _git(v["_root"] + "/origin.git", "log", "-1", "--format=%s",
+                "main").stdout.strip() == "land conflict main side"
     assert _git(wt, "status", "--porcelain").stdout.strip() == "", "abort 后工作树应干净"
     show = _git(wt, "show", "HEAD:README.md").stdout
     assert "branch side" in show, f"分支 WIP 应保留: {show!r}"
@@ -416,7 +428,7 @@ def s31_land冲突_修复无果_preserved保留WIP():
 def s32_land冲突_agent只解不收尾_复检推完rebase():
     """agent 解了冲突但没 continue（只 add）→ land_rebase2 复检替它把 rebase 推完。"""
     v = _land_fixture("@RESOLVE_STAGED")
-    assert v["verdict"] == "committed" and v["via"] == "git-publish-retry", v
+    assert v["verdict"] == "committed" and v["via"] == "direct-push-retry", v
     wt = Path(v["_run_dir"]) / "worktree"
     assert _git(wt, "merge-base", "--is-ancestor", "origin/main", "HEAD",
                 check=False).returncode == 0, "复检应把 rebase 推完"
@@ -424,10 +436,10 @@ def s32_land冲突_agent只解不收尾_复检推完rebase():
 
 def s34_land冲突_解后门红_不发布preserved():
     """#144 主路：land_fix 解完冲突 → 复跑同源门 → 门红 → failed-preserved
-    (stage=land)，绝不走 pub2。
+    (stage=land)，绝不走 land_push2。
 
-    此前门禁位点在 impl 之后、首次 pub 之前，解冲突改的是 rebase 后的**新树**，
-    解完直接 pub2 = 把没验证过的树推上 main（#134 实证编译错直达 main、CI 全红）。
+    此前门禁位点在 impl 之后、首次落推之前，解冲突改的是 rebase 后的**新树**，
+    解完直接重推 = 把没验证过的树推上 main（#134 实证编译错直达 main、CI 全红）。
     桩制：fmt/clippy 首检与复检都绿、test 首检绿而 land 复检红——证明复跑的是
     完整同一套门，且任何一道不过即止、不再发布。"""
     v = _land_fixture("@RESOLVE", gates={"fmt": [0, 0], "clippy": [0, 0],
@@ -437,9 +449,11 @@ def s34_land冲突_解后门红_不发布preserved():
     log = Path(v["_run_dir"]) / "failure-gate-land.log"
     assert log.exists(), "land 门失败应落 failure-gate-land.log"
     assert "cargo test" in log.read_text(), log.read_text()[:400]
-    # main 不被写：pub2 绝不执行，唯一 publish 是首检 ff 失败那次。
-    assert not [c for c in CALLS if c[0] == "publish" and c[1] == "pub2"], CALLS
+    # main 不被写：land_push2 绝不执行（唯一 publish 是 commit 那次），
+    # origin/main 顶部仍是 fixture 的 main 侧提交。
     assert len([c for c in CALLS if c[0] == "publish"]) == 1, CALLS
+    assert _git(v["_root"] + "/origin.git", "log", "-1", "--format=%s",
+                "main").stdout.strip() == "land conflict main side"
     fix_i = next(i for i, c in enumerate(CALLS)
                  if c[0] == "agentrun" and c[1] == "land_fix")
     landed = [c[1] for c in CALLS[fix_i:] if c[0] == "gate"]
@@ -449,6 +463,11 @@ def s34_land冲突_解后门红_不发布preserved():
 
 def _preflight_code() -> str:
     """编译后 IR 里 preflight（pre）code 节点的源码——kill-stale 不变量断言用。"""
+    return _node_code("pre")
+
+
+def _node_code(node_id: str) -> str:
+    """编译后 IR 里任意 code 节点的源码（真代码单测用；含 childflow 内层）。"""
     def walk(nodes):
         for n in nodes:
             yield n
@@ -456,9 +475,83 @@ def _preflight_code() -> str:
             if cf:
                 yield from walk(cf.get("nodes", []))
     for n in walk(self_improve_v2.__plaita_ir__["nodes"]):
-        if n.get("id") == "pre":
+        if n.get("id") == node_id and n.get("code"):
             return n["code"]
-    raise AssertionError("IR 里找不到 preflight（pre）节点")
+    raise AssertionError(f"IR 里找不到 code 节点 {node_id}")
+
+
+def _run_code_node(node_id: str, inp: dict) -> dict:
+    """本地 exec 指定 code 节点（离线真代码验证，发布前同款做法）。"""
+    ns: dict = {}
+    exec(_node_code(node_id), ns)
+    return ns["run"](inp)
+
+
+def s35_preflight_origin基线_本地领先不捆入():
+    """2026-10-07 陷阱回归（plaita#27/#35 land 失败根因）：本地 main 领先 origin 时，
+    fresh run 的 worktree 必须基于 origin/main——否则分支捆绑未推提交 → land 必败。"""
+    repo, root = make_repo()
+    (repo / "local_only.txt").write_text("unpushed parallel work\n")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "local only (未推)")
+    local_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    origin_sha = _git(repo, "rev-parse", "origin/main").stdout.strip()
+    assert local_sha != origin_sha, "fixture 状态：本地应领先 origin"
+    rd = root / "pipeline-77-originbase"
+    rd.mkdir()
+    pre = _run_code_node("pre", {"repo": str(repo), "run_dir": str(rd), "setup": "",
+                                 "gates_spec": json.dumps({"base": "main"})})
+    assert pre["ok"], pre
+    assert pre["land_base"] == "origin/main", pre
+    wt_sha = _git(rd / "worktree", "rev-parse", "HEAD").stdout.strip()
+    assert wt_sha == origin_sha, \
+        f"worktree 应基于 origin/main（{origin_sha[:8]}），实际 {wt_sha[:8]}"
+    assert wt_sha != local_sha, "不得基于本地 HEAD（未推提交会被捆进 run 分支）"
+
+
+def s36_land_push_直推与护栏():
+    """land_push 真代码三判据：① 干净分支直推 origin/main 成功；② 非 ff（origin
+    已前进）→ ok=False（交给 rebase 重试）；③ 分支捆绑本地未推提交 → 护栏拒推
+    且 origin 不被污染（绝不代推他人提交）。"""
+    repo, root = make_repo()
+    origin = root / "origin.git"
+    # ① 干净分支（基于 origin/main）→ 直推成功
+    wt = root / "wt_clean"
+    _git(repo, "worktree", "add", "-q", "-b", "v2-clean", str(wt), "origin/main")
+    (wt / "fix.txt").write_text("fix\n")
+    _git(wt, "add", "-A"); _git(wt, "commit", "-qm", "clean work")
+    r1 = _run_code_node("land_push", {"wt": str(wt), "branch": "v2-clean",
+                                      "land_base": "origin/main", "repo": str(repo)})
+    assert r1["ok"] is True and r1["refuse"] is False, r1
+    assert _git(origin, "log", "-1", "--format=%s", "main").stdout.strip() == "clean work"
+    # ② 非 ff：分支基于旧 origin/main，上游随后前进 → 判失败（走 rebase 重试路径）
+    wt2 = root / "wt_stale"
+    _git(repo, "worktree", "add", "-q", "-b", "v2-stale", str(wt2), "origin/main")
+    (wt2 / "s.txt").write_text("s\n")
+    _git(wt2, "add", "-A"); _git(wt2, "commit", "-qm", "stale work")
+    other = root / "other"
+    subprocess.run(["git", "clone", "-q", str(origin), str(other)],
+                   check=True, capture_output=True)
+    _git(other, "config", "user.email", "o@t"); _git(other, "config", "user.name", "o")
+    (other / "up.txt").write_text("up\n")
+    _git(other, "add", "-A"); _git(other, "commit", "-qm", "upstream adv")
+    _git(other, "push", "-q", "origin", "main")
+    r2 = _run_code_node("land_push", {"wt": str(wt2), "branch": "v2-stale",
+                                      "land_base": "origin/main", "repo": str(repo)})
+    assert r2["ok"] is False and r2["refuse"] is False, r2
+    # ③ 捆绑护栏：分支基于本地 main（含未推提交）→ refuse，origin 不被污染
+    (repo / "local_only.txt").write_text("unpushed\n")
+    _git(repo, "add", "-A"); _git(repo, "commit", "-qm", "local only (未推)")
+    wt3 = root / "wt_bundled"
+    _git(repo, "worktree", "add", "-q", "-b", "v2-bundled", str(wt3), "main")
+    (wt3 / "b.txt").write_text("b\n")
+    _git(wt3, "add", "-A"); _git(wt3, "commit", "-qm", "bundled work")
+    before = _git(origin, "rev-parse", "main").stdout.strip()
+    r3 = _run_code_node("land_push", {"wt": str(wt3), "branch": "v2-bundled",
+                                      "land_base": "origin/main", "repo": str(repo)})
+    assert r3["ok"] is False and r3["refuse"] is True, r3
+    assert "捆绑" in r3["why"], r3
+    assert _git(origin, "rev-parse", "main").stdout.strip() == before, \
+        "护栏命中时 origin/main 不得被污染"
 
 
 def _spawn_fake_agent(tmp: Path, *argv: str) -> subprocess.Popen:
@@ -1136,6 +1229,8 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s31_land冲突_修复无果_preserved保留WIP,
              s32_land冲突_agent只解不收尾_复检推完rebase,
              s34_land冲突_解后门红_不发布preserved,
+             s35_preflight_origin基线_本地领先不捆入,
+             s36_land_push_直推与护栏,
              s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run,
              s18_全部prompt表达式可解析,
              s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
