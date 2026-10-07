@@ -13,7 +13,8 @@ use crate::agent::PermissionDecision;
 use crate::error::{Error, Result};
 
 use super::audit::{
-    blake3_canonical_json, truncate_for_audit, unix_millis, AuditMeta, ExitStatus, TouchedFiles,
+    blake3_canonical_json, truncate_for_audit, unix_millis, AuditMeta, ExitStatus, ToolSideEffect,
+    TouchedFiles,
 };
 use super::permission_pipeline::{self, PermissionPipeline};
 use super::registry::ToolRegistry;
@@ -51,30 +52,73 @@ fn record_touched(name: &str, args: &Value, slot: &Mutex<TouchedFiles>) {
 }
 
 impl ToolRegistry {
+    /// Goal-161: the runtime permission hook — checked before static config,
+    /// so the user gets the chance to allow/deny at call time. Returns the
+    /// arguments to dispatch with (possibly hook-transformed), or the denial.
+    async fn apply_permission_hook(&self, name: &str, arguments: Value) -> Result<Value> {
+        let Some(hook) = self.permission_hook() else {
+            return Ok(arguments);
+        };
+        match hook.check(name, &arguments).await {
+            PermissionDecision::Allow => Ok(arguments),
+            PermissionDecision::Transform(new_args) => Ok(new_args),
+            PermissionDecision::Deny(reason) => Err(Error::PermissionDenied {
+                name: name.into(),
+                reason: crate::permissions::DecisionReason::Hook { name: reason },
+            }),
+        }
+    }
+
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
-        // Goal-161: runtime permission hook — checked first, before static
-        // config, so the user gets the chance to allow/deny at call time.
-        let effective_args = if let Some(hook) = self.permission_hook() {
-            match hook.check(name, &arguments).await {
-                PermissionDecision::Allow => arguments,
-                PermissionDecision::Transform(new_args) => new_args,
-                PermissionDecision::Deny(reason) => {
-                    return Err(Error::PermissionDenied {
-                        name: name.into(),
-                        reason: crate::permissions::DecisionReason::Hook { name: reason },
-                    });
+        self.invoke_gated_with_audit(name, arguments).await.result
+    }
+
+    /// [`Self::invoke`] with the audit record kept: the hook gate, then
+    /// [`Self::invoke_with_audit`].
+    ///
+    /// The gate lives *here*, not in `invoke`, because `run_code`'s
+    /// programmatic invoker needs both halves — a nested call must be gated
+    /// exactly like a model-issued one **and** keep its `AuditMeta` (issue
+    /// #134 review: an earlier revision bought the audit record with the
+    /// permission gate, so a program's calls bypassed the session hook
+    /// whenever no `permissions` config was installed — the CLI / TUI / HTTP
+    /// default). `invoke_with_audit` stays ungated on purpose: its direct
+    /// callers in the run loop consult the hook themselves first.
+    pub(crate) async fn invoke_gated_with_audit(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> ToolDispatch {
+        match self.apply_permission_hook(name, arguments).await {
+            Ok(arguments) => self.invoke_with_audit(name, arguments).await,
+            // A denied call never reaches the tool, so the audit record is
+            // synthetic — same shape as a pipeline denial (empty `args_hash`).
+            Err(error) => {
+                let (message, truncated) = truncate_for_audit(&error.to_string());
+                let now = unix_millis();
+                ToolDispatch {
+                    result: Err(error),
+                    audit: AuditMeta {
+                        step_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+                        started_at: now,
+                        finished_at: now,
+                        args_hash: String::new(),
+                        side_effect: ToolSideEffect::External,
+                        exit_status: ExitStatus::Err { message, truncated },
+                    },
                 }
             }
-        } else {
-            arguments
-        };
-        self.invoke_with_audit(name, effective_args).await.result
+        }
     }
 
     /// Invoke a tool and return both its result and a populated
     /// [`AuditMeta`]. Callers that need to persist audit data should
     /// use this method; callers that don't can call `invoke` which
     /// discards the audit half.
+    ///
+    /// Does **not** consult the runtime permission hook: callers reaching
+    /// here directly (the run loop, resume replay) have already done so.
+    /// Programmatic calls want [`Self::invoke_gated_with_audit`].
     pub async fn invoke_with_audit(&self, name: &str, arguments: Value) -> ToolDispatch {
         // Goal-261: pre-execution permission checks are delegated to
         // `PermissionPipeline`. This method keeps only `touched_files`

@@ -59,21 +59,21 @@ use runner::{RunCodeLimits, RunProgramRequest, ToolInvoker};
 pub const RUN_CODE_TOOL_NAME: &str = "RunCode";
 
 /// Adapter that runs programmatic tool calls through the ordinary registry, so
-/// they hit the same permission pipeline, touched-files collector and
-/// change-ledger accounting as a model-issued call.
+/// they hit the same permission hook, permission pipeline, touched-files
+/// collector and change-ledger accounting as a model-issued call.
 ///
 /// The per-call [`AuditMeta`](crate::tools::AuditMeta) is built by
-/// [`ToolRegistry::invoke_with_audit`] and emitted as a tracing record. A
-/// nested call has no transcript tool-call id, so there is no
+/// [`ToolRegistry::invoke_gated_with_audit`] and emitted as a tracing record.
+/// A nested call has no transcript tool-call id, so there is no
 /// `MessageAppendedWithAudit` slot to attach it to — `invoke` would simply
 /// throw the record away and make a program's calls the one un-audited path
-/// into the registry.
+/// into the registry, while `invoke_with_audit` alone would drop the hook.
 struct RegistryInvoker(ToolRegistry);
 
 #[async_trait]
 impl ToolInvoker for RegistryInvoker {
     async fn invoke(&self, tool: &str, args: Value) -> Result<String> {
-        let dispatch = self.0.invoke_with_audit(tool, args).await;
+        let dispatch = self.0.invoke_gated_with_audit(tool, args).await;
         let audit = &dispatch.audit;
         tracing::info!(
             target: "recursive::run_code",
@@ -121,11 +121,12 @@ impl RunCode {
     /// The tool names exposed as program bindings.
     ///
     /// Only names that are portable identifiers ([`bindings`]) become
-    /// bindings; a registry entry that cannot be one — an MCP tool
-    /// (`mcp__<server>__<tool>`), a hyphenated / dotted client tool, a
-    /// reserved word — is **skipped**, never fatal. One unportable entry must
-    /// not reject the whole table and kill every `run_code` call with an
-    /// error naming a binding the program never used.
+    /// bindings; a registry entry that cannot be one — a hyphenated / dotted
+    /// client tool, an ECMAScript/Python reserved word — is **skipped**, never
+    /// fatal. One unportable entry must not reject the whole table and kill
+    /// every `run_code` call with an error naming a binding the program never
+    /// used. An MCP name is not skipped as a class: `mcp__<server>__<tool>` is
+    /// a valid identifier, so it does become a binding.
     ///
     /// [`RUN_CODE_TOOL_NAME`] is excluded: a program may not recurse into
     /// another run.
@@ -312,10 +313,11 @@ mod tests {
         assert!(out.contains("status=sandbox-unavailable"), "{out}");
     }
 
-    /// Issue #134 review: a program's calls go through `invoke_with_audit`
-    /// (which builds the audit record) rather than `invoke` (which throws it
-    /// away) — the tool result the program sees is unchanged, and a rejected
-    /// call still surfaces as an `Err` the program can catch.
+    /// Issue #134 review: a program's calls go through
+    /// `invoke_gated_with_audit` — the hook gate *and* the audit record —
+    /// rather than `invoke` (which throws the record away) — the tool result
+    /// the program sees is unchanged, and a rejected call still surfaces as an
+    /// `Err` the program can catch.
     #[tokio::test]
     async fn programmatic_calls_use_the_audited_dispatch() {
         let invoker = RegistryInvoker(registry_with(Arc::new(Double)));
@@ -326,6 +328,34 @@ mod tests {
         assert!(
             invoker.invoke("Nope", json!({})).await.is_err(),
             "an unknown binding must reject"
+        );
+    }
+
+    /// Issue #134 review: a program's calls pass the session's runtime
+    /// permission hook — the path a TUI/CLI approval prompt or an AG-UI client
+    /// tool interrupt travels. No `permissions` config is installed: the hook
+    /// gate must not depend on one (that is the CLI / TUI / HTTP default, and
+    /// an earlier revision consulted the hook only inside the pipeline's
+    /// pre-configured branch).
+    #[tokio::test]
+    async fn programmatic_calls_are_gated_by_the_permission_hook() {
+        struct Deny;
+        #[async_trait]
+        impl crate::tools::PermissionHook for Deny {
+            async fn check(&self, name: &str, _args: &Value) -> crate::agent::PermissionDecision {
+                crate::agent::PermissionDecision::Deny(format!("denied {name}"))
+            }
+        }
+
+        let registry = registry_with(Arc::new(Double)).with_permission_hook(Arc::new(Deny));
+        let invoker = RegistryInvoker(registry);
+        let err = invoker
+            .invoke("Double", json!({"n": 1}))
+            .await
+            .expect_err("the hook must deny the programmatic call");
+        assert!(
+            matches!(err, Error::PermissionDenied { .. }),
+            "expected a hook denial, got {err:?}"
         );
     }
 
@@ -415,6 +445,39 @@ return "recovered";
             started.elapsed() < Duration::from_secs(20),
             "the run was not cut short: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Issue #134 review: the wall-clock budget stays authoritative when the
+    /// program leaves a detached process holding the inherited stdout/stderr
+    /// pipes. The stderr reader used to be awaited unbounded, so a 0.4s budget
+    /// produced a ~20s call after the runtime was killed (the leftover process
+    /// kept the pipe open).
+    #[tokio::test]
+    async fn a_detached_pipe_holder_cannot_outlast_the_budget() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let tool = RunCode::new(registry_with(Arc::new(Double))).with_limits(RunCodeLimits {
+            timeout: Duration::from_millis(400),
+            ..RunCodeLimits::default()
+        });
+        let code = r#"
+const cp = await import('node:child_process');
+cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], {
+  detached: true,
+  stdio: ['ignore', 'inherit', 'inherit'],
+}).unref();
+return 'spawned';
+"#;
+        let started = std::time::Instant::now();
+        let out = tool.execute(json!({ "code": code })).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(out.contains("status=timeout"), "{out}");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "a leftover pipe holder must not stretch the call past its budget: {elapsed:?}"
         );
     }
 

@@ -2456,6 +2456,60 @@ mod tests {
         );
     }
 
+    /// Issue #134 review: the hook gates the audited path too. `run_code`'s
+    /// programmatic invoker calls `invoke_gated_with_audit`; when the gate
+    /// lived only in `invoke`, a program's nested calls bypassed the session
+    /// hook entirely. No `permissions` config here on purpose — the hook gate
+    /// must not depend on one (CLI / TUI / HTTP install no layer config).
+    #[tokio::test]
+    async fn the_hook_gates_the_audited_path_without_a_permissions_config() {
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "Alpha" }))
+            .with_permission_hook(Arc::new(DenyAllHook));
+        assert!(reg.permissions_config().is_none());
+
+        let dispatch = reg
+            .invoke_gated_with_audit("Alpha", serde_json::json!({}))
+            .await;
+        assert!(
+            matches!(
+                dispatch.result,
+                Err(crate::error::Error::PermissionDenied { .. })
+            ),
+            "{:?}",
+            dispatch.result
+        );
+        assert!(
+            matches!(
+                dispatch.audit.exit_status,
+                super::super::audit::ExitStatus::Err { .. }
+            ),
+            "a denied call must still produce an audit record: {:?}",
+            dispatch.audit
+        );
+
+        // The hook's Allow half flows through unchanged.
+        struct AllowHook;
+        #[async_trait]
+        impl PermissionHook for AllowHook {
+            async fn check(
+                &self,
+                _tool_name: &str,
+                _args: &serde_json::Value,
+            ) -> PermissionDecision {
+                PermissionDecision::Allow
+            }
+        }
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "Alpha" }))
+            .with_permission_hook(Arc::new(AllowHook));
+        let dispatch = reg
+            .invoke_gated_with_audit("Alpha", serde_json::json!({}))
+            .await;
+        assert_eq!(dispatch.result.unwrap(), "read-result");
+        assert!(!dispatch.audit.args_hash.is_empty());
+    }
+
     // ── with_policy / policy ──────────────────────────────────────────────────
 
     #[test]

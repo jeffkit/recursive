@@ -424,8 +424,21 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
         Ok(Err(_)) | Err(_) => None,
     };
 
+    // The stderr join is bounded for the same reason `child.wait` is: a
+    // program can leave a detached process holding the inherited stderr pipe,
+    // and an unbounded `await` would then let the tool call — and the agent
+    // turn — outlast the wall-clock budget it was promised (issue #134
+    // review). After the grace the reader is aborted: the runtime is already
+    // dead, so whatever is left on that pipe is not ours to wait for.
     let stderr = match stderr_task {
-        Some(task) => task.await.unwrap_or_default(),
+        Some(mut task) => match tokio::time::timeout(REAP_GRACE, &mut task).await {
+            Ok(Ok(captured)) => captured,
+            Ok(Err(_)) => String::new(),
+            Err(_) => {
+                task.abort();
+                String::new()
+            }
+        },
         None => String::new(),
     };
 
