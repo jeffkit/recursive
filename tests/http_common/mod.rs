@@ -238,6 +238,8 @@ pub fn sample_state() -> AppState {
         skills: vec![],
         storage: test_storage_dir(),
         agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        // Issue #121: no native session mirror for the shared fixtures.
+        session_mirror_root: None,
     }
 }
 
@@ -266,6 +268,8 @@ pub fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
         skills: vec![],
         storage: test_storage_dir(),
         agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        // Issue #121: no native session mirror for the shared fixtures.
+        session_mirror_root: None,
     }
 }
 
@@ -308,5 +312,18 @@ pub fn sample_state_with_storage(
         skills: vec![],
         storage,
         agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        // Issue #121: no native session mirror for the shared fixtures.
+        session_mirror_root: None,
     }
 }
+
+// ── Issue #121: the native session mirror ────────────────────────────────
+//
+// Every fixture below disables the mirror (`session_mirror_root: None`).
+// `flush_all_sessions` / idle eviction would otherwise write into whatever
+// `paths::user_sessions_dir` resolves to — the developer's real store — and
+// pointing that at a tempdir means overriding `RECURSIVE_HOME` /
+// `RECURSIVE_SESSIONS_DIR`, which are process-global and would redirect every
+// *other* concurrently-running test in this binary that resolves
+// env-derived state (`TriggerStore::default_path` → `user_workspace_dir`).
+// The mirror root is injected per `AppState` precisely so no test has to.

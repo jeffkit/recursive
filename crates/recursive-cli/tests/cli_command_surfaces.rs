@@ -194,14 +194,14 @@ fn mcp_remove_without_config_file_errors() {
 
 // ─── agents ──────────────────────────────────────────────────────────────────
 
-/// `cmd_agents -> Ok(())`: the real body prints the "no active sessions" hint.
+/// `cmd_agents -> Ok(())`: the real body prints the "nothing in flight" hint.
 #[test]
 fn agents_reports_no_active_sessions() {
     let cli = Cli::new();
     let out = cli.run(&["agents"]);
     let stdout = stdout_of(&out);
     assert!(
-        stdout.contains("No active agent sessions."),
+        stdout.contains("No in-flight agent sessions."),
         "agents printed nothing: {stdout}"
     );
 }

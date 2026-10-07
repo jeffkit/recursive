@@ -573,6 +573,7 @@ mod tests {
             skills: vec![],
             storage: Arc::new(LocalStorageBackend::new(dir)),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_mirror_root: None,
         })
     }
 

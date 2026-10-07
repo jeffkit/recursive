@@ -168,6 +168,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         });
 
         let response = app
@@ -228,6 +230,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
         let app = build_router(state);
 
@@ -521,6 +525,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
         let app = build_router(state);
 
@@ -601,6 +607,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
         let app = build_router(state);
 
@@ -688,6 +696,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
         let app = build_router(state);
 
@@ -904,6 +914,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
 
         // Create a session.
@@ -1268,6 +1280,8 @@ mod http_tests {
             skills: vec![],
             storage: storage.clone(),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
 
         // Create a session.
@@ -1392,6 +1406,8 @@ mod http_tests {
         let state = AppState {
             storage: storage.clone(),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
             ..state
         };
 
@@ -3757,6 +3773,67 @@ mod http_tests {
         );
     }
 
+    /// Issue #121: a session that closes over HTTP is mirrored into the native
+    /// session layout, so `recursive sessions list` and the resume picker see
+    /// it. The root is injected on the `AppState` (not read from the
+    /// environment), which is what lets this assertion run hermetically
+    /// alongside every other test in this binary.
+    #[tokio::test]
+    async fn graceful_shutdown_mirrors_the_session_into_the_native_layout() {
+        let mirror_root = tempfile::tempdir().expect("mirror root");
+        let dir = tempfile::tempdir().expect("storage tempdir");
+        let backend = Arc::new(recursive::storage::LocalStorageBackend::new(
+            dir.path().to_path_buf(),
+        ));
+        let mut state = sample_state_with_storage(
+            Arc::new(MockProvider::new(vec![Completion {
+                content: "hello".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            }])),
+            backend,
+        );
+        state.session_mirror_root = Some(mirror_root.path().to_path_buf());
+        let app = build_router_with_auth(state.clone(), two_caller_auth());
+
+        let id = created_session_id(&app, api_request("POST", "/sessions", "key-a", "{}")).await;
+        assert_eq!(
+            status(
+                &app,
+                api_request(
+                    "POST",
+                    &format!("/sessions/{id}/messages"),
+                    "key-a",
+                    r#"{"content":"hi"}"#,
+                )
+            )
+            .await,
+            200
+        );
+
+        recursive::http::flush_all_sessions(&state).await;
+
+        // Only the injected root was written to, and the session is there in
+        // the shape a CLI reader consumes.
+        let slug_dir = std::fs::read_dir(mirror_root.path())
+            .expect("mirror root")
+            .map(|e| e.expect("entry").path())
+            .find(|p| p.join(&id).is_dir())
+            .expect("the mirrored session must exist under the injected root");
+        let session_dir = slug_dir.join(&id);
+        let meta = recursive::session::SessionReader::load_meta(&session_dir).expect("mirror meta");
+        assert_eq!(meta.session_id, id);
+        assert_eq!(meta.goal, "hi", "the mirror carries the session's prompt");
+        let entries = recursive::session::SessionReader::load_full_history(&session_dir)
+            .expect("mirror transcript");
+        assert!(
+            !entries.is_empty(),
+            "the mirrored transcript must not be empty"
+        );
+    }
+
     /// Issue #85: a trigger that resumes a session runs turns in it
     /// server-side (as an admin identity), so registration is ownership-
     /// asserted too — otherwise the `/sessions` scoping would be cosmetic.
@@ -5229,6 +5306,8 @@ mod http_tests {
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         };
         let app = build_router(state);
         let resp = app
@@ -5770,6 +5849,8 @@ pub(crate) mod trigger_endpoints {
                 std::env::temp_dir().join(format!("trig-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            // Issue #121: no native session mirror for these fixtures.
+            session_mirror_root: None,
         }
     }
 

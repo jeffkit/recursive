@@ -403,9 +403,15 @@ enum Cmd {
     Update,
     /// Alias for `update`.
     Upgrade,
-    /// List active agent sessions (sessions in the current workspace
-    /// whose status is "active" or whose lock file is live).
-    Agents,
+    /// List agent sessions in the current workspace that look in-flight
+    /// (status "active" or a live `.lock` file), each annotated `live`
+    /// (a process still holds the lock) or `stale` (recorded active, but
+    /// no live owner).
+    Agents {
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the remote provider preset catalog (download, list, status).
     Providers {
         #[command(subcommand)]
@@ -436,11 +442,26 @@ enum ProvidersCmd {
 #[derive(Subcommand, Debug)]
 enum SessionCmd {
     /// List all session files in the workspace's session directory.
-    List,
+    List {
+        /// Emit machine-readable JSON (one entry per session, with the full
+        /// persisted `SessionMeta`) instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show details of a specific session (by path or session ID).
     Show {
         /// Path to the session JSON file, or a session ID to search for.
         session: String,
+        /// Emit machine-readable JSON (`meta` + transcript). `--tail`
+        /// narrows the transcript here too.
+        #[arg(long)]
+        json: bool,
+        /// Only print the last N transcript entries.
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+        /// Print full message content instead of the 200-char preview.
+        #[arg(long)]
+        full: bool,
     },
     /// Delete a session file or session directory.
     Delete {
@@ -940,6 +961,11 @@ async fn main() -> anyhow::Result<()> {
             // cron/webhook trigger stores derive from the same workspace).
             // One bind at startup; delivery and registration share it.
             recursive::notify::set_file_context(&config.workspace);
+            // Issue #121: resolve the native session-mirror root once, here,
+            // so session teardown mirrors into a fixed tree instead of
+            // re-reading `RECURSIVE_SESSIONS_DIR` / `RECURSIVE_HOME` from a
+            // possibly-changed environment.
+            let session_mirror_root = recursive::user_sessions_dir(&config.workspace)?;
             let state = recursive::http::AppState {
                 tools: tool_infos,
                 tool_registry: tools,
@@ -960,6 +986,9 @@ async fn main() -> anyhow::Result<()> {
                 agui_active_runs: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
                 )),
+                // Issue #121: mirror closing sessions where the CLI looks for
+                // them (`recursive sessions list` / resume).
+                session_mirror_root: Some(session_mirror_root),
             };
             // M3: spawn the session reaper so idle sessions are evicted.
             // Clone the state before consuming it for the router (both share the
@@ -1159,12 +1188,32 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Workspace { cmd } => cli::workspace::run(cmd),
         Cmd::Sessions { cmd } => match cmd {
-            SessionCmd::List => {
+            SessionCmd::List { json } => {
                 let old_sessions = recursive::session::list_sessions(&config.workspace)?;
                 let new_sessions =
                     recursive::session::SessionReader::list_sessions(&config.workspace)?;
                 let total = total_sessions(old_sessions.len(), new_sessions.len());
-                if !has_sessions(total) {
+                if json || cli.json {
+                    // Machine exit: each native session carries its full
+                    // persisted `SessionMeta` (cost / message_count /
+                    // updated_at included); legacy `.json` files only have a
+                    // path, so they are tagged by `format`.
+                    let sessions: Vec<SessionListEntry> = old_sessions
+                        .iter()
+                        .map(|p| SessionListEntry {
+                            path: p.display().to_string(),
+                            format: "legacy",
+                            meta: None,
+                        })
+                        .chain(new_sessions.iter().map(|s| SessionListEntry {
+                            path: s.display().to_string(),
+                            format: "jsonl",
+                            meta: recursive::session::SessionReader::load_meta(s).ok(),
+                        }))
+                        .collect();
+                    let view = SessionListView { total, sessions };
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                } else if !has_sessions(total) {
                     let sessions_root = recursive::user_sessions_dir(&config.workspace)
                         .unwrap_or_else(|_| config.workspace.join(".recursive").join("sessions"));
                     println!("No sessions found in {}", sessions_root.display());
@@ -1188,9 +1237,12 @@ async fn main() -> anyhow::Result<()> {
                                 .map(|n| format!("  «{n}»"))
                                 .unwrap_or_default();
                             println!(
-                                "  {}  [{}]{} {}",
+                                "  {}  [{}]  {}  {} msgs  {} tok{}  {}",
                                 s.display(),
                                 meta.status,
+                                meta.updated_at,
+                                meta.message_count,
+                                session_token_total(meta.cost.as_ref()),
                                 name_suffix,
                                 label
                             );
@@ -1201,16 +1253,40 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(())
             }
-            SessionCmd::Show { session } => {
+            SessionCmd::Show {
+                session,
+                json,
+                tail,
+                full,
+            } => {
+                let json = json || cli.json;
                 let path = cli::session::resolve_session_path(&config.workspace, &session)?;
                 if path.is_dir() {
                     // New JSONL session format (directory with transcript.jsonl + .meta.json)
                     let meta = recursive::session::SessionReader::load_meta(&path)
                         .with_context(|| format!("reading session meta: {}", path.display()))?;
-                    let entries = recursive::session::SessionReader::load_full_history(&path)
+                    let all_entries = recursive::session::SessionReader::load_full_history(&path)
                         .with_context(|| {
-                            format!("reading session transcript: {}", path.display())
-                        })?;
+                        format!("reading session transcript: {}", path.display())
+                    })?;
+                    let total = all_entries.len();
+                    let entries = tail_entries(all_entries, tail);
+
+                    if json {
+                        let transcript: Vec<serde_json::Value> = entries
+                            .iter()
+                            .map(session_entry_to_json)
+                            .collect::<anyhow::Result<_>>()?;
+                        let view = SessionShowView {
+                            path: path.display().to_string(),
+                            format: "jsonl",
+                            meta: Some(meta),
+                            session: None,
+                            transcript: Some(transcript),
+                        };
+                        println!("{}", serde_json::to_string_pretty(&view)?);
+                        return Ok(());
+                    }
 
                     println!("Session: {}", path.display());
                     println!("  session_id:      {}", meta.session_id);
@@ -1224,14 +1300,28 @@ async fn main() -> anyhow::Result<()> {
                     println!("  updated_at:      {}", meta.updated_at);
                     println!("  message_count:   {}", meta.message_count);
                     println!("  status:          {}", meta.status);
+                    println!(
+                        "  cost:            {}",
+                        format_session_cost(meta.cost.as_ref())
+                    );
                     println!();
-                    println!("Transcript ({} entries):", entries.len());
+                    if entries.len() == total {
+                        println!("Transcript ({total} entries):");
+                    } else {
+                        println!("Transcript (last {} of {total} entries):", entries.len());
+                    }
                     for (i, entry) in entries.iter().enumerate() {
                         use recursive::session::LoadedEntry;
                         match entry {
                             LoadedEntry::Message(msg) => {
-                                let preview: String = msg.content.chars().take(200).collect();
-                                let truncated = truncation_marker(msg.content.len(), 200);
+                                let (preview, truncated) = if full {
+                                    (msg.content.clone(), "")
+                                } else {
+                                    (
+                                        msg.content.chars().take(200).collect(),
+                                        truncation_marker(msg.content.len(), 200),
+                                    )
+                                };
                                 println!("  [{:>3}] {:>9}: {}{}", i, msg.role, preview, truncated);
                                 if has_tool_calls(&msg.tool_calls) {
                                     for tc in &msg.tool_calls {
@@ -1239,8 +1329,14 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(ref rc) = msg.reasoning_content {
-                                    let rp: String = rc.chars().take(100).collect();
-                                    let rt = truncation_marker(rc.len(), 100);
+                                    let (rp, rt) = if full {
+                                        (rc.clone(), "")
+                                    } else {
+                                        (
+                                            rc.chars().take(100).collect(),
+                                            truncation_marker(rc.len(), 100),
+                                        )
+                                    };
                                     println!("         reasoning: {}{}", rp, rt);
                                 }
                             }
@@ -1259,6 +1355,31 @@ async fn main() -> anyhow::Result<()> {
                     // Old single-file session format (.json)
                     let file = SessionFile::read_from(&path)
                         .with_context(|| format!("reading session: {}", path.display()))?;
+                    let total = file.transcript.len();
+                    let transcript = tail_messages(&file.transcript, tail);
+
+                    if json {
+                        // Mirror the native branch: `transcript` is the
+                        // requested window, not always the whole file.
+                        let mut session = serde_json::to_value(&file)?;
+                        if transcript.len() != total {
+                            if let Some(obj) = session.as_object_mut() {
+                                obj.insert(
+                                    "transcript".to_string(),
+                                    serde_json::to_value(&transcript)?,
+                                );
+                            }
+                        }
+                        let view = SessionShowView {
+                            path: path.display().to_string(),
+                            format: "legacy",
+                            meta: None,
+                            session: Some(session),
+                            transcript: None,
+                        };
+                        println!("{}", serde_json::to_string_pretty(&view)?);
+                        return Ok(());
+                    }
 
                     println!("Session: {}", path.display());
                     println!("  schema_version:  {}", file.schema_version);
@@ -1267,18 +1388,28 @@ async fn main() -> anyhow::Result<()> {
                     println!("  provider:        {}", file.provider);
                     println!("  tool_registry:   {}", file.tool_registry_hash);
                     println!("  steps_consumed:  {}", file.steps_consumed);
-                    println!("  transcript_len:  {}", file.transcript.len());
+                    println!("  transcript_len:  {}", total);
                     println!();
-                    println!("Transcript:");
-                    for (i, msg) in file.transcript.iter().enumerate() {
+                    if transcript.len() == total {
+                        println!("Transcript:");
+                    } else {
+                        println!("Transcript (last {} of {total} entries):", transcript.len());
+                    }
+                    for (i, msg) in transcript.iter().enumerate() {
                         let role = match msg.role {
                             recursive::Role::System => "system",
                             recursive::Role::User => "user",
                             recursive::Role::Assistant => "assistant",
                             recursive::Role::Tool => "tool",
                         };
-                        let preview: String = msg.content.chars().take(200).collect();
-                        let truncated = truncation_marker(msg.content.len(), 200);
+                        let (preview, truncated) = if full {
+                            (msg.content.clone(), "")
+                        } else {
+                            (
+                                msg.content.chars().take(200).collect(),
+                                truncation_marker(msg.content.len(), 200),
+                            )
+                        };
                         println!("  [{:>3}] {:>9}: {}{}", i, role, preview, truncated);
                         if has_tool_calls(&msg.tool_calls) {
                             for tc in &msg.tool_calls {
@@ -1473,7 +1604,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Doctor { probe } => cmd_doctor(&config, cli.mcp_config, probe).await,
         Cmd::Mcp { cmd } => cmd_mcp(cmd, &config.workspace).await,
         Cmd::Update | Cmd::Upgrade => cmd_update().await,
-        Cmd::Agents => cmd_agents(&config.workspace),
+        Cmd::Agents { json } => cmd_agents(&config.workspace, json || cli.json),
         Cmd::Providers { cmd } => cmd_providers(cmd).await,
     }
 }
@@ -1889,42 +2020,100 @@ async fn cmd_update() -> anyhow::Result<()> {
 
 // ─── agents ──────────────────────────────────────────────────────────────────
 
-fn cmd_agents(workspace: &std::path::Path) -> anyhow::Result<()> {
+/// One in-flight-looking session as reported by `recursive agents`.
+#[derive(serde::Serialize)]
+struct AgentRow {
+    session_id: String,
+    dir: String,
+    status: String,
+    /// A live process currently holds this session's `.lock`. `false` with
+    /// `status == "active"` means the recorded owner died.
+    live: bool,
+    updated_at: String,
+    message_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    prompt: String,
+}
+
+/// Liveness of a session for `recursive agents`.
+///
+/// `None` = not worth reporting: the session finished cleanly (status is not
+/// `Active`) and nobody holds its `.lock`. `Some("live")` = a process holds
+/// the lock. `Some("stale")` = the recorded status is still `Active` but no
+/// live owner exists — a crashed run whose status was never finalised (P0-1).
+fn agent_liveness(status: &SessionStatus, has_live_lock: bool) -> Option<&'static str> {
+    if has_live_lock {
+        Some("live")
+    } else if *status == SessionStatus::Active {
+        Some("stale")
+    } else {
+        None
+    }
+}
+
+fn cmd_agents(workspace: &std::path::Path, json: bool) -> anyhow::Result<()> {
     let sessions = recursive::session::SessionReader::list_sessions(workspace).unwrap_or_default();
 
-    let active: Vec<_> = sessions
+    let rows: Vec<AgentRow> = sessions
         .iter()
         .filter_map(|dir| {
             let meta = recursive::session::SessionReader::load_meta(dir).ok()?;
-            if meta.status == SessionStatus::Active {
-                Some((dir, meta))
-            } else {
-                None
-            }
+            // Report a session that *looks* in-flight: the owning process
+            // still holds the `.lock`, or its recorded status is `Active`.
+            // The two differ — a crashed run leaves `status = Active` behind
+            // with no live lock (P0-1), so `live` tells the running session
+            // and the corpse apart instead of printing them identically.
+            let has_live_lock = recursive::session::locked_by_live_process(dir);
+            let liveness = agent_liveness(&meta.status, has_live_lock)?;
+            let prompt = meta
+                .last_prompt
+                .clone()
+                .unwrap_or_else(|| meta.goal.clone());
+            Some(AgentRow {
+                session_id: meta.session_id,
+                dir: dir.display().to_string(),
+                status: meta.status.to_string(),
+                live: liveness == "live",
+                updated_at: meta.updated_at,
+                message_count: meta.message_count,
+                name: meta.name,
+                prompt,
+            })
         })
         .collect();
 
-    if active.is_empty() {
-        println!("No active agent sessions.");
+    if json {
+        #[derive(serde::Serialize)]
+        struct AgentListView {
+            count: usize,
+            agents: Vec<AgentRow>,
+        }
+        let view = AgentListView {
+            count: rows.len(),
+            agents: rows,
+        };
+        println!("{}", serde_json::to_string_pretty(&view)?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("No in-flight agent sessions.");
         println!("hint: start a session with `recursive run <goal>` or `recursive repl`");
     } else {
-        println!("Active agent sessions ({}):", active.len());
-        for (dir, meta) in &active {
-            let label = meta
+        println!("In-flight agent sessions ({}):", rows.len());
+        for r in &rows {
+            let liveness = if r.live { "live" } else { "stale" };
+            let label = r
                 .name
                 .as_deref()
                 .map(|n| format!("  «{n}»"))
                 .unwrap_or_default();
-            let prompt = meta
-                .last_prompt
-                .as_deref()
-                .or(Some(meta.goal.as_str()))
-                .unwrap_or("(no prompt)");
             println!(
-                "  {}{}  [{}]  {}",
-                meta.session_id, label, meta.updated_at, prompt
+                "  {}{}  [{} {}]  {}  {}",
+                r.session_id, label, r.status, liveness, r.updated_at, r.prompt
             );
-            println!("    dir: {}", dir.display());
+            println!("    dir: {}", r.dir);
         }
     }
     Ok(())
@@ -2142,6 +2331,117 @@ fn truncation_marker(len: usize, limit: usize) -> &'static str {
 /// Whether a transcript entry carries tool calls (whose ids are also printed).
 fn has_tool_calls(calls: &[recursive::llm::ToolCall]) -> bool {
     !calls.is_empty()
+}
+
+/// One session as emitted by `sessions list --json`.
+#[derive(serde::Serialize)]
+struct SessionListEntry {
+    path: String,
+    /// `jsonl` (native slug directory) or `legacy` (single-file `.json`).
+    format: &'static str,
+    /// Full persisted metadata; `None` only for legacy single-file sessions,
+    /// which carry no `.meta.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<recursive::session::SessionMeta>,
+}
+
+/// Payload of `sessions list --json`.
+#[derive(serde::Serialize)]
+struct SessionListView {
+    total: usize,
+    sessions: Vec<SessionListEntry>,
+}
+
+/// Payload of `sessions show --json`. Exactly one of `session` (legacy
+/// single-file) / `transcript` (native) is present, keyed off `format`.
+#[derive(serde::Serialize)]
+struct SessionShowView {
+    path: String,
+    format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<recursive::session::SessionMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript: Option<Vec<serde_json::Value>>,
+}
+
+/// Serialize one on-disk history entry for `sessions show --json`. Messages
+/// keep every persisted field (id/uuid/timestamp/usage/audit); compaction
+/// boundaries surface as their own `type`.
+fn session_entry_to_json(
+    entry: &recursive::session::LoadedEntry,
+) -> anyhow::Result<serde_json::Value> {
+    use recursive::session::LoadedEntry;
+    Ok(match entry {
+        LoadedEntry::Message(m) => serde_json::json!({
+            "type": "message",
+            "message": serde_json::to_value(m)?,
+        }),
+        LoadedEntry::CompactBoundary { turn, removed } => serde_json::json!({
+            "type": "compact_boundary",
+            "turn": turn,
+            "removed": removed,
+        }),
+    })
+}
+
+/// Apply `sessions show --tail`: keep only the last N entries. `None` (or a
+/// value >= the length) keeps everything.
+fn tail_entries(
+    entries: Vec<recursive::session::LoadedEntry>,
+    tail: Option<usize>,
+) -> Vec<recursive::session::LoadedEntry> {
+    match tail {
+        Some(n) if n < entries.len() => {
+            let start = entries.len() - n;
+            entries[start..].to_vec()
+        }
+        _ => entries,
+    }
+}
+
+/// Apply `sessions show --tail` to a legacy single-file transcript.
+fn tail_messages(messages: &[recursive::Message], tail: Option<usize>) -> Vec<recursive::Message> {
+    match tail {
+        Some(n) if n < messages.len() => messages[messages.len() - n..].to_vec(),
+        _ => messages.to_vec(),
+    }
+}
+
+/// Total tokens recorded for a session, for the `sessions list` column.
+///
+/// Sums every billed bucket. Reasoning tokens are a separate bucket here
+/// (Goal 273) and are billed at the output rate
+/// (`ModelPricing::cost_usd`), so they are added too. `0` when no usage was
+/// persisted.
+fn session_token_total(cost: Option<&recursive::session::SessionCost>) -> u64 {
+    match cost {
+        Some(c) => {
+            c.total_input_tokens
+                + c.total_output_tokens
+                + c.total_cache_creation_tokens
+                + c.total_cache_read_tokens
+                + c.total_reasoning_tokens
+        }
+        None => 0,
+    }
+}
+
+/// Human `sessions show` cost line, or a placeholder when nothing was recorded.
+fn format_session_cost(cost: Option<&recursive::session::SessionCost>) -> String {
+    match cost {
+        Some(c) => format!(
+            "in={} out={} cache_create={} cache_read={} reasoning={} ({} tok)",
+            c.total_input_tokens,
+            c.total_output_tokens,
+            c.total_cache_creation_tokens,
+            c.total_cache_read_tokens,
+            c.total_reasoning_tokens,
+            session_token_total(Some(c)),
+        ),
+        None => "(no usage recorded)".to_string(),
+    }
 }
 
 /// Deleting a session asks for confirmation unless `--force` was passed.
@@ -4134,6 +4434,140 @@ mod tests {
     fn has_sessions_is_false_only_for_an_empty_list() {
         assert!(!has_sessions(0));
         assert!(has_sessions(1));
+    }
+
+    #[test]
+    fn agent_liveness_flags_live_stale_and_finished() {
+        // A held lock wins regardless of the recorded status.
+        assert_eq!(agent_liveness(&SessionStatus::Active, true), Some("live"));
+        assert_eq!(
+            agent_liveness(&SessionStatus::Completed, true),
+            Some("live")
+        );
+        // Recorded active but no live owner is a corpse (P0-1), not a run.
+        assert_eq!(agent_liveness(&SessionStatus::Active, false), Some("stale"));
+        // Cleanly finished and unheld: nothing to report.
+        assert_eq!(agent_liveness(&SessionStatus::Completed, false), None);
+        assert_eq!(agent_liveness(&SessionStatus::Crashed, false), None);
+    }
+
+    #[test]
+    fn session_token_total_sums_every_billed_bucket() {
+        use recursive::session::SessionCost;
+        assert_eq!(session_token_total(None), 0);
+        let cost = SessionCost {
+            total_input_tokens: 10,
+            total_output_tokens: 20,
+            total_cache_creation_tokens: 1,
+            total_cache_read_tokens: 2,
+            total_reasoning_tokens: 3,
+        };
+        // Reasoning is its own billed bucket (Goal 273), summed at the
+        // output rate — not a subset of `out=`.
+        assert_eq!(session_token_total(Some(&cost)), 36);
+    }
+
+    #[test]
+    fn format_session_cost_reports_each_bucket_or_a_placeholder() {
+        assert_eq!(format_session_cost(None), "(no usage recorded)");
+        let cost = recursive::session::SessionCost {
+            total_input_tokens: 10,
+            total_output_tokens: 20,
+            total_cache_creation_tokens: 1,
+            total_cache_read_tokens: 2,
+            total_reasoning_tokens: 3,
+        };
+        let rendered = format_session_cost(Some(&cost));
+        for needle in [
+            "in=10",
+            "out=20",
+            "cache_create=1",
+            "cache_read=2",
+            "reasoning=3",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "{needle} missing from {rendered}"
+            );
+        }
+        assert!(rendered.contains("(36 tok)"), "{rendered}");
+    }
+
+    fn boundary(index: usize) -> recursive::session::LoadedEntry {
+        recursive::session::LoadedEntry::CompactBoundary {
+            turn: Some(index as u32),
+            removed: index,
+        }
+    }
+
+    #[test]
+    fn tail_entries_keeps_only_the_last_n() {
+        let make = |n: usize| (0..n).map(boundary).collect::<Vec<_>>();
+        assert_eq!(tail_entries(make(3), None).len(), 3);
+        assert_eq!(tail_entries(make(3), Some(10)).len(), 3);
+        let tailed = tail_entries(make(5), Some(2));
+        assert_eq!(tailed.len(), 2);
+        // The kept window is the tail, not the head.
+        match &tailed[1] {
+            recursive::session::LoadedEntry::CompactBoundary { removed, .. } => {
+                assert_eq!(*removed, 4);
+            }
+            other => panic!("expected a boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tail_messages_keeps_only_the_last_n() {
+        let msgs: Vec<recursive::Message> = (0..5)
+            .map(|i| recursive::Message::user(format!("m{i}")))
+            .collect();
+        assert_eq!(tail_messages(&msgs, None).len(), 5);
+        assert_eq!(tail_messages(&msgs, Some(99)).len(), 5);
+        let tailed = tail_messages(&msgs, Some(3));
+        assert_eq!(tailed.len(), 3);
+        assert_eq!(tailed[0].content, "m2");
+    }
+
+    #[test]
+    fn sessions_and_agents_accept_the_json_and_show_flags() {
+        let cli = Cli::parse_from(vec!["recursive", "sessions", "list", "--json"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Sessions {
+                cmd: SessionCmd::List { json: true }
+            })
+        ));
+
+        let cli = Cli::parse_from(vec![
+            "recursive",
+            "sessions",
+            "show",
+            "abc",
+            "--json",
+            "--tail",
+            "5",
+            "--full",
+        ]);
+        match cli.cmd {
+            Some(Cmd::Sessions {
+                cmd:
+                    SessionCmd::Show {
+                        session,
+                        json,
+                        tail,
+                        full,
+                    },
+            }) => {
+                assert_eq!(session, "abc");
+                assert!(json);
+                assert_eq!(tail, Some(5));
+                assert!(full);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::parse_from(vec!["recursive", "agents", "--json"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Agents { json: true })));
     }
 
     #[test]

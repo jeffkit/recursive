@@ -354,3 +354,269 @@ fn replay_resume_from_orphans_abort_refuses_the_run() {
         "the refusal must land before the run starts, got:\n{stderr}"
     );
 }
+
+// ── issue #121: sessions --json / show cost+tail / agents liveness ──────────
+
+/// A valid `.meta.json` payload (every required `SessionMeta` field present).
+fn native_meta(id: &str, status: &str) -> String {
+    format!(
+        r#"{{"session_id":"{id}","goal":"goal-{id}","model":"m","provider":"p","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","message_count":2,"status":"{status}","cost":{{"total_input_tokens":10,"total_output_tokens":5}}}}"#
+    )
+}
+
+/// A native session directory with a valid meta and a 2-message transcript.
+fn jsonl_session_with_meta(root: &Path, slug: &str, id: &str, meta: &str) -> std::path::PathBuf {
+    let dir = root.join(slug).join(id);
+    std::fs::create_dir_all(&dir).expect("mkdir session dir");
+    std::fs::write(dir.join(".meta.json"), meta).expect("write meta");
+    std::fs::write(
+        dir.join("transcript.jsonl"),
+        "{\"id\":\"msg_001\",\"role\":\"user\",\"content\":\"hello\",\"timestamp\":\"t\"}\n\
+         {\"id\":\"msg_002\",\"role\":\"assistant\",\"content\":\"world\",\"timestamp\":\"t\"}\n",
+    )
+    .expect("write transcript");
+    dir
+}
+
+#[test]
+fn sessions_list_json_emits_the_persisted_meta() {
+    let rig = Rig::new();
+    jsonl_session_with_meta(
+        rig.sessions_root(),
+        "workspace-slug",
+        "sess-json",
+        &native_meta("sess-json", "completed"),
+    );
+
+    let out = rig.run(&["sessions", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "sessions list --json failed: {:?}",
+        stderr_of(&out)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(stdout_of(&out).trim()).expect("list --json must emit JSON");
+    assert_eq!(value["total"], 1);
+    assert_eq!(value["sessions"][0]["format"], "jsonl");
+    assert_eq!(value["sessions"][0]["meta"]["session_id"], "sess-json");
+    assert_eq!(value["sessions"][0]["meta"]["message_count"], 2);
+    assert_eq!(
+        value["sessions"][0]["meta"]["status"], "completed",
+        "the full SessionMeta must survive into the machine output"
+    );
+}
+
+#[test]
+fn sessions_show_json_reports_cost_and_the_full_transcript() {
+    let rig = Rig::new();
+    let dir = jsonl_session_with_meta(
+        rig.sessions_root(),
+        "slug",
+        "sess-show",
+        &native_meta("sess-show", "completed"),
+    );
+
+    let out = rig.run(&[
+        "sessions",
+        "show",
+        dir.to_str().expect("utf8 path"),
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "sessions show --json failed: {:?}",
+        stderr_of(&out)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(stdout_of(&out).trim()).expect("show --json must emit JSON");
+    assert_eq!(value["meta"]["session_id"], "sess-show");
+    // The recorded cost must not be dropped (the pre-#121 gap).
+    assert_eq!(value["meta"]["cost"]["total_input_tokens"], 10);
+    assert_eq!(value["meta"]["cost"]["total_output_tokens"], 5);
+    let transcript = value["transcript"]
+        .as_array()
+        .expect("transcript array in show --json");
+    assert_eq!(transcript.len(), 2);
+    assert_eq!(transcript[0]["type"], "message");
+    assert_eq!(transcript[0]["message"]["content"], "hello");
+}
+
+#[test]
+fn sessions_show_tail_limits_the_printed_window() {
+    let rig = Rig::new();
+    let dir = jsonl_session_with_meta(
+        rig.sessions_root(),
+        "slug",
+        "sess-tail",
+        &native_meta("sess-tail", "completed"),
+    );
+
+    let out = rig.run(&[
+        "sessions",
+        "show",
+        dir.to_str().expect("utf8 path"),
+        "--tail",
+        "1",
+    ]);
+    let stdout = stdout_of(&out);
+    assert!(
+        out.status.success(),
+        "show --tail failed: {:?}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout.contains("Transcript (last 1 of 2 entries):"),
+        "--tail 1 must narrow the transcript to the last entry, got:\n{stdout}"
+    );
+    assert!(stdout.contains("world"), "the tail entry must be printed");
+    assert!(
+        !stdout.contains("hello"),
+        "the dropped head entry must not be printed, got:\n{stdout}"
+    );
+}
+
+/// A legacy single-file session with a 3-message transcript.
+fn legacy_session_with_transcript(root: &Path, name: &str) -> std::path::PathBuf {
+    let path = root.join(name);
+    std::fs::write(
+        &path,
+        r#"{
+  "schema_version": 1,
+  "goal": "g",
+  "model": "m",
+  "provider": "p",
+  "tool_registry_hash": "h",
+  "steps_consumed": 0,
+  "transcript": [
+    {"role": "user", "content": "one"},
+    {"role": "assistant", "content": "two"},
+    {"role": "user", "content": "three"}
+  ]
+}"#,
+    )
+    .expect("write legacy session");
+    path
+}
+
+#[test]
+fn sessions_show_legacy_tail_reports_the_window_and_the_full_length() {
+    let rig = Rig::new();
+    let path = legacy_session_with_transcript(rig.sessions_root(), "legacy-tail.json");
+
+    let out = rig.run(&[
+        "sessions",
+        "show",
+        path.to_str().expect("utf8 path"),
+        "--tail",
+        "2",
+    ]);
+    let stdout = stdout_of(&out);
+    assert!(
+        out.status.success(),
+        "legacy show --tail failed: {:?}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout.contains("transcript_len:  3"),
+        "the printed length must stay the full file length, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Transcript (last 2 of 3 entries):"),
+        "legacy --tail must announce the window, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("one"),
+        "the dropped head entry must not be printed, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn sessions_show_legacy_json_honors_tail() {
+    let rig = Rig::new();
+    let path = legacy_session_with_transcript(rig.sessions_root(), "legacy-json-tail.json");
+
+    let out = rig.run(&[
+        "sessions",
+        "show",
+        path.to_str().expect("utf8 path"),
+        "--json",
+        "--tail",
+        "2",
+    ]);
+    assert!(
+        out.status.success(),
+        "legacy show --json --tail failed: {:?}",
+        stderr_of(&out)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(stdout_of(&out).trim()).expect("show --json must emit JSON");
+    let transcript = value["session"]["transcript"]
+        .as_array()
+        .expect("legacy transcript array");
+    assert_eq!(
+        transcript.len(),
+        2,
+        "--json must apply --tail instead of returning the whole file"
+    );
+    assert_eq!(transcript[0]["content"], "two");
+    assert_eq!(transcript[1]["content"], "three");
+}
+
+#[test]
+fn agents_separates_live_stale_and_finished_sessions() {
+    let rig = Rig::new();
+    let root = rig.sessions_root();
+    // Recorded active but no live lock: a crashed run (P0-1) → stale.
+    jsonl_session_with_meta(
+        root,
+        "slug",
+        "sess-stale",
+        &native_meta("sess-stale", "active"),
+    );
+    // A lock held by another host is not ours to judge → live.
+    let live = jsonl_session_with_meta(
+        root,
+        "slug",
+        "sess-live",
+        &native_meta("sess-live", "completed"),
+    );
+    std::fs::write(live.join(".lock"), "12345\ndefinitely-another-host\n0\n")
+        .expect("write live lock");
+    // Cleanly finished, no lock → not reported at all.
+    jsonl_session_with_meta(
+        root,
+        "slug",
+        "sess-done",
+        &native_meta("sess-done", "completed"),
+    );
+
+    let out = rig.run(&["agents", "--json"]);
+    assert!(
+        out.status.success(),
+        "agents --json failed: {:?}",
+        stderr_of(&out)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(stdout_of(&out).trim()).expect("agents --json must emit JSON");
+    assert_eq!(
+        value["count"], 2,
+        "only in-flight-looking sessions are listed"
+    );
+
+    let agents = value["agents"].as_array().expect("agents array");
+    let find = |id: &str| agents.iter().find(|a| a["session_id"] == id);
+    assert_eq!(
+        find("sess-stale").expect("stale session listed")["live"],
+        false,
+        "an active status with no lock is stale, not live"
+    );
+    assert_eq!(
+        find("sess-live").expect("live session listed")["live"],
+        true,
+        "a cross-host lock holder is live"
+    );
+    assert!(
+        find("sess-done").is_none(),
+        "a finished, unheld session must not be listed"
+    );
+}

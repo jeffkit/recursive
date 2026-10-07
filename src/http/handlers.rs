@@ -2958,6 +2958,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         };
 
         let preset = resolve_session_preset(None, &state.config).expect("preset");
@@ -3023,6 +3024,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         };
 
         let preset = resolve_session_preset(None, &state.config).expect("preset");
@@ -3073,6 +3075,7 @@ mod tests {
                 root.join("storage"),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         }
     }
 
@@ -3339,6 +3342,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         });
 
         let body = serde_json::json!({
@@ -3420,6 +3424,7 @@ mod tests {
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-agui-prompt-test-{}", std::process::id())),
@@ -3798,6 +3803,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         });
 
         // Acquire the runtime mutex to simulate a busy runtime.
@@ -3895,6 +3901,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         });
         (state, runtime_arc)
     }
@@ -4145,6 +4152,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -4199,6 +4207,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         });
         let output = metrics_handler(State(state)).await;
         assert!(
@@ -4262,6 +4271,7 @@ mod tests {
             skills: vec![],
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         })
     }
 
@@ -4942,6 +4952,7 @@ mod tests {
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         };
 
         let auth = crate::http::auth::AuthConfig::default();
@@ -5630,6 +5641,7 @@ mod tests {
                     .join(format!("recursive-agui-seed-test-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         };
         let app = crate::http::build_router_with_auth_and_rate_limit(
             state,
@@ -5756,6 +5768,7 @@ mod tests {
                 std::env::temp_dir().join(format!("recursive-agui-cancel-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         });
 
         let token = tokio_util::sync::CancellationToken::new();
@@ -5854,6 +5867,7 @@ mod tests {
                 std::env::temp_dir().join(format!("recursive-agui-stream-{}", std::process::id())),
             )),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         };
         let app = crate::http::build_router_with_auth_and_rate_limit(
             state,

@@ -13,6 +13,7 @@ mod environment_binding_tests;
 mod handlers;
 mod metrics;
 mod rate_limit;
+mod session_mirror;
 pub mod triggers;
 mod usage;
 
@@ -75,6 +76,8 @@ use crate::runtime::AgentRuntime;
 use crate::storage::StorageBackend;
 use crate::tools::plan_mode::PlanApprovalGate;
 use crate::tools::ToolRegistry;
+use crate::Message;
+use std::path::Path;
 
 // ── Metrics ────────────────────────────────────────────────────────────────
 
@@ -684,6 +687,13 @@ pub struct AppState {
     /// per-session `interrupt_token` slot.
     pub agui_active_runs:
         Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Issue #121: root of the native session mirror
+    /// (`<root>/<workspace-slug>/<session-id>/`), or `None` to disable
+    /// mirroring. Resolved once at startup — the teardown paths
+    /// ([`evict_idle_sessions`] / [`flush_all_sessions`]) must not re-resolve
+    /// it from the environment, which can move under a running server (tests
+    /// inject a tempdir or `None` instead of pinning process-global env).
+    pub session_mirror_root: Option<std::path::PathBuf>,
 }
 
 /// Serializable tool info for the `/tools` endpoint.
@@ -1934,6 +1944,57 @@ pub fn spawn_session_reaper(
     })
 }
 
+/// Issue #121: mirror a closing HTTP session into the native session layout so
+/// the CLI (`recursive sessions list`, the resume picker) sees it — the same
+/// treatment #57 gave AG-UI threads ([`crate::agui_session`]). See
+/// [`session_mirror`]; the flat `StorageBackend` transcript stays authoritative
+/// for cold load, so this is best-effort.
+///
+/// Both call sites pass [`crate::session::SessionStatus::Completed`]: the
+/// mirror only runs after the runtime was closed, so a mirrored session is
+/// never in flight.
+fn mirror_closing_session(
+    mirror_root: Option<&Path>,
+    workspace: &Path,
+    model: &str,
+    provider: &str,
+    session: &SessionState,
+    transcript: &[Message],
+    status: crate::session::SessionStatus,
+) {
+    // Issue #121: `None` = mirroring disabled for this server (see
+    // `AppState::session_mirror_root`).
+    let Some(root) = mirror_root else {
+        return;
+    };
+    let prompt = session.prompt_tokens.load(Ordering::Relaxed);
+    let completion = session.completion_tokens.load(Ordering::Relaxed);
+    let cost = if prompt == 0 && completion == 0 {
+        None
+    } else {
+        Some(crate::session::SessionCost {
+            total_input_tokens: prompt,
+            total_output_tokens: completion,
+            ..Default::default()
+        })
+    };
+    session_mirror::mirror_session(
+        root,
+        &session_mirror::MirrorInput {
+            workspace,
+            id: &session.id,
+            created_at: &session.created_at,
+            transcript,
+            model,
+            provider,
+            preset: None,
+            name: session.title.as_deref(),
+            cost,
+            status,
+        },
+    );
+}
+
 /// One host-layer eviction sweep.
 ///
 /// Goal 395 moved the sweep into [`SessionHost::evict_idle`] (busy sessions are
@@ -1955,6 +2016,10 @@ pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
             |session| {
                 let storage = state.storage.clone();
                 let metrics = state.metrics.clone();
+                let workspace = state.config.workspace.clone();
+                let model = state.config.model.clone();
+                let provider = state.config.provider_type.clone();
+                let mirror_root = state.session_mirror_root.clone();
                 async move {
                     if let Ok(mut rt) = session.runtime.try_lock() {
                         rt.close(None).await;
@@ -1977,6 +2042,18 @@ pub(super) async fn evict_idle_sessions(state: &AppState) -> Vec<String> {
                                 "reaper: failed to persist session transcript"
                             );
                         }
+                        // Issue #121: also mirror into the native session
+                        // layout so the CLI (`sessions list` / resume) sees
+                        // this HTTP session.
+                        mirror_closing_session(
+                            mirror_root.as_deref(),
+                            &workspace,
+                            &model,
+                            &provider,
+                            &session,
+                            &transcript,
+                            crate::session::SessionStatus::Completed,
+                        );
                     }
                 }
             },
@@ -2043,6 +2120,16 @@ pub async fn flush_all_sessions(state: &AppState) -> usize {
                     );
                 }
             }
+            // Issue #121: mirror into the native session layout too.
+            mirror_closing_session(
+                state.session_mirror_root.as_deref(),
+                &state.config.workspace,
+                &state.config.model,
+                &state.config.provider_type,
+                &session,
+                &transcript,
+                crate::session::SessionStatus::Completed,
+            );
         } else {
             // Issue #123: a session still mid-turn at shutdown loses
             // everything since its last teardown save. That is data loss,
@@ -2141,6 +2228,31 @@ mod goal_272_route_level_auth_bypass {
         assert!(
             protected_end.contains("rate_limit_middleware"),
             "protected sub-router must include rate_limit_middleware layer"
+        );
+    }
+}
+
+// =====================================================================
+// Issue #121 — the native session mirror is opt-in per `AppState`.
+//
+// `session_mirror_root: None` disables mirroring, which is what every test
+// fixture uses (a teardown must never write into the developer's real
+// session store, and pinning process-global env to say so perturbs
+// unrelated tests in the same binary). That makes the *production* wiring
+// load-bearing: this pins that the `recursive http` entry resolves the
+// sessions root at startup, so a refactor cannot silently leave HTTP
+// sessions invisible to `recursive sessions list`.
+// =====================================================================
+#[cfg(test)]
+mod goal_121_session_mirror_wiring {
+    #[test]
+    fn http_entry_enables_the_native_session_mirror() {
+        let src = include_str!("../../crates/recursive-cli/src/main.rs");
+        assert!(
+            src.contains("session_mirror_root: Some("),
+            "the HTTP entry must resolve `user_sessions_dir` at startup and \
+             set `session_mirror_root: Some(...)` — `None` disables the mirror \
+             (issue #121)"
         );
     }
 }
@@ -2405,6 +2517,7 @@ mod goal_396_persistence_tests {
     async fn test_state(
         host: Arc<SessionHost<SessionState>>,
         storage: Arc<dyn StorageBackend>,
+        session_mirror_root: Option<PathBuf>,
     ) -> AppState {
         AppState {
             tools: vec![],
@@ -2419,6 +2532,7 @@ mod goal_396_persistence_tests {
             skills: vec![],
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root,
         }
     }
 
@@ -2446,6 +2560,7 @@ mod goal_396_persistence_tests {
             skills: vec![],
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
         };
 
         let registry = state.session_tool_registry().await.expect("registry");
@@ -2467,7 +2582,8 @@ mod goal_396_persistence_tests {
         let host = test_host(0);
         let sessions = host.sessions();
         let storage = RecordingStorage::with_probe(sessions.clone());
-        let state = test_state(host, storage.clone()).await;
+        // Mirroring is off here (issue #121): this test asserts persistence.
+        let state = test_state(host, storage.clone(), None).await;
 
         state
             .host
@@ -2523,7 +2639,7 @@ mod goal_396_persistence_tests {
     async fn evict_counts_persist_failure_when_storage_write_fails() {
         let host = test_host(0);
         let storage: Arc<dyn StorageBackend> = Arc::new(FailingStorage);
-        let state = test_state(host, storage).await;
+        let state = test_state(host, storage, None).await;
 
         state
             .host
@@ -2550,7 +2666,7 @@ mod goal_396_persistence_tests {
     async fn flush_counts_busy_session_as_data_loss() {
         let host = test_host(0);
         let storage: Arc<dyn StorageBackend> = RecordingStorage::new();
-        let state = test_state(host, storage).await;
+        let state = test_state(host, storage, None).await;
 
         state
             .host
@@ -2583,7 +2699,7 @@ mod goal_396_persistence_tests {
     async fn evict_skips_busy_session_in_place_without_persistence() {
         let host = test_host(0);
         let storage = RecordingStorage::new();
-        let state = test_state(host, storage.clone()).await;
+        let state = test_state(host, storage.clone(), None).await;
 
         state
             .host
@@ -2620,10 +2736,19 @@ mod goal_396_persistence_tests {
 
     #[tokio::test]
     async fn flush_all_persists_and_drains_every_session() {
+        // Issue #121: the shutdown flush also mirrors into the native session
+        // layout. The root is injected — never read from the environment — so
+        // the mirror can only land under this tempdir.
+        let mirror_root = tempfile::tempdir().expect("mirror root");
         let host = test_host(0);
         let sessions = host.sessions();
         let storage = RecordingStorage::with_probe(sessions.clone());
-        let state = test_state(host, storage.clone()).await;
+        let state = test_state(
+            host,
+            storage.clone(),
+            Some(mirror_root.path().to_path_buf()),
+        )
+        .await;
 
         state
             .host
@@ -2655,6 +2780,22 @@ mod goal_396_persistence_tests {
             state.metrics.persist_failures.load(Ordering::Relaxed),
             0,
             "a clean shutdown must not report data loss"
+        );
+
+        // Issue #121: the flush mirrored `f-1` under the injected root, in the
+        // shape `recursive sessions list` / resume reads.
+        let mirrored = mirror_root
+            .path()
+            .join(crate::session::workspace_slug(&state.config.workspace))
+            .join("f-1");
+        let meta = crate::session::SessionReader::load_meta(&mirrored).expect("mirrored meta");
+        assert_eq!(meta.session_id, "f-1");
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(
+            crate::session::SessionReader::load_full_history(&mirrored)
+                .expect("mirrored transcript")
+                .len(),
+            2
         );
     }
 }

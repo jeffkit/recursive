@@ -636,8 +636,14 @@ pub struct ExportedTranscript {
     pub version: u32,
     pub session_id: String,
     pub model: String,
+    /// Provider id, e.g. `deepseek`. Mirrors `SessionMeta::provider`.
+    #[serde(default)]
+    pub provider: String,
     pub goal: String,
     pub created_at: String,
+    /// Last-write timestamp, mirrors `SessionMeta::updated_at`.
+    #[serde(default)]
+    pub updated_at: String,
     /// Status at the moment of export. Mirrors `SessionMeta::status`
     /// — the same enum is used in both structs to keep the
     /// wire shape consistent for external SDK consumers.
@@ -651,6 +657,14 @@ pub struct ExportedTranscript {
     /// Mirrors `SessionMeta::error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Resolved provider preset id at session creation time, if any
+    /// (issue #121: previously dropped from the export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Cumulative token usage recorded for the session, if any
+    /// (issue #121: previously dropped from the export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SessionCost>,
     /// Every persisted message in on-disk order, including those that
     /// were folded into a compaction summary (older `messages.len()` of
     /// these were superseded by the corresponding [`Self::compact_boundaries`]
@@ -709,11 +723,15 @@ impl ExportedTranscript {
             version: 1,
             session_id: meta.session_id,
             model: meta.model,
+            provider: meta.provider,
             goal: meta.goal,
             created_at: meta.created_at,
+            updated_at: meta.updated_at,
             status: meta.status,
             finish_reason: meta.finish_reason,
             error: meta.error,
+            preset: meta.preset,
+            cost: meta.cost,
             messages,
             compact_boundaries,
             message_count,
@@ -1874,5 +1892,38 @@ mod tests {
         assert_eq!(exported.status, SessionStatus::Crashed);
         assert_eq!(exported.finish_reason.as_deref(), Some("budget_exceeded"));
         assert_eq!(exported.error, None);
+    }
+
+    #[test]
+    fn export_carries_provider_preset_updated_at_and_cost() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create_with_tools(
+            ws,
+            "export fields",
+            "m",
+            "openai",
+            &[],
+            Some("deepseek"),
+        )
+        .unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+        let usage = UsageMeta {
+            input_tokens: 7,
+            output_tokens: 3,
+            ..Default::default()
+        };
+        w.append(&Message::assistant("hi".to_string()), None, Some(&usage))
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let exported = ExportedTranscript::from_session_dir(&session_dir).unwrap();
+        assert_eq!(exported.provider, "openai");
+        assert_eq!(exported.preset.as_deref(), Some("deepseek"));
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(exported.updated_at, meta.updated_at);
+        let cost = exported.cost.expect("cost must survive the export");
+        assert_eq!(cost.total_input_tokens, 7);
+        assert_eq!(cost.total_output_tokens, 3);
     }
 }
