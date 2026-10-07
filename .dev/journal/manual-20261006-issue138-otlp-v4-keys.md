@@ -73,3 +73,36 @@ existing plaita-compatible `langfuse.trace.*` / `cost_usd` attributes:
 - `Attributes` are also attached to the root span (a `span`, not a
   `generation`); Langfuse ignores `cost_details` on non-generations, so the
   generation records remain the authoritative cost source.
+
+## Resume run (2026-10-07)
+
+Resumed from the WIP snapshot `wip-pipeline-138-1006121744` after the previous
+attempt was preserved at the `test` gate. The preserved failure was **not** a
+code defect: `cargo test --workspace` died with `rustc-LLVM ERROR: IO failure
+on output stream: No space left on device` (the host disk filled while several
+pipelines were building). No source change was needed — the collector change
+and its tests were re-verified green on a fresh worktree (276 GiB free):
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  clean (6m34s cold).
+- `cargo test --workspace` — all targets pass, including
+  `observability::collector::tests::v4_native_session_and_cost_keys_populate_grouping_and_cost`,
+  `empty_session_omits_both_session_keys` and
+  `cost_details_is_json_with_a_numeric_total`. (The workspace test build enables
+  `otel` through `crates/recursive-cli`'s dependency feature unification, so
+  these run under plain `cargo test --workspace`, not only under an explicit
+  `--features otel`.)
+- `bash .dev/scripts/agent-mutants.sh --jobs 8` — `--in-diff` scoped the run to
+  the 5 mutants in `root_record` / `step_record` / `cost_details_json`, and the
+  unmutated baseline passed. **No mutant survived**: 2 caught (`delete !` in
+  `step_record`; `cost_details_json` → `"xyzzy"`) and 2 unviable
+  (`… -> Observation with Default::default()` — no `Default` impl). The host
+  interrupted the run before the last (sibling) mutant finished, but the result
+  is what the `agent-mutants.sh` change is for: with `otel` in the feature set
+  these mutants actually compile, so the gate is no longer a blanket MISSED.
+
+Verified `cargo mutants --list` enumerates `src/observability/collector.rs`
+mutants **even without** `otel` in `--features` (cargo-mutants walks the AST,
+not the build graph) — so the missing feature really did make every
+observability mutant a no-op, exactly as claimed above.
