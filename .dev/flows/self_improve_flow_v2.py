@@ -16,7 +16,9 @@
 - 落地：GIT_PUBLISH main 模式；merged=False → worktree rebase 新 main 后重推
   一次（rebase-retry，2026-10-01）；rebase 冲突进 AGENTRUN 修复环（#137）——
   现场落 land-failure.log → 当轮 agent 就地解 → rebase 推完再重推；修复轮用尽
-  仍冲突才 failed-preserved
+  仍冲突才 failed-preserved；解完冲突的树必须复跑门（#144，门禁位点在 impl 后、
+  首次 pub 前，此前解冲突后的新树从不验证即发布）——不过即 failed-preserved
+  不发布
 
 v2 与 v1 引擎的有意差异：
 - watchdog（journal 增长/后代活性）暂由 AGENTRUN timeout_secs 硬墙替代——
@@ -642,6 +644,47 @@ def self_improve_v2(INPUT):
                                               land_rebase2.scene))
             return {"verdict": "failed-preserved", "stage": "land",
                     "why": F.concat("rebase conflict: ", land_rebase2.why)}
+        # #144：解冲突后的树从未过门——fmt/clippy/test 的位点在 impl 之后、
+        # 首次 pub 之前，land_fix 就地改的是 rebase 后的**新树**，解完直接
+        # pub2 = 把一棵没验证过的树推上 main（#134 实证：E0063/E0061 编译错
+        # 直达 main、CI 全红）。这里把同一套门（同一 gate_runner/spec，gate_once
+        # 单发）在解完冲突、rebase 推完后复跑一遍；任何一道不过即
+        # failed-preserved（stage=land），绝不走 pub2。命令/预算与 g1/g2/g3
+        # 同源，非 Rust 仓的 spec 路径下 fmt 槽即整组门。干净 rebase 路径的
+        # 重跑是另一单（#39 同类）。
+        lg1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
+                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree},
+                    flow=gate_once)
+        if lg1.passed == False:
+            wlg1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
+                             content=F.concat("gate: ", gates.fmt_name,
+                                              "\ncmd: ", gates.fmt,
+                                              "\n--- stdout ---\n", lg1.out,
+                                              "\n--- stderr ---\n", lg1.err))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "gate": lg1.gate, "out": lg1.out}
+        lg2 = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
+                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree},
+                    flow=gate_once)
+        if lg2.passed == False:
+            wlg2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
+                             content=F.concat("gate: ", gates.lint_name,
+                                              "\ncmd: ", gates.lint,
+                                              "\n--- stdout ---\n", lg2.out,
+                                              "\n--- stderr ---\n", lg2.err))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "gate": lg2.gate, "out": lg2.out}
+        lg3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
+                           "timeout_secs": gates.test_timeout, "wt": pre.worktree},
+                    flow=gate_once)
+        if lg3.passed == False:
+            wlg3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
+                             content=F.concat("gate: ", gates.test_name,
+                                              "\ncmd: ", gates.test,
+                                              "\n--- stdout ---\n", lg3.out,
+                                              "\n--- stderr ---\n", lg3.err))
+            return {"verdict": "failed-preserved", "stage": "land",
+                    "gate": lg3.gate, "out": lg3.out}
     pub2 = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
                        commit_message=F.concat("self-improve: ", goal),
                        merge_mode="main", main_clone=repo, base_branch="main")
@@ -703,6 +746,7 @@ CHILDFLOW_BY_NODE = {
     "chg": "has_changes",
     "g1": "gate_once", "g2": "gate_once", "g3": "gate_once",
     "g1b": "gate_once", "g2b": "gate_once", "g3b": "gate_once",
+    "lg1": "gate_once", "lg2": "gate_once", "lg3": "gate_once",
 }
 
 

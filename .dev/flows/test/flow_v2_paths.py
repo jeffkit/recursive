@@ -353,13 +353,16 @@ def s10_全新run会话存储存在但不取():
         f"全新 run 不应带 session: {impl_calls}"
 
 
-def _land_fixture(landfix: str) -> dict:
-    """land 场景公共装配：真冲突 + ff 先败（pub）后成（pub2）。"""
+def _land_fixture(landfix: str, gates: dict | None = None) -> dict:
+    """land 场景公共装配：真冲突 + ff 先败（pub）后成（pub2）。
+
+    gates：逐道门的退出码序列（默认全绿）；复检复用同一序列——[0, 1] 即
+    「首检绿、land 复检红」（#144 失败路径）。"""
     repo, root = make_repo()
     _add_origin(repo, root)
     AGENT_SCRIPT.update({"impl": "@LAND_CONFLICT", "review": "VERDICT:PASS",
                          "landfix": landfix})
-    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+    GATE_SCRIPT.update(gates or {"fmt": [0], "clippy": [0], "test": [0]})
     PUBLISH_SCRIPT[:] = [
         dict(PUBLISH_RESULT, merged=False, note="stub-ff-failed"),
         dict(PUBLISH_RESULT, merged=True, note="stub-retry")]
@@ -382,6 +385,14 @@ def s30_land冲突_当轮修复环解掉_重推committed():
     fix_calls = [c for c in CALLS if c[0] == "agentrun" and c[1] == "land_fix"]
     assert len(fix_calls) == 1, f"land 修复环应恰一次 AGENTRUN: {CALLS}"
     assert len([c for c in CALLS if c[0] == "publish"]) == 2, "冲突解完应重推一次"
+    # #144：解冲突后的树必须先复跑同一套门，才允许 pub2。
+    fix_i = next(i for i, c in enumerate(CALLS)
+                 if c[0] == "agentrun" and c[1] == "land_fix")
+    pub2_i = next(i for i, c in enumerate(CALLS)
+                  if c[0] == "publish" and c[1] == "pub2")
+    landed = [c[1] for c in CALLS[fix_i:pub2_i] if c[0] == "gate"]
+    assert landed == ["fmt", "clippy", "test"], \
+        f"解冲突后、重推前必须复跑 fmt/clippy/test（#144）: {CALLS}"
     assert _git(wt, "merge-base", "--is-ancestor", "origin/main", "HEAD",
                 check=False).returncode == 0, "rebase 后 origin/main 应是 HEAD 祖先"
 
@@ -409,6 +420,31 @@ def s32_land冲突_agent只解不收尾_复检推完rebase():
     wt = Path(v["_run_dir"]) / "worktree"
     assert _git(wt, "merge-base", "--is-ancestor", "origin/main", "HEAD",
                 check=False).returncode == 0, "复检应把 rebase 推完"
+
+
+def s34_land冲突_解后门红_不发布preserved():
+    """#144 主路：land_fix 解完冲突 → 复跑同源门 → 门红 → failed-preserved
+    (stage=land)，绝不走 pub2。
+
+    此前门禁位点在 impl 之后、首次 pub 之前，解冲突改的是 rebase 后的**新树**，
+    解完直接 pub2 = 把没验证过的树推上 main（#134 实证编译错直达 main、CI 全红）。
+    桩制：fmt/clippy 首检与复检都绿、test 首检绿而 land 复检红——证明复跑的是
+    完整同一套门，且任何一道不过即止、不再发布。"""
+    v = _land_fixture("@RESOLVE", gates={"fmt": [0, 0], "clippy": [0, 0],
+                                         "test": [0, 1]})
+    assert v["verdict"] == "failed-preserved" and v.get("stage") == "land", v
+    assert v.get("gate") == "test", v
+    log = Path(v["_run_dir"]) / "failure-gate-land.log"
+    assert log.exists(), "land 门失败应落 failure-gate-land.log"
+    assert "cargo test" in log.read_text(), log.read_text()[:400]
+    # main 不被写：pub2 绝不执行，唯一 publish 是首检 ff 失败那次。
+    assert not [c for c in CALLS if c[0] == "publish" and c[1] == "pub2"], CALLS
+    assert len([c for c in CALLS if c[0] == "publish"]) == 1, CALLS
+    fix_i = next(i for i, c in enumerate(CALLS)
+                 if c[0] == "agentrun" and c[1] == "land_fix")
+    landed = [c[1] for c in CALLS[fix_i:] if c[0] == "gate"]
+    assert landed == ["fmt", "clippy", "test"], \
+        f"复检应对齐 fmt/clippy/test 且 test 红即止: {CALLS}"
 
 
 def _preflight_code() -> str:
@@ -507,6 +543,7 @@ def s18_全部prompt表达式可解析():
     ctx = {"$NODE": {k: {"out": "x", "text": "x", "stdout": "x", "stderr": "x",
                           "passed": False, "gate": "g", "err": "x"}
                       for k in ("g1", "g1b", "g2", "g2b", "g3", "g3b",
+                                "lg1", "lg2", "lg3",
                                 "impl", "rev1", "rev2", "pre", "pub")}}
     ctx["$NODE"].update({"pre": {"worktree": "/wt", "branch": "b", "baseline": "h",
                                   "sys_prompt": "s", "last_sid": "", "ok": True, "why": ""},
@@ -1098,6 +1135,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s30_land冲突_当轮修复环解掉_重推committed,
              s31_land冲突_修复无果_preserved保留WIP,
              s32_land冲突_agent只解不收尾_复检推完rebase,
+             s34_land冲突_解后门红_不发布preserved,
              s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run,
              s18_全部prompt表达式可解析,
              s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
