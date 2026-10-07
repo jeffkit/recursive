@@ -1520,6 +1520,8 @@ mod tests {
         }])
         .with_errors(vec![crate::error::Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 400: context_length_exceeded, prompt is too long".into(),
         }]);
 
@@ -1574,6 +1576,8 @@ mod tests {
         for _ in 0..=MAX_PTL_RETRIES {
             errors.push(crate::error::Error::Llm {
                 provider: "mock".into(),
+                model: None,
+                request_id: None,
                 message: "HTTP 400: context_length_exceeded, prompt is too long".into(),
             });
         }
@@ -1607,6 +1611,8 @@ mod tests {
         // Non-PTL error — should NOT retry.
         let provider = MockProvider::new(vec![]).with_errors(vec![crate::error::Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 400: invalid request".into(),
         }]);
 

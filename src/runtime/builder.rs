@@ -628,7 +628,7 @@ impl AgentRuntimeBuilder {
             wakeup_store_dir: self.wakeup_store_dir,
             preset_id: self.preset_id,
             deliverables,
-            last_failed_usage: TokenUsage::default(),
+            last_failed: crate::kernel::FailureOutcome::default(),
             pending_compact_usage: TokenUsage::default(),
             worker_telemetry: self.worker_telemetry,
         };

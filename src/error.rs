@@ -13,14 +13,36 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[non_exhaustive]
 pub enum Error {
     /// LLM provider returned an error (HTTP, parse, etc.)
-    #[error("LLM error ({provider}): {message}")]
-    Llm { provider: String, message: String },
+    ///
+    /// `provider` names the adapter/endpoint that failed; `model` is the model
+    /// that was requested — they are separate fields because a failure report
+    /// must say *who* failed, not just *what* we asked for (issue #112
+    /// previously stored the model in `provider`). `request_id` carries the
+    /// provider's own request/trace id from the response headers
+    /// (`x-request-id` / `request-id` / `traceparent`) so a failed run can be
+    /// correlated with the provider's logs.
+    #[error(
+        "{}",
+        format_llm_error(provider, model.as_deref(), message, request_id.as_deref())
+    )]
+    Llm {
+        provider: String,
+        model: Option<String>,
+        message: String,
+        request_id: Option<String>,
+    },
 
     /// LLM rate limited — caller should retry after `retry_after_ms`
-    #[error("LLM rate limited ({provider}): retry after {retry_after_ms}ms")]
+    #[error(
+        "{}",
+        format_rate_limited(provider, *retry_after_ms, request_id.as_deref())
+    )]
     RateLimited {
         provider: String,
         retry_after_ms: u64,
+        /// Provider trace id from the response headers, when the adapter
+        /// captured one (issue #112).
+        request_id: Option<String>,
     },
 
     /// Tool execution failure (spawn, timeout, I/O)
@@ -165,6 +187,46 @@ pub enum Error {
     Internal { context: String, message: String },
 }
 
+/// Render an [`Error::Llm`] message: provider, optional model, the adapter
+/// message, and the provider request id when one was captured (issue #112).
+///
+/// Kept as a free function so the `thiserror` attribute stays a single
+/// `write!` and the optional fragments cannot drift between the two LLM
+/// variants (see [`format_rate_limited`]).
+fn format_llm_error(
+    provider: &str,
+    model: Option<&str>,
+    message: &str,
+    request_id: Option<&str>,
+) -> String {
+    let mut out = format!("LLM error ({provider}");
+    if let Some(model) = model {
+        out.push_str(", model=");
+        out.push_str(model);
+    }
+    out.push_str("): ");
+    out.push_str(message);
+    push_request_id(&mut out, request_id);
+    out
+}
+
+/// Render an [`Error::RateLimited`] message (issue #112), appending the
+/// provider request id when the adapter captured one.
+fn format_rate_limited(provider: &str, retry_after_ms: u64, request_id: Option<&str>) -> String {
+    let mut out = format!("LLM rate limited ({provider}): retry after {retry_after_ms}ms");
+    push_request_id(&mut out, request_id);
+    out
+}
+
+/// Append ` [request_id=<id>]` when the provider returned a trace id.
+fn push_request_id(out: &mut String, request_id: Option<&str>) {
+    if let Some(id) = request_id {
+        out.push_str(" [request_id=");
+        out.push_str(id);
+        out.push(']');
+    }
+}
+
 impl Error {
     /// Returns `true` if the error is safe to retry (rate limits, timeouts).
     pub fn is_retryable(&self) -> bool {
@@ -188,6 +250,38 @@ impl Error {
     pub fn credential_code(&self) -> Option<CredentialErrorCode> {
         match self {
             Error::Credential { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The provider's own request/trace id from response headers, when the
+    /// error carries one (issue #112).
+    ///
+    /// Present on [`Error::Llm`] / [`Error::RateLimited`] for every adapter
+    /// failure where the provider returned `x-request-id` / `request-id` /
+    /// `traceparent`. Machine consumers use it to correlate a failed run with
+    /// the provider's logs; a run with no id still surfaces the rest of the
+    /// error unchanged.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Error::Llm { request_id, .. } | Error::RateLimited { request_id, .. } => {
+                request_id.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    /// The provider adapter and model an [`Error::Llm`] names separately
+    /// (issue #112). `None` for every other variant.
+    ///
+    /// A failure report needs both: `provider` says which endpoint rejected
+    /// the call, `model` which model was asked for. The adapters used to store
+    /// the model in `provider`, so consumers could not tell them apart.
+    pub fn llm_site(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Error::Llm {
+                provider, model, ..
+            } => Some((provider, model.as_deref())),
             _ => None,
         }
     }
@@ -307,6 +401,8 @@ mod tests {
     fn test_llm_error_format() {
         let err = Error::Llm {
             provider: "openai".into(),
+            model: None,
+            request_id: None,
             message: "rate limit hit".into(),
         };
         let msg = err.to_string();
@@ -314,11 +410,68 @@ mod tests {
         assert!(msg.contains("rate limit"));
     }
 
+    /// Issue #112: provider and model are separate fields, and the provider's
+    /// request id reaches both `Display` and the `request_id()` accessor.
+    #[test]
+    fn llm_error_surfaces_provider_model_and_request_id() {
+        let err = Error::Llm {
+            provider: "deepseek".into(),
+            model: Some("deepseek-chat".into()),
+            message: "HTTP 500: upstream".into(),
+            request_id: Some("req-abc".into()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("deepseek"), "provider must appear: {msg}");
+        assert!(
+            msg.contains("model=deepseek-chat"),
+            "model must appear: {msg}"
+        );
+        assert!(
+            msg.contains("[request_id=req-abc]"),
+            "trace id must appear: {msg}"
+        );
+        assert_eq!(err.request_id(), Some("req-abc"));
+        assert_eq!(err.llm_site(), Some(("deepseek", Some("deepseek-chat"))));
+    }
+
+    /// The optional fragments are omitted, not rendered as `None`, when the
+    /// adapter has no model / the provider returned no trace id.
+    #[test]
+    fn llm_error_omits_absent_model_and_request_id() {
+        let err = Error::Llm {
+            provider: "openai".into(),
+            model: None,
+            message: "boom".into(),
+            request_id: None,
+        };
+        assert_eq!(err.to_string(), "LLM error (openai): boom");
+        assert_eq!(err.request_id(), None);
+        assert_eq!(err.llm_site(), Some(("openai", None)));
+    }
+
+    /// Issue #112: a provider 429 keeps its trace id and retry hint on the
+    /// structured `RateLimited` variant.
+    #[test]
+    fn rate_limited_reports_request_id_and_provider() {
+        let err = Error::RateLimited {
+            provider: "glm".into(),
+            retry_after_ms: 2500,
+            request_id: Some("trace-1".into()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("glm"), "provider must appear: {msg}");
+        assert!(msg.contains("2500"), "retry hint must appear: {msg}");
+        assert!(msg.contains("[request_id=trace-1]"), "trace id: {msg}");
+        assert_eq!(err.request_id(), Some("trace-1"));
+        assert_eq!(err.http_status(), Some(429));
+    }
+
     #[test]
     fn test_rate_limited_format() {
         let err = Error::RateLimited {
             provider: "deepseek".into(),
             retry_after_ms: 5000,
+            request_id: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("deepseek"));
@@ -399,7 +552,8 @@ mod tests {
     fn test_is_retryable() {
         assert!(Error::RateLimited {
             provider: "x".into(),
-            retry_after_ms: 1000
+            retry_after_ms: 1000,
+            request_id: None,
         }
         .is_retryable());
         assert!(Error::Timeout { duration_ms: 5000 }.is_retryable());
@@ -419,7 +573,8 @@ mod tests {
     fn test_is_transient() {
         assert!(Error::RateLimited {
             provider: "x".into(),
-            retry_after_ms: 1000
+            retry_after_ms: 1000,
+            request_id: None,
         }
         .is_transient());
         assert!(Error::Timeout { duration_ms: 5000 }.is_transient());
@@ -569,18 +724,23 @@ mod tests {
         // The adapters format provider failures as "HTTP <status phrase>: body".
         let err = Error::Llm {
             provider: "openai".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 429 Too Many Requests: slow down".into(),
         };
         assert_eq!(err.http_status(), Some(429));
         let err = Error::Llm {
             provider: "anthropic".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 503 Service Unavailable: upstream".into(),
         };
         assert_eq!(err.http_status(), Some(503));
         assert_eq!(
             Error::RateLimited {
                 provider: "x".into(),
-                retry_after_ms: 1
+                retry_after_ms: 1,
+                request_id: None,
             }
             .http_status(),
             Some(429)
@@ -593,6 +753,8 @@ mod tests {
         assert_eq!(
             Error::Llm {
                 provider: "x".into(),
+                model: None,
+                request_id: None,
                 message: "request failed: connection reset".into(),
             }
             .http_status(),
@@ -601,6 +763,8 @@ mod tests {
         assert_eq!(
             Error::Llm {
                 provider: "x".into(),
+                model: None,
+                request_id: None,
                 message: "upstream 5xx".into(),
             }
             .http_status(),
@@ -614,16 +778,22 @@ mod tests {
         assert!(Error::Timeout { duration_ms: 1 }.is_network_error());
         assert!(Error::Llm {
             provider: "x".into(),
+            model: None,
+            request_id: None,
             message: "request failed: error sending request for url".into(),
         }
         .is_network_error());
         assert!(Error::Llm {
             provider: "x".into(),
+            model: None,
+            request_id: None,
             message: "SSE stream read error: connection closed".into(),
         }
         .is_network_error());
         assert!(!Error::Llm {
             provider: "x".into(),
+            model: None,
+            request_id: None,
             message: "invalid tool schema".into(),
         }
         .is_network_error());
@@ -645,6 +815,8 @@ mod tests {
     fn is_transient_provider_error_classifies_retryable_statuses() {
         let llm = |msg: &str| Error::Llm {
             provider: "x".into(),
+            model: None,
+            request_id: None,
             message: msg.to_string(),
         };
         assert!(llm("HTTP 429 Too Many Requests: x").is_transient_provider_error());
@@ -675,6 +847,8 @@ mod tests {
     fn is_llm_failure_covers_only_provider_side_failures() {
         let llm = |message: &str| Error::Llm {
             provider: "openai".into(),
+            model: None,
+            request_id: None,
             message: message.into(),
         };
         for message in [
@@ -709,6 +883,7 @@ mod tests {
         assert!(Error::RateLimited {
             provider: "openai".into(),
             retry_after_ms: 1000,
+            request_id: None,
         }
         .is_llm_failure());
         assert!(!Error::Cancelled.is_llm_failure());
@@ -740,6 +915,8 @@ mod tests {
         for msg in &cases {
             let err = Error::Llm {
                 provider: "test".into(),
+                model: None,
+                request_id: None,
                 message: msg.to_string(),
             };
             assert!(
@@ -760,6 +937,8 @@ mod tests {
         for msg in &cases {
             let err = Error::Llm {
                 provider: "test".into(),
+                model: None,
+                request_id: None,
                 message: msg.to_string(),
             };
             assert!(

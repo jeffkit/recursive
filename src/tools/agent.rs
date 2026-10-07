@@ -2165,6 +2165,8 @@ allowed_tools:
         let provider: Arc<dyn ChatProvider> =
             Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
                 provider: "mock".into(),
+                model: None,
+                request_id: None,
                 message: "injected failure for deregistration test".into(),
             }]));
         let tmp = tempfile::tempdir().unwrap();

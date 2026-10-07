@@ -46,6 +46,7 @@ pub fn build_llm_provider(
                 max_backoff: Duration::from_secs(config.retry_max_backoff_secs),
             };
             let mut anthropic = AnthropicProvider::new(&config.api_base, api_key, &config.model)?
+                .with_provider_name(config.provider_type.clone())
                 .with_temperature(config.temperature)
                 .with_max_tokens(config.max_tokens)
                 .with_thinking_budget(thinking_budget)
@@ -57,6 +58,7 @@ pub fn build_llm_provider(
         }
         _ => {
             let mut openai = OpenAiProvider::new(&config.api_base, api_key, &config.model)?
+                .with_provider_name(config.provider_type.clone())
                 .with_temperature(config.temperature)
                 .with_max_tokens(config.max_tokens)
                 .with_retry_policy(retry);

@@ -104,6 +104,8 @@ mod tests {
     fn llm(message: &str) -> Error {
         Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: message.into(),
         }
     }
@@ -148,6 +150,7 @@ mod tests {
             Error::RateLimited {
                 provider: "mock".into(),
                 retry_after_ms: 10,
+                request_id: None,
             },
             Error::Timeout { duration_ms: 10 },
             llm("HTTP 503: upstream unavailable"),

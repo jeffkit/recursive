@@ -45,6 +45,11 @@ const TOOL_SEARCH_TOOL_NAME: &str = "ToolSearchTool";
 pub struct OpenAiProvider {
     base_url: String,
     api_key: String,
+    /// Name of the provider kind this adapter is standing in for
+    /// (`openai`, `deepseek`, `glm`, …). The factory seeds it from
+    /// `config.provider_type`; it is what `Error::Llm::provider` reports so a
+    /// failure names the endpoint, not the model (issue #112).
+    provider_name: String,
     /// When set, the key is re-resolved through this source immediately before
     /// each request instead of using `api_key` (issue #130). A rotation of the
     /// underlying credential therefore lands on the next request without
@@ -82,6 +87,7 @@ impl OpenAiProvider {
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            provider_name: "openai".to_string(),
             api_key_source: None,
             model: model.into(),
             client,
@@ -141,12 +147,72 @@ impl OpenAiProvider {
         }
     }
 
-    /// Build an `Error::Llm` with the model name prefixed.
+    /// Name the provider kind this adapter stands for (`openai`, `deepseek`,
+    /// `glm`, …) — the factory forwards `config.provider_type` here so
+    /// [`Error::Llm`] attributes a failure to the endpoint, not the model
+    /// (issue #112).
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = name.into();
+        self
+    }
+
+    /// Build an `Error::Llm` attributing the failure to this adapter and the
+    /// model it requested (issue #112) — never the model in `provider`.
     fn make_err(&self, ctx: impl Into<String>) -> Error {
+        self.make_err_with_request_id(ctx, None)
+    }
+
+    /// Like [`Self::make_err`] but carries the provider's request/trace id
+    /// captured from the response headers (issue #112).
+    fn make_err_with_request_id(
+        &self,
+        ctx: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Error {
         Error::Llm {
-            provider: self.model.clone(),
+            provider: self.provider_name.clone(),
+            model: Some(self.model.clone()),
             message: ctx.into(),
+            request_id,
         }
+    }
+
+    /// The provider's own request/trace id from response headers (issue #112).
+    fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+        super::request_id_from_headers(headers)
+    }
+
+    /// Milliseconds from the `Retry-After` header (issue #112).
+    fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
+        super::retry_after_ms(headers)
+    }
+
+    /// The terminal error for a provider status whose retries are exhausted
+    /// (issue #112). A 429 becomes [`Error::RateLimited`] so machine consumers
+    /// see the real status and `Retry-After` instead of a generic LLM error;
+    /// every other status keeps the adapter's `HTTP <status>: <body>` shape.
+    /// Both carry the request id when the provider returned one.
+    fn exhausted_error(
+        &self,
+        status: u16,
+        text: String,
+        request_id: Option<String>,
+        retry_after_ms: u64,
+    ) -> Error {
+        if status == 429 {
+            return Error::RateLimited {
+                provider: self.provider_name.clone(),
+                retry_after_ms,
+                request_id,
+            };
+        }
+        self.make_err_with_request_id(format!("HTTP {status}: {text}"), request_id)
+    }
+
+    /// WARN once when a provider call fails terminally — the loop only warned
+    /// per *scheduled* retry, so the final give-up was silent (issue #112).
+    fn warn_provider_giving_up(label: &str, status: Option<u16>, request_id: Option<&str>) {
+        super::warn_provider_giving_up(label, status, request_id);
     }
 
     pub fn with_temperature(mut self, t: f64) -> Self {
@@ -205,11 +271,16 @@ impl OpenAiProvider {
                                 attempt += 1;
                                 continue;
                             }
+                            Self::warn_provider_giving_up(label, None, None);
                             return Err(self.make_err("HTTP 200 but response body is empty"));
                         }
                         return Ok(text);
                     }
 
+                    // Capture the correlation id / retry hint before `text()`
+                    // consumes the response (issue #112).
+                    let request_id = Self::request_id_from_headers(resp.headers());
+                    let retry_after_ms = Self::retry_after_ms(resp.headers());
                     let text = resp.text().await?;
                     tracing::debug!(target: "recursive::llm", body = %text, "error response ({label})");
 
@@ -235,7 +306,17 @@ impl OpenAiProvider {
                         continue;
                     }
 
-                    return Err(self.make_err(format!("HTTP {status}: {text}")));
+                    Self::warn_provider_giving_up(
+                        label,
+                        Some(status.as_u16()),
+                        request_id.as_deref(),
+                    );
+                    return Err(self.exhausted_error(
+                        status.as_u16(),
+                        text,
+                        request_id,
+                        retry_after_ms,
+                    ));
                 }
                 Err(e) => {
                     if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
@@ -251,6 +332,7 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
+                    Self::warn_provider_giving_up(label, None, None);
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -659,6 +741,8 @@ impl OpenAiProvider {
                             .parse_sse_stream(resp, stream_tx.clone(), cancel_token.clone())
                             .await;
                     }
+                    let request_id = Self::request_id_from_headers(resp.headers());
+                    let retry_after_ms = Self::retry_after_ms(resp.headers());
                     let text = resp.text().await?;
                     tracing::debug!(target: "recursive::llm", body = %text, "error response (stream)");
                     if let Some(backoff) =
@@ -682,7 +766,17 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
-                    return Err(self.make_err(format!("HTTP {status}: {text}")));
+                    Self::warn_provider_giving_up(
+                        "stream",
+                        Some(status.as_u16()),
+                        request_id.as_deref(),
+                    );
+                    return Err(self.exhausted_error(
+                        status.as_u16(),
+                        text,
+                        request_id,
+                        retry_after_ms,
+                    ));
                 }
                 Err(e) => {
                     if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
@@ -698,6 +792,7 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
+                    Self::warn_provider_giving_up("stream", None, None);
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -832,6 +927,7 @@ impl OpenAiProvider {
                     let line = std::mem::take(&mut line_buf);
                     Self::process_sse_line(
                         &line,
+                        &self.provider_name,
                         &self.model,
                         &mut content,
                         &mut reasoning_content,
@@ -852,6 +948,7 @@ impl OpenAiProvider {
         if !line_buf.is_empty() {
             Self::process_sse_line(
                 &line_buf,
+                &self.provider_name,
                 &self.model,
                 &mut content,
                 &mut reasoning_content,
@@ -935,12 +1032,13 @@ impl OpenAiProvider {
         }
     }
 
-    // provider is needed to produce accurate error messages when the OpenAI adapter
-    // is used by non-OpenAI backends (DeepSeek, GLM, Moonshot, …).
+    // provider/model identify the adapter and the model it requested, so a
+    // parse failure names the right endpoint (issue #112).
     #[allow(clippy::too_many_arguments)]
     fn process_sse_line(
         line: &str,
         provider: &str,
+        model: &str,
         content: &mut String,
         reasoning_content: &mut String,
         tool_call_builders: &mut HashMap<usize, (String, String, String)>,
@@ -958,7 +1056,9 @@ impl OpenAiProvider {
 
         let chunk: Value = serde_json::from_str(data).map_err(|e| Error::Llm {
             provider: provider.to_string(),
+            model: Some(model.to_string()),
             message: format!("SSE parse error: {e}; data: {data}"),
+            request_id: None,
         })?;
 
         if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
@@ -1588,6 +1688,7 @@ mod tests {
         OpenAiProvider::process_sse_line(
             data,
             "MiniMax-M3",
+            "MiniMax-M3",
             &mut content,
             &mut reasoning_content,
             &mut tool_call_builders,
@@ -2065,14 +2166,24 @@ data: [DONE]
             Err(e) => e,
         };
         match err {
-            Error::Llm { provider, message } => {
+            Error::Llm {
+                provider,
+                model,
+                message,
+                ..
+            } => {
                 assert!(
                     message.contains("SSE parse error"),
                     "error message should be diagnosable, got: {message}"
                 );
-                assert!(
-                    provider.contains("test-malformed-model"),
-                    "error should carry the provider/model name, got: {provider}"
+                assert_eq!(
+                    provider, "openai",
+                    "provider must name the adapter, not the model (issue #112)"
+                );
+                assert_eq!(
+                    model.as_deref(),
+                    Some("test-malformed-model"),
+                    "model must be carried separately from provider"
                 );
             }
             other => panic!("expected Error::Llm, got {other:?}"),
@@ -2191,6 +2302,105 @@ data: [DONE]
         assert_eq!(policy.backoff_for(0, Some(404), false), None);
         // 429 (rate limit) IS retried with backoff
         assert!(policy.backoff_for(0, Some(429), false).is_some());
+    }
+
+    /// Issue #112: a 429 whose retries are exhausted must surface as the
+    /// structured `RateLimited` variant — carrying the adapter name (not the
+    /// model), the provider trace id from the response headers, and the
+    /// `Retry-After` hint — instead of a generic `Llm` error.
+    #[tokio::test]
+    async fn exhausted_429_becomes_rate_limited_with_request_id() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = r#"{"error":{"message":"slow down"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                 x-request-id: req-xyz\r\nRetry-After: 2\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model")
+            .unwrap()
+            .with_provider_name("deepseek")
+            .with_retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..Default::default()
+            });
+
+        let err = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect_err("a 429 with no retries left must fail");
+
+        match err {
+            Error::RateLimited {
+                provider,
+                retry_after_ms,
+                request_id,
+            } => {
+                assert_eq!(provider, "deepseek", "provider must be the adapter name");
+                assert_eq!(retry_after_ms, 2000, "Retry-After: 2 must become 2000ms");
+                assert_eq!(request_id.as_deref(), Some("req-xyz"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// Issue #112: a non-429 terminal failure keeps the `Llm` shape but still
+    /// carries the adapter/model split and the provider trace id.
+    #[tokio::test]
+    async fn exhausted_5xx_llm_error_carries_provider_model_and_trace_id() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = r#"{"error":{"message":"upstream"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+                 traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "test-model")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 0,
+                ..Default::default()
+            });
+
+        let err = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect_err("a 503 with no retries left must fail");
+
+        assert_eq!(err.http_status(), Some(503));
+        assert_eq!(err.llm_site(), Some(("openai", Some("test-model"))));
+        assert_eq!(
+            err.request_id(),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
     }
 
     #[test]
@@ -3005,6 +3215,7 @@ data: [DONE]
         OpenAiProvider::process_sse_line(
             "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"abc\"},\"finish_reason\":null}]}",
             "m",
+            "m",
             &mut content,
             &mut reasoning,
             &mut tcb,
@@ -3027,6 +3238,7 @@ data: [DONE]
         let mut usage = None;
         OpenAiProvider::process_sse_line(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"Read\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}",
+            "m",
             "m",
             &mut content,
             &mut reasoning,
@@ -3053,6 +3265,7 @@ data: [DONE]
         OpenAiProvider::process_sse_line(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_cache_hit_tokens\":3,\"prompt_cache_miss_tokens\":5}}",
             "m",
+            "m",
             &mut content,
             &mut reasoning,
             &mut tcb,
@@ -3076,6 +3289,7 @@ data: [DONE]
         let mut usage = None;
         OpenAiProvider::process_sse_line(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_cache_hit_tokens\":0,\"prompt_cache_miss_tokens\":0}}",
+            "m",
             "m",
             &mut content,
             &mut reasoning,

@@ -427,6 +427,8 @@ mod tests {
     fn estimate_target_extracts_resulted_in_tokens() {
         let err = crate::error::Error::Llm {
             provider: "openai".into(),
+            model: None,
+            request_id: None,
             message: "This model's maximum context length is 16385 tokens. \
                        However, your messages resulted in 17000 tokens."
                 .into(),
@@ -441,6 +443,8 @@ mod tests {
     fn estimate_target_extracts_basic_token_count() {
         let err = crate::error::Error::Llm {
             provider: "deepseek".into(),
+            model: None,
+            request_id: None,
             message: "prompt is too long (16000 tokens)".into(),
         };
         let target = estimate_target_from_error(&err);
@@ -462,6 +466,8 @@ mod tests {
     fn estimate_target_returns_none_for_unparseable_message() {
         let err = crate::error::Error::Llm {
             provider: "test".into(),
+            model: None,
+            request_id: None,
             message: "some other error without numbers".into(),
         };
         let target = estimate_target_from_error(&err);
@@ -472,6 +478,8 @@ mod tests {
     fn estimate_target_parses_tokens_in_context_window_format() {
         let err = crate::error::Error::Llm {
             provider: "test".into(),
+            model: None,
+            request_id: None,
             message: "request exceeds the model context window of 128000 tokens".into(),
         };
         let target = estimate_target_from_error(&err);

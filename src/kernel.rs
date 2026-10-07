@@ -110,18 +110,35 @@ pub struct TurnContext {
     /// [`FinishReason::WallClockExceeded`]. Default 0 = unset.
     pub wall_timeout_secs: u64,
 
-    /// Issue #115: where the kernel publishes the turn's accumulated token
-    /// usage when it returns `Err` — a turn's `total_usage` would otherwise
-    /// be dropped with the error, so the whole run counted as zero and budget
-    /// accounting was systematically optimistic.
+    /// Issue #115/#112: where the kernel publishes the turn's partial outcome
+    /// when it returns `Err` — a turn's `total_usage` would otherwise be
+    /// dropped with the error, so the whole run counted as zero and budget
+    /// accounting was systematically optimistic. Issue #112 extends this from
+    /// "usage only" to the steps and LLM latency completed so far, so a failed
+    /// run's terminal envelope no longer claims `num_turns: 0`.
     ///
-    /// `None` (tests, sub-agents) is fine: the usage is simply not reported.
-    pub failure_usage: Option<FailureUsage>,
+    /// `None` (tests, sub-agents) is fine: the partial outcome is not reported.
+    pub failure_outcome: Option<FailureOutcomeSlot>,
 }
 
-/// Issue #115: shared cell a [`TurnContext`] carries so the wrapper can read
-/// back the token usage of a turn that ended in `Err`.
-pub type FailureUsage = Arc<std::sync::Mutex<TokenUsage>>;
+/// Issue #115/#112: the partial outcome of a turn that ended in `Err`.
+///
+/// Carries the work that *did* happen before the failure, so consumers
+/// (budget accounting, the CLI `result` envelope) can report it instead of
+/// substituting zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailureOutcome {
+    /// Tokens burned by the steps that completed before the failure.
+    pub usage: TokenUsage,
+    /// LLM steps the turn got through, including the failing call.
+    pub steps: usize,
+    /// LLM latency accumulated before the failure, in milliseconds.
+    pub llm_latency_ms: u64,
+}
+
+/// Shared cell a [`TurnContext`] carries so the wrapper can read back the
+/// [`FailureOutcome`] of a turn that ended in `Err`.
+pub type FailureOutcomeSlot = Arc<std::sync::Mutex<FailureOutcome>>;
 
 // ---------------------------------------------------------------------------
 // TurnOutcome
@@ -386,7 +403,7 @@ impl AgentKernel {
                     self.budget_pricing,
                 ),
                 compaction_usage: TokenUsage::default(),
-                failure_usage: ctx.failure_usage,
+                failure_outcome: ctx.failure_outcome,
             }
         };
 

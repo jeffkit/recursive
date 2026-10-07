@@ -562,3 +562,42 @@ fn resume_finalizes_the_session_as_crashed_when_the_provider_fails() {
         "the provider failure must be carried onto the session, got: {meta}"
     );
 }
+
+// ── issue #112: a failed run still emits an informative result envelope ─────
+
+/// A provider failure under `--output-format json` must still emit the
+/// terminal `result` envelope — the `?` used to return before `task.finish`,
+/// so stream consumers waiting for `result` hung forever — and that envelope
+/// must report the steps that actually ran, not the all-zero default the
+/// Single-mode emitter (which never sees events) would otherwise produce.
+#[test]
+fn resume_emits_an_informative_result_when_the_provider_fails() {
+    let rig = Rig::with_stub(Stub::start_failing());
+    let dir = rig.session_dir("sess-fail-json", &[]);
+
+    let out = rig.run(
+        &as_refs(&resume_args(&dir, &["--output-format", "json"], &[])),
+        None,
+    );
+    let stdout = stdout_of(&out);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("\"type\":\"result\""))
+        .unwrap_or_else(|| {
+            panic!("a failed resume must emit a terminal result line, got:\n{stdout}")
+        });
+    let result: serde_json::Value =
+        serde_json::from_str(line).expect("the result line must be valid JSON");
+    assert_eq!(result["is_error"], true, "envelope must flag the failure");
+    assert_eq!(
+        result["num_turns"], 1,
+        "the failing first step must be reported, not zero: {result}"
+    );
+    assert!(
+        result["stop_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("provider_stop"),
+        "stop_reason must name the provider stop: {result}"
+    );
+}

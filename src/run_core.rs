@@ -284,9 +284,10 @@ pub(crate) struct RunCore<'a> {
     /// the turn's `total_usage` in [`Self::make_outcome`] (the compaction call
     /// re-sends the whole history, so dropping it undercounted every run).
     pub(crate) compaction_usage: TokenUsage,
-    /// Issue #115: where to publish the accumulated usage when the loop exits
-    /// with `Err` instead of an outcome. `None` (tests) drops it as before.
-    pub(crate) failure_usage: Option<crate::kernel::FailureUsage>,
+    /// Issue #115/#112: where to publish the partial outcome (usage, steps,
+    /// LLM latency) when the loop exits with `Err` instead of an outcome.
+    /// `None` (tests) drops it as before.
+    pub(crate) failure_outcome: Option<crate::kernel::FailureOutcomeSlot>,
 }
 
 impl<'a> RunCore<'a> {
@@ -989,10 +990,12 @@ impl<'a> RunCore<'a> {
         }
     }
 
-    /// Issue #115: publish the turn's accumulated usage, then propagate
+    /// Issue #115/#112: publish the turn's partial outcome, then propagate
     /// `error`. `run_inner` used to return the bare `Err`, dropping
     /// `total_usage` so every failed run counted as zero tokens; the sink lets
-    /// the wrapper still account for the spend. Extracted from the loop body
+    /// the wrapper still account for the spend and (issue #112) report the
+    /// steps and LLM latency completed before the failure, so the CLI's
+    /// terminal envelope is no longer all zeros. Extracted from the loop body
     /// to keep it under the invariant-#1 line budget — no-op when no sink was
     /// supplied.
     fn fail_step(
@@ -1001,11 +1004,15 @@ impl<'a> RunCore<'a> {
         error: crate::error::Error,
         total_usage: TokenUsage,
     ) -> Result<RunInnerOutcome> {
-        if let Some(slot) = &self.failure_usage {
-            let usage = total_usage.accumulate(self.compaction_usage);
+        if let Some(slot) = &self.failure_outcome {
+            let outcome = crate::kernel::FailureOutcome {
+                usage: total_usage.accumulate(self.compaction_usage),
+                steps: step,
+                llm_latency_ms: self.total_llm_latency_ms,
+            };
             match slot.lock() {
-                Ok(mut guard) => *guard = usage,
-                Err(poisoned) => *poisoned.into_inner() = usage,
+                Ok(mut guard) => *guard = outcome,
+                Err(poisoned) => *poisoned.into_inner() = outcome,
             }
         }
         // Issue #120: announce the failure on the event stream so observers do
@@ -2026,7 +2033,7 @@ mod tests {
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
             compaction_usage: TokenUsage::default(),
-            failure_usage: None,
+            failure_outcome: None,
         }
     }
 
@@ -2157,7 +2164,7 @@ mod tests {
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
             compaction_usage: TokenUsage::default(),
-            failure_usage: None,
+            failure_outcome: None,
         }
     }
 
@@ -2882,6 +2889,8 @@ mod tests {
         // MockProvider that errors on the first complete() call → compaction fails.
         let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "simulated compaction failure".into(),
         }]));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2930,6 +2939,8 @@ mod tests {
         // MockProvider errors on every complete() call → compaction always fails.
         let mk_err = || Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "simulated compaction failure".into(),
         };
         let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![
@@ -3044,7 +3055,7 @@ mod tests {
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
             compaction_usage: TokenUsage::default(),
-            failure_usage: None,
+            failure_outcome: None,
         }
     }
 
@@ -3345,6 +3356,8 @@ mod tests {
         let provider = Arc::new(crate::llm::MockProvider::new(vec![]).with_errors(vec![
             crate::error::Error::Llm {
                 provider: "mock".to_string(),
+                model: None,
+                request_id: None,
                 message: "injected non-cancelled error".to_string(),
             },
         ]));
@@ -3370,6 +3383,8 @@ mod tests {
         let provider = Arc::new(crate::llm::MockProvider::new(vec![]).with_errors(vec![
             crate::error::Error::Llm {
                 provider: "mock".to_string(),
+                model: None,
+                request_id: None,
                 message: "kaboom".to_string(),
             },
         ]));
@@ -3502,9 +3517,10 @@ mod tests {
         }]));
         let mut core =
             make_run_core_for_inner(vec![Message::user("hi".to_string())], &hooks, provider, 5);
-        let sink: crate::kernel::FailureUsage =
-            Arc::new(std::sync::Mutex::new(TokenUsage::default()));
-        core.failure_usage = Some(Arc::clone(&sink));
+        let sink: crate::kernel::FailureOutcomeSlot = Arc::new(std::sync::Mutex::new(
+            crate::kernel::FailureOutcome::default(),
+        ));
+        core.failure_outcome = Some(Arc::clone(&sink));
 
         let err = match core.run_inner().await {
             Ok(_) => panic!("the second LLM call must fail"),
@@ -3517,12 +3533,16 @@ mod tests {
 
         let published = *sink.lock().expect("sink lock");
         assert_eq!(
-            published.prompt_tokens, 100,
+            published.usage.prompt_tokens, 100,
             "partial prompt tokens must survive the error return"
         );
         assert_eq!(
-            published.completion_tokens, 40,
+            published.usage.completion_tokens, 40,
             "partial completion tokens must survive the error return"
+        );
+        assert_eq!(
+            published.steps, 2,
+            "the failing step must be published so the envelope's num_turns is not zero"
         );
     }
 
@@ -4655,6 +4675,8 @@ mod tests {
             }])
             .with_errors(vec![Error::Llm {
                 provider: "mock".into(),
+                model: None,
+                request_id: None,
                 message: "HTTP 429 Too Many Requests: slow down".into(),
             }]),
         );
@@ -4690,6 +4712,8 @@ mod tests {
         let hooks = crate::hooks::HookRegistry::new();
         let down = || Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 503 Service Unavailable: upstream".into(),
         };
         // One more error than the budget: initial call + 2 retries.
@@ -4734,6 +4758,8 @@ mod tests {
             }])
             .with_errors(vec![Error::Llm {
                 provider: "mock".into(),
+                model: None,
+                request_id: None,
                 message: "HTTP 400 Bad Request: bad tool schema".into(),
             }]),
         );
@@ -4776,6 +4802,7 @@ mod tests {
                 crate::llm::MockProvider::new(vec![]).with_errors(vec![Error::RateLimited {
                     provider: "mock".into(),
                     retry_after_ms: 1,
+                    request_id: None,
                 }]),
             );
         let mut core = make_run_core_for_inner(

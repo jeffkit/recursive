@@ -150,6 +150,8 @@ impl ChatProvider for MockProvider {
             if queue.is_empty() {
                 return Err(Error::Llm {
                     provider: "mock".into(),
+                    model: None,
+                    request_id: None,
                     message: "MockProvider: no scripted completions left".into(),
                 });
             }
@@ -293,6 +295,8 @@ mod tracing_tests {
         }])
         .with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "injected error".into(),
         }]);
 

@@ -3023,6 +3023,7 @@ mod tests {
         let err = crate::error::Error::RateLimited {
             provider: "mock".into(),
             retry_after_ms: 1234,
+            request_id: None,
         };
         let api = map_run_error(&err);
         assert_eq!(api.status, StatusCode::TOO_MANY_REQUESTS);
@@ -3034,6 +3035,8 @@ mod tests {
 
         let llm = map_run_error(&crate::error::Error::Llm {
             provider: "p".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 500 Internal Server Error: boom".into(),
         });
         assert_eq!(llm.status, StatusCode::INTERNAL_SERVER_ERROR);

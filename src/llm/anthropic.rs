@@ -29,6 +29,10 @@ use crate::message::{Message, Role};
 pub struct AnthropicProvider {
     base_url: String,
     api_key: String,
+    /// Name of the provider kind this adapter reports (`anthropic`). Seeded by
+    /// the factory from `config.provider_type`; it is what `Error::Llm::provider`
+    /// reports so a failure names the endpoint, not the model (issue #112).
+    provider_name: String,
     /// When set, the key is re-resolved through this source immediately before
     /// each request instead of using `api_key` (issue #130). A rotation of the
     /// underlying credential therefore lands on the next request without
@@ -75,6 +79,7 @@ impl AnthropicProvider {
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            provider_name: "anthropic".to_string(),
             api_key_source: None,
             model: model.into(),
             client,
@@ -122,12 +127,55 @@ impl AnthropicProvider {
         self
     }
 
-    /// Build an `Error::Llm` with the model name prefixed.
+    /// Name the provider kind this adapter reports — the factory forwards
+    /// `config.provider_type` here so [`Error::Llm`] attributes a failure to
+    /// the endpoint, not the model (issue #112).
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = name.into();
+        self
+    }
+
+    /// Build an `Error::Llm` attributing the failure to this adapter and the
+    /// model it requested (issue #112) — never the model in `provider`.
     fn make_err(&self, ctx: impl Into<String>) -> Error {
+        self.make_err_with_request_id(ctx, None)
+    }
+
+    /// Like [`Self::make_err`] but carries the provider's request/trace id
+    /// captured from the response headers (issue #112).
+    fn make_err_with_request_id(
+        &self,
+        ctx: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Error {
         Error::Llm {
-            provider: self.model.clone(),
+            provider: self.provider_name.clone(),
+            model: Some(self.model.clone()),
             message: ctx.into(),
+            request_id,
         }
+    }
+
+    /// The terminal error for a provider status whose retries are exhausted
+    /// (issue #112). A 429 becomes [`Error::RateLimited`] so machine consumers
+    /// see the real status and `Retry-After`; every other status keeps the
+    /// adapter's `HTTP <status>: <body>` shape. Both carry the request id when
+    /// the provider returned one.
+    fn exhausted_error(
+        &self,
+        status: u16,
+        text: String,
+        request_id: Option<String>,
+        retry_after_ms: u64,
+    ) -> Error {
+        if status == 429 {
+            return Error::RateLimited {
+                provider: self.provider_name.clone(),
+                retry_after_ms,
+                request_id,
+            };
+        }
+        self.make_err_with_request_id(format!("HTTP {status}: {text}"), request_id)
     }
 
     /// Resolve the API key through `source` immediately before each request
@@ -226,6 +274,8 @@ impl AnthropicProvider {
                     if status.is_success() {
                         return resp.text().await.map_err(Error::from);
                     }
+                    let request_id = super::request_id_from_headers(resp.headers());
+                    let retry_after_ms = super::retry_after_ms(resp.headers());
                     let text = resp.text().await?;
                     if let Some(backoff) =
                         self.retry
@@ -248,7 +298,17 @@ impl AnthropicProvider {
                         attempt += 1;
                         continue;
                     }
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
+                    super::warn_provider_giving_up(
+                        "anthropic",
+                        Some(status.as_u16()),
+                        request_id.as_deref(),
+                    );
+                    return Err(self.exhausted_error(
+                        status.as_u16(),
+                        text,
+                        request_id,
+                        retry_after_ms,
+                    ));
                 }
                 Err(e) => {
                     if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
@@ -264,6 +324,7 @@ impl AnthropicProvider {
                         attempt += 1;
                         continue;
                     }
+                    super::warn_provider_giving_up("anthropic", None, None);
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -382,6 +443,8 @@ impl AnthropicProvider {
                     }
 
                     // Non-2xx: read body and check retry
+                    let request_id = super::request_id_from_headers(resp.headers());
+                    let retry_after_ms = super::retry_after_ms(resp.headers());
                     let text = resp.text().await?;
                     tracing::debug!(target: "recursive::llm", body = %text, "error response (stream)");
 
@@ -407,7 +470,17 @@ impl AnthropicProvider {
                         continue;
                     }
 
-                    return Err(self.make_err(format!("HTTP {}: {}", status, text)));
+                    super::warn_provider_giving_up(
+                        "anthropic-stream",
+                        Some(status.as_u16()),
+                        request_id.as_deref(),
+                    );
+                    return Err(self.exhausted_error(
+                        status.as_u16(),
+                        text,
+                        request_id,
+                        retry_after_ms,
+                    ));
                 }
                 Err(e) => {
                     if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
@@ -424,6 +497,7 @@ impl AnthropicProvider {
                         continue;
                     }
 
+                    super::warn_provider_giving_up("anthropic-stream", None, None);
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -2074,14 +2148,24 @@ data: {\"type\":\"message_stop\"}
             Err(e) => e,
         };
         match err {
-            Error::Llm { provider, message } => {
+            Error::Llm {
+                provider,
+                model,
+                message,
+                ..
+            } => {
                 assert!(
                     message.contains("SSE parse error"),
                     "error message should be diagnosable, got: {message}"
                 );
-                assert!(
-                    provider.contains("claude-3-sonnet"),
-                    "error should carry the provider/model name, got: {provider}"
+                assert_eq!(
+                    provider, "anthropic",
+                    "provider must name the adapter, not the model (issue #112)"
+                );
+                assert_eq!(
+                    model.as_deref(),
+                    Some("claude-3-sonnet"),
+                    "model must be carried separately from provider"
                 );
             }
             other => panic!("expected Error::Llm, got {other:?}"),

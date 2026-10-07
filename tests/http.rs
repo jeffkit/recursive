@@ -380,6 +380,7 @@ mod http_tests {
             .with_errors(vec![Error::RateLimited {
                 provider: "mock".into(),
                 retry_after_ms: 1,
+                request_id: None,
             }]),
         );
         let state = sample_state_with_provider(provider);
@@ -457,6 +458,8 @@ mod http_tests {
         // server-side failures.
         let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "upstream 5xx".into(),
         }]));
         let state = sample_state_with_provider(provider);
@@ -4372,6 +4375,8 @@ mod http_tests {
         use recursive::error::Error;
         let provider = Arc::new(MockProvider::new(vec![]).with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "injected provider failure".into(),
         }]));
         let state = sample_state_with_provider(provider);

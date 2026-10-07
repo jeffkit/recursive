@@ -337,6 +337,8 @@ async fn failed_turn_reports_on_event_hook_and_checkpoint_surfaces() {
         Arc::new(
             MockProvider::new(vec![]).with_errors(vec![crate::error::Error::Llm {
                 provider: "mock".into(),
+                model: None,
+                request_id: None,
                 message: "kaboom".into(),
             }]),
         );
@@ -1332,6 +1334,13 @@ async fn failed_turn_exposes_last_failed_usage() {
         "the failed turn's completed step must still be accounted for"
     );
     assert_eq!(wasted.completion_tokens, 21);
+    // Issue #112: the partial outcome also carries the steps that ran, so the
+    // CLI's terminal envelope reports `num_turns: 2` instead of zero.
+    assert_eq!(
+        rt.last_failed_outcome().steps,
+        2,
+        "the failing step must survive the error return"
+    );
 }
 
 #[tokio::test]
@@ -1834,6 +1843,7 @@ async fn llm_retry_recovers_and_emits_event() {
         .with_errors(vec![crate::error::Error::RateLimited {
             provider: "mock".into(),
             retry_after_ms: 1,
+            request_id: None,
         }]),
     );
 
@@ -2193,6 +2203,8 @@ fn context_overflow_detector_matches_known_patterns() {
     for msg in &cases {
         let err = crate::error::Error::Llm {
             provider: "test".into(),
+            model: None,
+            request_id: None,
             message: msg.to_string(),
         };
         assert!(
@@ -2213,6 +2225,8 @@ fn context_overflow_detector_ignores_unrelated_errors() {
     for msg in &cases {
         let err = crate::error::Error::Llm {
             provider: "test".into(),
+            model: None,
+            request_id: None,
             message: msg.to_string(),
         };
         assert!(
@@ -2463,6 +2477,8 @@ async fn compact_on_overflow_rejects_degenerate_transcript_without_hook_events()
 async fn context_overflow_triggers_compact_and_retry() {
     let overflow_err = crate::error::Error::Llm {
         provider: "test-model".into(),
+        model: None,
+        request_id: None,
         message: "HTTP 400: {\"error\":{\"code\":\"context_length_exceeded\",\
                       \"message\":\"maximum context length is 200000 tokens\"}}"
             .into(),

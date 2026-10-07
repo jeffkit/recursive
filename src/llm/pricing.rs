@@ -491,6 +491,8 @@ mod tests {
         let policy = RetryPolicy::default();
         let llm = |msg: &str| crate::error::Error::Llm {
             provider: "x".into(),
+            model: None,
+            request_id: None,
             message: msg.to_string(),
         };
         assert!(policy
@@ -508,6 +510,7 @@ mod tests {
                 &crate::error::Error::RateLimited {
                     provider: "x".into(),
                     retry_after_ms: 1,
+                    request_id: None,
                 }
             )
             .is_some());

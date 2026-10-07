@@ -238,13 +238,14 @@ pub struct AgentRuntime {
     /// Every ledger failure is logged and swallowed: a broken ledger must
     /// never take a turn down with it.
     deliverables: Option<Arc<crate::deliverables::Deliverables>>,
-    /// Issue #115: token usage burned by the most recent turn that ended in
-    /// an error. The kernel's `total_usage` is dropped when it returns `Err`;
-    /// it publishes the value to the sink carried by
-    /// [`TurnContext::failure_usage`] and the wrapper reads it here so a
-    /// failed run can still be accounted for (the HTTP
-    /// `tokens_wasted_on_failure_total` counter, the CLI cost tracker).
-    last_failed_usage: TokenUsage,
+    /// Issue #115/#112: the partial outcome (usage, steps, LLM latency) of the
+    /// most recent turn that ended in an error. The kernel's outcome is
+    /// dropped when it returns `Err`; it publishes the values to the sink
+    /// carried by [`TurnContext::failure_outcome`] and the wrapper reads them
+    /// here so a failed run can still be accounted for (the HTTP
+    /// `tokens_wasted_on_failure_total` counter, the CLI cost tracker, and the
+    /// CLI terminal `result` envelope).
+    last_failed: crate::kernel::FailureOutcome,
     /// Issue #115: compaction usage not attributable to a turn — a manual
     /// `/compact` (`compact_now` / `compact_partial_*`) burned these tokens
     /// outside any turn's LLM calls. Folded into the next turn's usage so it
@@ -353,9 +354,9 @@ impl AgentRuntime {
                     "context window exceeded; attempting emergency compaction before retry"
                 );
                 // Issue #115: the rejected first attempt already burned tokens.
-                // The retry resets `last_failed_usage`, so snapshot it here and
+                // The retry resets `last_failed`, so snapshot it here and
                 // fold it into whichever account the retry lands in.
-                let first_attempt_usage = self.last_failed_usage;
+                let first_attempt_usage = self.last_failed.usage;
                 match self.compact_on_overflow().await {
                     // The overflow-recovery summary itself failed. Surface it
                     // through the same failure path as any other turn error so
@@ -375,14 +376,15 @@ impl AgentRuntime {
                         // Both attempts failed: add their spend to the failed
                         // turn's account.
                         Err(retry_err) => {
-                            self.last_failed_usage = self
-                                .last_failed_usage
+                            self.last_failed.usage = self
+                                .last_failed
+                                .usage
                                 .accumulate(first_attempt_usage)
                                 .accumulate(overflow_usage);
                             Err(retry_err)
                         }
                     },
-                    // Compaction was rejected — `last_failed_usage` already
+                    // Compaction was rejected — `last_failed` already
                     // holds the rejected attempt's spend.
                     Ok(None) => Err(e),
                 }
@@ -954,10 +956,12 @@ impl AgentRuntime {
             (deferred_finished, committed)
         });
 
-        // Issue #115: the kernel publishes the turn's accumulated usage here
-        // when it exits with `Err`, so the spend survives the error return.
-        let failure_usage: crate::kernel::FailureUsage =
-            Arc::new(std::sync::Mutex::new(TokenUsage::default()));
+        // Issue #115/#112: the kernel publishes the turn's partial outcome
+        // (usage, steps, LLM latency) here when it exits with `Err`, so the
+        // work survives the error return.
+        let failure_outcome: crate::kernel::FailureOutcomeSlot = Arc::new(std::sync::Mutex::new(
+            crate::kernel::FailureOutcome::default(),
+        ));
         let ctx = TurnContext {
             messages: Arc::clone(&self.transcript),
             tool_specs: self.kernel.tools().specs(),
@@ -973,7 +977,7 @@ impl AgentRuntime {
             // budget (set via `AgentRuntimeBuilder::wall_timeout_secs`).
             // `AgentKernel::run` resolves the effective value; 0 = unlimited.
             wall_timeout_secs: self.kernel.wall_timeout_secs,
-            failure_usage: Some(Arc::clone(&failure_usage)),
+            failure_outcome: Some(Arc::clone(&failure_outcome)),
         };
 
         let turn_outcome = self.kernel.run(ctx).await;
@@ -990,7 +994,7 @@ impl AgentRuntime {
         let turn_outcome = match turn_outcome {
             Ok(outcome) => {
                 // A clean turn has nothing wasted to account for.
-                self.last_failed_usage = TokenUsage::default();
+                self.last_failed = crate::kernel::FailureOutcome::default();
                 outcome
             }
             Err(e) => {
@@ -1013,10 +1017,11 @@ impl AgentRuntime {
                 // Issue #119: this branch returns before `drive_turn_inner`'s
                 // drain, so the workers the failed turn dispatched must be
                 // drained here — otherwise their spend is never billed (the CLI
-                // accounts a failed run from `last_failed_usage`) and would
+                // accounts a failed run from `last_failed`) and would
                 // silently reappear on the next turn instead.
-                let failed_usage = failure_usage.lock().map(|u| *u).unwrap_or_default();
-                self.last_failed_usage = failed_usage.accumulate(self.take_worker_usage().usage);
+                let mut failed = failure_outcome.lock().map(|o| *o).unwrap_or_default();
+                failed.usage = failed.usage.accumulate(self.take_worker_usage().usage);
+                self.last_failed = failed;
                 return Err(e);
             }
         };
@@ -1116,7 +1121,16 @@ impl AgentRuntime {
     /// CLI cost tracker) read it here instead of losing the spend with the
     /// returned `Err`.
     pub fn last_failed_usage(&self) -> TokenUsage {
-        self.last_failed_usage
+        self.last_failed.usage
+    }
+
+    /// Issue #112: the full partial outcome of the most recent turn that ended
+    /// in an error — usage plus the steps and LLM latency completed before the
+    /// failure. The CLI reads it on the error path so the terminal `result`
+    /// envelope reports the real `num_turns` / `duration_api_ms` instead of
+    /// zeros.
+    pub fn last_failed_outcome(&self) -> crate::kernel::FailureOutcome {
+        self.last_failed
     }
 
     /// Return the most-recent `n` transcript messages, or the full

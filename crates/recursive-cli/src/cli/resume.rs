@@ -848,22 +848,50 @@ pub(crate) async fn run_resumed(
         Err(err) => {
             // Issue #115: a failed turn still burned the tokens of the steps
             // that completed before the error — bill them before propagating.
-            let failed_usage = runtime.last_failed_usage();
+            // Issue #112: carry the steps / latency too, not just usage.
+            let failed = runtime.last_failed_outcome();
             if let Some(ref cs) = control_session {
-                cs.record_usage(failed_usage, 0);
+                cs.record_usage(failed.usage, failed.llm_latency_ms);
             }
             // Issue #110: the `?`-shaped error path used to skip the session
             // envelope, leaving `.meta.json` at `active` forever. Drop the
             // runtime first (its event sink holds a writer clone), then
             // finalize as `Crashed` with the error text.
             drop(runtime);
+            // Issue #112: emit the terminal `result` envelope before returning.
+            // The old `?` skipped `task.finish` entirely, so a stream-json
+            // consumer waiting for a `result` line hung forever — the same
+            // Claude SDK contract violation `run_once` already fixed. Mirrors
+            // `run_once`'s error arm.
+            let reason = recursive::FinishReason::ProviderStop(err.to_string());
+            match printer {
+                RunPrinter::Json(task) => {
+                    task.finish(
+                        &reason,
+                        None,
+                        failed.usage,
+                        failed.llm_latency_ms,
+                        failed.steps,
+                        control_bridge.as_deref(),
+                    )
+                    .await;
+                }
+                RunPrinter::Text(handle) => {
+                    handle.await.ok();
+                }
+            }
             finalize_session_writer(
                 session_writer,
                 SessionStatus::Crashed,
                 None,
                 Some(err.to_string()),
             );
-            finalize_cost_tracker(cost_tracker, failed_usage, 0, &config.model);
+            finalize_cost_tracker(
+                cost_tracker,
+                failed.usage,
+                failed.llm_latency_ms,
+                &config.model,
+            );
             return Err(err.into());
         }
     };
@@ -882,18 +910,42 @@ pub(crate) async fn run_resumed(
                     let turn = match runtime.run(msg).await {
                         Ok(turn) => turn,
                         Err(err) => {
-                            // Issue #110: a mid-turn failure must still close
-                            // the session envelope.
-                            let failed_usage = runtime.last_failed_usage();
-                            cs.record_usage(failed_usage, 0);
+                            // Issue #110/#112: a mid-turn failure must still
+                            // close the session envelope *and* emit the
+                            // terminal result, or stream-json consumers hang
+                            // waiting for one.
+                            let failed = runtime.last_failed_outcome();
+                            cs.record_usage(failed.usage, failed.llm_latency_ms);
                             drop(runtime);
+                            let reason = recursive::FinishReason::ProviderStop(err.to_string());
+                            match printer {
+                                RunPrinter::Json(task) => {
+                                    task.finish(
+                                        &reason,
+                                        None,
+                                        failed.usage,
+                                        failed.llm_latency_ms,
+                                        failed.steps,
+                                        control_bridge.as_deref(),
+                                    )
+                                    .await;
+                                }
+                                RunPrinter::Text(handle) => {
+                                    handle.await.ok();
+                                }
+                            }
                             finalize_session_writer(
                                 session_writer,
                                 SessionStatus::Crashed,
                                 None,
                                 Some(err.to_string()),
                             );
-                            finalize_cost_tracker(cost_tracker, failed_usage, 0, &config.model);
+                            finalize_cost_tracker(
+                                cost_tracker,
+                                failed.usage,
+                                failed.llm_latency_ms,
+                                &config.model,
+                            );
                             return Err(err.into());
                         }
                     };

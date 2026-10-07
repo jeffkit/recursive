@@ -639,7 +639,7 @@ impl AgentPool {
             // budget (never unlimited while the parent is bounded).
             wall_timeout_secs: self.wall_timeout_secs,
             // Issue #115: sub-agent turns are not billed separately.
-            failure_usage: None,
+            failure_outcome: None,
         };
 
         kernel.run(ctx).await

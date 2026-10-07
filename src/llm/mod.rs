@@ -223,9 +223,83 @@ pub trait ChatProvider: Send + Sync {
     }
 }
 
+// ── Provider failure correlation (issue #112) ────────────────────────────────
+
+/// The provider's own request/trace id from response headers, shared by both
+/// adapters (issue #112).
+///
+/// Tries the OpenAI-style `x-request-id`, the generic `request-id` Anthropic
+/// and some gateways emit, and the W3C `traceparent`. `None` when the provider
+/// returned none — a failed call then simply carries no correlation id.
+pub(crate) fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "traceparent"]
+        .iter()
+        .find_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+        .map(str::to_string)
+}
+
+/// Milliseconds from the `Retry-After` header, when it is an integer number of
+/// seconds (the form OpenAI-compatible providers send). `0` for an HTTP-date or
+/// a missing header — the caller floors to "retry immediately".
+pub(crate) fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or(0)
+}
+
+/// WARN once when a provider call fails terminally — the retry loop only
+/// warned per *scheduled* retry, so the final give-up (including a 429 whose
+/// retries ran out) was silent (issue #112). `request_id` is included when the
+/// provider returned one, so a 429 storm can be correlated with its logs.
+pub(crate) fn warn_provider_giving_up(label: &str, status: Option<u16>, request_id: Option<&str>) {
+    tracing::warn!(
+        target: "recursive::llm",
+        status = status.unwrap_or(0),
+        request_id = request_id.unwrap_or(""),
+        "provider call failed; giving up ({label})"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #112: the trace id the adapters put on a failure comes from the
+    /// response headers, preferring `x-request-id`, then `request-id`, then
+    /// the W3C `traceparent`.
+    #[test]
+    fn request_id_prefers_x_request_id_then_request_id_then_traceparent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(request_id_from_headers(&headers), None);
+        headers.insert("traceparent", "tp".parse().unwrap());
+        assert_eq!(request_id_from_headers(&headers).as_deref(), Some("tp"));
+        headers.insert("request-id", "rid".parse().unwrap());
+        assert_eq!(request_id_from_headers(&headers).as_deref(), Some("rid"));
+        headers.insert("x-request-id", "xrid".parse().unwrap());
+        assert_eq!(request_id_from_headers(&headers).as_deref(), Some("xrid"));
+    }
+
+    /// Issue #112: only an integer-seconds `Retry-After` becomes a hint; an
+    /// HTTP-date or missing header means "retry immediately" (`0`).
+    #[test]
+    fn retry_after_parses_integer_seconds_only() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_ms(&headers), 0);
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(retry_after_ms(&headers), 3000);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            retry_after_ms(&headers),
+            0,
+            "an HTTP-date is not an integer-second hint"
+        );
+    }
 
     #[tokio::test]
     async fn mock_structured_returns_default_error() {

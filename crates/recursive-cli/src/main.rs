@@ -3185,9 +3185,13 @@ async fn run_once(
             // that completed before the error. Fold them into the run's cost
             // (and the control session's cumulative usage) instead of losing
             // the spend with the returned `Err`.
-            let failed_usage = runtime.last_failed_usage();
+            // Issue #112: read the *whole* partial outcome, not just usage —
+            // the terminal envelope's `num_turns` / `duration_api_ms` must
+            // report the steps that ran before the failure, not zero.
+            let failed = runtime.last_failed_outcome();
+            let failed_usage = failed.usage;
             if let Some(ref cs) = control_session {
-                cs.record_usage(failed_usage, 0);
+                cs.record_usage(failed_usage, failed.llm_latency_ms);
             }
             // Drop the runtime first so its event-sink sender releases the
             // stream task's `rx` — otherwise `task.finish()` would await a
@@ -3198,8 +3202,15 @@ async fn run_once(
             let reason = recursive::FinishReason::ProviderStop(err.to_string());
             match printer {
                 RunPrinter::Json(task) => {
-                    task.finish(&reason, None, failed_usage, 0, 0, control_bridge.as_deref())
-                        .await;
+                    task.finish(
+                        &reason,
+                        None,
+                        failed_usage,
+                        failed.llm_latency_ms,
+                        failed.steps,
+                        control_bridge.as_deref(),
+                    )
+                    .await;
                 }
                 RunPrinter::Text(handle) => {
                     handle.await.ok();

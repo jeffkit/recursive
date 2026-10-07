@@ -83,6 +83,8 @@ impl ChatProvider for StepProvider {
             Some(Step::Fail(e)) => Err(e),
             None => Err(Error::Llm {
                 provider: "scripted".into(),
+                model: None,
+                request_id: None,
                 message: "script exhausted".into(),
             }),
         }
@@ -214,6 +216,8 @@ async fn run_loop_retries_a_transient_turn_failure() {
     let llm = Arc::new(
         MockProvider::new(vec![completion("recovered")]).with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 503: upstream unavailable".into(),
         }]),
     );
@@ -258,6 +262,8 @@ async fn run_loop_resumes_a_mid_turn_failure_without_re_running_its_tools() {
         Step::Answer(tool_call("c1")),
         Step::Fail(Error::Llm {
             provider: "scripted".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 503: upstream unavailable".into(),
         }),
         Step::Answer(completion("recovered")),
@@ -313,6 +319,8 @@ async fn run_loop_gives_up_after_the_retry_budget() {
     let errors: Vec<Error> = (0..3)
         .map(|_| Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 503: still down".into(),
         })
         .collect();
@@ -339,6 +347,8 @@ async fn run_loop_does_not_retry_a_permanent_failure() {
     let llm = Arc::new(
         MockProvider::new(vec![completion("never")]).with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 404: model not found".into(),
         }]),
     );
@@ -366,6 +376,8 @@ async fn run_loop_clears_the_pending_record_before_propagating_an_error() {
     let llm = Arc::new(
         MockProvider::new(vec![completion("turn one")]).with_errors(vec![Error::Llm {
             provider: "mock".into(),
+            model: None,
+            request_id: None,
             message: "HTTP 404: model not found".into(),
         }]),
     );
