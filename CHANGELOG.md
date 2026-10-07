@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- feat(eval): a preset benchmark harness (#129) — the standing "minimal vs
+  standard" comparison that turns preset gains into numbers. A fixed task set
+  of 10 tasks (two per shape: single-file read-modify-write, multi-file
+  search & locate, multi-step tool chains, long-context inputs, failure
+  recovery) is compiled into the library (`src/eval.rs::TASKS`), each with its
+  own seed workspace, a deterministic replay script and a machine-checkable
+  success predicate. `recursive-eval run` executes every task under every
+  built-in preset and writes per-run records (JSONL) plus a markdown report:
+  the preset's system-prompt weight (the *fixed* per-request cost), input /
+  output / cache-read tokens, wall clock, turns, tool calls, success and a
+  failure class (`budget_exceeded` / `stuck` / `context_limit` /
+  `provider_error` / `wall_clock` / `permission_denied` / `run_error` /
+  `wrong_result`). `--mode replay` (default) drives a scripted provider, so the
+  harness runs with no API key and its token/success numbers are reproducible;
+  `--mode live` drives the configured provider and is the quality measurement;
+  `--repeat N` adds the min..max spread of each task × preset. The committed
+  baseline (`eval/`) reads: minimal's fixed cost is **74×** smaller than
+  standard's, the total input paid across the task set is **4.8×** smaller, and
+  the simple tasks complete under both. Re-render a report from raw data with
+  `recursive-eval report <jsonl>`; no new dependency.
 - feat(runtime): a `minimal` agent preset (#128). Session presets (#127) could
   re-compose a session's context management, but every session still paid the
   same fixed system prompt: the assembled base, the six memory layers, the

@@ -33,6 +33,7 @@ pub mod cost;
 pub mod credentials;
 pub mod deliverables;
 pub mod error;
+pub mod eval;
 pub mod event;
 pub mod hooks;
 #[cfg(feature = "http")]
