@@ -50,31 +50,39 @@
       "type": "assignment",
       "id": "impl_timeout",
       "output": "$F.or($INPUT.impl_timeout_secs, 7200)",
-      "next": "pre",
+      "next": "setup_command",
       "source_line": 106
+    },
+    {
+      "type": "assignment",
+      "id": "setup_command",
+      "output": "$F.or($INPUT.setup_command, \"\")",
+      "next": "pre",
+      "source_line": 110
     },
     {
       "type": "code",
       "id": "pre",
       "language": "python",
-      "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\n\ndef _kill_stale_agents(rd, repo, own_run=None):\n    \"\"\"清本仓孤儿 recursive agent（#94）。\n\n    旧实现是「全表 pgrep + 逐 pid killpg」：模式字面量出现在自身 cmdline\n    上时自匹配（killpg 打掉自身进程组 → 子进程 -15 秒死、node 重试耗尽\n    → engine_error），并发下还会误杀兄弟 run 的 agent。现在只杀 cmdline\n    带本仓 .flowcast/runs 路径下 worktree/transcript 引用、且所属 run 已无\n    存活宿主的 recursive 进程；自身 pid / 祖先链 / 自身进程组一律跳过；\n    逐 pid SIGTERM（永不 killpg）；被杀清单落 rd/kill-stale.log 留痕。\n    \"\"\"\n    def sh(*a):\n        return subprocess.run(list(a), capture_output=True, text=True)\n    procs = []\n    for line in sh(\"ps\", \"-axo\", \"pid=,ppid=,pgid=,command=\").stdout.splitlines():\n        parts = line.split(None, 3)\n        if len(parts) < 4:\n            continue\n        try:\n            procs.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))\n        except ValueError:\n            continue\n    by_pid = dict((p[0], p) for p in procs)\n    mine = set()\n    cur = os.getpid()\n    while cur and cur not in mine:\n        mine.add(cur)\n        cur = by_pid.get(cur, (0, 0, 0, \"\"))[1]\n    own_pgid = os.getpgid(0)\n    live = set([rd.name])\n    for _p, _pp, _pg, c in procs:\n        m = re.search(r\"--run-id[\\s=]+(\\S+)\", c)\n        if m:\n            live.add(m.group(1))\n    repo_abs = os.path.abspath(str(repo))\n    run_path = re.compile(r\"(?:--workspace|--transcript-out)[ =]+(\\S+)\")\n    run_id = re.compile(r\"runs/([^/\\s]+)/(?:worktree|transcript)\")\n    killed = []\n    for pid, ppid, pgid, cmd in procs:\n        if pid in mine or pgid == own_pgid:\n            continue\n        if not re.search(r\"\\brecursive\\b\", cmd):\n            continue\n        m = run_path.search(cmd)\n        if not m:\n            continue\n        arg = m.group(1).strip(\"'\\\"\")\n        if not os.path.abspath(arg).startswith(repo_abs + os.sep):\n            continue\n        ids = run_id.findall(arg)\n        if not ids or ids[0] in live:\n            continue\n        # 重投自保：worktree/transcript 落在**本次 rd** 之下的进程是本 run\n        # 自己（上一次投递）的子树；本 run 仍在跑，不得当 stale 清——否则\n        # 重投的 pre 会杀掉自己上一投递 → -15 → 死循环（Linux 多 worker 实证）。\n        if os.path.abspath(arg).startswith(os.path.abspath(str(rd)) + os.sep):\n            continue\n        par = by_pid.get(ppid)\n        if par and (\"self_improve_bridge\" in par[3]\n                    or \"self-improve.flow.js\" in par[3]):\n            continue\n        killed.append((pid, pgid, ids[0], cmd))\n        try:\n            os.kill(pid, signal.SIGTERM)\n        except Exception:\n            pass\n    with open(str(rd / \"kill-stale.log\"), \"a\") as fh:\n        fh.write(\"# kill-stale \" + time.strftime(\"%Y-%m-%dT%H:%M:%S\") + \"\\n\")\n        fh.write(\"live_runs=\" + \",\".join(sorted(live)) + \"\\n\")\n        for pid, pgid, rid, cmd in killed:\n            fh.write(\"killed pid=%d pgid=%d run=%s cmd=%s\\n\" % (pid, pgid, rid, cmd[:200]))\n        if not killed:\n            fh.write(\"killed none\\n\")\n    return [pid for pid, _pg, _r, _c in killed]\n\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    killed = _kill_stale_agents(rd, repo)\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True) if issue_no else None\n    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n              if br is not None else [])\n    if cands:\n        # canonical 分支（pipeline/issue-N，GIT_PUBLISH 推的门禁通过版）\n        # 优先于 v2-*/wip-* 按新度拣选——#70 实证：被否决的朴素变体（25e41f9）\n        # 比 canonical 新 30 分钟，纯按 %ct 会继承错误基线。\n        canon = \"pipeline/issue-\" + issue_no\n        newest = canon if canon in cands else None\n        if newest is None:\n            newest_t = -1.0\n            for c in cands:\n                t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                                   capture_output=True, text=True)\n                try:\n                    ct = float(t.stdout.strip())\n                except ValueError:\n                    continue\n                if ct > newest_t:\n                    newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n        import glob as _glob\n        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', '*failure.log')))\n        if _rf:\n            _latest = max(_rf, key=os.path.getmtime)\n            sp.write_text(sp.read_text() + \"\\n\\n# 上轮失败上下文（\" + os.path.basename(_latest) + \"：评审未过或 land rebase 冲突，逐条解决其中问题；已通过部分不要动）\\n\\n\" + open(_latest, encoding='utf-8', errors='replace').read()[:6000] + \"\\n\")\n    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n    last_sid = \"\"\n    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n    if sroot and resumed:\n        cands = []\n        for root, dirs, files in os.walk(sroot):\n            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n                # 噪音过滤：var-folders tmp 工作区的空壳会话（code 沙箱副产物）\n                # 与 <300B 的 stub 都不配续跑（68 实证：选中即 resume 垃圾会话）\n                if \"var-folders-\" in root or \"-tmp\" in root:\n                    continue\n                _tp = os.path.join(root, \"transcript.jsonl\")\n                if os.path.exists(_tp) and os.path.getsize(_tp) < 300:\n                    continue\n                cands.append((os.path.getmtime(root), os.path.basename(root)))\n        if cands:\n            cands.sort()\n            last_sid = cands[-1][1]\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n",
+      "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\n\ndef _kill_stale_agents(rd, repo, own_run=None):\n    \"\"\"清本仓孤儿 recursive agent（#94）。\n\n    旧实现是「全表 pgrep + 逐 pid killpg」：模式字面量出现在自身 cmdline\n    上时自匹配（killpg 打掉自身进程组 → 子进程 -15 秒死、node 重试耗尽\n    → engine_error），并发下还会误杀兄弟 run 的 agent。现在只杀 cmdline\n    带本仓 .flowcast/runs 路径下 worktree/transcript 引用、且所属 run 已无\n    存活宿主的 recursive 进程；自身 pid / 祖先链 / 自身进程组一律跳过；\n    逐 pid SIGTERM（永不 killpg）；被杀清单落 rd/kill-stale.log 留痕。\n    \"\"\"\n    def sh(*a):\n        return subprocess.run(list(a), capture_output=True, text=True)\n    procs = []\n    for line in sh(\"ps\", \"-axo\", \"pid=,ppid=,pgid=,command=\").stdout.splitlines():\n        parts = line.split(None, 3)\n        if len(parts) < 4:\n            continue\n        try:\n            procs.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))\n        except ValueError:\n            continue\n    by_pid = dict((p[0], p) for p in procs)\n    mine = set()\n    cur = os.getpid()\n    while cur and cur not in mine:\n        mine.add(cur)\n        cur = by_pid.get(cur, (0, 0, 0, \"\"))[1]\n    own_pgid = os.getpgid(0)\n    live = set([rd.name])\n    for _p, _pp, _pg, c in procs:\n        m = re.search(r\"--run-id[\\s=]+(\\S+)\", c)\n        if m:\n            live.add(m.group(1))\n    repo_abs = os.path.abspath(str(repo))\n    run_path = re.compile(r\"(?:--workspace|--transcript-out)[ =]+(\\S+)\")\n    run_id = re.compile(r\"runs/([^/\\s]+)/(?:worktree|transcript)\")\n    killed = []\n    for pid, ppid, pgid, cmd in procs:\n        if pid in mine or pgid == own_pgid:\n            continue\n        if not re.search(r\"\\brecursive\\b\", cmd):\n            continue\n        m = run_path.search(cmd)\n        if not m:\n            continue\n        arg = m.group(1).strip(\"'\\\"\")\n        if not os.path.abspath(arg).startswith(repo_abs + os.sep):\n            continue\n        ids = run_id.findall(arg)\n        if not ids or ids[0] in live:\n            continue\n        # 重投自保：worktree/transcript 落在**本次 rd** 之下的进程是本 run\n        # 自己（上一次投递）的子树；本 run 仍在跑，不得当 stale 清——否则\n        # 重投的 pre 会杀掉自己上一投递 → -15 → 死循环（Linux 多 worker 实证）。\n        if os.path.abspath(arg).startswith(os.path.abspath(str(rd)) + os.sep):\n            continue\n        par = by_pid.get(ppid)\n        if par and (\"self_improve_bridge\" in par[3]\n                    or \"self-improve.flow.js\" in par[3]):\n            continue\n        killed.append((pid, pgid, ids[0], cmd))\n        try:\n            os.kill(pid, signal.SIGTERM)\n        except Exception:\n            pass\n    with open(str(rd / \"kill-stale.log\"), \"a\") as fh:\n        fh.write(\"# kill-stale \" + time.strftime(\"%Y-%m-%dT%H:%M:%S\") + \"\\n\")\n        fh.write(\"live_runs=\" + \",\".join(sorted(live)) + \"\\n\")\n        for pid, pgid, rid, cmd in killed:\n            fh.write(\"killed pid=%d pgid=%d run=%s cmd=%s\\n\" % (pid, pgid, rid, cmd[:200]))\n        if not killed:\n            fh.write(\"killed none\\n\")\n    return [pid for pid, _pg, _r, _c in killed]\n\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    killed = _kill_stale_agents(rd, repo)\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True) if issue_no else None\n    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n              if br is not None else [])\n    if cands:\n        # canonical 分支（pipeline/issue-N，GIT_PUBLISH 推的门禁通过版）\n        # 优先于 v2-*/wip-* 按新度拣选——#70 实证：被否决的朴素变体（25e41f9）\n        # 比 canonical 新 30 分钟，纯按 %ct 会继承错误基线。\n        canon = \"pipeline/issue-\" + issue_no\n        newest = canon if canon in cands else None\n        if newest is None:\n            newest_t = -1.0\n            for c in cands:\n                t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                                   capture_output=True, text=True)\n                try:\n                    ct = float(t.stdout.strip())\n                except ValueError:\n                    continue\n                if ct > newest_t:\n                    newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    setup = str(input.get(\"setup\") or \"\")\n    if setup:\n        _sp_log = rd / \"setup.log\"\n        try:\n            with open(_sp_log, \"w\") as _fh:\n                _sr = subprocess.run([\"bash\", \"-c\", setup], cwd=wt, stdout=_fh,\n                                     stderr=subprocess.STDOUT, timeout=900)\n        except subprocess.TimeoutExpired:\n            return {\"ok\": False, \"why\": \"setup timeout 900s（见 rd/setup.log）\"}\n        if _sr.returncode != 0:\n            _st = open(_sp_log, encoding=\"utf-8\", errors=\"replace\").read()[-400:]\n            return {\"ok\": False, \"why\": \"setup exit %d: %s\" % (_sr.returncode, _st)}\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n        import glob as _glob\n        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', '*failure.log')))\n        if _rf:\n            _latest = max(_rf, key=os.path.getmtime)\n            sp.write_text(sp.read_text() + \"\\n\\n# 上轮失败上下文（\" + os.path.basename(_latest) + \"：评审未过或 land rebase 冲突，逐条解决其中问题；已通过部分不要动）\\n\\n\" + open(_latest, encoding='utf-8', errors='replace').read()[:6000] + \"\\n\")\n    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n    last_sid = \"\"\n    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n    if sroot and resumed:\n        cands = []\n        for root, dirs, files in os.walk(sroot):\n            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n                # 噪音过滤：var-folders tmp 工作区的空壳会话（code 沙箱副产物）\n                # 与 <300B 的 stub 都不配续跑（68 实证：选中即 resume 垃圾会话）\n                if \"var-folders-\" in root or \"-tmp\" in root:\n                    continue\n                _tp = os.path.join(root, \"transcript.jsonl\")\n                if os.path.exists(_tp) and os.path.getsize(_tp) < 300:\n                    continue\n                cands.append((os.path.getmtime(root), os.path.basename(root)))\n        if cands:\n            cands.sort()\n            last_sid = cands[-1][1]\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n",
       "input": {
         "repo": "$NODE.repo",
-        "run_dir": "$NODE.run_dir"
+        "run_dir": "$NODE.run_dir",
+        "setup": "$NODE.setup_command"
       },
       "next": "gates",
-      "source_line": 109
+      "source_line": 113
     },
     {
       "type": "code",
       "id": "gates",
       "language": "python",
-      "code": "def run(input):\n    g = input.get(\"gates\")\n    # 注入的 gate 数量可变（如 plaita 只有 lint+tests 两道）：按序填入\n    # fmt/lint/test 三个语义位，**缺位用 \"true\" 占位**（恒绿 no-op，\n    # 不带语义）。不注入 = 回退 cargo 三段（recursive 零回归）。\n    if g:\n        cmds = [(x.get(\"name\") or \"gate\") if isinstance(x, dict) else \"gate\"\n                for x in g]\n        runs = [(x[\"cmd\"]) if isinstance(x, dict) and x.get(\"cmd\") else \"true\"\n                for x in g]\n        while len(cmds) < 3:\n            cmds.append(\"noop\"); runs.append(\"true\")\n        return {\"fmt\": runs[0], \"lint\": runs[1], \"test\": runs[2],\n                \"fmt_name\": cmds[0], \"lint_name\": cmds[1], \"test_name\": cmds[2]}\n    return {\"fmt\": \"cargo fmt --all\", \"lint\": \"cargo clippy --workspace --all-targets --all-features -- -D warnings\", \"test\": \"cargo test --workspace --no-fail-fast\", \"fmt_name\": \"fmt\", \"lint_name\": \"clippy\", \"test_name\": \"test\"}\n",
+      "code": "def run(input):\n    g = input.get(\"gates\")\n    # 注入的 gate 数量可变（如 plaita 只有 lint+tests 两道）：按序填入\n    # fmt/lint/test 三个语义位，**缺位用 \"true\" 占位**（恒绿 no-op，\n    # 不带语义）。不注入 = 回退 cargo 三段（recursive 零回归）。\n    if g:\n        cmds = [(x.get(\"name\") or \"gate\") if isinstance(x, dict) else \"gate\"\n                for x in g]\n        runs = [(x[\"cmd\"]) if isinstance(x, dict) and x.get(\"cmd\") else \"true\"\n                for x in g]\n        # 预算（2026-10-07）：注入方给了 timeout_secs 就用它，否则回退\n        # cargo 时代的默认位（120/1800/1800）——非 Rust 仓的 install/build\n        # 塞进第 1 槽时 120s 不够，必须让 keeper 的 per-repo 预算透传。\n        touts = [(int(x.get(\"timeout_secs\") or 0) if isinstance(x, dict) else 0)\n                 for x in g]\n        while len(cmds) < 3:\n            cmds.append(\"noop\"); runs.append(\"true\"); touts.append(0)\n        _d = [120, 1800, 1800]\n        to = [touts[i] if touts[i] > 0 else _d[i] for i in range(3)]\n        return {\"fmt\": runs[0], \"lint\": runs[1], \"test\": runs[2],\n                \"fmt_name\": cmds[0], \"lint_name\": cmds[1], \"test_name\": cmds[2],\n                \"fmt_timeout\": to[0], \"lint_timeout\": to[1], \"test_timeout\": to[2]}\n    return {\"fmt\": \"cargo fmt --all\", \"lint\": \"cargo clippy --workspace --all-targets --all-features -- -D warnings\", \"test\": \"cargo test --workspace --no-fail-fast\", \"fmt_name\": \"fmt\", \"lint_name\": \"clippy\", \"test_name\": \"test\", \"fmt_timeout\": 120, \"lint_timeout\": 1800, \"test_timeout\": 1800}\n",
       "input": {
         "gates": "$F.ifelse($INPUT.gates, $INPUT.gates, null)"
       },
       "next": "ok_eq_false",
-      "source_line": 291
+      "source_line": 308
     },
     {
       "type": "if",
@@ -85,8 +93,8 @@
         "value": false
       },
       "name": "pre.ok == False?",
-      "desc": "if pre.ok == False（第 312 行）",
-      "source_line": 312,
+      "desc": "if pre.ok == False（第 338 行）",
+      "source_line": 338,
       "next": "contains_str_why_or_disk",
       "else_next": "impl"
     },
@@ -99,7 +107,7 @@
       "timeout_secs": "$NODE.impl_timeout",
       "session": "$NODE.pre.last_sid",
       "next": "chg",
-      "source_line": 328
+      "source_line": 354
     },
     {
       "type": "child",
@@ -152,7 +160,7 @@
         }
       },
       "next": "any_eq_false",
-      "source_line": 330
+      "source_line": 356
     },
     {
       "type": "if",
@@ -163,8 +171,8 @@
         "value": false
       },
       "name": "chg.any == False?",
-      "desc": "if chg.any == False（第 331 行）",
-      "source_line": 331,
+      "desc": "if chg.any == False（第 357 行）",
+      "source_line": 357,
       "next": "_n15",
       "else_next": "g1"
     },
@@ -174,7 +182,7 @@
       "input": {
         "name": "$NODE.gates.fmt_name",
         "cmd": "$NODE.gates.fmt",
-        "timeout_secs": 120,
+        "timeout_secs": "$NODE.gates.fmt_timeout",
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -224,7 +232,7 @@
         }
       },
       "next": "passed_eq_false",
-      "source_line": 354
+      "source_line": 380
     },
     {
       "type": "if",
@@ -235,8 +243,8 @@
         "value": false
       },
       "name": "g1.passed == False?",
-      "desc": "if g1.passed == False（第 356 行）",
-      "source_line": 356,
+      "desc": "if g1.passed == False（第 382 行）",
+      "source_line": 382,
       "next": "_n14",
       "else_next": "g2"
     },
@@ -246,7 +254,7 @@
       "input": {
         "name": "$NODE.gates.lint_name",
         "cmd": "$NODE.gates.lint",
-        "timeout_secs": 1800,
+        "timeout_secs": "$NODE.gates.lint_timeout",
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -296,7 +304,7 @@
         }
       },
       "next": "passed_eq_false_2",
-      "source_line": 376
+      "source_line": 402
     },
     {
       "type": "if",
@@ -307,8 +315,8 @@
         "value": false
       },
       "name": "g2.passed == False?",
-      "desc": "if g2.passed == False（第 379 行）",
-      "source_line": 379,
+      "desc": "if g2.passed == False（第 405 行）",
+      "source_line": 405,
       "next": "_n11",
       "else_next": "g3"
     },
@@ -318,7 +326,7 @@
       "input": {
         "name": "$NODE.gates.test_name",
         "cmd": "$NODE.gates.test",
-        "timeout_secs": 1800,
+        "timeout_secs": "$NODE.gates.test_timeout",
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -368,7 +376,7 @@
         }
       },
       "next": "passed_eq_false_3",
-      "source_line": 395
+      "source_line": 421
     },
     {
       "type": "if",
@@ -379,8 +387,8 @@
         "value": false
       },
       "name": "g3.passed == False?",
-      "desc": "if g3.passed == False（第 397 行）",
-      "source_line": 397,
+      "desc": "if g3.passed == False（第 423 行）",
+      "source_line": 423,
       "next": "_n9",
       "else_next": "review_prompt"
     },
@@ -389,7 +397,7 @@
       "id": "review_prompt",
       "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff $(git merge-base main HEAD)` to see the full change (relative to the branch point: covers both uncommitted edits and commits inherited from a resumed run, while excluding main-side commits that landed after this branch was cut — plain `git diff main` would show those as inverted deletions and waste your attention), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
       "next": "rev1",
-      "source_line": 420
+      "source_line": 446
     },
     {
       "type": "agentrun",
@@ -399,7 +407,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa",
-      "source_line": 432
+      "source_line": 458
     },
     {
       "type": "if",
@@ -410,8 +418,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 434 行）",
-      "source_line": 434,
+      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 460 行）",
+      "source_line": 460,
       "next": "contains_text_verdict_ne",
       "else_next": "pub"
     },
@@ -425,7 +433,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true",
-      "source_line": 467
+      "source_line": 493
     },
     {
       "type": "if",
@@ -436,8 +444,8 @@
         "value": true
       },
       "name": "pub.merged == True?",
-      "desc": "if pub.merged == True（第 470 行）",
-      "source_line": 470,
+      "desc": "if pub.merged == True（第 496 行）",
+      "source_line": 496,
       "next": "_n4",
       "else_next": "land_rebase"
     },
@@ -451,7 +459,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_2",
-      "source_line": 483
+      "source_line": 509
     },
     {
       "type": "if",
@@ -462,8 +470,8 @@
         "value": false
       },
       "name": "land_rebase.ok == False?",
-      "desc": "if land_rebase.ok == False（第 511 行）",
-      "source_line": 511,
+      "desc": "if land_rebase.ok == False（第 537 行）",
+      "source_line": 537,
       "next": "wlp",
       "else_next": "pub2"
     },
@@ -477,7 +485,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "merged_eq_true_2",
-      "source_line": 595
+      "source_line": 621
     },
     {
       "type": "if",
@@ -488,8 +496,8 @@
         "value": true
       },
       "name": "pub2.merged == True?",
-      "desc": "if pub2.merged == True（第 598 行）",
-      "source_line": 598,
+      "desc": "if pub2.merged == True（第 624 行）",
+      "source_line": 624,
       "next": "_n2",
       "else_next": "wfp3"
     },
@@ -499,7 +507,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"retry merged=False\\nnote: \", $F.concat($NODE.pub2.note), \"\\npush_note: \", $F.concat($NODE.pub2.push_note))",
       "next": "_n1",
-      "source_line": 601
+      "source_line": 627
     },
     {
       "type": "end",
@@ -513,7 +521,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 604
+      "source_line": 630
     },
     {
       "type": "end",
@@ -526,7 +534,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish-retry',…",
-      "source_line": 599
+      "source_line": 625
     },
     {
       "type": "writefile",
@@ -534,7 +542,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why, \"\\n\\n\", $NODE.land_rebase.scene)",
       "next": "land_fix",
-      "source_line": 512
+      "source_line": 538
     },
     {
       "type": "agentrun",
@@ -544,7 +552,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "land_rebase2",
-      "source_line": 515
+      "source_line": 541
     },
     {
       "type": "code",
@@ -556,7 +564,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_3",
-      "source_line": 528
+      "source_line": 554
     },
     {
       "type": "if",
@@ -567,8 +575,8 @@
         "value": false
       },
       "name": "land_rebase2.ok == False?",
-      "desc": "if land_rebase2.ok == False（第 588 行）",
-      "source_line": 588,
+      "desc": "if land_rebase2.ok == False（第 614 行）",
+      "source_line": 614,
       "next": "wlp2",
       "else_next": "pub2"
     },
@@ -578,7 +586,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict (fix round done): \", $NODE.land_rebase2.why, \"\\n\\n\", $NODE.land_rebase2.scene)",
       "next": "_n3",
-      "source_line": 589
+      "source_line": 615
     },
     {
       "type": "end",
@@ -591,7 +599,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 593
+      "source_line": 619
     },
     {
       "type": "end",
@@ -604,7 +612,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'git-publish', 'note…",
-      "source_line": 471
+      "source_line": 497
     },
     {
       "type": "if",
@@ -615,8 +623,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 435 行）",
-      "source_line": 435,
+      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 461 行）",
+      "source_line": 461,
       "next": "wfr",
       "else_next": "fix_prompt"
     },
@@ -625,7 +633,7 @@
       "id": "fix_prompt",
       "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
       "next": "_n6",
-      "source_line": 440
+      "source_line": 466
     },
     {
       "type": "agentrun",
@@ -635,7 +643,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev2",
-      "source_line": 444
+      "source_line": 470
     },
     {
       "type": "agentrun",
@@ -645,7 +653,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_2",
-      "source_line": 445
+      "source_line": 471
     },
     {
       "type": "if",
@@ -656,8 +664,8 @@
         "value": true
       },
       "name": "F.contains(rev2.text, 'VERD…",
-      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 447 行）",
-      "source_line": 447,
+      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 473 行）",
+      "source_line": 473,
       "next": "fix_prompt2",
       "else_next": "pub"
     },
@@ -666,7 +674,7 @@
       "id": "fix_prompt2",
       "output": "$F.concat(\"An independent reviewer still rejects this change after one fix round. \", \"Address every remaining issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev2.text)",
       "next": "fix2",
-      "source_line": 452
+      "source_line": 478
     },
     {
       "type": "agentrun",
@@ -676,7 +684,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev3",
-      "source_line": 456
+      "source_line": 482
     },
     {
       "type": "agentrun",
@@ -686,7 +694,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_3",
-      "source_line": 458
+      "source_line": 484
     },
     {
       "type": "if",
@@ -697,8 +705,8 @@
         "value": true
       },
       "name": "F.contains(rev3.text, 'VERD…",
-      "desc": "if F.contains(rev3.text, 'VERDICT:PASS') != True（第 460 行）",
-      "source_line": 460,
+      "desc": "if F.contains(rev3.text, 'VERDICT:PASS') != True（第 486 行）",
+      "source_line": 486,
       "next": "wfr3",
       "else_next": "pub"
     },
@@ -708,7 +716,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
       "content": "$NODE.rev3.text",
       "next": "_n5",
-      "source_line": 461
+      "source_line": 487
     },
     {
       "type": "end",
@@ -721,7 +729,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 463
+      "source_line": 489
     },
     {
       "type": "writefile",
@@ -729,7 +737,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
       "content": "$NODE.rev1.text",
       "next": "_n7",
-      "source_line": 436
+      "source_line": 462
     },
     {
       "type": "end",
@@ -742,7 +750,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 438
+      "source_line": 464
     },
     {
       "type": "agentrun",
@@ -752,7 +760,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g3b",
-      "source_line": 398
+      "source_line": 424
     },
     {
       "type": "child",
@@ -760,7 +768,7 @@
       "input": {
         "name": "$NODE.gates.test_name",
         "cmd": "$NODE.gates.test",
-        "timeout_secs": 1800,
+        "timeout_secs": "$NODE.gates.test_timeout",
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -810,7 +818,7 @@
         }
       },
       "next": "passed_eq_false_4",
-      "source_line": 405
+      "source_line": 431
     },
     {
       "type": "if",
@@ -821,8 +829,8 @@
         "value": false
       },
       "name": "g3b.passed == False?",
-      "desc": "if g3b.passed == False（第 407 行）",
-      "source_line": 407,
+      "desc": "if g3b.passed == False（第 433 行）",
+      "source_line": 433,
       "next": "wgf3",
       "else_next": "review_prompt"
     },
@@ -832,7 +840,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-test.log\")",
       "content": "$F.concat(\"cmd: cargo test --workspace\\n--- stdout ---\\n\", $NODE.g3b.out, \"\\n--- stderr ---\\n\", $NODE.g3b.err)",
       "next": "_n8",
-      "source_line": 408
+      "source_line": 434
     },
     {
       "type": "end",
@@ -846,7 +854,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 411
+      "source_line": 437
     },
     {
       "type": "agentrun",
@@ -856,7 +864,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g2b",
-      "source_line": 380
+      "source_line": 406
     },
     {
       "type": "child",
@@ -864,7 +872,7 @@
       "input": {
         "name": "$NODE.gates.lint_name",
         "cmd": "$NODE.gates.lint",
-        "timeout_secs": 1800,
+        "timeout_secs": "$NODE.gates.lint_timeout",
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -914,7 +922,7 @@
         }
       },
       "next": "passed_eq_false_5",
-      "source_line": 387
+      "source_line": 413
     },
     {
       "type": "if",
@@ -925,8 +933,8 @@
         "value": false
       },
       "name": "g2b.passed == False?",
-      "desc": "if g2b.passed == False（第 389 行）",
-      "source_line": 389,
+      "desc": "if g2b.passed == False（第 415 行）",
+      "source_line": 415,
       "next": "wgf2",
       "else_next": "g3"
     },
@@ -936,7 +944,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-clippy.log\")",
       "content": "$F.concat(\"cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\\n--- stdout ---\\n\", $NODE.g2b.out, \"\\n--- stderr ---\\n\", $NODE.g2b.err)",
       "next": "_n10",
-      "source_line": 390
+      "source_line": 416
     },
     {
       "type": "end",
@@ -950,7 +958,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 393
+      "source_line": 419
     },
     {
       "type": "agentrun",
@@ -960,7 +968,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g1b",
-      "source_line": 357
+      "source_line": 383
     },
     {
       "type": "child",
@@ -968,7 +976,7 @@
       "input": {
         "name": "$NODE.gates.fmt_name",
         "cmd": "$NODE.gates.fmt",
-        "timeout_secs": 120,
+        "timeout_secs": "$NODE.gates.fmt_timeout",
         "wt": "$NODE.pre.worktree"
       },
       "childFlow": {
@@ -1018,7 +1026,7 @@
         }
       },
       "next": "_n12",
-      "source_line": 363
+      "source_line": 389
     },
     {
       "type": "if",
@@ -1029,8 +1037,8 @@
         "value": false
       },
       "name": "g1b.passed == False?",
-      "desc": "if g1b.passed == False（第 365 行）",
-      "source_line": 365,
+      "desc": "if g1b.passed == False（第 391 行）",
+      "source_line": 391,
       "next": "wgf1",
       "else_next": "g2"
     },
@@ -1040,7 +1048,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-fmt.log\")",
       "content": "$F.concat(\"cmd: cargo fmt --all\\n--- stdout ---\\n\", $NODE.g1b.out, \"\\n--- stderr ---\\n\", $NODE.g1b.err)",
       "next": "_n13",
-      "source_line": 366
+      "source_line": 392
     },
     {
       "type": "end",
@@ -1054,7 +1062,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 369
+      "source_line": 395
     },
     {
       "type": "end",
@@ -1068,7 +1076,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'skip-co…",
       "desc": "return {'verdict': 'skip-commit', 'stage': 'commit', 'why':…",
-      "source_line": 332
+      "source_line": 358
     },
     {
       "type": "if",
@@ -1079,8 +1087,8 @@
         "value": true
       },
       "name": "F.contains(str(pre.why or '…",
-      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 318 行）",
-      "source_line": 318,
+      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 344 行）",
+      "source_line": 344,
       "next": "_n17",
       "else_next": "wf"
     },
@@ -1090,7 +1098,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-context.md\")",
       "content": "$F.concat(\"## preflight failed\\n\\nreason: \", $NODE.pre.why)",
       "next": "_n16",
-      "source_line": 320
+      "source_line": 346
     },
     {
       "type": "end",
@@ -1103,7 +1111,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'preflight'…",
-      "source_line": 322
+      "source_line": 348
     },
     {
       "type": "end",
@@ -1116,7 +1124,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'retry-l…",
       "desc": "return {'verdict': 'retry-later', 'stage': 'preflight', 'wh…",
-      "source_line": 319
+      "source_line": 345
     }
   ]
 }

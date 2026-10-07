@@ -104,9 +104,14 @@ def self_improve_v2(INPUT):
     # 幂等续跑，但每轮吃 reaper 周期与台账噪音）。旧 checkpoint 无此键 → or 7200
     # 兜底，续跑零回归。
     impl_timeout = INPUT.impl_timeout_secs or 7200
+    # setup：worktree 建立后、门与 agent 前执行一次（TS/Python 仓装依赖用；
+    # 空 = 跳过，recursive 自身零变化）。2026-10-07 多仓放量必需——此前 flow
+    # 不跑 setup，非 Rust 仓在 fresh worktree 上 gate 必挂（无 node_modules）。
+    setup_command = INPUT.setup_command or ""
 
     # ── preflight（唯一复杂 code 节点）──
-    pre = CODE(id="preflight", lang="python", input={"repo": repo, "run_dir": run_dir}, code=(
+    pre = CODE(id="preflight", lang="python",
+               input={"repo": repo, "run_dir": run_dir, "setup": setup_command}, code=(
         "import json, os, re, signal, subprocess, sys, time\n"
         "from pathlib import Path\n"
         "\n"
@@ -236,6 +241,18 @@ def self_improve_v2(INPUT):
         "            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n"
         "    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n"
         "                          capture_output=True, text=True).stdout.strip()\n"
+        "    setup = str(input.get(\"setup\") or \"\")\n"
+        "    if setup:\n"
+        "        _sp_log = rd / \"setup.log\"\n"
+        "        try:\n"
+        "            with open(_sp_log, \"w\") as _fh:\n"
+        "                _sr = subprocess.run([\"bash\", \"-c\", setup], cwd=wt, stdout=_fh,\n"
+        "                                     stderr=subprocess.STDOUT, timeout=900)\n"
+        "        except subprocess.TimeoutExpired:\n"
+        "            return {\"ok\": False, \"why\": \"setup timeout 900s（见 rd/setup.log）\"}\n"
+        "        if _sr.returncode != 0:\n"
+        "            _st = open(_sp_log, encoding=\"utf-8\", errors=\"replace\").read()[-400:]\n"
+        "            return {\"ok\": False, \"why\": \"setup exit %d: %s\" % (_sr.returncode, _st)}\n"
         "    sp = rd / \"sys-prompt.md\"\n"
         "    sp.write_text(\"\"\"# Headless batch-run constraints\n"
         "\n"
@@ -300,14 +317,23 @@ def self_improve_v2(INPUT):
         "                for x in g]\n"
         "        runs = [(x[\"cmd\"]) if isinstance(x, dict) and x.get(\"cmd\") else \"true\"\n"
         "                for x in g]\n"
+        "        # 预算（2026-10-07）：注入方给了 timeout_secs 就用它，否则回退\n"
+        "        # cargo 时代的默认位（120/1800/1800）——非 Rust 仓的 install/build\n"
+        "        # 塞进第 1 槽时 120s 不够，必须让 keeper 的 per-repo 预算透传。\n"
+        "        touts = [(int(x.get(\"timeout_secs\") or 0) if isinstance(x, dict) else 0)\n"
+        "                 for x in g]\n"
         "        while len(cmds) < 3:\n"
-        "            cmds.append(\"noop\"); runs.append(\"true\")\n"
+        "            cmds.append(\"noop\"); runs.append(\"true\"); touts.append(0)\n"
+        "        _d = [120, 1800, 1800]\n"
+        "        to = [touts[i] if touts[i] > 0 else _d[i] for i in range(3)]\n"
         "        return {\"fmt\": runs[0], \"lint\": runs[1], \"test\": runs[2],\n"
-        "                \"fmt_name\": cmds[0], \"lint_name\": cmds[1], \"test_name\": cmds[2]}\n"
+        "                \"fmt_name\": cmds[0], \"lint_name\": cmds[1], \"test_name\": cmds[2],\n"
+        "                \"fmt_timeout\": to[0], \"lint_timeout\": to[1], \"test_timeout\": to[2]}\n"
         "    return {\"fmt\": \"cargo fmt --all\","
         " \"lint\": \"cargo clippy --workspace --all-targets --all-features -- -D warnings\","
         " \"test\": \"cargo test --workspace --no-fail-fast\","
-        " \"fmt_name\": \"fmt\", \"lint_name\": \"clippy\", \"test_name\": \"test\"}\n"))
+        " \"fmt_name\": \"fmt\", \"lint_name\": \"clippy\", \"test_name\": \"test\","
+        " \"fmt_timeout\": 120, \"lint_timeout\": 1800, \"test_timeout\": 1800}\n"))
 
     if pre.ok == False:
         # 磁盘守卫等环境性失败 → retry-later：keeper 不消费、自动重派（写回
@@ -352,7 +378,7 @@ def self_improve_v2(INPUT):
     # （2026-10-05 pipeline-93-1005122022 实证：clippy 门红、g2.out 长度 0，
     # 修复 agent 拿到空清单）。失败落盘分支早已是 out+err 双写，提示词对齐即可。
     g1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
-                      "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": gates.fmt_timeout, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
                 'The fmt check failed. Edit the source files to fix every '
@@ -361,7 +387,7 @@ def self_improve_v2(INPUT):
                 "\n--- stdout ---\n", g1.out, "\n--- stderr ---\n", g1.err),
             repo=pre.worktree, timeout_secs=7200)
         g1b = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
-                           "timeout_secs": 120, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree}, flow=gate_once)
         if g1b.passed == False:
             wgf1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-fmt.log"),
                              content=F.concat("cmd: cargo fmt --all\n--- stdout ---\n",
@@ -375,7 +401,7 @@ def self_improve_v2(INPUT):
     # Compiling 进度、零 error 行）。keeper 侧 gates.json 对该命令本就给 1800s。
     g2 = CHILD(input={"name": gates.lint_name,
                       "cmd": gates.lint,
-                      "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": gates.lint_timeout, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
                 'The clippy check failed. Edit the source files to fix every '
@@ -385,7 +411,7 @@ def self_improve_v2(INPUT):
                 "\n--- stdout ---\n", g2.out, "\n--- stderr ---\n", g2.err),
             repo=pre.worktree, timeout_secs=7200)
         g2b = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
-                           "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree}, flow=gate_once)
         if g2b.passed == False:
             wgf2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-clippy.log"),
                              content=F.concat("cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\n--- stdout ---\n",
@@ -393,7 +419,7 @@ def self_improve_v2(INPUT):
             return {"verdict": "failed-preserved", "stage": "gates", "gate": g2b.gate,
                     "out": g2b.out}
     g3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
-                      "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": gates.test_timeout, "wt": pre.worktree}, flow=gate_once)
     if g3.passed == False:
         AGENTRUN(agent=agent, prompt=F.concat(
                 'The cargo test check failed. Edit the source files to fix every '
@@ -403,7 +429,7 @@ def self_improve_v2(INPUT):
                 "\n--- stdout ---\n", g3.out, "\n--- stderr ---\n", g3.err),
             repo=pre.worktree, timeout_secs=7200)
         g3b = CHILD(input={"name": gates.test_name, "cmd": gates.test,
-                           "timeout_secs": 1800, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": gates.test_timeout, "wt": pre.worktree}, flow=gate_once)
         if g3b.passed == False:
             wgf3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-test.log"),
                              content=F.concat("cmd: cargo test --workspace\n--- stdout ---\n",
