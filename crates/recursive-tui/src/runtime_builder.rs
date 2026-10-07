@@ -349,13 +349,18 @@ pub fn build_runtime() -> TuiRuntime {
     // both the prompt profile and the builder consume it. `RECURSIVE_AGENT_PRESET`
     // selects it; `standard` is the default.
     let preset = resolve_tui_preset(&config);
-    let assembled = assemble_system_prompt(
-        &config.system_prompt,
-        &config.workspace,
-        &skills,
-        config.subagent_enabled,
+    // Issue #128: a `complete` prompt profile (the `minimal` preset) replaces
+    // the assembled prompt outright.
+    let assembled = recursive::preset::apply_prompt(
+        assemble_system_prompt(
+            &config.system_prompt,
+            &config.workspace,
+            &skills,
+            config.subagent_enabled,
+        ),
+        &preset,
     );
-    let system_prompt = recursive::preset::apply_prompt(assembled.full, &preset);
+    let system_prompt = assembled.full;
     let prompt_segments = assembled.segments;
 
     // Extract the shared read_state BEFORE `tools` is moved into the builder,
@@ -515,13 +520,18 @@ fn build_runtime_with_skill_tx(
     // both the prompt profile and the builder consume it. `RECURSIVE_AGENT_PRESET`
     // selects it; `standard` is the default.
     let preset = resolve_tui_preset(&config);
-    let assembled = assemble_system_prompt(
-        &config.system_prompt,
-        &config.workspace,
-        &skills,
-        config.subagent_enabled,
+    // Issue #128: a `complete` prompt profile (the `minimal` preset) replaces
+    // the assembled prompt outright.
+    let assembled = recursive::preset::apply_prompt(
+        assemble_system_prompt(
+            &config.system_prompt,
+            &config.workspace,
+            &skills,
+            config.subagent_enabled,
+        ),
+        &preset,
     );
-    let system_prompt = recursive::preset::apply_prompt(assembled.full, &preset);
+    let system_prompt = assembled.full;
     let prompt_segments = assembled.segments;
 
     // Extract the shared read_state BEFORE `tools` is moved into the builder,
@@ -654,6 +664,64 @@ mod tests {
         let config = Config::from_env().expect("config");
 
         assert_eq!(resolve_tui_preset(&config).id, "standard");
+    }
+
+    /// Issue #128 (TUI half): a `complete` prompt profile (the `minimal`
+    /// preset) reaches the built runtime as its one-liner — the assembled
+    /// project context / base / skill segments are gone (the segment
+    /// breakdown is pinned in `preset::tests`) — and the declared tool subset
+    /// survives the build's re-registrations.
+    #[tokio::test]
+    async fn minimal_preset_replaces_the_tui_prompt_and_surface() {
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(empty_home.path());
+        let _keys = ApiKeyGuard::clear();
+        let _preset_env = EnvGuard::set("RECURSIVE_AGENT_PRESET", "minimal");
+        let cfg_dir = empty_home.path().join(".recursive");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"[provider]
+api_key = "sk-test-from-config"
+api_base = "https://api.example.invalid"
+model = "test-model-from-config"
+type = "openai"
+"#,
+        )
+        .expect("write config");
+
+        let tui_rt = build_runtime();
+        let runtime = match tui_rt.state {
+            RuntimeBuild::Ready(Some(rt)) => rt,
+            RuntimeBuild::Ready(None) => panic!("expected a built runtime"),
+            RuntimeBuild::Offline { reason } => panic!("expected Ready, got Offline: {reason}"),
+        };
+        assert_eq!(runtime.preset_id(), Some("minimal"));
+
+        let system = runtime
+            .transcript()
+            .iter()
+            .find(|m| m.role == recursive::message::Role::System)
+            .expect("the build must install a system message");
+        assert_eq!(
+            system.content,
+            recursive::preset::MINIMAL_PROMPT,
+            "the one-liner must replace the whole assembled prompt"
+        );
+
+        let mut names: Vec<String> = runtime
+            .kernel()
+            .tools()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["Bash", "Edit", "Read", "Write"],
+            "the preset's four-tool surface must survive the build"
+        );
     }
 
     /// A preset with no re-injection declaration installs no reinjector even

@@ -35,6 +35,7 @@ use crate::config::Config;
 use crate::llm::{default_compact_threshold_chars, default_compact_threshold_tokens};
 use crate::runtime::AgentRuntimeBuilder;
 use crate::skills::Skill;
+use crate::system_prompt::{AssembledPrompt, PromptSegments};
 use crate::tools::fs::ReadFileState;
 
 // ── env var names (declared once: the inventory and the resolver share them) ─
@@ -66,27 +67,52 @@ pub const DEFAULT_PER_FILE_BUDGET: usize = 5_000;
 pub const DEFAULT_REINJECT_SKILL_BUDGET: usize = 25_000;
 pub const DEFAULT_PER_SKILL_BUDGET: usize = 5_000;
 
+/// The `minimal` preset's whole system prompt — one line, and that is the
+/// point (issue #128). Nothing is assembled around it.
+pub const MINIMAL_PROMPT: &str = "You are a helpful software engineer assistant.";
+
+/// The `minimal` preset's entire tool surface: read, write, edit, shell —
+/// names as the model sees them. Navigation and search are the shell's job.
+pub static MINIMAL_TOOLS: &[&str] = &["Read", "Write", "Edit", "Bash"];
+
 // ── declaration ───────────────────────────────────────────────────────────
 
 /// Prompt profile: what the session's system prompt is composed of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PromptProfile {
+    /// When `Some`, this text IS the session's whole system prompt (the
+    /// DeepSeek-Harness `complete: true` form): the assembled base, the
+    /// project context, the sub-agent note, the skill catalog and the
+    /// `<environment>` segment are all discarded — whatever the channel
+    /// assembled, and whatever the caller asked for in the request body.
+    ///
+    /// `None` = the channel's assembled prompt is used, with
+    /// [`Self::persona_suffix`] appended.
+    pub complete: Option<&'static str>,
     /// Appended to the assembled base prompt. `None` = the channel's own
-    /// prompt is used verbatim.
+    /// prompt is used verbatim. Ignored when [`Self::complete`] is set.
     pub persona_suffix: Option<&'static str>,
     /// Auto-load the full bodies of the skills matching the session goal (the
     /// CLI's goal-based injection). Channels with no goal at prompt-build time
     /// cannot honour it.
     pub auto_skill_injection: bool,
+    /// Ship the skill catalog as the per-turn `<system-reminder>`. `false`
+    /// leaves the session with no skill surface at all.
+    pub skill_catalog: bool,
 }
 
-/// Tool profile: which optional tool groups the preset asks for.
+/// Tool profile: which tools the preset asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ToolProfile {
     /// Register `enter_plan_mode` / `exit_plan_mode` / `request_plan_mode`.
     /// These block on a live human, so the channel must also report itself
     /// interactive ([`ChannelSupport`]) for them to be registered at all.
     pub plan_mode_tools: bool,
+    /// `Some(names)` = prune the session's registry to exactly these tool
+    /// names (`ToolRegistry::retain_tools`; case-insensitive). `None` = the
+    /// channel's full surface. Names are the LLM-facing tool names
+    /// (`Read` / `Write` / …), which are also the registry keys.
+    pub allow: Option<&'static [&'static str]>,
 }
 
 /// How the cross-turn compactor's threshold is derived.
@@ -479,11 +505,14 @@ pub static STANDARD: AgentPreset = AgentPreset {
     description: "General coding session: auto compaction, post-compaction re-injection \
                   of recently-read files and invoked skills, plan-mode tools.",
     prompt: PromptProfile {
+        complete: None,
         persona_suffix: None,
         auto_skill_injection: true,
+        skill_catalog: true,
     },
     tools: ToolProfile {
         plan_mode_tools: true,
+        allow: None,
     },
     context: ContextProfile {
         compaction: Some(CompactionMode::Auto),
@@ -502,9 +531,129 @@ pub static STANDARD: AgentPreset = AgentPreset {
     capabilities: STANDARD_CAPABILITIES,
 };
 
+/// Capability inventory of the `minimal` preset (issue #128).
+///
+/// Most rows are *off*: the point of this preset is that the session pays for
+/// nothing it does not need, so what is absent has to be discoverable here
+/// rather than inferred from the assembly code.
+static MINIMAL_CAPABILITIES: &[Capability] = &[
+    Capability {
+        name: "one-line-persona",
+        default: CapabilityDefault::Enabled,
+        toggle: "",
+        note: "the whole system prompt; the assembled base, project context, memory \
+               layers, sub-agent note and environment segment are discarded.",
+    },
+    Capability {
+        name: "core-tool-subset",
+        default: CapabilityDefault::Enabled,
+        toggle: "",
+        note: "Read / Write / Edit / Bash only — the registry is pruned to exactly this \
+               set before the runtime is built.",
+    },
+    Capability {
+        name: "memory-layers",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "user / project / summary / scratchpad / facts / episodic layers are baked \
+               into `Config::system_prompt` before any preset runs; a `complete` prompt \
+               profile replaces that base wholesale, so none of them is sent.",
+    },
+    Capability {
+        name: "project-context",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "AGENTS.md / CLAUDE.md are not read into the prompt.",
+    },
+    Capability {
+        name: "environment-segment",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "a channel still renders the transport's `<environment>` segment; the \
+               complete prompt profile drops it.",
+    },
+    Capability {
+        name: "goal-based-skill-injection",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "no skill bodies are auto-loaded from the session goal.",
+    },
+    Capability {
+        name: "skill-catalog-reminder",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "no per-turn `<system-reminder>` skill catalog, and no `LoadSkill` tool.",
+    },
+    Capability {
+        name: "cross-turn-compaction",
+        default: CapabilityDefault::Disabled,
+        toggle: COMPACT_THRESHOLD_ENV,
+        note: "the declaration has none; the env var still wins and can pin an explicit \
+               threshold (env > declaration, see the module docs).",
+    },
+    Capability {
+        name: "recently-read-file-reinjection",
+        default: CapabilityDefault::Disabled,
+        toggle: REINJECT_FILES_ENV,
+        note: "nothing is re-attached after compaction — there is no compaction.",
+    },
+    Capability {
+        name: "invoked-skill-reinjection",
+        default: CapabilityDefault::Disabled,
+        toggle: REINJECT_SKILLS_ENV,
+        note: "same: no invoked skills, no re-injection.",
+    },
+    Capability {
+        name: "plan-mode-tools",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "the plan tools block on a live human and are outside the core subset.",
+    },
+    Capability {
+        name: "subagent-delegation",
+        default: CapabilityDefault::Disabled,
+        toggle: "RECURSIVE_SUBAGENT_ENABLED",
+        note: "the `agent` tool is pruned by the core tool subset even when the operator \
+               enables sub-agents process-wide.",
+    },
+];
+
+/// The built-in `minimal` preset (issue #128): one-line prompt, four tools,
+/// no context management. Borrowed from the DeepSeek-Harness `minimal` preset
+/// (`packages/bundle/web-app/presets/minimal.patch.yml`), whose stated purpose
+/// is "the agent completes tasks with terminal tools only — suitable for
+/// testing and comparing its baseline behaviour". It is also the cheapest
+/// request this runtime can make, and therefore the floor a benchmark compares
+/// `standard` against.
+pub static MINIMAL: AgentPreset = AgentPreset {
+    id: "minimal",
+    description: "Minimal session: a one-line system prompt, Read/Write/Edit/Bash only, \
+                  no memory / skill / project-context / environment injection and no \
+                  compaction or re-injection. For simple tasks and for measuring a \
+                  model's baseline.",
+    prompt: PromptProfile {
+        complete: Some(MINIMAL_PROMPT),
+        persona_suffix: None,
+        auto_skill_injection: false,
+        skill_catalog: false,
+    },
+    tools: ToolProfile {
+        plan_mode_tools: false,
+        allow: Some(MINIMAL_TOOLS),
+    },
+    context: ContextProfile {
+        compaction: None,
+        microcompaction: None,
+        max_transcript_chars: None,
+        reinject_recent_files: None,
+        reinject_invoked_skills: None,
+    },
+    capabilities: MINIMAL_CAPABILITIES,
+};
+
 /// Every built-in preset. Adding one is a declaration plus a line here — no
 /// builder branch anywhere (issue #127 acceptance 3).
-static BUILTIN: [&AgentPreset; 1] = [&STANDARD];
+static BUILTIN: [&AgentPreset; 2] = [&STANDARD, &MINIMAL];
 
 /// Every built-in preset.
 pub fn builtin() -> &'static [&'static AgentPreset] {
@@ -649,17 +798,78 @@ pub fn apply(
         });
     }
 
+    // Issue #128: a declared tool subset prunes the registry (in `build()`,
+    // before the runtime re-registers its sinked placeholders), so "the
+    // preset decides the surface" holds for every channel that assembles here
+    // rather than for whichever channel remembered to filter.
+    if let Some(allow) = preset.tools.allow {
+        builder = builder.with_tool_allow(allow.iter().map(|name| (*name).to_string()).collect());
+    }
+
+    // Same for the skill catalog: it is the kernel's per-turn
+    // `<system-reminder>`, so a preset that declares no skill surface must
+    // clear it here — after the channel installed it.
+    if !preset.prompt.skill_catalog {
+        builder = builder.skills(Vec::new());
+    }
+
     builder
         .with_plan_mode_tools(preset.tools.plan_mode_tools && channel.interactive)
         .with_preset_id(preset.id.clone())
 }
 
 /// Apply the preset's prompt profile to an already-assembled system prompt.
-pub fn apply_prompt(prompt: String, preset: &ResolvedPreset) -> String {
-    match preset.prompt.persona_suffix {
-        Some(suffix) => format!("{prompt}\n{suffix}"),
-        None => prompt,
+///
+/// A `complete` profile replaces the prompt *and* its segment breakdown, so
+/// the local context-breakdown estimator sizes what the request really
+/// carries rather than what the channel assembled on the way there.
+pub fn apply_prompt(assembled: AssembledPrompt, preset: &ResolvedPreset) -> AssembledPrompt {
+    if let Some(complete) = preset.prompt.complete {
+        return AssembledPrompt {
+            full: complete.to_string(),
+            segments: PromptSegments {
+                system_prompt: complete.to_string(),
+                ..PromptSegments::default()
+            },
+        };
     }
+    match preset.prompt.persona_suffix {
+        Some(suffix) => AssembledPrompt {
+            full: format!("{}\n{suffix}", assembled.full),
+            ..assembled
+        },
+        None => assembled,
+    }
+}
+
+/// The system prompt a session created under `preset` would send on its first
+/// request, for the server's default base and no request-scoped override
+/// (issue #128 item 3: every preset's fixed per-request cost must be
+/// observable, not folklore).
+///
+/// The `<environment>` segment is transport-specific and therefore never part
+/// of this preview; a channel that injects one measures its own.
+pub fn preview_system_prompt(
+    config: &Config,
+    preset: &ResolvedPreset,
+    skills: &[Skill],
+) -> AssembledPrompt {
+    apply_prompt(
+        crate::assemble_system_prompt(
+            &config.system_prompt,
+            &config.workspace,
+            skills,
+            config.subagent_enabled,
+        ),
+        preset,
+    )
+}
+
+/// Estimated token weight of [`preview_system_prompt`] — the per-request
+/// system cost of one session under `preset`, in the same `bytes/4` estimator
+/// the context breakdown uses. Only relative comparisons are meaningful.
+pub fn system_prompt_tokens(config: &Config, preset: &ResolvedPreset, skills: &[Skill]) -> u32 {
+    crate::llm::estimate_tokens(preview_system_prompt(config, preset, skills).full())
 }
 
 #[cfg(test)]
@@ -676,6 +886,17 @@ mod tests {
 
     fn fresh_builder() -> AgentRuntimeBuilder {
         AgentRuntimeBuilder::new().llm(Arc::new(MockProvider::new(vec![])))
+    }
+
+    /// An assembled prompt whose segments claim exactly the text in `full`.
+    fn assembled(full: &str) -> AssembledPrompt {
+        AssembledPrompt {
+            full: full.to_string(),
+            segments: PromptSegments {
+                system_prompt: full.to_string(),
+                ..PromptSegments::default()
+            },
+        }
     }
 
     // ── declaration / resolution ──────────────────────────────────────────
@@ -909,8 +1130,9 @@ mod tests {
     fn an_unknown_preset_id_is_an_error_listing_the_known_ids() {
         let err = select(Some("nope"), &PresetEnv::default()).expect_err("must reject");
         assert_eq!(err.id, "nope");
-        assert_eq!(err.known, vec!["standard"]);
+        assert_eq!(err.known, vec!["standard", "minimal"]);
         assert!(err.to_string().contains("standard"));
+        assert!(err.to_string().contains("minimal"));
 
         let env = PresetEnv {
             agent_preset: Some("also-nope".to_string()),
@@ -1057,11 +1279,14 @@ mod tests {
             id: "lean-test-only",
             description: "test fixture",
             prompt: PromptProfile {
+                complete: None,
                 persona_suffix: Some("be terse"),
                 auto_skill_injection: false,
+                skill_catalog: false,
             },
             tools: ToolProfile {
                 plan_mode_tools: false,
+                allow: Some(&["Read"]),
             },
             context: ContextProfile {
                 compaction: Some(CompactionMode::Chars(1000)),
@@ -1087,8 +1312,16 @@ mod tests {
         assert_eq!(builder.preset_id(), Some("lean-test-only"));
         assert!(!builder.with_plan_mode_tools_for_test());
         assert_eq!(
-            apply_prompt("base".to_string(), &resolved),
+            apply_prompt(assembled("base"), &resolved).full,
             "base\nbe terse"
+        );
+        assert!(
+            builder.skills_for_test().is_empty(),
+            "a preset that declares no skill catalog must leave the kernel without one"
+        );
+        assert_eq!(
+            builder.tool_allow_for_test(),
+            Some(["Read".to_string()].as_slice())
         );
         // ...and the standard preset is unaffected by that declaration.
         let standard_facts = STANDARD.resolve(&config, &PresetEnv::default()).context;
@@ -1099,7 +1332,294 @@ mod tests {
     fn prompt_suffix_is_a_no_op_for_the_standard_preset() {
         let config = config_for("preset-test-model");
         let resolved = STANDARD.resolve(&config, &PresetEnv::default());
-        assert_eq!(apply_prompt("base".into(), &resolved), "base");
+        assert_eq!(apply_prompt(assembled("base"), &resolved).full, "base");
+    }
+
+    // ── Issue #128: the `minimal` preset ──────────────────────────────────
+
+    fn demo_skill() -> Skill {
+        crate::skills::skill_from_content(
+            "demo",
+            "---\nname: demo\ndescription: A demo skill\n---\n\nbody",
+            Vec::new(),
+        )
+    }
+
+    /// Acceptance 3, prompt half: whatever the channel assembled — project
+    /// context, memory layers, the sub-agent note, the skill catalog, the
+    /// `<environment>` segment — a `complete` prompt profile replaces it, and
+    /// the segment breakdown is replaced with it (so the local breakdown
+    /// estimator sizes what the request carries, not what was assembled on the
+    /// way there).
+    #[test]
+    fn a_complete_prompt_profile_replaces_the_whole_assembly() {
+        let config = config_for("preset-test-model");
+        let resolved = MINIMAL.resolve(&config, &PresetEnv::default());
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            "## AGENTS.md\n\ndeep project lore",
+        )
+        .expect("write");
+        let skills = vec![demo_skill()];
+        let mut assembled =
+            crate::assemble_system_prompt("base prompt + memory layers", tmp.path(), &skills, true);
+        const ENV: &str = "<environment>container tier</environment>";
+        assembled.full.push_str(ENV);
+        assembled.segments.environment = ENV.to_string();
+        assert!(assembled.full.contains("deep project lore"), "fixture");
+
+        let out = apply_prompt(assembled, &resolved);
+        assert_eq!(out.full, MINIMAL_PROMPT);
+        assert_eq!(out.segments.system_prompt, MINIMAL_PROMPT);
+        for (name, segment) in [
+            ("rules", &out.segments.rules),
+            ("skills", &out.segments.skills),
+            ("subagents", &out.segments.subagents),
+            ("environment", &out.segments.environment),
+        ] {
+            assert!(
+                segment.is_empty(),
+                "a minimal session must carry no {name} segment, got {segment:?}"
+            );
+        }
+    }
+
+    /// Acceptance 3, tools half: the declaration is a four-tool subset and no
+    /// context management — and the *built* runtime matches it, including the
+    /// tool surface (which is pruned in `AgentRuntimeBuilder::build`, after
+    /// the channel installed the full registry).
+    #[test]
+    fn minimal_prunes_the_built_runtime_to_the_core_tools() {
+        let config = config_for("preset-test-model");
+        let resolved = MINIMAL.resolve(&config, &PresetEnv::default());
+        assert_eq!(resolved.context, ContextFacts::default());
+        assert_eq!(resolved.tools.allow, Some(MINIMAL_TOOLS));
+        assert!(!resolved.tools.plan_mode_tools);
+        assert_eq!(resolved.prompt.complete, Some(MINIMAL_PROMPT));
+        assert!(!resolved.prompt.skill_catalog);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let registry = crate::tools::build_standard_tools(tmp.path(), &[], 30);
+        assert!(
+            registry.find_by_name("Glob").is_some(),
+            "fixture: the channel hands over the full standard surface"
+        );
+
+        let catalog = vec![demo_skill()];
+        let builder = apply(
+            fresh_builder()
+                .tools(registry)
+                .system_prompt(MINIMAL_PROMPT)
+                .skills(catalog.clone()),
+            &resolved,
+            &PresetAssets::new().with_skills(catalog),
+            ChannelSupport { interactive: true },
+        );
+        assert!(
+            builder.skills_for_test().is_empty(),
+            "a preset with no skill surface must clear the kernel's catalog"
+        );
+        let runtime = builder.build().expect("build");
+        let mut names: Vec<String> = runtime
+            .kernel()
+            .tools()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Bash", "Edit", "Read", "Write"]);
+    }
+
+    /// Acceptance 1: measured, with a realistic project (project context file
+    /// plus every local memory store seeded) — the `standard` session's
+    /// system prompt is at least an order of magnitude heavier than the
+    /// `minimal` one's.
+    #[test]
+    fn minimal_system_prompt_is_an_order_of_magnitude_smaller() {
+        let _env_lock = crate::test_util::env_lock();
+        let home = tempfile::tempdir().expect("home");
+        let _pinned = crate::test_util::PinnedRecursiveHomeNoLock::new(home.path(), &_env_lock);
+        let ws = tempfile::tempdir().expect("workspace");
+
+        std::fs::write(
+            ws.path().join("AGENTS.md"),
+            format!("## AGENTS.md\n\n{}", "project lore. ".repeat(400)),
+        )
+        .expect("write AGENTS.md");
+        let memory = crate::tools::memory::memory_path(ws.path());
+        std::fs::create_dir_all(memory.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &memory,
+            r#"{"notes":[{"id":"N1","tags":[],"text":"a remembered note","ts":"2026-07-09T00:00:00Z"}]}"#,
+        )
+        .expect("write memory");
+        std::fs::write(
+            crate::tools::memory::scratchpad_path(ws.path()),
+            r#"{"entries":[{"key":"k","value":"a scratchpad value"}]}"#,
+        )
+        .expect("write scratchpad");
+        let facts = crate::tools::facts::facts_path(ws.path(), "workspace");
+        std::fs::create_dir_all(facts.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &facts,
+            r#"{"id":"F1","text":"a workspace fact","tags":[],"source":null,"created_at":"2026-07-09T00:00:00Z","last_accessed":"2026-07-09T00:00:00Z","access_count":1,"superseded_by":null}
+"#,
+        )
+        .expect("write facts");
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "preset-test-model");
+        std::env::set_var("RECURSIVE_WORKSPACE", ws.path());
+        let config = Config::from_env().expect("config");
+        assert!(
+            config.system_prompt.contains("# Memory summary"),
+            "fixture: the standard base must really carry the memory layers"
+        );
+
+        let skills = vec![demo_skill()];
+        let standard = STANDARD.resolve(&config, &PresetEnv::default());
+        let minimal = MINIMAL.resolve(&config, &PresetEnv::default());
+        let standard_tokens = system_prompt_tokens(&config, &standard, &skills);
+        let minimal_tokens = system_prompt_tokens(&config, &minimal, &skills);
+
+        // The measurement itself, so a run with `--nocapture` leaves evidence
+        // rather than only a pass/fail.
+        eprintln!(
+            "system prompt tokens — standard: {standard_tokens}, minimal: {minimal_tokens} \
+             (ratio {:.1}x, standard base {} bytes, minimal {} bytes)",
+            standard_tokens as f64 / minimal_tokens as f64,
+            preview_system_prompt(&config, &standard, &skills)
+                .full
+                .len(),
+            MINIMAL_PROMPT.len(),
+        );
+
+        assert_eq!(
+            minimal_tokens,
+            crate::llm::estimate_tokens(MINIMAL_PROMPT),
+            "the minimal system prompt is the one-liner and nothing else"
+        );
+        assert!(
+            standard_tokens >= minimal_tokens * 10,
+            "measured: standard={standard_tokens} tokens vs minimal={minimal_tokens} tokens — \
+             the whole point of the preset is that this differs by an order of magnitude"
+        );
+    }
+
+    /// Acceptance 2, wiring half: the simple task shapes the minimal preset
+    /// targets — read-modify-run, search, multi-step — still complete on a
+    /// one-line prompt with four tools, exactly as they do under `standard`.
+    ///
+    /// The model here is scripted (`MockProvider` ignores the prompt), so this
+    /// is NOT a model-quality measurement — the benchmark issue owns that half.
+    /// What it pins is that the pruned, memory-less session is still a working
+    /// agent: the core tools execute, the transcript stays paired, the turn
+    /// ends with `NoMoreToolCalls`, and the workspace really changed.
+    #[tokio::test]
+    async fn the_simple_task_set_completes_under_both_presets() {
+        use crate::llm::{Completion, ToolCall};
+
+        let script = || {
+            let call = |content: &str, id: &str, name: &str, args: serde_json::Value| Completion {
+                content: content.to_string(),
+                tool_calls: vec![ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: args,
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            };
+            vec![
+                // multi-step + write half of read-modify-run
+                call(
+                    "writing the note",
+                    "c1",
+                    "Write",
+                    serde_json::json!({"path": "note.txt", "contents": "alpha\n"}),
+                ),
+                call(
+                    "reading it back",
+                    "c2",
+                    "Read",
+                    serde_json::json!({"path": "note.txt"}),
+                ),
+                call(
+                    "editing it",
+                    "c3",
+                    "Edit",
+                    serde_json::json!({"file_path": "note.txt", "old_string": "alpha", "new_string": "beta"}),
+                ),
+                // search half, through the shell the minimal preset is built on
+                call(
+                    "searching for the result",
+                    "c4",
+                    "Bash",
+                    serde_json::json!({"command": "grep -n beta note.txt"}),
+                ),
+                call(
+                    "confirming the run step",
+                    "c5",
+                    "Bash",
+                    serde_json::json!({"command": "cat note.txt"}),
+                ),
+                Completion {
+                    content: "note.txt now says beta".to_string(),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".into()),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]
+        };
+
+        for preset in [&STANDARD, &MINIMAL] {
+            let tmp = tempfile::tempdir().expect("workspace");
+            let mut config = config_for("preset-test-model");
+            config.workspace = tmp.path().to_path_buf();
+            let resolved = preset.resolve(&config, &PresetEnv::default());
+            let assembled = preview_system_prompt(&config, &resolved, &[]);
+            let registry = crate::tools::build_standard_tools(tmp.path(), &[], 30);
+            let assets = assets_from_registry(&registry, Vec::new());
+
+            let builder = apply(
+                AgentRuntimeBuilder::new()
+                    .llm(Arc::new(MockProvider::new(script())))
+                    .tools(registry)
+                    .system_prompt(assembled.full),
+                &resolved,
+                &assets,
+                ChannelSupport { interactive: false },
+            );
+            let mut runtime = builder.build().expect("build");
+            let outcome = runtime
+                .run("change alpha to beta in note.txt, then grep for beta")
+                .await
+                .expect("run");
+
+            assert_eq!(
+                outcome.finish_reason,
+                crate::agent::FinishReason::NoMoreToolCalls,
+                "{} session must finish the task, not stall",
+                preset.id
+            );
+            assert_eq!(
+                outcome.final_text.as_deref(),
+                Some("note.txt now says beta"),
+                "{} session must report the final answer",
+                preset.id
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("note.txt")).expect("read back"),
+                "beta\n",
+                "{} session must have really edited the file",
+                preset.id
+            );
+        }
     }
 
     #[test]

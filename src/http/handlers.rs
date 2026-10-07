@@ -396,21 +396,15 @@ pub(super) fn build_session_runtime(
     preset: &crate::preset::ResolvedPreset,
     overrides: SessionOverrides,
 ) -> AgentRuntimeBuilder {
-    let skills = state.skills.clone();
     build_session_runtime_parts(
         tool_registry,
-        crate::preset::apply_prompt(system_prompt, preset),
+        system_prompt,
         prompt_segments,
         max_steps,
         preset,
-        skills.clone(),
+        state.skills.clone(),
         HTTP_CHANNEL,
     )
-    // #74 拆单 3/3: the merged skill catalog (directory + service-level
-    // SkillSource entries) rides into the kernel, which ships it as the
-    // per-turn `<system-reminder>` — without this the catalog is
-    // computed at startup but never reaches any run's context.
-    .skills(skills)
     // Issue #94: a per-request thinking budget needs its own provider
     // (the budget is a request field in the Anthropic body); everything
     // else reuses the server's shared provider.
@@ -516,12 +510,31 @@ pub(super) fn build_session_runtime_parts(
     // The assets (shared read state, skill catalog) come from the registry
     // BEFORE it moves into the builder, so post-compaction re-injection has
     // something to re-inject on every channel — not just the CLI (issue #127).
-    let assets = crate::preset::assets_from_registry(&tool_registry, skills);
+    let assets = crate::preset::assets_from_registry(&tool_registry, skills.clone());
+    // Issue #127/#128: the prompt profile is applied here, the single point
+    // every HTTP-family channel reaches (REST sessions, `/agui`, triggers,
+    // cold load), so a `complete` profile replaces the assembled prompt —
+    // project context, memory layers and the `<environment>` segment
+    // included — exactly once.
+    let assembled = crate::preset::apply_prompt(
+        crate::system_prompt::AssembledPrompt {
+            full: system_prompt,
+            segments: prompt_segments,
+        },
+        preset,
+    );
     let builder = AgentRuntimeBuilder::new()
         .tools(tool_registry)
-        .system_prompt(system_prompt)
-        .prompt_segments(prompt_segments)
-        .max_steps(max_steps);
+        .system_prompt(assembled.full)
+        .prompt_segments(assembled.segments)
+        .max_steps(max_steps)
+        // #74 拆单 3/3: the merged skill catalog (directory + service-level
+        // SkillSource entries) rides into the kernel, which ships it as the
+        // per-turn `<system-reminder>` — without this the catalog is
+        // computed at startup but never reaches any run's context. Installed
+        // before `preset::apply` so a preset that declares no skill surface
+        // clears it.
+        .skills(skills);
     crate::preset::apply(builder, preset, &assets, channel)
 }
 
@@ -679,11 +692,22 @@ pub(super) async fn list_presets(State(state): State<Arc<AppState>>) -> Json<Vec
     Json(
         crate::preset::builtin()
             .iter()
-            .map(|p| PresetInfo {
-                id: p.id.to_string(),
-                description: p.description.to_string(),
-                capabilities: p.capabilities.to_vec(),
-                resolved: p.resolve(&state.config, &env),
+            .map(|p| {
+                let resolved = p.resolve(&state.config, &env);
+                PresetInfo {
+                    id: p.id.to_string(),
+                    description: p.description.to_string(),
+                    capabilities: p.capabilities.to_vec(),
+                    // Issue #128: the preset's fixed per-request system cost,
+                    // so the difference between the presets is a number an
+                    // operator can read instead of a claim.
+                    system_prompt_tokens: crate::preset::system_prompt_tokens(
+                        &state.config,
+                        &resolved,
+                        &state.skills,
+                    ),
+                    resolved,
+                }
             })
             .collect(),
     )
@@ -3227,6 +3251,111 @@ mod tests {
             "a disabled-by-default capability must be discoverable here"
         );
         assert_eq!(standard.resolved.id, "standard");
+
+        // Issue #128: the per-preset system cost is a number an operator can
+        // read off this endpoint, and the minimal preset really is an order of
+        // magnitude under standard (which pays for the base prompt, the memory
+        // layers and the workspace's project context).
+        let minimal = presets
+            .iter()
+            .find(|p| p.id == "minimal")
+            .expect("minimal is built in");
+        assert_eq!(
+            minimal.resolved.prompt.complete,
+            Some(crate::preset::MINIMAL_PROMPT)
+        );
+        assert_eq!(
+            minimal.system_prompt_tokens,
+            crate::llm::estimate_tokens(crate::preset::MINIMAL_PROMPT)
+        );
+        assert!(
+            standard.system_prompt_tokens >= minimal.system_prompt_tokens * 10,
+            "measured on the live endpoint: standard={} tokens vs minimal={} tokens",
+            standard.system_prompt_tokens,
+            minimal.system_prompt_tokens
+        );
+    }
+
+    /// Issue #128 acceptance: a minimal session's first system message is the
+    /// one-line prompt — no memory layers, no skill catalog, no project
+    /// context, no `<environment>` segment — and its tool surface is exactly
+    /// the core subset, even though the channel assembled (and the registry
+    /// carries) the full standard surface.
+    #[test]
+    fn minimal_session_carries_a_one_line_prompt_and_the_core_tools() {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::remove_var("RECURSIVE_AGENT_PRESET");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("AGENTS.md"), "## AGENTS.md\n\nproject lore")
+            .expect("write");
+        let mut state = preset_test_state(tmp.path());
+        state.skills = vec![crate::skills::skill_from_content(
+            "demo",
+            "---\nname: demo\ndescription: A demo skill\n---\n\nbody",
+            Vec::new(),
+        )];
+        let preset = resolve_session_preset(Some("minimal"), &state.config).expect("preset");
+
+        // What the channel would normally send: base + project context +
+        // skill catalog + sub-agent note.
+        let assembled = crate::assemble_system_prompt(
+            "base prompt with the six memory layers",
+            &state.config.workspace,
+            &state.skills,
+            state.config.subagent_enabled,
+        );
+        let registry = crate::tools::build_standard_tools(tmp.path(), &[], 60);
+        let (full, segments) =
+            inject_environment_segment(assembled.full, assembled.segments, &registry);
+
+        let builder = build_session_runtime(
+            &state,
+            registry,
+            full,
+            segments,
+            16,
+            &preset,
+            SessionOverrides::default(),
+        );
+        assert!(
+            builder.skills_for_test().is_empty(),
+            "a minimal session ships no skill catalog"
+        );
+        let runtime = builder.build().expect("build");
+
+        assert_eq!(runtime.preset_id(), Some("minimal"));
+        let first = runtime.transcript().first().expect("system message");
+        assert_eq!(first.role, crate::message::Role::System);
+        assert_eq!(
+            first.content.trim(),
+            crate::preset::MINIMAL_PROMPT,
+            "the minimal system message is the one-liner and nothing else: {:?}",
+            first.content
+        );
+        for marker in [
+            "# Project context",
+            "Memory summary",
+            "Available skills",
+            "<environment>",
+        ] {
+            assert!(
+                !first.content.contains(marker),
+                "{marker} must not survive into a minimal session"
+            );
+        }
+
+        let mut names: Vec<String> = runtime
+            .kernel()
+            .tools()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["Bash", "Edit", "Read", "Write"]);
     }
 
     // ── SDK Phase B: tool_progress forwarder ─────────────────────────────

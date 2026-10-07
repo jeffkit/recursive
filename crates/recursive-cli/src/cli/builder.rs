@@ -776,20 +776,22 @@ pub(crate) async fn build_runtime(
     // so the Goal-328 ContextBreakdown estimator can size the static
     // buckets from the structured segments.
     //
-    // CLI-run-only: auto-load matching skill *bodies* based on the goal (the
-    // index above only lists skill names). Other channels don't have a goal
-    // at prompt-build time, so this stays a CLI-run-specific suffix.
-    let mut assembled = assemble_system_prompt(
-        &config.system_prompt,
-        &config.workspace,
-        &skills,
-        config.subagent_enabled,
+    // Issue #127/#128: the preset's prompt profile applies to the *whole*
+    // assembled prompt — a `complete` profile (the `minimal` preset) replaces
+    // it, project context and memory layers included.
+    let mut assembled = recursive::preset::apply_prompt(
+        assemble_system_prompt(
+            &config.system_prompt,
+            &config.workspace,
+            &skills,
+            config.subagent_enabled,
+        ),
+        &preset,
     );
-    // Issue #127: the preset's prompt profile — persona suffix first, then the
-    // goal-matched skill bodies it declares. A channel with no goal at
-    // prompt-build time cannot honour the injection, which is why it is a
-    // declared capability rather than an assumption.
-    assembled.full = recursive::preset::apply_prompt(assembled.full, &preset);
+    // CLI-run-only: auto-load matching skill *bodies* based on the goal (the
+    // index above only lists skill names). Other channels don't have a goal at
+    // prompt-build time, so this stays a CLI-run-specific suffix — and the
+    // preset declares whether this channel may apply it at all.
     if preset.prompt.auto_skill_injection {
         let injected = skills_for_injection(&skills, goal.unwrap_or(""));
         assembled.full = apply_skill_injection(assembled.full, &injected);
@@ -1725,6 +1727,73 @@ done
         assert!(
             err.to_string().contains("standard"),
             "the error must name the known presets: {err}"
+        );
+    }
+
+    /// Issue #128 (CLI half): the preset's prompt profile applies to the whole
+    /// assembled prompt, so a `complete` profile (the `minimal` preset) reaches
+    /// the built runtime as its one-liner — every channel-owned segment
+    /// discarded — and the declared tool subset survives the build's
+    /// re-registrations. Pins the CLI channel against a drift that leaves the
+    /// profile applied to only part of the assembly.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the std env lock only guards same-crate tests
+    async fn minimal_preset_replaces_the_cli_prompt_and_surface() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config();
+        cfg.workspace = tmp.path().to_path_buf();
+        // Pin the preset-relevant env so the expectation cannot race the
+        // ambient environment of the developer's shell.
+        let _env = EnvGuard::set(&[
+            ("RECURSIVE_AGENT_PRESET", Some("minimal")),
+            ("RECURSIVE_COMPACT_THRESHOLD", None),
+            ("RECURSIVE_MAX_TRANSCRIPT_CHARS", None),
+            ("RECURSIVE_MICROCOMPACT_TRIGGER", None),
+            ("RECURSIVE_MICROCOMPACT_KEEP", None),
+            ("RECURSIVE_REINJECT_FILES", None),
+            ("RECURSIVE_REINJECT_SKILLS", None),
+        ]);
+
+        let runtime = build_runtime(
+            &cfg,
+            None,
+            vec![],
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("build_runtime");
+        assert_eq!(runtime.preset_id(), Some("minimal"));
+
+        let system = runtime
+            .transcript()
+            .iter()
+            .find(|m| m.role == recursive::message::Role::System)
+            .expect("the build must install a system message");
+        assert_eq!(
+            system.content,
+            recursive::preset::MINIMAL_PROMPT,
+            "the one-liner must replace the whole assembled prompt"
+        );
+
+        let mut names: Vec<String> = runtime
+            .kernel()
+            .tools()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["Bash", "Edit", "Read", "Write"],
+            "the preset's four-tool surface must survive the build"
         );
     }
 

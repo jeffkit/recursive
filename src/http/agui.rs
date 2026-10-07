@@ -877,11 +877,12 @@ pub(crate) fn build_agui_runtime(
         deps.prompt_segments,
         deps.max_steps,
         &deps.preset,
-        deps.skills.clone(),
+        // #74 拆单 3/3: same per-turn skill reminder the REST endpoints get —
+        // installed by the shared assembly, before `preset::apply` decides
+        // whether this preset has a skill surface at all.
+        deps.skills,
         super::handlers::HTTP_CHANNEL,
     )
-    // #74 拆单 3/3: same per-turn skill reminder the REST endpoints get.
-    .skills(deps.skills)
     .llm(deps.llm)
     // Goal 399: the same wall-clock budget the REST endpoints apply
     // (env-overridable via RECURSIVE_HTTP_WALL_TIMEOUT_SECS, resolved into

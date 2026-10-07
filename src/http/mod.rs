@@ -444,6 +444,10 @@ pub struct PresetInfo {
     pub id: String,
     pub description: String,
     pub capabilities: Vec<crate::preset::Capability>,
+    /// Issue #128 item 3: the system-prompt tokens a session created under
+    /// this preset pays on every request (same `bytes/4` estimator the
+    /// context breakdown uses — compare presets, don't bill with it).
+    pub system_prompt_tokens: u32,
     pub resolved: crate::preset::ResolvedPreset,
 }
 
@@ -1277,7 +1281,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
             "/presets": {
                 "get": {
                     "summary": "List agent presets",
-                    "description": "Returns the built-in session presets (issue #127) with their capability inventory and the context management each resolves to under the server's current environment. `POST /sessions` accepts a preset id in its `preset` field.",
+                    "description": "Returns the built-in session presets (issue #127) with their capability inventory, each preset's `system_prompt_tokens` (the fixed per-request system cost, issue #128) and the context management each resolves to under the server's current environment. `POST /sessions` accepts a preset id in its `preset` field.",
                     "responses": {
                         "200": {
                             "description": "Array of preset descriptors",
@@ -1697,9 +1701,13 @@ pub fn build_openapi_spec() -> serde_json::Value {
                                 "required": ["name", "default", "toggle", "note"]
                             }
                         },
+                        "system_prompt_tokens": {
+                            "type": "integer",
+                            "description": "Issue #128: the system-prompt tokens this preset sends on every request (bytes/4 estimate — compare presets, don't bill with it)."
+                        },
                         "resolved": { "type": "object" }
                     },
-                    "required": ["id", "description", "capabilities", "resolved"]
+                    "required": ["id", "description", "capabilities", "system_prompt_tokens", "resolved"]
                 },
                 "RunRequest": {
                     "type": "object",

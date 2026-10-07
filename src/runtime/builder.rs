@@ -63,6 +63,10 @@ pub struct AgentRuntimeBuilder {
     /// into the runtime so `GET /sessions/:id` can report the effective preset
     /// without re-deriving it.
     preset_id: Option<String>,
+    /// Issue #128: tool names the session's registry is pruned to, applied in
+    /// [`Self::build`] before the runtime re-registers its sinked
+    /// placeholders. `None` = the channel's full surface.
+    tool_allow: Option<Vec<String>>,
     /// Issue #119: shared bridge to the `agent` tool's worker runtimes. The
     /// host creates one slot, hands it to both
     /// [`crate::register_subagent_if_enabled`] and the runtime, and the
@@ -115,6 +119,7 @@ impl AgentRuntimeBuilder {
             loop_retry: crate::runtime::LoopRetryPolicy::default(),
             wakeup_store_dir: None,
             preset_id: None,
+            tool_allow: None,
             worker_telemetry: None,
         }
     }
@@ -271,9 +276,25 @@ impl AgentRuntimeBuilder {
         self.with_plan_mode_tools
     }
 
+    /// Inspect the tool subset a builder chain asked for (tests only). The
+    /// registry mutation itself happens in `build()`.
+    #[cfg(test)]
+    pub(crate) fn tool_allow_for_test(&self) -> Option<&[String]> {
+        self.tool_allow.as_deref()
+    }
+
     /// Issue #127: stamp the agent preset this session is assembled from.
     pub fn with_preset_id(mut self, id: String) -> Self {
         self.preset_id = Some(id);
+        self
+    }
+
+    /// Issue #128: prune this session's tool surface to `names`
+    /// (`ToolRegistry::retain_tools`, case-insensitive). Applied in
+    /// [`Self::build`], so the runtime's sinked re-registrations (TodoWrite,
+    /// Present, plan-mode) cannot resurrect a tool the preset dropped.
+    pub fn with_tool_allow(mut self, names: Vec<String>) -> Self {
+        self.tool_allow = Some(names);
         self
     }
 
@@ -450,6 +471,13 @@ impl AgentRuntimeBuilder {
     pub fn build(self) -> Result<AgentRuntime> {
         let kernel_builder = self.kernel_builder.skills(self.skills);
         let mut kernel = kernel_builder.build()?;
+
+        // Issue #128: a preset that declares a tool subset prunes the surface
+        // here — before the sinked placeholders below, so `surface_filtered`
+        // keeps the pruned surface strict.
+        if let Some(allow) = &self.tool_allow {
+            kernel.tools_mut().retain_tools(allow);
+        }
 
         let mut transcript = Vec::new();
         if let Some(sys) = self.system_prompt {

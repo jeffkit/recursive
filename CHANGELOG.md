@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- feat(runtime): a `minimal` agent preset (#128). Session presets (#127) could
+  re-compose a session's context management, but every session still paid the
+  same fixed system prompt: the assembled base, the six memory layers, the
+  project context (`AGENTS.md` / `CLAUDE.md`), the skill catalog, the
+  `<environment>` segment and the sub-agent note were injected
+  unconditionally, and cross-turn compaction was always installed. A simple
+  session (a single-file edit, a single command) paid all of it anyway. The new
+  `minimal` preset declares the DeepSeek-Harness `complete` prompt form — a
+  one-line `PromptProfile` that *is* the whole system prompt — plus a four-tool
+  surface (`Read` / `Write` / `Edit` / `Bash`, pruned in
+  `AgentRuntimeBuilder::build` so the runtime cannot resurrect what the preset
+  dropped), no skill catalog, and a `ContextProfile` whose every field is
+  `None` (no compaction, no microcompaction, no transcript cap, no
+  re-injection). Measured on a workspace with a project-context file and every
+  local memory store seeded: the one-liner costs an order of magnitude fewer
+  system-prompt tokens than `standard`'s assembled prompt. The test asserts the
+  ≥10× ratio rather than a fixed count — the exact number moves with the
+  workspace and the ambient `RECURSIVE_*` env, so it is not quoted here.
+  `GET /presets` now reports each preset's `system_prompt_tokens` (issue #128
+  item 3: the per-preset fixed cost of a request is observable, not folklore).
+  `standard` is untouched and remains the default; pick the new preset per
+  session (`POST /sessions`'s `preset: "minimal"`) or process-wide
+  (`RECURSIVE_AGENT_PRESET=minimal`). The prompt profile is applied at the
+  single HTTP assembly point (`build_session_runtime_parts`), so REST sessions,
+  `/agui`, trigger runs and cold-loaded sessions all honour it. No new
+  dependency.
 - feat(http): `/metrics` grew the labels, histograms and finish-reason
   breakdown an operator needs (#113). `Metrics` was a flat set of bare
   atomics, so a per-route 5xx rate did not exist, spend could not be attributed
