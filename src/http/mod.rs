@@ -10,6 +10,7 @@ mod auth;
 mod cold_load;
 #[cfg(test)]
 mod environment_binding_tests;
+mod event_log;
 mod handlers;
 mod metrics;
 mod rate_limit;
@@ -26,6 +27,8 @@ pub use auth::{
     AuthConfig, AuthIdentity, JwtConfig, DEFAULT_KEY_SUBJECT, ENV_AUTH_ADMINS, ENV_AUTH_JWT_SECRET,
     ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS,
 };
+// Issue #97: the bounded per-session replay ring behind SSE resume.
+pub use event_log::{SessionEventLog, SessionReplay, SESSION_EVENT_LOG_CAPACITY};
 pub use handlers::map_agent_event;
 // Issue #113: labelled counter / histogram families, the bounded finish-reason
 // labels and the run-event metrics sink.
@@ -319,6 +322,12 @@ pub struct SessionState {
     /// [`crate::event::EnvelopeSink`], so event `seq` numbers keep climbing
     /// across turns instead of restarting at 0 every turn.
     pub event_seq: Arc<AtomicU64>,
+    /// Issue #97: bounded replay buffer of this session's SSE frames, shared
+    /// with the live broadcast so a subscriber that reconnects with a
+    /// `Last-Event-ID` / `?since=` cursor — or merely lagged behind — is
+    /// replayed instead of losing the frames in between. It lives on the
+    /// session (and dies with it) because replay spans turns.
+    pub event_log: Arc<SessionEventLog>,
 }
 
 /// Reference instant for session last_active timestamps.
@@ -592,6 +601,15 @@ pub enum SseEvent {
     },
     /// An error occurred.
     Error { message: String },
+    /// Issue #97: the subscriber's resume cursor (`Last-Event-ID` / `?since=`)
+    /// is older than the oldest frame the session still retains, so the
+    /// events in between are gone. A client should reconcile against
+    /// `GET /sessions/:id`; the stream continues at `resume_id`.
+    Gap {
+        /// `id:` of the oldest frame still available, or `null` when the
+        /// replay buffer holds nothing.
+        resume_id: Option<String>,
+    },
     /// Agent proposed a plan and is waiting for human review.
     PlanProposed { plan: String },
     /// Goal-168: judge found condition not yet met; loop continues.
@@ -634,6 +652,11 @@ pub enum SseEvent {
 /// timeline from the per-turn `step` numbers, which restart every turn.
 /// Frames *derived* from one event (e.g. `tool_progress`) append a suffix —
 /// `<ts_ms>-<turn>-<seq>:progress` — so they stay ordered next to their origin.
+///
+/// Issue #97: the `id` doubles as the replay cursor — a client echoes the last
+/// one it saw via `Last-Event-ID` (or `?since=`), and the session's
+/// [`SessionEventLog`] replays everything after it. The trailing `<seq>`
+/// component is therefore what `?since=` accepts on its own.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SseFrame {
     /// The SSE `id:` field for this frame.
@@ -1534,11 +1557,25 @@ pub fn build_openapi_spec() -> serde_json::Value {
             "/sessions/{id}/events": {
                 "get": {
                     "summary": "Subscribe to session events",
-                    "description": "SSE stream of real-time agent events for a session.",
+                    "description": "SSE stream of real-time agent events for a session. \
+                        Resumable (issue #97): pass the `id:` of the last frame received \
+                        via the `Last-Event-ID` header or the `since` query parameter and \
+                        the stream first replays everything logged after it. When the \
+                        cursor is older than the retained replay window a `gap` frame is \
+                        emitted first, and the client should reconcile via \
+                        `GET /sessions/{id}`.",
                     "parameters": [{
                         "name": "id",
                         "in": "path",
                         "required": true,
+                        "schema": { "type": "string" }
+                    }, {
+                        "name": "since",
+                        "in": "query",
+                        "required": false,
+                        "description": "Replay cursor: the `id:` of the last frame the \
+                            client saw, or its trailing sequence number. Omit to start \
+                            from now.",
                         "schema": { "type": "string" }
                     }],
                     "responses": {
@@ -2628,6 +2665,7 @@ mod goal_396_persistence_tests {
             last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
             usage: Arc::new(SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
+            event_log: Arc::new(SessionEventLog::new(SESSION_EVENT_LOG_CAPACITY)),
         }
     }
 

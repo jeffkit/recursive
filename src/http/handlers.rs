@@ -1038,6 +1038,9 @@ pub(super) async fn create_session(
         // snapshot is persisted after every turn.
         usage: Arc::new(super::SessionUsage::new(state.config.model.clone())),
         event_seq: Arc::new(AtomicU64::new(0)),
+        event_log: Arc::new(crate::http::SessionEventLog::new(
+            crate::http::SESSION_EVENT_LOG_CAPACITY,
+        )),
     };
 
     state
@@ -1620,6 +1623,9 @@ pub(super) async fn fork_session(
         // transcript is history, not usage this session incurred.
         usage: Arc::new(super::SessionUsage::new(state.config.model.clone())),
         event_seq: Arc::new(AtomicU64::new(0)),
+        event_log: Arc::new(crate::http::SessionEventLog::new(
+            crate::http::SESSION_EVENT_LOG_CAPACITY,
+        )),
     };
 
     state
@@ -2054,6 +2060,9 @@ pub(super) async fn send_session_message(
     // count stays correct even when the turn errors out mid-run.
     let initial_count = msg_count_arc.load(std::sync::atomic::Ordering::Relaxed);
     let count_arc = msg_count_arc.clone();
+    // Issue #97: log each frame before broadcasting it, so a subscriber woken
+    // by the channel always finds it in the session's replay buffer.
+    let session_event_log = session.event_log.clone();
     let forward_handle = tokio::spawn(async move {
         let mut count: usize = initial_count;
         while let Some(envelope) = event_rx.recv().await {
@@ -2073,18 +2082,22 @@ pub(super) async fn send_session_message(
                 _ => {}
             }
             if let Some(sse_event) = map_agent_event(agent_event) {
-                let _ = broadcast_tx.send(SseFrame {
+                let frame = SseFrame {
                     id: frame_id.clone(),
                     event: sse_event,
-                });
+                };
+                session_event_log.push(frame.clone());
+                let _ = broadcast_tx.send(frame);
             }
             // After forwarding the tool_result, emit tool_progress with the
             // duration the runtime measured for this tool.
             if let Some(sse_event) = tool_progress_event(agent_event) {
-                let _ = broadcast_tx.send(SseFrame {
+                let frame = SseFrame {
                     id: format!("{frame_id}:progress"),
                     event: sse_event,
-                });
+                };
+                session_event_log.push(frame.clone());
+                let _ = broadcast_tx.send(frame);
             }
         }
     });
@@ -2201,26 +2214,55 @@ pub(super) async fn send_session_message(
 
 // ── SSE endpoint ─────────────────────────────────────────────────────────
 
+/// Query parameters for `GET /sessions/:id/events`.
+#[derive(serde::Deserialize, Debug, Default)]
+pub(super) struct SessionEventsQuery {
+    /// Issue #97: replay cursor — the `id:` of the last frame the client saw
+    /// (or its trailing sequence number). Omitted starts the stream from now.
+    #[serde(default)]
+    pub(super) since: Option<String>,
+}
+
 /// GET /sessions/:id/events — subscribe to SSE stream of agent events.
 ///
 /// Issue #85: the stream carries the session's transcript-derived events, so
 /// only the session's owner (or an admin) may subscribe.
+///
+/// Issue #97: the stream is resumable. A client that reconnects with
+/// `Last-Event-ID` (or `?since=`) set to the last frame `id:` it saw is
+/// replayed everything logged after it before going live, and a subscriber
+/// that merely fell behind the broadcast channel recovers the same way. Only
+/// when the cursor predates the retained replay window does the stream open
+/// with an explicit [`SseEvent::Gap`] instead of silently skipping frames.
 pub(super) async fn session_events(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SessionEventsQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // Verify session exists (and that the caller may see it)
-    {
+    // Verify the session exists (and that the caller may see it), keeping a
+    // handle on its replay log — the stream resumes from there.
+    let event_log = {
         let sessions_lock = state.host.sessions();
         let sessions = sessions_lock.read().await;
         match sessions.get(&id) {
-            Some(session) => ensure_access(&identity, session)?,
+            Some(session) => {
+                ensure_access(&identity, session)?;
+                session.event_log.clone()
+            }
             None => return Err(ApiError::not_found("session not found")),
         }
-    }
+    };
 
-    // Get or create broadcast channel for this session
+    // `?since=` wins over the header when a client sends both.
+    let cursor = query
+        .since
+        .filter(|s| !s.is_empty())
+        .or_else(|| header_last_event_id(&headers));
+
+    // Subscribe *before* snapshotting the log: frames emitted from here on are
+    // queued on `rx`, so none can slip between the replay and the live pump.
     let rx = {
         let mut channels = state.event_channels.write().await;
         let tx = channels.entry(id.clone()).or_insert_with(|| {
@@ -2230,44 +2272,95 @@ pub(super) async fn session_events(
         tx.subscribe()
     };
 
-    // Map real agent events to SSE data events, dropping lagged-receiver errors.
-    let agent_stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(SseFrame { id, event }) => {
-            let event_type = match &event {
-                SseEvent::Message { .. } => "message",
-                SseEvent::PartialMessage { .. } => "partial_message",
-                SseEvent::ToolCall { .. } => "tool_call",
-                SseEvent::ToolResult { .. } => "tool_result",
-                SseEvent::Done { .. } => "done",
-                SseEvent::Error { .. } => "error",
-                SseEvent::PlanProposed { .. } => "plan_proposed",
-                SseEvent::GoalContinuing { .. } => "goal_continuing",
-                SseEvent::GoalAchieved { .. } => "goal_achieved",
-                SseEvent::ToolProgress { .. } => "tool_progress",
-                SseEvent::Usage { .. } => "usage",
-            };
-            let data = serde_json::to_string(&event).unwrap_or_default();
-            // Issue #117: the frame carries its timeline id so clients can
-            // order/dedupe across turns and know where they left off.
-            Some(Ok::<Event, Infallible>(
-                Event::default().id(id).event(event_type).data(data),
-            ))
+    // Everything the client missed while it was away, oldest first.
+    let replay = event_log.replay(cursor.as_deref());
+    let mut initial: Vec<Result<Event, Infallible>> = Vec::with_capacity(replay.frames.len() + 1);
+    if replay.truncated {
+        initial.push(Ok(gap_event(replay.frames.first().map(|f| f.id.clone()))));
+    }
+    initial.extend(replay.frames.into_iter().map(sse_frame_event));
+
+    // The log — not the broadcast payload — decides what to send: the channel
+    // only wakes the pump. That is what turns a *lagged* receiver from a silent
+    // frame drop into a replay (issue #97): the wake-up for a dropped frame is
+    // the `Lagged` error, and the pump reads the frame back out of the log
+    // either way.
+    // Inclusive lower bound for the pump: the position of the next frame this
+    // subscriber must receive (everything below it has just been replayed).
+    let pump_next = Arc::new(AtomicU64::new(replay.next_pos));
+    let pump_log = event_log;
+    // `futures_util::StreamExt` is invoked through UFCS on purpose: this file
+    // already imports `tokio_stream::StreamExt` (which has no `flat_map`), and
+    // importing a second `StreamExt` would make `map` / `filter_map` / `merge`
+    // ambiguous everywhere.
+    let pump = futures_util::StreamExt::flat_map(BroadcastStream::new(rx), move |_| {
+        let replay = pump_log.drain_from(pump_next.load(Ordering::Relaxed));
+        pump_next.store(replay.next_pos, Ordering::Relaxed);
+        let mut frames: Vec<Result<Event, Infallible>> = Vec::new();
+        if replay.truncated {
+            frames.push(Ok(gap_event(replay.frames.first().map(|f| f.id.clone()))));
         }
-        Err(_) => None,
+        frames.extend(replay.frames.into_iter().map(sse_frame_event));
+        futures_util::stream::iter(frames)
     });
 
     // Heartbeat: emit an SSE comment every 30 seconds so proxy/load-balancer
-    // layers can detect the connection is still alive.
+    // layers can detect the connection is still alive. The 1 h cap still forces
+    // a periodic reconnect, but with the replay above it no longer drops the
+    // frames emitted while the client was away.
     let heartbeat_stream = IntervalStream::new(tokio::time::interval(Duration::from_secs(30)))
         .map(|_| Ok::<Event, Infallible>(Event::default().comment("heartbeat")));
 
-    // Merge agent events and heartbeats into a single stream, capped at 1 hour.
-    let combined = agent_stream
+    let combined = tokio_stream::iter(initial)
+        .chain(pump)
         .merge(heartbeat_stream)
         .timeout(Duration::from_secs(3600))
         .filter_map(|r| r.ok());
 
     Ok(Sse::new(combined))
+}
+
+/// The `Last-Event-ID` of a resuming client — the `id:` of the last frame it
+/// received (issue #97).
+fn header_last_event_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The `gap` frame (issue #97): the client's cursor is older than the retained
+/// replay window, so it must reconcile via `GET /sessions/:id` instead of
+/// trusting the stream alone. Deliberately carries no `id:` — it is a per
+/// connection notice, not a frame on the session timeline.
+fn gap_event(resume_id: Option<String>) -> Event {
+    let event = SseEvent::Gap { resume_id };
+    let data = serde_json::to_string(&event).unwrap_or_default();
+    Event::default().event("gap").data(data)
+}
+
+/// Render one [`SseFrame`] as an SSE [`Event`], typed by its payload variant.
+fn sse_frame_event(SseFrame { id, event }: SseFrame) -> Result<Event, Infallible> {
+    let event_type = match &event {
+        SseEvent::Message { .. } => "message",
+        SseEvent::PartialMessage { .. } => "partial_message",
+        SseEvent::ToolCall { .. } => "tool_call",
+        SseEvent::ToolResult { .. } => "tool_result",
+        SseEvent::Done { .. } => "done",
+        SseEvent::Error { .. } => "error",
+        SseEvent::Gap { .. } => "gap",
+        SseEvent::PlanProposed { .. } => "plan_proposed",
+        SseEvent::GoalContinuing { .. } => "goal_continuing",
+        SseEvent::GoalAchieved { .. } => "goal_achieved",
+        SseEvent::ToolProgress { .. } => "tool_progress",
+        SseEvent::Usage { .. } => "usage",
+    };
+    let data = serde_json::to_string(&event).unwrap_or_default();
+    // Issue #117: the frame carries its timeline id so clients can
+    // order/dedupe across turns and know where they left off.
+    Ok(Event::default().id(id).event(event_type).data(data))
 }
 
 // ── Event mapping ────────────────────────────────────────────────────────
@@ -4003,6 +4096,9 @@ mod tests {
             last_active_ms: Arc::new(AtomicU64::new(0)),
             usage: Arc::new(crate::http::SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
+            event_log: Arc::new(crate::http::SessionEventLog::new(
+                crate::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
         };
 
         let sessions: HashMap<String, SessionState> = [(session_id.clone(), session)].into();
@@ -4102,6 +4198,9 @@ mod tests {
             last_active_ms: Arc::new(AtomicU64::new(0)),
             usage: Arc::new(crate::http::SessionUsage::new("test-model")),
             event_seq: Arc::new(AtomicU64::new(0)),
+            event_log: Arc::new(crate::http::SessionEventLog::new(
+                crate::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
         };
         let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
         let host = Arc::new(crate::session_host::SessionHost::new(
@@ -6320,6 +6419,9 @@ mod tests {
                 last_active_ms: Arc::new(AtomicU64::new(0)),
                 usage: Arc::new(crate::http::SessionUsage::new("test-model")),
                 event_seq: Arc::new(AtomicU64::new(0)),
+                event_log: Arc::new(crate::http::SessionEventLog::new(
+                    crate::http::SESSION_EVENT_LOG_CAPACITY,
+                )),
             },
         );
 

@@ -280,6 +280,9 @@ pub(super) async fn get_or_load_session(
         last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(super::now_session_ms())),
         usage: restored_usage,
         event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        event_log: Arc::new(crate::http::SessionEventLog::new(
+            crate::http::SESSION_EVENT_LOG_CAPACITY,
+        )),
     };
     // All mutable state lives in Arc fields, so this handle shares everything
     // that matters with the table value.
@@ -989,6 +992,9 @@ mod tests {
                 last_active_ms: Arc::new(AtomicU64::new(now_session_ms())),
                 usage: Arc::new(crate::http::SessionUsage::new("test-model")),
                 event_seq: Arc::new(AtomicU64::new(0)),
+                event_log: Arc::new(crate::http::SessionEventLog::new(
+                    crate::http::SESSION_EVENT_LOG_CAPACITY,
+                )),
             },
         );
 

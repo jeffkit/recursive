@@ -3766,6 +3766,9 @@ mod http_tests {
                 last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 usage: Arc::new(SessionUsage::new("test-model")),
                 event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                event_log: Arc::new(recursive::http::SessionEventLog::new(
+                    recursive::http::SESSION_EVENT_LOG_CAPACITY,
+                )),
             },
         );
 
@@ -4727,6 +4730,9 @@ mod http_tests {
             last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             usage: Arc::new(SessionUsage::new("test-model")),
             event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            event_log: Arc::new(recursive::http::SessionEventLog::new(
+                recursive::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
         };
         state
             .host
