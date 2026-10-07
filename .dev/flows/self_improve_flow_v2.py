@@ -306,20 +306,38 @@ def self_improve_v2(INPUT):
     # 逐字节不变**，零回归）。DSL 限制（表达式无条件赋值/无列表字面量/
     # 变量名即节点 id 不可重赋）使此逻辑必须落在 code 节点内。
     gates = CODE(id="gate_select", lang="python",
-                 input={"gates": INPUT.gates if INPUT.gates else None}, code=(
+                 input={"gates": INPUT.gates if INPUT.gates else None,
+                        "spec": INPUT.gates_spec or "",
+                        "runner": INPUT.gate_runner or "",
+                        "gtimeout": INPUT.gate_timeout_secs or 0,
+                        "rd": run_dir}, code=(
         "def run(input):\n"
+        "    # ① 完整 spec 路径（2026-10-07，keeper≥dec7c6b + flow v1.0.5）：把本仓\n"
+        "    #    的 gate spec 落盘到 run_dir，交给**同一个** gate_runner.py 执行——\n"
+        "    #    N 道门/独立预算/paths 条件/autofix 重检，与本地路径逐字段等价。\n"
+        "    #    （jeffkit 指示：flow 严格按原来的实现，不许短斤缺两。）\n"
+        "    spec = str(input.get(\"spec\") or \"\")\n"
+        "    runner = str(input.get(\"runner\") or \"\")\n"
+        "    if spec and runner:\n"
+        "        import os as _os\n"
+        "        rd = str(input.get(\"rd\") or \"\")\n"
+        "        sf = _os.path.join(rd, \"gates.json\")\n"
+        "        _os.makedirs(rd, exist_ok=True)\n"
+        "        with open(sf, \"w\", encoding=\"utf-8\") as _fh:\n"
+        "            _fh.write(spec)\n"
+        "        to = int(input.get(\"gtimeout\") or 0) or 3600\n"
+        "        return {\"fmt\": \"python3 \" + runner + \" --spec \" + sf + \" --cwd .\",\n"
+        "                \"fmt_name\": \"gates\", \"fmt_timeout\": to,\n"
+        "                \"lint\": \"true\", \"lint_name\": \"noop\", \"lint_timeout\": 60,\n"
+        "                \"test\": \"true\", \"test_name\": \"noop\", \"test_timeout\": 60}\n"
+        "    # ② 三段式回退（旧 keeper 只传 gates 时）：按序填 fmt/lint/test 三语义位，\n"
+        "    #    缺位用 true 占位。仅作回滚兼容；>3 道会丢门，主路径不走这里。\n"
         "    g = input.get(\"gates\")\n"
-        "    # 注入的 gate 数量可变（如 plaita 只有 lint+tests 两道）：按序填入\n"
-        "    # fmt/lint/test 三个语义位，**缺位用 \"true\" 占位**（恒绿 no-op，\n"
-        "    # 不带语义）。不注入 = 回退 cargo 三段（recursive 零回归）。\n"
         "    if g:\n"
         "        cmds = [(x.get(\"name\") or \"gate\") if isinstance(x, dict) else \"gate\"\n"
         "                for x in g]\n"
         "        runs = [(x[\"cmd\"]) if isinstance(x, dict) and x.get(\"cmd\") else \"true\"\n"
         "                for x in g]\n"
-        "        # 预算（2026-10-07）：注入方给了 timeout_secs 就用它，否则回退\n"
-        "        # cargo 时代的默认位（120/1800/1800）——非 Rust 仓的 install/build\n"
-        "        # 塞进第 1 槽时 120s 不够，必须让 keeper 的 per-repo 预算透传。\n"
         "        touts = [(int(x.get(\"timeout_secs\") or 0) if isinstance(x, dict) else 0)\n"
         "                 for x in g]\n"
         "        while len(cmds) < 3:\n"
@@ -380,17 +398,23 @@ def self_improve_v2(INPUT):
     g1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
                       "timeout_secs": gates.fmt_timeout, "wt": pre.worktree}, flow=gate_once)
     if g1.passed == False:
+        # 第 1 槽可能是「整组门」（gate_runner，v1.0.5 spec 路径）也可能是单道门
+        # （三段式回退）——提示词做通用化，不再假定 cargo（非 Rust 仓此前会被
+        # 误导去跑 cargo fmt）。引用实测命令，修复者可直接复跑。
         AGENTRUN(agent=agent, prompt=F.concat(
-                'The fmt check failed. Edit the source files to fix every '
-                "error below, then re-run `cargo fmt --all` yourself to verify "
-                "before stopping.\nFix the source, never silence with #[allow]."
+                'Quality gates failed. Fix the source so every failing gate '
+                'passes, then re-run the gate command below yourself to verify '
+                'before stopping.\nFix the source, never silence or weaken '
+                'checks.\nGate command: ', gates.fmt,
                 "\n--- stdout ---\n", g1.out, "\n--- stderr ---\n", g1.err),
             repo=pre.worktree, timeout_secs=7200)
         g1b = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
                            "timeout_secs": gates.fmt_timeout, "wt": pre.worktree}, flow=gate_once)
         if g1b.passed == False:
             wgf1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-fmt.log"),
-                             content=F.concat("cmd: cargo fmt --all\n--- stdout ---\n",
+                             content=F.concat("gate: ", gates.fmt_name,
+                                              "\ncmd: ", gates.fmt,
+                                              "\n--- stdout ---\n",
                                               g1b.out, "\n--- stderr ---\n", g1b.err))
             return {"verdict": "failed-preserved", "stage": "gates", "gate": g1b.gate,
                     "out": g1b.out}
