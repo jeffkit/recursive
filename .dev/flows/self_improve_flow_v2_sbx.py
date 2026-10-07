@@ -70,7 +70,12 @@ def gate_once(INPUT):
     fmt apply 让门禁长期全绿把雷捂到 10-01 才炸）。修复环、失败落盘等一切
     需要拼接的逻辑一律放主层（与评审环同款），这里只做单发执行。
     """
-    run = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.wt,
+    # 沙箱化：沙箱变体里门禁也下沉（宿主只做编排）。cwd 用沙箱内工作区路径
+    # （impl 节点输出 workspace.path，与 agent 改的是同一棵树）；留空回退宿主。
+    # 沙箱化：cwd 用沙箱内工作区（impl 输出 workspace.path）——同一棵树；
+    # 表达式不做 or 运算（childflow 上下文无 F，59/69 教训），由主层算好传入。
+    run = GATE(command=INPUT.cmd, gate_name=INPUT.name, cwd=INPUT.sbx_wt,
+               sandbox=INPUT.sbx_spec,
                timeout_secs=INPUT.timeout_secs)
     return {"passed": run.passed, "gate": INPUT.name, "out": run.stdout,
             "err": run.stderr}
@@ -408,7 +413,7 @@ def self_improve_v2_sbx(INPUT):
     # （2026-10-05 pipeline-93-1005122022 实证：clippy 门红、g2.out 长度 0，
     # 修复 agent 拿到空清单）。失败落盘分支早已是 out+err 双写，提示词对齐即可。
     g1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
-                      "timeout_secs": gates.fmt_timeout, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": gates.fmt_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path}, flow=gate_once)
     if g1.passed == False:
         # 第 1 槽可能是「整组门」（gate_runner，v1.0.5 spec 路径）也可能是单道门
         # （三段式回退）——提示词做通用化，不再假定 cargo（非 Rust 仓此前会被
@@ -421,7 +426,7 @@ def self_improve_v2_sbx(INPUT):
                 "\n--- stdout ---\n", g1.out, "\n--- stderr ---\n", g1.err),
             repo=pre.worktree, timeout_secs=7200)
         g1b = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
-                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path}, flow=gate_once)
         if g1b.passed == False:
             wgf1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-fmt.log"),
                              content=F.concat("gate: ", gates.fmt_name,
@@ -437,7 +442,7 @@ def self_improve_v2_sbx(INPUT):
     # Compiling 进度、零 error 行）。keeper 侧 gates.json 对该命令本就给 1800s。
     g2 = CHILD(input={"name": gates.lint_name,
                       "cmd": gates.lint,
-                      "timeout_secs": gates.lint_timeout, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": gates.lint_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path}, flow=gate_once)
     if g2.passed == False:
         SANDBOX_AGENT(agent=agent, prompt=F.concat(
                 'The clippy check failed. Edit the source files to fix every '
@@ -447,7 +452,7 @@ def self_improve_v2_sbx(INPUT):
                 "\n--- stdout ---\n", g2.out, "\n--- stderr ---\n", g2.err),
             repo=pre.worktree, timeout_secs=7200)
         g2b = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
-                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path}, flow=gate_once)
         if g2b.passed == False:
             wgf2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-clippy.log"),
                              content=F.concat("cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\n--- stdout ---\n",
@@ -455,7 +460,7 @@ def self_improve_v2_sbx(INPUT):
             return {"verdict": "failed-preserved", "stage": "gates", "gate": g2b.gate,
                     "out": g2b.out}
     g3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
-                      "timeout_secs": gates.test_timeout, "wt": pre.worktree}, flow=gate_once)
+                      "timeout_secs": gates.test_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path}, flow=gate_once)
     if g3.passed == False:
         SANDBOX_AGENT(agent=agent, prompt=F.concat(
                 'The cargo test check failed. Edit the source files to fix every '
@@ -465,13 +470,39 @@ def self_improve_v2_sbx(INPUT):
                 "\n--- stdout ---\n", g3.out, "\n--- stderr ---\n", g3.err),
             repo=pre.worktree, timeout_secs=7200)
         g3b = CHILD(input={"name": gates.test_name, "cmd": gates.test,
-                           "timeout_secs": gates.test_timeout, "wt": pre.worktree}, flow=gate_once)
+                           "timeout_secs": gates.test_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path}, flow=gate_once)
         if g3b.passed == False:
             wgf3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-test.log"),
                              content=F.concat("cmd: cargo test --workspace\n--- stdout ---\n",
                                               g3b.out, "\n--- stderr ---\n", g3b.err))
             return {"verdict": "failed-preserved", "stage": "gates", "gate": g3b.gate,
                     "out": g3b.out}
+
+    # ── 门禁沙箱化的收尾同步 ──
+    # 门禁在沙箱里跑（可能产生改动：fmt autofix、生成物等）；全绿后把沙箱侧
+    # 最终树同步回宿主 worktree——否则下游（评审/发布）看到的是没有那些改动的
+    # 旧树，出现「验证过的代码 ≠ 发布的代码」。实例 id 取自 impl 节点输出。
+    sync_back = CODE(id="sbx_sync_back", lang="python",
+                     input={"repo": repo, "instance": impl.sandbox_instance,
+                            "sbx_path": impl.workspace.path if impl.workspace else ""},
+        code=(
+        "import os, sys\n"
+        "def run(input):\n"
+        "    inst = str(input.get('instance') or '')\n"
+        "    if not inst:\n"
+        "        return {'skipped': 'no-instance'}\n"
+        "    # plaita_nodes 由 worker 环境提供（entry point 加载路径）——不写死绝对路径\n"
+        "    from plaita_nodes.sandbox import get_driver\n"
+        "    from plaita_nodes.sandbox_ags import AgsDriver\n"
+        "    d = get_driver('ags') or AgsDriver()\n"
+        "    from plaita_nodes.sandbox import WorkspaceHandle\n"
+        "    h = WorkspaceHandle(driver='ags', id=inst, path=str(input.get('sbx_path') or ''),\n"
+        "                        ws_key='main', execution_id=inst)\n"
+        "    try:\n"
+        "        return d.sync_out(h, str(input['repo']))\n"
+        "    except Exception as e:\n"
+        "        return {'error': str(e)[:200]}\n"
+        ))
 
     # ── 评审（线性两轮）：独立 reviewer → NEEDS_FIX 则修一轮 → 复审定论 ──
     # 2026-09-30 弃用 WHILE 版：#63/#64 实证 WHILE 循环体内表达式上下文没有
@@ -716,7 +747,7 @@ def self_improve_v2_sbx(INPUT):
         # 同源，非 Rust 仓的 spec 路径下 fmt 槽即整组门。
         # （2026-10-07：干净 rebase 路径同样复跑，见下方 else 分支——#39 同类缺口已补。）
         lg1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
-                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree},
+                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path},
                     flow=gate_once)
         if lg1.passed == False:
             wlg1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
@@ -727,7 +758,7 @@ def self_improve_v2_sbx(INPUT):
             return {"verdict": "failed-preserved", "stage": "land",
                     "gate": lg1.gate, "out": lg1.out}
         lg2 = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
-                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree},
+                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path},
                     flow=gate_once)
         if lg2.passed == False:
             wlg2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
@@ -738,7 +769,7 @@ def self_improve_v2_sbx(INPUT):
             return {"verdict": "failed-preserved", "stage": "land",
                     "gate": lg2.gate, "out": lg2.out}
         lg3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
-                           "timeout_secs": gates.test_timeout, "wt": pre.worktree},
+                           "timeout_secs": gates.test_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path},
                     flow=gate_once)
         if lg3.passed == False:
             wlg3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
@@ -752,7 +783,7 @@ def self_improve_v2_sbx(INPUT):
         # 干净 rebase（基支已前进、无冲突）：树相对首次门禁已变 → 同样复跑门禁
         # （2026-10-07 补齐 #39 同类缺口：任何 rebase 后都不得把未验证的树推上 main）。
         rg1 = CHILD(input={"name": gates.fmt_name, "cmd": gates.fmt,
-                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree},
+                           "timeout_secs": gates.fmt_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path},
                     flow=gate_once)
         if rg1.passed == False:
             wrg1 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
@@ -763,7 +794,7 @@ def self_improve_v2_sbx(INPUT):
             return {"verdict": "failed-preserved", "stage": "land",
                     "gate": rg1.gate, "out": rg1.out}
         rg2 = CHILD(input={"name": gates.lint_name, "cmd": gates.lint,
-                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree},
+                           "timeout_secs": gates.lint_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path},
                     flow=gate_once)
         if rg2.passed == False:
             wrg2 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
@@ -774,7 +805,7 @@ def self_improve_v2_sbx(INPUT):
             return {"verdict": "failed-preserved", "stage": "land",
                     "gate": rg2.gate, "out": rg2.out}
         rg3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
-                           "timeout_secs": gates.test_timeout, "wt": pre.worktree},
+                           "timeout_secs": gates.test_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": impl.workspace.path},
                     flow=gate_once)
         if rg3.passed == False:
             wrg3 = WRITEFILE(path=F.concat(run_dir, "/failure-gate-land.log"),
