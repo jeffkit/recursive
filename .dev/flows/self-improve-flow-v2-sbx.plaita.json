@@ -214,8 +214,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -286,8 +289,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -358,8 +364,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -665,8 +674,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -737,8 +749,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -809,8 +824,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -968,8 +986,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -1040,8 +1061,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -1112,8 +1136,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -1442,8 +1469,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -1548,8 +1578,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
@@ -1654,8 +1687,11 @@
             "source_line": 66
           },
           {
-            "type": "sandbox_agent",
+            "type": "gate",
             "id": "run",
+            "command": "$INPUT.cmd",
+            "gate_name": "$INPUT.name",
+            "cwd": "$INPUT.sbx_wt",
             "sandbox": "$INPUT.sbx_spec",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",

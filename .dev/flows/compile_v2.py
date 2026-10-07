@@ -84,13 +84,17 @@ def _node_type(n: dict) -> str:
         ("code" in ks and "language" in ks, "code"),
         ("child_flow" in ks, "child"),
         ("error" in ks and "result_type" in ks, "end"),
+        # ⚠️ 判别键顺序即优先级：gate 的 (command, gate_name) **必须**排在
+        # sandbox 规则之前——GATE 节点自 2026-10-07 起也可带 sandbox 字段
+        # （门禁下沉沙箱），否则会被误判成 sandbox_agent（实测：子流程里的
+        # gate 节点在产物里变成 sandbox_agent，门禁静默退化成宿主执行）。
+        ("command" in ks and "gate_name" in ks, "gate"),
+        ("path" in ks and "content" in ks, "writefile"),
+        ("base_branch" in ks, "git_publish"),
         # sandbox_agent 与 agentrun 同带 agent 字段：靠 sandbox/ws_key 判别键
         # 先行区分（沙箱变体 flow 的 type 归属）
         ("sandbox" in ks or "ws_key" in ks, "sandbox_agent"),
         ("agent" in ks, "agentrun"),
-        ("base_branch" in ks, "git_publish"),
-        ("path" in ks and "content" in ks, "writefile"),
-        ("command" in ks and "gate_name" in ks, "gate"),
         ("upstream_output" in ks, "assignment"),
     ]
     for hit, t in table:
@@ -115,8 +119,8 @@ _KEY_ORDER = {
                     "next", "source_line"),
     "writefile": ("path", "content", "next", "source_line"),
     "end": ("output", "resultType", "name", "desc", "source_line"),
-    "gate": ("command", "gate_name", "cwd", "timeout_secs", "max_retries",
-             "dry_run", "next", "source_line"),
+    "gate": ("command", "gate_name", "cwd", "sandbox", "ws_key",
+             "timeout_secs", "max_retries", "dry_run", "next", "source_line"),
 }
 
 
