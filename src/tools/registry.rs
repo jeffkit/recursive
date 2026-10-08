@@ -616,6 +616,28 @@ impl ToolRegistry {
         self
     }
 
+    /// Override the permission *mode* while preserving the attached rule
+    /// layers (issue #87).
+    ///
+    /// [`with_permissions`] replaces the whole config, so a request-supplied
+    /// `permission_mode` used to discard the operator-configured
+    /// allow/deny/interactive layers and hand the run an empty-layer config —
+    /// one JSON field could strip a server-side policy. This swaps only the
+    /// mode and carries the existing layers over.
+    ///
+    /// The returned registry holds a fresh `Arc`: the source config is not
+    /// mutated, so one session's mode cannot leak into another that shares
+    /// the source registry.
+    pub async fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
+        let layers = match &self.permissions {
+            Some(sp) => sp.read().await.layers.clone(),
+            None => Vec::new(),
+        };
+        self.permission_mode = mode.clone();
+        self.permissions = Some(Arc::new(RwLock::new(PermissionsConfig { mode, layers })));
+        self
+    }
+
     /// Attach a [`SharedPermissions`] reference for runtime rule updates.
     ///
     /// Unlike [`with_permissions`], this accepts an already-constructed
@@ -2310,6 +2332,81 @@ mod tests {
         assert!(
             matches!(reg.permission_mode(), PermissionMode::AcceptEdits),
             "permission_mode must reflect config.mode"
+        );
+    }
+
+    /// Issue #87: overriding the mode must swap the mode but keep the rule
+    /// layers, so a mode downgrade cannot strip the operator's deny rules.
+    #[tokio::test]
+    async fn with_permission_mode_preserves_rule_layers() {
+        let config = PermissionsConfig {
+            mode: PermissionMode::Strict,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                allow: Vec::new(),
+                deny: vec!["Bash".into()],
+                interactive: Vec::new(),
+            }],
+        };
+        let reg = make_registry().with_permissions(config);
+        let reg = reg.with_permission_mode(PermissionMode::Default).await;
+
+        assert!(
+            matches!(reg.permission_mode(), PermissionMode::Default),
+            "the requested mode must be applied"
+        );
+        let cfg = reg.permissions_config().expect("permissions attached");
+        assert_eq!(cfg.layers.len(), 1, "operator layer must survive");
+        assert!(
+            cfg.check_static("Bash", false, None).is_denied(),
+            "the operator deny rule must still deny Bash"
+        );
+    }
+
+    /// Issue #87: the mode override must not write back into the registry it
+    /// was derived from. HTTP sessions share one base registry, so mutating
+    /// the shared config in place would let one session's requested mode
+    /// change another session's.
+    #[tokio::test]
+    async fn with_permission_mode_does_not_mutate_source_registry() {
+        let config = PermissionsConfig {
+            mode: PermissionMode::Strict,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                allow: Vec::new(),
+                deny: vec!["Bash".into()],
+                interactive: Vec::new(),
+            }],
+        };
+        let base = make_registry().with_permissions(config);
+        let _overridden = base
+            .clone()
+            .with_permission_mode(PermissionMode::Default)
+            .await;
+
+        assert!(
+            matches!(base.permission_mode(), PermissionMode::Strict),
+            "the source registry's mode must be untouched"
+        );
+        let cfg = base.permissions_config().expect("permissions attached");
+        assert!(
+            matches!(cfg.mode, PermissionMode::Strict),
+            "the source config's mode must be untouched"
+        );
+    }
+
+    /// Issue #87: with no operator config there is nothing to preserve — the
+    /// requested mode is still applied and the layer list stays empty.
+    #[tokio::test]
+    async fn with_permission_mode_on_bare_registry_applies_mode() {
+        let reg = make_registry()
+            .with_permission_mode(PermissionMode::Strict)
+            .await;
+        assert!(matches!(reg.permission_mode(), PermissionMode::Strict));
+        let cfg = reg.permissions_config().expect("permissions attached");
+        assert!(
+            cfg.layers.is_empty(),
+            "a bare registry has no operator layers to carry over"
         );
     }
 

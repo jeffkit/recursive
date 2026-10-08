@@ -360,13 +360,12 @@ async fn build_restored_runtime(
         .await
         .map_err(ApiError::internal)?;
     if let Some(mode_str) = meta.and_then(|m| m.permission_mode.as_deref()) {
-        let perm_mode =
-            super::handlers::parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
-        tool_registry =
-            tool_registry.with_permissions(crate::permissions::LayeredPermissionsConfig {
-                mode: perm_mode,
-                layers: Vec::new(),
-            });
+        tool_registry = super::handlers::apply_request_permission_mode(
+            tool_registry,
+            mode_str,
+            state.config.allow_bypass_permissions,
+        )
+        .await;
     }
     let (full, segments) = super::handlers::inject_environment_segment(
         assembled.full,

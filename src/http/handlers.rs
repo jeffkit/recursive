@@ -15,7 +15,7 @@ use tokio_stream::{wrappers::BroadcastStream, wrappers::IntervalStream, StreamEx
 
 use crate::event::{AgentEvent, EnvelopeSink, NullSink};
 use crate::message::Role;
-use crate::permissions::{LayeredPermissionsConfig, PermissionMode};
+use crate::permissions::PermissionMode;
 use crate::runtime::AgentRuntimeBuilder;
 use crate::tools::ToolRegistry;
 
@@ -768,11 +768,12 @@ pub(super) async fn run_agent(
     let (system_prompt, prompt_segments) =
         inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
     if let Some(mode_str) = body.permission_mode.as_deref() {
-        let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
-        tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
-            mode: perm_mode,
-            layers: Vec::new(),
-        });
+        tool_registry = apply_request_permission_mode(
+            tool_registry,
+            mode_str,
+            state.config.allow_bypass_permissions,
+        )
+        .await;
     }
 
     let preset = resolve_session_preset(None, &state.config)?;
@@ -861,6 +862,21 @@ pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMo
         "bypass" | "bypass_permissions" if allow_bypass => PermissionMode::BypassPermissions,
         _ => PermissionMode::Default,
     }
+}
+
+/// Apply a request-supplied `permission_mode` to a session registry.
+///
+/// Issue #87: only the mode is overridden — the operator-configured rule
+/// layers stay attached, so a client cannot strip a server-side deny /
+/// interactive policy by sending a `permission_mode`.
+pub(super) async fn apply_request_permission_mode(
+    registry: ToolRegistry,
+    mode_str: &str,
+    allow_bypass: bool,
+) -> ToolRegistry {
+    registry
+        .with_permission_mode(parse_permission_mode(mode_str, allow_bypass))
+        .await
 }
 
 /// Render a [`PermissionMode`] in the API's request vocabulary (the strings
@@ -961,11 +977,12 @@ pub(super) async fn create_session(
     let (system_prompt, prompt_segments) =
         inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
     if let Some(mode_str) = body.permission_mode.as_deref() {
-        let perm_mode = parse_permission_mode(mode_str, state.config.allow_bypass_permissions);
-        tool_registry = tool_registry.with_permissions(LayeredPermissionsConfig {
-            mode: perm_mode,
-            layers: Vec::new(),
-        });
+        tool_registry = apply_request_permission_mode(
+            tool_registry,
+            mode_str,
+            state.config.allow_bypass_permissions,
+        )
+        .await;
     }
 
     // Issue #127: the session's agent preset — an explicit request id wins,
@@ -5708,6 +5725,29 @@ mod tests {
                 bypass_available: false,
             }),
             "plan"
+        );
+    }
+
+    /// Issue #87 acceptance: an operator-configured deny rule must survive a
+    /// request that carries `permission_mode: "default"`. The handler used to
+    /// hand the registry a mode-only config, which wiped every operator layer.
+    #[tokio::test]
+    async fn request_permission_mode_keeps_operator_deny_rules() {
+        let operator = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                allow: Vec::new(),
+                deny: vec!["Bash".into()],
+                interactive: Vec::new(),
+            }],
+        };
+        let registry = ToolRegistry::default().with_permissions(operator);
+        let registry = apply_request_permission_mode(registry, "default", false).await;
+        let cfg = registry.permissions_config().expect("permissions attached");
+        assert!(
+            cfg.check_static("Bash", false, None).is_denied(),
+            "the operator deny rule must still deny Bash after a request mode override"
         );
     }
 
