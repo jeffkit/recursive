@@ -6,7 +6,7 @@
 首次运行。本 harness 用桩替身（假 agent/假门禁/假发布）+ 真 git fixture 把
 每条分支在离线跑一遍。
 
-运行：  /opt/homebrew/bin/python3.13 test/flow_v2_paths.py
+运行：  python3 test/flow_v2_paths.py
 桩点：  AgentRunNode/GateNode/GitPublishNode.execute 按 node 参数路由到脚本；
         CODE（preflight/has_changes）与 WRITEFILE 走真实现（真 git worktree）。
 """
@@ -147,7 +147,9 @@ def _add_origin(repo: Path, root: Path) -> None:
     r = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        subprocess.run(["git", "init", "-q", "--bare", str(origin)],
+        # -b main：裸仓 HEAD 钉在 main——缺省 init.defaultBranch 的机器上裸仓
+        # HEAD 指向不存在的 master，后续 clone 出来的仓没有 main 可推（s36 假红）。
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
                        check=True, capture_output=True)
         _git(repo, "remote", "add", "origin", str(origin))
     _git(repo, "push", "-q", "-u", "origin", "main")
@@ -467,18 +469,23 @@ def _preflight_code() -> str:
     return _node_code("pre")
 
 
-def _node_code(node_id: str) -> str:
-    """编译后 IR 里任意 code 节点的源码（真代码单测用；含 childflow 内层）。"""
-    def walk(nodes):
-        for n in nodes:
+def _find_code(nodes: list, node_id: str) -> str:
+    """任意 IR 节点树里按 id 找 code 节点源码（含 childflow 内层）。"""
+    def walk(ns):
+        for n in ns:
             yield n
             cf = n.get("childFlow")
             if cf:
                 yield from walk(cf.get("nodes", []))
-    for n in walk(self_improve_v2.__plaita_ir__["nodes"]):
+    for n in walk(nodes):
         if n.get("id") == node_id and n.get("code"):
             return n["code"]
     raise AssertionError(f"IR 里找不到 code 节点 {node_id}")
+
+
+def _node_code(node_id: str) -> str:
+    """编译后 IR 里任意 code 节点的源码（真代码单测用；含 childflow 内层）。"""
+    return _find_code(self_improve_v2.__plaita_ir__["nodes"], node_id)
 
 
 def _run_code_node(node_id: str, inp: dict) -> dict:
@@ -561,16 +568,45 @@ def _spawn_fake_agent(tmp: Path, *argv: str) -> subprocess.Popen:
     if not exe.exists():
         exe.write_text("import time\ntime.sleep(300)\n")
     return subprocess.Popen([sys.executable, str(exe)] + list(argv),
-                            start_new_session=True)
+                            start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _spawn_fake_flow_worker(tmp: Path, agent_argv: list) -> subprocess.Popen:
+    """伪 v2 宿主：**生产同形** cmdline（`python -m plaita.server.flow_worker
+    --queue-name plaita:flow:queue:v2`，无 --run-id，#148 事故路径），
+    并把兄弟 run 的 agent 作为**自己的子进程**拉起——v2 worker 路径里宿主与
+    agent 的真实关系（AGENTRUN/GATE 都是 worker 的子树）。"""
+    pkg = tmp / "plaita" / "server"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (tmp / "plaita" / "__init__.py").write_text("")
+    (pkg / "__init__.py").write_text("")
+    (pkg / "flow_worker.py").write_text(
+        "import json, os, subprocess, sys, time\n"
+        "subprocess.Popen(json.loads(os.environ['FAKE_AGENT']))\n"
+        "time.sleep(300)\n")
+    env = dict(os.environ, PYTHONPATH=str(tmp),
+               FAKE_AGENT=json.dumps([sys.executable, str(tmp / "recursive")]
+                                     + list(agent_argv)))
+    return subprocess.Popen(
+        [sys.executable, "-m", "plaita.server.flow_worker",
+         "--queue-name", "plaita:flow:queue:v2", "--consumer-name", "worker-harness"],
+        cwd=str(tmp), env=env, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
-    """#94：preflight kill-stale 只许杀「本仓 .flowcast/runs 归属 + 宿主已死」的
-    recursive agent。旧实现是「全表 pgrep + 逐 pid killpg」：①自匹配（模式字面量
-    就在自身 cmdline 上）→ killpg 打掉自身进程组、子进程 -15、node 重试耗尽
-    engine_error）；②并发下误杀兄弟 run 的 agent。本场景造三条现场（四条真进程）：
-    - 旧 run 孤儿（宿主已死；v2 --workspace 形态与 v1 --transcript-out 形态各一）→ 必杀；
-    - 兄弟 run 的 agent（宿主 bridge 存活，--run-id 在 ps 里）→ 必活；
+    """#94 + #148：preflight kill-stale 只许杀「本仓 .flowcast/runs 归属 +
+    **宿主已死**」的 recursive agent。#148 实证：v2 console/worker 路径的宿主
+    （plaita flow_worker）cmdline **不带 --run-id**，旧 live 集只认 --run-id ⇒
+    并发兄弟 run 的 agent 恒判孤儿、同仓并发 run 互杀成链（单日 5 例）；而旧
+    s33 用「带 --run-id 的 bridge」当兄弟宿主，恰好测不出这条生产路径。
+    本场景按生产 v2 worker 形态造现场：
+    - 旧 run 孤儿 ×2（宿主已死；v2 --workspace 形态与 v1 --transcript-out 形态）
+      → 必杀；
+    - 兄弟 run 的 agent：宿主是 `-m plaita.server.flow_worker`（无 --run-id），
+      agent 是它的**子进程** → 必活，且 live_runs 里没有它（保护来自祖先链
+      宿主反查，而非 --run-id 反查）；
     - 自身/自身进程组 → 必活（流程跑到 committed 即证明没自杀）。"""
     repo, root = make_repo()
     old_wt = repo / ".flowcast" / "runs" / "pipeline-77-old" / "worktree"
@@ -579,6 +615,7 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
         p.mkdir(parents=True, exist_ok=True)
     tmp = root / "fake"; tmp.mkdir()
     procs = []
+    sib_agent = None
     try:
         v2_orphan = _spawn_fake_agent(
             tmp, "--workspace", str(old_wt), "--output-format", "json",
@@ -586,16 +623,14 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
         v1_orphan = _spawn_fake_agent(
             tmp, "--transcript-out", str(old_wt.parent / "transcript.json"),
             "--workspace", str(repo))
-        sib_agent = _spawn_fake_agent(
-            tmp, "--workspace", str(live_wt), "--output-format", "json",
-            "--permission-mode", "auto", "run", "stub")
-        bridge = tmp / "self_improve_bridge_v2.py"
-        bridge.write_text("import time\ntime.sleep(300)\n")
-        procs = [v2_orphan, v1_orphan, sib_agent,
-                 subprocess.Popen([sys.executable, str(bridge), "--goal-text",
-                                   "sibling", "--run-id", "pipeline-88-live"],
-                                  start_new_session=True)]
+        # 兄弟 run：agent 由伪 flow_worker 拉起（其子进程），全链无 --run-id
+        worker = _spawn_fake_flow_worker(
+            tmp, ["--workspace", str(live_wt), "--output-format", "json",
+                  "--permission-mode", "auto", "run", "stub"])
+        sib_agent = _child_of(worker)
+        procs = [v2_orphan, v1_orphan, worker]
         time.sleep(1.0)
+        assert sib_agent is not None, "伪 flow_worker 应已拉起兄弟 agent"
 
         AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
         GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
@@ -605,7 +640,8 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
         time.sleep(0.5)
         assert v2_orphan.poll() is not None, "旧 run 孤儿（--workspace 形态）应被清掉"
         assert v1_orphan.poll() is not None, "旧 run 孤儿（--transcript-out 形态）应被清掉"
-        assert sib_agent.poll() is None, "兄弟 run 的 agent 不得被杀（跨 run 误杀）"
+        assert sib_agent.poll() is None, \
+            "兄弟 run 的 agent 不得被杀（#148 同仓并发互杀）"
 
         log = Path(v["_run_dir"]) / "kill-stale.log"
         assert log.exists(), "kill-stale 必须留痕（#94 事故无任何留痕）"
@@ -613,18 +649,86 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
         assert f"killed pid={v2_orphan.pid} " in text, f"被杀清单缺 v2 孤儿: {text}"
         assert f"killed pid={v1_orphan.pid} " in text, f"被杀清单缺 v1 孤儿: {text}"
         assert f"killed pid={sib_agent.pid} " not in text, f"兄弟 agent 不该在清单: {text}"
-        assert "pipeline-88-live" in text, \
-            f"兄弟 run 必须被识别为存活宿主（保护它的判据，而非碰巧漏杀）: {text}"
+        live_line = next(l for l in text.splitlines() if l.startswith("live_runs="))
+        assert "pipeline-88-live" not in live_line, \
+            f"现场无 --run-id，live 集不该有兄弟 run（证明保护不走 --run-id）: {live_line}"
+        assert f"spared pid={sib_agent.pid} run=pipeline-88-live host=" in text \
+            and "flow_worker" in text, \
+            f"兄弟 agent 应记 spared 且宿主形态是 flow_worker: {text}"
 
         code = _preflight_code()
         assert "os.killpg(" not in code, "kill-stale 禁 killpg（打整组 = 自杀/跨 run 风险）"
         assert "os.kill(" in code, "应逐 pid os.kill(SIGTERM)"
+        assert "_host_ancestor" in code, "#148：孤儿判定必须走祖先链宿主反查"
     finally:
+        procs = procs + ([sib_agent] if sib_agent is not None else [])
         for p in procs:
             try:
-                p.kill(); p.wait(timeout=5)
+                kill = getattr(p, "kill", None)
+                if callable(kill):
+                    kill()
+                else:                     # _Popen_attach 句柄：按 pid 清
+                    os.kill(p.pid, 9)
+                p.wait(timeout=5)
             except Exception:
                 pass
+
+
+def _child_of(proc: subprocess.Popen):
+    """等伪宿主把子 agent 拉起来，按 ppid 反查返回其句柄；超时返回 None。"""
+    for _ in range(50):
+        out = subprocess.run(["ps", "-axo", "pid=,ppid="],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == str(proc.pid):
+                return _Popen_attach(int(parts[0]))
+        time.sleep(0.1)
+    return None
+
+
+def _Popen_attach(pid: int):
+    """只包一个 pid 的最小句柄：s33 只需要 .pid 与 .poll()。
+
+    poll() 按 ps state 判活——宿主（伪 worker）从不 wait，被 SIGTERM 的子进程
+    会以僵尸态挂着，os.kill(pid,0) 探不出死活，state=Z 才算死。"""
+    class _P:
+        def __init__(self, p):
+            self._p = p
+            self.pid = p
+
+        def poll(self):
+            out = subprocess.run(["ps", "-o", "state=", "-p", str(self._p)],
+                                 capture_output=True, text=True).stdout.strip()
+            if not out or out.startswith(("Z", "X")):
+                return -15
+            return None
+
+        def kill(self):
+            try:
+                os.kill(self._p, 9)
+            except ProcessLookupError:
+                pass
+
+        def wait(self, timeout=5):
+            return self.poll()
+    return _P(pid)
+
+
+def s43_kill_stale判据_v2与sbx变体同源_产物不落后():
+    """#148：孤儿判据改动必须同时进 v2 与 sbx（同一函数两处拷贝），且两个
+    编译产物同步——任何一处漂移都会让沙箱灰度侧与 v2 侧判据分叉，或让
+    console 发布链拿着旧 definition 继续互杀。"""
+    import self_improve_flow_v2_sbx as sbx
+    v2_code = _node_code("pre")
+    sbx_code = _find_code(sbx.self_improve_v2_sbx.__plaita_ir__["nodes"], "pre")
+    assert sbx_code == v2_code, "sbx 变体的 preflight code 与 v2 漂移（应逐字节同源）"
+    assert "_host_ancestor" in v2_code and "plaita\\.server" in v2_code, \
+        "v2 缺祖先链宿主反查（#148 判据）"
+    for artifact in (FLOWS_DIR / "self-improve-v2.plaita.json",
+                     FLOWS_DIR / "self-improve-flow-v2-sbx.plaita.json"):
+        code = _find_code(json.loads(artifact.read_text())["nodes"], "pre")
+        assert "_host_ancestor" in code, f"{artifact.name} 产物落后源码（重跑 compile_v2）"
 
 
 def s18_全部prompt表达式可解析():
@@ -1099,7 +1203,7 @@ def s27_v3_dryrun冒烟_真bridge无桩全图():
     flows_dir = Path(__file__).resolve().parent.parent
     bridge_py = flows_dir / "self_improve_bridge_v2.py"
     r = subprocess.run(
-        ["/opt/homebrew/bin/python3.13", str(bridge_py),
+        [sys.executable, str(bridge_py),
          "--goal-text", "#77 dry-run v3 smoke", "--repo", str(repo),
          "--run-id", "pipeline-77-drysmoke", "--dry-run"],
         capture_output=True, text=True, timeout=300,
@@ -1534,6 +1638,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s35_preflight_origin基线_本地领先不捆入,
              s36_land_push_直推与护栏,
              s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run,
+             s43_kill_stale判据_v2与sbx变体同源_产物不落后,
              s18_全部prompt表达式可解析,
              s11_v3等价性_终态与节点序列, s12_v3_崩溃恢复_断点续走,
              s13_v3_节点异常自动重试, s14_v3_重试耗尽_engine_error,

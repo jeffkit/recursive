@@ -16,55 +16,55 @@
       "id": "goal",
       "output": "$INPUT.goal",
       "next": "repo",
-      "source_line": 104
+      "source_line": 106
     },
     {
       "type": "assignment",
       "id": "repo",
       "output": "$INPUT.repo",
       "next": "run_dir",
-      "source_line": 105
+      "source_line": 107
     },
     {
       "type": "assignment",
       "id": "run_dir",
       "output": "$INPUT.run_dir",
       "next": "agent",
-      "source_line": 106
+      "source_line": 108
     },
     {
       "type": "assignment",
       "id": "agent",
       "output": "$INPUT.agent",
       "next": "reviewer",
-      "source_line": 107
+      "source_line": 109
     },
     {
       "type": "assignment",
       "id": "reviewer",
       "output": "$INPUT.reviewer",
       "next": "impl_timeout",
-      "source_line": 108
+      "source_line": 110
     },
     {
       "type": "assignment",
       "id": "impl_timeout",
       "output": "$F.or($INPUT.impl_timeout_secs, 7200)",
       "next": "setup_command",
-      "source_line": 114
+      "source_line": 116
     },
     {
       "type": "assignment",
       "id": "setup_command",
       "output": "$F.or($INPUT.setup_command, \"\")",
       "next": "pre",
-      "source_line": 118
+      "source_line": 120
     },
     {
       "type": "code",
       "id": "pre",
       "language": "python",
-      "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\n\ndef _kill_stale_agents(rd, repo, own_run=None):\n    \"\"\"清本仓孤儿 recursive agent（#94）。\n\n    旧实现是「全表 pgrep + 逐 pid killpg」：模式字面量出现在自身 cmdline\n    上时自匹配（killpg 打掉自身进程组 → 子进程 -15 秒死、node 重试耗尽\n    → engine_error），并发下还会误杀兄弟 run 的 agent。现在只杀 cmdline\n    带本仓 .flowcast/runs 路径下 worktree/transcript 引用、且所属 run 已无\n    存活宿主的 recursive 进程；自身 pid / 祖先链 / 自身进程组一律跳过；\n    逐 pid SIGTERM（永不 killpg）；被杀清单落 rd/kill-stale.log 留痕。\n    \"\"\"\n    def sh(*a):\n        return subprocess.run(list(a), capture_output=True, text=True)\n    procs = []\n    for line in sh(\"ps\", \"-axo\", \"pid=,ppid=,pgid=,command=\").stdout.splitlines():\n        parts = line.split(None, 3)\n        if len(parts) < 4:\n            continue\n        try:\n            procs.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))\n        except ValueError:\n            continue\n    by_pid = dict((p[0], p) for p in procs)\n    mine = set()\n    cur = os.getpid()\n    while cur and cur not in mine:\n        mine.add(cur)\n        cur = by_pid.get(cur, (0, 0, 0, \"\"))[1]\n    own_pgid = os.getpgid(0)\n    live = set([rd.name])\n    for _p, _pp, _pg, c in procs:\n        m = re.search(r\"--run-id[\\s=]+(\\S+)\", c)\n        if m:\n            live.add(m.group(1))\n    repo_abs = os.path.abspath(str(repo))\n    run_path = re.compile(r\"(?:--workspace|--transcript-out)[ =]+(\\S+)\")\n    run_id = re.compile(r\"runs/([^/\\s]+)/(?:worktree|transcript)\")\n    killed = []\n    for pid, ppid, pgid, cmd in procs:\n        if pid in mine or pgid == own_pgid:\n            continue\n        if not re.search(r\"\\brecursive\\b\", cmd):\n            continue\n        m = run_path.search(cmd)\n        if not m:\n            continue\n        arg = m.group(1).strip(\"'\\\"\")\n        if not os.path.abspath(arg).startswith(repo_abs + os.sep):\n            continue\n        ids = run_id.findall(arg)\n        if not ids or ids[0] in live:\n            continue\n        # 重投自保：worktree/transcript 落在**本次 rd** 之下的进程是本 run\n        # 自己（上一次投递）的子树；本 run 仍在跑，不得当 stale 清——否则\n        # 重投的 pre 会杀掉自己上一投递 → -15 → 死循环（Linux 多 worker 实证）。\n        if os.path.abspath(arg).startswith(os.path.abspath(str(rd)) + os.sep):\n            continue\n        par = by_pid.get(ppid)\n        if par and (\"self_improve_bridge\" in par[3]\n                    or \"self-improve.flow.js\" in par[3]):\n            continue\n        killed.append((pid, pgid, ids[0], cmd))\n        try:\n            os.kill(pid, signal.SIGTERM)\n        except Exception:\n            pass\n    with open(str(rd / \"kill-stale.log\"), \"a\") as fh:\n        fh.write(\"# kill-stale \" + time.strftime(\"%Y-%m-%dT%H:%M:%S\") + \"\\n\")\n        fh.write(\"live_runs=\" + \",\".join(sorted(live)) + \"\\n\")\n        for pid, pgid, rid, cmd in killed:\n            fh.write(\"killed pid=%d pgid=%d run=%s cmd=%s\\n\" % (pid, pgid, rid, cmd[:200]))\n        if not killed:\n            fh.write(\"killed none\\n\")\n    return [pid for pid, _pg, _r, _c in killed]\n\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    killed = _kill_stale_agents(rd, repo)\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True) if issue_no else None\n    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n              if br is not None else [])\n    if cands:\n        # canonical 分支（pipeline/issue-N，GIT_PUBLISH 推的门禁通过版）\n        # 优先于 v2-*/wip-* 按新度拣选——#70 实证：被否决的朴素变体（25e41f9）\n        # 比 canonical 新 30 分钟，纯按 %ct 会继承错误基线。\n        canon = \"pipeline/issue-\" + issue_no\n        newest = canon if canon in cands else None\n        if newest is None:\n            newest_t = -1.0\n            for c in cands:\n                t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                                   capture_output=True, text=True)\n                try:\n                    ct = float(t.stdout.strip())\n                except ValueError:\n                    continue\n                if ct > newest_t:\n                    newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    # ── 落地基线 origin 化（2026-10-07，plaita#27/#35 land 失败根因）──\n    # 本地 clone 的 <base> 可能领先/落后/被并行会话推动：fresh run 若直接以\n    # 本地 HEAD 建树，会把本地未推提交捆进 run 分支 → land ff 必败\n    # （needs-human）。改为先 fetch、以 origin/<base> 建树；fetch 或解析失败\n    # 退回 HEAD（离线仍可跑）。base 名取自 keeper 注入的 gates_spec（缺省 main）。\n    # land 阶段也复用同一 land_base（直推服务端 ff 校验，不碰本地 clone）。\n    base_branch = \"main\"\n    try:\n        base_branch = (json.loads(input.get(\"gates_spec\") or \"{}\").get(\"base\")\n                       or \"main\").strip() or \"main\"\n    except Exception:\n        pass\n    try:\n        subprocess.run([\"git\", \"-C\", repo, \"fetch\", \"--prune\", \"origin\", base_branch],\n                       capture_output=True, text=True, timeout=120)\n    except Exception:\n        pass\n    land_base = \"HEAD\"\n    _ob = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"--verify\", \"-q\",\n                          \"origin/\" + base_branch], capture_output=True, text=True)\n    if _ob.returncode == 0 and _ob.stdout.strip():\n        land_base = \"origin/\" + base_branch\n    if base_ref == \"HEAD\":\n        base_ref = land_base\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    setup = str(input.get(\"setup\") or \"\")\n    if setup:\n        _sp_log = rd / \"setup.log\"\n        try:\n            with open(_sp_log, \"w\") as _fh:\n                _sr = subprocess.run([\"bash\", \"-c\", setup], cwd=wt, stdout=_fh,\n                                     stderr=subprocess.STDOUT, timeout=900)\n        except subprocess.TimeoutExpired:\n            return {\"ok\": False, \"why\": \"setup timeout 900s（见 rd/setup.log）\"}\n        if _sr.returncode != 0:\n            _st = open(_sp_log, encoding=\"utf-8\", errors=\"replace\").read()[-400:]\n            return {\"ok\": False, \"why\": \"setup exit %d: %s\" % (_sr.returncode, _st)}\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff origin/main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n        import glob as _glob\n        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', '*failure.log')))\n        if _rf:\n            _latest = max(_rf, key=os.path.getmtime)\n            sp.write_text(sp.read_text() + \"\\n\\n# 上轮失败上下文（\" + os.path.basename(_latest) + \"：评审未过或 land rebase 冲突，逐条解决其中问题；已通过部分不要动）\\n\\n\" + open(_latest, encoding='utf-8', errors='replace').read()[:6000] + \"\\n\")\n    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n    last_sid = \"\"\n    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n    if sroot and resumed:\n        cands = []\n        for root, dirs, files in os.walk(sroot):\n            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n                # 噪音过滤：var-folders tmp 工作区的空壳会话（code 沙箱副产物）\n                # 与 <300B 的 stub 都不配续跑（68 实证：选中即 resume 垃圾会话）\n                if \"var-folders-\" in root or \"-tmp\" in root:\n                    continue\n                _tp = os.path.join(root, \"transcript.jsonl\")\n                if os.path.exists(_tp) and os.path.getsize(_tp) < 300:\n                    continue\n                cands.append((os.path.getmtime(root), os.path.basename(root)))\n        if cands:\n            cands.sort()\n            last_sid = cands[-1][1]\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head,\n            \"land_base\": land_base, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n",
+      "code": "import json, os, re, signal, subprocess, sys, time\nfrom pathlib import Path\n\n\ndef _kill_stale_agents(rd, repo, own_run=None):\n    \"\"\"清本仓孤儿 recursive agent（#94；#148 重写孤儿判据）。\n\n    #148 实证：旧 live 集只认 cmdline 上的 `--run-id`，而 v2 console/worker\n    路径的宿主（plaita flow_worker）不带它 ⇒ 并发兄弟 run 的 agent 恒判孤儿、\n    同仓并发 run 互杀成链（2026-10-08 单日 5 例）。改为**祖先链宿主反查**：\n    候选进程沿 ppid 上溯，链上任一进程命中 self-improve 宿主形态（plaita\n    flow_worker / self_improve_bridge / self-improve.flow.js / launch-flow /\n    engine）⇒ 所属 run 仍存活，跳过；宿主已死（链走到表外/init）才是孤儿。\n    只杀 cmdline 带本仓 .flowcast/runs 路径下 worktree/transcript 引用的\n    recursive 进程；`--run-id` 反查保留作 v1 路径的补充判据；自身 pid /\n    祖先链 / 自身进程组 / 本 run 目录子树一律跳过；逐 pid SIGTERM（永不\n    killpg）；留痕 rd/kill-stale.log（宿主保下的记 spared 行，供取证）。\n    \"\"\"\n    def sh(*a):\n        return subprocess.run(list(a), capture_output=True, text=True)\n    procs = []\n    for line in sh(\"ps\", \"-axo\", \"pid=,ppid=,pgid=,command=\").stdout.splitlines():\n        parts = line.split(None, 3)\n        if len(parts) < 4:\n            continue\n        try:\n            procs.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))\n        except ValueError:\n            continue\n    by_pid = dict((p[0], p) for p in procs)\n    mine = set()\n    cur = os.getpid()\n    while cur and cur not in mine:\n        mine.add(cur)\n        cur = by_pid.get(cur, (0, 0, 0, \"\"))[1]\n    own_pgid = os.getpgid(0)\n    # 宿主形态：v2 console/worker 是 plaita flow_worker（cmdline 无 --run-id，\n    # #148），v1 是 bridge / flow.js。命中即「该子树里所有 recursive agent\n    # 的所属 run 仍存活」——宿主死光（链断到表外/init）才算孤儿。\n    host_pat = re.compile(r\"plaita\\.server\"\n                          r\"|python3? -m plaita\\b\"\n                          r\"|self_improve_bridge\"\n                          r\"|self-improve\\.flow\\.js\"\n                          r\"|self_improve_engine\"\n                          r\"|launch-flow\")\n\n    def _host_ancestor(pid):\n        cur = by_pid.get(pid, (0, 0, 0, \"\"))[1]\n        seen = set()\n        while cur and cur not in seen:\n            seen.add(cur)\n            node = by_pid.get(cur)\n            if not node:\n                return None\n            if host_pat.search(node[3]):\n                return node[3]\n            cur = node[1]\n        return None\n    live = set([rd.name])\n    for _p, _pp, _pg, c in procs:\n        m = re.search(r\"--run-id[\\s=]+(\\S+)\", c)\n        if m:\n            live.add(m.group(1))\n    repo_abs = os.path.abspath(str(repo))\n    run_path = re.compile(r\"(?:--workspace|--transcript-out)[ =]+(\\S+)\")\n    run_id = re.compile(r\"runs/([^/\\s]+)/(?:worktree|transcript)\")\n    killed = []\n    spared = []\n    for pid, ppid, pgid, cmd in procs:\n        if pid in mine or pgid == own_pgid:\n            continue\n        if not re.search(r\"\\brecursive\\b\", cmd):\n            continue\n        m = run_path.search(cmd)\n        if not m:\n            continue\n        arg = m.group(1).strip(\"'\\\"\")\n        if not os.path.abspath(arg).startswith(repo_abs + os.sep):\n            continue\n        ids = run_id.findall(arg)\n        if not ids or ids[0] in live:\n            continue\n        # 重投自保：worktree/transcript 落在**本次 rd** 之下的进程是本 run\n        # 自己（上一次投递）的子树；本 run 仍在跑，不得当 stale 清——否则\n        # 重投的 pre 会杀掉自己上一投递 → -15 → 死循环（Linux 多 worker 实证）。\n        if os.path.abspath(arg).startswith(os.path.abspath(str(rd)) + os.sep):\n            continue\n        # #148：存活判定走祖先链宿主反查（v2 worker 宿主无 --run-id，\n        # 旧「只看直接父进程是否 bridge/flow.js」在 v2 路径恒判孤儿）。\n        host = _host_ancestor(pid)\n        if host:\n            spared.append((pid, ids[0], host))\n            continue\n        killed.append((pid, pgid, ids[0], cmd))\n        try:\n            os.kill(pid, signal.SIGTERM)\n        except Exception:\n            pass\n    with open(str(rd / \"kill-stale.log\"), \"a\") as fh:\n        fh.write(\"# kill-stale \" + time.strftime(\"%Y-%m-%dT%H:%M:%S\") + \"\\n\")\n        fh.write(\"live_runs=\" + \",\".join(sorted(live)) + \"\\n\")\n        for pid, rid, host in spared:\n            fh.write(\"spared pid=%d run=%s host=%s\\n\" % (pid, rid, host[:120]))\n        for pid, pgid, rid, cmd in killed:\n            fh.write(\"killed pid=%d pgid=%d run=%s cmd=%s\\n\" % (pid, pgid, rid, cmd[:200]))\n        if not killed:\n            fh.write(\"killed none\\n\")\n    return [pid for pid, _pg, _r, _c in killed]\n\n\ndef run(input):\n    \"\"\"worktree + 系统提示词 + disk 守卫 + kill stale + baseline。\"\"\"\n    repo, run_dir = input[\"repo\"], input[\"run_dir\"]\n    rd = Path(run_dir); rd.mkdir(parents=True, exist_ok=True)\n    st = os.statvfs(repo)\n    free_gib = (st.f_bavail * st.f_frsize) / 2**30\n    if free_gib < float(os.environ.get(\"RECURSIVE_MIN_FREE_DISK_GIB\", \"20\")):\n        return {\"ok\": False, \"why\": f\"disk {free_gib:.1f}GiB < min\"}\n    killed = _kill_stale_agents(rd, repo)\n    wt = str(rd / \"worktree\")\n    branch = \"v2-\" + rd.name\n    # 断点续跑（work 级）：本 issue 有既往尝试分支（v2-*/wip-*，含 WIP 快照）\n    # 时基线继承最新者——重跑从半成品继续而非从零重做。找不到才回退 HEAD。\n    base_ref = \"HEAD\"\n    m = re.match(r\"pipeline-(\\d+)-\", rd.name)\n    issue_no = m.group(1) if m else \"\"\n    br = subprocess.run([\"git\", \"-C\", repo, \"branch\", \"--list\",\n                         \"v2-pipeline-\" + issue_no + \"-*\", \"wip-pipeline-\" + issue_no + \"-*\",\n                         \"pipeline/issue-\" + issue_no],\n                        capture_output=True, text=True) if issue_no else None\n    cands = ([l.strip().lstrip(\"* \") for l in br.stdout.splitlines() if l.strip()]\n              if br is not None else [])\n    if cands:\n        # canonical 分支（pipeline/issue-N，GIT_PUBLISH 推的门禁通过版）\n        # 优先于 v2-*/wip-* 按新度拣选——#70 实证：被否决的朴素变体（25e41f9）\n        # 比 canonical 新 30 分钟，纯按 %ct 会继承错误基线。\n        canon = \"pipeline/issue-\" + issue_no\n        newest = canon if canon in cands else None\n        if newest is None:\n            newest_t = -1.0\n            for c in cands:\n                t = subprocess.run([\"git\", \"-C\", repo, \"log\", \"-1\", \"--format=%ct\", c],\n                                   capture_output=True, text=True)\n                try:\n                    ct = float(t.stdout.strip())\n                except ValueError:\n                    continue\n                if ct > newest_t:\n                    newest, newest_t = c, ct\n        if newest:\n            base_ref = newest\n            branch = \"v2-\" + rd.name + \"-cont\"\n    resumed = base_ref != \"HEAD\"\n    # ── 落地基线 origin 化（2026-10-07，plaita#27/#35 land 失败根因）──\n    # 本地 clone 的 <base> 可能领先/落后/被并行会话推动：fresh run 若直接以\n    # 本地 HEAD 建树，会把本地未推提交捆进 run 分支 → land ff 必败\n    # （needs-human）。改为先 fetch、以 origin/<base> 建树；fetch 或解析失败\n    # 退回 HEAD（离线仍可跑）。base 名取自 keeper 注入的 gates_spec（缺省 main）。\n    # land 阶段也复用同一 land_base（直推服务端 ff 校验，不碰本地 clone）。\n    base_branch = \"main\"\n    try:\n        base_branch = (json.loads(input.get(\"gates_spec\") or \"{}\").get(\"base\")\n                       or \"main\").strip() or \"main\"\n    except Exception:\n        pass\n    try:\n        subprocess.run([\"git\", \"-C\", repo, \"fetch\", \"--prune\", \"origin\", base_branch],\n                       capture_output=True, text=True, timeout=120)\n    except Exception:\n        pass\n    land_base = \"HEAD\"\n    _ob = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"--verify\", \"-q\",\n                          \"origin/\" + base_branch], capture_output=True, text=True)\n    if _ob.returncode == 0 and _ob.stdout.strip():\n        land_base = \"origin/\" + base_branch\n    if base_ref == \"HEAD\":\n        base_ref = land_base\n    if not Path(wt).exists():\n        r = subprocess.run([\"git\", \"-C\", repo, \"worktree\", \"add\", \"-b\", branch, wt, base_ref],\n                           capture_output=True, text=True)\n        if r.returncode != 0:\n            return {\"ok\": False, \"why\": f\"worktree add: {r.stderr[-400:]}\"}\n    head = subprocess.run([\"git\", \"-C\", repo, \"rev-parse\", \"HEAD\"],\n                          capture_output=True, text=True).stdout.strip()\n    setup = str(input.get(\"setup\") or \"\")\n    if setup:\n        _sp_log = rd / \"setup.log\"\n        try:\n            with open(_sp_log, \"w\") as _fh:\n                _sr = subprocess.run([\"bash\", \"-c\", setup], cwd=wt, stdout=_fh,\n                                     stderr=subprocess.STDOUT, timeout=900)\n        except subprocess.TimeoutExpired:\n            return {\"ok\": False, \"why\": \"setup timeout 900s（见 rd/setup.log）\"}\n        if _sr.returncode != 0:\n            _st = open(_sp_log, encoding=\"utf-8\", errors=\"replace\").read()[-400:]\n            return {\"ok\": False, \"why\": \"setup exit %d: %s\" % (_sr.returncode, _st)}\n    sp = rd / \"sys-prompt.md\"\n    sp.write_text(\"\"\"# Headless batch-run constraints\n\nYou are running non-interactively (no human in the loop).\n\n**DO NOT call `enter_plan_mode` or `exit_plan_mode`.** These tools block forever\nwaiting for a human - in batch mode there is no approval channel.\nImplement directly: read -> think -> patch -> test.\n\n# Mandatory self-verification before stopping (do NOT skip)\n\nBefore you declare the goal done, run all three quality gates yourself in the\nworktree and make them green:\n1. `cargo fmt --all`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --workspace`\n\nThe flow runs these again as a backstop. Fix the source, never `#[allow]`.\nOnly stop once fmt + clippy + test are all green by your own hand.\"\"\")\n    if resumed:\n        sp.write_text(sp.read_text() + \"\\n\\n# 续跑提示\\n\\n本 worktree 基于上一次尝试的半成品（分支 \" + base_ref + \"）而非 main：先 `git diff origin/main --stat` 评估已有改动，完成/修正它而非从零重写；仅当方向明显错误才推倒。若上轮在 land 阶段因 rebase 冲突失败（见下方 failure.log），**先把 `git fetch origin && git rebase origin/main` 并解决冲突再继续**——上一轮 land 的当轮修复环已用尽（#137），这次冲突需要你接手。\\n\")\n        import glob as _glob\n        _rf = sorted(_glob.glob(os.path.join(str(rd.parent), 'pipeline-' + issue_no + '-*', '*failure.log')))\n        if _rf:\n            _latest = max(_rf, key=os.path.getmtime)\n            sp.write_text(sp.read_text() + \"\\n\\n# 上轮失败上下文（\" + os.path.basename(_latest) + \"：评审未过或 land rebase 冲突，逐条解决其中问题；已通过部分不要动）\\n\\n\" + open(_latest, encoding='utf-8', errors='replace').read()[:6000] + \"\\n\")\n    # L2 会话续跑：RECURSIVE_SESSIONS_DIR（bridge 按 issue 设的持久存储）\n    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n    last_sid = \"\"\n    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n    if sroot and resumed:\n        cands = []\n        for root, dirs, files in os.walk(sroot):\n            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n                # 噪音过滤：var-folders tmp 工作区的空壳会话（code 沙箱副产物）\n                # 与 <300B 的 stub 都不配续跑（68 实证：选中即 resume 垃圾会话）\n                if \"var-folders-\" in root or \"-tmp\" in root:\n                    continue\n                _tp = os.path.join(root, \"transcript.jsonl\")\n                if os.path.exists(_tp) and os.path.getsize(_tp) < 300:\n                    continue\n                cands.append((os.path.getmtime(root), os.path.basename(root)))\n        if cands:\n            cands.sort()\n            last_sid = cands[-1][1]\n    return {\"ok\": True, \"worktree\": wt, \"branch\": branch, \"baseline\": head,\n            \"land_base\": land_base, \"sys_prompt\": str(sp), \"last_sid\": last_sid, \"killed\": killed}\n",
       "input": {
         "repo": "$NODE.repo",
         "run_dir": "$NODE.run_dir",
@@ -72,7 +72,7 @@
         "gates_spec": "$F.or($INPUT.gates_spec, \"\")"
       },
       "next": "gates",
-      "source_line": 121
+      "source_line": 123
     },
     {
       "type": "code",
@@ -87,7 +87,7 @@
         "rd": "$NODE.run_dir"
       },
       "next": "ok_eq_false",
-      "source_line": 342
+      "source_line": 375
     },
     {
       "type": "if",
@@ -98,8 +98,8 @@
         "value": false
       },
       "name": "pre.ok == False?",
-      "desc": "if pre.ok == False（第 390 行）",
-      "source_line": 390,
+      "desc": "if pre.ok == False（第 423 行）",
+      "source_line": 423,
       "next": "contains_str_why_or_disk",
       "else_next": "impl"
     },
@@ -112,7 +112,7 @@
       "timeout_secs": "$NODE.impl_timeout",
       "session": "$NODE.pre.last_sid",
       "next": "chg",
-      "source_line": 406
+      "source_line": 439
     },
     {
       "type": "child",
@@ -136,7 +136,7 @@
             "next": "ch",
             "name": "'是否有待落地的改动（impl/fix 后的落门前置判…",
             "desc": "'是否有待落地的改动（impl/fix 后的落门前置判断）。\\n\\n 两类都算：① worktree 未提交改动（gi…",
-            "source_line": 59
+            "source_line": 61
           },
           {
             "type": "code",
@@ -148,7 +148,7 @@
               "base": "$INPUT.base"
             },
             "next": "_n1",
-            "source_line": 68
+            "source_line": 70
           },
           {
             "type": "end",
@@ -158,8 +158,8 @@
             },
             "resultType": "success",
             "name": "return {'any': ch.any}",
-            "desc": "return {'any': ch.any}（第 83 行）",
-            "source_line": 83
+            "desc": "return {'any': ch.any}（第 85 行）",
+            "source_line": 85
           }
         ],
         "inputType": {
@@ -167,7 +167,7 @@
         }
       },
       "next": "any_eq_false",
-      "source_line": 408
+      "source_line": 441
     },
     {
       "type": "if",
@@ -178,8 +178,8 @@
         "value": false
       },
       "name": "chg.any == False?",
-      "desc": "if chg.any == False（第 409 行）",
-      "source_line": 409,
+      "desc": "if chg.any == False（第 442 行）",
+      "source_line": 442,
       "next": "_n28",
       "else_next": "g1"
     },
@@ -207,7 +207,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -217,7 +217,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -231,7 +231,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -239,7 +239,7 @@
         }
       },
       "next": "passed_eq_false",
-      "source_line": 432
+      "source_line": 465
     },
     {
       "type": "if",
@@ -250,8 +250,8 @@
         "value": false
       },
       "name": "g1.passed == False?",
-      "desc": "if g1.passed == False（第 434 行）",
-      "source_line": 434,
+      "desc": "if g1.passed == False（第 467 行）",
+      "source_line": 467,
       "next": "_n27",
       "else_next": "g2"
     },
@@ -279,7 +279,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -289,7 +289,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -303,7 +303,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -311,7 +311,7 @@
         }
       },
       "next": "passed_eq_false_2",
-      "source_line": 460
+      "source_line": 493
     },
     {
       "type": "if",
@@ -322,8 +322,8 @@
         "value": false
       },
       "name": "g2.passed == False?",
-      "desc": "if g2.passed == False（第 463 行）",
-      "source_line": 463,
+      "desc": "if g2.passed == False（第 496 行）",
+      "source_line": 496,
       "next": "_n24",
       "else_next": "g3"
     },
@@ -351,7 +351,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -361,7 +361,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -375,7 +375,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -383,7 +383,7 @@
         }
       },
       "next": "passed_eq_false_3",
-      "source_line": 479
+      "source_line": 512
     },
     {
       "type": "if",
@@ -394,8 +394,8 @@
         "value": false
       },
       "name": "g3.passed == False?",
-      "desc": "if g3.passed == False（第 481 行）",
-      "source_line": 481,
+      "desc": "if g3.passed == False（第 514 行）",
+      "source_line": 514,
       "next": "_n21",
       "else_next": "review_prompt"
     },
@@ -404,7 +404,7 @@
       "id": "review_prompt",
       "output": "You are an independent reviewer (different provider). In the current workspace, run `git diff $(git merge-base origin/main HEAD)` to see the full change (relative to the branch point: covers both uncommitted edits and commits inherited from a resumed run, while excluding main-side commits that landed after this branch was cut — plain `git diff origin/main` would show those as inverted deletions and waste your attention), and Read any source files you need to cross-check claims.\nReview for correctness, regressions and contract violations.\nRespond with the last line exactly \"VERDICT:PASS\" or \"VERDICT:NEEDS_FIX\".",
       "next": "rev1",
-      "source_line": 504
+      "source_line": 537
     },
     {
       "type": "agentrun",
@@ -414,7 +414,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa",
-      "source_line": 516
+      "source_line": 549
     },
     {
       "type": "if",
@@ -425,8 +425,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 518 行）",
-      "source_line": 518,
+      "desc": "if F.contains(rev1.text, 'VERDICT:PASS') != True（第 551 行）",
+      "source_line": 551,
       "next": "contains_text_verdict_ne",
       "else_next": "pub"
     },
@@ -440,7 +440,7 @@
       "main_clone": "$NODE.repo",
       "base_branch": "main",
       "next": "land_push",
-      "source_line": 555
+      "source_line": 588
     },
     {
       "type": "code",
@@ -454,7 +454,7 @@
         "repo": "$NODE.repo"
       },
       "next": "refuse_eq_true",
-      "source_line": 558
+      "source_line": 591
     },
     {
       "type": "if",
@@ -465,8 +465,8 @@
         "value": true
       },
       "name": "land_push.refuse == True?",
-      "desc": "if land_push.refuse == True（第 602 行）",
-      "source_line": 602,
+      "desc": "if land_push.refuse == True（第 635 行）",
+      "source_line": 635,
       "next": "w_land_push0",
       "else_next": "ok_eq_true"
     },
@@ -479,8 +479,8 @@
         "value": true
       },
       "name": "land_push.ok == True?",
-      "desc": "if land_push.ok == True（第 607 行）",
-      "source_line": 607,
+      "desc": "if land_push.ok == True（第 640 行）",
+      "source_line": 640,
       "next": "_n14",
       "else_next": "land_rebase"
     },
@@ -494,7 +494,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_2",
-      "source_line": 620
+      "source_line": 653
     },
     {
       "type": "if",
@@ -505,8 +505,8 @@
         "value": false
       },
       "name": "land_rebase.ok == False?",
-      "desc": "if land_rebase.ok == False（第 648 行）",
-      "source_line": 648,
+      "desc": "if land_rebase.ok == False（第 681 行）",
+      "source_line": 681,
       "next": "wlp",
       "else_next": "rg1"
     },
@@ -522,7 +522,7 @@
         "repo": "$NODE.repo"
       },
       "next": "ok_eq_true_2",
-      "source_line": 809
+      "source_line": 842
     },
     {
       "type": "if",
@@ -533,8 +533,8 @@
         "value": true
       },
       "name": "land_push2.ok == True?",
-      "desc": "if land_push2.ok == True（第 848 行）",
-      "source_line": 848,
+      "desc": "if land_push2.ok == True（第 881 行）",
+      "source_line": 881,
       "next": "_n2",
       "else_next": "wfp3"
     },
@@ -544,7 +544,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"land retry failed\\nwhy: \", $F.concat($NODE.land_push2.why), \"\\nnote: \", $F.concat($NODE.land_push2.note))",
       "next": "_n1",
-      "source_line": 851
+      "source_line": 884
     },
     {
       "type": "end",
@@ -558,7 +558,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 854
+      "source_line": 887
     },
     {
       "type": "end",
@@ -571,7 +571,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'direct-push-retry',…",
-      "source_line": 849
+      "source_line": 882
     },
     {
       "type": "writefile",
@@ -579,7 +579,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict: \", $NODE.land_rebase.why, \"\\n\\n\", $NODE.land_rebase.scene)",
       "next": "land_fix",
-      "source_line": 649
+      "source_line": 682
     },
     {
       "type": "agentrun",
@@ -589,7 +589,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "land_rebase2",
-      "source_line": 652
+      "source_line": 685
     },
     {
       "type": "code",
@@ -601,7 +601,7 @@
         "branch": "$NODE.pre.branch"
       },
       "next": "ok_eq_false_3",
-      "source_line": 665
+      "source_line": 698
     },
     {
       "type": "if",
@@ -612,8 +612,8 @@
         "value": false
       },
       "name": "land_rebase2.ok == False?",
-      "desc": "if land_rebase2.ok == False（第 725 行）",
-      "source_line": 725,
+      "desc": "if land_rebase2.ok == False（第 758 行）",
+      "source_line": 758,
       "next": "w_land_fail2",
       "else_next": "lg1"
     },
@@ -641,7 +641,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -651,7 +651,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -665,7 +665,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -673,7 +673,7 @@
         }
       },
       "next": "passed_eq_false_4",
-      "source_line": 740
+      "source_line": 773
     },
     {
       "type": "if",
@@ -684,8 +684,8 @@
         "value": false
       },
       "name": "lg1.passed == False?",
-      "desc": "if lg1.passed == False（第 743 行）",
-      "source_line": 743,
+      "desc": "if lg1.passed == False（第 776 行）",
+      "source_line": 776,
       "next": "wlg1",
       "else_next": "lg2"
     },
@@ -713,7 +713,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -723,7 +723,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -737,7 +737,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -745,7 +745,7 @@
         }
       },
       "next": "passed_eq_false_5",
-      "source_line": 751
+      "source_line": 784
     },
     {
       "type": "if",
@@ -756,8 +756,8 @@
         "value": false
       },
       "name": "lg2.passed == False?",
-      "desc": "if lg2.passed == False（第 754 行）",
-      "source_line": 754,
+      "desc": "if lg2.passed == False（第 787 行）",
+      "source_line": 787,
       "next": "wlg2",
       "else_next": "lg3"
     },
@@ -785,7 +785,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -795,7 +795,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -809,7 +809,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -817,7 +817,7 @@
         }
       },
       "next": "_n3",
-      "source_line": 762
+      "source_line": 795
     },
     {
       "type": "if",
@@ -828,8 +828,8 @@
         "value": false
       },
       "name": "lg3.passed == False?",
-      "desc": "if lg3.passed == False（第 765 行）",
-      "source_line": 765,
+      "desc": "if lg3.passed == False（第 798 行）",
+      "source_line": 798,
       "next": "wlg3",
       "else_next": "land_push2"
     },
@@ -839,7 +839,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-land.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.test_name, \"\\ncmd: \", $NODE.gates.test, \"\\n--- stdout ---\\n\", $NODE.lg3.out, \"\\n--- stderr ---\\n\", $NODE.lg3.err)",
       "next": "_n4",
-      "source_line": 766
+      "source_line": 799
     },
     {
       "type": "end",
@@ -853,7 +853,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'ga…",
-      "source_line": 771
+      "source_line": 804
     },
     {
       "type": "writefile",
@@ -861,7 +861,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-land.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.lint_name, \"\\ncmd: \", $NODE.gates.lint, \"\\n--- stdout ---\\n\", $NODE.lg2.out, \"\\n--- stderr ---\\n\", $NODE.lg2.err)",
       "next": "_n5",
-      "source_line": 755
+      "source_line": 788
     },
     {
       "type": "end",
@@ -875,7 +875,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'ga…",
-      "source_line": 760
+      "source_line": 793
     },
     {
       "type": "writefile",
@@ -883,7 +883,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-land.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.fmt_name, \"\\ncmd: \", $NODE.gates.fmt, \"\\n--- stdout ---\\n\", $NODE.lg1.out, \"\\n--- stderr ---\\n\", $NODE.lg1.err)",
       "next": "_n6",
-      "source_line": 744
+      "source_line": 777
     },
     {
       "type": "end",
@@ -897,7 +897,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'ga…",
-      "source_line": 749
+      "source_line": 782
     },
     {
       "type": "writefile",
@@ -905,7 +905,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"rebase conflict (fix round done): \", $NODE.land_rebase2.why, \"\\n\\n\", $NODE.land_rebase2.scene)",
       "next": "_n7",
-      "source_line": 726
+      "source_line": 759
     },
     {
       "type": "end",
@@ -918,7 +918,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 730
+      "source_line": 763
     },
     {
       "type": "child",
@@ -944,7 +944,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -954,7 +954,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -968,7 +968,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -976,7 +976,7 @@
         }
       },
       "next": "_n8",
-      "source_line": 776
+      "source_line": 809
     },
     {
       "type": "if",
@@ -987,8 +987,8 @@
         "value": false
       },
       "name": "rg1.passed == False?",
-      "desc": "if rg1.passed == False（第 779 行）",
-      "source_line": 779,
+      "desc": "if rg1.passed == False（第 812 行）",
+      "source_line": 812,
       "next": "wrg1",
       "else_next": "rg2"
     },
@@ -1016,7 +1016,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -1026,7 +1026,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -1040,7 +1040,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -1048,7 +1048,7 @@
         }
       },
       "next": "_n9",
-      "source_line": 787
+      "source_line": 820
     },
     {
       "type": "if",
@@ -1059,8 +1059,8 @@
         "value": false
       },
       "name": "rg2.passed == False?",
-      "desc": "if rg2.passed == False（第 790 行）",
-      "source_line": 790,
+      "desc": "if rg2.passed == False（第 823 行）",
+      "source_line": 823,
       "next": "wrg2",
       "else_next": "rg3"
     },
@@ -1088,7 +1088,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -1098,7 +1098,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -1112,7 +1112,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -1120,7 +1120,7 @@
         }
       },
       "next": "_n10",
-      "source_line": 798
+      "source_line": 831
     },
     {
       "type": "if",
@@ -1131,8 +1131,8 @@
         "value": false
       },
       "name": "rg3.passed == False?",
-      "desc": "if rg3.passed == False（第 801 行）",
-      "source_line": 801,
+      "desc": "if rg3.passed == False（第 834 行）",
+      "source_line": 834,
       "next": "wrg3",
       "else_next": "land_push2"
     },
@@ -1142,7 +1142,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-land.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.test_name, \"\\ncmd: \", $NODE.gates.test, \"\\n--- stdout ---\\n\", $NODE.rg3.out, \"\\n--- stderr ---\\n\", $NODE.rg3.err)",
       "next": "_n11",
-      "source_line": 802
+      "source_line": 835
     },
     {
       "type": "end",
@@ -1156,7 +1156,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'ga…",
-      "source_line": 807
+      "source_line": 840
     },
     {
       "type": "writefile",
@@ -1164,7 +1164,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-land.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.lint_name, \"\\ncmd: \", $NODE.gates.lint, \"\\n--- stdout ---\\n\", $NODE.rg2.out, \"\\n--- stderr ---\\n\", $NODE.rg2.err)",
       "next": "_n12",
-      "source_line": 791
+      "source_line": 824
     },
     {
       "type": "end",
@@ -1178,7 +1178,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'ga…",
-      "source_line": 796
+      "source_line": 829
     },
     {
       "type": "writefile",
@@ -1186,7 +1186,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-land.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.fmt_name, \"\\ncmd: \", $NODE.gates.fmt, \"\\n--- stdout ---\\n\", $NODE.rg1.out, \"\\n--- stderr ---\\n\", $NODE.rg1.err)",
       "next": "_n13",
-      "source_line": 780
+      "source_line": 813
     },
     {
       "type": "end",
@@ -1200,7 +1200,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'ga…",
-      "source_line": 785
+      "source_line": 818
     },
     {
       "type": "end",
@@ -1213,7 +1213,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'committ…",
       "desc": "return {'verdict': 'committed', 'via': 'direct-push', 'note…",
-      "source_line": 608
+      "source_line": 641
     },
     {
       "type": "writefile",
@@ -1221,7 +1221,7 @@
       "path": "$F.concat($NODE.run_dir, \"/land-failure.log\")",
       "content": "$F.concat(\"bundled local commits: \", $NODE.land_push.why)",
       "next": "_n15",
-      "source_line": 604
+      "source_line": 637
     },
     {
       "type": "end",
@@ -1234,7 +1234,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'land', 'wh…",
-      "source_line": 606
+      "source_line": 639
     },
     {
       "type": "if",
@@ -1245,8 +1245,8 @@
         "value": true
       },
       "name": "F.contains(rev1.text, 'VERD…",
-      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 519 行）",
-      "source_line": 519,
+      "desc": "if F.contains(rev1.text, 'VERDICT:NEEDS_FIX') != True（第 552 行）",
+      "source_line": 552,
       "next": "wfr",
       "else_next": "fix_prompt"
     },
@@ -1255,7 +1255,7 @@
       "id": "fix_prompt",
       "output": "$F.concat(\"An independent reviewer rejected this change with NEEDS_FIX. \", \"Address every issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev1.text)",
       "next": "_n17",
-      "source_line": 524
+      "source_line": 557
     },
     {
       "type": "agentrun",
@@ -1265,7 +1265,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev2",
-      "source_line": 528
+      "source_line": 561
     },
     {
       "type": "agentrun",
@@ -1275,7 +1275,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_2",
-      "source_line": 529
+      "source_line": 562
     },
     {
       "type": "if",
@@ -1286,8 +1286,8 @@
         "value": true
       },
       "name": "F.contains(rev2.text, 'VERD…",
-      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 531 行）",
-      "source_line": 531,
+      "desc": "if F.contains(rev2.text, 'VERDICT:PASS') != True（第 564 行）",
+      "source_line": 564,
       "next": "fix_prompt2",
       "else_next": "pub"
     },
@@ -1296,7 +1296,7 @@
       "id": "fix_prompt2",
       "output": "$F.concat(\"An independent reviewer still rejects this change after one fix round. \", \"Address every remaining issue below. Do not regress passing checks.\", \"\\n\\n--- reviewer feedback ---\\n\", $NODE.rev2.text)",
       "next": "fix2",
-      "source_line": 536
+      "source_line": 569
     },
     {
       "type": "agentrun",
@@ -1306,7 +1306,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "rev3",
-      "source_line": 540
+      "source_line": 573
     },
     {
       "type": "agentrun",
@@ -1316,7 +1316,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 5400,
       "next": "contains_text_verdict_pa_3",
-      "source_line": 542
+      "source_line": 575
     },
     {
       "type": "if",
@@ -1327,8 +1327,8 @@
         "value": true
       },
       "name": "F.contains(rev3.text, 'VERD…",
-      "desc": "if F.contains(rev3.text, 'VERDICT:PASS') != True（第 544 行）",
-      "source_line": 544,
+      "desc": "if F.contains(rev3.text, 'VERDICT:PASS') != True（第 577 行）",
+      "source_line": 577,
       "next": "wfr3",
       "else_next": "pub"
     },
@@ -1338,7 +1338,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-failure.log\")",
       "content": "$NODE.rev3.text",
       "next": "_n16",
-      "source_line": 545
+      "source_line": 578
     },
     {
       "type": "end",
@@ -1351,7 +1351,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 547
+      "source_line": 580
     },
     {
       "type": "writefile",
@@ -1359,7 +1359,7 @@
       "path": "$F.concat($NODE.run_dir, \"/review-unavailable.log\")",
       "content": "$NODE.rev1.text",
       "next": "_n18",
-      "source_line": 520
+      "source_line": 553
     },
     {
       "type": "end",
@@ -1372,7 +1372,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'review', '…",
-      "source_line": 522
+      "source_line": 555
     },
     {
       "type": "agentrun",
@@ -1382,7 +1382,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g3b",
-      "source_line": 482
+      "source_line": 515
     },
     {
       "type": "child",
@@ -1408,7 +1408,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -1418,7 +1418,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -1432,7 +1432,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -1440,7 +1440,7 @@
         }
       },
       "next": "_n19",
-      "source_line": 489
+      "source_line": 522
     },
     {
       "type": "if",
@@ -1451,8 +1451,8 @@
         "value": false
       },
       "name": "g3b.passed == False?",
-      "desc": "if g3b.passed == False（第 491 行）",
-      "source_line": 491,
+      "desc": "if g3b.passed == False（第 524 行）",
+      "source_line": 524,
       "next": "wgf3",
       "else_next": "review_prompt"
     },
@@ -1462,7 +1462,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-test.log\")",
       "content": "$F.concat(\"cmd: cargo test --workspace\\n--- stdout ---\\n\", $NODE.g3b.out, \"\\n--- stderr ---\\n\", $NODE.g3b.err)",
       "next": "_n20",
-      "source_line": 492
+      "source_line": 525
     },
     {
       "type": "end",
@@ -1476,7 +1476,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 495
+      "source_line": 528
     },
     {
       "type": "agentrun",
@@ -1486,7 +1486,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g2b",
-      "source_line": 464
+      "source_line": 497
     },
     {
       "type": "child",
@@ -1512,7 +1512,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -1522,7 +1522,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -1536,7 +1536,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -1544,7 +1544,7 @@
         }
       },
       "next": "_n22",
-      "source_line": 471
+      "source_line": 504
     },
     {
       "type": "if",
@@ -1555,8 +1555,8 @@
         "value": false
       },
       "name": "g2b.passed == False?",
-      "desc": "if g2b.passed == False（第 473 行）",
-      "source_line": 473,
+      "desc": "if g2b.passed == False（第 506 行）",
+      "source_line": 506,
       "next": "wgf2",
       "else_next": "g3"
     },
@@ -1566,7 +1566,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-clippy.log\")",
       "content": "$F.concat(\"cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings\\n--- stdout ---\\n\", $NODE.g2b.out, \"\\n--- stderr ---\\n\", $NODE.g2b.err)",
       "next": "_n23",
-      "source_line": 474
+      "source_line": 507
     },
     {
       "type": "end",
@@ -1580,7 +1580,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 477
+      "source_line": 510
     },
     {
       "type": "agentrun",
@@ -1590,7 +1590,7 @@
       "repo": "$NODE.pre.worktree",
       "timeout_secs": 7200,
       "next": "g1b",
-      "source_line": 438
+      "source_line": 471
     },
     {
       "type": "child",
@@ -1616,7 +1616,7 @@
             "next": "run",
             "name": "'单发一道门（只包 GATE 本体，返回结果即走）。\\…",
             "desc": "'单发一道门（只包 GATE 本体，返回结果即走）。\\n\\n ⚠️ childflow 表达式上下文没有 F（可用根仅…",
-            "source_line": 88
+            "source_line": 90
           },
           {
             "type": "gate",
@@ -1626,7 +1626,7 @@
             "cwd": "$INPUT.wt",
             "timeout_secs": "$INPUT.timeout_secs",
             "next": "_n1",
-            "source_line": 95
+            "source_line": 97
           },
           {
             "type": "end",
@@ -1640,7 +1640,7 @@
             "resultType": "success",
             "name": "return {'passed': run.passe…",
             "desc": "return {'passed': run.passed, 'gate': INPUT.name, 'out': ru…",
-            "source_line": 97
+            "source_line": 99
           }
         ],
         "inputType": {
@@ -1648,7 +1648,7 @@
         }
       },
       "next": "_n25",
-      "source_line": 445
+      "source_line": 478
     },
     {
       "type": "if",
@@ -1659,8 +1659,8 @@
         "value": false
       },
       "name": "g1b.passed == False?",
-      "desc": "if g1b.passed == False（第 447 行）",
-      "source_line": 447,
+      "desc": "if g1b.passed == False（第 480 行）",
+      "source_line": 480,
       "next": "wgf1",
       "else_next": "g2"
     },
@@ -1670,7 +1670,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-gate-fmt.log\")",
       "content": "$F.concat(\"gate: \", $NODE.gates.fmt_name, \"\\ncmd: \", $NODE.gates.fmt, \"\\n--- stdout ---\\n\", $NODE.g1b.out, \"\\n--- stderr ---\\n\", $NODE.g1b.err)",
       "next": "_n26",
-      "source_line": 448
+      "source_line": 481
     },
     {
       "type": "end",
@@ -1684,7 +1684,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'gates', 'g…",
-      "source_line": 453
+      "source_line": 486
     },
     {
       "type": "end",
@@ -1698,7 +1698,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'skip-co…",
       "desc": "return {'verdict': 'skip-commit', 'stage': 'commit', 'why':…",
-      "source_line": 410
+      "source_line": 443
     },
     {
       "type": "if",
@@ -1709,8 +1709,8 @@
         "value": true
       },
       "name": "F.contains(str(pre.why or '…",
-      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 396 行）",
-      "source_line": 396,
+      "desc": "if F.contains(str(pre.why or ''), 'disk')（第 429 行）",
+      "source_line": 429,
       "next": "_n30",
       "else_next": "wf"
     },
@@ -1720,7 +1720,7 @@
       "path": "$F.concat($NODE.run_dir, \"/failure-context.md\")",
       "content": "$F.concat(\"## preflight failed\\n\\nreason: \", $NODE.pre.why)",
       "next": "_n29",
-      "source_line": 398
+      "source_line": 431
     },
     {
       "type": "end",
@@ -1733,7 +1733,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'failed-…",
       "desc": "return {'verdict': 'failed-preserved', 'stage': 'preflight'…",
-      "source_line": 400
+      "source_line": 433
     },
     {
       "type": "end",
@@ -1746,7 +1746,7 @@
       "resultType": "success",
       "name": "return {'verdict': 'retry-l…",
       "desc": "return {'verdict': 'retry-later', 'stage': 'preflight', 'wh…",
-      "source_line": 397
+      "source_line": 430
     }
   ]
 }
