@@ -46,3 +46,12 @@
   canonical，keeper 管线自己的 patrol flow 也并入）；mediaflow 评估为无需改
   （运行时 `flow_from_source` 编译即跑，无编译落盘脚本）。
 - 上游 plaita 提交：cd0b41f `feat(cli): python -m plaita build`。
+
+## Follow-up（同日）：--embed-source
+- 排查「console 看不到 flow 的 codeflow 代码」：console 的 @flow 源码页签读
+  `definition.metadata.source`，而两个 console（本地 8080 / 生产 8323 隧道）
+  现存全部版本都没有该字段——keeper/recursive 发布链从未接过 mediaflow 式
+  注入器，页签从未亮过，与编译收敛无关（新旧产物都不含 metadata）。
+- 修复：plaita build 新增 `--embed-source`（e70ba5d），compile_v2.py 薄壳
+  启用；两个产物重编（v2 133KB / sbx 137KB，含源码原文），`--check` 双绿。
+  下次 console 发布新 semver 时源码页签即生效（版本不可变，需发新版本）。
