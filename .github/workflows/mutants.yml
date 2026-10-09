@@ -32,6 +32,15 @@ on:
       - Cargo.lock
       - .cargo/**
       - .github/workflows/mutants.yml
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - .github/workflows/mutants.yml
   workflow_dispatch:
     inputs:
       scope:
@@ -55,6 +64,149 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
+  # ── push→main 落地门（2026-10-09，接替沙箱内 tui-mutants）─────────────────
+  # keeper 管线落地直接进 main（push_mode: main），PR 门看不到这些提交；
+  # 变异测试改在落地后于 CI 补跑：文件级作用域（与本地各 *-mutants.sh 门同
+  # 语义，显式传文件 = 整文件作用域），红则按 docs/ISSUE_FILING_GUIDE.md 自动
+  # 建档（P2）交给 keeper 派发修复 goal——effectiveness loop 保留，但自迭代
+  # 沙箱不再为 mutants 花 40-150 分钟/轮（也不再往沙箱装 cargo-mutants）。
+  main-push:
+    name: mutants (push to main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD^..HEAD diff（merge commit 取第一父）
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mutants-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mutants-cargo-
+
+      - name: Cache cargo-mutants binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('.github/workflows/mutants.yml') }}
+
+      - name: Install cargo-mutants
+        run: command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@recursive.local"
+          git config --global user.name "CI Bot"
+          git config --global safe.directory "*"
+
+      - name: Resolve changed files (HEAD^..HEAD)
+        id: scope
+        run: |
+          git diff --name-only 'HEAD^..HEAD' > /tmp/changed.txt 2>/dev/null || true
+          agent_list=""; cli_list=""; tui_list=""
+          while IFS= read -r f; do
+            case "$f" in
+              src/*.rs)
+                case "$f" in src/weixin/*|src/test_util.rs) continue ;; esac
+                agent_list="$agent_list $f" ;;
+              crates/recursive-cli/src/*) cli_list="$cli_list $f" ;;
+              crates/recursive-tui/src/*.rs) tui_list="$tui_list $f" ;;
+            esac
+          done < /tmp/changed.txt
+          {
+            echo "agent=${agent_list# }"
+            echo "cli=${cli_list# }"
+            echo "tui=${tui_list# }"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run mutants (per crate, files scope)
+        env:
+          AGENT_FILES: ${{ steps.scope.outputs.agent }}
+          CLI_FILES: ${{ steps.scope.outputs.cli }}
+          TUI_FILES: ${{ steps.scope.outputs.tui }}
+        run: |
+          failed=""
+          if [[ -n "$AGENT_FILES$CLI_FILES$TUI_FILES" ]]; then
+            if [[ -n "$AGENT_FILES" ]]; then
+              read -ra F <<< "$AGENT_FILES"
+              echo "::group::agent-mutants (${#F[@]} files)"
+              bash .dev/scripts/agent-mutants.sh "${F[@]}" || failed="$failed agent"
+              echo "::endgroup::"
+            fi
+            if [[ -n "$CLI_FILES" ]]; then
+              read -ra F <<< "$CLI_FILES"
+              echo "::group::cli-mutants (${#F[@]} files)"
+              bash .dev/scripts/cli-mutants.sh "${F[@]}" || failed="$failed cli"
+              echo "::endgroup::"
+            fi
+            if [[ -n "$TUI_FILES" ]]; then
+              read -ra F <<< "$TUI_FILES"
+              echo "::group::tui-mutants (${#F[@]} files)"
+              bash .dev/scripts/tui-mutants.sh "${F[@]}" || failed="$failed tui"
+              echo "::endgroup::"
+            fi
+          else
+            echo "no crate sources changed in this push — nothing to mutate"
+            exit 0
+          fi
+          if [[ -n "$failed" ]]; then
+            echo "mutants survivors in:$failed"
+            exit 1
+          fi
+
+      # 幸存者 → 自动建档（P2）给 keeper 派发修复 goal；查重：已有同前缀 open
+      # 单只回评，不重复开单（ISSUE_FILING_GUIDE 禁止重复提报）。
+      - name: File keeper issue on survivors
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA_SHORT: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="test(gates): main 落地变异测试幸存（${SHA_SHORT:0:8}）"
+          BODY="$(cat <<BODY_EOF
+          > 优先级 **P2** · 依赖：无
+
+          基线 HEAD = ${SHA_SHORT:0:7}
+
+          ## Summary
+          push→main 落地门（mutants.yml / main-push job）在 CI 上检出变异测试幸存者。
+          - 运行记录：$RUN_URL
+          - 幸存者清单见该 run 的「Run mutants (per crate, files scope)」步骤日志（MISSED 段）
+
+          ## 影响
+          对应行为的测试存在但未钉住改动语义——mutant 幸存意味着测试全绿的情况下
+          行为仍可被破坏而不被发现。
+
+          ## 建议
+          按 run 日志 MISSED 清单强化对应测试，使每个幸存 mutant 被杀。验收：本地
+          复跑对应 crate 的 *-mutants.sh（显式传同批文件）零幸存。
+          BODY_EOF
+          )"
+          EXISTING="$(gh issue list -R jeffkit/recursive --state open \
+            --search "main 落地变异测试幸存 in:title" --json number --jq 'length' 2>/dev/null || echo 0)"
+          if [[ "$EXISTING" -gt 0 ]]; then
+            LAST="$(gh issue list -R jeffkit/recursive --state open \
+              --search "main 落地变异测试幸存 in:title" --json number --jq '.[0].number')"
+            gh issue comment "$LAST" -R jeffkit/recursive --body "$BODY"
+            echo "commented on existing issue #$LAST"
+          else
+            gh issue create -R jeffkit/recursive --title "$TITLE" --body "$BODY"
+          fi
+
   incremental:
     name: mutants (diff vs main)
     runs-on: ubuntu-latest

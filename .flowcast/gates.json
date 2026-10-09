@@ -2,7 +2,8 @@
   "_comment": "recursive 项目特定质量门（committed）。flowcast self-improve flow 经 loadGates 加载，与内置 cargo test/clippy/fmt 门用 mergeGates 合并（项目门追加在后，按对象顺序）。新增门或覆盖同名内置门都在这里声明，不改 flow 代码。",
   "gates": {
     "e2e": {
-      "cmd": "sh .dev/scripts/e2e-gate.sh",
+      "_comment": "2026-10-09 起 CI 形态：RECURSIVE_E2E_LOCAL_ONLY=1 只跑本地快路径（host release 二进制 + npx aimock，秒级，零 Docker——colima 不用起），Docker fallback 与深诊断移交给 GitHub CI 的 smoke-gate/full-sweep（.github/workflows/e2e.yml，每次 PR 自动跑）。E2E_AIMOCK_ENGINE=npx 与 e2e-local.sh 的 npx aimock 引擎配套（版本 pin 见该脚本）。",
+      "cmd": "E2E_AIMOCK_ENGINE=npx RECURSIVE_E2E_LOCAL_ONLY=1 bash .dev/scripts/e2e-gate.sh",
       "onFail": "resume-fix",
       "timeout": 600000
     },
@@ -13,10 +14,10 @@
       "timeout": 60000
     },
     "tui-mutants": {
-      "_comment": "TUI 测试有效性门（stage 3/5）。tui-mutants.sh 自带变更检测：未动 crates/recursive-tui/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix 把 survivor 报告喂回 agent 强化测试后再跑一次——这正是 effectiveness loop 的价值；cargo-mutants 缺失时 resume-fix 会让 agent 装上它（或装不上则硬回滚）。",
-      "cmd": "bash .dev/scripts/tui-mutants.sh",
+      "_comment": "TUI 测试有效性门（stage 3/5）。2026-10-09 起 CI 化：cmd 换 ci-mutants-gate.sh——沙箱只做工作树快照（临时 index，不碰 HEAD/index，评审与落地零感知）+ push 快照分支 + dispatch .github/workflows/mutants.yml (scope=incremental) + 轮询；变异测试本体在 GitHub 4 核 runner 上跑，不再占本机 20-60 分钟。作用域自跳过同语义（未动 crates/recursive-tui/src/ 即 exit 0，不烧 CI）。红时 CI 日志的 MISSED 段喂回 agent 强化测试。RECURSIVE_MUTANTS_ENGINE=local 可强制回退本机脚本（CI/gh 不可用时 auto 亦自动回退）。预算 30min：CI 冷缓存首跑可能 15-25min，缓存热后显著缩短。",
+      "cmd": "CI_MUTANTS_MAX_WAIT=1500 bash .dev/scripts/ci-mutants-gate.sh tui",
       "onFail": "resume-fix",
-      "timeout": 1200000
+      "timeout": 1800000
     },
     "agent-presence": {
       "_comment": "快存在性门：动了 src/（排除 weixin/test_util）就必须有测试改动。排在 agent-mutants 前。RECURSIVE_AGENT_TEST_PRESENCE=0 opt-out。",
@@ -25,10 +26,10 @@
       "timeout": 60000
     },
     "agent-mutants": {
-      "_comment": "主 kernel 测试有效性门。agent-mutants.sh 自带变更检测：未动 src/（排除 src/weixin/ 和 src/test_util.rs）即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix 把 survivor 报告喂回 agent 强化测试后再跑一次。覆盖 recursive-agent crate 的全部核心逻辑（transcript、compact、session、checkpoint、tools、http、llm 等）。2026-08-03 起脚本默认并行 copy 模式（--jobs=核数，~60s/批 vs 单线程 ~60s/变异点）：69 变异点约 10-15min，90min 超时覆盖首次全量依赖编译 + 慢机余量。",
-      "cmd": "bash .dev/scripts/agent-mutants.sh",
+      "_comment": "主 kernel 测试有效性门。2026-10-09 起 CI 化（机制见 tui-mutants 注释）：变异本体在 GitHub runner 上跑，本机不再占 90min 预算（函数级 --in-diff 作用域在 CI 缓存热后预计 10-20min）。作用域自跳过同语义（未动 src/ 排除 weixin/test_util 即 exit 0）。预算 60min 覆盖 CI 冷缓存首跑。",
+      "cmd": "CI_MUTANTS_MAX_WAIT=3300 bash .dev/scripts/ci-mutants-gate.sh agent",
       "onFail": "resume-fix",
-      "timeout": 5400000
+      "timeout": 3600000
     },
     "cli-presence": {
       "_comment": "快存在性门：动了 crates/recursive-cli/src/ 就必须有测试改动。排在 cli-mutants 前。RECURSIVE_CLI_TEST_PRESENCE=0 opt-out。",
@@ -37,11 +38,10 @@
       "timeout": 60000
     },
     "cli-mutants": {
-      "_comment": "CLI crate 测试有效性门。cli-mutants.sh 自带变更检测：未动 crates/recursive-cli/src/ 即 exit 0 跳过；cargo-mutants 缺失 exit 2；有 survivor 即非 0。onFail=resume-fix。",
-      "_timeout_note": "2026-09-29（goal-407）：20 分钟预算在这台机器上**不可能**跑完。cli-mutants 的作用域是「相对 main 变更过的整文件」，而 crates/recursive-cli/src/main.rs 有 ~150 个可变点；改动 main.rs 会让变更集变成 4 个文件 / ~200 个 mutant。copy 模式每个 --jobs 副本都要先冷编译一遍依赖树，之后每个 mutant 还要 build ~27s + test ~11s（实测中位数；6 个 test target 的链接占大头），整机吞吐约 1.9 mutant/分钟。实测一轮 ≈ 110–120 分钟，20 分钟预算只能跑掉 ~150/242 个 mutant，于是 gate 被 SIGKILL、报告只剩截断的 survivor 列表（flow 日志里的 `timeout (exit -1)`；报告没有收尾汇总行就是判据）。这里把预算设为 150 分钟，**不改任何判定语义**（同样的 mutant、同样的测试命令、同样 fail-on-survivor）。若要真正缩短，应由维护者决定更结构化的做法（`--in-diff` 差分作用域 / 合并 integration test target 以减少每 mutant 的链接次数 / dev profile 关掉 debug info），不要靠改判定阈值来掩盖。",
-      "cmd": "bash .dev/scripts/cli-mutants.sh",
+      "_comment": "CLI crate 测试有效性门。2026-10-09 起 CI 化（机制见 tui-mutants 注释）——这是收益最大的一刀：cli 的文件级作用域碰上 main.rs（~150 可变点 / ~242 mutants）时本机一跑 110-150 分钟、两轮 resume-fix 能吃掉半天沙箱；CI 上同预算压到 ~60-90min 且本机零占用。作用域自跳过同语义（未动 crates/recursive-cli/src/ 即 exit 0）。预算 90min 覆盖 CI 冷缓存首跑（goal-407 的教训：绝不拿截断报告当幸存者清单，超时由 ci-mutants-gate.sh 主动 cancel 并 exit 3）。",
+      "cmd": "CI_MUTANTS_MAX_WAIT=5100 bash .dev/scripts/ci-mutants-gate.sh cli",
       "onFail": "resume-fix",
-      "timeout": 9000000
+      "timeout": 5400000
     },
     "flow-watchdog": {
       "_comment": "Goal 346: watchdog unit tests for self-improve.flow.js (startRecursiveWatchdog / findRecursivePid). Run with node --test. Keeps the flow's own test coverage enforceable in CI.",

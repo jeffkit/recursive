@@ -45,6 +45,21 @@ FEATURES="recursive/test-utils,weixin"
 # runs blew the gate timeout; copy mode also tolerates uncommitted changes).
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
+# ── AGS 沙箱自跳过（2026-10-09，mutants 下沉 GitHub CI）────────────────
+# keeper 的 tui-mutants 门在本脚本里跑（sbx flow：cwd = /home/user/plaita-ws/repo，
+# 见 self_improve_flow_v2_sbx.py 的 sbx_wt）。变异测试本体已由 GitHub CI 接管
+# （.github/workflows/mutants.yml 的 main-push job：push→main 落地后文件级
+# 作用域补跑，幸存者自动建档给 keeper 派发修复 goal）——沙箱里再跑一遍纯属
+# 双花：每轮 ≤3600s 预算，还要在沙箱里 cargo install cargo-mutants。
+# 判据用沙箱内工作区路径（sbx_wt 硬编码值），本地 / CI runner 均不命中；
+# keeper config.yaml 里移除该门后此垫片可整体删除。
+case "$PWD" in
+  /home/user/plaita-ws/*)
+    echo "skip: tui-mutants 已下沉 GitHub CI（mutants.yml main-push）——AGS 沙箱内自跳过，节省 ≤3600s 沙箱预算"
+    exit 0
+    ;;
+esac
+
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
   exit 2
