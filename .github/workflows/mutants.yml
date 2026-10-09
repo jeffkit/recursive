@@ -1,0 +1,225 @@
+# Mutation — cargo-mutants 变异测试的 CI 入口（复用 .dev/scripts 的三个门脚本，
+# 与 self-improve flow 的 .flowcast/gates.json 用同一套判定语义）。
+#
+# 三个 job：
+#   incremental (PR 门禁) — 三个脚本无参跑（默认增量作用域）：
+#       agent / tui 走 --in-diff 函数级差分（只变异 diff 触及的函数，实测
+#       6 函数 ≈26 变异点 ≈3-4min）；cli 目前是文件级（main.rs 单文件
+#       ~150 个可变点，是慢的来源，预算参考 gates.json 的 150min）。
+#       各脚本「未动本 crate 即 exit 0 跳过」，一次 PR 通常只付一个 crate。
+#   full-baseline (双周)  — 每个 crate 一个 job，--all 全量基线。本地参考：
+#       agent 69 变异点 ≈10-15min（14 核 8 jobs）、cli ~242 个 ≈110-120min
+#       （32GB）。CI 托管 runner 只有 4 核，预算给 5.5h（6h 是单 job 上限）。
+#       若超时或磁盘吃紧（runner 可用 ~14GB，4 份 copy 各带独立 target），
+#       降到 --jobs 2，或挂一台 self-hosted runner。
+#   regression (双周)     — 完整编译回归：全特性编译 + 默认特性全测 +
+#       全特性 clippy + fmt（= 本地强制质量门的完整集）。
+#
+# 定时：与 e2e.yml 相同（每月 1/15 日 18:37 UTC ≈ 北京 2/16 日 02:37）；
+# 想改每月一次：cron 改 "37 18 1 * *"。
+#
+# rollout：三个 job 目前都是 continue-on-error: true（advisory）——先跑出
+# 真实时长与幸存者噪音水平，再逐个摘掉改阻塞。
+
+name: Mutation
+
+on:
+  pull_request:
+    paths:
+      - src/**
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/**
+      - .github/workflows/mutants.yml
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "incremental = 只测相对 main 的改动；full = 全 crate 基线 + 完整回归"
+        type: choice
+        options:
+          - incremental
+          - full
+        default: incremental
+  schedule:
+    - cron: "37 18 1,15 * *"
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 关掉 dev profile 的 debug info：copy 模式每份副本独立 target，这是控制
+  # 磁盘与编译时长的主要杠杆（gates.json 对 cli-mutants 的结构化建议同款）。
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  incremental:
+    name: mutants (diff vs main)
+    runs-on: ubuntu-latest
+    # 常规 PR（函数级差分）分钟级；最坏情形 cli 文件级作用域碰上 main.rs
+    # 是小时级 —— 预算 180min，超时即被 SIGKILL（gates.json 失败模式 #8 同款
+    # 症状：报告没有收尾汇总行。真发生时不要缩脚本作用域，改预算或 self-hosted）。
+    timeout-minutes: 180
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'incremental')
+    # 首批 advisory：先观察 CI 上的真实时长与幸存者噪音，再改阻塞。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 脚本的自动检测用 `git diff main...HEAD`，需要完整历史。
+          fetch-depth: 0
+
+      # checkout 只建 origin/* 不建本地分支；不补这一步 diff 为空 →
+      # 三个脚本全部「无改动」静默跳过（假绿）。
+      - name: Materialize local main branch
+        run: |
+          git branch main origin/main 2>/dev/null || true
+          git rev-parse --verify main
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@recursive.local"
+          git config --global user.name "CI Bot"
+          git config --global safe.directory "*"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mutants-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mutants-cargo-
+
+      # 缓存编译好的 cargo-mutants 二进制（与 ci.yml supply-chain 的工具缓存
+      # 同款模式；改本 workflow 会换 key 触发重装 —— 这是故意的升级通道）。
+      - name: Cache cargo-mutants binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('.github/workflows/mutants.yml') }}
+
+      - name: Install cargo-mutants
+        run: command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+
+      - name: Show diff scope
+        run: |
+          echo "changed files vs main:"
+          git diff --name-only main...HEAD | sed 's/^/  /'
+
+      # 顺序跑三个门脚本：各自按 crate 目录过滤 diff，未动即秒级跳过，
+      # 所以总时长 ≈ 命中的那一个 crate 的成本，而非三者之和。
+      - name: agent-mutants (recursive-agent)
+        run: bash .dev/scripts/agent-mutants.sh
+
+      - name: tui-mutants (recursive-tui)
+        run: bash .dev/scripts/tui-mutants.sh
+
+      - name: cli-mutants (recursive-cli)
+        run: bash .dev/scripts/cli-mutants.sh
+
+  full-baseline:
+    name: mutants --all (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    # 4h，控制在托管 runner 的 6h 单 job 上限内，且给 4 核降速留余量。
+    timeout-minutes: 330
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full')
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: recursive-agent
+            script: agent-mutants.sh
+          - crate: recursive-cli
+            script: cli-mutants.sh
+          - crate: recursive-tui
+            script: tui-mutants.sh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1   # --all 全量基线，不 diff，浅检出即可
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mutants-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mutants-cargo-
+
+      - name: Cache cargo-mutants binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('.github/workflows/mutants.yml') }}
+
+      - name: Install cargo-mutants
+        run: command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+
+      # --jobs 4 = copy 模式 4 副本（runner 4 核）。磁盘兜底：CARGO_PROFILE_
+      # DEV_DEBUG=0 已在 workflow 级设置；仍吃紧就降到 --jobs 2。
+      - name: Run full-crate mutation baseline
+        run: bash .dev/scripts/${{ matrix.script }} --all --jobs 4
+
+  regression:
+    name: full compile regression (all features)
+    runs-on: ubuntu-latest
+    # 全特性编译（cloud-runtime 的 aws-sdk/bollard、weixin、otel 都要编）+
+    # 全测试套件，4 核冷缓存给 180min（缓存热后显著缩短）。
+    timeout-minutes: 180
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-regression-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-regression-cargo-
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@recursive.local"
+          git config --global user.name "CI Bot"
+          git config --global safe.directory "*"
+
+      # 完整编译回归四件套（AGENTS.md 本地强制门的超集：编译维度开满特性）：
+      # 1) 全特性编译 —— 平时 feature-matrix 只逐个 cargo check，这里全量 build；
+      # 2) 默认特性全测 —— 与本地 `cargo test --workspace` 门一致；
+      # 3) 全特性 clippy -D warnings —— 与本地门一致；
+      # 4) fmt --check。
+      - name: Build workspace (all features)
+        run: cargo build --workspace --all-features
+
+      - name: Test workspace (default features)
+        run: cargo test --workspace
+
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check

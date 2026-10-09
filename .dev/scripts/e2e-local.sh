@@ -22,7 +22,10 @@ cd "$REPO_ROOT"
 SECONDS=0
 
 # ── 前置检查 ──────────────────────────────────────────────────────────
-if ! command -v docker >/dev/null 2>&1; then
+# E2E_AIMOCK_ENGINE=npx（CI 无 Docker 形态）：aimock 以 npx 原生进程跑
+# （@copilotkit/aimock 的 llmock bin，与 ghcr 镜像同一 CLI），docker 不再是前置。
+E2E_AIMOCK_ENGINE="${E2E_AIMOCK_ENGINE:-docker}"
+if [[ "$E2E_AIMOCK_ENGINE" != "npx" ]] && ! command -v docker >/dev/null 2>&1; then
   echo "error: docker required (for aimock mock service)" >&2
   exit 3
 fi
@@ -36,14 +39,22 @@ if [[ ! -x "$RECURSIVE_BIN" ]]; then
   exit 3
 fi
 
-# ── 清理 trap（aimock 容器 + 临时目录）──────────────────────────────
+# ── 清理 trap（aimock 容器/进程 + 临时目录）──────────────────────────
 AIMOCK_NAME=""
 TMPDIR_BASE=""
+AIMOCK_PID=""
+AIMOCK_LOG=""
 cleanup() {
   local rc=$?
   if [[ -n "$AIMOCK_NAME" ]]; then
     docker rm -f "$AIMOCK_NAME" >/dev/null 2>&1 || true
   fi
+  # npx 引擎：先杀子进程（npx → node llmock）再杀 npx 本身，避免孤儿占端口。
+  if [[ -n "$AIMOCK_PID" ]] && kill -0 "$AIMOCK_PID" 2>/dev/null; then
+    pkill -P "$AIMOCK_PID" >/dev/null 2>&1 || true
+    kill "$AIMOCK_PID" >/dev/null 2>&1 || true
+  fi
+  [[ -n "$AIMOCK_LOG" && -f "$AIMOCK_LOG" ]] && rm -f "$AIMOCK_LOG"
   if [[ -n "$TMPDIR_BASE" && -d "$TMPDIR_BASE" ]]; then
     rm -rf "$TMPDIR_BASE"
   fi
@@ -51,12 +62,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── 起 aimock（本地端口映射，不走 argusai 网络）──────────────────────
+# ── 起 aimock（docker 容器或 npx 原生进程，端口映射到 localhost）──────
 AIMOCK_PORT="${E2E_AIMOCK_PORT:-4010}"
 AIMOCK_NAME="e2e-local-aimock-$$"
 FIXTURES_DIR="$REPO_ROOT/e2e/fixtures"
+# Pin 具体版本：fixtures 匹配语义随上游演进可能漂移，升级须显式换这里
+# （ghcr 镜像与 npm 包同源，见 CopilotKit/aimock 的发布流）。
+AIMOCK_NPX_SPEC="@copilotkit/aimock@1.44.0"
 
-if ! docker run -d --rm --name "$AIMOCK_NAME" \
+if [[ "$E2E_AIMOCK_ENGINE" == "npx" ]]; then
+  command -v npx >/dev/null 2>&1 \
+    || { echo "error: E2E_AIMOCK_ENGINE=npx needs node/npx on PATH" >&2; exit 3; }
+  AIMOCK_LOG="$(mktemp "${TMPDIR:-/tmp}/e2e-local-aimock-log-XXXXXX")"
+  # npx 命中已全局安装的包时直接走 PATH，不会重复下载。
+  npx -y -p "$AIMOCK_NPX_SPEC" llmock \
+    -p "$AIMOCK_PORT" -f "$FIXTURES_DIR" -h 0.0.0.0 \
+    >"$AIMOCK_LOG" 2>&1 &
+  AIMOCK_PID=$!
+elif ! docker run -d --rm --name "$AIMOCK_NAME" \
   -p "${AIMOCK_PORT}:4010" \
   -v "${FIXTURES_DIR}:/fixtures:ro" \
   ghcr.io/copilotkit/aimock -f /fixtures -h 0.0.0.0 >/dev/null 2>&1; then
@@ -65,13 +88,27 @@ if ! docker run -d --rm --name "$AIMOCK_NAME" \
   exit 3
 fi
 
-# 等 aimock ready（最多 5 秒）
-for _ in 1 2 3 4 5; do
+# 等 aimock ready：docker 镜像已本地化 → 5s 足够；npx 首次要下载包 → 90s。
+# /v1/models 是两种形态共有的探活端点。npx 进程若早死（端口被占/参数错）
+# 立刻中止等待并把日志吐出来，不傻等满 90s。
+READY=0
+for _ in $(seq 1 90); do
   if curl -sf "http://localhost:${AIMOCK_PORT}/v1/models" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+  if [[ -n "$AIMOCK_PID" ]] && ! kill -0 "$AIMOCK_PID" 2>/dev/null; then
     break
   fi
   sleep 1
 done
+if [[ "$READY" -ne 1 ]]; then
+  echo "error: aimock not ready on port $AIMOCK_PORT" >&2
+  if [[ -n "$AIMOCK_LOG" && -f "$AIMOCK_LOG" ]]; then
+    tail -20 "$AIMOCK_LOG" >&2
+  fi
+  exit 3
+fi
 
 # ── 准备临时工作区 ───────────────────────────────────────────────────
 TMPDIR_BASE=$(mktemp -d /tmp/e2e-local-XXXXXX)

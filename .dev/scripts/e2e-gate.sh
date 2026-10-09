@@ -56,15 +56,21 @@ elif command -v npx >/dev/null 2>&1; then
 fi
 
 # ---- HARD-GATE：前置缺失即红灯 ---------------------------------------------
+# RECURSIVE_E2E_LOCAL_ONLY=1（CI 无 Docker 形态）：只跑本地快路径——docker
+# daemon / mcp2cli / argusai-mcp 都不再是前置（Docker fallback 不可用，本地红
+# 的诊断来自 e2e-local.sh 自己的输出）。本地开发不设它，行为不变。
+LOCAL_ONLY="${RECURSIVE_E2E_LOCAL_ONLY:-0}"
 _missing=()
-# Docker daemon：argusai smoke 依赖 recursive-e2e 容器，daemon 没起时 argus-setup
-# 才挂（晚且日志难读）。这里提前查 `docker info`，down 即红灯，配合 flow 的
-# best-effort colima 自启。
-if ! docker info >/dev/null 2>&1; then
+if [[ "$LOCAL_ONLY" != "1" ]] && ! docker info >/dev/null 2>&1; then
+  # argusai smoke 依赖 recursive-e2e 容器，daemon 没起时 argus-setup
+  # 才挂（晚且日志难读）。这里提前查 `docker info`，down 即红灯，
+  # 配合 flow 的 best-effort colima 自启。
   _missing+=("docker daemon（colima start / Docker Desktop 启动）")
 fi
-[[ -n "$MCP2CLI" ]]        || _missing+=("mcp2cli（uv tool install mcp2cli）")
-[[ -n "$_MCP_STDIO_CMD" ]] || _missing+=("argusai-mcp（npm i -g argusai-mcp）")
+if [[ "$LOCAL_ONLY" != "1" ]]; then
+  [[ -n "$MCP2CLI" ]]        || _missing+=("mcp2cli（uv tool install mcp2cli）")
+  [[ -n "$_MCP_STDIO_CMD" ]] || _missing+=("argusai-mcp（npm i -g argusai-mcp）")
+fi
 [[ -f "$E2E_YAML" ]]       || _missing+=("$E2E_YAML")
 if [[ ${#_missing[@]} -gt 0 ]]; then
   echo "[e2e-gate] HARD-FAIL — 缺少 E2E 前置：" >&2
@@ -110,6 +116,10 @@ if [[ "${RECURSIVE_E2E_DOCKER:-0}" != "1" ]]; then
   if bash "$REPO_ROOT/.dev/scripts/e2e-local.sh"; then
     echo "[e2e-gate] local smoke PASS — skipping Docker full e2e (set RECURSIVE_E2E_DOCKER=1 to force)"
     exit 0
+  fi
+  if [[ "$LOCAL_ONLY" == "1" ]]; then
+    echo "[e2e-gate] local smoke FAIL — RECURSIVE_E2E_LOCAL_ONLY=1, no Docker fallback" >&2
+    exit 1
   fi
   echo "[e2e-gate] local smoke FAIL — falling through to Docker e2e for full diagnostics" >&2
 fi

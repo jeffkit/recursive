@@ -1,0 +1,224 @@
+# E2E — argusai 端到端套件的 CI 入口（**无 Docker 形态**）。
+#
+# GitHub runner 上零容器：aimock 以 npx 原生进程跑（@copilotkit/aimock 的
+# llmock bin，与 ghcr.io/copilotkit/aimock 镜像同一 CLI、同一 fixtures），
+# recursive 以 host release 二进制跑。docker / mcp2cli / argusai-mcp 的
+# Docker 编排链路完全不参与。
+#
+# 两个 job：
+#   smoke-gate (PR 门禁) — `RECURSIVE_E2E_LOCAL_ONLY=1 sh .dev/scripts/e2e-gate.sh`：
+#       只跑本地快路径（e2e-local.sh：host 二进制 + npx aimock，秒级），
+#       前置检查不含 docker/mcp2cli/argusai-mcp，本地红不再 fallback Docker。
+#       与 self-improve flow 的 e2e 门同一脚本、同一套场景断言（write_file /
+#       read_file + session 结构校验）；改动未触及 src/、crates/*/src/、e2e/
+#       时脚本自跳过。
+#   full-sweep (双周/手动) — `.dev/scripts/e2e-run-host.sh` 逐 suite 跑
+#       argusai HostRuntime 路径（无镜像构建、无服务容器；aimock 由插件的
+#       npx 引擎分支拉起，PID 文件 + 进程组收割，见 e2e/plugins/src/index.ts）。
+#       排除需要真实 LLM key 的 suite（live / judge / deferred-tool-loading）。
+#
+# 版本 pin：@copilotkit/aimock@1.44.0（.dev/scripts/e2e-local.sh 的
+# AIMOCK_NPX_SPEC 与 e2e/plugins/src/index.ts 的 aimockNpxSpec 三处同步，
+# fixtures 匹配语义随上游演进可能漂移，升级须一起换）。
+#
+# 已知边界：
+# - full-sweep 是 advisory：各 suite 在 HostRuntime（/workspace → 临时目录
+#   映射）下的兼容性未逐一验证，首轮红不代表回归；按轮次补排除清单后收紧。
+# - E2E 只跑 ubuntu。
+#
+# 定时：每月 1/15 日 18:37 UTC（≈ 北京时间 2/16 日 02:37，避开整点高峰）。
+# 想改每月一次：cron 改 "37 18 1 * *"。注意 GitHub schedule 用 UTC、只在
+# 默认分支生效、高峰期会延迟，仓库 60 天无提交会被自动停用。
+
+name: E2E
+
+on:
+  pull_request:
+    paths:
+      - src/**
+      - crates/**
+      - e2e/**
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+      - providers.toml
+      - .github/workflows/e2e.yml
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "full-sweep 的 suite id 列表（空格分隔）。留空 = e2e.yaml 全量减排除项"
+        required: false
+        type: string
+        default: ""
+  schedule:
+    - cron: "37 18 1,15 * *"
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 无 Docker 形态的开关：e2e-local.sh / e2e-gate.sh / e2e-run-host.sh /
+  # e2e 插件都读它（docker 引擎仍是本地默认，行为不变）。
+  E2E_AIMOCK_ENGINE: npx
+
+jobs:
+  smoke-gate:
+    name: e2e smoke gate (PR, no Docker)
+    runs-on: ubuntu-latest
+    # 预算大头是 release 二进制冷编译（4 核 ~15-30min）；smoke 本身秒级。
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # e2e-gate.sh 用 `git diff main...HEAD` 判定跳过 —— 需要完整历史。
+          fetch-depth: 0
+
+      # actions/checkout 只建 origin/* 不建本地分支；脚本 diff 的基准是本地
+      # ref `main`。不补这一步 diff 为空 → 门被静默跳过（假绿）。
+      - name: Materialize local main branch
+        run: |
+          git branch main origin/main 2>/dev/null || true
+          git rev-parse --verify main
+
+      # recursive 的 session/checkpoint 依赖 git 身份（与 ci.yml 的 test job 同款）。
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@recursive.local"
+          git config --global user.name "CI Bot"
+          git config --global safe.directory "*"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-cargo-
+
+      - uses: actions/setup-node@v4
+        with:
+          # @copilotkit/aimock 要求 node >= 20.15。
+          node-version: 22
+
+      # 预装全局（npx 命中 PATH 不再下载）：smoke 只用 llmock。
+      - name: Install aimock (npx engine)
+        run: npm install -g @copilotkit/aimock@1.44.0
+
+      # 本地快路径前置：host release 二进制（e2e-local.sh 硬检查项）。
+      - name: Build recursive release binary
+        run: cargo build --release -p recursive-cli
+
+      # LOCAL_ONLY：前置检查不含 docker/mcp2cli/argusai-mcp；本地红直接红
+      # （无 Docker fallback），诊断来自 e2e-local.sh 的场景级输出。
+      - name: Run e2e gate
+        env:
+          RECURSIVE_E2E_LOCAL_ONLY: "1"
+          # workflow_dispatch 在 main 上跑，diff 恒空 → 门会自跳过；手动触发
+          # 时强制执行，让「生效验证」真的跑到 smoke。
+          RECURSIVE_E2E_GATE_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: sh .dev/scripts/e2e-gate.sh
+
+  full-sweep:
+    name: e2e full sweep (host mode, no Docker)
+    runs-on: ubuntu-latest
+    # 无镜像构建；38 个 suite 逐个跑（argus-init/setup 每轮有固定开销），
+    # 150min 留足余量。
+    timeout-minutes: 150
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # 首批 advisory：HostRuntime 下各 suite 兼容性未逐一验证；排除清单补齐后摘除。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # argusai-mcp：HostRuntime 编排；aimock：插件的 npx 引擎用。
+      - name: Install node-side prereqs
+        run: |
+          npm install -g argusai-mcp @copilotkit/aimock@1.44.0
+
+      - name: Install mcp2cli
+        run: |
+          uv tool install mcp2cli || pipx install mcp2cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # e2e-run-host.sh 用 python3+yaml 从 e2e.yaml 抽 suite 注册表。
+      - name: Ensure PyYAML
+        run: python3 -c 'import yaml' || pip install pyyaml --break-system-packages
+
+      # e2e.yaml 的 plugins: ./plugins/dist/index.js —— dist 不入库，必须构建。
+      - name: Build e2e plugins
+        run: |
+          npm ci --prefix e2e/plugins
+          npm run build --prefix e2e/plugins
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-e2e-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-cargo-
+
+      # HostRuntime 直接跑 host 二进制（无镜像构建）。
+      - name: Build recursive release binary
+        run: cargo build --release -p recursive-cli
+
+      - name: Run suites
+        env:
+          SUITE_OVERRIDE: ${{ inputs.suites }}
+        run: |
+          EXCLUDE_RE='^(live|judge|deferred-tool-loading)$'   # 需要真实 LLM key
+          if [[ -n "$SUITE_OVERRIDE" ]]; then
+            SUITES="$SUITE_OVERRIDE"
+          else
+            SUITES=$(grep -E '^[[:space:]]+id:' e2e/e2e.yaml \
+              | awk '{print $2}' | grep -vE "$EXCLUDE_RE" | tr '\n' ' ')
+          fi
+          read -ra SUITE_ARR <<< "$SUITES"
+          if [[ ${#SUITE_ARR[@]} -eq 0 ]]; then
+            echo "no suites resolved (check e2e/e2e.yaml or the suites input)" >&2
+            exit 1
+          fi
+          echo "suites (${#SUITE_ARR[@]}): $SUITES"
+
+          failed=()
+          for s in "${SUITE_ARR[@]}"; do
+            echo "::group::e2e suite: $s"
+            rc=0
+            bash .dev/scripts/e2e-run-host.sh "$s" || rc=$?
+            echo "::endgroup::"
+            if [[ $rc -ne 0 ]]; then
+              failed+=("$s")
+              echo "::warning::suite $s failed (exit $rc)"
+            fi
+          done
+
+          {
+            echo "## E2E full sweep (host mode)"
+            echo "- total: ${#SUITE_ARR[@]}, failed: ${#failed[@]}"
+            if [[ ${#failed[@]} -gt 0 ]]; then
+              echo "- failed: ${failed[*]}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            exit 1
+          fi

@@ -12,7 +12,9 @@
  * - record (E2E_RECORD=1): aimock proxies to real LLM, records responses
  */
 
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { PluginModule } from 'argusai-core';
 import { recursiveSessionPlugin } from './session-plugin.js';
@@ -50,34 +52,92 @@ const plugin: PluginModule = {
     // http://localhost:4010/v1 (set by the e2e config or env).
     if (hostMode) {
       const aimockPort = process.env['E2E_AIMOCK_PORT'] ?? '4010';
+      // E2E_AIMOCK_ENGINE=npx：aimock 以 npx 原生进程跑（无 Docker，CI 形态）。
+      // 默认 docker——本地与既有 e2e-run-host.sh 行为不变。
+      const aimockEngine = process.env['E2E_AIMOCK_ENGINE'] ?? 'docker';
+      const fixturesDir = path.resolve(import.meta.dirname, '../../fixtures');
+      const recordedDir = path.resolve(fixturesDir, 'recorded');
+      // Pin 具体版本，与 .dev/scripts/e2e-local.sh 的 AIMOCK_NPX_SPEC 保持
+      // 一致——fixtures 匹配语义随上游演进可能漂移，升级须三处同步换。
+      const aimockNpxSpec = '@copilotkit/aimock@1.44.0';
+      // Readiness probe: /v1/models 由 llmock 在两种引擎下统一提供。
+      const aimockUp = async (): Promise<boolean> =>
+        await fetch(`http://127.0.0.1:${aimockPort}/v1/models`).then(r => r.ok).catch(() => false);
       try {
-        const running = execSync(`docker ps --filter "name=^/${aimockContainerName}$" --format "{{.Names}}"`, { encoding: 'utf-8' }).trim();
-        if (!running.includes(aimockContainerName)) {
-          const fixturesDir = path.resolve(import.meta.dirname, '../../fixtures');
-          const recordedDir = path.resolve(fixturesDir, 'recorded');
-          let aimockCmd: string;
-          if (recordMode && apiKey) {
-            execSync(`mkdir -p "${recordedDir}"`);
-            aimockCmd = `docker run -d --name ${aimockContainerName} ` +
-              `-p ${aimockPort}:4010 ` +
-              `-v "${fixturesDir}:/fixtures" ` +
-              `-e "OPENAI_API_KEY=${apiKey}" ` +
-              `ghcr.io/copilotkit/aimock ` +
-              `--record --provider-openai ${realApiBase} ` +
-              `-f /fixtures/recorded -f /fixtures -h 0.0.0.0`;
-            console.log('[recursive-agent] aimock starting in RECORD mode (host, port-mapped)');
+        if (aimockEngine === 'npx') {
+          // 原生进程形态：detached spawn（独立进程组，调用方可按 PGID 清理），
+          // PID 写入 E2E_AIMOCK_PID_FILE（由 e2e-run-host.sh 传入），日志落
+          // tmp 便于失败诊断。首次 npx 运行会下载包，ready 等待给足 90s。
+          const alreadyUp = await aimockUp();
+          if (!alreadyUp) {
+            const llmockArgs: string[] = ['-y', '-p', aimockNpxSpec, 'llmock'];
+            if (recordMode && apiKey) {
+              execSync(`mkdir -p "${recordedDir}"`);
+              // 与 docker 路径同序：recorded 在前、全量 fixtures 在后（argv
+              // 顺序 = 分层顺序）。
+              llmockArgs.push('--record', '--provider-openai', realApiBase,
+                '-f', recordedDir, '-f', fixturesDir,
+                '-p', aimockPort, '-h', '0.0.0.0');
+              console.log('[recursive-agent] aimock starting in RECORD mode (npx, host)');
+            } else {
+              llmockArgs.push('-p', aimockPort, '-f', fixturesDir, '-h', '0.0.0.0');
+              console.log('[recursive-agent] aimock starting in REPLAY mode (npx, host)');
+            }
+            const childEnv: NodeJS.ProcessEnv = { ...process.env };
+            if (recordMode && apiKey) {
+              // llmock 只认 AIMOCK_PROVIDER_OPENAI_KEY（README：仅 llmock bin 读取）。
+              childEnv['AIMOCK_PROVIDER_OPENAI_KEY'] = apiKey;
+            }
+            const logPath = path.join(os.tmpdir(), `recursive-aimock-${aimockPort}.log`);
+            const out = fs.openSync(logPath, 'a');
+            const child = spawn('npx', llmockArgs, {
+              detached: true,
+              stdio: ['ignore', out, out],
+              env: childEnv,
+            });
+            child.unref();
+            const pidFile = process.env['E2E_AIMOCK_PID_FILE'];
+            if (pidFile) fs.writeFileSync(pidFile, String(child.pid));
+            const deadline = Date.now() + 90_000;
+            let up = false;
+            while (Date.now() < deadline) {
+              if (await aimockUp()) { up = true; break; }
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            if (!up) {
+              throw new Error(`aimock (npx) not ready on port ${aimockPort} — log: ${logPath}`);
+            }
+            console.log(`[recursive-agent] aimock (npx) ready on localhost:${aimockPort} (log: ${logPath})`);
           } else {
-            aimockCmd = `docker run -d --name ${aimockContainerName} ` +
-              `-p ${aimockPort}:4010 ` +
-              `-v "${fixturesDir}:/fixtures" ` +
-              `ghcr.io/copilotkit/aimock -f /fixtures -h 0.0.0.0`;
-            console.log('[recursive-agent] aimock starting in REPLAY mode (host, port-mapped)');
+            console.log(`[recursive-agent] aimock already running on localhost:${aimockPort}`);
           }
-          execSync(aimockCmd, { stdio: 'pipe' });
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          console.log(`[recursive-agent] aimock container started on localhost:${aimockPort} (${aimockContainerName})`);
         } else {
-          console.log(`[recursive-agent] aimock already running (${aimockContainerName})`);
+          const running = execSync(`docker ps --filter "name=^/${aimockContainerName}$" --format "{{.Names}}"`, { encoding: 'utf-8' }).trim();
+          if (!running.includes(aimockContainerName)) {
+            let aimockCmd: string;
+            if (recordMode && apiKey) {
+              execSync(`mkdir -p "${recordedDir}"`);
+              aimockCmd = `docker run -d --name ${aimockContainerName} ` +
+                `-p ${aimockPort}:4010 ` +
+                `-v "${fixturesDir}:/fixtures" ` +
+                `-e "OPENAI_API_KEY=${apiKey}" ` +
+                `ghcr.io/copilotkit/aimock ` +
+                `--record --provider-openai ${realApiBase} ` +
+                `-f /fixtures/recorded -f /fixtures -h 0.0.0.0`;
+              console.log('[recursive-agent] aimock starting in RECORD mode (host, port-mapped)');
+            } else {
+              aimockCmd = `docker run -d --name ${aimockContainerName} ` +
+                `-p ${aimockPort}:4010 ` +
+                `-v "${fixturesDir}:/fixtures" ` +
+                `ghcr.io/copilotkit/aimock -f /fixtures -h 0.0.0.0`;
+              console.log('[recursive-agent] aimock starting in REPLAY mode (host, port-mapped)');
+            }
+            execSync(aimockCmd, { stdio: 'pipe' });
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            console.log(`[recursive-agent] aimock container started on localhost:${aimockPort} (${aimockContainerName})`);
+          } else {
+            console.log(`[recursive-agent] aimock already running (${aimockContainerName})`);
+          }
         }
       } catch (e) {
         console.warn(`[recursive-agent] aimock auto-start failed: ${(e as Error).message}`);

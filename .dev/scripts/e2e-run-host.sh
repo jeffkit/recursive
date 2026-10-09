@@ -52,6 +52,12 @@ export RECURSIVE_RATE_LIMIT_RPM=6000
 # in exec commands, so YAML suites with container paths work on host.
 WORKSPACE_DIR=$(mktemp -d /tmp/e2e-host-ws-XXXXXX)
 export E2E_WORKSPACE_DIR="$WORKSPACE_DIR"
+# ── aimock 引擎 ──
+# docker（默认，既有行为）| npx：E2E_AIMOCK_ENGINE=npx 时插件以原生进程起
+# aimock（@copilotkit/aimock 的 llmock bin），整个 host 模式零 Docker —— CI
+# 无 Docker 形态用这个。PID 文件供 cleanup 按进程组收割 npx spawn 的服务。
+export E2E_AIMOCK_ENGINE="${E2E_AIMOCK_ENGINE:-docker}"
+export E2E_AIMOCK_PID_FILE="$WORKSPACE_DIR/aimock.pid"
 # recursive binary 在 PATH 上（用主仓的 release 产物）
 export PATH="$REPO_ROOT/target/release:$PATH"
 
@@ -121,6 +127,13 @@ cp "$HOST_E2E_YAML" "$HOST_E2E_PROJECT/e2e.yaml"
 AIMOCK_NAME="${WORKTREE_ID}-aimock"
 cleanup() {
   local rc=$?
+  # npx 引擎：插件 detached spawn 的 aimock 是独立进程组，按 PID 文件整组收割。
+  if [[ -n "${E2E_AIMOCK_PID_FILE:-}" && -f "$E2E_AIMOCK_PID_FILE" ]]; then
+    AIMOCK_PGID=$(cat "$E2E_AIMOCK_PID_FILE" 2>/dev/null || true)
+    if [[ -n "$AIMOCK_PGID" ]]; then
+      kill -- "-$AIMOCK_PGID" >/dev/null 2>&1 || true
+    fi
+  fi
   docker rm -f "$AIMOCK_NAME" >/dev/null 2>&1 || true
   # Drop the WORKTREE_ID-scoped network this run created. Leftover
   # argusai-* networks accumulate and exhaust Docker's subnet pool
