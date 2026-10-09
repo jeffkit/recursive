@@ -1,228 +1,80 @@
 #!/usr/bin/env python3
-"""self-improve v2 编译产物的**正典生产者**（#84 拍板）。
+"""self-improve plaita flow 编译入口（v2 / v2-sbx 薄壳）。
 
-背景：产物曾有两个生产者——in-repo 脚本（`Flow.model_dump(by_alias=True)`，
-snake_case 全量展开）与 console 发布链（画布 `flowToJson` 形态：`type` 首键、
-null 剔除、簿记默认值剥离、`inputType`/`resultType`/`childFlow` camel 别名键、
-source_line/行注解为源文件绝对行号）。两种格式 parse 互载等价，但每次产物
-同步都是 ~3000 行格式翻转 diff，审查不可读（9165b9a0 警告的就是这个）。
+#84 拍板的「正典生产者」职责不变：产物 = console 发布 definition 形态
+（canonical），字节稳定，``--check`` 供 CI 钉「产物落后源码」。
+**实现自 2026-10-09 起上收 plaita**（``plaita.dsl.codeflow.to_canonical`` +
+``python -m plaita build``），本脚本只做三件事：选 flow、注入大仓相邻目录、
+透传 CLI。上收后废弃的仓内机制：
 
-拍板：**正典格式 = console 发布 definition 形态**（生产运行时真相是 console
-上发布的 definition，见 keeper `engine=v2-console` 派发链）；正典生产者 =
-本脚本。`Flow.model_dump()` 的 IR 经 `_to_canonical` 转成 console 形态再落盘，
-并与 console 已发布版本逐字段核验口径一致（2026-10-03 实测：同源码同字节）。
+- model_dump 字段形状反推节点 type 的判别表——IR 自带 ``type`` 判别键
+  （gate/sandbox_agent 误判事故的根源，见 plaita _canonical 模块 docstring）；
+- CHILDFLOW_BY_NODE 行号偏移机器——源码模式编译的 source_line 本就是
+  源文件绝对行号；
+- 节点模型默认值烘进产物（如 sandbox_agent 的 ``sandbox="ags"``/
+  ``details=false``）——运行期 parse 等价回填，plaita-nodes 改默认值不再
+  引起产物漂移。
 
-字节稳定性：`json.dumps(..., indent=2, ensure_ascii=False)` 无尾随换行、
-dict 插入序固定、节点序 = IR 编译序，无时间戳/版本号等易变字段——连续两次
-重建 diff 必为空；console 侧后续发布同一源码时 definition 也应与产物一致
-（若漂移，说明 console 画布序列化规则变了，先拍板再同步，勿盲合）。
+import 期 F-scan 部署守卫（childflow 子树禁 $F 表达式，59/69 教训）不在此
+复现——它守的是「模块被 import 的所有路径」（bridge/测试 harness），编译
+产物生产走不到；模块顶部的 ``validate_flow_ir`` 调用原样保留。
 
-用法（在仓根）：
-    python3 .dev/flows/self_improve_flow_v2.py          # 等价入口（转发本脚本）
-    python3 .dev/flows/compile_v2.py                    # 编译 + 落盘 + 自检
-    python3 .dev/flows/compile_v2.py --check            # 只校验产物 = 重编译结果
+用法（recursive 仓根或本目录）：
+
+    python3 .dev/flows/compile_v2.py                 # v2 主 flow 编译落盘
+    python3 .dev/flows/compile_v2.py --check         # 只校验产物未落后
+    python3 .dev/flows/compile_v2.py --which v2-sbx  # 沙箱变体
+
+依赖：plaita 与 plaita-nodes 可 import。默认按大仓相邻目录自动注入
+sys.path（大仓根取 INFRA4AGENT_ROOT 环境变量，缺省按本仓位置上溯）。
 """
 from __future__ import annotations
 
 import argparse
-import json
-import re
+import os
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
 
-FLOW_MODULE = "self_improve_flow_v2"
-OUT = HERE / "self-improve-v2.plaita.json"
-
-# codeflow 的 IR source_line 相对「getsource 截取段」（含装饰器行）计数，
-# console 链路落盘的是源文件绝对行号：offset = 装饰器行 - 1。主/子流程各算各的。
-_LINE_ANNO_RE = re.compile(r"（第 (\d+) 行）")
-
-# bookkeeping 默认值（model_dump 展开产物）——console 形态一律不落这些键
-_DEFAULT_KEYS = ("timeout", "timeout_handler", "error_handler",
-                 "upstream_output", "branches", "output_type",
-                 "sandbox_backend", "max_retries", "dry_run")
-# engine 内部实现细节（非画布字段），console 形态同样剥离
-_HANDLER_DEFAULT = {"strategy": "abort", "defaultValue": None, "code": -9527}
-
-
-def _deco_line(func) -> int:
-    """装饰器所在源文件行号（getsource 从装饰器行起算，见 codeflow _source.py）。
-
-    即 offset 本身：IR 行号（相对 getsource 段）+ offset = 源文件绝对行号。
-    """
-    import inspect
-    src_first = inspect.getsource(func).splitlines()[0]
-    start = func.__code__.co_firstlineno
-    if src_first.lstrip().startswith("def "):
-        return start  # 无装饰器（理论上 @flow 不会走到）
-    return start - 1
-
-
-def _bump_lines(v, off: int):
-    """把 desc/name 里的「（第 N 行）」行注解加偏移；跳过 childFlow 子树。"""
-    if isinstance(v, str):
-        return _LINE_ANNO_RE.sub(lambda m: f"（第 {int(m.group(1)) + off} 行）", v)
-    if isinstance(v, dict):
-        return {k: (x if k == "childFlow" else _bump_lines(x, off))
-                for k, x in v.items()}
-    if isinstance(v, list):
-        return [_bump_lines(x, off) for x in v]
-    return v
-
-
-def _node_type(n: dict) -> str:
-    """从 model_dump 的字段形状反推 console 的 `type` 判别键（model_dump 不含它）。"""
-    ks = set(n) - {"id", "name", "desc", "output", "next", "timeout",
-                   "source_line", "timeout_handler", "error_handler"}
-    if n.get("id") == "start" and not ks:
-        return "start"
-    table = [
-        ("condition" in ks and "branches" in ks, "if"),
-        ("code" in ks and "language" in ks, "code"),
-        ("child_flow" in ks, "child"),
-        ("error" in ks and "result_type" in ks, "end"),
-        # ⚠️ 判别键顺序即优先级：gate 的 (command, gate_name) **必须**排在
-        # sandbox 规则之前——GATE 节点自 2026-10-07 起也可带 sandbox 字段
-        # （门禁下沉沙箱），否则会被误判成 sandbox_agent（实测：子流程里的
-        # gate 节点在产物里变成 sandbox_agent，门禁静默退化成宿主执行）。
-        ("command" in ks and "gate_name" in ks, "gate"),
-        ("path" in ks and "content" in ks, "writefile"),
-        ("base_branch" in ks, "git_publish"),
-        # sandbox_agent 与 agentrun 同带 agent 字段：靠 sandbox/ws_key 判别键
-        # 先行区分（沙箱变体 flow 的 type 归属）
-        ("sandbox" in ks or "ws_key" in ks, "sandbox_agent"),
-        ("agent" in ks, "agentrun"),
-        ("upstream_output" in ks, "assignment"),
-    ]
-    for hit, t in table:
-        if hit:
-            return t
-    raise ValueError(f"无法判定节点类型: {n.get('id')}: {sorted(n.keys())}")
-
-
-# console 形态的键序（flowToJson 落盘观感；JSON 语义无序，这里只为 diff 可读）
-_KEY_ORDER = {
-    "start": ("next",),
-    "assignment": ("output", "next", "name", "desc", "source_line"),
-    "code": ("language", "code", "input", "next", "source_line"),
-    "if": ("condition", "name", "desc", "source_line", "next", "else_next"),
-    "agentrun": ("agent", "prompt", "repo", "timeout_secs", "session",
-                 "next", "source_line"),
-    "sandbox_agent": ("agent", "prompt", "repo", "sandbox", "ws_key",
-                      "timeout_secs", "session", "details", "next", "source_line"),
-    "child": ("input", "childFlow", "next", "source_line"),
-    "git_publish": ("worktree_dir", "branch_name", "commit_message",
-                    "merge_mode", "main_clone", "base_branch",
-                    "next", "source_line"),
-    "writefile": ("path", "content", "next", "source_line"),
-    "end": ("output", "resultType", "name", "desc", "source_line"),
-    "gate": ("command", "gate_name", "cwd", "sandbox", "ws_key",
-             "timeout_secs", "max_retries", "dry_run", "next", "source_line"),
+# 短名 → (源码, 产物)。产物路径即 console 发布 definition 的仓内正典来源。
+# v1（self-improve.plaita.json）已退役（2026-10-01 拍板），其产物是带弃用
+# 声明的取证记录，**不重建**——故不在本表。
+FLOWS: dict[str, tuple[str, str]] = {
+    "v2": ("self_improve_flow_v2.py", "self-improve-v2.plaita.json"),
+    "v2-sbx": ("self_improve_flow_v2_sbx.py", "self-improve-flow-v2-sbx.plaita.json"),
 }
 
 
-def _to_canonical(n: dict, off: int, sub_offs: dict[str, int]) -> dict:
-    t = _node_type(n)
-    body: dict = {}
-    for k, v in n.items():
-        if k == "id" or k in _DEFAULT_KEYS:
-            continue
-        if v is None:
-            continue
-        body[k] = v
-    if "source_line" in body:
-        body["source_line"] += off
-    if t == "end":
-        body["resultType"] = body.pop("result_type")
-    if t == "child":
-        cf = body.pop("child_flow")
-        sub_off = sub_offs.get(n["id"], off)
-        body["childFlow"] = {
-            "runtime": "python",
-            "nodes": [_to_canonical(x, sub_off, sub_offs) for x in cf["nodes"]],
-            "inputType": {"dataType": "object"},
-        }
-    body = _bump_lines(body, off)
-    out = {"type": t, "id": n["id"]}
-    for k in _KEY_ORDER[t]:
-        if k in body:
-            out[k] = body[k]
-    return out
+def _bootstrap_syspath() -> None:
+    """把大仓相邻的 plaita / plaita-nodes/src 注入 sys.path（显式注册，
+    不依赖 pip dist-info entry-points 的新鲜度）。"""
+    root = os.environ.get("INFRA4AGENT_ROOT") or str(
+        HERE.parent.parent.parent)  # .dev/flows → recursive → 大仓根
+    for rel in ("plaita", "plaita-nodes/src"):
+        p = str(Path(root) / rel)
+        if Path(p).is_dir() and p not in sys.path:
+            sys.path.insert(0, p)
 
 
-def canonical_ir(module: str = FLOW_MODULE, flow_attr: str = "self_improve_v2") -> dict:
-    """编译 self_improve_flow_v2 并产出 console 形态 IR dict（不落盘）。"""
-    import importlib
-    mod = importlib.import_module(module)
-    flow_obj = getattr(mod, flow_attr)
-    md = flow_obj.model_dump(by_alias=True, mode="json")
-
-    root_off = _deco_line(flow_obj.__wrapped__)
-    # 子流程 offset 按引用它的 CHILD 节点 id 映射到 @childflow 装饰器行。
-    # 只认 _ChildFlowMarker——DSL 的 _Placeholder（CHILD/F/NODE…）也有 _func
-    # 属性但不可 unwrap。
-    from plaita.dsl.codeflow._common import _ChildFlowMarker
-    marker_off = {}
-    for name in dir(mod):
-        obj = getattr(mod, name)
-        if not isinstance(obj, _ChildFlowMarker):
-            continue
-        marker_off[name] = _deco_line(obj._func)
-    childfn_by_node = getattr(mod, "CHILDFLOW_BY_NODE", {})
-    sub_offs = {nid: marker_off[fname] for nid, fname in childfn_by_node.items()}
-
-    return {
-        "runtime": "python",
-        "flow_id": md["flow_id"],
-        "inputType": {"dataType": "object"},
-        "desc": md["desc"],
-        "nodes": [_to_canonical(n, root_off, sub_offs) for n in md["nodes"]],
-    }
-
-
-def serialize(doc: dict) -> str:
-    return json.dumps(doc, ensure_ascii=False, indent=2)
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="self-improve plaita flow 编译（plaita CLI 薄壳）")
+    ap.add_argument("--which", choices=sorted(FLOWS), default="v2",
+                    help="编哪个 flow（默认 v2 主 flow）")
     ap.add_argument("--check", action="store_true",
                     help="不落盘；校验现有产物与重编译结果逐字节一致")
-    ap.add_argument("--module", default=FLOW_MODULE,
-                    help="flow 源模块名（默认 v2；沙箱变体传 self_improve_flow_v2_sbx）")
-    ap.add_argument("--flow-attr", default="self_improve_v2",
-                    help="模块内 @flow 函数名（默认 self_improve_v2）")
-    ap.add_argument("--out", default="",
-                    help="产物路径（默认随模块名：v2-sbx 落 self-improve-v2-sbx.plaita.json）")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    out_path = Path(args.out) if args.out else (
-        OUT if args.module == FLOW_MODULE else HERE / f"{args.module.replace('_', '-')}.plaita.json")
-    text = serialize(canonical_ir(args.module, args.flow_attr))
+    _bootstrap_syspath()
+    from plaita.cli import main as plaita_main
+
+    src, out = FLOWS[args.which]
+    cmd = ["build", str(HERE / src), "-o", str(HERE / out),
+           "--register", "plaita_nodes", "--code-backend", "subprocess"]
     if args.check:
-        current = out_path.read_text(encoding="utf-8")
-        if current != text:
-            import difflib
-            diff = list(difflib.unified_diff(
-                current.splitlines(), text.splitlines(),
-                "committed-artifact", "recompiled", lineterm=""))
-            sys.stderr.write("\n".join(diff[:80]) +
-                             f"\n… ({len(diff)} diff lines) 产物落后源码，"
-                             f"重跑 python3 {FLOW_MODULE}.py 同步\n")
-            return 1
-        print(f"OK {out_path.name} 与源码逐字节一致（{len(text)} bytes）")
-        return 0
-
-    out_path.write_text(text, encoding="utf-8")
-    doc = json.loads(text)
-    n_top = len(doc["nodes"])
-    n_sub = sum(len(n.get("childFlow", {}).get("nodes", []))
-                for n in doc["nodes"] if "childFlow" in n)
-    print(f"compiled -> {out_path} ({n_top} top + {n_sub} subflow nodes, {len(text)} bytes)")
-    return 0
+        cmd.append("--check")
+    return plaita_main(cmd)
 
 
 if __name__ == "__main__":

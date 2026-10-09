@@ -488,14 +488,20 @@ Operational notes:
   returns). `console_zombie_secs` eventually reaps the orphan; the durable
   fix (anchor-first + client-supplied execution_id) is deferred to the G5/G6
   protocol owners.
-- **Compiled artifact (canonical producer, #84 decision 2026-10-03)**:
+- **Compiled artifact (canonical producer, #84 decision 2026-10-03;
+  implementation moved into plaita 2026-10-09)**:
   `.dev/flows/compile_v2.py` is THE producer of
-  `self-improve-v2.plaita.json`. It serializes the compiled IR in the
-  console-publish definition shape (`type` first key, nulls dropped,
-  bookkeeping defaults stripped, `inputType`/`resultType`/`childFlow` alias
-  keys, `source_line` as absolute source-file line numbers) — the same shape
-  the published console version carries, so artifact diffs are semantic
-  only. Never hand-edit the JSON and never regenerate it with a bare
+  `self-improve-v2.plaita.json` — a thin shell that delegates to
+  `python -m plaita build` (`plaita.dsl.codeflow.to_canonical`). It
+  serializes the compiled IR in the console-publish definition shape
+  (`type` first key, nulls dropped, `inputType`/`resultType`/`childFlow`
+  alias keys, `source_line` as absolute source-file line numbers —
+  source-string compilation makes them absolute natively). Since the
+  plaita-side rewrite, the artifact records only fields the source
+  explicitly declares: node-model defaults (e.g. sandbox_agent's
+  `sandbox="ags"`) are no longer baked in — runtime parse refills them,
+  so plaita-nodes default changes no longer churn artifacts. Never
+  hand-edit the JSON and never regenerate it with a bare
   `Flow.model_dump()` (snake_case full expansion) — that flips every sync
   back into a 3000-line format diff.
 

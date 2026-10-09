@@ -109,10 +109,8 @@
       "agent": "$NODE.agent",
       "prompt": "$NODE.goal",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": "$NODE.impl_timeout",
       "session": "$NODE.pre.last_sid",
-      "details": false,
       "next": "chg",
       "source_line": 425
     },
@@ -436,9 +434,7 @@
       "agent": "$NODE.reviewer",
       "prompt": "$NODE.review_prompt",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 5400,
-      "details": false,
       "next": "contains_text_verdict_pa",
       "source_line": 561
     },
@@ -613,9 +609,7 @@
       "agent": "$NODE.agent",
       "prompt": "$F.concat(\"The git rebase onto origin/main stopped with merge conflicts. Resolve them in place so the rebase can finish, without changing behaviour on either side: keep both the upstream change and the local change of this branch, drop nothing, and do not weaken the change under review. Inspect the conflicting files in the report below, edit out every conflict marker, then run `git add -A` followed by `GIT_EDITOR=true git rebase --continue` until the rebase completes with exit code 0 and `git status` is clean. Do not abort the rebase, do not create a merge commit, and do not re-run the quality gates.\\n\\n--- rebase conflict report ---\\n\", $NODE.land_rebase.scene)",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 7200,
-      "details": false,
       "next": "land_rebase2",
       "source_line": 697
     },
@@ -1309,9 +1303,7 @@
       "agent": "$NODE.agent",
       "prompt": "$NODE.fix_prompt",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 7200,
-      "details": false,
       "next": "rev2",
       "source_line": 573
     },
@@ -1321,9 +1313,7 @@
       "agent": "$NODE.reviewer",
       "prompt": "$NODE.review_prompt",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 5400,
-      "details": false,
       "next": "contains_text_verdict_pa_2",
       "source_line": 574
     },
@@ -1354,9 +1344,7 @@
       "agent": "$NODE.agent",
       "prompt": "$NODE.fix_prompt2",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 7200,
-      "details": false,
       "next": "rev3",
       "source_line": 585
     },
@@ -1366,9 +1354,7 @@
       "agent": "$NODE.reviewer",
       "prompt": "$NODE.review_prompt",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 5400,
-      "details": false,
       "next": "contains_text_verdict_pa_3",
       "source_line": 587
     },
@@ -1434,9 +1420,7 @@
       "agent": "$NODE.agent",
       "prompt": "$F.concat(\"The cargo test check failed. Edit the source files to fix every failing test below, then re-run `cargo test --workspace` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- stdout ---\\n\", $NODE.g3.out, \"\\n--- stderr ---\\n\", $NODE.g3.err)",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 7200,
-      "details": false,
       "next": "g3b",
       "source_line": 501
     },
@@ -1543,9 +1527,7 @@
       "agent": "$NODE.agent",
       "prompt": "$F.concat(\"The clippy check failed. Edit the source files to fix every error below, then re-run `cargo clippy --workspace --all-targets --all-features -- -D warnings` yourself to verify before stopping.\\nFix the source, never silence with #[allow].\\n--- stdout ---\\n\", $NODE.g2.out, \"\\n--- stderr ---\\n\", $NODE.g2.err)",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 7200,
-      "details": false,
       "next": "g2b",
       "source_line": 483
     },
@@ -1652,9 +1634,7 @@
       "agent": "$NODE.agent",
       "prompt": "$F.concat(\"Quality gates failed. Fix the source so every failing gate passes, then re-run the gate command below yourself to verify before stopping.\\nFix the source, never silence or weaken checks.\\nGate command: \", $NODE.gates.fmt, \"\\n--- stdout ---\\n\", $NODE.g1.out, \"\\n--- stderr ---\\n\", $NODE.g1.err)",
       "repo": "$NODE.pre.worktree",
-      "sandbox": "ags",
       "timeout_secs": 7200,
-      "details": false,
       "next": "g1b",
       "source_line": 457
     },
