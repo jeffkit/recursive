@@ -47,3 +47,18 @@
   都先 `git branch main origin/main` 再跑，否则 diff 恒空 → 门假绿。
 - schedule：`37 18 1,15 * *`（北京 2/16 日 01:37，避开整点高峰）；只在默认
   分支生效；60 天无提交自动停用。
+
+## CI 验证结果（GitHub Actions 实跑）
+
+- run 37870123519（首次 dispatch）：smoke-gate 红 exit 2 —— 根因是
+  `sh .dev/scripts/e2e-gate.sh` 在 ubuntu 上是 **dash**，脚本用了 `[[` /
+  数组 / pipefail，dash 语法错误中止。macOS 的 sh=bash 一直掩盖着这一点。
+  修复：workflow 改 `bash` 调用（3a36a738）。同 run 里 full-sweep（host
+  模式 + npx aimock）3m07s 绿——mcp2cli/HostRuntime 在 CI 上无沙箱问题。
+- run 37870730473（修复后）：**两 job 全绿**。smoke-gate 3m29s（FORCE=1
+  真跑，`✅ smoke PASS (2 scenarios, 5s)`，零 Docker）；full-sweep 3m36s。
+- run 37870127787（Mutation dispatch）：incremental 1m6s 绿（dispatch 在
+  main 上 diff 恒空，三脚本按设计自跳过；真实增量作用域由首个 PR 验证）；
+  regression job 全绿——all-features build + 全测 + clippy -D warnings +
+  fmt 在 4 核托管 runner 上 ~9 分钟。
+- 结论：E2E 与 Mutation 两条管线在 GitHub 上均已生效。
