@@ -124,8 +124,10 @@ jobs:
           RECURSIVE_E2E_LOCAL_ONLY: "1"
           # workflow_dispatch 在 main 上跑，diff 恒空 → 门会自跳过；手动触发
           # 时强制执行，让「生效验证」真的跑到 smoke。
+          # 必须用 bash：脚本用了 [[ / 数组 / pipefail，ubuntu 的 sh 是 dash
+          # （macOS 上 sh=bash 掩盖了这一点，dash 下语法错误 exit 2）。
           RECURSIVE_E2E_GATE_FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-        run: sh .dev/scripts/e2e-gate.sh
+        run: bash .dev/scripts/e2e-gate.sh
 
   full-sweep:
     name: e2e full sweep (host mode, no Docker)
