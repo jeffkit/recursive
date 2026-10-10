@@ -133,6 +133,18 @@ def _ckpt_keeps_worktree(ckpt_path: Path, run_dir: Path) -> str:
     return f"checkpoint 存活待续 (last_node={raw.get('last_node')}, run_id={raw.get('run_id')})"
 
 
+def _seg_params(args) -> dict:
+    """按段档位键 → flow params（**只放非空的**）。
+
+    与 v2_bridge 的转发键名一一对应。非空才放：让 `_refresh_identity` 的
+    「params 里出现过才刷」语义不被空值污染，也让 flow 的 `or agent` 兜底
+    在「未配置」与「配成空」两种情况行为一致。
+    """
+    return {f"{seg}_agent": v
+            for seg in ("impl", "gatefix", "fix", "landfix")
+            if (v := getattr(args, f"{seg}_agent", ""))}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
@@ -142,6 +154,14 @@ def main() -> int:
     ap.add_argument("--run-id", default=f"v2-{int(time.time())}")
     ap.add_argument("--agent", default=os.environ.get("SELF_IMPROVE_AGENT", "recursive"))
     ap.add_argument("--reviewer", default=os.environ.get("SELF_IMPROVE_REVIEWER", "recursive"))
+    # 按段档位键（2026-10-11）：默认空 = 不覆盖，由 flow 的 `or agent` 兜底。
+    # 与 issue-keeper `v2_bridge.py` 的转发键名一一对应（那边是派生式转发，
+    # 这边 argparse 必须显式声明，否则 `unrecognized arguments` 直接失败）。
+    for _seg in ("impl", "gatefix", "fix", "landfix"):
+        ap.add_argument(f"--{_seg}-agent", default="")
+    # 按段档位键（2026-10-11）：默认空 = 不覆盖，由 flow 的 `or agent` 兜底。
+    # 与 v2_bridge 的转发键名一一对应；新增分档键时**两处都要加**（转发侧是
+    # 派生式，接收侧需显式声明——argparse 不认未声明的 flag）。
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -255,6 +275,7 @@ def main() -> int:
                 handler_specs=[(StepTracker, state_path)],
                 params={"goal": goal, "repo": args.repo, "run_dir": str(run_dir),
                         "agent": args.agent, "reviewer": args.reviewer,
+                        **_seg_params(args),
                         "impl_timeout_secs": int(os.environ.get("RECURSIVE_IMPL_TIMEOUT", "7200"))},
                 issue_root=issue_root, run_dir=run_dir, state_path=state_path,
                 max_node_retries=int(os.environ.get("RECURSIVE_NODE_RETRIES", "1")),
@@ -278,6 +299,7 @@ def main() -> int:
             result = ex.execute(fl, params={
                 "goal": goal, "repo": args.repo, "run_dir": str(run_dir),
                 "agent": args.agent, "reviewer": args.reviewer,
+                **_seg_params(args),
                 "impl_timeout_secs": int(os.environ.get("RECURSIVE_IMPL_TIMEOUT", "7200")),
             })
             verdict = _verdict_of(result)
