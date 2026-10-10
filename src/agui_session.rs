@@ -21,6 +21,11 @@
 //!   timestamps, `.meta.json`, per-session `SessionLock`), so the
 //!   thread is readable by every native session consumer with zero
 //!   changes to those consumers.
+//! - **Granularity** (issue #147): the writer is opened for the whole
+//!   run ([`open_thread_writer`]) and shared with a
+//!   [`SessionPersistenceSink`](crate::session::SessionPersistenceSink),
+//!   so a row lands as the kernel appends it. Only [`finalize_run`]
+//!   (status / usage / `cost.json`) still waits for the run to end.
 //! - **Cost**: run usage lands in `.meta.json` (`cost` totals via the
 //!   writer, `cost_usd` + `cost.json` via [`crate::cost::CostTracker`]).
 //! - **Legacy threads**: pre-#57 flat `agui-<sanitized>/` directories
@@ -31,10 +36,11 @@
 //! Redis/S3 deployments work is the #56 layering follow-up.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::llm::TokenUsage;
 use crate::message::{Message, Role};
-use crate::session::{SessionMeta, SessionReader, SessionStatus, SessionWriter, UsageMeta};
+use crate::session::{SessionMeta, SessionReader, SessionStatus, SessionWriter};
 
 /// Files a pre-#57 flat AG-UI thread directory can carry. All of them
 /// move into the native session layout on migration.
@@ -112,8 +118,8 @@ pub fn legacy_session_dir(workspace: &Path, thread_id: &str) -> Option<PathBuf> 
 /// flat thread into the native layout first when one exists.
 ///
 /// The directory is not created on disk — callers that write create
-/// it (`persist_run`, checkpoint wiring); readers just get `None`
-/// -free paths and treat a missing directory as "no state".
+/// it (`open_thread_writer`, checkpoint wiring); readers just get
+/// `None`-free paths and treat a missing directory as "no state".
 pub fn resolve_session_dir(workspace: &Path, thread_id: &str) -> Option<PathBuf> {
     let dir = session_dir(workspace, thread_id)?;
     if !dir.join("transcript.jsonl").is_file() {
@@ -122,15 +128,8 @@ pub fn resolve_session_dir(workspace: &Path, thread_id: &str) -> Option<PathBuf>
     Some(dir)
 }
 
-/// One AG-UI run's persist request.
+/// One AG-UI run's finalize request (see [`finalize_run`]).
 pub struct RunRecord<'a> {
-    pub workspace: &'a Path,
-    pub thread_id: &'a str,
-    /// Messages this run added — NOT the seeded history. Appending the
-    /// seed back would duplicate the transcript on resume runs.
-    pub messages: &'a [Message],
-    /// Run goal, used when the session's `.meta.json` is first created.
-    pub goal: &'a str,
     pub model: &'a str,
     pub provider: &'a str,
     pub preset: Option<&'a str>,
@@ -148,40 +147,66 @@ pub struct RunRecord<'a> {
     pub llm_latency_ms: u64,
 }
 
-/// Append one AG-UI run to the thread's native session.
+/// Open (or create) the native session writer a thread's run appends to
+/// (issue #147).
 ///
-/// Opens (or creates) the thread's session directory and appends
-/// `messages` through [`SessionWriter`] — uuid chain, `.meta.json`
-/// bookkeeping and the per-session [`crate::session::SessionLock`]
-/// all come from the writer, so a thread is indistinguishable from a
-/// CLI session on disk. Cost: usage totals accumulate into
-/// `.meta.json`'s `cost` across runs, and a `cost.json` +
-/// `cost_usd`/`total_tokens`/... block (via
-/// [`crate::cost::CostTracker`]) is written per billed run.
+/// The handle is shared with a
+/// [`SessionPersistenceSink`](crate::session::SessionPersistenceSink) for the
+/// whole run, so every `MessageAppended` lands in the thread's
+/// `transcript.jsonl` as the kernel appends it — a host killed mid-run keeps
+/// the steps that already completed, instead of the whole run's work. The
+/// writer owns the per-session [`crate::session::SessionLock`] for that
+/// window, so the run and a concurrent `recursive resume` of the same thread
+/// cannot interleave.
 ///
-/// Returns the session directory on success.
-pub fn persist_run(record: RunRecord<'_>) -> std::io::Result<PathBuf> {
-    let dir = resolve_session_dir(record.workspace, record.thread_id)
+/// The returned handle is also what [`finalize_run`] closes the run's
+/// `.meta.json` / `cost.json` through — the same writer, so the run's status,
+/// prompts, message count and cost all describe the rows the sink wrote.
+pub fn open_thread_writer(
+    workspace: &Path,
+    thread_id: &str,
+    goal: &str,
+    model: &str,
+    provider: &str,
+    preset: Option<&str>,
+) -> std::io::Result<Arc<Mutex<SessionWriter>>> {
+    let dir = resolve_session_dir(workspace, thread_id)
         .ok_or_else(|| std::io::Error::other("cannot resolve AG-UI session directory"))?;
     std::fs::create_dir_all(&dir)?;
+    let writer = SessionWriter::open_or_create(&dir, goal, model, provider, preset)?;
+    Ok(Arc::new(Mutex::new(writer)))
+}
 
-    let mut writer = SessionWriter::open_or_create(
-        &dir,
-        record.goal,
-        record.model,
-        record.provider,
-        record.preset,
-    )?;
-    // The server may have been started with a different model than the
-    // session was created with — `.meta.json` should name the model the
-    // latest activity actually used (pricing reads it).
+/// Close out one AG-UI run in the thread's native session.
+///
+/// Takes the writer [`open_thread_writer`] handed to the run's
+/// [`SessionPersistenceSink`](crate::session::SessionPersistenceSink): the
+/// messages are already on disk (one row per completed step), so this only
+/// records what the run *as a whole* concluded — status / finish reason /
+/// error (issue #111) and a `cost.json` block via
+/// [`crate::cost::CostTracker`]. Appending the run's messages here too would
+/// duplicate every row the sink wrote.
+///
+/// `.meta.json`'s `cost` needs no call of its own: the sink attaches each
+/// assistant row's usage, and the writer accumulates those into the meta
+/// totals on `finish_with_details`. Folding `record.usage` in again would
+/// double every run's tokens.
+///
+/// The server may have been started with a different model than the session
+/// was created with — `.meta.json` should name the model the latest activity
+/// actually used (pricing reads it).
+///
+/// Returns the session directory on success.
+pub fn finalize_run(
+    writer: &Arc<Mutex<SessionWriter>>,
+    record: RunRecord<'_>,
+) -> std::io::Result<PathBuf> {
+    let mut writer = match writer.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let dir = writer.session_dir().to_path_buf();
     writer.update_identity(record.model, record.provider, record.preset);
-    for msg in record.messages {
-        writer.append(msg, None, None)?;
-    }
-    if let Some(usage) = record.usage {
-        writer.add_usage(&UsageMeta::from_token_usage(&usage));
-    }
     writer.finish_with_details(record.status, record.finish_reason, record.error)?;
 
     if let Some(usage) = record.usage {
@@ -457,17 +482,8 @@ mod tests {
         }
     }
 
-    fn record<'a>(
-        ws: &'a Path,
-        thread: &'a str,
-        msgs: &'a [Message],
-        usage: Option<TokenUsage>,
-    ) -> RunRecord<'a> {
+    fn record(usage: Option<TokenUsage>) -> RunRecord<'static> {
         RunRecord {
-            workspace: ws,
-            thread_id: thread,
-            messages: msgs,
-            goal: "first prompt",
             model: "deepseek-chat",
             provider: "deepseek",
             preset: None,
@@ -477,6 +493,35 @@ mod tests {
             usage,
             llm_latency_ms: 7,
         }
+    }
+
+    /// Drive one run's persistence the way the `/agui` driver does: open the
+    /// thread's writer, append the run's messages through it (what
+    /// `SessionPersistenceSink` does per `MessageAppended` — the run's usage
+    /// rides on its assistant rows), then finalize. Returns the thread's
+    /// session directory.
+    fn run_once(
+        ws: &Path,
+        thread: &str,
+        goal: &str,
+        msgs: &[Message],
+        usage: Option<TokenUsage>,
+    ) -> PathBuf {
+        let writer =
+            open_thread_writer(ws, thread, goal, "deepseek-chat", "deepseek", None).unwrap();
+        let usage_meta = usage
+            .as_ref()
+            .map(crate::session::UsageMeta::from_token_usage);
+        {
+            let mut w = writer.lock().unwrap();
+            for m in msgs {
+                let row_usage = (m.role == Role::Assistant)
+                    .then_some(usage_meta.as_ref())
+                    .flatten();
+                w.append_with_audit(m, None, None, row_usage, None).unwrap();
+            }
+        }
+        finalize_run(&writer, record(usage)).expect("finalize")
     }
 
     // ── thread_session_key ────────────────────────────────────────────────
@@ -508,15 +553,15 @@ mod tests {
         }
     }
 
-    // ── persist_run: native layout + visibility ──────────────────────────
+    // ── open_thread_writer + finalize_run: native layout + visibility ────
 
     #[test]
-    fn persist_run_writes_a_listable_native_session() {
+    fn a_run_writes_a_listable_native_session() {
         let ws_tmp = IsolatedWorkspace::new();
         let ws = ws_tmp.path();
 
         let msgs = vec![user_msg("hello thread"), assistant_msg("hi there")];
-        let dir = persist_run(record(ws, "thread-1", &msgs, Some(usage(100)))).expect("persist");
+        let dir = run_once(ws, "thread-1", "first prompt", &msgs, Some(usage(100)));
 
         // Documented layout: <sessions>/<slug>/agui-<hash>/
         let base = crate::paths::user_sessions_dir(ws).unwrap();
@@ -566,38 +611,38 @@ mod tests {
     }
 
     #[test]
-    fn persist_run_appends_across_runs_and_preserves_created_at() {
+    fn runs_append_and_preserve_created_at() {
         let ws_tmp = IsolatedWorkspace::new();
         let ws = ws_tmp.path();
 
         let first = vec![user_msg("run one"), assistant_msg("done one")];
-        let dir = persist_run(record(ws, "thread-2", &first, Some(usage(10)))).unwrap();
+        let dir = run_once(ws, "thread-2", "first prompt", &first, Some(usage(10)));
         let meta1 = SessionReader::load_meta(&dir).unwrap();
 
-        let second = vec![user_msg("run two")];
-        let dir2 = persist_run(record(ws, "thread-2", &second, Some(usage(20)))).unwrap();
+        let second = vec![user_msg("run two"), assistant_msg("done two")];
+        let dir2 = run_once(ws, "thread-2", "first prompt", &second, Some(usage(20)));
         assert_eq!(dir, dir2, "same thread must map to the same session dir");
 
         let meta2 = SessionReader::load_meta(&dir).unwrap();
         assert_eq!(meta2.created_at, meta1.created_at, "created_at is sticky");
         assert_eq!(
-            meta2.message_count, 3,
+            meta2.message_count, 4,
             "second run appends instead of overwriting"
         );
         let cost = meta2.cost.unwrap();
         assert_eq!(cost.total_input_tokens, 30, "cost accumulates across runs");
         // Resume-visible transcript carries both runs.
         let entries = SessionReader::load_transcript(&dir).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[2].content, "run two");
     }
 
     #[test]
-    fn persist_run_without_usage_skips_cost_but_still_lists() {
+    fn a_run_without_usage_skips_cost_but_still_lists() {
         let ws_tmp = IsolatedWorkspace::new();
         let ws = ws_tmp.path();
         let msgs = vec![user_msg("failed run")];
-        let dir = persist_run(record(ws, "thread-3", &msgs, None)).unwrap();
+        let dir = run_once(ws, "thread-3", "first prompt", &msgs, None);
         let meta = SessionReader::load_meta(&dir).unwrap();
         assert!(meta.cost.is_none());
         assert!(!dir.join("cost.json").exists());
@@ -682,7 +727,7 @@ mod tests {
         .unwrap();
 
         let msgs = vec![user_msg("after upgrade")];
-        let dir = persist_run(record(ws, "old", &msgs, None)).unwrap();
+        let dir = run_once(ws, "old", "first prompt", &msgs, None);
         let entries = SessionReader::load_transcript(&dir).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].content, "before upgrade");
@@ -720,7 +765,7 @@ mod tests {
                 is_compaction_summary: false,
             },
         ];
-        let dir = persist_run(record(ws, "resume-thread", &msgs, None)).unwrap();
+        let dir = run_once(ws, "resume-thread", "first prompt", &msgs, None);
 
         // Replaced-in-place: the deny text becomes the real payload.
         apply_resume_tool_results(

@@ -502,11 +502,14 @@ fn provider_for_request(
 ///
 /// Issue #92: per-turn transcript persistence is deliberately NOT enabled
 /// here. The session-creation sites that own a stable session id opt in with
-/// `.persist_transcript_per_turn(true)` (create / fork / cold load); AG-UI
-/// also builds through this factory but reseeds its transcript from the
-/// client-supplied `messages` on every run, so the append watermark premise
-/// ("on-disk prefix == runtime prefix") does not hold there — it stays
-/// teardown-only.
+/// `.persist_transcript_per_turn(true)` (create / fork / cold load).
+///
+/// AG-UI also builds through this factory but does not opt in: it reseeds
+/// its transcript from the thread's persisted history on every run, so the
+/// `StorageBackend` append watermark ("on-disk prefix == runtime prefix")
+/// does not describe it. Its thread's native session JSONL is written
+/// per message instead, through the `SessionPersistenceSink` the run driver
+/// installs (issue #147) — see [`super::agui::spawn_agui_run`].
 pub(super) fn build_session_runtime_parts(
     tool_registry: ToolRegistry,
     system_prompt: String,
@@ -2088,6 +2091,28 @@ pub(super) async fn send_session_message(
     // Issue #113: fold tool errors / retries / compactions into `/metrics`
     // alongside the SSE and Langfuse sinks — never instead of them.
     event_sinks.push(Box::new(super::MetricsSink::new(state.metrics.clone())));
+    // Issue #147: the session's native mirror (#121) is updated as the turn
+    // goes, not only at teardown — one row per completed step, so a host
+    // killed mid-turn keeps what already finished. Best-effort: an unwritable
+    // or resume-owned mirror directory only costs the incremental rows; the
+    // flat `StorageBackend` transcript (issue #92) is untouched and still
+    // owns cold load.
+    let mirror_writer = state.session_mirror_root.as_deref().and_then(|root| {
+        super::session_mirror::open_live_writer(
+            root,
+            &state.config.workspace,
+            &id,
+            &body.content,
+            &state.config.model,
+            &state.config.provider_type,
+            state.config.preset.as_deref(),
+        )
+    });
+    if let Some(writer) = &mirror_writer {
+        event_sinks.push(Box::new(crate::session::SessionPersistenceSink::new(
+            writer.clone(),
+        )));
+    }
     crate::observability::with_sink(&langfuse_run, &mut event_sinks);
     runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(event_sinks)));
 
@@ -2729,6 +2754,16 @@ pub(super) async fn agui_run(
         )
     })?;
 
+    // Issue #147: a thread the server has never seen is seeded from the
+    // client's own history, and the run driver writes that history into the
+    // thread's transcript before running — otherwise the next request could
+    // not drop it (`threadId` alone must be enough to continue).
+    let seed_to_persist = if prepared.seed_is_new_history {
+        prepared.seed_transcript.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let (runtime, hooks) = super::agui::build_agui_runtime(
         &state.config.workspace,
         &input.thread_id,
@@ -2775,6 +2810,7 @@ pub(super) async fn agui_run(
             permit,
             run_guard,
             active_runs: Arc::clone(&state.agui_active_runs),
+            seed_to_persist,
         },
     );
 

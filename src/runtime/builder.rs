@@ -397,12 +397,13 @@ impl AgentRuntimeBuilder {
     /// otherwise), so a host crash loses at most the in-flight turn.
     ///
     /// Default `false`: the CLI/TUI already write a per-message session JSONL
-    /// through their own sink, and the kernel must not double-write. The HTTP
-    /// REST session-creation sites opt in, because their sessions live only in
-    /// the process until teardown; AG-UI does not (it reseeds from
-    /// client-supplied messages each run, so a stored prefix never describes
-    /// its transcript). No-op when no session id is set or no storage is
-    /// injected.
+    /// through their own sink, and the kernel must not double-write. Issue
+    /// #147 extends the same treatment to `/agui`: its run driver shares the
+    /// thread's session writer with a `SessionPersistenceSink`, so this
+    /// `StorageBackend` transcript stays teardown-only there. The HTTP REST
+    /// session-creation sites opt in, because for them this transcript is the
+    /// record cold load reads and their runs happen between teardowns. No-op
+    /// when no session id is set or no storage is injected.
     pub fn persist_transcript_per_turn(mut self, enabled: bool) -> Self {
         self.persist_transcript_per_turn = enabled;
         self

@@ -17,11 +17,19 @@
 //! failure only means the session is missing from the CLI listing — never data
 //! loss, and never a teardown error.
 //!
-//! It runs at teardown only (session eviction and graceful shutdown), so a
-//! session that is still running is not yet listed by the CLI (`recursive
+//! It runs at teardown (session eviction and graceful shutdown), so a session
+//! that is still running is not yet listed by the CLI (`recursive
 //! sessions list` / `agents`); it appears once it closes. `recursive agents`
 //! therefore reports native sessions (CLI runs, resumed sessions) as `live`
 //! but cannot see a running HTTP session.
+//!
+//! Issue #147 adds the other half: [`open_live_writer`] opens the same
+//! directory for the duration of a turn so a
+//! [`SessionPersistenceSink`](crate::session::SessionPersistenceSink) can
+//! append each completed message as the kernel appends it. A host killed
+//! mid-turn then keeps the steps that already finished instead of nothing
+//! until the next teardown, and the teardown mirror still rewrites the same
+//! directory from the authoritative snapshot, so the two agree.
 //!
 //! The sessions root is **injected** ([`AppState::session_mirror_root`]), not
 //! resolved here: production pins it once at startup, and `None` disables the
@@ -31,11 +39,12 @@
 //! [`AppState::session_mirror_root`]: super::AppState::session_mirror_root
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::message::{Message, Role};
 use crate::session::{
     chrono_lite_now, workspace_slug, SessionCost, SessionLock, SessionMeta, SessionStatus,
-    TranscriptEntry, SUPPORTED_SESSION_SCHEMA_VERSION,
+    SessionWriter, TranscriptEntry, SUPPORTED_SESSION_SCHEMA_VERSION,
 };
 
 /// Everything the mirror needs from the closing session.
@@ -74,6 +83,45 @@ pub(super) fn mirror_session(root: &Path, input: &MirrorInput<'_>) {
         return;
     };
     mirror_into(&dir, input);
+}
+
+/// Open the native session directory for `id` as a live writer (issue #147).
+///
+/// [`mirror_session`] writes a closing session's transcript in one shot;
+/// this opens the very same directory for the duration of a turn so a
+/// [`SessionPersistenceSink`](crate::session::SessionPersistenceSink) can
+/// append each completed message as the kernel appends it — a host killed
+/// mid-turn then keeps the steps that already finished instead of nothing
+/// until the next teardown. The teardown mirror still runs and rewrites the
+/// same directory from the authoritative snapshot, so the two agree.
+///
+/// Both take the same [`SessionLock`], so a live `recursive resume` (or a
+/// concurrent mirror) can never be clobbered.
+///
+/// Returns `None` — never an error — when the id is not filesystem-safe or
+/// the directory is unavailable/locked: the mirror is best-effort by design,
+/// and the flat `StorageBackend` transcript stays authoritative for cold load.
+pub(super) fn open_live_writer(
+    root: &Path,
+    workspace: &Path,
+    id: &str,
+    goal: &str,
+    model: &str,
+    provider: &str,
+    preset: Option<&str>,
+) -> Option<Arc<Mutex<SessionWriter>>> {
+    let dir = native_session_dir(root, workspace, id)?;
+    match SessionWriter::open_or_create(&dir, goal, model, provider, preset) {
+        Ok(writer) => Some(Arc::new(Mutex::new(writer))),
+        Err(e) => {
+            tracing::debug!(
+                session_id = %id,
+                error = %e,
+                "session mirror: no live writer (another owner holds it?)"
+            );
+            None
+        }
+    }
 }
 
 /// Write the native `.meta.json` + `transcript.jsonl` under `dir`, overwriting
@@ -257,6 +305,61 @@ mod tests {
             "the mirror must land under the injected root"
         );
         assert!(dir.join(".meta.json").exists());
+    }
+
+    /// Issue #147: the live writer lands in the same native directory the
+    /// teardown mirror uses, so a turn's rows are already there when it closes.
+    #[test]
+    fn open_live_writer_appends_into_the_mirror_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = Path::new("/tmp/ws");
+
+        let writer = open_live_writer(
+            root.path(),
+            ws,
+            "sess-live",
+            "goal",
+            "deepseek-chat",
+            "deepseek",
+            None,
+        )
+        .expect("a safe id under a writable root opens");
+        {
+            let mut guard = writer.lock().unwrap();
+            guard
+                .append(&msg(Role::User, "live row"), None, None)
+                .unwrap();
+        }
+        drop(writer);
+
+        let dir = root.path().join(workspace_slug(ws)).join("sess-live");
+        assert!(
+            dir.join("transcript.jsonl").is_file(),
+            "the live writer must create the mirror transcript"
+        );
+        let entries = crate::session::SessionReader::load_transcript(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "live row");
+        assert!(dir.join(".meta.json").is_file(), "and the native meta");
+    }
+
+    #[test]
+    fn open_live_writer_refuses_unsafe_ids_and_live_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = Path::new("/tmp/ws");
+
+        assert!(
+            open_live_writer(root.path(), ws, "../escape", "g", "m", "p", None).is_none(),
+            "an id that resolves outside the root must never open"
+        );
+
+        // A live owner (a `recursive resume`, or a concurrent run) wins.
+        let dir = root.path().join(workspace_slug(ws)).join("sess-held");
+        let _held = SessionLock::acquire(&dir).expect("take the lock");
+        assert!(
+            open_live_writer(root.path(), ws, "sess-held", "g", "m", "p", None).is_none(),
+            "a locked mirror directory must stand the live writer down"
+        );
     }
 
     #[test]

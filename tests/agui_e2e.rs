@@ -649,6 +649,287 @@ async fn agui_run_persists_a_listable_native_session() {
     );
 }
 
+/// Drain a run's SSE stream to its terminal `RunFinished`.
+async fn drain_to_finished(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) {
+    while let Some(ev) = rx.recv().await {
+        if matches!(ev, Event::RunFinished(_)) {
+            return;
+        }
+    }
+    panic!("stream ended without RunFinished");
+}
+
+fn stop(text: &str) -> Completion {
+    Completion {
+        content: text.into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+/// Every content row of a thread's native transcript, by exact thread key.
+fn thread_transcript(workspace: &std::path::Path, thread: &str) -> Vec<(String, String)> {
+    let listed = SessionReader::list_sessions(workspace).expect("list sessions");
+    let dir = listed
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy() == recursive::agui_session::thread_session_key(thread))
+                .unwrap_or(false)
+        })
+        .expect("thread session dir")
+        .clone();
+    SessionReader::load_transcript(&dir)
+        .expect("transcript")
+        .into_iter()
+        .map(|e| (e.role, e.content))
+        .collect()
+}
+
+/// Issue #147: the thread id IS the session. Once a thread exists, the
+/// server's own transcript is the conversation of record, so a request may
+/// carry nothing but the thread id — and nothing lands on disk twice.
+#[tokio::test]
+async fn agui_thread_id_alone_continues_the_conversation() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+    let nonce = "zq7-nonce-4412";
+
+    let mock = Arc::new(MockProvider::new(vec![stop("noted"), stop("still here")]));
+    let endpoint = spawn_server(workspace.path().to_path_buf(), mock.clone()).await;
+    let client = AguiClient::new(endpoint);
+
+    // Turn 1 states the nonce.
+    let mut rx = client
+        .run(input_with(
+            "tid-thread",
+            "tid-run-1",
+            vec![user_msg("u1", nonce)],
+        ))
+        .await
+        .expect("run 1");
+    drain_to_finished(&mut rx).await;
+
+    // Turn 2 carries an empty `messages` array — legal because the thread
+    // exists, and the only way to say "keep going" without resending history.
+    let mut rx = client
+        .run(input_with("tid-thread", "tid-run-2", vec![]))
+        .await
+        .expect("an existing thread must accept an empty messages array");
+    drain_to_finished(&mut rx).await;
+
+    let calls = mock.calls();
+    assert_eq!(calls.len(), 2, "one LLM call per run");
+    let seen: Vec<&str> = calls[1].iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        seen.iter().filter(|c| c.contains(nonce)).count(),
+        1,
+        "run 2 must see turn 1 exactly once, from the server's transcript: {seen:?}"
+    );
+
+    let rows = thread_transcript(workspace.path(), "tid-thread");
+    let contents: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(
+        contents.iter().filter(|c| c.contains(nonce)).count(),
+        1,
+        "the first turn must appear exactly once on disk: {contents:?}"
+    );
+    assert!(contents.contains(&"noted"));
+    assert!(contents.contains(&"still here"));
+}
+
+/// Issue #147: a thread seeded from the client's own history writes that
+/// history down before the run — otherwise the next request (which is
+/// allowed to drop it) would silently lose the conversation.
+#[tokio::test]
+async fn agui_client_seeded_history_is_persisted_before_the_run() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+    let old_nonce = "seed-nonce-8801";
+
+    let mock = Arc::new(MockProvider::new(vec![stop("second answer")]));
+    let endpoint = spawn_server(workspace.path().to_path_buf(), mock.clone()).await;
+    let client = AguiClient::new(endpoint);
+
+    // A standard full-replay client: history (including its own earlier
+    // turns) plus the new user message that becomes this run's goal.
+    let mut rx = client
+        .run(input_with(
+            "seed-thread",
+            "seed-run-1",
+            vec![
+                user_msg("u0", old_nonce),
+                Message {
+                    id: "a0".into(),
+                    role: "assistant".into(),
+                    content: Some("first answer".into()),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                user_msg("u1", "and now?"),
+            ],
+        ))
+        .await
+        .expect("run 1");
+    drain_to_finished(&mut rx).await;
+
+    let rows = thread_transcript(workspace.path(), "seed-thread");
+    let contents: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(
+        contents.iter().filter(|c| c.contains(old_nonce)).count(),
+        1,
+        "the seeded history must be written down exactly once: {contents:?}"
+    );
+    assert!(contents.contains(&"first answer"));
+
+    // The thread's transcript is now self-sufficient: the client can drop it.
+    let mut rx = client
+        .run(input_with("seed-thread", "seed-run-2", vec![]))
+        .await
+        .expect("run 2");
+    drain_to_finished(&mut rx).await;
+
+    let calls = mock.calls();
+    let seen: Vec<&str> = calls[0].iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        seen.iter().filter(|c| c.contains(old_nonce)).count(),
+        1,
+        "run 2 must still see the seeded history: {seen:?}"
+    );
+}
+
+/// Provider that calls a tool on the first `complete()` and parks inside the
+/// second until released — so a test can look at the thread *while* the run is
+/// still in flight.
+struct MidRunProbeProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    in_second: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    notified: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl ChatProvider for MidRunProbeProvider {
+    async fn complete(
+        &self,
+        _messages: &[recursive::message::Message],
+        _tools: &[recursive::llm::ToolSpec],
+    ) -> recursive::error::Result<Completion> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(Completion {
+                content: "step one".into(),
+                tool_calls: vec![ToolCall {
+                    id: "mid-1".into(),
+                    name: "unknown_tool".into(),
+                    arguments: serde_json::json!({"probe": true}),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            });
+        }
+        self.in_second.store(true, Ordering::SeqCst);
+        self.notified.notify_waiters();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.release.load(Ordering::SeqCst) {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                self.notified.notified(),
+            )
+            .await;
+        }
+        Ok(stop("done"))
+    }
+}
+
+/// Issue #147, the point of the whole change: a run's completed steps are on
+/// disk *while the run is still in flight*, not only when it ends. The provider
+/// parks the run inside its second call, and in that window the thread's
+/// transcript must already hold the user turn, the assistant tool call and the
+/// tool result — the CLI/TUI granularity an HTTP run used to lack.
+#[tokio::test(flavor = "multi_thread")]
+async fn agui_run_writes_each_completed_step_before_the_run_ends() {
+    let _home = HomeOverride::new();
+    let workspace = tempfile::tempdir().expect("ws");
+
+    let in_second = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(Notify::new());
+    let provider = Arc::new(MidRunProbeProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        in_second: in_second.clone(),
+        release: release.clone(),
+        notified: notify.clone(),
+    });
+
+    let endpoint = spawn_server(workspace.path().to_path_buf(), provider).await;
+    let client = AguiClient::new(endpoint);
+
+    let mut rx = client
+        .run(input_with(
+            "mid-run-thread",
+            "mid-run-0",
+            vec![user_msg("u1", "kick off the run")],
+        ))
+        .await
+        .expect("run");
+
+    // The second call is the run's second step: by then the first step's rows
+    // must be committed. The sink writes on its own task, so poll rather than
+    // sample once — the run stays parked here for as long as we need.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !in_second.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run never reached its second step"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
+    }
+
+    let mut rows = thread_transcript(workspace.path(), "mid-run-thread");
+    while rows.len() < 3 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        rows = thread_transcript(workspace.path(), "mid-run-thread");
+    }
+    let contents: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|(role, content)| (role.as_str(), content.as_str()))
+        .collect();
+    assert_eq!(
+        contents.len(),
+        3,
+        "the run is parked inside its second step, so exactly the completed \
+         steps are on disk — got {contents:?}"
+    );
+    assert_eq!(contents[0], ("user", "kick off the run"));
+    assert_eq!(contents[1].0, "assistant");
+    assert_eq!(contents[2].0, "tool", "the tool result must be written too");
+
+    release.store(true, Ordering::SeqCst);
+    notify.notify_waiters();
+    drain_to_finished(&mut rx).await;
+
+    // The finished run appends its last step; nothing is written twice.
+    let rows = thread_transcript(workspace.path(), "mid-run-thread");
+    let contents: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|(role, content)| (role.as_str(), content.as_str()))
+        .collect();
+    assert_eq!(contents.len(), 4, "one row per message: {contents:?}");
+    assert_eq!(contents[3], ("assistant", "done"));
+    assert_eq!(
+        contents.iter().filter(|(_, c)| *c == "step one").count(),
+        1,
+        "no row may land twice: {contents:?}"
+    );
+}
+
 /// Provider that holds the first `complete()` call open until released —
 /// lets the test hold run #1 in flight while probing the fence.
 struct BarrierProvider {

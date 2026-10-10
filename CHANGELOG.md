@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- feat(agui): the thread id is the session, and both HTTP channels now persist
+  per message (#147). The kernel already announced every message as it was
+  appended (`AgentEvent::MessageAppended`, consumed by `SessionPersistenceSink`),
+  but only the CLI and TUI were wired to that sink: a REST turn persisted at
+  turn end (`persist_transcript_per_turn`) and an AG-UI run at run end
+  (`agui_session::persist_run`), so a host killed mid-run — OOM, SIGKILL, a
+  deploy — lost everything the run had done, including the spend. Both are now
+  wired: `/agui` opens the thread's `SessionWriter` for the whole run
+  (`agui_session::open_thread_writer`) and shares it with the sink, and a REST
+  turn appends into the session's native mirror (#121) as it goes, so the crash
+  window drops from a whole run to a single message. The AG-UI run is closed
+  through that same writer (`agui_session::finalize_run`: status, finish reason,
+  error, `cost.json`) instead of re-appending the transcript — one writer, one
+  row per message. "The thread id is the session" then follows: a thread the
+  server has already persisted is its own conversation of record, so a request's
+  `messages` only supply this turn's prompt and `messages: []` is legal (a
+  neutral continuation directive becomes the goal); a thread the server has
+  never seen keeps the full-history seeding standard clients rely on, and that
+  history is written down before the run so a later request may drop it.
+  Documented cost: a client-side rewrite/trim of the history no longer takes
+  effect — the server holds the history. Seeding also repairs a tail an
+  interrupted host left unpaired (an assistant `tool_calls` with no result is an
+  HTTP 400, invariant #8) with the same marker `recursive resume
+  --orphans=skip` writes, so a crash cannot brick a thread. No new dependency.
 - feat(eval): a preset benchmark harness (#129) — the standing "minimal vs
   standard" comparison that turns preset gains into numbers. A fixed task set
   of 10 tasks (two per shape: single-file read-modify-write, multi-file

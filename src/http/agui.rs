@@ -8,6 +8,12 @@
 //! finished run onto AG-UI events (transcript persistence, interrupt
 //! bookkeeping, checkpoint / RunFinished emission).
 //!
+//! The thread id is the session id (issue #147): an existing thread's
+//! persisted transcript is the conversation, so a request only has to name
+//! the thread — and every message the run appends is written to that
+//! transcript as it happens, through the same `SessionPersistenceSink` the
+//! CLI and TUI run on.
+//!
 //! The only axum-aware piece is [`super::handlers::agui_run`], which parses
 //! the JSON body, maps admission/prepare errors onto status codes, and
 //! frames the returned event stream as SSE. Everything below is
@@ -501,9 +507,16 @@ pub(crate) struct AguiRunInput<'a> {
 pub(crate) struct PreparedAguiRun {
     /// The goal (last user message, resume directive, or context fallback).
     pub goal: String,
-    /// Transcript seed: resume-modified history or the client-resent
-    /// `messages` history. `None` for a bare first turn.
+    /// Transcript seed: resume-modified history, the thread's persisted
+    /// transcript, or the client-supplied `messages` history of a thread
+    /// that does not exist yet. `None` for a bare first turn.
     pub seed_transcript: Option<Vec<crate::message::Message>>,
+    /// Issue #147: `true` when `seed_transcript` is the client's own history
+    /// for a thread the server has never seen. Then it *is* the conversation
+    /// of record and is written to the thread's transcript before the run —
+    /// otherwise a later request that omits the history (the whole point of
+    /// "the thread id is the session") would silently lose it.
+    pub seed_is_new_history: bool,
 }
 
 /// Typed error for the prepare phase. The HTTP adapter maps these onto
@@ -524,6 +537,98 @@ pub(crate) enum PrepareAguiError {
 /// model re-issue the same tool call).
 pub(crate) const RESUME_GOAL_DIRECTIVE: &str =
     "[frontend tool result received] 客户端工具结果已注入对话，请基于该结果继续回答用户最初的问题。";
+
+/// The neutral turn directive for a request whose `messages` array is empty
+/// on a thread that already exists (issue #147).
+///
+/// "The thread id is the session" means the request no longer has to carry
+/// the history — but a run still needs a user turn, so an empty `messages`
+/// array asks the model to carry on from the persisted transcript rather
+/// than re-stating a prompt the server already has.
+pub(crate) const CONTINUE_GOAL_DIRECTIVE: &str =
+    "[no new message] 客户端未提供新的用户消息，请基于已有对话继续推进用户的目标。";
+
+/// Load a thread's persisted transcript as the seed for its next run
+/// (issue #147).
+///
+/// The runtime assembles its own system prompt, so a stored system message
+/// (a pre-#147 teardown snapshot carries one) is dropped rather than seeded
+/// twice. A leading orphan tool result is dropped too: it must answer an
+/// assistant `tool_calls` that is no longer in the transcript, and an
+/// unpaired Tool message violates invariant #8 (HTTP 400 from the provider).
+///
+/// A *trailing* orphan — the assistant `tool_calls` a host killed mid-tool-call
+/// never got a result for — is answered instead of dropped (see
+/// [`unanswered_tool_calls`]): the row is real history, and the provider
+/// rejects an unanswered call, which without the repair would brick the thread
+/// for every later run. A missing or unreadable transcript yields an empty
+/// seed.
+fn load_thread_seed(session_dir: &Path) -> Vec<crate::message::Message> {
+    let Ok(content) = std::fs::read_to_string(session_dir.join("transcript.jsonl")) else {
+        return Vec::new();
+    };
+    let mut msgs: Vec<crate::message::Message> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if msgs
+        .first()
+        .is_some_and(|m| m.role == crate::message::Role::System)
+    {
+        msgs.remove(0);
+    }
+    match msgs
+        .iter()
+        .position(|m| m.role != crate::message::Role::Tool)
+    {
+        Some(0) => {}
+        Some(n) => {
+            msgs.drain(..n);
+        }
+        None => msgs.clear(),
+    }
+    let unanswered = unanswered_tool_calls(&msgs);
+    crate::session::splice_orphan_results(msgs, &unanswered)
+}
+
+/// The `(tool_call_id, result)` answers for a seed's unpaired tool calls, which
+/// [`load_thread_seed`] splices in.
+///
+/// Same detection rule as
+/// [`crate::session::scan_orphan_tool_calls_in_messages`] — only the last
+/// assistant row carrying `tool_calls` is examined, and a call is unpaired when
+/// no later `tool` row answers its id — minus the registry, which that scanner
+/// only needs to classify a side effect the skip answer never uses.
+///
+/// The answer is [the skip marker](crate::session::ORPHAN_SKIPPED_RESULT),
+/// exactly what `recursive resume --orphans=skip` writes: a server-driven run
+/// has no user to ask, and re-running an arbitrary tool call is not something a
+/// retry may decide on its own.
+fn unanswered_tool_calls(msgs: &[crate::message::Message]) -> Vec<(String, String)> {
+    let Some(asst_idx) = msgs
+        .iter()
+        .rposition(|m| m.role == crate::message::Role::Assistant && !m.tool_calls.is_empty())
+    else {
+        return Vec::new();
+    };
+    let answered: std::collections::HashSet<&str> = msgs[asst_idx..]
+        .iter()
+        .filter(|m| m.role == crate::message::Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    msgs[asst_idx]
+        .tool_calls
+        .iter()
+        .filter(|tc| !answered.contains(tc.id.as_str()))
+        .map(|tc| {
+            (
+                tc.id.clone(),
+                crate::session::ORPHAN_SKIPPED_RESULT.to_string(),
+            )
+        })
+        .collect()
+}
 
 /// Map AG-UI `input.messages` into a seed transcript for a NON-resume run.
 ///
@@ -566,9 +671,18 @@ pub(crate) fn prepare_run(
     // resolutions before building the runtime.
     let resume_items: Vec<ag::Resume> = input.resume.clone().unwrap_or_default();
 
+    // Issue #147: the thread id IS the session id — a thread with a
+    // persisted transcript is an existing conversation, and the transcript
+    // on disk (not whatever the client resent) is its content of record.
+    let session_dir = agui_session_dir(workspace, &input.thread_id);
+    let thread_exists = session_dir
+        .as_ref()
+        .is_some_and(|dir| dir.join("transcript.jsonl").is_file());
+
     // Derive the user goal: prefer the last user message, else fall back
-    // to the first context item value. Resume turns use a neutral
-    // continuation directive (see RESUME_GOAL_DIRECTIVE).
+    // to the first context item value, else — for an existing thread — a
+    // neutral continuation directive. Resume turns use their own directive
+    // (see RESUME_GOAL_DIRECTIVE).
     let goal = if resume_items.is_empty() {
         input
             .messages
@@ -578,6 +692,7 @@ pub(crate) fn prepare_run(
             .and_then(|m| m.content.clone())
             .or_else(|| input.context.first().map(|c| c.value.clone()))
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| thread_exists.then(|| CONTINUE_GOAL_DIRECTIVE.to_string()))
             .ok_or_else(|| {
                 PrepareAguiError::BadRequest(
                     "RunAgentInput must contain at least one user \
@@ -594,14 +709,31 @@ pub(crate) fn prepare_run(
         // interrupts and no resume is provided, reject. Runs BEFORE any
         // early return — the conflict applies no matter what history the
         // client re-sent.
-        if let Some(session_dir) = agui_session_dir(workspace, &input.thread_id) {
-            let open = load_open_interrupts(&session_dir);
+        if let Some(dir) = &session_dir {
+            let open = load_open_interrupts(dir);
             if !open.is_empty() {
                 return Err(PrepareAguiError::InterruptBeforeConflict {
                     thread_id: input.thread_id.clone(),
                     open: open.len(),
                 });
             }
+        }
+        // Issue #147: an existing thread keeps its own history. The
+        // request's `messages` only supply this turn's prompt (the goal
+        // above) — so a business backend can send `messages: []` (or just
+        // the new user turn) and the conversation still continues. The
+        // documented cost: a client-side rewrite/trim of the history no
+        // longer takes effect; the server holds it.
+        if thread_exists {
+            let seed = session_dir
+                .as_deref()
+                .map(load_thread_seed)
+                .unwrap_or_default();
+            return Ok(PreparedAguiRun {
+                goal,
+                seed_transcript: (!seed.is_empty()).then_some(seed),
+                seed_is_new_history: false,
+            });
         }
         // Issue #62: standard AG-UI clients resend the FULL `messages`
         // array every turn and expect the agent to see the whole history.
@@ -626,16 +758,18 @@ pub(crate) fn prepare_run(
             return Ok(PreparedAguiRun {
                 goal,
                 seed_transcript: None,
+                seed_is_new_history: false,
             });
         }
         return Ok(PreparedAguiRun {
             goal,
             seed_transcript: Some(seeded),
+            seed_is_new_history: true,
         });
     }
 
     // ── Resume handling ────────────────────────────────────────────────
-    let session_dir = agui_session_dir(workspace, &input.thread_id).ok_or_else(|| {
+    let session_dir = session_dir.ok_or_else(|| {
         PrepareAguiError::Internal("cannot resolve session directory for resume".into())
     })?;
 
@@ -766,6 +900,9 @@ pub(crate) fn prepare_run(
     Ok(PreparedAguiRun {
         goal,
         seed_transcript: Some(modified),
+        // The resume history is already on disk (it was just read from
+        // there) — re-writing it would duplicate every row.
+        seed_is_new_history: false,
     })
 }
 
@@ -974,6 +1111,11 @@ pub(crate) struct AguiRunContext {
     /// Issue #66: the AppState-level cancel registry (thread id → token).
     /// Borrowed only to insert/remove this run's own entry.
     pub active_runs: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Issue #147: the client's history to write into a thread the server
+    /// has never seen before the run starts (see
+    /// [`PreparedAguiRun::seed_is_new_history`]). Empty on every other path —
+    /// a resumed or already-existing thread's history is on disk already.
+    pub seed_to_persist: Vec<crate::message::Message>,
 }
 
 /// Spawn the AG-UI run driver.
@@ -1009,8 +1151,50 @@ pub(crate) fn spawn_agui_run(
         permit,
         run_guard,
         active_runs,
+        seed_to_persist,
     } = ctx;
     let (sse_tx, sse_rx) = mpsc::unbounded_channel::<ag::Event>();
+
+    // Issue #147: hold the thread's session writer for the whole run and let
+    // a `SessionPersistenceSink` write every `MessageAppended` row as the
+    // kernel appends it. The crash window for an AG-UI run drops from the
+    // whole run to one message. Best-effort: a thread a live `recursive
+    // resume` owns (or an unwritable session dir) only costs the incremental
+    // rows, never the run.
+    let writer = crate::agui_session::open_thread_writer(
+        &workspace,
+        &thread_id,
+        &goal,
+        &model,
+        &provider,
+        preset.as_deref(),
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            thread_id = %thread_id,
+            error = %e,
+            "agui: cannot open the thread's session writer; this run will not be persisted"
+        );
+        e
+    })
+    .ok();
+
+    // A thread the server had never seen starts from the client's own
+    // history — write it down first, so the thread id alone can continue the
+    // conversation from here on (and so the persisted transcript matches what
+    // the standard full-replay client already saw). The runtime's own rows
+    // follow through the sink.
+    if let Some(writer) = &writer {
+        if !seed_to_persist.is_empty() {
+            let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+            for msg in &seed_to_persist {
+                if let Err(e) = guard.append(msg, None, None) {
+                    tracing::warn!("agui: failed to persist the thread's history: {e}");
+                    break;
+                }
+            }
+        }
+    }
 
     // Issue #66 §3.3: install the per-run cancellation token on the
     // runtime (the kernel checks it between steps and mid-LLM-call) and
@@ -1036,10 +1220,19 @@ pub(crate) fn spawn_agui_run(
     // Issue #113: the AG-UI channel sink fans out to the metrics sink too, so
     // an AG-UI run's tool errors / retries / compactions reach `/metrics` the
     // same way a session run's do.
-    let sinks: Vec<Box<dyn crate::event::EventSink>> = vec![
+    let mut sinks: Vec<Box<dyn crate::event::EventSink>> = vec![
         Box::new(sink),
         Box::new(super::MetricsSink::new(metrics.clone())),
     ];
+    // Issue #147: message-granular persistence into the thread's native
+    // session — the same sink the CLI and TUI run on. It is the ONLY writer
+    // of this run's rows (`finalize_run` below writes just the run's
+    // status/usage), so nothing lands twice.
+    if let Some(writer) = &writer {
+        sinks.push(Box::new(crate::session::SessionPersistenceSink::new(
+            writer.clone(),
+        )));
+    }
     runtime.set_event_sink(Arc::new(crate::event::CompositeSink::new(sinks)));
 
     // Converter task: forward AgentEvents → AG-UI Events. Owns the
@@ -1075,11 +1268,12 @@ pub(crate) fn spawn_agui_run(
     let drv_model = model;
     let drv_provider = provider;
     let drv_preset = preset;
-    // Transcript length before the run: everything after this index is
-    // THIS run's contribution — only that gets appended to the session
-    // (on resume runs the transcript starts with the seeded history;
-    // appending it again would duplicate it).
-    let drv_pre_run_len = runtime.transcript().len();
+    // Issue #147: this run's rows are already on disk — the sink writes each
+    // one as the kernel appends it — so the driver finalizes the session
+    // (status / usage / cost) through the very same writer instead of
+    // re-appending the transcript. `writer` is dropped with the driver task,
+    // releasing the session lock.
+    let drv_writer = writer.clone();
     // Issue #66: cancel-registry bookkeeping — the driver removes its
     // thread's token when the run finishes so a later run registers a
     // fresh one.
@@ -1166,15 +1360,14 @@ pub(crate) fn spawn_agui_run(
             }
         }
 
-        // Persist the run into the thread's native session (issue #57):
-        // SessionWriter appends this run's messages (uuid chain, msg ids,
-        // timestamps) and updates `.meta.json` — status, prompts, message
-        // count and cumulative token cost — so the thread is a first-class
-        // session (`sessions list`, `episodic_recall`, resume picker).
-        // `CostTracker` adds `cost.json` + the `cost_usd` block. Only the
-        // messages this run produced are appended (drv_pre_run_len skips
-        // the seeded history on resume runs).
-        {
+        // Close the run in the thread's native session (issue #57):
+        // `.meta.json` gets the run's status, message count (bumped by the
+        // sink's appends) and cumulative token cost, and `CostTracker` adds
+        // `cost.json` + the `cost_usd` block — so the thread is a
+        // first-class session (`sessions list`, `episodic_recall`, resume
+        // picker). The transcript itself was written by the sink as the run
+        // went (issue #147), so nothing is appended here.
+        if let Some(writer) = &drv_writer {
             // Issue #111: the status alone collapses six failure modes into
             // `Crashed` and the `Err` arm used to swallow the error text —
             // carry both onto the persisted session.
@@ -1195,15 +1388,7 @@ pub(crate) fn spawn_agui_run(
                     ),
                 }
             };
-            let transcript = runtime.transcript();
-            let new_messages = transcript
-                .get(drv_pre_run_len.min(transcript.len())..)
-                .unwrap_or(&[]);
             let record = crate::agui_session::RunRecord {
-                workspace: &drv_workspace,
-                thread_id: &drv_thread,
-                messages: new_messages,
-                goal: &goal,
                 model: &drv_model,
                 provider: &drv_provider,
                 preset: drv_preset.as_deref(),
@@ -1224,8 +1409,8 @@ pub(crate) fn spawn_agui_run(
                 },
                 llm_latency_ms: outcome.as_ref().ok().map(|o| o.llm_latency_ms).unwrap_or(0),
             };
-            if let Err(e) = crate::agui_session::persist_run(record) {
-                tracing::warn!("agui: session persist failed: {e}");
+            if let Err(e) = crate::agui_session::finalize_run(writer, record) {
+                tracing::warn!("agui: session finalize failed: {e}");
             }
         }
 
@@ -1905,9 +2090,201 @@ mod tests {
         })
         .expect("prepare");
         assert_eq!(prepared.goal, "turn two");
+        assert!(
+            prepared.seed_is_new_history,
+            "a thread the server has never seen seeds from the client, and that \
+             history must be written down"
+        );
         let seed = prepared.seed_transcript.expect("seed");
         let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(contents, vec!["turn one", "answer"]);
+    }
+
+    // ── issue #147: the thread id IS the session ───────────────────────────
+
+    /// Write `msgs` as one raw `Message` JSON line each — the shape both the
+    /// sink's `transcript.jsonl` and the resume path read back.
+    fn write_transcript(dir: &Path, msgs: &[crate::message::Message]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let body: Vec<String> = msgs
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        std::fs::write(dir.join("transcript.jsonl"), body.join("\n") + "\n").unwrap();
+    }
+
+    fn user(text: &str) -> crate::message::Message {
+        crate::message::Message::user(text)
+    }
+
+    #[test]
+    fn prepare_run_existing_thread_uses_its_own_transcript() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-exists").unwrap();
+        write_transcript(
+            &dir,
+            &[
+                user("server one"),
+                crate::message::Message::assistant("server answer"),
+            ],
+        );
+
+        // The client resends a *different* history — the server's own
+        // transcript is the conversation of record, so it wins.
+        let mut input = run_input("t-exists", None);
+        input.messages = vec![
+            agui_protocol::Message {
+                id: "m0".into(),
+                role: "user".into(),
+                content: Some("client-only history".into()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            agui_protocol::Message {
+                id: "m1".into(),
+                role: "user".into(),
+                content: Some("this turn".into()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let prepared = prepare_run(AguiRunInput {
+            workspace: ws,
+            input: &input,
+        })
+        .expect("prepare");
+        assert_eq!(prepared.goal, "this turn");
+        assert!(
+            !prepared.seed_is_new_history,
+            "an existing thread's history is already on disk"
+        );
+        let contents: Vec<String> = prepared
+            .seed_transcript
+            .expect("seed")
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(contents, vec!["server one", "server answer"]);
+    }
+
+    #[test]
+    fn prepare_run_existing_thread_accepts_empty_messages() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-empty").unwrap();
+        write_transcript(&dir, &[user("earlier turn")]);
+
+        let mut input = run_input("t-empty", None);
+        input.messages.clear();
+        let prepared = prepare_run(AguiRunInput {
+            workspace: ws,
+            input: &input,
+        })
+        .expect("an existing thread must accept an empty messages array");
+        assert_eq!(prepared.goal, CONTINUE_GOAL_DIRECTIVE);
+        assert!(!prepared.seed_is_new_history);
+        let seed = prepared.seed_transcript.expect("seed");
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["earlier turn"]);
+    }
+
+    #[test]
+    fn load_thread_seed_drops_system_and_leading_orphan_tool_rows() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-orphan").unwrap();
+        write_transcript(
+            &dir,
+            &[
+                crate::message::Message::system("stored prompt"),
+                crate::message::Message::tool_result("tc-gone", "orphan"),
+                user("real turn"),
+            ],
+        );
+
+        let seed = load_thread_seed(&dir);
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["real turn"],
+            "the runtime assembles its own prompt and an unpaired tool result \
+             would break invariant #8"
+        );
+    }
+
+    /// Issue #147: the row a kill mid-tool-call leaves behind is real history —
+    /// it must not be dropped, and it must not reach the provider unanswered
+    /// (invariant #8), or the thread stays unusable for every later run.
+    #[test]
+    fn load_thread_seed_answers_a_killed_run_s_unpaired_tool_call() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-crash").unwrap();
+        write_transcript(
+            &dir,
+            &[
+                user("run the suite"),
+                crate::message::Message::assistant_with_tool_calls(
+                    "running it",
+                    vec![crate::llm::ToolCall {
+                        id: "tc-crash".into(),
+                        name: "Bash".into(),
+                        arguments: serde_json::json!({"command": "cargo test"}),
+                    }],
+                ),
+            ],
+        );
+
+        let seed = load_thread_seed(&dir);
+        let contents: Vec<(&str, Option<&str>)> = seed
+            .iter()
+            .map(|m| (m.content.as_str(), m.tool_call_id.as_deref()))
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                ("run the suite", None),
+                ("running it", None),
+                (crate::session::ORPHAN_SKIPPED_RESULT, Some("tc-crash")),
+            ],
+            "the interrupted call must be answered, not dropped or left open"
+        );
+    }
+
+    /// The answered call is already paired — the repair must not add a second
+    /// result for it, nor invent one for a seed that has no tool call at all.
+    #[test]
+    fn load_thread_seed_leaves_an_answered_call_alone() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-answered").unwrap();
+        write_transcript(
+            &dir,
+            &[
+                user("run the suite"),
+                crate::message::Message::assistant_with_tool_calls(
+                    "running it",
+                    vec![crate::llm::ToolCall {
+                        id: "tc-done".into(),
+                        name: "Bash".into(),
+                        arguments: serde_json::json!({"command": "cargo test"}),
+                    }],
+                ),
+                crate::message::Message::tool_result("tc-done", "ok"),
+                crate::message::Message::assistant("all green"),
+            ],
+        );
+
+        let seed = load_thread_seed(&dir);
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["run the suite", "running it", "ok", "all green"]
+        );
     }
 
     // ── build_agui_runtime (Issue #56: runtime assembly, no HTTP) ──────────

@@ -1723,6 +1723,98 @@ mod http_tests {
         assert_eq!(response.status(), 404);
     }
 
+    /// Issue #147: a REST session's native mirror (#121) is written as the
+    /// turn goes, not only at teardown — a host killed mid-turn keeps the
+    /// steps that already completed.
+    #[tokio::test]
+    async fn post_message_mirrors_the_session_transcript_before_teardown() {
+        let mirror_root = tempfile::tempdir().expect("mirror root");
+        let storage = MemoryStorage::new();
+        let provider = Arc::new(MockProvider::new(vec![Completion {
+            content: "mirrored reply".into(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let base = sample_state_with_provider(provider);
+        let workspace = base.config.workspace.clone();
+        let state = AppState {
+            storage: storage.clone(),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_mirror_root: Some(mirror_root.path().to_path_buf()),
+            ..base
+        };
+
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "content": "hello mirror" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // No DELETE / eviction / shutdown: the mirror must already hold the
+        // turn, one row per completed step.
+        let dir = std::fs::read_dir(mirror_root.path())
+            .expect("mirror root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join(&session_id))
+            .find(|candidate| candidate.is_dir())
+            .unwrap_or_else(|| panic!("no mirror directory for {session_id} under {workspace:?}"));
+        let entries =
+            recursive::session::SessionReader::load_transcript(&dir).expect("mirror transcript");
+        let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
+        assert!(
+            contents.contains(&"hello mirror"),
+            "the user turn must be mirrored before teardown, got {contents:?}"
+        );
+        assert!(
+            contents.contains(&"mirrored reply"),
+            "the assistant reply must be mirrored before teardown, got {contents:?}"
+        );
+        assert_eq!(
+            contents.iter().filter(|c| **c == "hello mirror").count(),
+            1,
+            "no row may be mirrored twice, got {contents:?}"
+        );
+        assert_eq!(
+            contents.iter().filter(|c| **c == "mirrored reply").count(),
+            1,
+            "no row may be mirrored twice, got {contents:?}"
+        );
+    }
+
     /// Goal-297: PATCH /sessions/:id must echo the actual non-system
     /// message count, not 0. `SessionState::non_system_message_count`
     /// is an `Arc<AtomicUsize>` kept in lock-step with the runtime's
@@ -4209,9 +4301,56 @@ mod http_tests {
         parser.feed(&bytes)
     }
 
-    fn agui_request_body(messages: serde_json::Value, context: serde_json::Value) -> String {
+    /// Keep the `/agui` tests out of the developer's real sessions store.
+    ///
+    /// `/agui` resolves a thread's directory through `paths::user_sessions_dir`,
+    /// which has no per-`AppState` injection point — so unlike the mirror
+    /// fixtures (see `http_common`) these tests would otherwise write a session
+    /// into `~/.recursive/.../sessions/<workspace-slug>/` on every run. Pin the
+    /// root once per process: `RECURSIVE_SESSIONS_DIR` is a hard override read
+    /// by `user_sessions_dir` alone, and the value never changes afterwards, so
+    /// no test can observe a different root depending on scheduling.
+    fn pin_agui_sessions_root() {
+        static ROOT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            // Leaked on purpose: the root must outlive every test in the process.
+            let dir: &'static tempfile::TempDir =
+                Box::leak(Box::new(tempfile::tempdir().expect("agui sessions root")));
+            // SAFETY: written exactly once per test process, before this helper
+            // returns to any caller, and every reader in this binary wants the
+            // throwaway root.
+            unsafe { std::env::set_var("RECURSIVE_SESSIONS_DIR", dir.path()) };
+        });
+    }
+
+    /// Build an `AppState` for an `/agui` test on a throwaway workspace.
+    ///
+    /// Issue #147: a run resolves the thread's session directory through
+    /// `config.workspace`, and wires per-turn checkpoints against it too (a
+    /// shadow `git add -A`). The shared fixtures point that at `/tmp`, so a
+    /// thread the process has not snapshotted before pays a full walk of the
+    /// real `/tmp` on the failure path (tens of seconds), and every test lands
+    /// its session in one shared workspace subtree. A tempdir per test keeps
+    /// the snapshot to the test's own files — and gives each test a workspace
+    /// slug of its own, so a leftover thread from an earlier run cannot leak in.
+    fn agui_state(provider: Arc<MockProvider>) -> (tempfile::TempDir, AppState) {
+        pin_agui_sessions_root();
+        let ws = tempfile::tempdir().expect("agui workspace");
+        let mut state = sample_state_with_provider(provider);
+        state.config.workspace = ws.path().to_path_buf();
+        (ws, state)
+    }
+
+    /// The thread id is explicit on purpose: issue #147 seeds a run from the
+    /// thread's *persisted* transcript, so two tests sharing an id would read
+    /// each other's conversation.
+    fn agui_request_body(
+        thread: &str,
+        messages: serde_json::Value,
+        context: serde_json::Value,
+    ) -> String {
         serde_json::to_string(&serde_json::json!({
-            "threadId": "t-test",
+            "threadId": thread,
             "runId": "r-test",
             "messages": messages,
             "tools": [],
@@ -4229,10 +4368,11 @@ mod http_tests {
             usage: None,
             reasoning_content: None,
         }]));
-        let state = sample_state_with_provider(provider);
+        let (_ws, state) = agui_state(provider);
         let app = build_router(state);
 
         let body = agui_request_body(
+            "t-streams",
             serde_json::json!([
                 {"id": "u1", "role": "user", "content": "say hello"}
             ]),
@@ -4270,7 +4410,7 @@ mod http_tests {
         // First event must be RunStarted with the supplied ids.
         match &events[0] {
             agui_protocol::Event::RunStarted(rs) => {
-                assert_eq!(rs.thread_id, "t-test");
+                assert_eq!(rs.thread_id, "t-streams");
                 assert_eq!(rs.run_id, "r-test");
             }
             other => panic!("expected RunStarted first, got {other:?}"),
@@ -4279,7 +4419,7 @@ mod http_tests {
         // Last event must be RunFinished.
         match events.last().unwrap() {
             agui_protocol::Event::RunFinished(rf) => {
-                assert_eq!(rf.thread_id, "t-test");
+                assert_eq!(rf.thread_id, "t-streams");
                 assert_eq!(rf.run_id, "r-test");
             }
             other => panic!("expected RunFinished last, got {other:?}"),
@@ -4323,13 +4463,22 @@ mod http_tests {
         }
     }
 
+    /// Issue #147: empty `messages` is legal for a thread the server has a
+    /// persisted transcript for — naming the thread is enough to continue
+    /// (covered end to end in `tests/agui_e2e.rs`). A thread the server has
+    /// never seen still needs its prompt, so that request is the bad request it
+    /// always was.
     #[tokio::test]
-    async fn agui_endpoint_rejects_empty_messages_and_context() {
+    async fn agui_endpoint_rejects_empty_messages_for_an_unknown_thread() {
         let provider = Arc::new(MockProvider::new(vec![]));
-        let state = sample_state_with_provider(provider);
+        let (_ws, state) = agui_state(provider);
         let app = build_router(state);
 
-        let body = agui_request_body(serde_json::json!([]), serde_json::json!([]));
+        let body = agui_request_body(
+            "t-empty-unknown",
+            serde_json::json!([]),
+            serde_json::json!([]),
+        );
 
         let response = app
             .oneshot(
@@ -4369,10 +4518,11 @@ mod http_tests {
                 reasoning_content: None,
             },
         ]));
-        let state = sample_state_with_provider(provider);
+        let (_ws, state) = agui_state(provider);
         let app = build_router(state);
 
         let body = agui_request_body(
+            "t-tool-calls",
             serde_json::json!([
                 {"id": "u1", "role": "user", "content": "go"}
             ]),
@@ -4457,10 +4607,11 @@ mod http_tests {
             request_id: None,
             message: "injected provider failure".into(),
         }]));
-        let state = sample_state_with_provider(provider);
+        let (_ws, state) = agui_state(provider);
         let app = build_router(state);
 
         let body = agui_request_body(
+            "t-run-failed",
             serde_json::json!([
                 {"id": "u1", "role": "user", "content": "say hello"}
             ]),
@@ -4528,12 +4679,13 @@ mod http_tests {
             }),
             reasoning_content: None,
         }]));
-        let mut state = sample_state_with_provider(provider);
+        let (_ws, mut state) = agui_state(provider);
         state.config.model = "deepseek-chat".into();
         let metrics = state.metrics.clone();
         let app = build_router(state);
 
         let body = agui_request_body(
+            "t-cost",
             serde_json::json!([{"id": "u1", "role": "user", "content": "say hello"}]),
             serde_json::json!([]),
         );
