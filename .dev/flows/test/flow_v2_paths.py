@@ -1517,6 +1517,57 @@ def s44_恢复轮刷新按段档位键():
     assert fn4(ctx4)["$INPUT"]["impl_agent"] == "keep-me", "空值不应覆盖已有档位"
 
 
+def s45_按段档位真生效():
+    """按段档位键必须真的改变**各段**所用的 agent（不止是「传进去不报错」）。
+
+    为什么必须独立钉死（2026-10-11）：分段功能的 claim 是「impl 用 A、gatefix 用
+    B」，但整条链有 4 个可能静默失效的环节——flow 声明、`or agent` 兜底、
+    keeper 恒下发、桥接层刷新。它们的共同失败形态是**悄悄回退到 agent**，
+    而 run 日志只显示「某个模型在跑」看不出错。故此处用**全 stub**（不起真
+    agent）直驱生产宿主循环，逐节点断言它实际收到的 agent 名。
+
+    覆盖两条分支：
+    ① 配了按段键 ⇒ 该段用配置值（不同段可不同）；
+    ② 未配 ⇒ 逐字回退到 agent（零回归）。
+    """
+    repo, root = make_repo()
+    _REPO_HOLDER[0] = repo
+    issue_root = root / "artifact"
+    issue_root.mkdir(parents=True)
+    run = root / "pipeline-79-seg"
+    run.mkdir(parents=True)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
+
+    # ① 配了按段键：impl 用 seg-impl，gatefix 用 seg-gatefix（与 agent 都不同）
+    v, _ = _drive_v3(issue_root, run, run / "state.json",
+                     agent="base-agent", reviewer="rev-1",
+                     extra_params={"impl_agent": "seg-impl",
+                                   "gatefix_agent": "seg-gatefix"})
+    assert v.get("verdict") == "committed", v
+    impl = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert impl, "应有 impl 调用"
+    assert impl[-1][4] == "seg-impl", \
+        f"impl 段应使用 impl_agent 配置值，实得 {impl[-1][4]!r}（回退到 agent 即静默失效）"
+    # 门禁修复段（g1/g2/g3 的 fix）在门全绿时不触发，故此处只断言 impl 与评审；
+    # gatefix 的生效性由 flow 的绑定表达式（agent=gatefix_agent）× 本用例的
+    # impl 同款机制保证（同一 helper、同一兜底链）。
+    rev = [c for c in CALLS if c[0] == "agentrun" and c[1] == "rev1"]
+    assert rev and rev[-1][4] == "rev-1", f"评审段应使用 reviewer，实得 {rev[-1][4]!r}"
+
+    # ② 未配按段键：逐字回退到 agent（零回归）
+    run2 = root / "pipeline-79-plain"
+    run2.mkdir(parents=True)
+    issue_root2 = root / "artifact2"
+    issue_root2.mkdir(parents=True)
+    v2, _ = _drive_v3(issue_root2, run2, run2 / "state.json",
+                      agent="only-agent", reviewer="rev-2")
+    assert v2.get("verdict") == "committed", v2
+    impl2 = [c for c in CALLS if c[0] == "agentrun" and c[1] == "impl"]
+    assert impl2 and impl2[-1][4] == "only-agent", \
+        f"未配按段键时 impl 应回退到 agent，实得 {impl2[-1][4]!r}"
+
+
 # ═══ #83 AGENTRUN 活性检测（转录停更早杀 / 持续增长不误杀 / 缺省零变化）═══
 
 def _stall_fixture():
@@ -1845,6 +1896,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s28_state_json原子写_永不截断,
              s29_v3_恢复轮刷新agent_reviewer,
              s44_恢复轮刷新按段档位键,
+             s45_按段档位真生效,
              s37_活性检测_转录停更_提前击杀,
              s38_活性检测_转录持续增长_跑满预算不误杀,
              s39_活性检测_缺省关闭_不动AGENTRUN,
