@@ -911,8 +911,15 @@ def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None,
     v, nodes = bridge.run_host_v3(
         flow_obj=flowmod.self_improve_v2,
         handler_specs=specs,
+        # 按段档位键**恒下发**（未显式给时 = agent），与 keeper
+        # `_identity_payload` 的真实契约一致。为什么必须与生产同形：flow 侧
+        # `impl_agent = INPUT.impl_agent or agent`，若首派缺该键，`_refresh_identity`
+        # 在恢复轮就刷不到它（它只刷 params 里出现过的键）⇒ 出现「agent 刷了、
+        # impl_agent 没刷」的不一致 ⇒ impl 拿到陈旧档位（s29 曾因此变红，实测）。
         params={"goal": "#77 v3 harness", "repo": str(_REPO_HOLDER[0]),
                 "run_dir": str(run_dir), "agent": agent, "reviewer": reviewer,
+                **{k: agent for k in ("impl_agent", "gatefix_agent",
+                                      "fix_agent", "landfix_agent")},
                 **(extra_params or {})},
         issue_root=issue_root, run_dir=run_dir, state_path=state_path,
         max_node_retries=max_retries)

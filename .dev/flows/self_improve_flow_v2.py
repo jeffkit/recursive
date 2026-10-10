@@ -108,6 +108,24 @@ def self_improve_v2(INPUT):
     run_dir = INPUT.run_dir
     agent = INPUT.agent
     reviewer = INPUT.reviewer
+    # ── 按段档位（2026-10-11，评审 A 项：分段粒度细化）──
+    # 语义分工（依据各段提示词实测，非按名字猜）：
+    #   impl      —— 写实现，**最重**（预算 impl_timeout，可续会话）
+    #   gatefix   —— 修 fmt/lint/test 失败。提示词要求「Fix the **source** so
+    #                every failing gate passes」+ 自己复跑门 ⇒ **是完整实现能力，
+    #                不是轻活**（评审纠正了我的误判：其预算 7200 与 fix 轮同档）
+    #   fix       —— 按 reviewer 意见修（含第二轮）
+    #   landfix   —— 解 rebase 冲突（偏机械，但要读懂冲突语义）
+    #
+    # **一律 `or agent` 兜底**：未配置时逐字等价于改动前（零回归）。但这正是
+    # 评审警告的「静默回退」面——故配套两件事，缺一不可：
+    #   ① 桥接层已能把 params 里的按段键刷新/注入 context（recursive a645e501）；
+    #   ② harness s44 已钉死刷新语义（反转验证有效）。
+    # 接线完整性仍须端到端验证（run 日志的 model 必须是配置值，而非 agent 的）。
+    impl_agent = INPUT.impl_agent or agent
+    gatefix_agent = INPUT.gatefix_agent or agent
+    fix_agent = INPUT.fix_agent or agent
+    landfix_agent = INPUT.landfix_agent or agent
     # impl 预算（秒）：bridge 经 RECURSIVE_IMPL_TIMEOUT 注入，缺省 2h 硬墙。
     # 10-03 实证：#78/#68 的 impl 撞墙时转录仍在活跃推进（566 轮 rustc 编译），
     # 属合法长活被截断而非卡死——拉长预算比多轮 engine_error 重派省（重派本身
@@ -449,7 +467,7 @@ def self_improve_v2(INPUT):
     # session=pre.last_sid：续跑且找到既往会话时走 resume（L2，agent 带全量
     # 上下文接着干）；全新 run / 无会话时为空串，AGENTRUN 自然退化 run 形态，
     # 单节点无分支。
-    impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
+    impl = AGENTRUN(agent=impl_agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
                     session=pre.last_sid)
     # 会话落盘（2026-10-11，L2 加固）：把本轮的 session_id 写进 run_dir，供
     # **engine_error 重派后的下一轮**在 pre 段直接读回、走 resume 续上下文。
@@ -510,7 +528,7 @@ def self_improve_v2(INPUT):
         # 第 1 槽可能是「整组门」（gate_runner，v1.0.5 spec 路径）也可能是单道门
         # （三段式回退）——提示词做通用化，不再假定 cargo（非 Rust 仓此前会被
         # 误导去跑 cargo fmt）。引用实测命令，修复者可直接复跑。
-        AGENTRUN(agent=agent, prompt=F.concat(
+        AGENTRUN(agent=gatefix_agent, prompt=F.concat(
                 'Quality gates failed. Fix the source so every failing gate '
                 'passes, then re-run the gate command below yourself to verify '
                 'before stopping.\nFix the source, never silence or weaken '
@@ -536,7 +554,7 @@ def self_improve_v2(INPUT):
                       "cmd": gates.lint,
                       "timeout_secs": gates.lint_timeout, "wt": pre.worktree}, flow=gate_once)
     if g2.passed == False:
-        AGENTRUN(agent=agent, prompt=F.concat(
+        AGENTRUN(agent=gatefix_agent, prompt=F.concat(
                 'The clippy check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo clippy --workspace --all-targets "
                 "--all-features -- -D warnings` yourself to verify before stopping."
@@ -554,7 +572,7 @@ def self_improve_v2(INPUT):
     g3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
                       "timeout_secs": gates.test_timeout, "wt": pre.worktree}, flow=gate_once)
     if g3.passed == False:
-        AGENTRUN(agent=agent, prompt=F.concat(
+        AGENTRUN(agent=gatefix_agent, prompt=F.concat(
                 'The cargo test check failed. Edit the source files to fix every '
                 "failing test below, then re-run `cargo test --workspace` yourself "
                 "to verify before stopping."
@@ -624,7 +642,7 @@ def self_improve_v2(INPUT):
             "An independent reviewer rejected this change with NEEDS_FIX. ",
             "Address every issue below. Do not regress passing checks.",
             "\n\n--- reviewer feedback ---\n", rev1.text)
-        AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
+        AGENTRUN(agent=fix_agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
         rev2 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                         timeout_secs=5400)
         v2 = CODE(id="rev2_verdict", lang="python", input={"text": rev2.text}, code=(
@@ -653,7 +671,7 @@ def self_improve_v2(INPUT):
                 "An independent reviewer still rejects this change after one fix round. ",
                 "Address every remaining issue below. Do not regress passing checks.",
                 "\n\n--- reviewer feedback ---\n", rev2.text)
-            fix2 = AGENTRUN(agent=agent, prompt=fix_prompt2, repo=pre.worktree,
+            fix2 = AGENTRUN(agent=fix_agent, prompt=fix_prompt2, repo=pre.worktree,
                             timeout_secs=7200)
             rev3 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                             timeout_secs=5400)
@@ -782,7 +800,7 @@ def self_improve_v2(INPUT):
         wlp = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
                         content=F.concat("rebase conflict: ", land_rebase.why,
                                          "\n\n", land_rebase.scene))
-        land_fix = AGENTRUN(agent=agent, prompt=F.concat(
+        land_fix = AGENTRUN(agent=landfix_agent, prompt=F.concat(
                 "The git rebase onto origin/main stopped with merge conflicts. "
                 "Resolve them in place so the rebase can finish, without changing "
                 "behaviour on either side: keep both the upstream change and the "
