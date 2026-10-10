@@ -791,9 +791,60 @@ def s43_kill_stale判据_v2与sbx变体同源_产物不落后():
         import self_improve_flow_v2_sbx as sbx
     v2_code = _node_code("pre")
     sbx_code = _find_code(sbx.self_improve_v2_sbx.__plaita_ir__["nodes"], "pre")
-    assert sbx_code == v2_code, "sbx 变体的 preflight code 与 v2 漂移（应逐字节同源）"
+
+    # ── 判据加固（2026-10-11，评审指出旧版「守护形同虚设」）──
+    # 旧版只比 `pre` **一个**节点的逐字节相等 ⇒ 新增/缺失**其他** code 节点
+    # （如 sid_dump）完全不被发现，实测 sbx 已缺 sid_dump 而测试仍绿。
+    # 现改为**全量 code 节点集合**比对，并把「刻意不同」显式登记为白名单——
+    # 漂移不再是静默的，而必须在此处写明理由。
+    def _code_map(ir):
+        out = {}
+
+        def walk(ns):
+            for n in ns:
+                yield n
+                cf = n.get("childFlow")
+                if cf:
+                    yield from walk(cf.get("nodes", []))
+
+        for n in walk(ir["nodes"]):
+            if n.get("code"):
+                out[n["id"]] = n["code"]
+        return out
+
+    v2_codes = _code_map(self_improve_v2.__plaita_ir__)
+    sbx_codes = _code_map(sbx.self_improve_v2_sbx.__plaita_ir__)
+
+    # 刻意白名单（每条必须写理由；新增漂移会在此处报错而非静默通过）
+    #   sid_dump   —— v2 独有：impl 后把 session_id 落 run_dir/session.json
+    #   sync_back  —— sbx 独有：沙箱工作区回写宿主（沙箱路径专有）
+    v2_only_ok = {"sid_dump"}
+    sbx_only_ok = {"sync_back"}
+
+    only_v2 = set(v2_codes) - set(sbx_codes) - v2_only_ok
+    only_sbx = set(sbx_codes) - set(v2_codes) - sbx_only_ok
+    assert not only_v2, f"v2 有而 sbx 缺的 code 节点（未登记）：{sorted(only_v2)}"
+    assert not only_sbx, f"sbx 有而 v2 缺的 code 节点（未登记）：{sorted(only_sbx)}"
+
+    # 同名节点：语义比对（去缩进/去注释），差异须在白名单内
+    def _norm(code: str) -> list:
+        return [l.strip() for l in code.splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+
+    # pre 允许不同：sbx 的 pre 不做 session.json 读回（与 sid_dump 配对——
+    # cursor 等宿主锁定型 CLI 已被 fail-closed 拒绝进沙箱，沙箱侧无需该能力）。
+    allow_diff_nodes = {"pre"}
+    drifted = sorted(k for k in set(v2_codes) & set(sbx_codes)
+                     if k not in allow_diff_nodes
+                     and _norm(v2_codes[k]) != _norm(sbx_codes[k]))
+    assert not drifted, f"v2/sbx 同名 code 节点语义漂移（应同源）：{drifted}"
+
+    # 判据本身仍须在两侧都在（防白名单滥用成「永久豁免」）
+    for k in sorted(allow_diff_nodes):
+        assert k in v2_codes and k in sbx_codes, f"白名单节点 {k} 不存在"
     assert "_host_ancestor" in v2_code and "plaita\\.server" in v2_code, \
         "v2 缺祖先链宿主反查（#148 判据）"
+    assert "_host_ancestor" in sbx_code, "sbx 缺祖先链宿主反查（#148 判据）"
     for artifact in (FLOWS_DIR / "self-improve-v2.plaita.json",
                      FLOWS_DIR / "self-improve-flow-v2-sbx.plaita.json"):
         code = _find_code(json.loads(artifact.read_text())["nodes"], "pre")
