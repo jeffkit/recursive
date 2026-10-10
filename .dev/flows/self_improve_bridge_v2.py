@@ -470,7 +470,23 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
         checkpoint 原值——worktree 锚点本就必须指旧 run。"""
         if not isinstance(ctx, dict):
             return ctx
-        for key in ("agent", "reviewer"):
+
+        # 刷新范围 = **params 里所有 agent 类键**，而非硬编码 ("agent","reviewer")。
+        #
+        # 为什么必须派生而不是写死（2026-10-11 评审发现，已核对）：
+        # 一旦引入按段分档的键（impl_agent / gatefix_agent / …），写死列表
+        # **不会报错、也不会有任何提示**——恢复轮会静默沿用 checkpoint 固化的
+        # 旧档位，即「改了配置但续跑仍用旧模型」。这正是本函数当年要治的病
+        # （2026-10-04 GLM→DeepSeek 切档后整批 resume 打向已耗尽配额秒死），
+        # 而硬编码列表会让同一个病在**新键**上复现。
+        #
+        # 命名约定：`agent` / `reviewer` / `*_agent` / `*_reviewer`。
+        # 保守取「键名以 agent/reviewer 结尾」，避免误刷同名非档位键
+        # （params 里现有的其他键如 run_dir/worktree 不以之结尾，不受影响）。
+        def _is_identity_key(k: str) -> bool:
+            return k == "agent" or k == "reviewer" or k.endswith(("_agent", "_reviewer"))
+
+        for key in sorted(k for k in params if _is_identity_key(k)):
             val = params.get(key)
             if not val:
                 continue
