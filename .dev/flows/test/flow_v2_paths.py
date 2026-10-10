@@ -1517,6 +1517,61 @@ def s44_恢复轮刷新按段档位键():
     assert fn4(ctx4)["$INPUT"]["impl_agent"] == "keep-me", "空值不应覆盖已有档位"
 
 
+def s46_按段档位键全链存在性():
+    """按段档位键必须在**每一环**都存在——防「加了键但到不了」的静默断链。
+
+    为什么单立一条（2026-10-11 实测三次同一模式）：
+      ① keeper 内部 3 处重复解析（已抽 `_identity_payload`）；
+      ② `v2_bridge` 白名单转发把新键**静默丢弃**（keeper 侧成死代码）；
+      ③ **sbx 变体零覆盖**（`self_improve_flow_v2_sbx.py` 对 `impl_agent`
+         出现 0 次），而它有**完全相同的 7 个调用点** ⇒ 走 sbx 的 run
+         （24h 内 97 次）拿不到任何分段配置，且两变体静默分叉。
+
+    共同点：**全部不报错、只悄悄回退**。故此处对每一环做**键名存在性断言**，
+    而非依赖「跑一次看看」——后者对「回退到默认值」这种形态不敏感。
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3]      # recursive 仓根
+    seg_keys = ("impl_agent", "gatefix_agent", "fix_agent", "landfix_agent")
+
+    # ① flow v2：声明 + 调用点使用
+    v2 = (root / ".dev/flows/self_improve_flow_v2.py").read_text(encoding="utf-8")
+    for k in seg_keys:
+        assert f"{k} = INPUT.{k} or agent" in v2, f"v2 缺声明 {k}"
+        assert f"agent={k}" in v2, f"v2 声明了 {k} 却没有调用点使用它"
+    # ② flow sbx：**与 v2 同源**（这是本轮修的那个）
+    sbx = (root / ".dev/flows/self_improve_flow_v2_sbx.py").read_text(encoding="utf-8")
+    for k in seg_keys:
+        assert f"{k} = INPUT.{k} or agent" in sbx, f"sbx 缺声明 {k}（与 v2 分叉）"
+        assert f"agent={k}" in sbx, f"sbx 声明了 {k} 却没有调用点使用它"
+    # ③ bridge 接收侧：必须真的能解析这些 flag——**实跑 argparse** 而非字面匹配
+    # （声明是循环生成 `f"--{_seg}-agent"`，字面断言会误报；实跑才测契约）
+    import argparse as _ap
+
+    src = (root / ".dev/flows/self_improve_bridge_v2.py").read_text(encoding="utf-8")
+    ap = _ap.ArgumentParser()
+    ap.add_argument("--agent", default="recursive")
+    ap.add_argument("--reviewer", default="recursive")
+    for _seg in ("impl", "gatefix", "fix", "landfix"):
+        assert f'"{_seg}"' in src, f"bridge 的 seg 列表缺 {_seg}"
+        ap.add_argument(f"--{_seg}-agent", default="")
+    ns, _unknown = ap.parse_known_args(
+        ["--impl-agent", "cursor-sonnet46", "--gatefix-agent", "glm53-flash"])
+    assert ns.impl_agent == "cursor-sonnet46" and ns.gatefix_agent == "glm53-flash", \
+        "bridge 必须能解析按段 flag（否则子进程 unrecognized arguments 直接失败）"
+    # 并确认 bridge 自身确实在用这份 seg 列表（防「测试里造了 parser、源码没有」）
+    assert 'for _seg in ("impl", "gatefix", "fix", "landfix"):' in src, \
+        "bridge 源码应有 seg 列表声明"
+    # ④ 两变体的调用点数量一致（防一侧漏改）
+    import re
+    cnt = {k: len(re.findall(rf"agent={k},", v2)) for k in seg_keys}
+    cnts = {k: len(re.findall(rf"agent={k},", sbx)) for k in seg_keys}
+    assert cnt == cnts, f"v2/sbx 调用点数量不一致：v2={cnt} sbx={cnts}"
+    assert cnt == {"impl_agent": 1, "gatefix_agent": 3, "fix_agent": 2,
+                   "landfix_agent": 1}, f"调用点分布异常：{cnt}"
+
+
 def s45_按段档位真生效():
     """按段档位键必须真的改变**各段**所用的 agent（不止是「传进去不报错」）。
 
@@ -1919,6 +1974,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s29_v3_恢复轮刷新agent_reviewer,
              s44_恢复轮刷新按段档位键,
              s45_按段档位真生效,
+             s46_按段档位键全链存在性,
              s37_活性检测_转录停更_提前击杀,
              s38_活性检测_转录持续增长_跑满预算不误杀,
              s39_活性检测_缺省关闭_不动AGENTRUN,
@@ -1944,3 +2000,4 @@ if __name__ == "__main__":
             failed.append(s.__name__)
             print(f"  ERROR {s.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(SCENARIOS)-len(failed)}/{len(SCENARIOS)} passed")
+
