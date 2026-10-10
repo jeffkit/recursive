@@ -1555,6 +1555,28 @@ def s45_按段档位真生效():
     rev = [c for c in CALLS if c[0] == "agentrun" and c[1] == "rev1"]
     assert rev and rev[-1][4] == "rev-1", f"评审段应使用 reviewer，实得 {rev[-1][4]!r}"
 
+    # ③ 门禁修复段（gatefix_agent）：造「fmt 首检红 → 修复后绿」以**真正走到**
+    #    该分支（门全绿时它不触发，s45 初版因此未覆盖——本轮补齐）。
+    #    判据：该轮里**除 impl/review 外的 agentrun** 应收到 gatefix 配置值。
+    run3 = root / "pipeline-79-gatefix"
+    run3.mkdir(parents=True)
+    issue_root3 = root / "artifact3"
+    issue_root3.mkdir(parents=True)
+    AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
+    GATE_SCRIPT.update({"fmt": [1, 0], "clippy": [0], "test": [0]})   # 首检红→复检绿
+    v3, _ = _drive_v3(issue_root3, run3, run3 / "state.json",
+                      agent="base-agent", reviewer="rev-3",
+                      extra_params={"impl_agent": "seg-impl",
+                                    "gatefix_agent": "seg-gatefix"})
+    assert v3.get("verdict") == "committed", v3
+    assert len([c for c in CALLS if c[0] == "gate" and c[1] == "fmt"]) == 2, \
+        "应在 fmt 上红一次绿一次（否则没走到 gatefix 分支）"
+    # gatefix 是 gate 之后的修复轮：取 impl 之后、且非 rev 的 agentrun
+    others = [c for c in CALLS if c[0] == "agentrun" and c[1] not in ("impl", "rev1")]
+    assert others, "红门应触发 gatefix 段（未触发则本分支未被覆盖）"
+    assert all(c[4] == "seg-gatefix" for c in others), \
+        f"gatefix 段应全部使用 gatefix_agent，实得 {[c[4] for c in others]}"
+
     # ② 未配按段键：逐字回退到 agent（零回归）
     run2 = root / "pipeline-79-plain"
     run2.mkdir(parents=True)
