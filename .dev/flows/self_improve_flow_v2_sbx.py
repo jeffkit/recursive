@@ -89,6 +89,15 @@ def self_improve_v2_sbx(INPUT):
     run_dir = INPUT.run_dir
     agent = INPUT.agent
     reviewer = INPUT.reviewer
+    # ── 按段档位（2026-10-11）：与 v2 同源（s43 守护要求两变体语义一致）──
+    # 一律 `or agent` 兜底 ⇒ 未配置时逐字等价于改动前。
+    # 注意：cursor 等**宿主锁定型 CLI** 已被 plaita-nodes fail-closed 拒绝进沙箱
+    # （`_HOST_LOCKED_EXECUTORS`），故沙箱变体实际可配的是**有沙箱能力**的执行器。
+    # 键仍要声明——否则 v2 与 sbx 会出现「同一配置一半生效」的静默分叉。
+    impl_agent = INPUT.impl_agent or agent
+    gatefix_agent = INPUT.gatefix_agent or agent
+    fix_agent = INPUT.fix_agent or agent
+    landfix_agent = INPUT.landfix_agent or agent
     # impl 预算（秒）：bridge 经 RECURSIVE_IMPL_TIMEOUT 注入，缺省 2h 硬墙。
     # 10-03 实证：#78/#68 的 impl 撞墙时转录仍在活跃推进（566 轮 rustc 编译），
     # 属合法长活被截断而非卡死——拉长预算比多轮 engine_error 重派省（重派本身
@@ -422,7 +431,7 @@ def self_improve_v2_sbx(INPUT):
     # session=pre.last_sid：续跑且找到既往会话时走 resume（L2，agent 带全量
     # 上下文接着干）；全新 run / 无会话时为空串，AGENTRUN 自然退化 run 形态，
     # 单节点无分支。
-    impl = SANDBOX_AGENT(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
+    impl = SANDBOX_AGENT(agent=impl_agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
                     session=pre.last_sid)
     chg = CHILD(input={"wt": pre.worktree, "base": pre.land_base}, flow=has_changes)
     if chg.any == False:
@@ -454,7 +463,7 @@ def self_improve_v2_sbx(INPUT):
         # 第 1 槽可能是「整组门」（gate_runner，v1.0.5 spec 路径）也可能是单道门
         # （三段式回退）——提示词做通用化，不再假定 cargo（非 Rust 仓此前会被
         # 误导去跑 cargo fmt）。引用实测命令，修复者可直接复跑。
-        SANDBOX_AGENT(agent=agent, prompt=F.concat(
+        SANDBOX_AGENT(agent=gatefix_agent, prompt=F.concat(
                 'Quality gates failed. Fix the source so every failing gate '
                 'passes, then re-run the gate command below yourself to verify '
                 'before stopping.\nFix the source, never silence or weaken '
@@ -480,7 +489,7 @@ def self_improve_v2_sbx(INPUT):
                       "cmd": gates.lint,
                       "timeout_secs": gates.lint_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": "/home/user/plaita-ws/repo"}, flow=gate_once)
     if g2.passed == False:
-        SANDBOX_AGENT(agent=agent, prompt=F.concat(
+        SANDBOX_AGENT(agent=gatefix_agent, prompt=F.concat(
                 'The clippy check failed. Edit the source files to fix every '
                 "error below, then re-run `cargo clippy --workspace --all-targets "
                 "--all-features -- -D warnings` yourself to verify before stopping."
@@ -498,7 +507,7 @@ def self_improve_v2_sbx(INPUT):
     g3 = CHILD(input={"name": gates.test_name, "cmd": gates.test,
                       "timeout_secs": gates.test_timeout, "wt": pre.worktree, "sbx_spec": "ags", "sbx_wt": "/home/user/plaita-ws/repo"}, flow=gate_once)
     if g3.passed == False:
-        SANDBOX_AGENT(agent=agent, prompt=F.concat(
+        SANDBOX_AGENT(agent=gatefix_agent, prompt=F.concat(
                 'The cargo test check failed. Edit the source files to fix every '
                 "failing test below, then re-run `cargo test --workspace` yourself "
                 "to verify before stopping."
@@ -593,7 +602,7 @@ def self_improve_v2_sbx(INPUT):
             "An independent reviewer rejected this change with NEEDS_FIX. ",
             "Address every issue below. Do not regress passing checks.",
             "\n\n--- reviewer feedback ---\n", rev1.text)
-        SANDBOX_AGENT(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
+        SANDBOX_AGENT(agent=fix_agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
         rev2 = SANDBOX_AGENT(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                         timeout_secs=5400)
         v2 = CODE(id="rev2_verdict", lang="python", input={"text": rev2.text}, code=(
@@ -622,7 +631,7 @@ def self_improve_v2_sbx(INPUT):
                 "An independent reviewer still rejects this change after one fix round. ",
                 "Address every remaining issue below. Do not regress passing checks.",
                 "\n\n--- reviewer feedback ---\n", rev2.text)
-            fix2 = SANDBOX_AGENT(agent=agent, prompt=fix_prompt2, repo=pre.worktree,
+            fix2 = SANDBOX_AGENT(agent=fix_agent, prompt=fix_prompt2, repo=pre.worktree,
                             timeout_secs=7200)
             rev3 = SANDBOX_AGENT(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                             timeout_secs=5400)
@@ -751,7 +760,7 @@ def self_improve_v2_sbx(INPUT):
         wlp = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
                         content=F.concat("rebase conflict: ", land_rebase.why,
                                          "\n\n", land_rebase.scene))
-        land_fix = SANDBOX_AGENT(agent=agent, prompt=F.concat(
+        land_fix = SANDBOX_AGENT(agent=landfix_agent, prompt=F.concat(
                 "The git rebase onto origin/main stopped with merge conflicts. "
                 "Resolve them in place so the rebase can finish, without changing "
                 "behaviour on either side: keep both the upstream change and the "
