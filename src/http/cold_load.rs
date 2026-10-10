@@ -919,9 +919,10 @@ mod tests {
     /// server, a persisted `permission_mode` that would loosen it is dropped —
     /// the restored session keeps `strict`, so `run_shell` stays denied.
     /// Before the fix the persisted string was re-applied verbatim, so a
-    /// downgrade outlived a restart.
+    /// downgrade outlived a restart. "Stored once" is not consent: the ceiling
+    /// applies to the replayed value exactly as it does to a live request.
     #[tokio::test]
-    async fn cold_load_keeps_operator_strict_over_a_loosening_persisted_mode() {
+    async fn cold_load_cannot_replay_looser_mode() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state(dir.path().to_path_buf(), vec![]);
         Arc::get_mut(&mut state)
@@ -936,7 +937,19 @@ mod tests {
                 }],
             });
 
-        for (i, persisted) in ["default", "xyz", "", "bypass"].into_iter().enumerate() {
+        for (i, persisted) in [
+            "default",
+            "acceptEdits",
+            "auto",
+            "dontAsk",
+            "plan",
+            "xyz",
+            "",
+            "bypass",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let id = format!("sess-151-{i}");
             seed(dir.path(), &id, vec![user("hi"), assistant("yo")]).await;
             persist_session_meta(

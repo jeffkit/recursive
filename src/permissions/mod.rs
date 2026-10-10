@@ -233,18 +233,107 @@ impl<'de> Deserialize<'de> for PermissionMode {
     }
 }
 
+/// May a request-supplied `requested` mode replace the operator-configured
+/// `operator` mode (issue #151)?
+///
+/// The operator mode is a **ceiling**: a request may narrow it, never widen
+/// it, i.e. the requested mode must deny at least everything the operator mode
+/// denies. This is an explicit policy table rather than a lookup in
+/// [`PermissionMode::restrictiveness`] because the modes are not totally
+/// ordered — `plan` blocks every write while `dontAsk` denies the interactive
+/// tools, and neither contains the other — so a single rank per mode would
+/// accept pairs that do not actually narrow.
+///
+/// The per-mode denials the table is written against are `check_static`'s
+/// steps, on top of the rule layers (which the request never touches):
+///
+/// | mode | denies, beyond the rules |
+/// |---|---|
+/// | `bypass` | nothing — it skips the rule checks as well |
+/// | `acceptEdits` | nothing, but *allows* writes the rules would deny |
+/// | `default` / `auto` / `plan{bypass_available: true}` | nothing |
+/// | `plan` | every write (bar `exit_plan_mode`) |
+/// | `dontAsk` | every interactive tool |
+/// | `strict` | everything without an explicit allow rule |
+///
+/// Two consequences worth spelling out:
+///
+/// - `strict`, `dontAsk` and a write-blocking `plan` each deny along an axis no
+///   other mode contains — `strict`'s catch-all deny only exists *while* the
+///   mode is `strict`, `dontAsk` does not block writes and `plan` does not
+///   block unmatched read-only tools — so each accepts only its own mode.
+/// - `bypass` is never reachable from a request: the `bypass` value is
+///   parseable when the operator opted in with
+///   `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`, but a request may not *widen* into
+///   it, so only an operator already in `bypass` can re-assert it.
+///
+/// `auto` is ranked with the modes that add denials: its classifier can only
+/// *deny* a call the static rules would have allowed (with no classifier
+/// attached — issue #182 — `check_static` decides exactly as it does in
+/// `default`), so it narrows `default` / `acceptEdits`, while requesting
+/// either of those over an `auto` operator would drop the classifier.
+pub fn request_mode_allowed(operator: &PermissionMode, requested: &PermissionMode) -> bool {
+    use PermissionMode::*;
+    match (operator, requested) {
+        // An operator that already bypasses has nothing left to loosen.
+        (BypassPermissions, _) => true,
+        // Otherwise `bypass` is granted by the operator only.
+        (_, BypassPermissions) => false,
+        // `strict` denies every unmatched tool, and only while the mode is
+        // `strict` — any other mode lets some of those through.
+        (Strict, r) => matches!(r, Strict),
+        // `dontAsk` denies the interactive tools; `strict` and `plan` allow
+        // them, so neither is a narrowing (the axes are incomparable).
+        (DontAsk, r) => matches!(r, DontAsk),
+        // `plan` blocks every write unless `bypass_available` — which is only
+        // set when the pre-plan mode already allowed bypass — so a request may
+        // neither leave plan mode for a write-allowing mode nor turn the
+        // write block off.
+        (
+            Plan {
+                bypass_available: op,
+                ..
+            },
+            Plan {
+                bypass_available: req,
+                ..
+            },
+        ) => !req || *op,
+        // A `plan` operator that does not block writes is `default` again.
+        (
+            Plan {
+                bypass_available: true,
+                ..
+            },
+            r,
+        ) => !matches!(r, AcceptEdits),
+        (Plan { .. }, _) => false,
+        // `acceptEdits` auto-allows writes before the deny rules run, so
+        // requesting it over `default` widens.
+        (Default, r) => !matches!(r, AcceptEdits),
+        // Everything else narrows `acceptEdits`: it is the widest mode that
+        // still runs the rules, so even `default` only drops the
+        // auto-approval of writes the rules would have denied.
+        (AcceptEdits, _) => true,
+        // `auto` as operator: only the modes that deny more.
+        (Auto, r) => !matches!(r, Default | AcceptEdits),
+    }
+}
+
 impl PermissionMode {
-    /// Position of this mode on the "how much does it restrict" ladder —
-    /// higher is stricter.
+    /// Position of this mode on the informal "how much does it restrict"
+    /// ladder — higher is stricter.
     ///
-    /// Used to decide whether a request-supplied mode may replace an
-    /// operator-configured one (issue #151): a request may tighten the
-    /// operator mode, never loosen it. The order mirrors `check_static`'s own
-    /// precedence — `bypass` skips every rule, `acceptEdits` auto-allows
-    /// writes before the deny rules run, `default` merely defers to the rules,
-    /// `auto` adds an LLM classifier that can deny an otherwise-allowed call,
-    /// `dontAsk` denies the interactive tools, `plan` blocks every write, and
-    /// `strict` denies anything without an explicit allow rule.
+    /// The order mirrors `check_static`'s own precedence — `bypass` skips
+    /// every rule, `acceptEdits` auto-allows writes before the deny rules run,
+    /// `default` merely defers to the rules, `auto` adds an LLM classifier
+    /// that can deny an otherwise-allowed call, `dontAsk` denies the
+    /// interactive tools, `plan` blocks every write, and `strict` denies
+    /// anything without an explicit allow rule.
+    ///
+    /// It is *not* the request-ceiling decision — [`request_mode_allowed`]
+    /// spells the accepted pairs out explicitly, because this ranking is not a
+    /// total order over the modes' semantics.
     pub fn restrictiveness(&self) -> u8 {
         match self {
             PermissionMode::BypassPermissions => 0,
@@ -730,9 +819,10 @@ mod tests {
         assert_eq!(PermissionMode::default(), PermissionMode::Default);
     }
 
-    /// Issue #151: the ladder the request-mode ceiling is computed from.
-    /// Every variant must sit at a distinct rank, in this exact order — a
-    /// re-ordering silently changes which request modes are accepted.
+    /// Issue #151: the informal strictness ranking. Every variant must sit at
+    /// a distinct rank, in this exact order — the request-ceiling policy table
+    /// ([`request_mode_allowed`]) is written out by hand, so a silent
+    /// re-ordering would desynchronise the two.
     #[test]
     fn test_permission_mode_restrictiveness_ladder() {
         let ladder = [
@@ -768,6 +858,103 @@ mod tests {
             }
             .restrictiveness()
         );
+    }
+
+    /// Issue #151: the request-mode ceiling, asserted pair by pair — it is an
+    /// explicit table, so every operator row must be pinned down here.
+    #[test]
+    fn request_mode_allowed_policy_table() {
+        use PermissionMode::*;
+        let plan = || Plan {
+            pre_plan_mode: Box::new(PermissionMode::Default),
+            bypass_available: false,
+        };
+        let plan_bypass = || Plan {
+            pre_plan_mode: Box::new(PermissionMode::BypassPermissions),
+            bypass_available: true,
+        };
+        // (operator, requested, allowed)
+        let cases: Vec<(PermissionMode, PermissionMode, bool)> = vec![
+            // `strict`'s catch-all deny only exists *while* the mode is
+            // `strict`, so anything else — `dontAsk` and `plan` included —
+            // lets an unlisted tool through.
+            (Strict, Strict, true),
+            (Strict, DontAsk, false),
+            (Strict, plan(), false),
+            (Strict, Default, false),
+            (Strict, AcceptEdits, false),
+            (Strict, Auto, false),
+            (Strict, BypassPermissions, false),
+            // `dontAsk` denies the interactive tools; `strict` and `plan`
+            // allow them, so no other mode is a narrowing.
+            (DontAsk, DontAsk, true),
+            (DontAsk, plan(), false),
+            (DontAsk, Strict, false),
+            (DontAsk, Default, false),
+            (DontAsk, AcceptEdits, false),
+            (DontAsk, Auto, false),
+            (DontAsk, BypassPermissions, false),
+            // `plan` blocks writes (`bypass_available` = the pre-plan mode
+            // already allowed bypass); no other mode blocks at least as much.
+            (plan(), plan(), true),
+            (plan(), plan_bypass(), false),
+            (plan(), Strict, false),
+            (plan(), DontAsk, false),
+            (plan(), Default, false),
+            (plan(), AcceptEdits, false),
+            (plan(), Auto, false),
+            (plan(), BypassPermissions, false),
+            // A `plan` operator that does not block writes is `default` again.
+            (plan_bypass(), plan_bypass(), true),
+            (plan_bypass(), plan(), true),
+            (plan_bypass(), Default, true),
+            (plan_bypass(), Strict, true),
+            (plan_bypass(), DontAsk, true),
+            (plan_bypass(), Auto, true),
+            (plan_bypass(), AcceptEdits, false),
+            (plan_bypass(), BypassPermissions, false),
+            // `default`: narrowing yes, `acceptEdits` widens.
+            (Default, Default, true),
+            (Default, Strict, true),
+            (Default, DontAsk, true),
+            (Default, plan(), true),
+            (Default, AcceptEdits, false),
+            // `auto` only adds a classifier that can deny, so it narrows.
+            (Default, Auto, true),
+            (Default, BypassPermissions, false),
+            // `acceptEdits` auto-allows writes the rules would deny, so every
+            // other mode narrows it — `default` included.
+            (AcceptEdits, AcceptEdits, true),
+            (AcceptEdits, Default, true),
+            (AcceptEdits, Strict, true),
+            (AcceptEdits, DontAsk, true),
+            (AcceptEdits, plan(), true),
+            (AcceptEdits, Auto, true),
+            (AcceptEdits, BypassPermissions, false),
+            // An `auto` operator keeps the classifier only in `auto`.
+            (Auto, Auto, true),
+            (Auto, Strict, true),
+            (Auto, DontAsk, true),
+            (Auto, plan(), true),
+            (Auto, Default, false),
+            (Auto, AcceptEdits, false),
+            (Auto, BypassPermissions, false),
+            // An operator that already bypasses accepts anything requestable —
+            // but `bypass` is never requestable.
+            (BypassPermissions, BypassPermissions, true),
+            (BypassPermissions, Strict, true),
+            (BypassPermissions, Default, true),
+            (BypassPermissions, AcceptEdits, true),
+            (BypassPermissions, Auto, true),
+            (BypassPermissions, plan(), true),
+        ];
+        for (operator, requested, expected) in cases {
+            assert_eq!(
+                request_mode_allowed(&operator, &requested),
+                expected,
+                "operator {operator:?} + request {requested:?}"
+            );
+        }
     }
 
     #[test]

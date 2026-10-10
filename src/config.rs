@@ -127,9 +127,13 @@ pub struct Config {
     /// fully removes both the tool and its token cost. Honoured uniformly by
     /// every agent-loop channel (CLI run / loop, HTTP API, TUI).
     pub subagent_enabled: bool,
-    /// When `false` (default), API callers who request `"bypass"` permission
-    /// mode are silently downgraded to `Default`. Set to `true` via
-    /// `RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1` to honour bypass requests.
+    /// Whether the API recognises `"bypass"` as a request / persisted
+    /// `permission_mode` at all: when `false` (default) such a value is a 400
+    /// (issue #151), and `RECURSIVE_ALLOW_BYPASS_PERMISSIONS=1` makes it
+    /// parseable. Parsing is not honouring — the operator mode stays a ceiling,
+    /// and `bypass` is the weakest mode, so the opt-in never lets a request
+    /// *widen* a stricter operator mode into it. The operator's own
+    /// `[permissions] mode = "bypassPermissions"` is unaffected by this flag.
     pub allow_bypass_permissions: bool,
     /// Maximum number of ToolSearchTool round-trips per
     /// `complete_with_search` / `stream_with_search` call.
