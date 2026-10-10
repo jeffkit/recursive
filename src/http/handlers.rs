@@ -772,11 +772,11 @@ pub(super) async fn run_agent(
         inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
     if let Some(mode_str) = body.permission_mode.as_deref() {
         tool_registry = apply_request_permission_mode(
-            tool_registry,
+            &tool_registry,
             mode_str,
             state.config.allow_bypass_permissions,
         )
-        .await;
+        .await?;
     }
 
     let preset = resolve_session_preset(None, &state.config)?;
@@ -853,17 +853,68 @@ pub(super) async fn run_agent(
 /// Parse `permission_mode` string from an API request body.
 ///
 /// Accepted values (case-insensitive): `"default"`, `"auto"`, `"strict"`,
-/// `"bypass"` / `"bypass_permissions"`. Unknown values fall back to `Default`.
+/// `"bypass"` / `"bypass_permissions"` (the last two only when the server was
+/// started with `allow_bypass_permissions`).
+///
+/// Issue #151: an unrecognised value — or `bypass` on a server that does not
+/// allow it — is an error. Both used to be folded into `Default`, so a typo
+/// silently replaced the policy the caller asked for with a *more permissive*
+/// one (`Default` lets every unmatched tool through; `strict` does not).
 ///
 /// `pub(super)` since issue #98: cold load re-parses the persisted
 /// `permission_mode` through here, so the `allow_bypass_permissions` guard
 /// applies to restored sessions too.
-pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMode {
+pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> Result<PermissionMode, String> {
     match s.to_ascii_lowercase().as_str() {
-        "auto" => PermissionMode::Auto,
-        "strict" => PermissionMode::Strict,
-        "bypass" | "bypass_permissions" if allow_bypass => PermissionMode::BypassPermissions,
-        _ => PermissionMode::Default,
+        "default" => Ok(PermissionMode::Default),
+        "auto" => Ok(PermissionMode::Auto),
+        "strict" => Ok(PermissionMode::Strict),
+        "bypass" | "bypass_permissions" if allow_bypass => Ok(PermissionMode::BypassPermissions),
+        "bypass" | "bypass_permissions" => {
+            Err("permission_mode `bypass` is disabled on this server \
+             (RECURSIVE_ALLOW_BYPASS_PERMISSIONS is not set)"
+                .to_string())
+        }
+        _ => Err(format!(
+            "unknown permission_mode `{s}`; expected one of \
+             \"default\", \"auto\", \"strict\", \"bypass\""
+        )),
+    }
+}
+
+/// May a request-supplied `requested` mode replace the operator's `operator`
+/// mode (issue #151)?
+///
+/// The operator mode is a **ceiling**: a request may narrow it, never widen
+/// it.
+///
+/// - `bypass` skips every rule check, so it is weaker than every other mode.
+///   It stays reachable only when the operator opted in with
+///   `allow_bypass_permissions`, and even then it must not erase an
+///   explicitly restrictive operator mode (`strict` / `dontAsk` / `plan`) —
+///   those each deny a class of calls that `bypass` would run.
+/// - `dontAsk` and `plan` deny along an axis the request vocabulary cannot
+///   express, so no request value is a superset of them: only the identical
+///   mode is accepted (i.e. nothing, since neither is request-parseable).
+/// - Otherwise the requested mode must rank at least as high as the
+///   operator's on the [`PermissionMode::restrictiveness`] ladder.
+fn request_mode_allowed(
+    requested: &PermissionMode,
+    operator: &PermissionMode,
+    allow_bypass: bool,
+) -> bool {
+    if matches!(requested, PermissionMode::BypassPermissions) {
+        return allow_bypass
+            && !matches!(
+                operator,
+                PermissionMode::Strict | PermissionMode::DontAsk | PermissionMode::Plan { .. }
+            );
+    }
+    match operator {
+        // The operator already skips every rule check — nothing is stricter.
+        PermissionMode::BypassPermissions => true,
+        PermissionMode::DontAsk | PermissionMode::Plan { .. } => requested == operator,
+        _ => requested.restrictiveness() >= operator.restrictiveness(),
     }
 }
 
@@ -872,14 +923,26 @@ pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> PermissionMo
 /// Issue #87: only the mode is overridden — the operator-configured rule
 /// layers stay attached, so a client cannot strip a server-side deny /
 /// interactive policy by sending a `permission_mode`.
+///
+/// Issue #151: the operator mode is also a ceiling ([`request_mode_allowed`]),
+/// and an unusable value is a 400 rather than a silent `Default`. The source
+/// registry is left untouched (the override lands on a fresh `Arc`), so the
+/// caller keeps its operator registry if the request is refused.
 pub(super) async fn apply_request_permission_mode(
-    registry: ToolRegistry,
+    registry: &ToolRegistry,
     mode_str: &str,
     allow_bypass: bool,
-) -> ToolRegistry {
-    registry
-        .with_permission_mode(parse_permission_mode(mode_str, allow_bypass))
-        .await
+) -> Result<ToolRegistry, ApiError> {
+    let requested = parse_permission_mode(mode_str, allow_bypass).map_err(ApiError::bad_request)?;
+    let operator = registry.permission_mode();
+    if !request_mode_allowed(&requested, &operator, allow_bypass) {
+        return Err(ApiError::bad_request(format!(
+            "permission_mode `{mode_str}` would loosen the operator-configured mode `{}`; \
+             a request may only tighten it",
+            permission_mode_label(&operator)
+        )));
+    }
+    Ok(registry.clone().with_permission_mode(requested).await)
 }
 
 /// Render a [`PermissionMode`] in the API's request vocabulary (the strings
@@ -981,11 +1044,11 @@ pub(super) async fn create_session(
         inject_environment_segment(system_prompt, prompt_segments, &tool_registry);
     if let Some(mode_str) = body.permission_mode.as_deref() {
         tool_registry = apply_request_permission_mode(
-            tool_registry,
+            &tool_registry,
             mode_str,
             state.config.allow_bypass_permissions,
         )
-        .await;
+        .await?;
     }
 
     // Issue #127: the session's agent preset — an explicit request id wins,
@@ -5702,41 +5765,66 @@ mod tests {
         assert_eq!(sp, base_prompt);
     }
 
-    // ── parse_permission_mode ───────────────────────────────────────────────
+    // ── parse_permission_mode ─────────────────────────────────────
 
     #[test]
     fn parse_permission_mode_all_variants() {
-        assert_eq!(parse_permission_mode("auto", false), PermissionMode::Auto);
-        assert_eq!(parse_permission_mode("AUTO", true), PermissionMode::Auto);
+        assert_eq!(
+            parse_permission_mode("auto", false),
+            Ok(PermissionMode::Auto)
+        );
+        assert_eq!(
+            parse_permission_mode("AUTO", true),
+            Ok(PermissionMode::Auto)
+        );
         assert_eq!(
             parse_permission_mode("strict", false),
-            PermissionMode::Strict
+            Ok(PermissionMode::Strict)
         );
         assert_eq!(
             parse_permission_mode("bypass", true),
-            PermissionMode::BypassPermissions
+            Ok(PermissionMode::BypassPermissions)
         );
         assert_eq!(
             parse_permission_mode("bypass_permissions", true),
-            PermissionMode::BypassPermissions
-        );
-        // Bypass rejected when allow_bypass=false → Default (kills match-guard mutant).
-        assert_eq!(
-            parse_permission_mode("bypass", false),
-            PermissionMode::Default
-        );
-        assert_eq!(
-            parse_permission_mode("bypass_permissions", false),
-            PermissionMode::Default
+            Ok(PermissionMode::BypassPermissions)
         );
         assert_eq!(
             parse_permission_mode("default", true),
-            PermissionMode::Default
+            Ok(PermissionMode::Default)
         );
-        assert_eq!(
-            parse_permission_mode("unknown", true),
-            PermissionMode::Default
-        );
+    }
+
+    /// Issue #151 (recommendation 2): an unrecognised value, and `bypass` on a
+    /// server that does not allow it, are errors — not a silent `Default`,
+    /// which is *more* permissive than the `strict` a caller would have meant.
+    #[test]
+    fn parse_permission_mode_rejects_unknown_and_gated_bypass() {
+        // Case-insensitive matching still applies, so `STRICT` is accepted —
+        // only genuinely unknown spellings are refused.
+        for unknown in ["xyz", "", "strict ", "allow"] {
+            let err = parse_permission_mode(unknown, true)
+                .expect_err("an unrecognised mode must not be accepted");
+            assert!(
+                err.contains("unknown permission_mode"),
+                "the error must name the problem: {err}"
+            );
+            if !unknown.is_empty() {
+                assert!(
+                    err.contains(unknown),
+                    "the error must echo the offending value: {err}"
+                );
+            }
+        }
+        // The `allow_bypass` match guard: `bypass` without the operator opt-in.
+        for gated in ["bypass", "bypass_permissions", "BYPASS"] {
+            let err = parse_permission_mode(gated, false)
+                .expect_err("bypass must be refused when the server disallows it");
+            assert!(
+                err.contains("RECURSIVE_ALLOW_BYPASS_PERMISSIONS"),
+                "the error must say how to enable it: {err}"
+            );
+        }
     }
 
     /// Issue #98: `GET /sessions/:id` reports the mode in the same vocabulary
@@ -5764,9 +5852,175 @@ mod tests {
         );
     }
 
+    // ── issue #151: the operator mode is a ceiling ─────────────────────────
+
+    /// Operator `[permissions] mode = "strict"` + `allow = ["Read", "Grep"]`
+    /// — the audit scenario from issue #151: everything not on the
+    /// allow-list must be denied.
+    fn strict_operator_registry() -> ToolRegistry {
+        ToolRegistry::default().with_permissions(crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Strict,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                allow: vec!["Read".into(), "Grep".into()],
+                ..Default::default()
+            }],
+        })
+    }
+
+    /// The `(operator, requested, allow_bypass) -> allowed` table the request
+    /// path is built on.
+    #[test]
+    fn request_mode_allowed_treats_the_operator_mode_as_a_ceiling() {
+        let plan = PermissionMode::Plan {
+            pre_plan_mode: Box::new(PermissionMode::Default),
+            bypass_available: false,
+        };
+        let cases: Vec<(PermissionMode, PermissionMode, bool, bool)> = vec![
+            // A `default` operator may be tightened...
+            (
+                PermissionMode::Default,
+                PermissionMode::Default,
+                false,
+                true,
+            ),
+            (PermissionMode::Default, PermissionMode::Auto, false, true),
+            (PermissionMode::Default, PermissionMode::Strict, false, true),
+            // ...but never loosened: `bypass` is weaker than `default`, and
+            // additionally needs the operator's explicit opt-in.
+            (
+                PermissionMode::Default,
+                PermissionMode::BypassPermissions,
+                false,
+                false,
+            ),
+            (
+                PermissionMode::Default,
+                PermissionMode::BypassPermissions,
+                true,
+                true,
+            ),
+            // `strict` is the top of the ladder: only `strict` itself, and the
+            // opt-in does not buy `bypass`.
+            (
+                PermissionMode::Strict,
+                PermissionMode::Default,
+                false,
+                false,
+            ),
+            (PermissionMode::Strict, PermissionMode::Auto, true, false),
+            (PermissionMode::Strict, PermissionMode::Strict, true, true),
+            (
+                PermissionMode::Strict,
+                PermissionMode::BypassPermissions,
+                true,
+                false,
+            ),
+            // `dontAsk` / `plan` deny along an axis no request value can
+            // express, so switching away from them always loosens something.
+            (
+                PermissionMode::DontAsk,
+                PermissionMode::Strict,
+                false,
+                false,
+            ),
+            (
+                PermissionMode::DontAsk,
+                PermissionMode::DontAsk,
+                false,
+                true,
+            ),
+            (plan.clone(), PermissionMode::Strict, true, false),
+            (plan, PermissionMode::Default, true, false),
+            // An operator that already bypasses accepts anything.
+            (
+                PermissionMode::BypassPermissions,
+                PermissionMode::Strict,
+                false,
+                true,
+            ),
+            (
+                PermissionMode::BypassPermissions,
+                PermissionMode::Default,
+                false,
+                true,
+            ),
+        ];
+        for (operator, requested, allow_bypass, expected) in cases {
+            assert_eq!(
+                request_mode_allowed(&requested, &operator, allow_bypass),
+                expected,
+                "operator {operator:?} + request {requested:?} (allow_bypass={allow_bypass})"
+            );
+        }
+    }
+
+    /// Issue #151 acceptance: with `mode = "strict"` on the server, no request
+    /// body value can switch the session off deny-by-default. Each one is a
+    /// 400, the session registry keeps the operator mode, and `run_shell`
+    /// — not on the operator allow-list — stays denied.
+    #[tokio::test]
+    async fn request_permission_mode_cannot_loosen_operator_strict() {
+        use axum::response::IntoResponse;
+        for (value, allow_bypass) in [
+            ("default", false),
+            ("xyz", false),
+            ("", false),
+            ("bypass", false),
+            ("bypass", true),
+            ("auto", true),
+        ] {
+            let registry = strict_operator_registry();
+            // `ToolRegistry` has no `Debug`, so match instead of `expect_err`.
+            let err = match apply_request_permission_mode(&registry, value, allow_bypass).await {
+                Ok(_) => panic!("a request must not loosen the operator mode"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::BAD_REQUEST,
+                "`{value}` must be refused with 400"
+            );
+            // The refused request left the session registry alone.
+            assert!(
+                matches!(registry.permission_mode(), PermissionMode::Strict),
+                "the session registry must stay strict after `{value}`"
+            );
+            let cfg = registry.permissions_config().expect("permissions attached");
+            assert!(
+                cfg.check_static("run_shell", false, None).is_denied(),
+                "run_shell must stay denied after `{value}`"
+            );
+        }
+
+        // Re-asserting `strict` is not a loosening, so it is still accepted.
+        let registry = strict_operator_registry();
+        let registry = apply_request_permission_mode(&registry, "strict", false)
+            .await
+            .expect("`strict` does not loosen `strict`");
+        assert!(matches!(registry.permission_mode(), PermissionMode::Strict));
+    }
+
+    /// The tightening direction still works: a request may narrow the
+    /// operator mode.
+    #[tokio::test]
+    async fn request_permission_mode_tightens_the_operator_mode() {
+        let registry = apply_request_permission_mode(&ToolRegistry::default(), "strict", false)
+            .await
+            .expect("strict tightens the default operator mode");
+        assert!(matches!(registry.permission_mode(), PermissionMode::Strict));
+
+        // `auto` also ranks above `default`: its classifier can deny a call
+        // that `default` would have let through.
+        let registry = apply_request_permission_mode(&ToolRegistry::default(), "auto", false)
+            .await
+            .expect("auto does not loosen the default operator mode");
+        assert!(matches!(registry.permission_mode(), PermissionMode::Auto));
+    }
+
     /// Issue #87 acceptance: an operator-configured deny rule must survive a
-    /// request that carries `permission_mode: "default"`. The handler used to
-    /// hand the registry a mode-only config, which wiped every operator layer.
+    /// request. The handler used to hand the registry a mode-only config,
+    /// which wiped every operator layer.
     #[tokio::test]
     async fn request_permission_mode_keeps_operator_deny_rules() {
         let operator = crate::permissions::LayeredPermissionsConfig {
@@ -5779,7 +6033,9 @@ mod tests {
             }],
         };
         let registry = ToolRegistry::default().with_permissions(operator);
-        let registry = apply_request_permission_mode(registry, "default", false).await;
+        let registry = apply_request_permission_mode(&registry, "default", false)
+            .await
+            .expect("`default` matches the operator mode");
         let cfg = registry.permissions_config().expect("permissions attached");
         assert!(
             cfg.check_static("Bash", false, None).is_denied(),

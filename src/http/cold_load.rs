@@ -360,12 +360,25 @@ async fn build_restored_runtime(
         .await
         .map_err(ApiError::internal)?;
     if let Some(mode_str) = meta.and_then(|m| m.permission_mode.as_deref()) {
-        tool_registry = super::handlers::apply_request_permission_mode(
-            tool_registry,
+        match super::handlers::apply_request_permission_mode(
+            &tool_registry,
             mode_str,
             state.config.allow_bypass_permissions,
         )
-        .await;
+        .await
+        {
+            Ok(reg) => tool_registry = reg,
+            // Issue #151: an unusable persisted mode — a value an older build
+            // folded into `Default`, or one the operator ceiling no longer
+            // admits — must not brick the session. The operator registry is
+            // untouched, so the session restores at the operator mode, which
+            // is the strict end of the ladder.
+            Err(e) => tracing::warn!(
+                session_id = %id,
+                mode = %mode_str,
+                "cold load: ignoring persisted permission_mode: {e:?}"
+            ),
+        }
     }
     let (full, segments) = super::handlers::inject_environment_segment(
         assembled.full,
@@ -900,6 +913,66 @@ mod tests {
             ),
             "bypass must be re-parsed against the server's allow_bypass policy"
         );
+    }
+
+    /// Issue #151 acceptance (replay path): with `mode = "strict"` on the
+    /// server, a persisted `permission_mode` that would loosen it is dropped —
+    /// the restored session keeps `strict`, so `run_shell` stays denied.
+    /// Before the fix the persisted string was re-applied verbatim, so a
+    /// downgrade outlived a restart.
+    #[tokio::test]
+    async fn cold_load_keeps_operator_strict_over_a_loosening_persisted_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path().to_path_buf(), vec![]);
+        Arc::get_mut(&mut state)
+            .expect("freshly built state is uniquely owned")
+            .tool_registry = crate::tools::build_standard_tools(dir.path(), &[], 60)
+            .with_permissions(crate::permissions::LayeredPermissionsConfig {
+                mode: crate::permissions::PermissionMode::Strict,
+                layers: vec![crate::permissions::PermissionLayer {
+                    source: crate::permissions::RuleSource::User,
+                    allow: vec!["Read".into(), "Grep".into()],
+                    ..Default::default()
+                }],
+            });
+
+        for (i, persisted) in ["default", "xyz", "", "bypass"].into_iter().enumerate() {
+            let id = format!("sess-151-{i}");
+            seed(dir.path(), &id, vec![user("hi"), assistant("yo")]).await;
+            persist_session_meta(
+                &state,
+                &id,
+                &SessionMeta {
+                    system_prompt: None,
+                    permission_mode: Some(persisted.into()),
+                    title: None,
+                    max_steps: None,
+                    preset: None,
+                    overrides: Default::default(),
+                    owner: None,
+                    tenant: None,
+                },
+            )
+            .await;
+
+            let session = get_or_load_session(&state, &id, &AuthIdentity::local())
+                .await
+                .expect("cold load");
+            let rt = session.runtime.lock().await;
+            let tools = rt.kernel().tools();
+            assert!(
+                matches!(
+                    tools.permission_mode(),
+                    crate::permissions::PermissionMode::Strict
+                ),
+                "a persisted `{persisted}` must not loosen the operator's strict mode"
+            );
+            let cfg = tools.permissions_config().expect("permissions attached");
+            assert!(
+                cfg.check_static("run_shell", false, None).is_denied(),
+                "run_shell must stay denied after replaying `{persisted}`"
+            );
+        }
     }
 
     #[tokio::test]

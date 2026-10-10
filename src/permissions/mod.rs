@@ -233,6 +233,31 @@ impl<'de> Deserialize<'de> for PermissionMode {
     }
 }
 
+impl PermissionMode {
+    /// Position of this mode on the "how much does it restrict" ladder —
+    /// higher is stricter.
+    ///
+    /// Used to decide whether a request-supplied mode may replace an
+    /// operator-configured one (issue #151): a request may tighten the
+    /// operator mode, never loosen it. The order mirrors `check_static`'s own
+    /// precedence — `bypass` skips every rule, `acceptEdits` auto-allows
+    /// writes before the deny rules run, `default` merely defers to the rules,
+    /// `auto` adds an LLM classifier that can deny an otherwise-allowed call,
+    /// `dontAsk` denies the interactive tools, `plan` blocks every write, and
+    /// `strict` denies anything without an explicit allow rule.
+    pub fn restrictiveness(&self) -> u8 {
+        match self {
+            PermissionMode::BypassPermissions => 0,
+            PermissionMode::AcceptEdits => 1,
+            PermissionMode::Default => 2,
+            PermissionMode::Auto => 3,
+            PermissionMode::DontAsk => 4,
+            PermissionMode::Plan { .. } => 5,
+            PermissionMode::Strict => 6,
+        }
+    }
+}
+
 // ── Layered permission system ──────────────────────────────────────────────
 
 /// The source/origin of a permission layer.
@@ -703,6 +728,46 @@ mod tests {
     #[test]
     fn test_permission_mode_default_is_default() {
         assert_eq!(PermissionMode::default(), PermissionMode::Default);
+    }
+
+    /// Issue #151: the ladder the request-mode ceiling is computed from.
+    /// Every variant must sit at a distinct rank, in this exact order — a
+    /// re-ordering silently changes which request modes are accepted.
+    #[test]
+    fn test_permission_mode_restrictiveness_ladder() {
+        let ladder = [
+            PermissionMode::BypassPermissions,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Default,
+            PermissionMode::Auto,
+            PermissionMode::DontAsk,
+            PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            },
+            PermissionMode::Strict,
+        ];
+        for (i, mode) in ladder.iter().enumerate() {
+            assert_eq!(
+                mode.restrictiveness(),
+                i as u8,
+                "{mode:?} must rank at position {i} on the restrictiveness ladder"
+            );
+        }
+        // The `plan` payload (which mode it restores to) is irrelevant to the
+        // rank; `check_static` blocks writes either way.
+        assert_eq!(
+            PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::BypassPermissions),
+                bypass_available: true,
+            }
+            .restrictiveness(),
+            PermissionMode::Plan {
+                pre_plan_mode: Box::new(PermissionMode::Default),
+                bypass_available: false,
+            }
+            .restrictiveness()
+        );
     }
 
     #[test]

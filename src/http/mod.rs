@@ -424,6 +424,10 @@ pub struct CreateSessionRequest {
     /// with `thinking.budget_tokens = n` instead of reusing the server's.
     pub thinking_budget: Option<u32>,
     /// Permission mode: `"default"`, `"auto"`, `"strict"`, or `"bypass"`.
+    ///
+    /// Issue #151: the server's operator-configured mode is a ceiling — a
+    /// request may only tighten it, never loosen it. An unknown value, or a
+    /// value that would loosen the operator mode, is a 400.
     pub permission_mode: Option<String>,
     /// Maximum API spend in USD **per turn** of this session (issue #94).
     /// The agent stops with `budget_exceeded` at the first step boundary
@@ -887,6 +891,10 @@ pub struct RunRequest {
     /// `thinking = {type: "enabled", budget_tokens: n}`.
     pub thinking_budget: Option<u32>,
     /// Permission mode: `"default"`, `"auto"`, `"strict"`, or `"bypass"`.
+    ///
+    /// Issue #151: the server's operator-configured mode is a ceiling — a
+    /// request may only tighten it, never loosen it. An unknown value, or a
+    /// value that would loosen the operator mode, is a 400.
     pub permission_mode: Option<String>,
     /// Maximum API spend in USD for this run (issue #94). The run finishes
     /// with `finish_reason: "budget_exceeded"` at the first step boundary
@@ -1842,7 +1850,12 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "system_prompt": { "type": "string", "nullable": true },
                         "append_system_prompt": { "type": "string", "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
-                        "permission_mode": { "type": "string", "enum": ["default", "auto", "strict", "bypass"], "nullable": true },
+                        "permission_mode": {
+                            "type": "string",
+                            "enum": ["default", "auto", "strict", "bypass"],
+                            "nullable": true,
+                            "description": "Requested permission mode. The server's operator-configured mode is a ceiling: a request may tighten it, never loosen it. Unknown values, `bypass` when RECURSIVE_ALLOW_BYPASS_PERMISSIONS is unset, and any value that would loosen the operator mode are rejected with 400."
+                        },
                         "max_budget_usd": { "type": "number", "nullable": true }
                     },
                     "required": ["goal"]
@@ -1913,7 +1926,12 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "session_name": { "type": "string", "nullable": true },
                         "max_steps": { "type": "integer", "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
-                        "permission_mode": { "type": "string", "enum": ["default", "auto", "strict", "bypass"], "nullable": true },
+                        "permission_mode": {
+                            "type": "string",
+                            "enum": ["default", "auto", "strict", "bypass"],
+                            "nullable": true,
+                            "description": "Requested permission mode. The server's operator-configured mode is a ceiling: a request may tighten it, never loosen it. Unknown values, `bypass` when RECURSIVE_ALLOW_BYPASS_PERMISSIONS is unset, and any value that would loosen the operator mode are rejected with 400."
+                        },
                         "max_budget_usd": { "type": "number", "nullable": true },
                         "preset": { "type": "string", "nullable": true, "description": "issue #127: agent preset id; unknown ids are rejected with 400. See GET /presets." }
                     }
