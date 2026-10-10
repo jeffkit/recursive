@@ -16,6 +16,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -891,7 +892,8 @@ def _v3_setup(repo: Path, root: Path):
 
 
 def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None,
-              extra_handlers=None, agent="stub-agent", reviewer="stub-rev"):
+              extra_handlers=None, agent="stub-agent", reviewer="stub-rev",
+              extra_params=None):
     """直驱生产宿主循环（import 生产代码，非复制品）。
 
     extra_handlers：追加的裸 FlowCallback 实例（经宿主 _Adapter 包装分发，
@@ -910,7 +912,8 @@ def _drive_v3(issue_root, run_dir, state_path, max_retries=1, scripts=None,
         flow_obj=flowmod.self_improve_v2,
         handler_specs=specs,
         params={"goal": "#77 v3 harness", "repo": str(_REPO_HOLDER[0]),
-                "run_dir": str(run_dir), "agent": agent, "reviewer": reviewer},
+                "run_dir": str(run_dir), "agent": agent, "reviewer": reviewer,
+                **(extra_params or {})},
         issue_root=issue_root, run_dir=run_dir, state_path=state_path,
         max_node_retries=max_retries)
     return v, nodes
@@ -1446,6 +1449,67 @@ def s29_v3_恢复轮刷新agent_reviewer():
     assert not (run_new / "worktree").exists(), "不应走 L1 在新 run_dir 重建 worktree"
 
 
+def s44_恢复轮刷新按段档位键():
+    """`_refresh_identity` 必须覆盖**按段档位键**，不止 agent/reviewer。
+
+    ## 为什么必须钉死（评审 A/B 项）
+
+    `_refresh_identity` 原为**硬编码列表** `("agent","reviewer")`。一旦引入按段
+    分档（`impl_agent` 等），这些键不在列表里 ⇒ **不报错、只静默沿用 checkpoint
+    固化的旧档位** ⇒ 「改了配置但续跑仍用旧模型」。**该失效无法靠 run 日志的
+    model 发现**（日志显示的是旧档位的模型，看着正常），故必须有专门用例。
+
+    ## 为什么直接测函数而非走 harness 全链
+
+    走 harness 需要 flow 先在 context 里建立该键，而**当前 flow 尚未接线**
+    （`INPUT.impl_agent` 未声明）⇒ 只能走到「键不存在」的弱分支，**反转验证会
+    假通过**（实测：把实现改回硬编码列表后该用例仍绿）。故此处直接对
+    `_refresh_identity` 施压，语义无歧义，且两条分支都能被覆盖。
+    """
+    import types as _types
+
+    import self_improve_bridge_v2 as bridge
+
+    # 取出内嵌的 _refresh_identity 并绑定不同 params 复现（真实实现，非复制）
+    src = pathlib.Path(bridge.__file__).read_text(encoding="utf-8")
+    body = src[src.index("    def _refresh_identity(ctx):"):
+               src.index("    def _ckpt_load(")]
+    code = "\n".join(l[4:] if l.startswith("    ") else l for l in body.splitlines())
+
+    def _mk(params):
+        ns = {"params": params}
+        exec(compile(code, "<refresh>", "exec"), ns)
+        return ns["_refresh_identity"]
+
+    # ① 键已存在（flow 已接线）⇒ 必须刷成本次派发值（硬编码列表会漏这条）
+    fn = _mk({"agent": "new-agent", "impl_agent": "new-seg"})
+    ctx = {"$INPUT": {"agent": "old-agent", "impl_agent": "old-seg"},
+           "$NODE": {"agent": "old-agent", "impl_agent": "old-seg"}}
+    out = fn(ctx)
+    assert out["$INPUT"]["impl_agent"] == "new-seg", \
+        f"已存在的按段键必须被刷新，实得 {out['$INPUT']['impl_agent']!r}（硬编码列表会静默沿用旧值）"
+    assert out["$NODE"]["agent"] == "new-agent", "既有 agent 刷新不得回归"
+
+    # ② 键不存在（首派未写入）⇒ 也应注入，否则恢复轮永远拿不到
+    fn2 = _mk({"impl_agent": "new-seg"})
+    ctx2 = {"$INPUT": {"agent": "a"}, "$NODE": {"agent": "a"}}
+    out2 = fn2(ctx2)
+    assert out2["$INPUT"].get("impl_agent") == "new-seg", \
+        "context 里还没有的按段键也应注入（否则恢复轮无从生效）"
+
+    # ③ 非身份键不得被误刷（run_dir 等锚点必须保持 checkpoint 原值）
+    fn3 = _mk({"impl_agent": "x", "run_dir": "/new"})
+    ctx3 = {"$INPUT": {"run_dir": "/old", "impl_agent": "old"}, "$NODE": {}}
+    out3 = fn3(ctx3)
+    assert out3["$INPUT"]["run_dir"] == "/old", \
+        "非身份键（run_dir 锚点）不得被刷新——必须仍指旧 run"
+
+    # ④ 空值不得覆盖（避免用空串抹掉有效档位）
+    fn4 = _mk({"impl_agent": ""})
+    ctx4 = {"$INPUT": {"impl_agent": "keep-me"}, "$NODE": {}}
+    assert fn4(ctx4)["$INPUT"]["impl_agent"] == "keep-me", "空值不应覆盖已有档位"
+
+
 # ═══ #83 AGENTRUN 活性检测（转录停更早杀 / 持续增长不误杀 / 缺省零变化）═══
 
 def _stall_fixture():
@@ -1773,6 +1837,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
              s27_v3_dryrun冒烟_真bridge无桩全图,
              s28_state_json原子写_永不截断,
              s29_v3_恢复轮刷新agent_reviewer,
+             s44_恢复轮刷新按段档位键,
              s37_活性检测_转录停更_提前击杀,
              s38_活性检测_转录持续增长_跑满预算不误杀,
              s39_活性检测_缺省关闭_不动AGENTRUN,

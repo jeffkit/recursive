@@ -491,7 +491,14 @@ def run_host_v3(*, flow_obj, handler_specs, params: dict, issue_root, run_dir: P
             if not val:
                 continue
             for holder in (ctx.get("$INPUT"), ctx.get("$NODE")):
-                if isinstance(holder, dict) and holder.get(key):
+                if not isinstance(holder, dict):
+                    continue
+                # 旧写法是 `and holder.get(key)` —— 只在键**已存在**时才刷新，
+                # 于是**新引入**的按段键（context 里本来没有）永远刷不进去，
+                # 只能靠首派写入。但恢复轮恰恰不会重注 params（本函数存在的
+                # 全部理由），故新键在恢复轮必然缺失 ⇒ flow 读不到 ⇒ 静默回退。
+                # 改为：键在 **context 或 params** 任一侧出现即写入（以 params 为准）。
+                if holder.get(key) or key in params:
                     holder[key] = val
         return ctx
 
