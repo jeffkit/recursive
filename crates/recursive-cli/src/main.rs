@@ -570,6 +570,11 @@ enum McpCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Issue #150: hide this process's `/proc/<pid>/environ` from same-uid
+    // children before any execution surface (tool transport, run_background,
+    // HTTP server) can spawn a shell. Must happen before `Cli::parse()` /
+    // `Config::from_env()` read the environment.
+    recursive::hardening::harden_process();
     let cli = Cli::parse();
     // --sandbox flag (issue §3): wins over RECURSIVE_SANDBOX when given, by
     // exporting it before any tool-set construction reads the env.
@@ -3895,6 +3900,18 @@ async fn next_weixin_request(
 mod tests {
     use super::*;
     use crate::cli::builder::build_runtime;
+
+    /// Issue #150: the CLI hardens the process at the top of `main()` so a
+    /// same-uid child cannot read the service process's credentials out of
+    /// `/proc/<ppid>/environ`. The helper must be safe to call more than
+    /// once (embedded runners and re-entrant tests do); the kernel-level
+    /// assertion lives in `src/hardening.rs` and
+    /// `tests/issue89_parent_environ.rs`.
+    #[test]
+    fn harden_process_is_idempotent() {
+        recursive::hardening::harden_process();
+        recursive::hardening::harden_process();
+    }
 
     fn dummy_config(tmp: &std::path::Path) -> Config {
         Config {

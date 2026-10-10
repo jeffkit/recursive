@@ -126,7 +126,14 @@ e2e/
    `env_clear` and re-adds only non-sensitive host vars (`RECURSIVE_*` and
    `*KEY*`/`*SECRET*`/`*TOKEN*`/`*AUTH*` names are dropped) before the
    explicit `env` pairs are applied.
+   Extension (issue #150): that scrub must not be bypassable through the
+   service process's own environment — on startup the CLI calls
+   `hardening::harden_process()` (`prctl(PR_SET_DUMPABLE, 0)`), which makes
+   the kernel refuse a same-uid child's `open()` of `/proc/<ppid>/environ`.
+   `remove_var` alone does not close this (the kernel environment block is
+   fixed at `execve` time and is not the C `environ` array).
    Automated tests: `tests/issue51_sandbox_env_inheritance.rs`,
+   `tests/issue89_parent_environ.rs`,
    `local_transport_exec_shell_scrubs_sensitive_env` (transport.rs)
 4. **Tests are non-negotiable.** Every new public function / tool / provider
    gets unit tests in the same file (`#[cfg(test)] mod tests`).

@@ -140,7 +140,10 @@ Per tier, **who does this tier defend against — and who does it not?**
   trusted input (a prompt-injected command deletes real files). One
   narrow exception: shell exec scrubs credential-shaped env vars before
   the child runs (issue #89), so a prompt-injected `printenv` cannot walk
-  off with the service's API keys / JWT secret.
+  off with the service's API keys / JWT secret. Since issue #150 the
+  process is additionally non-dumpable (`prctl(PR_SET_DUMPABLE, 0)` at
+  startup), so a same-uid child cannot read those credentials out of
+  `/proc/<ppid>/environ` either.
 - **`policy`**: defends against the agent's *mistakes* (wrong-path
   deletes, disallowed commands) via path/command allow-lists. Does **not**
   defend against malicious code: same kernel, same user, no syscall
@@ -213,7 +216,23 @@ segment (issue #89). This keeps the upstream LLM key
 The `Bash` tool's `env` argument schema
 (`src/tools/execution/shell.rs`) states this per-tier contract; the test
 `env_schema_description_matches_per_tier_reality` pins the wording.
+
+The scrub above only rewrites the *child's* environment block. A child can
+still read the service process's own environment out of
+`/proc/<ppid>/environ` on Linux (the default tier spawns `/bin/sh` as a
+direct child, so `$PPID` is the service process), and `remove_var` does not
+help — the kernel environment block is established at `execve` and is not
+the C `environ` array. Issue #150 closes that channel: `harden_process()`
+(`src/hardening.rs`) clears the process's dumpable attribute with
+`prctl(PR_SET_DUMPABLE, 0)`, making `/proc/<pid>/environ` root-owned so a
+same-uid child's open fails with `EACCES`. The CLI calls it at the top of
+`main()`; library embedders must call `recursive::hardening::harden_process()`
+themselves after process start. Non-Linux targets have no such channel and
+the function is a no-op. The trade-off is that core dumps are disabled for
+the process (intended — a dump would contain the same secrets).
+
 Regression tests: `tests/issue51_sandbox_env_inheritance.rs`,
+`tests/issue89_parent_environ.rs`,
 `local_transport_exec_shell_scrubs_sensitive_env`
 (`src/tools/transport_layer/transport.rs`).
 

@@ -145,6 +145,14 @@ zip = { version = "4.2.0", optional = true }
 serde_yaml_ng = "0.10.0"
 shell-words = "1"
 
+# Issue #150: `prctl(PR_SET_DUMPABLE, 0)` at startup hides the service
+# process's `/proc/<pid>/environ` from same-uid children. `libc` was not a
+# direct dependency before, but it is already in `Cargo.lock` (a
+# transitive dep of tokio/reqwest), so this adds no new crate to the
+# graph — see `.dev/journal/manual-20261010-issue150-parent-environ.md`.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 tempfile = "3"

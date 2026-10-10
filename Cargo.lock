@@ -3641,6 +3641,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
+ "libc",
  "mockito",
  "mutants",
  "opentelemetry",

@@ -9,6 +9,17 @@
 运行：  python3 test/flow_v2_paths.py
 桩点：  AgentRunNode/GateNode/GitPublishNode.execute 按 node 参数路由到脚本；
         CODE（preflight/has_changes）与 WRITEFILE 走真实现（真 git worktree）。
+
+环境要求（#149：裸检 / CI / 自托管三种宿主下结论必须一致）：
+- python3 + git + POSIX `ps`（s33/s41/s42 用 ps 判活、反查祖先链）；
+- `plaita` / `plaita_nodes` 可 import。`sandbox_agent` 节点类型经默认 registry
+  的 entry-points 发现；本机 pip metadata 落后源码时会缺它（2026-10-10/11 两次
+  实证），s43 自行走 `plaita_nodes.register_all()` 兜底（= 生产
+  `PLAITA_NODE_MODULES` 那条注册路径）。连该兜底都不可用 = 环境缺能力，记
+  **SKIP**（非 ERROR）——不把「装不出节点」报成产品回归；
+- **不需要** flow_worker / flowcast 宿主。s33 的「宿主已死」孤儿子树由一次性
+  中间人拉起（中间人随即退出 ⇒ 子进程被 reparent 到 init），故判据的输入
+  （祖先链上有没有存活宿主）与 harness 自己跑在谁的子树里无关。
 """
 from __future__ import annotations
 
@@ -40,6 +51,14 @@ GATE_SCRIPT = {}    # gate_name -> [exit_code, ...] 逐次弹出，末项常驻
 AGENT_SCRIPT = {}   # 路由键 -> 文本
 PUBLISH_RESULT = {"pushed": True, "merged": True, "note": "stub", "push_note": ""}
 PUBLISH_SCRIPT = []  # 逐次弹出，末项常驻；空则用 PUBLISH_RESULT（land 场景要 ff 先败）
+
+
+class SkipScenario(Exception):
+    """环境不满足（缺节点类型/依赖，或造不出场景前提）——runner 记 SKIP，不计失败。
+
+    #149：环境差异不得伪装成产品回归，也不得伪装成产品正确（旧版把结论随环境
+    翻成 spared 后照样 PASS）。凡是「本机装不出该能力」一律 SKIP 并写明原因。
+    """
 
 
 def _eval(node, execution, attr, default=""):
@@ -563,14 +582,66 @@ def s36_land_push_直推与护栏():
         "护栏命中时 origin/main 不得被污染"
 
 
-def _spawn_fake_agent(tmp: Path, *argv: str) -> subprocess.Popen:
-    """伪 recursive agent：真 argv 形态（kill-stale 只按 cmdline 识别）+ 独立会话。"""
+_DETACH_SRC = (
+    "import subprocess, sys\n"
+    "p = subprocess.Popen(sys.argv[1:], start_new_session=True,\n"
+    "                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "print(p.pid)\n")
+
+
+def _spawn_fake_agent(tmp: Path, *argv: str, detached: bool = False) -> subprocess.Popen:
+    """伪 recursive agent：真 argv 形态（kill-stale 只按 cmdline 识别）+ 独立会话。
+
+    detached=True：用**一次性中间人**拉起后随即退出 ⇒ 子进程被 reparent 到
+    init/launchd，祖先链上既无 harness 也无 harness 的宿主（自托管时 harness
+    自己跑在 flow_worker 子树里）。这是「宿主已死」孤儿唯一与环境无关的造法：
+    否则孤儿的祖先链会带上 harness 的宿主 ⇒ 判据正确地把它保下 ⇒ 断言结论随
+    harness 的运行环境漂移（#149）。"""
     exe = tmp / "recursive"
     if not exe.exists():
         exe.write_text("import time\ntime.sleep(300)\n")
+    if detached:
+        r = subprocess.run(
+            [sys.executable, "-c", _DETACH_SRC, sys.executable, str(exe)] + list(argv),
+            capture_output=True, text=True, check=True)
+        try:
+            pid = int(r.stdout.strip())
+        except ValueError:                     # 本机起不了中间人 = 环境不满足
+            raise SkipScenario(f"无法拉起脱离 harness 的子进程：stdout={r.stdout!r}") from None
+        return _Popen_attach(pid)
     return subprocess.Popen([sys.executable, str(exe)] + list(argv),
                             start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _ancestor_hits_production_host(pid: int) -> bool:
+    """孤儿祖先链上是否还有存活的生产宿主形态（= 产品 `_host_ancestor` 的判据）。
+
+    形态表与产品 preflight 内的 `host_pat` 同源常量，仅用于**场景前提自检**：
+    裸检下应为 False（链断在 init 之前），链上仍命中即说明本机没能把子进程
+    reparent 到 init。"""
+    pat = re.compile(r"plaita\.server"
+                     r"|python3? -m plaita\b"
+                     r"|self_improve_bridge"
+                     r"|self-improve\.flow\.js"
+                     r"|self_improve_engine"
+                     r"|launch-flow")
+    cur = pid
+    for _ in range(64):
+        r = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(cur)],
+                           capture_output=True, text=True).stdout.strip()
+        if not r:
+            return False              # 链断在表外 = 真孤儿形态
+        ppid_s, _, cmd = r.partition(" ")
+        if pat.search(cmd):
+            return True
+        try:
+            cur = int(ppid_s)
+        except ValueError:
+            return False
+        if cur <= 1:
+            return False
+    return False
 
 
 def _spawn_fake_flow_worker(tmp: Path, agent_argv: list) -> subprocess.Popen:
@@ -610,14 +681,16 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
       宿主反查，而非 --run-id 反查）；
     - 自身/自身进程组 → 必活（流程跑到 committed 即证明没自杀）。
 
-    环境护栏（2026-10-09）：fixture 孤儿经 Popen 从 harness 进程树拉起；当
-    harness 本身跑在 recursive agent 里（v2 console/worker 路径自举，即本仓
-    的自托管形态）时，孤儿的祖先链上**真有** plaita flow_worker ⇒ 判据正确地
-    把它保下（spared）。这否证不了 #148——孤儿「宿主已死」的语义在自托管
-    环境里无法用子进程伪造（真孤儿只能来自真实死亡的生产宿主）。处置：
-    检测到孤儿的祖先链命中本机生产宿主形态时，跳过「孤儿被杀」断言并要求
-    日志里有对应 spared 行（判据行为仍被验证，只是结论从 killed 变 spared）；
-    独立 runner（CI / 交互终端）下无此祖先 ⇒ 照常断言必杀。"""
+    环境无关性（#149 重做）：fixture 孤儿用**一次性中间人**拉起（`detached=True`，
+    见 `_spawn_fake_agent`）——中间人随即退出 ⇒ 孤儿被 reparent 到 init，祖先链
+    上既无 harness 也无 harness 的宿主。于是「宿主已死」在任何宿主下都成立，
+    「必杀」是**无条件**断言，不再随 harness 跑在谁的子树里翻面。
+
+    旧实现（2026-10-09 #148 值守）把孤儿挂在 harness 进程树里：自托管（harness
+    跑在 flow_worker 子树里）时判定为 spared、裸检时判定为 killed，两条分支各自
+    断言 ⇒ 同一份代码结论随运行环境漂移，验收者无法区分产品回归与环境差异
+    （#149 实证 41/43）。现改为先自检**场景前提**（孤儿祖先链上不得有生产宿主），
+    前提不成立才 SKIP——仍然不把环境差异混进产品判据。"""
     repo, root = make_repo()
     old_wt = repo / ".flowcast" / "runs" / "pipeline-77-old" / "worktree"
     live_wt = repo / ".flowcast" / "runs" / "pipeline-88-live" / "worktree"
@@ -629,18 +702,30 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
     try:
         v2_orphan = _spawn_fake_agent(
             tmp, "--workspace", str(old_wt), "--output-format", "json",
-            "--permission-mode", "auto", "run", "stub")
+            "--permission-mode", "auto", "run", "stub", detached=True)
+        procs.append(v2_orphan)     # 逐个登记：中途 SKIP 也不漏清现场
         v1_orphan = _spawn_fake_agent(
             tmp, "--transcript-out", str(old_wt.parent / "transcript.json"),
-            "--workspace", str(repo))
+            "--workspace", str(repo), detached=True)
+        procs.append(v1_orphan)
         # 兄弟 run：agent 由伪 flow_worker 拉起（其子进程），全链无 --run-id
         worker = _spawn_fake_flow_worker(
             tmp, ["--workspace", str(live_wt), "--output-format", "json",
                   "--permission-mode", "auto", "run", "stub"])
+        procs.append(worker)
         sib_agent = _child_of(worker)
-        procs = [v2_orphan, v1_orphan, worker]
         time.sleep(1.0)
         assert sib_agent is not None, "伪 flow_worker 应已拉起兄弟 agent"
+
+        # 场景前提自检（#149，必须在 preflight 之前——杀完就看不出祖先链了）：
+        # 孤儿脱离 harness 后，其祖先链上不得再有存活的生产宿主形态。有则说明
+        # 本环境没把它 reparent 到 init（异常 subreaper 等），「宿主已死」前提
+        # 不成立 ⇒ SKIP，而不是把结论翻成 spared 后照样 PASS。
+        for tag, orphan in (("--workspace", v2_orphan), ("--transcript-out", v1_orphan)):
+            if _ancestor_hits_production_host(orphan.pid):
+                raise SkipScenario(
+                    f"{tag} 孤儿的祖先链仍命中生产宿主形态——本环境无法构造"
+                    "「宿主已死」孤儿（子进程未 reparent 到 init）")
 
         AGENT_SCRIPT.update({"impl": "@WRITE", "review": "VERDICT:PASS"})
         GATE_SCRIPT.update({"fmt": [0], "clippy": [0], "test": [0]})
@@ -651,56 +736,13 @@ def s33_kill_stale_只杀本仓旧run孤儿_不碰自身与兄弟run():
         log = Path(v["_run_dir"]) / "kill-stale.log"
         assert log.exists(), "kill-stale 必须留痕（#94 事故无任何留痕）"
         text = log.read_text()
-        # 自托管护栏（见 docstring）：harness 自身跑在 recursive/flow_worker
-        # 子树里时，fixture 孤儿按判据**应该**被 spared（祖先链命中生产宿主）；
-        # 此时断言 spared 行在、killed 不在，其余判据照走。独立 runner 下照常
-        # 断言必杀。
-        def _ancestor_hits_production_host(pid) -> bool:
-            pat = re.compile(r"plaita\.server"
-                             r"|python3? -m plaita\b"
-                             r"|self_improve_bridge"
-                             r"|self-improve\.flow\.js"
-                             r"|self_improve_engine"
-                             r"|launch-flow")
-            cur = pid
-            for _ in range(64):
-                r = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(cur)],
-                                   capture_output=True, text=True).stdout.strip()
-                if not r:
-                    return False          # 链断在表外 = 真孤儿形态
-                ppid_s, _, cmd = r.partition(" ")
-                if pat.search(cmd):
-                    return True
-                try:
-                    cur = int(ppid_s)
-                except ValueError:
-                    return False
-                if cur <= 1:
-                    return False
-            return False
-
-        selfhosted_v2 = _ancestor_hits_production_host(v2_orphan.pid)
-        # v1 孤儿与 v2 孤儿同树拉起，宿主链命运一致
-        selfhosted_v1 = _ancestor_hits_production_host(v1_orphan.pid)
-        if selfhosted_v2:
-            # 判据把 fixture 孤儿当自家 run 的 agent 保下——必须留 spared 取证行
-            assert f"spared pid={v2_orphan.pid} run=pipeline-77-old host=" in text, \
-                f"自托管下 fixture 孤儿应被 spared 且留取证行: {text}"
-            assert f"killed pid={v2_orphan.pid} " not in text, \
-                f"自托管下不得杀 fixture 孤儿（宿主链活着）: {text}"
-        else:
-            assert v2_orphan.poll() is not None, \
-                "旧 run 孤儿（--workspace 形态）应被清掉"
-            assert f"killed pid={v2_orphan.pid} " in text, \
-                f"被杀清单缺 v2 孤儿: {text}"
-        if selfhosted_v1:
-            assert f"spared pid={v1_orphan.pid} run=pipeline-77-old host=" in text, \
-                f"自托管下 v1 形态 fixture 孤儿应被 spared: {text}"
-        else:
-            assert v1_orphan.poll() is not None, \
-                "旧 run 孤儿（--transcript-out 形态）应被清掉"
-            assert f"killed pid={v1_orphan.pid} " in text, \
-                f"被杀清单缺 v1 孤儿: {text}"
+        # 真孤儿照杀（前提已自检，见上方）——无条件断言，不看 harness 跑在哪。
+        assert v2_orphan.poll() is not None, "旧 run 孤儿（--workspace 形态）应被清掉"
+        assert f"killed pid={v2_orphan.pid} " in text, f"被杀清单缺 v2 孤儿: {text}"
+        assert v1_orphan.poll() is not None, "旧 run 孤儿（--transcript-out 形态）应被清掉"
+        assert f"killed pid={v1_orphan.pid} " in text, f"被杀清单缺 v1 孤儿: {text}"
+        assert f"spared pid={v2_orphan.pid} " not in text, \
+            f"宿主已死的孤儿不得被 spared: {text}"
         assert sib_agent.poll() is None, \
             "兄弟 run 的 agent 不得被杀（#148 同仓并发互杀）"
 
@@ -774,22 +816,48 @@ def _Popen_attach(pid: int):
     return _P(pid)
 
 
+def _ensure_sandbox_agent_node() -> str:
+    """确保 `sandbox_agent` 在默认 registry；返回 ""=可用，否则返回不可用的原因。
+
+    #149：sbx 源码的 `@flow` 装饰器在 **import 期**校验节点类型，缺 `sandbox_agent`
+    就 import 失败。生产 worker 有两条注册路径（plaita/server/flow_worker.py）：
+      ① 默认 registry 懒发现 `plaita.nodes` entry-points（pip 安装态）——本机
+         pip metadata 落后源码时缺该类型（2026-10-10/11 两次实证：装的是 0.6.0，
+         源码 0.8.0 才把 `sandbox_agent` 加进 pyproject）；
+      ② `PLAITA_NODE_MODULES=plaita_nodes` → 模块 `register_all()`（源码态）。
+    harness 走 ② 显式兜底：与生产「源码引入」路径同源且幂等，结论不再取决于本机
+    entry-points 的新旧；连 ② 都不可用 = 环境缺能力，由调用方记 SKIP。
+
+    旧实现把注册藏在 `except Exception` 里按错误文本匹配、失败即上抛 ⇒ 同一环境
+    差异在裸检下表现为 ERROR（#149 实证），验收者误判为产品回归。
+    """
+    try:
+        from plaita.node import get_default_registry
+
+        reg = get_default_registry()          # 懒发现 entry-points（生产同款）
+        if reg.get("sandbox_agent") is None:
+            import plaita_nodes
+
+            plaita_nodes.register_all()
+        if reg.get("sandbox_agent") is None:
+            return "registry 无 sandbox_agent（entry-points 与 register_all 都没给）"
+    except Exception as e:                     # 缺依赖/包不可用 = 环境不满足
+        return f"{type(e).__name__}: {e}"
+    return ""
+
+
 def s43_kill_stale判据_v2与sbx变体同源_产物不落后():
     """#148：孤儿判据改动必须同时进 v2 与 sbx（同一函数两处拷贝），且两个
     编译产物同步——任何一处漂移都会让沙箱灰度侧与 v2 侧判据分叉，或让
-    console 发布链拿着旧 definition 继续互杀。"""
-    # sbx 源码 import 需要 sandbox_agent 在 registry（@flow 装饰器 import 期
-    # 即校验）。生产 worker 走 entry-points 装载（含 console 发布链），但本机
-    # pip metadata 落后源码时 entry-points 缺该类型——显式 register_all 兜底
-    # （幂等：生产路径重复注册无害；缺依赖才抛，与源码真实可用性一致）。
-    try:
-        import self_improve_flow_v2_sbx as sbx
-    except Exception as e:
-        if "sandbox_agent" not in str(e):
-            raise
-        import plaita_nodes
-        plaita_nodes.register_all()
-        import self_improve_flow_v2_sbx as sbx
+    console 发布链拿着旧 definition 继续互杀。
+
+    环境（#149）：本场景要先 import sbx 源码，而它需要 `sandbox_agent` 在
+    registry 里（@flow 装饰器 import 期校验）——由 `_ensure_sandbox_agent_node()`
+    显式兜底；环境装不出该节点则 SKIP，不报 ERROR。"""
+    why = _ensure_sandbox_agent_node()
+    if why:
+        raise SkipScenario(f"环境缺 sandbox_agent 节点：{why}")
+    import self_improve_flow_v2_sbx as sbx
     v2_code = _node_code("pre")
     sbx_code = _find_code(sbx.self_improve_v2_sbx.__plaita_ir__["nodes"], "pre")
 
@@ -1985,7 +2053,7 @@ SCENARIOS = [s1_全绿首跑, s2_fmt首检红_修后绿, s3_clippy两连红_fail
 if __name__ == "__main__":
     _patch()
     failed = []
-
+    skipped = []
 
     for s in SCENARIOS:
         CALLS.clear(); GATE_SCRIPT.clear(); AGENT_SCRIPT.clear()
@@ -1993,11 +2061,18 @@ if __name__ == "__main__":
         try:
             s()
             print(f"  PASS  {s.__name__}")
+        except SkipScenario as e:
+            # 环境不满足 ≠ 产品回归：记 SKIP 并写明原因，不计失败（#149）。
+            skipped.append(s.__name__)
+            print(f"  SKIP  {s.__name__}: {e}")
         except AssertionError as e:
             failed.append(s.__name__)
             print(f"  FAIL  {s.__name__}: {e}")
         except Exception as e:
             failed.append(s.__name__)
             print(f"  ERROR {s.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{len(SCENARIOS)-len(failed)}/{len(SCENARIOS)} passed")
-
+    # #149：报告里区分 SKIP 与 PASS（环境缺依赖时不再伪装成全通过）
+    tail = f"\n{len(SCENARIOS)-len(failed)-len(skipped)}/{len(SCENARIOS)} passed"
+    if skipped:
+        tail += f"（SKIP {len(skipped)}：{'、'.join(skipped)}）"
+    print(tail)

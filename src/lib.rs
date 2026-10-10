@@ -36,6 +36,7 @@ pub mod deliverables;
 pub mod error;
 pub mod eval;
 pub mod event;
+pub mod hardening;
 pub mod hooks;
 #[cfg(feature = "http")]
 pub mod http;
