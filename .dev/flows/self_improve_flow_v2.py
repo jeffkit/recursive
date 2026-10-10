@@ -349,8 +349,21 @@ def self_improve_v2(INPUT):
         "    # 里检索本 issue 最新的会话目录名（= session id）。找到且本次是续跑\n"
         "    # 分支时交给 impl 走 resume——agent 带全量上下文接着干，不再重读重划。\n"
         "    last_sid = \"\"\n"
+        "    # 首选：run_dir/session.json（本 flow 于 2026-10-11 起在 impl 后写入）。\n"
+        "    # 为什么要这条：原检索依赖 RECURSIVE_SESSIONS_DIR 里的 transcript.jsonl/\n"
+        "    # meta.json —— 那是 **recursive 的会话格式**。换 executor（cursor 等）后\n"
+        "    # 会话落在各自的位置（cursor 在 ~/.cursor/chats），扫不到 ⇒ last_sid 恒空\n"
+        "    # ⇒ engine_error 重派后 impl 每次全新会话、丢上下文重做。\n"
+        "    # 与下方扫盘互补而非取代：文件在（本 flow 写过）就用它，缺则回退旧检索。\n"
+        "    if resumed:\n"
+        "        try:\n"
+        "            _sf = Path(run_dir) / \"session.json\"\n"
+        "            if _sf.exists():\n"
+        "                last_sid = str(json.loads(_sf.read_text(encoding=\"utf-8\")).get(\"session_id\") or \"\")\n"
+        "        except Exception:\n"
+        "            last_sid = \"\"\n"
         "    sroot = os.environ.get(\"RECURSIVE_SESSIONS_DIR\", \"\")\n"
-        "    if sroot and resumed:\n"
+        "    if not last_sid and sroot and resumed:\n"
         "        cands = []\n"
         "        for root, dirs, files in os.walk(sroot):\n"
         "            if \"transcript.jsonl\" in files or \"meta.json\" in files:\n"
@@ -438,6 +451,35 @@ def self_improve_v2(INPUT):
     # 单节点无分支。
     impl = AGENTRUN(agent=agent, prompt=goal, repo=pre.worktree, timeout_secs=impl_timeout,
                     session=pre.last_sid)
+    # 会话落盘（2026-10-11，L2 加固）：把本轮的 session_id 写进 run_dir，供
+    # **engine_error 重派后的下一轮**在 pre 段直接读回、走 resume 续上下文。
+    #
+    # 为什么不能只靠扫 RECURSIVE_SESSIONS_DIR：那是 recursive 的会话格式
+    # （transcript.jsonl/meta.json）。换 executor 后（cursor 在 ~/.cursor/chats）
+    # 扫不到 ⇒ last_sid 恒空 ⇒ 重派即全新会话、丢上下文重做。本节点与 executor
+    # 无关（session_id 由 agentproc 的 parse_event 统一回传，见 AGENTRUN 输出契约），
+    # 故对所有 executor 一致生效。
+    #
+    # 失败不阻断主流程（写不进就没有续跑能力，等价改动前行为）——用 CODE 节点
+    # 而非表达式：DSL 表达式不支持 dict/json 序列化（见上方 DSL 限制注释）。
+    sid_dump = CODE(
+        id="session_dump", lang="python",
+        input={"run_dir": run_dir, "sid": impl.session_id, "agent": agent},
+        code=(
+            "import json\n"
+            "from pathlib import Path\n"
+            "def run(input):\n"
+            "    rd = Path(input[\"run_dir\"]); rd.mkdir(parents=True, exist_ok=True)\n"
+            "    sid = str(input.get(\"sid\") or \"\")\n"
+            "    # 空 sid（agentproc 未回传 / 单测桩）不写：写了空值会让 pre 段\n"
+            "    # 误判「有会话」而传空串，与不写等价但更难排查。\n"
+            "    if sid:\n"
+            "        (rd / \"session.json\").write_text(\n"
+            "            json.dumps({\"session_id\": sid,\n"
+            "                        \"agent\": input.get(\"agent\") or \"\"},\n"
+            "                       ensure_ascii=False), encoding=\"utf-8\")\n"
+            "    return {\"written\": bool(sid)}\n"
+        ))
     chg = CHILD(input={"wt": pre.worktree, "base": pre.land_base}, flow=has_changes)
     if chg.any == False:
         return {"verdict": "skip-commit", "stage": "commit",
