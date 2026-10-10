@@ -590,8 +590,32 @@ def self_improve_v2(INPUT):
     # 评审段赋值名一律带序号：rev1/rev2/wfr/wfr2。
     rev1 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                     timeout_secs=5400)
-    if F.contains(rev1.text, "VERDICT:PASS") != True:
-        if F.contains(rev1.text, "VERDICT:NEEDS_FIX") != True:
+    # 判定解析（2026-10-11 加固）：取**末行**严格匹配，取代旧的全文子串搜索。
+    # 旧判据先判 PASS 且用 `in` 语义 ⇒ reviewer 正文只要出现 "VERDICT:PASS"
+    # （例如**复述输出格式要求**，而提示词本身含这两个字面量）就会把真值
+    # NEEDS_FIX 判成 PASS、短路跳过修复环 ⇒ **坏代码直接进 land**。
+    # 实测复现（cursor-sonnet46，要求先复述格式再判定）：
+    #   含PASS=True 含NEEDS_FIX=True 末行=VERDICT:NEEDS_FIX 旧判据→PASS（危险）
+    # 注意：code= 不能引用模块常量（见本文件上方 codeflow 实锤坑），故内联。
+    v1 = CODE(id="rev1_verdict", lang="python", input={"text": rev1.text}, code=(
+            "def run(input):\n"
+            "    t = str(input.get(\"text\") or \"\").rstrip()\n"
+            "    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]\n"
+            "    tail = lines[-3:] if lines else []\n"
+            "    # 只在**末尾 3 行**判定（不看全文，避免正文引用污染），\n"
+            "    # 且 **NEEDS_FIX 优先**：任一末行命中即判不通过，绝不因正文\n"
+            "    # 出现过 PASS 而短路（旧判据的事故成因，见上方注释）。\n"
+            "    for ln in reversed(tail):\n"
+            "        if \"VERDICT:NEEDS_FIX\" in ln:\n"
+            "            return {\"verdict\": \"needs_fix\", \"line\": ln[:120]}\n"
+            "    for ln in reversed(tail):\n"
+            "        if \"VERDICT:PASS\" in ln:\n"
+            "            return {\"verdict\": \"pass\", \"line\": ln[:120]}\n"
+            "    return {\"verdict\": \"unavailable\",\n"
+            "            \"line\": (lines[-1][:120] if lines else \"\")}\n"
+        ))
+    if v1.verdict != "pass":
+        if v1.verdict != "needs_fix":
             wfr = WRITEFILE(path=F.concat(run_dir, "/review-unavailable.log"),
                             content=rev1.text)
             return {"verdict": "failed-preserved", "stage": "review",
@@ -603,7 +627,24 @@ def self_improve_v2(INPUT):
         AGENTRUN(agent=agent, prompt=fix_prompt, repo=pre.worktree, timeout_secs=7200)
         rev2 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                         timeout_secs=5400)
-        if F.contains(rev2.text, "VERDICT:PASS") != True:
+        v2 = CODE(id="rev2_verdict", lang="python", input={"text": rev2.text}, code=(
+            "def run(input):\n"
+            "    t = str(input.get(\"text\") or \"\").rstrip()\n"
+            "    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]\n"
+            "    tail = lines[-3:] if lines else []\n"
+            "    # 只在**末尾 3 行**判定（不看全文，避免正文引用污染），\n"
+            "    # 且 **NEEDS_FIX 优先**：任一末行命中即判不通过，绝不因正文\n"
+            "    # 出现过 PASS 而短路（旧判据的事故成因，见上方注释）。\n"
+            "    for ln in reversed(tail):\n"
+            "        if \"VERDICT:NEEDS_FIX\" in ln:\n"
+            "            return {\"verdict\": \"needs_fix\", \"line\": ln[:120]}\n"
+            "    for ln in reversed(tail):\n"
+            "        if \"VERDICT:PASS\" in ln:\n"
+            "            return {\"verdict\": \"pass\", \"line\": ln[:120]}\n"
+            "    return {\"verdict\": \"unavailable\",\n"
+            "            \"line\": (lines[-1][:120] if lines else \"\")}\n"
+        ))
+        if v2.verdict != "pass":
             # 第二轮修复（2026-10-05 jeffkit 拍板「review 修复可以多加一两轮」）：
             # 首轮修后仍 NEEDS_FIX 时再修一轮、再复审定论；仍不过才 preserved。
             # 代价上界 = 每轮 fix(≤7200s) + review(≤5400s)；若撞 8h 运行墙由
@@ -616,7 +657,24 @@ def self_improve_v2(INPUT):
                             timeout_secs=7200)
             rev3 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
                             timeout_secs=5400)
-            if F.contains(rev3.text, "VERDICT:PASS") != True:
+            v3 = CODE(id="rev3_verdict", lang="python", input={"text": rev3.text}, code=(
+            "def run(input):\n"
+            "    t = str(input.get(\"text\") or \"\").rstrip()\n"
+            "    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]\n"
+            "    tail = lines[-3:] if lines else []\n"
+            "    # 只在**末尾 3 行**判定（不看全文，避免正文引用污染），\n"
+            "    # 且 **NEEDS_FIX 优先**：任一末行命中即判不通过，绝不因正文\n"
+            "    # 出现过 PASS 而短路（旧判据的事故成因，见上方注释）。\n"
+            "    for ln in reversed(tail):\n"
+            "        if \"VERDICT:NEEDS_FIX\" in ln:\n"
+            "            return {\"verdict\": \"needs_fix\", \"line\": ln[:120]}\n"
+            "    for ln in reversed(tail):\n"
+            "        if \"VERDICT:PASS\" in ln:\n"
+            "            return {\"verdict\": \"pass\", \"line\": ln[:120]}\n"
+            "    return {\"verdict\": \"unavailable\",\n"
+            "            \"line\": (lines[-1][:120] if lines else \"\")}\n"
+        ))
+            if v3.verdict != "pass":
                 wfr3 = WRITEFILE(path=F.concat(run_dir, "/review-failure.log"),
                                  content=rev3.text)
                 return {"verdict": "failed-preserved", "stage": "review",
