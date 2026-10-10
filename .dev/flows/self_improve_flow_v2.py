@@ -482,7 +482,7 @@ def self_improve_v2(INPUT):
     # 而非表达式：DSL 表达式不支持 dict/json 序列化（见上方 DSL 限制注释）。
     sid_dump = CODE(
         id="session_dump", lang="python",
-        input={"run_dir": run_dir, "sid": impl.session_id, "agent": agent},
+        input={"run_dir": run_dir, "sid": impl.session_id, "agent": impl_agent},
         code=(
             "import json\n"
             "from pathlib import Path\n"
