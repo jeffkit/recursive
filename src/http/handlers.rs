@@ -94,6 +94,61 @@ pub(super) async fn ensure_session_access_by_id(
     }
 }
 
+/// Issue #152: authorise access to an AG-UI thread before its transcript is
+/// read or written.
+///
+/// A thread is a session addressed by a client-chosen id, so it gets the same
+/// ownership rule `/sessions` applies ([`AuthIdentity::may_access_session`]):
+/// the `.meta.json` written when the thread was first created records its
+/// `owner` / `tenant`, and a caller reaches it only as that identity or as an
+/// admin. A thread with no `.meta.json` yet is new — there is no history to
+/// leak, and its first run records the caller as owner.
+///
+/// `identity == None` means auth is disabled (single-user deployment / the
+/// debug escape hatch): the legacy pass-through, no check and no owner
+/// recorded.
+fn ensure_agui_thread_access(
+    identity: Option<&AuthIdentity>,
+    workspace: &std::path::Path,
+    thread_id: &str,
+) -> Result<(), ApiError> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    let Some(dir) = super::agui::agui_session_dir(workspace, thread_id) else {
+        return Ok(());
+    };
+    // No metadata: a thread nobody has written yet. (Resolving the directory
+    // may have migrated a pre-#57 thread into the native layout, which does
+    // synthesize a meta — that one lands in the branch below, unattributed,
+    // and is therefore admins-only.)
+    if !dir.join(".meta.json").is_file() {
+        return Ok(());
+    }
+    // A meta that cannot be read counts as unattributed — the same
+    // default-deny an older thread gets, rather than letting a corrupt file
+    // turn into a green light.
+    let meta = crate::session::SessionReader::load_meta(&dir).ok();
+    ensure_owned(
+        identity,
+        meta.as_ref().and_then(|m| m.owner.as_deref()),
+        meta.as_ref().and_then(|m| m.tenant.as_deref()),
+    )
+}
+
+/// Map the ownership [`ApiError`] from [`ensure_agui_thread_access`] onto the
+/// `/agui` endpoints' `(status, {status, error})` body shape, which the rest
+/// of those handlers already return.
+fn agui_api_error_response(e: ApiError) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        e.status,
+        Json(ErrorResponse {
+            status: "error".into(),
+            error: e.message,
+        }),
+    )
+}
+
 /// Issue #123: reserved storage key for the `/readyz` storage probe. No other
 /// code path reads or writes it, so it can never collide with a session
 /// transcript or a memory entry.
@@ -2643,6 +2698,7 @@ fn sse_message_from_canonical(msg: &crate::message::Message) -> Option<SseEvent>
 /// `super::agui` and is unit-tested there without an HTTP server.
 pub(super) async fn agui_run(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<AuthIdentity>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
@@ -2694,6 +2750,17 @@ pub(super) async fn agui_run(
                 }),
             )
         })?;
+
+    // Issue #152: an AG-UI thread is a session addressed by a client-chosen
+    // id, so it must get the same ownership check `/sessions` applies —
+    // otherwise any credential holder can resume, read or cancel another
+    // tenant's thread by naming it. The check runs BEFORE `prepare_run`,
+    // which reads (and, on a resume, rewrites) the thread's transcript, and
+    // under the fence above, so no competing run can create the thread's
+    // metadata between the check and the writer that opens below.
+    let identity = identity.map(|Extension(id)| id);
+    ensure_agui_thread_access(identity.as_ref(), &state.config.workspace, &input.thread_id)
+        .map_err(agui_api_error_response)?;
 
     // ── Transport-free prepare: resume/interrupt state machine ─────────
     // (Runs after the fence above — see the ordering invariant there.)
@@ -2874,6 +2941,8 @@ pub(super) async fn agui_run(
             run_guard,
             active_runs: Arc::clone(&state.agui_active_runs),
             seed_to_persist,
+            owner: identity.as_ref().map(|i| i.subject.clone()),
+            tenant: identity.as_ref().and_then(|i| i.tenant.clone()),
         },
     );
 
@@ -2962,15 +3031,29 @@ impl<S> Drop for CancelOnDrop<S> {
 /// Idempotent like `session_interrupt`: an unknown thread or an
 /// already-finished run answers `200 OK` with `"cancelled": false` —
 /// stopping something that already stopped is not an error.
+///
+/// Issue #152: a thread that belongs to another identity is refused with
+/// `403` before the registry is consulted — the same rule `POST /agui`
+/// applies to resuming it.
 pub(super) async fn agui_cancel(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<AuthIdentity>>,
     Path(thread_id): Path<String>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Issue #152: cancelling acts on the thread, so it needs the same
+    // ownership check a run does — otherwise any credential holder could
+    // stop another tenant's run by naming its thread id.
+    let identity = identity.map(|Extension(id)| id);
+    ensure_agui_thread_access(identity.as_ref(), &state.config.workspace, &thread_id)
+        .map_err(agui_api_error_response)?;
+    // Issue #152: the registry is keyed by the thread's session key (what
+    // `spawn_agui_run` inserts), not the raw thread id.
+    let key = crate::agui_session::thread_session_key(&thread_id);
     let token = state
         .agui_active_runs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&thread_id)
+        .get(&key)
         .cloned();
     let cancelled = token.is_some();
     if let Some(token) = token {
@@ -2981,11 +3064,11 @@ pub(super) async fn agui_cancel(
         );
         token.cancel();
     }
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "status": "interrupted",
         "thread_id": thread_id,
         "cancelled": cancelled,
-    }))
+    })))
 }
 
 /// Map a transport-free [`super::agui::PrepareAguiError`] onto its HTTP
@@ -3809,7 +3892,7 @@ mod tests {
             "runId": "r1",
             "messages": [{"id": "m1", "role": "user", "content": "hi"}],
         });
-        let (status, _err) = agui_run(State(state), Json(body))
+        let (status, _err) = agui_run(State(state), None, Json(body))
             .await
             .expect_err("expected SERVICE_UNAVAILABLE");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -6475,14 +6558,21 @@ mod tests {
             .agui_active_runs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert("t-cancel".into(), token.clone());
+            .insert(
+                crate::agui_session::thread_session_key("t-cancel"),
+                token.clone(),
+            );
 
-        let Json(res) = agui_cancel(State(Arc::clone(&state)), Path("t-cancel".into())).await;
+        let Json(res) = agui_cancel(State(Arc::clone(&state)), None, Path("t-cancel".into()))
+            .await
+            .expect("cancel must succeed for a registered thread");
         assert_eq!(res["status"], "interrupted");
         assert_eq!(res["cancelled"], true);
         assert!(token.is_cancelled(), "registered token must be cancelled");
 
-        let Json(res) = agui_cancel(State(state), Path("no-such-thread".into())).await;
+        let Json(res) = agui_cancel(State(state), None, Path("no-such-thread".into()))
+            .await
+            .expect("an unknown thread is still an idempotent success");
         assert_eq!(res["cancelled"], false, "unknown thread stays idempotent");
     }
 
@@ -6888,5 +6978,57 @@ mod tests {
         .expect_err("a foreign identity must not purge another session");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         assert!(path.exists(), "a refused purge must leave the transcript");
+    }
+
+    // ── Issue #152: AG-UI thread ownership ───────────────────────────────
+
+    /// `ensure_agui_thread_access` is the single authorisation point for the
+    /// AG-UI channel: the owner and an admin pass, a foreign identity (and a
+    /// pre-#152 unattributed thread) is refused, and a request with no
+    /// identity — auth disabled — keeps the legacy pass-through.
+    #[test]
+    fn agui_thread_access_enforces_owner_and_admin() {
+        let ws_tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let thread = "shared-thread";
+        drop(
+            crate::agui_session::open_thread_writer(
+                ws,
+                thread,
+                "goal",
+                "m",
+                "p",
+                None,
+                Some("alice"),
+                Some("acme"),
+            )
+            .expect("create the owner's thread"),
+        );
+
+        let alice = AuthIdentity {
+            subject: "alice".into(),
+            tenant: Some("acme".into()),
+            admin: false,
+        };
+        let bob = AuthIdentity {
+            subject: "bob".into(),
+            tenant: Some("acme".into()),
+            admin: false,
+        };
+        let root = AuthIdentity {
+            subject: "root".into(),
+            tenant: None,
+            admin: true,
+        };
+
+        assert!(ensure_agui_thread_access(Some(&alice), ws, thread).is_ok());
+        assert!(ensure_agui_thread_access(Some(&bob), ws, thread).is_err());
+        assert!(ensure_agui_thread_access(Some(&root), ws, thread).is_ok());
+        // Auth disabled: `None` identity means no check and no requirement
+        // that the thread be attributed (single-user deployment).
+        assert!(ensure_agui_thread_access(None, ws, thread).is_ok());
+        // A thread nobody has written yet has no history to leak, so its
+        // first caller — whoever wins the race — is let through.
+        assert!(ensure_agui_thread_access(Some(&bob), ws, "brand-new").is_ok());
     }
 }

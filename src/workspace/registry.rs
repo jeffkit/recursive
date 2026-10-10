@@ -1012,6 +1012,8 @@ mod tests {
             derived_from: None,
             finish_reason: None,
             error: None,
+            owner: None,
+            tenant: None,
         };
         std::fs::write(
             session_dir.join(".meta.json"),

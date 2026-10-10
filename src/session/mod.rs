@@ -624,6 +624,18 @@ pub struct SessionMeta {
     /// reason, since those are data, not errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Issue #152: subject that created the session/thread, recorded the
+    /// first time a caller-addressed session (an AG-UI thread, whose id the
+    /// client picks) is written so later access can be authorised. `None`
+    /// for timestamped CLI sessions and for files written before the field
+    /// existed — an unattributed thread is reachable by admins only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Issue #152: the owner's tenant, the second half of the ownership key
+    /// (two tenants can mint the same `sub`). `None` when the owner has no
+    /// tenant and for every pre-#152 file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,6 +1520,8 @@ mod tests {
             derived_from: None,
             finish_reason: None,
             error: None,
+            owner: None,
+            tenant: None,
         }
     }
 

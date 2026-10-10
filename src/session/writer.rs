@@ -173,6 +173,8 @@ impl SessionWriter {
             derived_from: None,
             finish_reason: None,
             error: None,
+            owner: None,
+            tenant: None,
         };
 
         // Write initial meta file (atomic: temp + rename to prevent corruption).
@@ -250,6 +252,8 @@ impl SessionWriter {
             derived_from: None,
             finish_reason: None,
             error: None,
+            owner: None,
+            tenant: None,
         };
         let meta_path = session_dir.join(".meta.json");
         let meta_json = serde_json::to_string_pretty(&meta)
@@ -657,6 +661,34 @@ impl SessionWriter {
         meta.model = model.to_string();
         meta.provider = provider.to_string();
         meta.preset = preset.map(|s| s.to_string());
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
+        }
+    }
+
+    /// Record the identity that owns this session (issue #152).
+    ///
+    /// Called once, when a caller-addressed session (an AG-UI thread) is
+    /// first created. Like [`SessionWriter::set_derived_from`] this is a
+    /// read-modify-write on `.meta.json` rather than a value held until
+    /// `finish()`: ownership is a creation-time fact, and `open_or_create`
+    /// re-reads the meta on later runs without reconstructing the writer.
+    ///
+    /// `owner = None` (auth disabled) leaves the meta unattributed, which the
+    /// access check reads as admins-only — the pre-#152 default.
+    pub fn set_owner(&mut self, owner: Option<&str>, tenant: Option<&str>) {
+        let Some(owner) = owner else {
+            return;
+        };
+        let meta_path = self.session_dir.join(".meta.json");
+        let Ok(bytes) = std::fs::read(&meta_path) else {
+            return;
+        };
+        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+            return;
+        };
+        meta.owner = Some(owner.to_string());
+        meta.tenant = tenant.map(|t| t.to_string());
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
         }

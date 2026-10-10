@@ -718,7 +718,9 @@ pub struct AppState {
     /// restart (`cold_load::get_or_load_session`).
     pub storage: Arc<dyn StorageBackend>,
     /// Issue #66: cancellation tokens for in-flight `/agui` runs, keyed by
-    /// AG-UI thread id. `agui_run` inserts a fresh token before spawning its
+    /// the thread's session key (`agui_session::thread_session_key`, issue
+    /// #152) — the same namespace the run fence and the thread's directory
+    /// use. `agui_run` inserts a fresh token before spawning its
     /// driver task and removes the entry on completion; the disconnect guard
     /// on the SSE body and `POST /agui/{thread_id}/cancel` both cancel it.
     /// AG-UI runs have no `SessionState` row, so they cannot reuse the

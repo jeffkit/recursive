@@ -233,6 +233,10 @@ fn build_meta(input: &MirrorInput<'_>) -> SessionMeta {
         derived_from: None,
         finish_reason: None,
         error: None,
+        // The mirror is written by the `/sessions` path, where ownership
+        // lives in the persisted (issue #98) metadata blob, not here.
+        owner: None,
+        tenant: None,
     }
 }
 

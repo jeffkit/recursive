@@ -1108,14 +1108,22 @@ pub(crate) struct AguiRunContext {
     /// task so the fence stays closed for the whole background run — a
     /// second run for the same thread gets 409 until this drops.
     pub run_guard: crate::session_host::ActiveRunGuard,
-    /// Issue #66: the AppState-level cancel registry (thread id → token).
-    /// Borrowed only to insert/remove this run's own entry.
+    /// Issue #66: the AppState-level cancel registry
+    /// (`thread_session_key` → token, issue #152). Borrowed only to
+    /// insert/remove this run's own entry.
     pub active_runs: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Issue #147: the client's history to write into a thread the server
     /// has never seen before the run starts (see
     /// [`PreparedAguiRun::seed_is_new_history`]). Empty on every other path —
     /// a resumed or already-existing thread's history is on disk already.
     pub seed_to_persist: Vec<crate::message::Message>,
+    /// Issue #152: identity that owns this run's thread. Recorded on the
+    /// thread's `.meta.json` when this run is the one that creates it, so
+    /// `POST /agui` / `/agui/{id}/cancel` can authorise later callers. `None`
+    /// when auth is disabled (single-user deployment, legacy behaviour).
+    pub owner: Option<String>,
+    /// Issue #152: the owner's tenant, the second half of the ownership key.
+    pub tenant: Option<String>,
 }
 
 /// Spawn the AG-UI run driver.
@@ -1152,6 +1160,8 @@ pub(crate) fn spawn_agui_run(
         run_guard,
         active_runs,
         seed_to_persist,
+        owner,
+        tenant,
     } = ctx;
     let (sse_tx, sse_rx) = mpsc::unbounded_channel::<ag::Event>();
 
@@ -1168,6 +1178,8 @@ pub(crate) fn spawn_agui_run(
         &model,
         &provider,
         preset.as_deref(),
+        owner.as_deref(),
+        tenant.as_deref(),
     )
     .map_err(|e| {
         tracing::warn!(
@@ -1198,15 +1210,19 @@ pub(crate) fn spawn_agui_run(
 
     // Issue #66 §3.3: install the per-run cancellation token on the
     // runtime (the kernel checks it between steps and mid-LLM-call) and
-    // register it under the thread id — the SSE body's disconnect guard
-    // and `POST /agui/{thread_id}/cancel` both cancel through this
-    // registry. The driver task removes the entry when the run finishes;
-    // cancelling a finished run is a no-op.
+    // register it under the thread's session key — the SSE body's disconnect
+    // guard and `POST /agui/{thread_id}/cancel` both cancel through this
+    // registry. Issue #152: the key is the thread directory's key
+    // (`thread_session_key`), the same namespace the run fence uses, so a
+    // raw thread id cannot collide with it or address a run by an id the
+    // directory mapping would not produce. The driver task removes the entry
+    // when the run finishes; cancelling a finished run is a no-op.
+    let active_run_key = crate::agui_session::thread_session_key(&thread_id);
     runtime.set_interrupt_token(cancel.clone());
     active_runs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(thread_id.clone(), cancel.clone());
+        .insert(active_run_key.clone(), cancel.clone());
 
     // Emit RunStarted up front so clients can render the run shell
     // before the first model token arrives.
@@ -1276,8 +1292,9 @@ pub(crate) fn spawn_agui_run(
     let drv_writer = writer.clone();
     // Issue #66: cancel-registry bookkeeping — the driver removes its
     // thread's token when the run finishes so a later run registers a
-    // fresh one.
-    let drv_thread_key = drv_thread.clone();
+    // fresh one. Issue #152: keyed by the thread's session key, matching
+    // the insert above.
+    let drv_thread_key = active_run_key;
 
     let driver_handle = tokio::spawn(async move {
         // Issue #66: hold the admission permit for the whole background run.

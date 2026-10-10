@@ -162,6 +162,12 @@ pub struct RunRecord<'a> {
 /// The returned handle is also what [`finalize_run`] closes the run's
 /// `.meta.json` / `cost.json` through — the same writer, so the run's status,
 /// prompts, message count and cost all describe the rows the sink wrote.
+///
+/// `owner` / `tenant` (issue #152) are the identity that created the thread.
+/// They are recorded on a thread the writer *creates*; an existing
+/// `.meta.json` is left alone, because its owner decided (and the caller
+/// already checked) access to this run.
+#[allow(clippy::too_many_arguments)] // thread id + session identity + owner
 pub fn open_thread_writer(
     workspace: &Path,
     thread_id: &str,
@@ -169,11 +175,17 @@ pub fn open_thread_writer(
     model: &str,
     provider: &str,
     preset: Option<&str>,
+    owner: Option<&str>,
+    tenant: Option<&str>,
 ) -> std::io::Result<Arc<Mutex<SessionWriter>>> {
     let dir = resolve_session_dir(workspace, thread_id)
         .ok_or_else(|| std::io::Error::other("cannot resolve AG-UI session directory"))?;
     std::fs::create_dir_all(&dir)?;
-    let writer = SessionWriter::open_or_create(&dir, goal, model, provider, preset)?;
+    let is_new = !dir.join(".meta.json").is_file();
+    let mut writer = SessionWriter::open_or_create(&dir, goal, model, provider, preset)?;
+    if is_new {
+        writer.set_owner(owner, tenant);
+    }
     Ok(Arc::new(Mutex::new(writer)))
 }
 
@@ -437,6 +449,11 @@ fn synthesize_meta_if_missing(dir: &Path, thread_id: &str) {
         derived_from: None,
         finish_reason: None,
         error: None,
+        // A migrated pre-#57 thread predates the identity model: it has no
+        // owner, so it is reachable by admins only (issue #152, matching the
+        // #85 default-deny for unattributed data).
+        owner: None,
+        tenant: None,
     };
     if let Ok(json) = serde_json::to_string_pretty(&meta) {
         let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
@@ -507,8 +524,17 @@ mod tests {
         msgs: &[Message],
         usage: Option<TokenUsage>,
     ) -> PathBuf {
-        let writer =
-            open_thread_writer(ws, thread, goal, "deepseek-chat", "deepseek", None).unwrap();
+        let writer = open_thread_writer(
+            ws,
+            thread,
+            goal,
+            "deepseek-chat",
+            "deepseek",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let usage_meta = usage
             .as_ref()
             .map(crate::session::UsageMeta::from_token_usage);
@@ -551,6 +577,76 @@ mod tests {
             assert!(key.len() == 21, "agui- + 16 hex chars, got {key}");
             assert!(key[5..].chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    // ── issue #152: thread ownership ─────────────────────────────────────
+
+    #[test]
+    fn a_new_thread_records_its_owner_and_keeps_it() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+
+        let dir = {
+            drop(
+                open_thread_writer(
+                    ws,
+                    "owned-thread",
+                    "goal",
+                    "deepseek-chat",
+                    "deepseek",
+                    None,
+                    Some("alice"),
+                    Some("acme"),
+                )
+                .unwrap(),
+            );
+            resolve_session_dir(ws, "owned-thread").unwrap()
+        };
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.owner.as_deref(), Some("alice"));
+        assert_eq!(meta.tenant.as_deref(), Some("acme"));
+
+        // Re-opening as another identity must NOT re-attribute the thread —
+        // access was already decided against the owner on disk.
+        drop(
+            open_thread_writer(
+                ws,
+                "owned-thread",
+                "goal",
+                "deepseek-chat",
+                "deepseek",
+                None,
+                Some("bob"),
+                None,
+            )
+            .unwrap(),
+        );
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.owner.as_deref(), Some("alice"), "owner is sticky");
+        assert_eq!(meta.tenant.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn owner_survives_finalize() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let writer = open_thread_writer(
+            ws,
+            "owned-run",
+            "goal",
+            "deepseek-chat",
+            "deepseek",
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+        finalize_run(&writer, record(None)).expect("finalize");
+        let dir = resolve_session_dir(ws, "owned-run").unwrap();
+        assert_eq!(
+            SessionReader::load_meta(&dir).unwrap().owner.as_deref(),
+            Some("alice")
+        );
     }
 
     // ── open_thread_writer + finalize_run: native layout + visibility ────
