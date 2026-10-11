@@ -22,6 +22,7 @@
 #![cfg(target_os = "linux")]
 
 use recursive::tools::shell::RunShell;
+use recursive::Tool;
 use serde_json::json;
 
 /// The issue's exact command: the shell spawned by the `Bash` tool is a
