@@ -137,12 +137,19 @@ impl Message {
 /// The single definition is shared by all four guard sites so they can never
 /// drift apart:
 ///
-/// * `run_core::finish_interrupted` — never *push* the empty shape;
-/// * `session::reader::SessionReader::load_messages` — filter rows already
-///   written to disk by a pre-fix binary, so a poisoned session is still
-///   openable;
-/// * `llm::openai::build_request` / `llm::anthropic::serialize_messages_anthropic`
-///   — belt-and-braces drop on the request path.
+/// * `llm::openai::build_request` (`is_droppable_empty_assistant`) and
+///   `llm::anthropic::serialize_messages_anthropic` — drop it on the request
+///   path (and log the drop);
+/// * `session::reader::SessionReader::load_messages` /
+///   `load_messages_with_orphan_results` — filter rows already written to disk
+///   by a pre-fix binary, so a poisoned session is still openable.
+///
+/// Note what this predicate therefore implies: it ignores `reasoning_content`
+/// (`is_empty_assistant_ignores_reasoning`), so a **reasoning-only** row is
+/// dropped from requests and from resumed seeds even though
+/// [`has_persistable_interrupt`] let `run_core::finish_interrupted` write it —
+/// the row survives on disk as a record of the turn, and is never put on the
+/// wire. The push decision itself uses the other predicate.
 ///
 /// Deliberately narrow: `content` is trimmed (a whitespace-only reply is
 /// equally empty on the wire) and messages carrying `tool_calls` are NEVER
@@ -164,11 +171,17 @@ pub fn is_empty_assistant(m: &Message) -> bool {
 /// 另一种形态）". A reasoning-only reply (`content == ""`,
 /// `reasoning_content == Some(_)`) is a real model output — DeepSeek thinking
 /// mode and Anthropic extended thinking both emit thinking deltas before any
-/// text — so discarding it would silently drop the turn's work. Keeping it is
-/// also wire-safe: the Anthropic serializer maps a `reasoning_content`-bearing
-/// message with empty content to a bare `{"role":"assistant","content":[]}`
-/// (no empty text block), and the OpenAI serializer reports the thought via
-/// `reasoning_content` with `content: null` (#16).
+/// text — so `finish_interrupted` must not silently drop the turn's work.
+///
+/// Where the two predicates meet, be precise about which layer does what:
+/// this one governs **persistence only**. A reasoning-only row therefore lands
+/// in `transcript.jsonl` as a record of the turn, but it is *not* sent: both
+/// serializers and `SessionReader::load_messages` filter on
+/// [`is_empty_assistant`], which ignores reasoning entirely (see
+/// `is_empty_assistant_ignores_reasoning`). So the request and any resumed seed
+/// carry no such message — and *that* is why keeping the row is wire-safe
+/// (no empty text block is ever emitted), not because a serializer would
+/// render it as `content: []`, which it does not.
 ///
 /// So: persist when there is text **or** reasoning; drop only when there is
 /// neither. Same carve-out for `tool_calls`: such a message is never

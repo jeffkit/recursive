@@ -94,16 +94,27 @@ reasoning-only 中断的处理（见下）。
 **取舍：选 (A)，保留 reasoning-only 中断。** 理由：
 
 1. 它是**真实模型产出**（DeepSeek thinking / Anthropic extended thinking 都先发
-   thinking 增量再发文本），丢弃等于静默吞掉这一 turn 的工作；
-2. 保留它**不毒化请求**：Anthropic 序列化器对“无文本、无 tool_calls”的消息本就
-   只产出 `{"role":"assistant","content":[]}`（无空文本块），OpenAI 侧则按 #16
-   用 `reasoning_content` + `content: null` 表达；
-3. 规格明确要求不夹带这种行为变更。
+   thinking 增量再发文本），丢弃等于静默吞掉这一 turn 的工作记录；
+2. 规格明确要求不夹带这种行为变更；
+3. 落盘它不会毒化后续请求 —— 但**原因不是**“序列化器会把它渲染成 `content: []`”
+   （此前本 journal 与 `has_persistable_interrupt` 的 doc comment 是这么写的，
+   **与实现相反，review 已指出并改正**）。真正的原因是：两个序列化器与
+   `load_messages` 都按 `is_empty_assistant` 过滤，而该判据**不看 reasoning**，
+   所以 reasoning-only 行在上线时被直接丢弃，请求里根本不会出现空文本块。
 
 实现方式：`finish_interrupted` 改用 `has_persistable_interrupt`（content ∨
-reasoning ∨ tool_calls）。序列化/加载过滤**不变**（仍是 `is_empty_assistant`），
-即：reasoning-only 消息会被落盘，仍会在序列化时被丢弃（对 Anthropic 而言就是
-`content: []`），两者语义一致且都不产生空文本块。
+reasoning ∨ tool_calls）。由此形成明确的**分层**分工：
+
+- **落盘**：reasoning-only 行会写进 `transcript.jsonl`（规格「不做」的要求，保住
+  这一 turn 的工作记录）；
+- **上线**：两个序列化器按 `is_empty_assistant` 丢弃它 ⇒ 请求不含空文本块
+  （这才是 wire-safe 的真正原因）；
+- **重载**：`load_messages` / `load_messages_with_orphan_results` 同样按
+  `is_empty_assistant` 过滤 ⇒ 该行也不会进入 resume 的 seed。
+
+即该行是**纯磁盘记录**，既不发往 provider 也不被重放。
+`is_empty_assistant` 处另有单测 `is_empty_assistant_ignores_reasoning` 钉住
+“reasoning 不影响该判据”，与上面的落盘断言合起来覆盖了两半行为。
 
 钉住该行为的断言：`run_core::tests::interrupted_reasoning_only_assistant_is_still_pushed`
 （content 为空、reasoning 为 `Some("thinking hard")` → assistant 行仍在、reasoning 仍在）。

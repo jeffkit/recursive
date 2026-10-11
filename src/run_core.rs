@@ -1152,9 +1152,12 @@ impl<'a> RunCore<'a> {
         //
         // The predicate is `has_persistable_interrupt`, NOT
         // `is_empty_assistant`: the latter would also swallow reasoning-only
-        // interrupts, which the issue's 「不做」 clause pins as out of scope
-        // (they are a legitimate model output and stay wire-safe — see the
-        // doc comment on the predicate).
+        // interrupts, which the issue's 「不做」 clause pins as out of scope.
+        // Note the division of labour — this guard only decides whether the row
+        // is *written*; the serializers and the load filter use
+        // `is_empty_assistant`, so a reasoning-only row is recorded on disk but
+        // never sent and never replayed from a resumed seed (see the doc
+        // comments on both predicates in `crate::message`).
         if !crate::message::has_persistable_interrupt(&msg) {
             tracing::warn!(
                 target: "recursive::agent",
