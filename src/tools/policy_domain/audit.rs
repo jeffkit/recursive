@@ -79,6 +79,15 @@ pub type AuditKey = (u32 /* turn */, String /* tool_call_id */);
 pub struct AuditMeta {
     /// UUIDv7 step identifier (time-ordered).
     pub step_id: String,
+    /// Tool name exactly as the caller supplied it. May be an alias such as
+    /// `write_file`; `None` only for records written before issue #153.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Canonical (primary) tool name after alias resolution — `Write` for
+    /// both `Write` and `write_file`. Permission, safety and policy
+    /// decisions are made on this name (issue #153).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_name: Option<String>,
     /// Unix epoch millis at registry dispatch start.
     pub started_at: i64,
     /// Unix epoch millis when the tool returned.
@@ -99,6 +108,8 @@ impl AuditMeta {
         let now = unix_millis();
         Self {
             step_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+            tool_name: Some(name.to_string()),
+            canonical_name: Some(name.to_string()),
             started_at: now,
             finished_at: now,
             args_hash: String::new(),

@@ -828,6 +828,23 @@ impl ToolRegistry {
         self
     }
 
+    /// Resolve `name` to its canonical (primary) tool name.
+    ///
+    /// Returns the primary name when `name` is a registered alias, and
+    /// `None` when it is already a primary name (or unknown) so callers can
+    /// write `canonical_name(n).unwrap_or(n)`.
+    ///
+    /// Aliases only ever affect *lookup*: every policy, permission and
+    /// safety decision must be made on the canonical name, otherwise an
+    /// alias like `write_file` could dodge a rule written for `Write`.
+    pub fn canonical_name(&self, name: &str) -> Option<&str> {
+        // A primary name always wins over an alias, matching `find_by_name`.
+        if self.tools.contains_key(name) {
+            return None;
+        }
+        self.aliases.get(name).map(String::as_str)
+    }
+
     /// Find a registered tool by its primary name or any alias.
     ///
     /// This is the preferred lookup path. `invoke` delegates to this so that
@@ -983,9 +1000,14 @@ impl ToolRegistry {
     }
 
     /// Check if a tool is read-only (no side effects).
+    ///
+    /// Resolves aliases first: `is_readonly("read_file")` and
+    /// `is_readonly("Read")` must agree, or a permission check keyed on the
+    /// canonical name would misclassify an alias call as a write.
     pub fn is_readonly(&self, name: &str) -> bool {
+        let canonical = self.canonical_name(name).unwrap_or(name);
         self.tools
-            .get(name)
+            .get(canonical)
             .map(|t| t.is_readonly())
             .unwrap_or(false)
     }
@@ -1002,10 +1024,12 @@ impl ToolRegistry {
 
     /// Like `is_readonly` but passes call-time arguments to the tool so it can
     /// make an argument-specific decision (e.g. `sub_agent` checking
-    /// `subagent_type: "explore"`).
+    /// `subagent_type: "explore"`). Aliases are resolved first, like
+    /// [`Self::is_readonly`].
     pub fn is_readonly_for_call(&self, name: &str, args: &Value) -> bool {
+        let canonical = self.canonical_name(name).unwrap_or(name);
         self.tools
-            .get(name)
+            .get(canonical)
             .map(|t| t.is_readonly_for_args(args))
             .unwrap_or(false)
     }
@@ -1590,6 +1614,46 @@ mod tests {
         let args = serde_json::json!({});
         assert!(reg.is_readonly_for_call("Ro2", &args));
         assert!(!reg.is_readonly_for_call("Missing", &args));
+    }
+
+    // --- canonical_name (issue #153) ---
+
+    #[test]
+    fn canonical_name_resolves_alias_and_ignores_primary() {
+        let reg = make_registry()
+            .register_with_aliases(Arc::new(ReadOnlyTool { name: "Canon" }), &["canon_alias"]);
+        assert_eq!(reg.canonical_name("canon_alias"), Some("Canon"));
+        assert_eq!(
+            reg.canonical_name("Canon"),
+            None,
+            "a primary name is already canonical"
+        );
+        assert_eq!(reg.canonical_name("missing"), None);
+    }
+
+    #[test]
+    fn alias_readonly_classification_matches_primary() {
+        let reg = make_registry()
+            .register_with_aliases(Arc::new(ReadOnlyTool { name: "PrimRO" }), &["prim_ro"])
+            .register_with_aliases(Arc::new(MutatingTool { name: "PrimMut" }), &["prim_mut"]);
+        assert_eq!(
+            reg.is_readonly("prim_ro"),
+            reg.is_readonly("PrimRO"),
+            "alias and primary must classify identically"
+        );
+        assert_eq!(
+            reg.is_readonly("prim_mut"),
+            reg.is_readonly("PrimMut"),
+            "alias and primary must classify identically"
+        );
+        assert!(
+            reg.is_readonly("prim_ro"),
+            "read-only tool must stay read-only"
+        );
+        assert!(
+            !reg.is_readonly("prim_mut"),
+            "mutating tool must stay mutable"
+        );
     }
 
     // --- retain_tools ---

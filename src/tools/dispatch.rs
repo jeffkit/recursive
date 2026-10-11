@@ -100,6 +100,8 @@ impl ToolRegistry {
                     result: Err(error),
                     audit: AuditMeta {
                         step_id: uuid::Uuid::now_v7().hyphenated().to_string(),
+                        tool_name: Some(name.to_string()),
+                        canonical_name: Some(self.canonical_name(name).unwrap_or(name).to_string()),
                         started_at: now,
                         finished_at: now,
                         args_hash: String::new(),
@@ -207,6 +209,8 @@ impl ToolRegistry {
             result: raw_result,
             audit: AuditMeta {
                 step_id,
+                tool_name: Some(name.to_string()),
+                canonical_name: Some(self.canonical_name(name).unwrap_or(name).to_string()),
                 started_at,
                 finished_at,
                 args_hash,
@@ -895,6 +899,38 @@ mod tests {
         assert!(
             resolve_within_any(&roots, "b.txt", true).is_ok(),
             "write to RW root must succeed"
+        );
+    }
+
+    // ── AuditMeta records both raw and canonical names (issue #153) ──────────
+
+    #[tokio::test]
+    async fn audit_records_both_names() {
+        use crate::tools::WriteFile;
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let registry = ToolRegistry::local()
+            .register_with_aliases(Arc::new(WriteFile::new(tmp.path())), &["write_file"]);
+        let dispatch = registry
+            .invoke_with_audit(
+                "write_file",
+                serde_json::json!({"path": "out.txt", "contents": "hello"}),
+            )
+            .await;
+        assert!(
+            dispatch.result.is_ok(),
+            "write must succeed: {:?}",
+            dispatch.result
+        );
+        assert_eq!(
+            dispatch.audit.tool_name.as_deref(),
+            Some("write_file"),
+            "audit must keep the raw (aliased) name"
+        );
+        assert_eq!(
+            dispatch.audit.canonical_name.as_deref(),
+            Some("Write"),
+            "audit must carry the canonical name"
         );
     }
 }

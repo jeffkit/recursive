@@ -428,6 +428,34 @@ impl LayeredPermissionsConfig {
         is_readonly: bool,
         content: Option<&str>,
     ) -> Permission {
+        self.check_static_inner(tool_name, None, is_readonly, content)
+    }
+
+    /// Like [`Self::check_static`], but deny/allow/interactive rule matching
+    /// also honors patterns written against `alias`.
+    ///
+    /// Issue #153: the policy decision is made on the canonical tool name,
+    /// but an operator may have written a rule using the alias the tool is
+    /// also reachable by (`deny = ["write_file"]`). Both names are tested in
+    /// one pass so deny-union still beats allow-union — a deny on either
+    /// name wins.
+    pub fn check_static_aliased(
+        &self,
+        tool_name: &str,
+        alias: &str,
+        is_readonly: bool,
+        content: Option<&str>,
+    ) -> Permission {
+        self.check_static_inner(tool_name, Some(alias), is_readonly, content)
+    }
+
+    fn check_static_inner(
+        &self,
+        tool_name: &str,
+        alias: Option<&str>,
+        is_readonly: bool,
+        content: Option<&str>,
+    ) -> Permission {
         // 0. Safety check (Goal 196): protected paths cannot be written
         // to, even under BypassPermissions. Read-only tools are exempt.
         if !is_readonly {
@@ -465,7 +493,11 @@ impl LayeredPermissionsConfig {
         }
 
         // 3. DontAsk: deny interactive tools
-        if matches!(self.mode, PermissionMode::DontAsk) && self.any_interactive(tool_name) {
+        if matches!(self.mode, PermissionMode::DontAsk)
+            && self
+                .all_interactive()
+                .any(|p| name_matches(p, tool_name, alias))
+        {
             return Permission::Denied(
                 DecisionReason::Mode(self.mode.clone()),
                 format!("tool `{tool_name}` requires interaction but mode is dontAsk"),
@@ -479,7 +511,7 @@ impl LayeredPermissionsConfig {
 
         // 5. Static deny/allow rules (union semantics)
         for (pattern, source) in self.all_deny() {
-            if matches_pattern(pattern, tool_name) {
+            if name_matches(pattern, tool_name, alias) {
                 return Permission::Denied(
                     DecisionReason::Rule {
                         source: *source,
@@ -490,7 +522,7 @@ impl LayeredPermissionsConfig {
             }
         }
         for (pattern, source) in self.all_allow() {
-            if matches_pattern(pattern, tool_name) {
+            if name_matches(pattern, tool_name, alias) {
                 return Permission::Allowed(DecisionReason::Rule {
                     source: *source,
                     pattern: pattern.to_string(),
@@ -806,6 +838,13 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
     } else {
         name == pattern
     }
+}
+
+/// Does `pattern` match `name`, or (issue #153) the alias `name` is also
+/// reachable by? Used by rule matching so a config written against either
+/// the canonical tool name or its alias keeps firing.
+fn name_matches(pattern: &str, name: &str, alias: Option<&str>) -> bool {
+    matches_pattern(pattern, name) || alias.is_some_and(|a| matches_pattern(pattern, a))
 }
 
 #[cfg(test)]

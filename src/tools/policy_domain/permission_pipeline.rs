@@ -82,11 +82,21 @@ impl<'a> PermissionPipeline<'a> {
     /// (possibly hook-transformed) final arguments.
     ///
     /// This is a behavior-preserving extraction from
-    /// `ToolRegistry::invoke_with_audit`. The semantics of every code
-    /// path are unchanged.
+    /// `ToolRegistry::invoke_with_audit`, except for issue #153: `tool_name`
+    /// is normalized to the registry's canonical (primary) name before any
+    /// decision, so an alias such as `write_file` cannot bypass a check
+    /// written for `Write`.
     pub async fn check(&self, tool_name: &str, mut arguments: Value) -> CheckOutcome {
+        // Aliases only affect lookup (issue #153): normalize to the
+        // canonical (primary) tool name *before* any policy decision, so an
+        // alias like `write_file` cannot dodge a rule written for `Write`.
+        // Every phase below — safety content, static rules, hooks, L1 policy
+        // — must see the canonical name; `tool_name` (the raw, possibly
+        // aliased name) is kept only for user-facing error text.
+        let canonical = self.registry.canonical_name(tool_name).unwrap_or(tool_name);
+
         // Phase 1: safety content (file-path content for protected-path check).
-        let safety_content = safety_content_for_tool(tool_name, &arguments);
+        let safety_content = safety_content_for_tool(canonical, &arguments);
 
         // NEW-PERM-2 (Goal H2): safety check for protected paths must
         // run independently of whether `permissions` is configured.
@@ -97,9 +107,9 @@ impl<'a> PermissionPipeline<'a> {
         // upfront; the per-permission-mode code below may also call
         // `check_static` (which does its own safety check) but the
         // second call is idempotent — both Deny with the same path.
-        let is_readonly = self.registry.is_readonly(tool_name);
+        let is_readonly = self.registry.is_readonly(canonical);
         if let Some(path) = crate::permissions::check_protected_path(
-            tool_name,
+            canonical,
             is_readonly,
             safety_content.as_deref(),
         ) {
@@ -122,7 +132,7 @@ impl<'a> PermissionPipeline<'a> {
                     let args_summary =
                         serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".into());
                     let mut c = classifier.lock().await;
-                    match c.classify(tool_name, &args_summary, "").await {
+                    match c.classify(canonical, &args_summary, "").await {
                         Ok((true, _reason)) => {
                             if c.tracker.is_over_limit() {
                                 return CheckOutcome::Deny {
@@ -152,12 +162,26 @@ impl<'a> PermissionPipeline<'a> {
             }
 
             // Phase 3: static permission check.
-            let is_readonly = self.registry.is_readonly(tool_name);
+            let is_readonly = self.registry.is_readonly(canonical);
             // Pre-compute interactive flag before the match so we can use it
             // after without holding `guard` across an await point.
-            let is_interactive_tool = guard.any_interactive(tool_name);
+            let is_interactive_tool = guard.any_interactive(canonical)
+                || (canonical != tool_name && guard.any_interactive(tool_name));
             let mut perm_is_unknown = false;
-            match guard.check_static(tool_name, is_readonly, safety_content.as_deref()) {
+            // Decide on the canonical name; a rule written with the raw alias
+            // (`deny = ["write_file"]`) also fires, in the same pass so that
+            // deny-union still beats allow-union.
+            let static_perm = if canonical == tool_name {
+                guard.check_static(canonical, is_readonly, safety_content.as_deref())
+            } else {
+                guard.check_static_aliased(
+                    canonical,
+                    tool_name,
+                    is_readonly,
+                    safety_content.as_deref(),
+                )
+            };
+            match static_perm {
                 Permission::Denied(reason, _msg) => {
                     return CheckOutcome::Deny {
                         error: Error::PermissionDenied {
@@ -188,7 +212,7 @@ impl<'a> PermissionPipeline<'a> {
             if perm_is_unknown && !self.registry.headless && is_interactive_tool {
                 if let Some(hook) = self.registry.permission_hook() {
                     drop(guard);
-                    match hook.check(tool_name, &arguments).await {
+                    match hook.check(canonical, &arguments).await {
                         PermissionDecision::Deny(reason) => {
                             return CheckOutcome::Deny {
                                 error: Error::PermissionDenied {
@@ -203,7 +227,7 @@ impl<'a> PermissionPipeline<'a> {
                             // A malicious/compromised hook could use Transform
                             // to substitute a different command/path that bypasses
                             // the policy check already performed above.
-                            if let Err(e) = self.recheck_policy(tool_name, &new_args) {
+                            if let Err(e) = self.recheck_policy(canonical, &new_args) {
                                 return CheckOutcome::Deny {
                                     error: e,
                                     audit: AuditMeta::synthetic_unknown_tool(tool_name),
@@ -218,7 +242,7 @@ impl<'a> PermissionPipeline<'a> {
                             // the policy would have denied above; the
                             // Transform path already rechecks but the
                             // Allow path historically skipped it.
-                            if let Err(e) = self.recheck_policy(tool_name, &arguments) {
+                            if let Err(e) = self.recheck_policy(canonical, &arguments) {
                                 return CheckOutcome::Deny {
                                     error: e,
                                     audit: AuditMeta::synthetic_unknown_tool(tool_name),
@@ -246,7 +270,7 @@ impl<'a> PermissionPipeline<'a> {
                 }
                 let hook_input = crate::hooks::external::HookInput {
                     event: crate::hooks::external::HookEvent::PermissionRequest,
-                    tool_name: Some(tool_name.to_string()),
+                    tool_name: Some(canonical.to_string()),
                     args: Some(arguments.clone()),
                     mode: format!("{:?}", self.registry.permission_mode),
                     content: None,
@@ -298,7 +322,7 @@ impl<'a> PermissionPipeline<'a> {
                     // Consider using PermissionMode::Strict or adding an explicit
                     // allow rule to silence this warning.
                     tracing::warn!(
-                        tool = %tool_name,
+                        tool = %canonical,
                         "tool has no explicit permission rule; \
                          allowing implicitly (use strict mode to deny by default)"
                     );
@@ -310,7 +334,7 @@ impl<'a> PermissionPipeline<'a> {
         // Phase 7: L1 policy check (shell + fs). Same logic as the post-hook
         // recheck; we run it here for the main path so a tool that passed
         // permission checks is still subject to L1 policy.
-        if let Err(e) = self.recheck_policy(tool_name, &arguments) {
+        if let Err(e) = self.recheck_policy(canonical, &arguments) {
             return CheckOutcome::Deny {
                 error: e,
                 audit: AuditMeta::synthetic_unknown_tool(tool_name),
@@ -331,7 +355,8 @@ impl<'a> PermissionPipeline<'a> {
     /// - If `arguments["command"]` is a string, runs `policy.check_shell(cmd)`.
     /// - If `arguments["path"]` or `arguments["file_path"]` is a string,
     ///   runs `policy.check_fs_path(path, is_write)`. `is_write` is
-    ///   `true` for `Write` / `Edit` / `StrReplace`, `false` otherwise.
+    ///   `true` for the canonical `Write` / `Edit` / `StrReplace`, `false`
+    ///   otherwise (aliases are resolved first, issue #153).
     ///
     /// Returns the first policy error encountered. Callers must propagate
     /// the error and stop dispatch.
@@ -339,10 +364,13 @@ impl<'a> PermissionPipeline<'a> {
         let Some(policy): Option<&PolicyConfig> = self.registry.policy.as_ref() else {
             return Ok(());
         };
+        // Issue #153: classify on the canonical name so an alias such as
+        // `write_file` is still treated as a write for `fs.write_allow`.
+        let canonical = self.registry.canonical_name(tool_name).unwrap_or(tool_name);
         if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
             policy.check_shell(cmd)?;
         }
-        let is_write = matches!(tool_name, "Write" | "Edit" | "StrReplace");
+        let is_write = matches!(canonical, "Write" | "Edit" | "StrReplace");
         let path_arg = arguments
             .get("path")
             .or_else(|| arguments.get("file_path"))
@@ -676,6 +704,117 @@ mod tests {
             .check("Bash", serde_json::json!({"command": "dangerous_cmd"}))
             .await;
         assert!(outcome.is_deny());
+    }
+
+    // ── Issue #153: aliases must not bypass any policy surface ────────────────
+
+    /// Registry exposing the real `Read`/`Write` tools under their aliases so
+    /// the alias-normalization path is exercised end to end.
+    fn registry_with_fs_aliases(root: &std::path::Path) -> ToolRegistry {
+        use crate::tools::{ReadFile, WriteFile};
+        use std::sync::Arc;
+        ToolRegistry::local()
+            .register_with_aliases(Arc::new(ReadFile::new(root)), &["read_file"])
+            .register_with_aliases(Arc::new(WriteFile::new(root)), &["write_file"])
+    }
+
+    /// `deny = ["Write"]` must reject the canonical name *and* its alias.
+    #[tokio::test]
+    async fn alias_cannot_bypass_deny_rule() {
+        use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                deny: vec!["Write".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = registry_with_fs_aliases(tmp.path()).with_permissions(config);
+        let pipeline = PermissionPipeline::new(&registry);
+        let args = serde_json::json!({"path": "out.txt", "contents": "x"});
+        assert!(
+            pipeline.check("Write", args.clone()).await.is_deny(),
+            "canonical `Write` must be denied by deny=[\"Write\"]"
+        );
+        assert!(
+            pipeline.check("write_file", args).await.is_deny(),
+            "alias `write_file` must not bypass deny=[\"Write\"]"
+        );
+    }
+
+    /// A deny rule written against the alias must keep firing — canonical
+    /// normalization must not silently drop it.
+    #[tokio::test]
+    async fn alias_keyed_deny_rule_still_fires() {
+        use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                deny: vec!["write_file".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = registry_with_fs_aliases(tmp.path()).with_permissions(config);
+        let pipeline = PermissionPipeline::new(&registry);
+        let args = serde_json::json!({"path": "out.txt", "contents": "x"});
+        assert!(
+            pipeline.check("write_file", args).await.is_deny(),
+            "deny=[\"write_file\"] must still deny the alias call"
+        );
+    }
+
+    /// Protected paths are denied for the canonical name and the alias, with
+    /// no permissions config installed (Phase 1 safety check runs standalone).
+    #[tokio::test]
+    async fn alias_cannot_bypass_protected_path() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let registry = registry_with_fs_aliases(tmp.path());
+        let pipeline = PermissionPipeline::new(&registry);
+        for target in [".git/hooks/pre-commit", ".ssh/authorized_keys"] {
+            for name in ["Write", "write_file"] {
+                let args = serde_json::json!({"path": target, "contents": "x"});
+                match pipeline.check(name, args).await {
+                    CheckOutcome::Deny { error, .. } => assert!(
+                        matches!(
+                            error,
+                            Error::PermissionDenied {
+                                reason: DecisionReason::SafetyCheck { .. },
+                                ..
+                            }
+                        ),
+                        "`{name}` on `{target}` must be denied as a safety check, got: {error:?}"
+                    ),
+                    CheckOutcome::Allow { .. } => {
+                        panic!("`{name}` on `{target}` must be denied")
+                    }
+                }
+            }
+        }
+    }
+
+    /// L1 `fs.write_allow` must classify the alias as a write (via the
+    /// canonical name), otherwise the write policy is skipped.
+    #[test]
+    fn alias_is_treated_as_write_by_l1_policy() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let policy = PolicyConfig {
+            shell: ShellPolicy::default(),
+            fs: FsPolicy {
+                write_allow: vec!["allowed/".into()],
+                ..Default::default()
+            },
+        };
+        let registry = registry_with_fs_aliases(tmp.path()).with_policy(policy);
+        let pipeline = PermissionPipeline::new(&registry);
+        let args = serde_json::json!({"path": "elsewhere/out.txt"});
+        assert!(
+            pipeline.recheck_policy("write_file", &args).is_err(),
+            "write_file outside write_allow must be denied (must classify as a write)"
+        );
     }
 
     // ── safety_content_for_tool targeted tests ────────────────────────────────

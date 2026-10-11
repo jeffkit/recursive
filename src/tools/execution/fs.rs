@@ -566,6 +566,22 @@ impl Tool for WriteFile {
             })?;
         let abs = resolve_within_any(&self.all_roots(), path, true)?;
 
+        // Issue #153: defense in depth. The permission pipeline denies
+        // protected paths before dispatch, but the safety surface must hold
+        // on its own (see `permission_pipeline.rs` Phase 1) — a direct
+        // `Tool::execute` call must not write `.git/hooks/*` either.
+        {
+            let abs_str = abs.to_string_lossy();
+            if let Some(protected) =
+                crate::permissions::check_protected_path("Write", false, Some(abs_str.as_ref()))
+            {
+                return Err(Error::PermissionDenied {
+                    name: "Write".into(),
+                    reason: crate::permissions::DecisionReason::SafetyCheck { path: protected },
+                });
+            }
+        }
+
         // ── Pre-read guard for existing files ──────────────────────────
         // New files (non-existent on disk) are exempt — no prior Read needed.
         //
