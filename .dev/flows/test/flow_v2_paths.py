@@ -2072,7 +2072,7 @@ if __name__ == "__main__":
             failed.append(s.__name__)
             print(f"  ERROR {s.__name__}: {type(e).__name__}: {e}")
     # #149：报告里区分 SKIP 与 PASS（环境缺依赖时不再伪装成全通过）
-    tail = f"\n{len(SCENARIOS)-len(failed)-len(skipped)}/{len(SCENARIOS)} passed"
+    tail =f"\n{len(SCENARIOS)-len(failed)-len(skipped)}/{len(SCENARIOS)} passed"
     if skipped:
         tail += f"（SKIP {len(skipped)}：{'、'.join(skipped)}）"
     print(tail)
