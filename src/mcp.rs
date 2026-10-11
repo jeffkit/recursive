@@ -129,6 +129,24 @@ fn resolve_remote_transport(transport: Option<&str>, server: &str) -> RemoteTran
     }
 }
 
+/// Whether a server advertised a capability (issue #181).
+///
+/// The MCP spec represents a capability as an **object** — `"tools": {}`,
+/// `"resources": {"subscribe": true}` — optionally with sub-capabilities.
+/// Older/looser servers use bare `true`. Reading the field with
+/// `as_bool()` alone therefore reported every spec-shaped server as "does
+/// not advertise". A bare array is accepted as well, since some servers
+/// publish capability lists inline.
+///
+/// `false`, explicit `null`, and an absent field all mean "not
+/// advertised".
+fn has_capability(value: Option<&Value>) -> bool {
+    matches!(
+        value,
+        Some(Value::Bool(true)) | Some(Value::Object(_)) | Some(Value::Array(_))
+    )
+}
+
 /// Expand `${VAR}` references in a config string against the process
 /// environment (Claude Code `.mcp.json` convention). An unset variable
 /// expands to the empty string; `$${` is not special (only `${…}`).
@@ -326,10 +344,20 @@ pub struct McpClient {
     /// Name of the MCP server (for error reporting).
     server_name: String,
     /// How long to wait for a single line of stdio output before
-    /// declaring the server hung. Defaults to
-    /// [`DEFAULT_STDIO_READ_TIMEOUT`]; tests use a shorter value to
-    /// keep the suite fast.
+    /// declaring the server hung. Applies to the `initialize` handshake
+    /// and the cheap request/response methods (`tools/list`, …).
+    /// Defaults to [`DEFAULT_STDIO_READ_TIMEOUT`]; tests use a shorter
+    /// value to keep the suite fast.
     read_timeout: Duration,
+    /// How long to wait for a single line of stdio output while a
+    /// `tools/call` is outstanding (issue #181). Kept separate from
+    /// [`McpClient::read_timeout`] on purpose: a build/retrieval/external
+    /// API tool routinely takes minutes, while a hung handshake must
+    /// still be reported in seconds. Defaults to
+    /// [`DEFAULT_MCP_TOOL_TIMEOUT`]; override with
+    /// [`McpClient::with_tool_timeout`] or the
+    /// `RECURSIVE_MCP_TOOL_TIMEOUT_SECS` environment variable.
+    tool_timeout: Duration,
     /// Optional host elicitation handler (Claude control channel).
     elicitation: Option<SharedElicitationHandler>,
 }
@@ -338,6 +366,40 @@ pub struct McpClient {
 /// MCP server. Generous on purpose — real servers can pause briefly
 /// during large tool runs without being broken.
 pub const DEFAULT_STDIO_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default timeout for a single `tools/call` on a stdio MCP server
+/// (issue #181). Long-running MCP tools — builds, retrieval, external
+/// APIs — legitimately take minutes, so this is deliberately far larger
+/// than [`DEFAULT_STDIO_READ_TIMEOUT`], which still governs the
+/// handshake and the discovery calls.
+pub const DEFAULT_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Environment variable that overrides [`DEFAULT_MCP_TOOL_TIMEOUT`] for
+/// every client built by [`McpClient::spawn`]. An unparseable value (or
+/// `0`) is ignored in favour of the default.
+pub const MCP_TOOL_TIMEOUT_ENV: &str = "RECURSIVE_MCP_TOOL_TIMEOUT_SECS";
+
+/// Resolve the configured `tools/call` timeout for a newly spawned
+/// stdio client: `RECURSIVE_MCP_TOOL_TIMEOUT_SECS` when set to a usable
+/// whole number of seconds, otherwise [`DEFAULT_MCP_TOOL_TIMEOUT`].
+fn default_tool_timeout() -> Duration {
+    match std::env::var(MCP_TOOL_TIMEOUT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                tracing::warn!(
+                    target: "recursive::mcp",
+                    value = %raw,
+                    env = MCP_TOOL_TIMEOUT_ENV,
+                    default_secs = DEFAULT_MCP_TOOL_TIMEOUT.as_secs(),
+                    "ignoring unusable MCP tool timeout override"
+                );
+                DEFAULT_MCP_TOOL_TIMEOUT
+            }
+        },
+        Err(_) => DEFAULT_MCP_TOOL_TIMEOUT,
+    }
+}
 
 /// Protocol revision this client offers during `initialize`. The server may
 /// negotiate down; [`SUPPORTED_PROTOCOL_VERSIONS`] lists what we can speak.
@@ -385,40 +447,66 @@ impl McpClient {
     ///
     /// If `server.url` is set, uses HTTP+SSE transport. Otherwise uses stdio.
     pub async fn spawn(server: &McpServer) -> Result<Self> {
-        Self::spawn_with_timeout(server, DEFAULT_STDIO_READ_TIMEOUT).await
+        Self::spawn_with_timeout_and_tool_timeout(
+            server,
+            DEFAULT_STDIO_READ_TIMEOUT,
+            default_tool_timeout(),
+        )
+        .await
     }
 
     /// Like [`spawn`], but with a custom stdio read timeout. Tests use
     /// a short value (e.g. 500ms) to keep the suite fast; production
     /// callers should stick to [`spawn`].
     pub async fn spawn_with_timeout(server: &McpServer, read_timeout: Duration) -> Result<Self> {
+        Self::spawn_with_timeout_and_tool_timeout(server, read_timeout, default_tool_timeout())
+            .await
+    }
+
+    /// The full stdio-timeout form of [`spawn`] (issue #181): the short
+    /// `read_timeout` governs the handshake and discovery, while
+    /// `tool_timeout` governs each `tools/call`.
+    async fn spawn_with_timeout_and_tool_timeout(
+        server: &McpServer,
+        read_timeout: Duration,
+        tool_timeout: Duration,
+    ) -> Result<Self> {
         let Some(url) = &server.url else {
-            return Self::spawn_stdio(server, read_timeout).await;
+            return Self::spawn_stdio(server, read_timeout, tool_timeout).await;
         };
         // Remote transports have their own internal timeouts independent of
         // stdio handshake behavior; keep their existing semantics.
         match resolve_remote_transport(server.transport.as_deref(), &server.name) {
-            RemoteTransport::LegacySse => Self::spawn_http_sse(server, url).await,
-            RemoteTransport::StreamableHttp => Self::spawn_streamable(server, url).await,
-            RemoteTransport::Auto => match Self::spawn_streamable(server, url).await {
-                Ok(client) => Ok(client),
-                Err(streamable_err) => {
-                    tracing::debug!(
-                        target: "recursive::mcp",
-                        server = %server.name,
-                        error = %streamable_err,
-                        "Streamable HTTP unavailable; falling back to legacy SSE"
-                    );
-                    Self::spawn_http_sse(server, url).await
+            RemoteTransport::LegacySse => Self::spawn_http_sse(server, url, tool_timeout).await,
+            RemoteTransport::StreamableHttp => {
+                Self::spawn_streamable(server, url, tool_timeout).await
+            }
+            RemoteTransport::Auto => {
+                match Self::spawn_streamable(server, url, tool_timeout).await {
+                    Ok(client) => Ok(client),
+                    Err(streamable_err) => {
+                        tracing::debug!(
+                            target: "recursive::mcp",
+                            server = %server.name,
+                            error = %streamable_err,
+                            "Streamable HTTP unavailable; falling back to legacy SSE"
+                        );
+                        Self::spawn_http_sse(server, url, tool_timeout).await
+                    }
                 }
-            },
+            }
         }
     }
 
     /// Build the shared HTTP client for a remote server, applying its
     /// configured `headers` (auth). Header values support `${VAR}` env
     /// expansion so tokens need not be stored in the config file.
-    fn build_http_client(server: &McpServer) -> Result<reqwest::Client> {
+    ///
+    /// The request timeout is aligned with `tool_timeout` (issue #181) so
+    /// a configured long-running `tools/call` is not cut short by
+    /// reqwest's own deadline; the 30s floor is kept for the cheap
+    /// discovery calls.
+    fn build_http_client(server: &McpServer, tool_timeout: Duration) -> Result<reqwest::Client> {
         let mut default_headers = reqwest::header::HeaderMap::new();
         if let Some(extra) = &server.headers {
             for (key, value) in extra {
@@ -439,7 +527,7 @@ impl McpClient {
             }
         }
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(tool_timeout.max(Duration::from_secs(30)))
             .default_headers(default_headers)
             .build()
             .map_err(|e| Error::Mcp {
@@ -449,7 +537,11 @@ impl McpClient {
     }
 
     /// Spawn via stdio subprocess.
-    async fn spawn_stdio(server: &McpServer, read_timeout: Duration) -> Result<Self> {
+    async fn spawn_stdio(
+        server: &McpServer,
+        read_timeout: Duration,
+        tool_timeout: Duration,
+    ) -> Result<Self> {
         let mut cmd = Command::new(&server.command);
         cmd.args(&server.args)
             .stdin(std::process::Stdio::piped())
@@ -483,6 +575,7 @@ impl McpClient {
             capabilities: ServerCapabilities::default(),
             server_name: server.name.clone(),
             read_timeout,
+            tool_timeout,
             elicitation: None,
         };
 
@@ -497,8 +590,12 @@ impl McpClient {
     /// answers either with a JSON body or an SSE stream in that same POST
     /// response. The `initialize` handshake establishes the optional
     /// `Mcp-Session-Id`.
-    async fn spawn_streamable(server: &McpServer, url: &str) -> Result<Self> {
-        let http_client = Self::build_http_client(server)?;
+    async fn spawn_streamable(
+        server: &McpServer,
+        url: &str,
+        tool_timeout: Duration,
+    ) -> Result<Self> {
+        let http_client = Self::build_http_client(server, tool_timeout)?;
         let mut client = Self {
             transport: McpTransport::StreamableHttp {
                 client: http_client,
@@ -510,6 +607,7 @@ impl McpClient {
             capabilities: ServerCapabilities::default(),
             server_name: server.name.clone(),
             read_timeout: DEFAULT_STDIO_READ_TIMEOUT,
+            tool_timeout,
             elicitation: None,
         };
         client.do_initialize(&server.name).await?;
@@ -517,8 +615,8 @@ impl McpClient {
     }
 
     /// Spawn via HTTP+SSE transport.
-    async fn spawn_http_sse(server: &McpServer, url: &str) -> Result<Self> {
-        let http_client = Self::build_http_client(server)?;
+    async fn spawn_http_sse(server: &McpServer, url: &str, tool_timeout: Duration) -> Result<Self> {
+        let http_client = Self::build_http_client(server, tool_timeout)?;
 
         // Connect to the SSE endpoint and read the initial event to discover
         // the message endpoint.
@@ -603,6 +701,7 @@ impl McpClient {
             // SSE transport reads its own stream with internal timeouts;
             // this field is unused for HTTP+SSE but must be set.
             read_timeout: DEFAULT_STDIO_READ_TIMEOUT,
+            tool_timeout,
             elicitation: None,
         };
 
@@ -640,17 +739,15 @@ impl McpClient {
             }
         }
 
-        // Parse capabilities from the server response
+        // Parse capabilities from the server response. The MCP spec
+        // advertises a capability as an *object* (optionally carrying
+        // sub-capabilities); some servers use the legacy boolean form.
+        // `as_bool()` alone therefore reported every spec-shaped server
+        // as "does not advertise" (issue #181).
         if let Some(caps) = init_result.get("capabilities") {
-            self.capabilities.tools = caps.get("tools").and_then(|v| v.as_bool()).unwrap_or(false);
-            self.capabilities.resources = caps
-                .get("resources")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            self.capabilities.prompts = caps
-                .get("prompts")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            self.capabilities.tools = has_capability(caps.get("tools"));
+            self.capabilities.resources = has_capability(caps.get("resources"));
+            self.capabilities.prompts = has_capability(caps.get("prompts"));
         }
 
         // Send initialized notification (no response expected)
@@ -712,24 +809,44 @@ impl McpClient {
         self
     }
 
+    /// Override the per-`tools/call` read timeout (issue #181).
+    ///
+    /// The handshake and `tools/list` keep using the short
+    /// [`read_timeout`](Self::spawn_with_timeout) — deliberately, so a
+    /// server that never started is still reported in seconds — while a
+    /// tool invocation gets this budget instead. Defaults to
+    /// [`DEFAULT_MCP_TOOL_TIMEOUT`] (300s), or
+    /// `RECURSIVE_MCP_TOOL_TIMEOUT_SECS` when set.
+    pub fn with_tool_timeout(mut self, tool_timeout: Duration) -> Self {
+        self.tool_timeout = tool_timeout;
+        self
+    }
+
     /// Call a tool by name with the given arguments.
     /// Returns the textual content of the first `content[].text` block.
     /// Errors if `isError` is true in the response.
+    ///
+    /// Uses the per-call tool timeout
+    /// ([`with_tool_timeout`](Self::with_tool_timeout)) rather than the
+    /// short read timeout, so long-running tools are not cut off at 10s
+    /// (issue #181).
     ///
     /// When the server returns JSON-RPC `-32042` (UrlElicitationRequired) and
     /// an [`ElicitationHandler`] is installed, the host is asked via the
     /// Claude control channel before the error is returned to the caller.
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<String> {
-        let result: Value = match self
-            .send_request(
-                "tools/call",
-                serde_json::json!({
-                    "name": name,
-                    "arguments": arguments,
-                }),
-            )
-            .await
-        {
+        let params = serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        });
+        // Scope the switched window to exactly this request: the short
+        // read timeout goes back in place even when the call fails, so a
+        // later `initialize`-style request cannot inherit the long one.
+        let previous = std::mem::replace(&mut self.read_timeout, self.tool_timeout);
+        let outcome = self.send_request("tools/call", params).await;
+        self.read_timeout = previous;
+
+        let result: Value = match outcome {
             Ok(v) => v,
             Err(Error::Mcp { server, message }) if message.contains("code -32042") => {
                 // UrlElicitationRequired — ask the host, then surface a clear error
@@ -1097,9 +1214,15 @@ impl McpClient {
     /// Read a JSON-RPC response matching the given id from the active transport.
     async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
         match &mut self.transport {
-            McpTransport::Stdio { reader, .. } => {
-                Self::read_stdio_response(reader, expected_id, &self.server_name, self.read_timeout)
-                    .await
+            McpTransport::Stdio { stdin, reader, .. } => {
+                Self::read_stdio_response(
+                    stdin,
+                    reader,
+                    expected_id,
+                    &self.server_name,
+                    self.read_timeout,
+                )
+                .await
             }
             McpTransport::HttpSse {
                 client,
@@ -1128,7 +1251,17 @@ impl McpClient {
     }
 
     /// Read a JSON-RPC response from stdio.
+    ///
+    /// Anything the server sends that is not the awaited response is
+    /// handled rather than discarded (issue #181):
+    ///
+    /// * a **server-initiated request** (`id` + `method`) is answered on
+    ///   the spot — `ping` with an empty result, anything else with
+    ///   JSON-RPC `-32601` — so the peer never waits forever;
+    /// * a **non-JSON line** (server logging to stdout) is logged at
+    ///   `debug` and skipped, instead of aborting the pending call.
     async fn read_stdio_response(
+        stdin: &mut ChildStdin,
         reader: &mut BufReader<ChildStdout>,
         expected_id: u64,
         server_name: &str,
@@ -1153,10 +1286,42 @@ impl McpClient {
                         continue;
                     }
 
-                    let parsed: Value = serde_json::from_str(trimmed).map_err(|e| Error::Mcp {
-                        server: server_name.to_string(),
-                        message: format!("server returned non-JSON line: {e}; line: {trimmed}"),
-                    })?;
+                    let parsed: Value = match serde_json::from_str(trimmed) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            // Servers commonly print progress/log lines to
+                            // stdout between protocol messages. Skipping is
+                            // safe: a real response must be valid JSON, so
+                            // it can never be one of these lines.
+                            tracing::debug!(
+                                target: "recursive::mcp",
+                                server = %server_name,
+                                error = %e,
+                                line = %trimmed,
+                                "skipping non-JSON line on MCP stdio stdout"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // A *request* from the server carries both `id` and
+                    // `method`; a response carries `id` and `result`/`error`.
+                    if let Some(req_id) = parsed.get("id") {
+                        if let Some(method) = parsed.get("method").and_then(|v| v.as_str()) {
+                            if let Err(e) =
+                                Self::answer_server_request(stdin, req_id.clone(), method).await
+                            {
+                                tracing::debug!(
+                                    target: "recursive::mcp",
+                                    server = %server_name,
+                                    error = %e,
+                                    method = %method,
+                                    "failed to answer server-initiated MCP request"
+                                );
+                            }
+                            continue;
+                        }
+                    }
 
                     if let Some(resp_id) = parsed.get("id") {
                         if resp_id.as_u64() == Some(expected_id) {
@@ -1198,6 +1363,45 @@ impl McpClient {
                 }
             }
         }
+    }
+
+    /// Write a JSON-RPC reply to a server-initiated request (issue #181).
+    ///
+    /// `ping` is answered with an empty result; any other method — and any
+    /// method we cannot honour — gets `-32601 Method not found`. Answering
+    /// with an error rather than staying silent matters: the peer is
+    /// waiting on this id and would otherwise block until its own
+    /// timeout.
+    async fn answer_server_request(
+        stdin: &mut ChildStdin,
+        request_id: Value,
+        method: &str,
+    ) -> std::io::Result<()> {
+        // A null/missing id means a notification, not a request — it must
+        // not be answered.
+        if request_id.is_null() {
+            return Ok(());
+        }
+        let reply = if method == "ping" {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {},
+            })
+        } else {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("Method not found: {method}"),
+                },
+            })
+        };
+        let mut full = serde_json::to_vec(&reply)?;
+        full.push(b'\n');
+        stdin.write_all(&full).await?;
+        stdin.flush().await
     }
 
     /// Read a JSON-RPC response from an SSE stream.
@@ -2375,6 +2579,87 @@ mod tests {
         assert_eq!(servers[0].command, "");
         assert!(servers[0].args.is_empty());
         assert_eq!(servers[0].url.as_deref(), Some("http://example.com/sse"));
+    }
+
+    // ── issue #181: stdio timeout / capability helpers ────────────────────
+
+    /// One consolidated test for the process-global env override (the
+    /// cargo test harness runs tests in parallel, so two tests touching
+    /// the same env var would race — see `.dev/AGENTS.md`).
+    #[test]
+    fn default_tool_timeout_env_override_and_fallback() {
+        std::env::remove_var(MCP_TOOL_TIMEOUT_ENV);
+        assert_eq!(
+            default_tool_timeout(),
+            DEFAULT_MCP_TOOL_TIMEOUT,
+            "no env var → the #181 default (300s) must apply"
+        );
+
+        std::env::set_var(MCP_TOOL_TIMEOUT_ENV, "42");
+        assert_eq!(default_tool_timeout(), Duration::from_secs(42));
+
+        // A usable value with surrounding whitespace still parses.
+        std::env::set_var(MCP_TOOL_TIMEOUT_ENV, " 7 ");
+        assert_eq!(default_tool_timeout(), Duration::from_secs(7));
+
+        // Unusable values fall back to the default rather than to zero
+        // (a zero timeout would fail every tool call instantly).
+        for bad in ["", "abc", "0", "-1", "1.5"] {
+            std::env::set_var(MCP_TOOL_TIMEOUT_ENV, bad);
+            assert_eq!(
+                default_tool_timeout(),
+                DEFAULT_MCP_TOOL_TIMEOUT,
+                "`{bad}` must fall back to the default"
+            );
+        }
+
+        std::env::remove_var(MCP_TOOL_TIMEOUT_ENV);
+    }
+
+    #[test]
+    fn with_tool_timeout_overrides_the_per_call_budget() {
+        let server = server_with_url("http://example.invalid/mcp", None);
+        // Build the client struct directly: no transport is exercised, we
+        // only assert the builder method's effect on the field.
+        let client = McpClient {
+            transport: McpTransport::StreamableHttp {
+                client: reqwest::Client::new(),
+                url: "http://example.invalid/mcp".into(),
+                session_id: None,
+                pending: None,
+            },
+            next_id: 1,
+            capabilities: ServerCapabilities::default(),
+            server_name: server.name.clone(),
+            read_timeout: DEFAULT_STDIO_READ_TIMEOUT,
+            tool_timeout: DEFAULT_MCP_TOOL_TIMEOUT,
+            elicitation: None,
+        };
+        assert_eq!(client.tool_timeout, DEFAULT_MCP_TOOL_TIMEOUT);
+        assert_eq!(client.read_timeout, DEFAULT_STDIO_READ_TIMEOUT);
+
+        let client = client.with_tool_timeout(Duration::from_secs(900));
+        assert_eq!(client.tool_timeout, Duration::from_secs(900));
+        assert_eq!(
+            client.read_timeout, DEFAULT_STDIO_READ_TIMEOUT,
+            "`with_tool_timeout` must not widen the handshake timeout"
+        );
+    }
+
+    #[test]
+    fn has_capability_accepts_object_true_and_array() {
+        // The spec wire shape.
+        assert!(has_capability(Some(&serde_json::json!({}))));
+        assert!(has_capability(Some(
+            &serde_json::json!({"subscribe": true})
+        )));
+        // Legacy/loose shapes.
+        assert!(has_capability(Some(&serde_json::json!(true))));
+        assert!(has_capability(Some(&serde_json::json!([]))));
+        // Not advertised.
+        assert!(!has_capability(Some(&serde_json::json!(false))));
+        assert!(!has_capability(Some(&serde_json::json!(null))));
+        assert!(!has_capability(None));
     }
 
     #[test]
