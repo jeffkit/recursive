@@ -44,9 +44,11 @@
      请求结束（成功或失败）后原地换回 —— **不做全局放宽**：`initialize` 仍是
      10s，"服务端根本没起" 仍在秒级暴露。
    - `spawn` / `spawn_with_timeout` / 私有 `spawn_with_timeout_and_tool_timeout`
-     把两个超时分别下发到 stdio 与两种 HTTP transport。HTTP 客户端
-     `build_http_client` 的 reqwest 超时改为 `tool_timeout.max(30s)`
-     （原为硬编码 30s），否则远端 300s 工具仍会被 reqwest 自己砍掉。
+     把两个超时分别下发到 stdio 与两种 HTTP transport。**第一版**把 HTTP 客户端
+     `build_http_client` 的 reqwest 超时改成
+     `tool_timeout.max(30s)`（原为硬编码 30s），否则远端 300s 工具仍会被
+     reqwest 自己砍掉 —— **这个全局放宽是回归（撞规格「陷阱」第 1 条），已在
+     下方「Review 返工」小节收回**；读本节时请以返工后的设计为准。
 2. **答复服务端请求**（`src/mcp.rs:1307-1324`、`1375-1405`）
    - `read_stdio_response` 新增分支：带 `id` **且**带 `method` 的消息识别为
      服务端请求 → 新私有 `answer_server_request(stdin, id, method)`：
@@ -132,14 +134,26 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
 ### 改法
 
 - `build_http_client` 恢复**固定有界**超时：新常量
-  `HTTP_DEFAULT_REQUEST_TIMEOUT = 30s`，**不再**看 `tool_timeout`。
+  `HTTP_DEFAULT_REQUEST_TIMEOUT = 30s`，**不再**看 `tool_timeout`。它是
+  **没有显式逐请求超时那类请求（例如 legacy SSE 的 `GET` 建连）的默认值**，
+  不是 POST 的硬 backstop —— reqwest 的逐请求 `.timeout()` 会**双向覆盖**它
+  （复核者 P3 实测：逐请求 40s 可以压过 30s client 默认而成功），所以下文的
+  "30s backstop" 措辞只在"未设逐请求超时"这一意义上成立（本小节末尾已统一改为
+  准确表述）。
 - 新增私有 `McpClient::http_request_timeout(&Value) -> Duration`：逐请求分级 ——
   `tools/call` → `tool_timeout`，其余（`initialize` / `tools/list` / 通知）→
   `read_timeout`。
-- `write_line` 里对两种 HTTP transport 的 POST 都加
+- `write_line` 里对两种 HTTP transport 的 **POST** 都加
   `RequestBuilder::timeout(self.http_request_timeout(value))`（reqwest 支持逐请求
   超时，且覆盖 client 级）。这样 `initialize` 仍然快速失败，只有 `tools/call`
   拿到可配置预算。
+- **已知边界（不改代码，NIT-A）**：`tool_timeout` **覆盖不到 legacy SSE 的响应
+  读取**。`read_sse_response`（`src/mcp.rs:1468-1536`，修复前就有、本单未动）走的是
+  `client.get(sse_url)` + 硬编码 `timeout(10s, stream.next())`；逐请求
+  `RequestBuilder::timeout` 只加在 `write_line` 的 POST 上，加不到这个 `GET` 上。
+  因此准确表述是：**streamable HTTP 完整覆盖**（POST 即全部流量）；
+  **legacy SSE 只有请求发送侧覆盖，响应读取侧未覆盖** —— >10s 无事件本来就失败。
+  这是既有边界，不在本 issue 的 stdio 范围，留作后续单。
 - **顺带修掉 NIT-2**：`spawn_streamable` / `spawn_http_sse` 此前把
   `read_timeout` 写死成 `DEFAULT_STDIO_READ_TIMEOUT`、完全忽略调用方实参，所以
   `spawn_with_timeout` 对 HTTP 形同虚设（这也正是 `with_tool_timeout` 在 HTTP 上
@@ -156,21 +170,25 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
 |---|---|---|
 | `initialize` 快速失败 | mock 延迟 1.2s，read=300ms，tool=5s | **304.7ms** 失败（第一版 client 级超时下是 30s；放宽版是 1.2s+ 才成功） |
 | `tools/call` 拿到预算（成功侧） | mock 延迟 800ms，read=300ms，tool=5s | **803.4ms** 成功（若用 read 预算会在 300ms 失败） |
-| `tools/call` 预算**有约束力** | mock 延迟 2.5s，read=5s，tool=700ms | **702.4ms** 被切断（若退化成 30s client 级 backstop，调用会成功） |
+| `tools/call` 预算**有约束力** | mock 延迟 2.5s，read=5s，tool=700ms | **702.4ms** 被切断（若没有逐请求超时，只剩 client 级 30s 默认值，调用会 2.5s 成功） |
 
 ### 返工负控制
 
 | 负控制 | 还原的 hunk | 转红用例 | 实测输出 |
 |---|---|---|---|
-| nc5 | 去掉两种 HTTP transport 的 `RequestBuilder::timeout(...)` | `http_initialize_fails_fast_and_ignores_the_tool_budget` + `http_tools_call_is_cut_off_by_a_short_configured_budget` | `a 1.2s initialize must fail under a 300ms budget`；`http tools/call cut off after 2.502019916s` → `a 2.5s tools/call must be cut off by a 700ms tool budget`（即退化到 30s client 级 backstop，预算完全没施加） |
+| nc5 | 去掉两种 HTTP transport 的 `RequestBuilder::timeout(...)` | `http_initialize_fails_fast_and_ignores_the_tool_budget` + `http_tools_call_is_cut_off_by_a_short_configured_budget` | `a 1.2s initialize must fail under a 300ms budget`；`http tools/call cut off after 2.502019916s` → `a 2.5s tools/call must be cut off by a 700ms tool budget`（无逐请求超时 → 只剩 client 级 30s 默认值，预算完全没施加） |
 | nc6 | `http_request_timeout` 退化为恒定 `self.read_timeout`（预修复语义：工具预算永不施加） | `http_request_timeout_is_tiered` + `http_initialize_fails_fast_...` | `left: 10s / right: 300s`；`a 1.2s initialize must fail under a 300ms budget` |
 
-还原方式：负控制前把 `src/mcp.rs` 另存副本，验证后整文件写回，
-`sha256 = 191db8277fe788839da94c46fb183c288c577dc252346fa7e89c297fe54c9e01`
-与保存前一致，`grep -c "NEGATIVE CONTROL"` = 0。注：nc5 的第一轮只让
-`http_initialize_...` 转红，因为当时"成功侧"用例会被 30s backstop 掩盖；补上
-"约束力侧"用例（2.5s mock vs 700ms 预算）后，nc5 才同时打掉两条 —— 这本身就是
-夹具覆盖面的一次补强。
+还原方式：负控制前把 `src/mcp.rs` 另存副本，验证后整文件写回，并核对 `sha256`。
+**该"还原后"的值是可复现的 `59b0583f7907b0af1fd4ca40651a2a2d1a161c21fc9eab9abe42de6e3b32ee77`**
+（= `git show a069ba75:src/mcp.rs | shasum -a 256`，三处实测一致：worktree 文件、
+git 对象、`git archive`；`grep -c "NEGATIVE CONTROL"` = 0）。本文件早先写的
+`191db827…` 是"返工中途"（备份那一刻）的值，在随后补了"约束力侧"用例、并把重复的
+client 构造收敛进 `idle_streamable_client` 之后就失效了 —— 交付文档里的数字必须
+能在仓库对象上复现，故此处更正为上面的最终值。注：nc5 的第一轮只让
+`http_initialize_...` 转红，因为当时"成功侧"用例会被 30s（未设逐请求超时时的）
+默认值掩盖；补上"约束力侧"用例（2.5s mock vs 700ms 预算）后，nc5 才同时打掉两条
+—— 这本身就是夹具覆盖面的一次补强。
 
 ### 新测试
 
@@ -181,7 +199,7 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
 - `mcp::tests::http_tools_call_uses_the_configured_tool_budget`（端到端，成功侧）
 - `mcp::tests::http_tools_call_is_cut_off_by_a_short_configured_budget`（端到端，
   **约束力**侧：700ms 预算切断 2.5s 调用；这一条在去掉 per-request timeout 时会转红，
-  补上了"成功侧会被 30s backstop 掩盖"的漏洞）
+  补上了"成功侧会被 30s 默认值掩盖"的漏洞）
 
 ## 规格漂移（实测）
 规格给的行号整体前移 1~2 行，**行为判断无一处错误**：
@@ -197,21 +215,39 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
 
 ## Notes / 已知限制
 
-- **不做全局放宽**（规格「陷阱」第 1 条）：`initialize` / `tools/list` 仍是 10s（stdio）
-  或 30s（HTTP reqwest 下限），只有 `tools/call` 拿到 300s。`server_timeout_errors_cleanly`
-  与 `malformed_server_errors_cleanly` 两个既有用例在修复后仍绿，等于反向确认没有放宽。
-- **HTTP 侧超时（返工后）**：两种 HTTP transport 现在都用逐请求
-  `RequestBuilder::timeout`：`tools/call` → `tool_timeout`，其余 → `read_timeout`；
-  client 级固定 30s 只当backstop。但 **服务端发起的请求仍只在 stdio 得到答复** ——
-  HTTP 是"一问一答的 POST"，同一个 pending POST 之外没有可重入的读取点，要支持
-  就得改成并发读流（超出本单范围，issue #181 的标题范围也正是 stdio）。
+- **不做全局放宽**（规格「陷阱」第 1 条）：`initialize` / `tools/list` 保持短预算 ——
+  stdio 10s，HTTP `read_timeout`（默认 10s，见下条取舍）—— 只有 `tools/call` 拿到
+  300s。`server_timeout_errors_cleanly` 与 `malformed_server_errors_cleanly` 两个
+  既有用例在修复后仍绿，等于反向确认没有放宽。
+- **HTTP 侧超时（返工后）**：逐请求 `RequestBuilder::timeout` 加在**两种 HTTP
+  transport 的 POST** 上：`tools/call` → `tool_timeout`，其余 → `read_timeout`。
+  client 级固定 30s（`HTTP_DEFAULT_REQUEST_TIMEOUT`）是**没有显式逐请求超时那类
+  请求的默认值**（例如 legacy SSE 的 `GET` 建连/响应读取），**不是** POST 的硬
+  backstop —— reqwest 的逐请求超时双向覆盖它（复核者 P3：40s 逐请求可压过 30s
+  client 默认而成功）。**覆盖范围**：streamable HTTP 完整（POST 即全部流量）；
+  **legacy SSE 的响应读取未覆盖**（`read_sse_response` 的 `GET` + 硬编码
+  `timeout(10s, stream.next())`，`src/mcp.rs:1468-1536`，既有边界，>10s 无事件
+  本就失败，不在本单 stdio 范围）。另外 **服务端发起的请求仍只在 stdio 得到答复**
+  —— HTTP 是"一问一答的 POST"，同一个 pending POST 之外没有可重入的读取点，要
+  支持就得改成并发读流（超出本单范围，issue #181 的标题范围也正是 stdio）。
+- **HTTP `initialize` 预算从 30s 收紧到 `read_timeout`（默认 10s）—— 有意的取舍，
+  不改代码（收尾复核第 4 条）**：基线时 `initialize` 实际受 client 级 30s 约束；
+  返工后它受逐请求 `read_timeout`（默认 10s）约束。判断为**应当收紧**，理由：
+  (a) 本单「陷阱」第 1 条的意图就是"服务端没起要在秒级暴露"，30s 对它偏宽；
+  (b) 10s 对**健康**远端服务器的握手（TCP+TLS+一次 JSON-RPC 往返）是充裕的 ——
+  真正的"慢启动"多半是**连接**慢，而这由同一预算覆盖，正好是想要的 fail-fast；
+  (c) 不设 `max(read_timeout, 30s)` 下限，是因为那会把 HTTP 的 `initialize` 永久
+  钉在 ≥30s，等于把复核者刚要求收回的放宽又请回来一半；需要更宽预算的调用方可以
+  显式 `spawn_with_timeout(server, Duration::from_secs(30))`。
+  **影响**：极慢启动（>10s 才回 `initialize`）的远端服务器现在会失败，而基线
+  （30s）下可能成功 —— 属行为变化，已在最终 commit message 与本节记录。
 - **NIT-3 记清楚（不改代码）**：这里的 "tool timeout" 是**逐行 idle 超时**，不是
   墙钟 deadline。`read_stdio_response` 每读一行重新起计时，所以服务端只要在预算内
   偶尔吐一行（哪怕是非 JSON 的垃圾行 —— 规格要求跳过它们）就能让调用活过预算；
-  验收者探针实测：每 150ms 一行垃圾可让 400ms 预算的调用活到 **1.543s**。这是
-  "跳过非 JSON 行" 的固有语义，也是修复前就存在的行为（修复前该行为是直接报错，
-  所以不是本次引入的）。HTTP 侧的逐请求超时是真正的墙钟 deadline，两transport
-  语义因此在这一点上不同 —— 已知悉，未改。
+  验收者探针实测：每 150ms 一行垃圾可让 400ms 预算的调用活到 **1.543s**（复核者
+  独立复跑为 **1.557s**）。这是"跳过非 JSON 行"的固有语义，也是修复前就存在的
+  行为（修复前该行为是直接报错，所以不是本次引入的）。HTTP 侧 streamable 的逐请求
+  超时是真正的墙钟 deadline，两 transport 语义因此在这一点上不同 —— 已知悉，未改。
 - **配置入口的选择**：规格说 `spawn` 加 `with_tool_timeout` 让 CLI/服务端透传。
   我没有给 `McpServer`/`McpServerConfig` 加字段（会波及 10+ 处结构体字面量，且
   `McpServerConfig` 是 `.mcp.json` 的 serde 契约，加字段等于扩协议面）。改为：
@@ -249,3 +285,52 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
   `answer_server_request` 返回 `io::Result`）；#6 无新依赖；#7-#10 不涉及。
 - **未推送、未在 GitHub 上留任何痕迹**：无 `git push` / `gh pr create` /
   `gh gist create` / issue 评论 / `gh api` 写操作。
+
+## 收尾复核（第三个 commit，纯文档）：修正 journal 数字与措辞
+
+增量复核 **PASS-WITH-NITS**，NIT-1 已用原始探针实测修复（返工前 `initialize`
+40.004s → 返工后 1.0045s/1.0031s；生产路径 `McpClient::spawn` + env=40 → 10.001s，
+有界；`tools/call` 35s 延迟 / 40s 预算 → Ok，可上穿 30s client 默认）。三条文档级
+问题在本 commit 收掉，**不动任何行为代码**：
+
+| 编号 | 问题 | 处理 |
+|---|---|---|
+| NIT-B | journal 写的"负控制还原后"`sha256(src/mcp.rs)` 不可复现：早先写 `191db827…`（返工中途、备份那一刻的值），真实值是 `59b0583f…` | 已更正；见下方"数字可复现性" |
+| NIT-C | "client 级固定 30s 只当 backstop" 不精确：reqwest 逐请求 `.timeout()` **双向覆盖** client 默认（复核者 P3：40s 逐请求压过 30s 默认并成功） | 改为"**未设逐请求超时那类请求的默认值**"（已在上文 Notes 与改法两处统一） |
+| NIT-A | "两种 HTTP transport 都用逐请求 `RequestBuilder::timeout`" 对 **legacy SSE 的响应读取**不成立 | 已写明：streamable 完整覆盖；legacy SSE 只有请求发送侧覆盖，响应读取侧（`read_sse_response` 的 `GET` + 硬编码 `timeout(10s, …)`，`src/mcp.rs:1468-1536`）未覆盖 |
+
+第 4 条（`initialize` 预算 30s → `read_timeout`=10s 的收紧）**决定不改代码**，取舍
+与影响已写进上文 Notes 的专条。
+
+### 数字可复现性（NIT-B 的验收方式）
+
+本 commit **只改 `.dev/journal/manual-20261012-issue181-mcp-stdio.md`**，因此
+`src/mcp.rs` 的实现与上表记录的"还原后"值仍然一致，可由仓库对象直接复现：
+
+```
+$ git show a069ba75:src/mcp.rs | shasum -a 256
+59b0583f7907b0af1fd4ca40651a2a2d1a161c21fc9eab9abe42de6e3b32ee77
+$ shasum -a 256 src/mcp.rs                      # worktree，同一值
+$ git archive a069ba75 src/mcp.rs | tar -xO | shasum -a 256   # 同一值
+$ git show 587ccbef:src/mcp.rs | shasum -a 256  # 第一轮"还原后"值
+4a986de503a910d686bad784353bcfe59056ca59a5b2bac4c85ed706d1cd53cc
+$ git show 587ccbef:tests/mcp_e2e.rs | shasum -a 256
+d50956bd60ad7a7c90eb27336b648a459223ab0a2e9dd1a8af4de8afd52ba1b4
+$ git show 587ccbef:tests/bin/mock_mcp_server.rs | shasum -a 256
+bd1d128bbe56afd4dfd9239699ce388fba68e84da8c82b30a1d61efbf769edb3
+```
+
+（上面 5 个值本次都已实测，与文中声明一致；journal 自己不在其列 —— 它随本 commit
+变化，不能自指哈希。）
+
+### 影响面确认
+
+- 本 commit 实测 `git diff --stat` 只有 1 个文件：
+  `.dev/journal/manual-20261012-issue181-mcp-stdio.md`（+106/-26），
+  `src/mcp.rs` / `tests/mcp_e2e.rs` / `tests/bin/mock_mcp_server.rs` 与 `a069ba75`
+  逐字节相同（上表 sha256 已复核）。
+- 重跑确认无影响，全绿：
+  - `cargo fmt --all -- --check` → clean
+  - `cargo clippy -p recursive-agent --all-targets -- -D warnings` → clean
+  - `cargo test -p recursive-agent --lib mcp` → **78 passed**; 0 failed
+  - `cargo test -p recursive-agent --test mcp_e2e` → **22 passed**; 0 failed; 2 ignored
