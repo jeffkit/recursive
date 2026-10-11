@@ -872,4 +872,70 @@ mod tests {
             "expected a request-stage refusal, got: {err}"
         );
     }
+
+    // ── Issue #169: pin the production client wiring ────────────────────
+
+    /// `WebFetch::new()` must install the connection-time guard. Without it a
+    /// *name* that resolves to a loopback address — `localhost` here: private,
+    /// and present in every `/etc/hosts` — is fetched, so the guard can be
+    /// deleted from `new()` with the rest of the suite still green.
+    ///
+    /// Driven through `fetch` (not `execute`) because `validate_url` — the
+    /// first layer — already rejects the literal word `localhost`; this test
+    /// pins the *resolver* layer. Hermetic: no external DNS, and
+    /// `.cargo/config.toml` keeps `localhost` on `NO_PROXY` so the request
+    /// cannot be handed to a proxy.
+    #[tokio::test]
+    async fn web_fetch_new_installs_connection_time_guard() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                hits_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "PINNED-SECRET";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.flush();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let url = format!("http://localhost:{port}/pinned");
+
+        // Production wiring: the loopback DNS answer must be refused.
+        let err = WebFetch::new()
+            .fetch(&url, DEFAULT_MAX_BYTES)
+            .await
+            .expect_err("WebFetch::new() no longer installs the DNS guard");
+        assert!(!err.to_string().contains("PINNED-SECRET"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the guarded client must not connect"
+        );
+
+        // Control: the same client options without the resolver reach the
+        // listener, so the assertion above is not vacuous.
+        let body = WebFetch::from_builder(WebFetch::client_builder().no_proxy())
+            .fetch(&url, DEFAULT_MAX_BYTES)
+            .await
+            .expect("control: an unguarded client must reach the loopback listener");
+        assert_eq!(body, "PINNED-SECRET");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
 }

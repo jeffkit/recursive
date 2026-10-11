@@ -27,6 +27,19 @@ the A2A endpoint can be called with `a2a_call`.
 - [Multi-Agent Tools](multi-agent.md) handle **in-process** sub-agents (same binary).
 - A2A tools handle **cross-process** remote agents.
 
+## SSRF guard
+
+All three tools share one HTTP client factory, and that client validates both the
+endpoint URL and the address it resolves to before connecting (issue #169):
+literal loopback / private / link-local hosts are rejected up front, and any DNS
+answer containing a private address is refused, so a hostname that resolves into
+the internal network (or rebinds to it) never gets a socket. Redirects are not
+followed.
+
+Deployments that must reach agents on internal addresses can opt out with
+`RECURSIVE_SSRF_ALLOW_PRIVATE_DNS=1` (default off) — see
+[Web Tools](web-tools.md).
+
 ## Related Concepts
 
 - [Multi-Agent Tools](multi-agent.md)
