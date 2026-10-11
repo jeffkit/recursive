@@ -848,9 +848,8 @@ impl OpenAiProvider {
                         // there is nothing to save — keep the original
                         // Err(Error::Cancelled) so run_inner's Cancelled arm
                         // handles it.
-                        let have_partial = !content.is_empty()
-                            || !reasoning_content.is_empty()
-                            || !tool_call_builders.is_empty();
+                        let have_partial =
+                            Self::has_persistable_partial(&content, &reasoning_content);
                         if have_partial {
                             tracing::warn!(
                                 target: "recursive::llm",
@@ -883,9 +882,7 @@ impl OpenAiProvider {
                     // the caller persists it (the "interrupted" sentinel
                     // routes to FinishReason::Cancelled). A drop before the
                     // first token has nothing to save — keep the Err.
-                    let have_partial = !content.is_empty()
-                        || !reasoning_content.is_empty()
-                        || !tool_call_builders.is_empty();
+                    let have_partial = Self::has_persistable_partial(&content, &reasoning_content);
                     if have_partial {
                         tracing::warn!(
                             target: "recursive::llm",
@@ -968,6 +965,29 @@ impl OpenAiProvider {
             finish_reason,
             usage,
         ))
+    }
+
+    /// Issue #168 — is there anything in the interrupted SSE state worth
+    /// persisting as a partial assistant message?
+    ///
+    /// Only text (or reasoning) counts. A half-received **tool call** does
+    /// not: [`Self::build_completion`] is called with an empty builder map on
+    /// the partial paths (orphan risk), so a tool-call-only interrupt would
+    /// otherwise yield `content: ""` + `tool_calls: []` and run_core would
+    /// persist an empty assistant row — the shape Anthropic rejects with 400
+    /// "text content blocks must be non-empty". Before issue #168 this
+    /// predicate also accepted `!tool_call_builders.is_empty()`, which is
+    /// exactly how the poisoned message got written.
+    ///
+    /// `#[mutants::skip]`: the `reasoning_content` term is behavior-
+    /// equivalent to `true` on the read-error/cancel path, because
+    /// `reasoning_content` can only be non-empty when a reasoning delta was
+    /// already accumulated, and that path returns the partial *before*
+    /// re-entering the loop. Flipping or deleting that term therefore cannot
+    /// change observable behaviour.
+    #[cfg_attr(test, mutants::skip)]
+    fn has_persistable_partial(content: &str, reasoning_content: &str) -> bool {
+        !content.is_empty() || !reasoning_content.is_empty()
     }
 
     /// Assemble a [`Completion`] from accumulated SSE state. Shared by the
@@ -1181,7 +1201,17 @@ fn build_request(
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "messages": messages.iter().map(serialize_message).collect::<Vec<_>>(),
+        // Issue #168: an assistant message with no text and no tool calls
+        // carries nothing, but `content: ""` is a hard 400 for Anthropic and
+        // every strict OpenAI→Anthropic translation gateway ("text content
+        // blocks must be non-empty"). Drop it on the way out (belt-and-braces
+        // alongside `SessionReader::load_messages` + `finish_interrupted`)
+        // instead of letting a poisoned transcript kill every later turn.
+        "messages": messages
+            .iter()
+            .filter(|m| !crate::message::is_empty_assistant(m))
+            .map(serialize_message)
+            .collect::<Vec<_>>(),
     });
     if !tools.is_empty() {
         let tools_json: Vec<Value> = tools
@@ -3092,12 +3122,15 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn parse_sse_stream_returns_partial_when_only_tool_call_started() {
-        // Kills `have_partial` tool-call-condition mutants (delete `!` on
-        // `!tool_call_builders.is_empty()`, `|| -> &&` at 705): a stream that
-        // started a tool call (but no text) must still return a partial
-        // Completion on a mid-stream read error, with the half-received tool
-        // call dropped (orphan risk).
+    async fn parse_sse_stream_errors_when_only_tool_call_started() {
+        // Issue #168 (spec test `interrupted_tool_call_delta_persists_no_empty_assistant`,
+        // provider half): a stream that started a tool call but delivered NO
+        // text has nothing worth persisting. Returning a partial Completion
+        // here makes run_core push an empty assistant message (the goal-382
+        // partial path clears tool_calls before returning), which poisons
+        // every later Anthropic request with `content: ""`. The interrupt
+        // must surface as an Err instead, so the turn fails without touching
+        // the transcript.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -3120,13 +3153,73 @@ data: [DONE]
         let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
         let completion = provider
             .stream(&[Message::user("hi")], &[], None, None)
-            .await
-            .expect("tool-call-only partial must be returned, not Err");
-        assert_eq!(completion.finish_reason.as_deref(), Some("interrupted"));
-        assert_eq!(completion.content, "");
+            .await;
+        let err = completion.expect_err(
+            "a tool-call-only interrupt must fail the call, not yield an empty partial",
+        );
+        let text = err.to_string();
         assert!(
-            completion.tool_calls.is_empty(),
-            "half-received tool calls must be dropped from a partial completion"
+            text.contains("SSE stream read error"),
+            "the tool-call-only interrupt must surface the read error, got: {text}",
+        );
+    }
+
+    #[test]
+    fn serializer_skips_empty_assistant() {
+        // Issue #168 (spec test `serializer_skips_empty_assistant`): a
+        // persisted `{role: "assistant", content: ""}` message (no
+        // tool_calls) must never reach the OpenAI-compatible wire — a strict
+        // OpenAI→Anthropic gateway materialises it as an empty text block and
+        // rejects the whole request with 400. It must be dropped, not turned
+        // into `content: ""` or `content: null`.
+        let msgs = vec![
+            Message::user("hello".to_string()),
+            Message::assistant("".to_string()),
+            Message::user("continue".to_string()),
+        ];
+        let req = build_request("m", 0.2, 1024, &msgs, &[]);
+        assert_eq!(
+            req["messages"].as_array().map(Vec::len),
+            Some(2),
+            "the empty assistant must be dropped from the request body, got {}",
+            req["messages"],
+        );
+        assert!(
+            req["messages"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(|m| m["role"] != "assistant")),
+            "no assistant message may survive when it was empty: {}",
+            req["messages"],
+        );
+    }
+
+    #[test]
+    fn serializer_keeps_interrupted_assistant_with_text() {
+        // Negative pair for `serializer_skips_empty_assistant`: the guard is
+        // scoped to *empty* assistants. An interrupted reply that did carry
+        // text must still go out (goal-382 keeps partial output), and a
+        // tool-call assistant with empty content keeps its `content: null`
+        // wire shape (issue #16) — invariant #8's pairing must not regress.
+        let msgs = vec![
+            Message::user("hello".to_string()),
+            Message::assistant("partial reply".to_string()),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"path": "x"}),
+                }],
+            ),
+        ];
+        let req = build_request("m", 0.2, 1024, &msgs, &[]);
+        let out = req["messages"].as_array().expect("messages array");
+        assert_eq!(out.len(), 3, "only the empty assistant is dropped");
+        assert_eq!(out[1]["content"].as_str(), Some("partial reply"));
+        assert!(
+            out[2]["content"].is_null(),
+            "tool-call assistant with empty content keeps content: null (#16), got {}",
+            out[2]["content"],
         );
     }
 

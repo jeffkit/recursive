@@ -153,9 +153,21 @@ impl SessionReader {
     /// The `system` role is **kept** in the returned vec; callers
     /// that want to rebuild the system prompt from `Config` can
     /// filter it out manually.
+    ///
+    /// Issue #168: assistant messages with no text and no tool calls (written
+    /// by pre-fix binaries when an interrupt hit during the tool_call phase)
+    /// are filtered out here. They carry no information and — worse — poison
+    /// the session: replayed to Anthropic they are an empty text block, which
+    /// is a permanent 400. Only that exact shape is dropped, so a
+    /// tool_call-carrying assistant and every `Role::Tool` result survive and
+    /// invariant #8 keeps holding.
     pub fn load_messages(session_dir: &Path) -> std::io::Result<Vec<crate::message::Message>> {
         let entries = Self::load_transcript(session_dir)?;
-        Ok(entries.into_iter().map(entry_to_message).collect())
+        Ok(entries
+            .into_iter()
+            .map(entry_to_message)
+            .filter(|m| !crate::message::is_empty_assistant(m))
+            .collect())
     }
 
     /// Load the resume seed ([`Self::load_messages`]) with the results of
@@ -183,11 +195,18 @@ impl SessionReader {
     ) -> std::io::Result<Vec<crate::message::Message>> {
         let entries = Self::load_transcript(session_dir)?;
         if answers.is_empty() {
-            return Ok(entries.into_iter().map(entry_to_message).collect());
+            return Ok(entries
+                .into_iter()
+                .map(entry_to_message)
+                .filter(|m| !crate::message::is_empty_assistant(m))
+                .collect());
         }
         let insert_at = orphan_result_insert_at(&entries);
-        let mut messages: Vec<crate::message::Message> =
-            entries.into_iter().map(entry_to_message).collect();
+        let mut messages: Vec<crate::message::Message> = entries
+            .into_iter()
+            .map(entry_to_message)
+            .filter(|m| !crate::message::is_empty_assistant(m))
+            .collect();
         let synthetic = answers
             .iter()
             .map(|(id, content)| crate::message::Message::tool_result(id.clone(), content.clone()));
@@ -508,6 +527,73 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "msg_001");
         assert!(!entries[0].timestamp.is_empty());
+    }
+
+    #[test]
+    fn legacy_empty_assistant_is_filtered_on_load() {
+        // Issue #168 (spec test `legacy_empty_assistant_is_filtered_on_load`):
+        // sessions written before the fix already carry
+        // `{role: "assistant", content: ""}` (no tool_calls) rows on disk.
+        // They must be filtered on load, otherwise the poisoned session can
+        // never be reopened and every later request 400s. Only that exact
+        // shape is dropped — tool results and tool_call-carrying assistants
+        // must survive (invariant #8).
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut writer = SessionWriter::create(ws, "g168 legacy", "model", "anthropic").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+
+        writer
+            .append(&Message::user("hello".to_string()), None, None)
+            .unwrap();
+        writer
+            .append(&Message::assistant("".to_string()), None, None)
+            .unwrap();
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "".to_string(),
+                    vec![crate::llm::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: serde_json::json!({"path": "x"}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(
+                &Message::tool_result("call_1".to_string(), "file body".to_string()),
+                None,
+                None,
+            )
+            .unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+        drop(writer);
+
+        // The bad row really is on disk (the test would be vacuous otherwise).
+        let entries = SessionReader::load_transcript(&session_dir).unwrap();
+        assert_eq!(entries.len(), 4, "the legacy empty row must be persisted");
+        assert_eq!(entries[1].role, "assistant");
+        assert!(entries[1].content.is_empty());
+        assert!(entries[1].tool_calls.is_empty());
+
+        let msgs = SessionReader::load_messages(&session_dir).unwrap();
+        assert_eq!(
+            msgs.len(),
+            3,
+            "the legacy empty assistant must be filtered on load: {msgs:?}",
+        );
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert_eq!(msgs[1].tool_calls.len(), 1, "tool_calls must survive");
+        assert_eq!(msgs[2].role, Role::Tool, "tool result must survive (#8)");
+
+        // The resume seed with orphan answers goes through the same filter.
+        let spliced = SessionReader::load_messages_with_orphan_results(&session_dir, &[]).unwrap();
+        assert_eq!(spliced.len(), 3);
     }
 
     #[test]

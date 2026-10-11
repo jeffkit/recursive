@@ -1140,6 +1140,23 @@ impl<'a> RunCore<'a> {
         // `MessageAppended` event carries it.
         let mut msg = Message::assistant(completion.content.clone());
         msg.reasoning_content = completion.reasoning_content.clone();
+        // Issue #168: an interrupt that carries neither text nor tool calls
+        // has nothing to persist. Pushing it writes
+        // `{"role":"assistant","content":""}` to transcript.jsonl, and from
+        // then on every Anthropic request replays that empty text block and
+        // 400s for good. The providers no longer emit that shape (a
+        // tool-call-only interrupt is an Err), so this is the second layer:
+        // another provider, a future partial path, or a replayed transcript
+        // must not be able to poison the session here. The turn still ends
+        // Cancelled — only the empty row is dropped.
+        if crate::message::is_empty_assistant(&msg) {
+            tracing::warn!(
+                target: "recursive::agent",
+                "interrupted completion carried no text and no tool calls; \
+                 skipping the empty assistant message"
+            );
+            return self.make_cancelled_outcome(step, None, total_usage, tool_audits);
+        }
         self.push_message(step, msg);
         self.make_cancelled_outcome(
             step,
@@ -3358,6 +3375,140 @@ mod tests {
             assistant_msgs[0].reasoning_content.as_deref(),
             Some("half a thought"),
             "reasoning must be attached to the partial assistant message",
+        );
+    }
+
+    /// Issue #168 — HEADLINE persistence guard.
+    ///
+    /// The goal-382 partial path returned a Completion with
+    /// `finish_reason = "interrupted"`, empty content and (because the SSE
+    /// parsers drop half-received tool calls) no tool_calls when the only
+    /// thing that had arrived was a tool_call/tool_use delta. `finish_interrupted`
+    /// then pushed `Message::assistant("")` — content empty AND no tool_calls —
+    /// and `emit_turn_messages` wrote it to `transcript.jsonl`. Every later
+    /// Anthropic request then carried `{"role":"assistant","content":""}` and
+    /// 400'd forever.
+    ///
+    /// The providers no longer *produce* that completion (a tool-call-only
+    /// interrupt is an Err now), but the persistence path is the second layer
+    /// of defence: if such a completion ever reaches us anyway (another
+    /// provider, a future partial path, a replayed transcript) it must not be
+    /// pushed.
+    #[tokio::test]
+    async fn interrupted_tool_call_delta_persists_no_empty_assistant() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Exactly the shape the buggy provider path produced: the SSE
+        // tool_call delta was dropped, so content and tool_calls are both
+        // empty while the interrupted sentinel remains.
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![],
+            finish_reason: Some("interrupted".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "an interrupted completion must still finish as Cancelled, got {:?}",
+            outcome.finish_reason,
+        );
+        assert!(
+            !outcome.messages.iter().any(|m| m.role == Role::Assistant
+                && m.content.trim().is_empty()
+                && m.tool_calls.is_empty()),
+            "no empty assistant message may be pushed: {:?}",
+            outcome.messages,
+        );
+        assert_eq!(
+            outcome
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .count(),
+            0,
+            "an empty interrupted completion has nothing to persist",
+        );
+    }
+
+    /// Issue #168 negative control for the persistence guard: an interrupted
+    /// completion that DID carry text is still persisted (goal-382's intent is
+    /// preserved — the guard only drops the empty shape), and a tool-call
+    /// assistant message is never touched.
+    #[tokio::test]
+    async fn interrupted_assistant_with_text_is_still_pushed() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "half a reply".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("interrupted".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
+        let assistant: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant.len(),
+            1,
+            "an interrupted reply with text must still be persisted",
+        );
+        assert_eq!(assistant[0].content, "half a reply");
+    }
+
+    #[test]
+    fn is_empty_assistant_matches_only_empty_assistant_messages() {
+        // The predicate must be exactly `assistant && content.trim().is_empty()
+        // && tool_calls.is_empty()`: whitespace-only content counts as empty,
+        // but every other role and every tool_call-carrying assistant does not.
+        assert!(crate::message::is_empty_assistant(&Message::assistant(
+            "".to_string()
+        )));
+        assert!(crate::message::is_empty_assistant(&Message::assistant(
+            "  \n\t ".to_string()
+        )));
+        assert!(!crate::message::is_empty_assistant(&Message::assistant(
+            "hi".to_string()
+        )));
+        assert!(!crate::message::is_empty_assistant(&Message::user(
+            "".to_string()
+        )));
+        assert!(!crate::message::is_empty_assistant(&Message::system(
+            "".to_string()
+        )));
+        assert!(!crate::message::is_empty_assistant(&Message::tool_result(
+            "call_1".to_string(),
+            "".to_string()
+        )));
+        let tool_call = crate::llm::ToolCall {
+            id: "call_1".to_string(),
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "x"}),
+        };
+        assert!(
+            !crate::message::is_empty_assistant(&Message::assistant_with_tool_calls(
+                "".to_string(),
+                vec![tool_call],
+            )),
+            "a tool-call assistant must never be filtered (invariant #8)",
         );
     }
 

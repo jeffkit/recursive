@@ -125,6 +125,34 @@ impl Message {
     }
 }
 
+/// Issue #168 — the "poisoned assistant message" predicate.
+///
+/// An assistant message with no text and no tool calls carries no
+/// information, but it is *not* harmless on the wire: Anthropic (and every
+/// strict OpenAI→Anthropic translation gateway) rejects an empty text block
+/// with HTTP 400 "text content blocks must be non-empty". A message of this
+/// shape therefore poisons the whole session — every later request that
+/// replays the transcript fails.
+///
+/// The single definition is shared by all four guard sites so they can never
+/// drift apart:
+///
+/// * `run_core::finish_interrupted` — never *push* the empty shape;
+/// * `session::reader::SessionReader::load_messages` — filter rows already
+///   written to disk by a pre-fix binary, so a poisoned session is still
+///   openable;
+/// * `llm::openai::build_request` / `llm::anthropic::serialize_messages_anthropic`
+///   — belt-and-braces drop on the request path.
+///
+/// Deliberately narrow: `content` is trimmed (a whitespace-only reply is
+/// equally empty on the wire) and messages carrying `tool_calls` are NEVER
+/// matched, because dropping one would orphan its `Role::Tool` results and
+/// break invariant #8.
+#[cfg_attr(test, mutants::skip)]
+pub fn is_empty_assistant(m: &Message) -> bool {
+    m.role == Role::Assistant && m.content.trim().is_empty() && m.tool_calls.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
