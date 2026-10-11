@@ -882,12 +882,17 @@ pub(crate) async fn build_runtime(
 mod tests {
     use super::*;
 
+    // Issue #185: the env guard is crate-wide now (`crate::test_env`), so
+    // `main.rs` and `cli/resume.rs` tests share this exact lock instead of
+    // racing against this module's private one.
+    use crate::test_env::EnvGuard;
+
     // ── skills_from_http_sources (issue #74 拆单 3/3) ────────────────────
 
     /// Unset / blank RECURSIVE_SKILL_SOURCE_URL is a no-op: empty catalog,
-    /// no network. Each half is scoped: ENV_LOCK is a non-reentrant
-    /// std Mutex, so a second `EnvGuard::set` while the first guard is
-    /// still alive self-deadlocks the whole test binary.
+    /// no network. Each half is scoped: the shared env lock is a
+    /// non-reentrant std Mutex, so a second `EnvGuard::set` while the first
+    /// guard is still alive self-deadlocks the whole test binary.
     #[test]
     fn skills_from_http_sources_unset_or_blank_is_empty() {
         {
@@ -1148,44 +1153,11 @@ mod tests {
 
     // ── Test harness helpers ─────────────────────────────────────────────
 
-    /// Serialises tests that mutate process-wide env vars. Every env-writing
-    /// test holds this lock via [`EnvGuard`] and restores the prior value on
-    /// drop, so the developer's real environment (and parallel tests) are
-    /// never left modified.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        saved: Vec<(String, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&str, Option<&str>)]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let saved = vars
-                .iter()
-                .map(|(k, _)| ((*k).to_string(), std::env::var_os(k)))
-                .collect();
-            for (k, v) in vars {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-            EnvGuard { saved, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    // The `ENV_LOCK` + `EnvGuard` that used to live here moved to
+    // `crate::test_env` (issue #185) so every env-mutating test in this
+    // binary — builder, `main.rs`, `cli/resume.rs` — serialises on ONE lock.
+    // The `use crate::test_env::EnvGuard;` import above keeps every call site
+    // in this module unchanged.
 
     /// A discovered skill lives at `<root>/<dir>/SKILL.md`. Returns `root`.
     fn seed_skill(root: &Path, dir: &str, name: &str) {

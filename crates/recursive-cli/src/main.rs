@@ -10,6 +10,11 @@
 
 mod cli;
 
+/// Issue #185: the one crate-wide guard every env-mutating test in this binary
+/// goes through (see the module docs for the cross-module race it fixes).
+#[cfg(test)]
+mod test_env;
+
 #[cfg(feature = "otel")]
 mod otel;
 
@@ -3900,6 +3905,9 @@ async fn next_weixin_request(
 mod tests {
     use super::*;
     use crate::cli::builder::build_runtime;
+    // Issue #185: one crate-wide env guard — `set_var`/`remove_var` below must
+    // never bypass it or these tests race `cli::builder` / `cli::resume` ones.
+    use crate::test_env::EnvGuard;
 
     /// Issue #150: the CLI hardens the process at the top of `main()` so a
     /// same-uid child cannot read the service process's credentials out of
@@ -3970,6 +3978,12 @@ mod tests {
     /// hermetic for any tests that come after it.
     #[tokio::test]
     async fn build_runtime_construction_smoke() {
+        // Issue #185: `build_runtime` resolves the agent preset from the
+        // process env, so this test holds the shared env lock for its whole
+        // body. Without it, `cli::builder::unknown_preset_env_fails_the_cli_build`
+        // (which sets `RECURSIVE_AGENT_PRESET=no-such-preset`) races this
+        // reader and the run goes red at random.
+        let mut env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = dummy_config(tmp.path());
 
@@ -4005,8 +4019,7 @@ mod tests {
         .await;
         assert!(r2.is_ok(), "openai/stream=true: must not panic or fail");
 
-        let original = std::env::var("RECURSIVE_PROVIDER_TYPE").ok();
-        std::env::set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
+        env.set_var("RECURSIVE_PROVIDER_TYPE", "anthropic");
         let mut cfg_anthropic = dummy_config(tmp.path());
         cfg_anthropic.provider_type = "anthropic".into();
         let r3 = build_runtime(
@@ -4023,10 +4036,7 @@ mod tests {
             false,
         )
         .await;
-        match original {
-            Some(v) => std::env::set_var("RECURSIVE_PROVIDER_TYPE", v),
-            None => std::env::remove_var("RECURSIVE_PROVIDER_TYPE"),
-        }
+        // `EnvGuard`'s Drop (at the end of this test) restores the variable.
         assert!(r3.is_ok(), "anthropic/stream=false: must not panic or fail");
     }
 
@@ -4043,6 +4053,11 @@ mod tests {
     /// says Cancelled".
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn build_runtime_threads_per_turn_slot_into_agent_tool() {
+        // Issue #185: this test *reads* the preset from the process env via
+        // `build_runtime`, so it takes the shared env lock for its whole body
+        // (writer tests would otherwise mutate `RECURSIVE_AGENT_PRESET` under
+        // it). `EnvGuard::lock` mutates nothing by itself.
+        let _env = EnvGuard::lock();
         // 127.0.0.1:1 refuses instantly — deterministic, no DNS, no network.
         let mut cfg = dummy_config(tempfile::tempdir().expect("tempdir").path());
         cfg.api_base = "http://127.0.0.1:1/v1".into();
@@ -4205,9 +4220,11 @@ mod tests {
     #[test]
     fn sandbox_flag_parses_all_tiers_env_and_garbage() {
         // clap reads the process env, so every env-dependent case lives in
-        // ONE fn (parallel sibling tests would race on the global).
-        let saved = std::env::var("RECURSIVE_SANDBOX").ok();
-        std::env::remove_var("RECURSIVE_SANDBOX");
+        // ONE fn and the whole fn runs under the shared env guard (#185):
+        // sibling tests that call `Cli::parse_from` must not observe the
+        // transient `RECURSIVE_SANDBOX=policy` below.
+        let mut env = EnvGuard::lock();
+        env.remove_var("RECURSIVE_SANDBOX");
 
         // Default: unset → local default tier.
         let cli = Cli::parse_from(vec!["recursive", "run", "g"]);
@@ -4221,7 +4238,7 @@ mod tests {
             assert_eq!(cli.sandbox.as_deref(), Some(tier));
         }
         // Env fallback populates the flag…
-        std::env::set_var("RECURSIVE_SANDBOX", "policy");
+        env.set_var("RECURSIVE_SANDBOX", "policy");
         let cli = Cli::parse_from(vec!["recursive", "run", "g"]);
         assert_eq!(
             cli.sandbox.as_deref(),
@@ -4235,16 +4252,12 @@ mod tests {
             Some("container"),
             "the explicit flag must win over the env value"
         );
-        std::env::remove_var("RECURSIVE_SANDBOX");
+        env.remove_var("RECURSIVE_SANDBOX");
         // Unknown tier names are rejected by clap's value_parser (exit 2).
         assert!(
             Cli::try_parse_from(vec!["recursive", "--sandbox", "bogus", "run", "g"]).is_err(),
             "bogus tier must fail parsing"
         );
-
-        if let Some(v) = saved {
-            std::env::set_var("RECURSIVE_SANDBOX", v);
-        }
     }
 
     #[test]
@@ -4383,58 +4396,43 @@ mod tests {
     #[test]
     fn plan_approval_timeout_env_default_override_and_zero_disables() {
         let var = "RECURSIVE_PLAN_APPROVAL_TIMEOUT_SECS";
-        let saved = std::env::var(var).ok();
+        // Issue #185: the whole mutation sweep runs under the crate-wide env
+        // guard; `Drop` restores whatever the developer's shell had.
+        let mut env = EnvGuard::lock();
 
-        unsafe {
-            std::env::remove_var(var);
-        }
+        env.remove_var(var);
         assert_eq!(
             plan_approval_timeout_secs(),
             Some(300),
             "unset keeps the #47④ 300s default"
         );
 
-        unsafe {
-            std::env::set_var(var, "0");
-        }
+        env.set_var(var, "0");
         assert_eq!(
             plan_approval_timeout_secs(),
             None,
             "0 restores wait-forever (the interrupt token still rescues it)"
         );
 
-        unsafe {
-            std::env::set_var(var, "45");
-        }
+        env.set_var(var, "45");
         assert_eq!(plan_approval_timeout_secs(), Some(45));
 
-        unsafe {
-            std::env::set_var(var, " 120 ");
-        }
+        env.set_var(var, " 120 ");
         assert_eq!(plan_approval_timeout_secs(), Some(120), "trim before parse");
 
-        unsafe {
-            std::env::set_var(var, "banana");
-        }
+        env.set_var(var, "banana");
         assert_eq!(
             plan_approval_timeout_secs(),
             Some(300),
             "garbage falls back to the default instead of failing REPL startup"
         );
 
-        unsafe {
-            std::env::set_var(var, "");
-        }
+        env.set_var(var, "");
         assert_eq!(
             plan_approval_timeout_secs(),
             Some(300),
             "blank counts as unset"
         );
-
-        match saved {
-            Some(v) => unsafe { std::env::set_var(var, v) },
-            None => unsafe { std::env::remove_var(var) },
-        }
     }
 
     #[test]
@@ -4637,16 +4635,13 @@ mod tests {
     /// `cargo test` parallel env races (`.dev/AGENTS.md` lesson).
     #[test]
     fn auth_warning_tracks_inbound_env_vars_in_one_test() {
-        let prev_keys = std::env::var(recursive::http::ENV_AUTH_KEYS).ok();
-        let prev_jwt = std::env::var(recursive::http::ENV_AUTH_JWT_SECRET).ok();
-        let prev_outbound = std::env::var("RECURSIVE_API_KEY").ok();
-
-        unsafe {
-            std::env::remove_var(recursive::http::ENV_AUTH_KEYS);
-            std::env::remove_var(recursive::http::ENV_AUTH_JWT_SECRET);
-            // Outbound LLM key must NOT suppress the warning.
-            std::env::set_var("RECURSIVE_API_KEY", "outbound-llm-key");
-        }
+        // Issue #185: the whole env-dependent sweep holds the crate-wide lock;
+        // `Drop` restores all three variables.
+        let mut env = EnvGuard::lock();
+        env.remove_var(recursive::http::ENV_AUTH_KEYS);
+        env.remove_var(recursive::http::ENV_AUTH_JWT_SECRET);
+        // Outbound LLM key must NOT suppress the warning.
+        env.set_var("RECURSIVE_API_KEY", "outbound-llm-key");
         // No inbound credentials → warning, even with RECURSIVE_API_KEY set.
         let enabled = http_auth_enabled(
             std::env::var(recursive::http::ENV_AUTH_KEYS)
@@ -4659,9 +4654,7 @@ mod tests {
         assert!(disabled_auth_warning(enabled).is_some());
 
         // Inbound keys set → no warning.
-        unsafe {
-            std::env::set_var(recursive::http::ENV_AUTH_KEYS, "k1,k2");
-        }
+        env.set_var(recursive::http::ENV_AUTH_KEYS, "k1,k2");
         let enabled = http_auth_enabled(
             std::env::var(recursive::http::ENV_AUTH_KEYS)
                 .ok()
@@ -4673,10 +4666,8 @@ mod tests {
         assert!(disabled_auth_warning(enabled).is_none());
 
         // JWT secret alone also enables auth.
-        unsafe {
-            std::env::remove_var(recursive::http::ENV_AUTH_KEYS);
-            std::env::set_var(recursive::http::ENV_AUTH_JWT_SECRET, "s3cret");
-        }
+        env.remove_var(recursive::http::ENV_AUTH_KEYS);
+        env.set_var(recursive::http::ENV_AUTH_JWT_SECRET, "s3cret");
         let enabled = http_auth_enabled(
             std::env::var(recursive::http::ENV_AUTH_KEYS)
                 .ok()
@@ -4686,38 +4677,20 @@ mod tests {
                 .as_deref(),
         );
         assert!(disabled_auth_warning(enabled).is_none());
-
-        // Restore.
-        unsafe {
-            match prev_keys {
-                Some(v) => std::env::set_var(recursive::http::ENV_AUTH_KEYS, v),
-                None => std::env::remove_var(recursive::http::ENV_AUTH_KEYS),
-            }
-            match prev_jwt {
-                Some(v) => std::env::set_var(recursive::http::ENV_AUTH_JWT_SECRET, v),
-                None => std::env::remove_var(recursive::http::ENV_AUTH_JWT_SECRET),
-            }
-            match prev_outbound {
-                Some(v) => std::env::set_var("RECURSIVE_API_KEY", v),
-                None => std::env::remove_var("RECURSIVE_API_KEY"),
-            }
-        }
     }
 
     #[test]
     fn trace_spans_requested_only_for_exact_one() {
-        let previous = std::env::var("RECURSIVE_TRACE_SPANS").ok();
-        std::env::set_var("RECURSIVE_TRACE_SPANS", "1");
+        // Issue #185: shared env guard (Drop restores the prior value).
+        let mut env = EnvGuard::lock();
+        env.set_var("RECURSIVE_TRACE_SPANS", "1");
         assert!(trace_spans_requested());
-        std::env::set_var("RECURSIVE_TRACE_SPANS", "on");
+        env.set_var("RECURSIVE_TRACE_SPANS", "on");
         assert!(!trace_spans_requested());
-        std::env::set_var("RECURSIVE_TRACE_SPANS", "0");
+        env.set_var("RECURSIVE_TRACE_SPANS", "0");
         assert!(!trace_spans_requested());
-        std::env::remove_var("RECURSIVE_TRACE_SPANS");
+        env.remove_var("RECURSIVE_TRACE_SPANS");
         assert!(!trace_spans_requested());
-        if let Some(v) = previous {
-            std::env::set_var("RECURSIVE_TRACE_SPANS", v);
-        }
     }
 
     #[test]
@@ -4732,15 +4705,13 @@ mod tests {
 
     #[test]
     fn log_format_flag_parses_and_defaults_to_text() {
-        let previous = std::env::var("RECURSIVE_LOG_FORMAT").ok();
-        std::env::remove_var("RECURSIVE_LOG_FORMAT");
+        // Issue #185: shared env guard (Drop restores the prior value).
+        let mut env = EnvGuard::lock();
+        env.remove_var("RECURSIVE_LOG_FORMAT");
         let cli = Cli::parse_from(vec!["recursive", "run", "g"]);
         assert_eq!(cli.log_format, "text", "--log-format defaults to text");
         let cli = Cli::parse_from(vec!["recursive", "--log-format", "json", "run", "g"]);
         assert_eq!(cli.log_format, "json", "--log-format json must be accepted");
-        if let Some(v) = previous {
-            std::env::set_var("RECURSIVE_LOG_FORMAT", v);
-        }
     }
 
     /// Issue #92: the `recursive http` startup path resolves its storage
@@ -4749,7 +4720,9 @@ mod tests {
     /// layout the HTTP cold-load path reads back (`load_transcript`).
     #[tokio::test]
     async fn http_storage_backend_defaults_to_local_filesystem() {
-        std::env::remove_var(recursive::storage::ENV_S3_BUCKET);
+        // Issue #185: the "no bucket configured" precondition goes through the
+        // shared env guard, so it is restored (rather than leaked) on exit.
+        let _env = EnvGuard::set(&[(recursive::storage::ENV_S3_BUCKET, None)]);
         let workspace = tempfile::tempdir().expect("tempdir");
         let backend = recursive::storage::http_storage_backend(workspace.path().to_path_buf())
             .await
@@ -4777,14 +4750,14 @@ mod tests {
     /// *user* dir, not the project tree — and leaves no residue.
     #[tokio::test]
     async fn doctor_probe_storage_round_trips_against_the_server_root_and_cleans_up() {
-        std::env::remove_var(recursive::storage::ENV_S3_BUCKET);
+        // Issue #185: both env preconditions under the shared guard.
+        let mut env = EnvGuard::set(&[(recursive::storage::ENV_S3_BUCKET, None)]);
         let home = tempfile::tempdir().expect("home");
         let tmp = tempfile::tempdir().expect("tempdir");
         // `user_workspace_dir` resolves through RECURSIVE_HOME, so pin it at
         // the tempdir: without this the probe writes into the developer's real
         // user dir.
-        let prev_home = std::env::var_os("RECURSIVE_HOME");
-        std::env::set_var("RECURSIVE_HOME", home.path());
+        env.set_var("RECURSIVE_HOME", home.path());
 
         let config = dummy_config(tmp.path());
         let root = recursive::user_workspace_dir(tmp.path()).expect("user workspace dir");
@@ -4803,11 +4776,6 @@ mod tests {
             !tmp.path().join(".recursive/memory").exists(),
             "the probe must not write into the project tree"
         );
-
-        match prev_home {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
-        }
     }
 
     /// Issue #123: the disk probe writes then verifies 1 MiB and removes it.
