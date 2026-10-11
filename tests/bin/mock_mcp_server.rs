@@ -211,7 +211,7 @@ fn dispatch(mode: &str, method: &str, id: &serde_json::Value) -> Option<String> 
                 "echo" => json!({"tools": true, "resources": true, "prompts": true}),
                 "read-blob" | "empty-resources" => json!({"resources": true}),
                 "prompt-args" | "prompt-default" => json!({"prompts": true}),
-                "tools-only" => json!({"tools": true}),
+                "tools-only" | "nonjson" => json!({"tools": true}),
                 "error-tool" => json!({}),
                 // issue #181: the spec wire shape — capabilities are
                 // *objects* (e.g. `"tools": {}`), not booleans. Reading

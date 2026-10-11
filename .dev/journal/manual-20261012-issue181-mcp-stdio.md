@@ -121,8 +121,69 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
 | `cargo fmt --all -- --check` | clean，exit 0 |
 | `cargo check --workspace --all-targets` | clean（额外自查：cli/tui 等下游消费方均编译通过） |
 
-## 规格漂移（实测）
+## Review 返工（第二 commit）：HTTP 侧不再全局放宽握手超时
 
+独立验收给出 **PASS-WITH-NITS**，其中 NIT-1 是真回归、且直接撞规格「陷阱」第 1 条：
+第一版把 `build_http_client` 的 **client 级** reqwest 超时从固定 30s 改成
+`tool_timeout.max(30s)`。验收者用挂死 loopback + `RECURSIVE_MCP_TOOL_TIMEOUT_SECS=40`
+实测 `initialize` 到 **40.004s** 才失败（修复前固定 30s；默认 300s 时"服务端没起"
+要 5 分钟才暴露）。stdio 侧分层是对的，只有 HTTP 侧要收回。
+
+### 改法
+
+- `build_http_client` 恢复**固定有界**超时：新常量
+  `HTTP_DEFAULT_REQUEST_TIMEOUT = 30s`，**不再**看 `tool_timeout`。
+- 新增私有 `McpClient::http_request_timeout(&Value) -> Duration`：逐请求分级 ——
+  `tools/call` → `tool_timeout`，其余（`initialize` / `tools/list` / 通知）→
+  `read_timeout`。
+- `write_line` 里对两种 HTTP transport 的 POST 都加
+  `RequestBuilder::timeout(self.http_request_timeout(value))`（reqwest 支持逐请求
+  超时，且覆盖 client 级）。这样 `initialize` 仍然快速失败，只有 `tools/call`
+  拿到可配置预算。
+- **顺带修掉 NIT-2**：`spawn_streamable` / `spawn_http_sse` 此前把
+  `read_timeout` 写死成 `DEFAULT_STDIO_READ_TIMEOUT`、完全忽略调用方实参，所以
+  `spawn_with_timeout` 对 HTTP 形同虚设（这也正是 `with_tool_timeout` 在 HTTP 上
+  静默 no-op 的一半原因）。现在两个 spawn 都收 `read_timeout` 并写进 client，
+  `with_tool_timeout` 因此在 HTTP 上真实生效，doc 也明确写了 "Applies to both
+  transports ... not stdio-only"。
+- **NIT-4**：`tests/bin/mock_mcp_server.rs` 的头表说 `nonjson` 声明 `tools` 能力，
+  但 `dispatch` 的 `_ => json!({})` 没给。按头表改代码：
+  `"tools-only" | "nonjson" => json!({"tools": true})`。
+
+### 实测数字（hermetic，本地 loopback 慢速 HTTP mock，无外网）
+
+| 场景 | 配置 | 结果 |
+|---|---|---|
+| `initialize` 快速失败 | mock 延迟 1.2s，read=300ms，tool=5s | **304.7ms** 失败（第一版 client 级超时下是 30s；放宽版是 1.2s+ 才成功） |
+| `tools/call` 拿到预算（成功侧） | mock 延迟 800ms，read=300ms，tool=5s | **803.4ms** 成功（若用 read 预算会在 300ms 失败） |
+| `tools/call` 预算**有约束力** | mock 延迟 2.5s，read=5s，tool=700ms | **702.4ms** 被切断（若退化成 30s client 级 backstop，调用会成功） |
+
+### 返工负控制
+
+| 负控制 | 还原的 hunk | 转红用例 | 实测输出 |
+|---|---|---|---|
+| nc5 | 去掉两种 HTTP transport 的 `RequestBuilder::timeout(...)` | `http_initialize_fails_fast_and_ignores_the_tool_budget` + `http_tools_call_is_cut_off_by_a_short_configured_budget` | `a 1.2s initialize must fail under a 300ms budget`；`http tools/call cut off after 2.502019916s` → `a 2.5s tools/call must be cut off by a 700ms tool budget`（即退化到 30s client 级 backstop，预算完全没施加） |
+| nc6 | `http_request_timeout` 退化为恒定 `self.read_timeout`（预修复语义：工具预算永不施加） | `http_request_timeout_is_tiered` + `http_initialize_fails_fast_...` | `left: 10s / right: 300s`；`a 1.2s initialize must fail under a 300ms budget` |
+
+还原方式：负控制前把 `src/mcp.rs` 另存副本，验证后整文件写回，
+`sha256 = 191db8277fe788839da94c46fb183c288c577dc252346fa7e89c297fe54c9e01`
+与保存前一致，`grep -c "NEGATIVE CONTROL"` = 0。注：nc5 的第一轮只让
+`http_initialize_...` 转红，因为当时"成功侧"用例会被 30s backstop 掩盖；补上
+"约束力侧"用例（2.5s mock vs 700ms 预算）后，nc5 才同时打掉两条 —— 这本身就是
+夹具覆盖面的一次补强。
+
+### 新测试
+
+- `mcp::tests::http_request_timeout_is_tiered`（单测，纯函数策略：四类方法 + 通知
+  + 短 read 预算 + `tools/call` 低于/高于 read 预算两种情形）
+- `mcp::tests::http_initialize_fails_fast_and_ignores_the_tool_budget`（端到端，
+  hermetic loopback mock）
+- `mcp::tests::http_tools_call_uses_the_configured_tool_budget`（端到端，成功侧）
+- `mcp::tests::http_tools_call_is_cut_off_by_a_short_configured_budget`（端到端，
+  **约束力**侧：700ms 预算切断 2.5s 调用；这一条在去掉 per-request timeout 时会转红，
+  补上了"成功侧会被 30s backstop 掩盖"的漏洞）
+
+## 规格漂移（实测）
 规格给的行号整体前移 1~2 行，**行为判断无一处错误**：
 
 | 规格 | base 实际 | 结论 |
@@ -139,20 +200,28 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
 - **不做全局放宽**（规格「陷阱」第 1 条）：`initialize` / `tools/list` 仍是 10s（stdio）
   或 30s（HTTP reqwest 下限），只有 `tools/call` 拿到 300s。`server_timeout_errors_cleanly`
   与 `malformed_server_errors_cleanly` 两个既有用例在修复后仍绿，等于反向确认没有放宽。
-- **HTTP 路径只做到"工具超时传导"**：http/SSE transport 没有"逐请求读取 deadline"，
-  服务端发起的请求也无法在同一个 pending POST 之外做重入答复。因此本次的
-  "答复服务端请求" 只在 **stdio** 生效（issue #181 的标题范围也正是 stdio）。
-  远端 300s 工具现在受 `reqwest.timeout = max(tool_timeout, 30s)` 约束，不会被砍。
+- **HTTP 侧超时（返工后）**：两种 HTTP transport 现在都用逐请求
+  `RequestBuilder::timeout`：`tools/call` → `tool_timeout`，其余 → `read_timeout`；
+  client 级固定 30s 只当backstop。但 **服务端发起的请求仍只在 stdio 得到答复** ——
+  HTTP 是"一问一答的 POST"，同一个 pending POST 之外没有可重入的读取点，要支持
+  就得改成并发读流（超出本单范围，issue #181 的标题范围也正是 stdio）。
+- **NIT-3 记清楚（不改代码）**：这里的 "tool timeout" 是**逐行 idle 超时**，不是
+  墙钟 deadline。`read_stdio_response` 每读一行重新起计时，所以服务端只要在预算内
+  偶尔吐一行（哪怕是非 JSON 的垃圾行 —— 规格要求跳过它们）就能让调用活过预算；
+  验收者探针实测：每 150ms 一行垃圾可让 400ms 预算的调用活到 **1.543s**。这是
+  "跳过非 JSON 行" 的固有语义，也是修复前就存在的行为（修复前该行为是直接报错，
+  所以不是本次引入的）。HTTP 侧的逐请求超时是真正的墙钟 deadline，两transport
+  语义因此在这一点上不同 —— 已知悉，未改。
 - **配置入口的选择**：规格说 `spawn` 加 `with_tool_timeout` 让 CLI/服务端透传。
   我没有给 `McpServer`/`McpServerConfig` 加字段（会波及 10+ 处结构体字面量，且
   `McpServerConfig` 是 `.mcp.json` 的 serde 契约，加字段等于扩协议面）。改为：
-  公开 builder `with_tool_timeout(Duration)`（库调用方）+ 环境变量
-  `RECURSIVE_MCP_TOOL_TIMEOUT_SECS`（CLI 与服务端免改代码即生效，`spawn` 读取一次）。
-  两条生产路径都实测走 `McpClient::spawn`，因此都覆盖到了。
+  公开 builder `with_tool_timeout(Duration)`（库调用方，两种 transport 都生效）+
+  环境变量 `RECURSIVE_MCP_TOOL_TIMEOUT_SECS`（CLI 与服务端免改代码即生效，`spawn`
+  读取一次）。两条生产路径都实测走 `McpClient::spawn`，因此都覆盖到了。
 - **未验证**：`tests/mcp_integration.rs` 的 4 个用例在该 base 上全是 `#[ignore]`，
   需要 `npx` + 网络，未联网运行（编译通过）。本地无网络环境，未跑 e2e 容器门禁
   （且本任务明确不要求、也不运行任何 push 类脚本）。
-- **夹具自身的三个坑**（都修掉并写进注释，避免后人重踩）：
+- **夹具自身的四个坑**（都修掉并写进注释，避免后人重踩）：
   1. `TempDir` 必须在 mock 写 marker 时仍然存活 —— `create(true)` 不会创建父目录，
      提前 `drop(dir)` 会让 mock 静默写不进去（第一次实现就栽在这里，表现为
      "marker 永远为空" 的假红）。
@@ -165,10 +234,17 @@ test result: FAILED. 1 passed; 4 failed   (第 5 个是回归守卫 boolean_capa
      那里被消费的），mock 把判词写进 `--marker-file`；helper 把 client 与
      TempDir 一并交还调用方，保证 mock 活到判词被读到为止（不用
      `mem::forget` 泄漏）。
+  4. HTTP 慢速 mock **不能**用 `read_to_end` 读请求：reqwest 在等响应期间保持
+     请求侧不关，`read_to_end` 会一直阻塞到客户端自己的超时才返回 —— 表现为
+     "服务端永远不回、每个用例都跑满超时"的假红。改为读 head 取
+     `Content-Length` 再用 `read_exact` 读 body。另外只延迟 `tools/call`
+     （`initialize` 与 `notifications/initialized` 立即回），否则通知那次 POST
+     也会撞上 read 预算，掩盖真正要测的 tier。
 - **依赖**（invariant #6）：零新增。仅用 `std::time::Duration`、`std::mem::replace`、
   `tracing`、既有 `tokio` / `serde_json`；测试夹具复用既有 `tempfile` dev-dependency。
-- **invariant 自查**：#1/#2/#3 未触及；#4 新增 3 个单测 + 7 个集成用例，
-  新公开 API（`with_tool_timeout`、两个常量）都有测试；#5 非测试代码无
+- **invariant 自查**：#1/#2/#3 未触及；#4 新增 5 个单测（3 个 #181 + 2 个 review
+  返工）与 7 个集成用例，新公开 API（`with_tool_timeout`、`DEFAULT_MCP_TOOL_TIMEOUT`、
+  `MCP_TOOL_TIMEOUT_ENV`、`HTTP_DEFAULT_REQUEST_TIMEOUT`）都有测试；#5 非测试代码无
   `unwrap()`/`expect()`（`default_tool_timeout` 用 `match`，
   `answer_server_request` 返回 `io::Result`）；#6 无新依赖；#7-#10 不涉及。
 - **未推送、未在 GitHub 上留任何痕迹**：无 `git push` / `gh pr create` /
