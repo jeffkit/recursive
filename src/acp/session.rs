@@ -353,6 +353,17 @@ impl AcpSessionManager {
         self.sessions.contains_key(sid)
     }
 
+    /// Kill every tracked MCP child process, across all sessions.
+    ///
+    /// This is the client-disconnect cleanup point: when the ACP transport goes
+    /// away (stdin EOF or idle timeout) no session can outlive its stdio pipe,
+    /// so their MCP children must be released rather than orphaned (#183).
+    pub async fn kill_all_mcp_children(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.kill_mcp_children().await;
+        }
+    }
+
     /// Get the shared permission store for ACP permission bridge.
     pub fn permission_store(&mut self) -> &mut PendingPermissionStore {
         &mut self.permission_store
@@ -987,5 +998,48 @@ mod tests {
             !shared_token.is_cancelled(),
             "dropping AcpSession must not cancel token if other Arc clones exist"
         );
+    }
+
+    /// #183: the transport-shutdown path must release MCP children of *every*
+    /// session, not just the one named in `session/close`.
+    #[tokio::test]
+    async fn kill_all_mcp_children_clears_every_session() {
+        use crate::llm::MockProvider;
+
+        // Pids far outside the platform range: `kill -TERM`/`kill -0` fail
+        // immediately, so the graceful-shutdown loop returns without waiting.
+        let fixtures = [("acp-sess-1", 999_990u32), ("acp-sess-2", 999_991u32)];
+
+        let mut mgr = AcpSessionManager::new();
+        for (sid, pid) in fixtures {
+            let runtime = AgentRuntime::builder()
+                .llm(Arc::new(MockProvider::new(vec![])))
+                .build()
+                .expect("build runtime");
+            let session = AcpSession {
+                runtime,
+                cwd: PathBuf::from("/tmp"),
+                turn: 0,
+                session_id: sid.to_string(),
+                transcript: vec![],
+                cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
+                system_prompt: None,
+                mcp_servers: None,
+                client_capabilities: None,
+                acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
+                mcp_child_pids: vec![pid],
+            };
+            mgr.insert_with_id(sid.to_string(), session);
+        }
+
+        mgr.kill_all_mcp_children().await;
+
+        for (sid, _) in fixtures {
+            let session = mgr.get(sid).expect("session must still be registered");
+            assert!(
+                session.mcp_child_pids.is_empty(),
+                "{sid}: tracked MCP pids must be cleared by the shutdown path"
+            );
+        }
     }
 }
