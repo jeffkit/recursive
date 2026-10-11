@@ -52,8 +52,9 @@ use crate::tools::ToolRegistry;
 ///
 /// `Deny` boxes its `AuditMeta`: at ~150 bytes it would make that variant
 /// ~250 bytes against `Allow`'s 32, tripping `clippy::large_enum_variant`
-/// in the bare feature matrix. Denials are rare, so the allocation is off
-/// the hot path.
+/// in the bare feature matrix. The outcome is transient — built once per
+/// gated call and destructured immediately — so the extra allocation is off
+/// the hot path, and denials are rare anyway.
 #[derive(Debug)]
 pub enum CheckOutcome {
     Deny { error: Error, audit: Box<AuditMeta> },

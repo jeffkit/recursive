@@ -363,7 +363,7 @@ impl ChatProvider for AnthropicProvider {
         fields(provider = "anthropic", model = %self.model)
     )]
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
-        let (system, messages) = extract_system_message(messages);
+        let (system, messages) = extract_system_messages(messages);
         let messages = filter_leading_assistant(&messages);
         let body = self.request_body(system.as_deref(), &messages, tools);
         let url = format!("{}/v1/messages", self.base_url);
@@ -406,7 +406,7 @@ impl AnthropicProvider {
         stream_tx: Option<StreamSender>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
-        let (system, messages) = extract_system_message(messages);
+        let (system, messages) = extract_system_messages(messages);
         let messages = filter_leading_assistant(&messages);
 
         let mut body = self.request_body(system.as_deref(), &messages, tools);
@@ -944,27 +944,35 @@ struct SseAccum {
     current_event: Option<String>,
 }
 
-/// Extract the leading System run, returning `(system_content, remaining_messages)`.
+/// Collect every `Role::System` message into the top-level `system` text, in
+/// order, and return the remaining messages in their original relative order.
 ///
-/// Anthropic's Messages API has no `system` role inside `messages` — the system
-/// prompt is a top-level field. Every *leading* System message is therefore
-/// folded into that field: the rebuilt prompt, a compaction summary spliced in
-/// after it (issue #158), and post-compact System attachments. Anything from
-/// the first non-System message onward is left untouched.
-fn extract_system_message(messages: &[Message]) -> (Option<String>, Vec<Message>) {
-    let leading = messages
-        .iter()
-        .take_while(|m| m.role == Role::System)
-        .count();
-    if leading == 0 {
-        return (None, messages.to_vec());
+/// The Messages API only accepts `user` / `assistant` roles inside `messages`;
+/// a `system` role there is a hard 400 (`messages.N.role: Input should be
+/// 'user' or 'assistant'`). System text can appear anywhere in the transcript,
+/// not just at index 0 — the deferred-tools block pushes the prompt off index
+/// 0, compaction re-injects system attachments, and globs-matched skills
+/// insert `system-reminder` messages mid-transcript.
+///
+/// A *leading* System run lands in that same field too, in order — the rebuilt
+/// prompt, a compaction summary spliced in after it (issue #158), and
+/// post-compact System attachments — so nothing before the first non-System
+/// message is left behind either.
+fn extract_system_messages(messages: &[Message]) -> (Option<String>, Vec<Message>) {
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut rest: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role == Role::System {
+            system_parts.push(m.content.as_str());
+        } else {
+            rest.push(m.clone());
+        }
     }
-    let system = messages[..leading]
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    (Some(system), messages[leading..].to_vec())
+    if system_parts.is_empty() {
+        (None, rest)
+    } else {
+        (Some(system_parts.join("\n\n")), rest)
+    }
 }
 
 /// Filter out any leading assistant messages that would cause Anthropic to reject the request.
@@ -1157,7 +1165,12 @@ fn sanitize_input_schema(schema: &Value) -> Value {
 
 fn serialize_message(m: &Message) -> Value {
     let role = match m.role {
-        Role::System => "system",
+        // System text must be hoisted to the top-level `system` field by
+        // `extract_system_messages`; a `system` role inside `messages` is a
+        // hard 400 (`messages.N.role: Input should be 'user' or 'assistant'`).
+        // This arm is a defensive fallback — normalize to `user` rather than
+        // ever emitting `system` on the wire.
+        Role::System => "user",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "user", // Anthropic uses "user" for tool results
@@ -1405,7 +1418,7 @@ mod tests {
             Message::system("You are helpful.".to_string()),
             Message::user("Hello".to_string()),
         ];
-        let (system, rest) = extract_system_message(&msgs);
+        let (system, rest) = extract_system_messages(&msgs);
         assert_eq!(system, Some("You are helpful.".to_string()));
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].role, Role::User);
@@ -1414,7 +1427,7 @@ mod tests {
     #[test]
     fn extract_system_message_when_not_present() {
         let msgs = vec![Message::user("Hello".to_string())];
-        let (system, rest) = extract_system_message(&msgs);
+        let (system, rest) = extract_system_messages(&msgs);
         assert_eq!(system, None);
         assert_eq!(rest.len(), 1);
     }
@@ -1430,10 +1443,94 @@ mod tests {
             Message::system("attachment".to_string()),
             Message::user("Hello".to_string()),
         ];
-        let (system, rest) = extract_system_message(&msgs);
+        let (system, rest) = extract_system_messages(&msgs);
         assert_eq!(system, Some("prompt\n\nsummary\n\nattachment".to_string()));
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].role, Role::User);
+    }
+
+    #[test]
+    fn extract_system_messages_collects_all_in_order() {
+        let msgs = vec![
+            Message::user("deferred".to_string()),
+            Message::system("prompt".to_string()),
+            Message::user("hi".to_string()),
+            Message::system("mid".to_string()),
+            Message::assistant("ok".to_string()),
+        ];
+        let (system, rest) = extract_system_messages(&msgs);
+        assert_eq!(
+            system,
+            Some("prompt\n\nmid".to_string()),
+            "all System text must be collected, in order"
+        );
+        assert!(
+            rest.iter().all(|m| m.role != Role::System),
+            "no System message may survive into `messages`: {rest:?}"
+        );
+        assert_eq!(rest.len(), 3);
+    }
+
+    /// Issue #157: the Messages API rejects `messages[*].role == "system"` with
+    /// a 400, and System text can sit anywhere in the transcript.
+    #[test]
+    fn request_body_never_has_system_role_in_messages() {
+        let msgs = vec![
+            Message::user(
+                "<available-deferred-tools>\nTodoWrite\n</available-deferred-tools>".to_string(),
+            ),
+            Message::system("you are a coding agent".to_string()),
+            Message::user("do the thing".to_string()),
+            Message::system("<!-- skill:pdf injected -->".to_string()),
+            Message::assistant("on it".to_string()),
+        ];
+        let (system, rest) = extract_system_messages(&msgs);
+        let body = build_request("claude-3", 0.2, 4096, system.as_deref(), &rest, &[], false);
+
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            roles.iter().all(|r| *r == "user" || *r == "assistant"),
+            "messages must only carry user/assistant roles, got {roles:?}"
+        );
+
+        let sys = body["system"]
+            .as_str()
+            .expect("top-level system must carry the System text");
+        assert!(sys.contains("you are a coding agent"), "{sys}");
+        assert!(sys.contains("<!-- skill:pdf injected -->"), "{sys}");
+    }
+
+    #[test]
+    fn deferred_block_does_not_displace_system_prompt() {
+        // Shape emitted by run_core::call_llm: the real prompt stays at index
+        // 0 and the `<available-deferred-tools>` block follows it.
+        let msgs = vec![
+            Message::system("you are a coding agent".to_string()),
+            Message::user(
+                "<available-deferred-tools>\nTodoWrite\n</available-deferred-tools>".to_string(),
+            ),
+            Message::user("do the thing".to_string()),
+        ];
+        let (system, rest) = extract_system_messages(&msgs);
+        let body = build_request("claude-3", 0.2, 4096, system.as_deref(), &rest, &[], false);
+
+        assert_eq!(
+            body["system"], "you are a coding agent",
+            "the full system prompt must land in the top-level system field"
+        );
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("available-deferred-tools"),
+            "deferred block must be a user message, not the system prompt"
+        );
     }
 
     #[test]
@@ -2884,6 +2981,20 @@ data: {\"type\":\"message_stop\"}
         let v = serialize_message(&msg);
         assert_eq!(v["role"].as_str(), Some("user"));
         assert_eq!(v["content"].as_str(), Some("Hello world"));
+    }
+
+    #[test]
+    fn serialize_message_system_never_emits_system_role() {
+        // Issue #157: a stray System message must never reach the wire as
+        // `role: "system"` — Anthropic rejects it with a 400. The serializer's
+        // defensive fallback normalizes it to `user`.
+        let v = serialize_message(&Message::system("system text".to_string()));
+        assert_eq!(
+            v["role"].as_str(),
+            Some("user"),
+            "System messages must be normalized off the `system` role"
+        );
+        assert_eq!(v["content"].as_str(), Some("system text"));
     }
 
     #[test]

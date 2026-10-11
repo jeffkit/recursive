@@ -124,6 +124,23 @@ fn tool_names_in_request(body: &serde_json::Value) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: assert the Anthropic request *shape* — every `messages[*].role` must
+// be `user`/`assistant` (a `system` role there is a hard 400), and the system
+// prompt must ride in the top-level `system` field. Returns that field.
+// ---------------------------------------------------------------------------
+fn assert_anthropic_request_shape(body: &serde_json::Value) -> String {
+    let msgs = body["messages"].as_array().expect("messages array");
+    for m in msgs {
+        let role = m["role"].as_str().unwrap_or("");
+        assert!(
+            role == "user" || role == "assistant",
+            "messages[*].role must be user/assistant, got {role:?}: {m:?}"
+        );
+    }
+    body["system"].as_str().unwrap_or("").to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Helper: find content of the first user message (as string).
 // ---------------------------------------------------------------------------
 fn first_user_message_content(body: &serde_json::Value) -> String {
@@ -251,6 +268,15 @@ async fn deferred_tool_absent_from_initial_tools_array() {
     let body0: serde_json::Value =
         serde_json::from_str(&captured[0].1).expect("round-0 body is valid JSON");
     let headers0 = &captured[0].0;
+
+    // Issue #157: the prompt must be the top-level `system`, and no message may
+    // carry the rejected `system` role even though the deferred block precedes
+    // the prompt in the assembled transcript.
+    let system0 = assert_anthropic_request_shape(&body0);
+    assert!(
+        system0.contains("you are a test agent"),
+        "round-0 top-level system must carry the system prompt: {system0:?}"
+    );
 
     // Beta header must be present.
     assert!(
@@ -389,6 +415,12 @@ async fn toolsearch_result_serialized_as_tool_references() {
     let body1: serde_json::Value =
         serde_json::from_str(&captured[1].1).expect("step-2 body is valid JSON");
 
+    let system1 = assert_anthropic_request_shape(&body1);
+    assert!(
+        system1.contains("you are a test agent"),
+        "step-2 top-level system must carry the system prompt: {system1:?}"
+    );
+
     // WebFetch is still deferred — it must NOT be in the tools array.
     // Anthropic expands it via the tool_reference block in the messages.
     let names1 = tool_names_in_request(&body1);
@@ -473,6 +505,11 @@ async fn no_deferred_tools_means_no_tool_search_injection() {
     assert_eq!(captured.len(), 1, "expected exactly 1 request");
 
     let body: serde_json::Value = serde_json::from_str(&captured[0].1).expect("body is valid JSON");
+    let system = assert_anthropic_request_shape(&body);
+    assert!(
+        system.contains("you are a test agent"),
+        "top-level system must carry the system prompt: {system:?}"
+    );
     let names = tool_names_in_request(&body);
 
     // Read is an eager tool — it must appear with full schema in the tools array.

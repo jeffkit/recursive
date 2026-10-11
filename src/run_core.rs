@@ -1153,8 +1153,9 @@ impl<'a> RunCore<'a> {
     /// internal `RetryPolicy` (Goal-288: exactly one retry layer).
     ///
     /// When the registry has deferred tools, their names are injected as an
-    /// `<available-deferred-tools>` user message prepended to the transcript,
-    /// and only eager tool specs are passed to the provider. ToolSearchTool
+    /// `<available-deferred-tools>` user message inserted just after the
+    /// leading system prompt (so index 0 stays the true prompt), and only eager
+    /// tool specs are passed to the provider. ToolSearchTool
     /// (registered by `freeze_deferred_specs`) appears in the eager list and
     /// its results in the message history are serialized as `tool_reference`
     /// blocks by `serialize_messages_anthropic`.
@@ -1187,9 +1188,20 @@ impl<'a> RunCore<'a> {
                         "<available-deferred-tools>\n{}\n</available-deferred-tools>",
                         names.join("\n")
                     );
-                    messages_with_deferred = std::iter::once(crate::message::Message::user(block))
-                        .chain(self.messages.iter().cloned())
-                        .collect();
+                    // Insert *after* the leading system prompt so index 0 stays
+                    // the true system prompt (Anthropic's request shape and the
+                    // prefix cache both key off that position).
+                    let leading_system = self
+                        .messages
+                        .iter()
+                        .take_while(|m| m.role == crate::message::Role::System)
+                        .count();
+                    let mut msgs: Vec<crate::message::Message> =
+                        Vec::with_capacity(self.messages.len() + 1);
+                    msgs.extend(self.messages[..leading_system].iter().cloned());
+                    msgs.push(crate::message::Message::user(block));
+                    msgs.extend(self.messages[leading_system..].iter().cloned());
+                    messages_with_deferred = msgs;
                     eager_specs_owned = eager;
                     (&eager_specs_owned, &messages_with_deferred)
                 }

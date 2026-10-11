@@ -130,10 +130,11 @@ pub(crate) fn inject_skill_reminder<'a>(
     }
     let reminder = crate::skills::skill_reminder(skills);
     let mut out = messages.to_vec();
-    // The prompt can sit at index 0 or 1 only: `call_llm` may prepend an
-    // `<available-deferred-tools>` user block. The leading-two bound also keeps
-    // globs-matched skill injections — later `System` messages in the
-    // transcript — from being mistaken for the system prompt.
+    // The prompt sits at index 0: `call_llm` inserts its
+    // `<available-deferred-tools>` user block *after* the prompt, not before.
+    // The leading-two bound also keeps globs-matched skill injections — later
+    // `System` messages in the transcript — from being mistaken for the
+    // system prompt.
     match out
         .iter()
         .take(2)
@@ -314,10 +315,10 @@ mod tests {
         assert_eq!(out[1], messages[1], "later messages are untouched");
     }
 
-    /// The system prompt is not always index 0: `call_llm` prepends an
-    /// `<available-deferred-tools>` user block when the registry has deferred
-    /// tools, and globs-matched skill injections push further `System`
-    /// messages. The reminder must still land on the leading system prompt.
+    /// The reminder must land on the leading system prompt, never on the
+    /// `<available-deferred-tools>` user block or a globs-matched skill
+    /// injection (a later `System` message). The leading-two bound picks the
+    /// prompt out even when it is not the very first message.
     #[test]
     fn skill_reminder_targets_the_system_prompt_not_the_first_message() {
         let skills = vec![skill("pdf", "Manipulate PDF documents")];
