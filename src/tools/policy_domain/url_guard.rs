@@ -12,8 +12,21 @@
 //! literals reach private hosts while the hand-rolled splitter saw a
 //! "hostname". Remaining known issues (hardcoded `"WebFetch"` name in error
 //! messages, the lack of a redirect policy) are still tracked separately.
+//!
+//! Issue #169 added the **connection-time** half: `validate_url` can only see
+//! the literal URL, so a *domain* that resolves to a private address
+//! (`http://127.0.0.1.nip.io/`, `http://169.254.169.254.nip.io/`, a DNS
+//! rebinding zone) used to reach it unchecked. [`GuardedResolver`] is a
+//! `reqwest::dns::Resolve` implementation that vets every DNS answer with
+//! [`is_private_ip`] before a socket opens; web tools install it with
+//! [`guarded_resolver`]. [`is_private_ip`] also grew the reserved blocks that
+//! were missing (CGNAT `100.64.0.0/10`, `0.0.0.0/8`, IPv4-compatible
+//! `::a.b.c.d`, NAT64).
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use url::Host;
 
@@ -122,17 +135,38 @@ pub(crate) fn validate_url(url: &str) -> Result<String> {
 }
 
 /// Returns true for IP addresses that must not be reached via outbound HTTP
-/// tools (loopback, private RFC-1918, link-local, and cloud metadata ranges).
+/// tools (loopback, private RFC-1918, link-local, and cloud metadata ranges,
+/// plus the reserved blocks that alias or embed them).
 pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let octets = v4.octets();
             v4.is_loopback()           // 127.0.0.0/8
                 || v4.is_private()     // 10/8, 172.16/12, 192.168/16
                 || v4.is_link_local()  // 169.254.0.0/16 (AWS IMDS et al.)
-                || v4.is_broadcast()
-                || v4.is_unspecified()
+                || v4.is_broadcast()   // 255.255.255.255
+                || v4.is_unspecified() // 0.0.0.0
+                // 0.0.0.0/8 "this network" (RFC 1122 §3.2.1.3) — the whole
+                // block is non-routable, not just 0.0.0.0 (issue #169).
+                || octets[0] == 0
+                // 100.64.0.0/10 CGNAT (RFC 6598) — carrier NAT space, never
+                // a public destination (issue #169).
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
         }
         IpAddr::V6(v6) => {
+            // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible
+            // (`::a.b.c.d`, deprecated) addresses are routed to the embedded
+            // v4 address — classify them by that address. `to_ipv4` (unlike
+            // `to_ipv4_mapped`, the only form the old check handled) covers
+            // both layouts (issue #169).
+            if let Some(v4) = v6.to_ipv4() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
+            // NAT64 translation prefixes embed (or target) non-global v4
+            // space — see `nat64_rejects`.
+            if nat64_rejects(&v6) {
+                return true;
+            }
             v6.is_loopback()           // ::1
                 || v6.is_unspecified() // ::
                 || v6.is_multicast()
@@ -142,6 +176,35 @@ pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+/// True when `v6` belongs to a NAT64 translation prefix that can only reach
+/// non-global IPv4 space.
+///
+/// - `64:ff9b:1::/48` (RFC 8215) is *explicitly* the local-use prefix: it
+///   exists to translate non-global IPv4 destinations, so every address in it
+///   is rejected outright.
+/// - `64:ff9b::/96` (RFC 6052 well-known prefix) is what DNS64 uses to
+///   synthesise **global** destinations on IPv6-only networks, so it is not
+///   rejected wholesale: only the embedded v4 address decides. That keeps
+///   DNS64/NAT64 deployments working for public targets while still refusing
+///   `64:ff9b::7f00:1` (127.0.0.1) and `64:ff9b::a00:1` (10.0.0.1).
+fn nat64_rejects(v6: &Ipv6Addr) -> bool {
+    let s = v6.segments();
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001 {
+        return true; // 64:ff9b:1::/48
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        // 64:ff9b::/96 — the v4 address occupies the last 32 bits.
+        let v4 = Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            (s[6] & 0xff) as u8,
+            (s[7] >> 8) as u8,
+            (s[7] & 0xff) as u8,
+        );
+        return is_private_ip(IpAddr::V4(v4));
+    }
+    false
 }
 
 /// Build the SSRF rejection error shared by the canonical and lenient IP
@@ -220,6 +283,158 @@ fn parse_lenient_part(part: &str) -> Option<u32> {
         return u32::from_str_radix(&part[1..], 8).ok();
     }
     part.parse::<u32>().ok()
+}
+
+// ── Issue #169: connection-time DNS guard ──────────────────────────────────
+//
+// `validate_url` above is the first layer (literal host). A *name* that
+// resolves into private space is the second: the resolver below runs inside
+// reqwest's connect path, so the check happens after the system resolver
+// answered — for the first lookup and for any rebinding re-resolve.
+
+/// Opt-out for the connection-time check: `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS=1`
+/// (also `true`/`yes`/`on`, case-insensitive) allows DNS answers that point at
+/// private addresses. Needed by deployments that legitimately resolve service
+/// names into private space (enterprise proxies, internal gateways). Default
+/// is unset ⇒ the guard is **on**.
+pub(crate) const ALLOW_PRIVATE_DNS_ENV: &str = "RECURSIVE_SSRF_ALLOW_PRIVATE_DNS";
+
+/// Reject the whole DNS answer when any address is private/reserved.
+///
+/// Rejecting rather than filtering the private addresses out matters: with a
+/// mixed answer (one public, one private) filtering would let the request
+/// fall through to another address, so a hostile record could still steer the
+/// connection. `allow_private` is the explicit form of
+/// [`ALLOW_PRIVATE_DNS_ENV`] so tests never mutate process env.
+pub(crate) fn guard_addrs(
+    addrs: Vec<SocketAddr>,
+    allow_private: bool,
+) -> std::io::Result<Vec<SocketAddr>> {
+    if allow_private {
+        return Ok(addrs);
+    }
+    for addr in &addrs {
+        if is_private_ip(addr.ip()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "SSRF protection: refusing to connect to private address {} resolved from DNS",
+                    addr.ip()
+                ),
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
+/// True when the operator set the [`ALLOW_PRIVATE_DNS_ENV`] opt-out.
+fn private_dns_opt_out() -> bool {
+    parse_opt_out(std::env::var(ALLOW_PRIVATE_DNS_ENV).ok().as_deref())
+}
+
+/// Accepted truthy spellings for [`ALLOW_PRIVATE_DNS_ENV`].
+fn parse_opt_out(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        None => false,
+    }
+}
+
+/// Boxed future returned by [`AddrSource::lookup`].
+pub(crate) type LookupFuture =
+    Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
+/// Address source for [`GuardedResolver`]: the production implementation is
+/// the system resolver, tests substitute a stub so no real DNS is involved.
+pub(crate) trait AddrSource: Send + Sync {
+    fn lookup(&self, host: &str) -> LookupFuture;
+}
+
+/// System resolver (getaddrinfo on tokio's blocking pool).
+pub(crate) struct SystemResolver;
+
+impl AddrSource for SystemResolver {
+    fn lookup(&self, host: &str) -> LookupFuture {
+        let host = host.to_string();
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            Ok(addrs.collect())
+        })
+    }
+}
+
+/// `reqwest::dns::Resolve` wrapper that refuses private/reserved DNS answers.
+///
+/// Residual risk (documented, not fixed): when reqwest routes the request
+/// through a proxy (`HTTP_PROXY`/`HTTPS_PROXY`), the *proxy* resolves the
+/// target name, so this resolver only vets the proxy's own address. That is
+/// why [`ALLOW_PRIVATE_DNS_ENV`] exists for proxy deployments, and why the
+/// guard is not the only layer (`validate_url` still runs first).
+pub(crate) struct GuardedResolver {
+    source: Arc<dyn AddrSource>,
+    allow_private: bool,
+}
+
+impl GuardedResolver {
+    /// Production resolver: system DNS, private answers rejected unless
+    /// [`ALLOW_PRIVATE_DNS_ENV`] opts out.
+    pub(crate) fn from_env() -> Self {
+        Self {
+            source: Arc::new(SystemResolver),
+            allow_private: private_dns_opt_out(),
+        }
+    }
+
+    /// Test seam: caller supplies the address source and the opt-out flag.
+    #[cfg(test)]
+    pub(crate) fn with_source(source: Arc<dyn AddrSource>, allow_private: bool) -> Self {
+        Self {
+            source,
+            allow_private,
+        }
+    }
+}
+
+/// Map an IO failure into the boxed error type `reqwest::dns::Resolving`
+/// expects.
+fn boxed_io_error(e: std::io::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(e)
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let source = Arc::clone(&self.source);
+        let allow_private = self.allow_private;
+        let fut: reqwest::dns::Resolving = Box::pin(async move {
+            let addrs = source.lookup(&host).await.map_err(boxed_io_error)?;
+            let guarded = match guard_addrs(addrs, allow_private) {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    // reqwest only renders "error sending request" and the
+                    // tool error flattens the cause, so log the reason here —
+                    // it is the only place that knows both host and address.
+                    tracing::warn!(
+                        host = %host,
+                        error = %e,
+                        "SSRF guard refused a DNS answer; set {ALLOW_PRIVATE_DNS_ENV}=1 to allow private targets"
+                    );
+                    return Err(boxed_io_error(e));
+                }
+            };
+            Ok(Box::new(guarded.into_iter()) as reqwest::dns::Addrs)
+        });
+        fut
+    }
+}
+
+/// The production [`GuardedResolver`], ready for
+/// `ClientBuilder::dns_resolver`.
+pub(crate) fn guarded_resolver() -> Arc<GuardedResolver> {
+    Arc::new(GuardedResolver::from_env())
 }
 
 #[cfg(test)]
@@ -340,6 +555,10 @@ mod tests {
         assert!(validate_url("http://[::ffff:169.254.169.254]/").is_err());
         // Public mapped addresses stay allowed.
         assert!(validate_url("http://[::ffff:8.8.8.8]/").is_ok());
+        // Deprecated IPv4-compatible (`::a.b.c.d`) literals route to the same
+        // v4 address; `is_private_ip` catches them via `to_ipv4` (issue #169).
+        assert!(validate_url("http://[::127.0.0.1]/").is_err());
+        assert!(validate_url("http://[::169.254.169.254]/").is_err());
     }
 
     /// Trailing-dot literals resolve to the same address; `localhost.` must
@@ -373,5 +592,209 @@ mod tests {
     fn validate_url_rejects_unparseable() {
         assert!(validate_url("http://").is_err());
         assert!(validate_url("http://exa mple.com/").is_err());
+    }
+
+    // ── Issue #169: missing reserved ranges ─────────────────────────────
+
+    /// CGNAT (`100.64.0.0/10`) and "this network" (`0.0.0.0/8`, RFC 1122)
+    /// are not globally routable: an outbound request that lands there is
+    /// reaching carrier-grade NAT / a local service, not the internet.
+    #[test]
+    fn is_private_ip_covers_cgnat_and_this_network() {
+        assert!(is_private_ip("100.64.0.1".parse().unwrap()));
+        assert!(is_private_ip("100.127.255.254".parse().unwrap()));
+        assert!(is_private_ip("100.64.0.0".parse().unwrap()));
+        assert!(is_private_ip("0.1.2.3".parse().unwrap()));
+        assert!(is_private_ip("0.255.255.255".parse().unwrap()));
+        // Boundaries: 100.63/100.128 are outside the CGNAT block, and
+        // 1.0.0.1 is outside 0.0.0.0/8.
+        assert!(!is_private_ip("100.63.255.255".parse().unwrap()));
+        assert!(!is_private_ip("100.128.0.0".parse().unwrap()));
+        assert!(!is_private_ip("1.0.0.1".parse().unwrap()));
+    }
+
+    /// IPv4-compatible IPv6 (`::a.b.c.d`) routes to the embedded v4 address
+    /// just like the mapped form; NAT64 (`64:ff9b::/96`) hands the embedded
+    /// v4 address to a translator.
+    #[test]
+    fn is_private_ip_covers_ipv4_compatible_and_nat64() {
+        // Compatible (`::a.b.c.d`) — the form the old `to_ipv4_mapped`-only
+        // check missed.
+        assert!(is_private_ip("::127.0.0.1".parse().unwrap()));
+        assert!(is_private_ip("::10.0.0.1".parse().unwrap()));
+        // Mapped (`::ffff:a.b.c.d`) keeps working.
+        assert!(is_private_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_private_ip("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(is_private_ip("64:ff9b::7f00:1".parse().unwrap()));
+        assert!(is_private_ip("64:ff9b::a00:1".parse().unwrap()));
+        // Public embedded addresses stay routable (DNS64/NAT64 deployments
+        // must keep working).
+        assert!(!is_private_ip("64:ff9b::808:808".parse().unwrap()));
+        assert!(!is_private_ip("::ffff:8.8.8.8".parse().unwrap()));
+        // Ordinary global v6 is untouched.
+        assert!(!is_private_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    /// The literal-IP layer (`validate_url`) sees the same ranges so a bare
+    /// `http://100.64.0.1/` never reaches the socket.
+    #[test]
+    fn validate_url_blocks_cgnat_and_this_network() {
+        for url in [
+            "http://100.64.0.1/",
+            "http://100.127.255.254:8080/admin",
+            "http://0.1.2.3/",
+        ] {
+            assert!(validate_url(url).is_err(), "expected {url} to be rejected");
+        }
+        // Public neighbours still pass.
+        assert!(validate_url("http://100.63.0.1/").is_ok());
+    }
+
+    // ── Issue #169: connection-time resolver guard ──────────────────────
+
+    fn sa(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 0)
+    }
+
+    /// The spec's `resolver_rejects_private_resolution`: every address a DNS
+    /// answer could hand back for an internal target is refused.
+    #[test]
+    fn resolver_rejects_private_resolution() {
+        for ip in [
+            "169.254.169.254",  // cloud metadata / link-local
+            "100.64.0.1",       // CGNAT
+            "0.1.2.3",          // 0.0.0.0/8
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+            "64:ff9b::7f00:1",  // NAT64-embedded loopback
+            "127.0.0.1",
+            "10.0.0.1",
+        ] {
+            let err = match guard_addrs(vec![sa(ip)], false) {
+                Ok(addrs) => panic!("{ip} must be refused, got {addrs:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                err.to_string()
+                    .contains("refusing to connect to private address"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The spec's `resolver_allows_public`.
+    #[test]
+    fn resolver_allows_public() {
+        let addrs = vec![sa("93.184.216.34"), sa("2606:4700:4700::1111")];
+        assert_eq!(guard_addrs(addrs.clone(), false).unwrap(), addrs);
+    }
+
+    /// A mixed answer is refused as a whole: keeping the public address would
+    /// let the connection fall through to the private one.
+    #[test]
+    fn resolver_rejects_mixed_answer() {
+        assert!(guard_addrs(vec![sa("93.184.216.34"), sa("127.0.0.1")], false).is_err());
+    }
+
+    /// The opt-out flag (parsed from the env var) disables the check.
+    #[test]
+    fn resolver_opt_out_allows_private() {
+        assert_eq!(guard_addrs(vec![sa("127.0.0.1")], true).unwrap().len(), 1);
+        assert_eq!(ALLOW_PRIVATE_DNS_ENV, "RECURSIVE_SSRF_ALLOW_PRIVATE_DNS");
+        assert!(parse_opt_out(Some("1")));
+        assert!(parse_opt_out(Some(" TRUE ")));
+        assert!(parse_opt_out(Some("yes")));
+        assert!(parse_opt_out(Some("on")));
+        assert!(!parse_opt_out(Some("0")));
+        assert!(!parse_opt_out(Some("")));
+        assert!(!parse_opt_out(None));
+    }
+
+    /// The `Resolve` impl end to end: a stub source's private answer surfaces
+    /// as the guard's `PermissionDenied` (which reqwest reports as a connect
+    /// error), a public answer passes through unchanged.
+    #[tokio::test]
+    async fn guarded_resolver_vets_stub_answers() {
+        use reqwest::dns::Resolve;
+
+        struct Stub(Vec<SocketAddr>);
+        impl AddrSource for Stub {
+            fn lookup(&self, _host: &str) -> LookupFuture {
+                let addrs = self.0.clone();
+                Box::pin(async move { Ok(addrs) })
+            }
+        }
+        fn resolver(addrs: Vec<SocketAddr>, allow_private: bool) -> GuardedResolver {
+            GuardedResolver::with_source(Arc::new(Stub(addrs)), allow_private)
+        }
+
+        let name: reqwest::dns::Name = "127.0.0.1.nip.io".parse().unwrap();
+        // (`Resolving`'s Ok type is a boxed iterator, so no `unwrap_err()`.)
+        let err = match resolver(vec![sa("127.0.0.1")], false).resolve(name).await {
+            Ok(_) => panic!("a private DNS answer must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("refusing to connect to private address 127.0.0.1"),
+            "{err}"
+        );
+
+        let name: reqwest::dns::Name = "example.com".parse().unwrap();
+        let addrs = resolver(vec![sa("93.184.216.34")], false)
+            .resolve(name)
+            .await
+            .unwrap();
+        assert_eq!(addrs.collect::<Vec<_>>(), vec![sa("93.184.216.34")]);
+
+        // Opt-out path.
+        let name: reqwest::dns::Name = "internal.example".parse().unwrap();
+        let addrs = resolver(vec![sa("10.0.0.1")], true)
+            .resolve(name)
+            .await
+            .unwrap();
+        assert_eq!(addrs.collect::<Vec<_>>(), vec![sa("10.0.0.1")]);
+    }
+
+    /// The system source resolves a name to port-0 `SocketAddr`s (reqwest
+    /// substitutes the scheme port). `localhost` keeps this offline.
+    #[tokio::test]
+    async fn system_resolver_looks_up_localhost() {
+        let addrs = SystemResolver.lookup("localhost").await.unwrap();
+        assert!(!addrs.is_empty(), "localhost must resolve");
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
+        assert!(addrs.iter().all(|a| a.port() == 0), "{addrs:?}");
+    }
+
+    /// `nat64_rejects`: the RFC 8215 local-use prefix is rejected wholesale,
+    /// the RFC 6052 well-known prefix follows its embedded v4 address.
+    #[test]
+    fn nat64_prefixes_are_classified() {
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert!(nat64_rejects(&v6("64:ff9b::7f00:1")));
+        assert!(nat64_rejects(&v6("64:ff9b::a00:1")));
+        assert!(nat64_rejects(&v6("64:ff9b:1::1")));
+        assert!(!nat64_rejects(&v6("64:ff9b::808:808")));
+        assert!(!nat64_rejects(&v6("64:ff9b:2::1")));
+        assert!(!nat64_rejects(&v6("2001:db8::1")));
+    }
+
+    /// `boxed_io_error` preserves the message the guard produced.
+    #[test]
+    fn boxed_io_error_keeps_message() {
+        let err = boxed_io_error(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refused",
+        ));
+        assert_eq!(err.to_string(), "refused");
+    }
+
+    /// The production constructor is usable as reqwest's trait object.
+    #[test]
+    fn guarded_resolver_from_env_is_usable() {
+        // Compiles ⇒ `Arc<GuardedResolver>` coerces to the `dyn Resolve`
+        // that `ClientBuilder::dns_resolver` accepts.
+        let resolver: Arc<dyn reqwest::dns::Resolve> = guarded_resolver();
+        drop(resolver);
     }
 }

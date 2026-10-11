@@ -181,6 +181,11 @@ impl A2aCallTool {
             // call site rejects it explicitly instead of issuing a second
             // request.
             .redirect(reqwest::redirect::Policy::none())
+            // Issue #169: `validate_url` only sees literal hosts, so a name
+            // that resolves into private space (`127.0.0.1.nip.io`, DNS
+            // rebinding) would still get a socket. The guarded resolver vets
+            // every DNS answer at connect time.
+            .dns_resolver(crate::tools::url_guard::guarded_resolver())
             .build()
     }
 }

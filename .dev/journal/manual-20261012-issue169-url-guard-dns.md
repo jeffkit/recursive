@@ -1,0 +1,123 @@
+# manual-20261012-issue169-url-guard-dns
+
+- **Date**: 2026-10-12
+- **Goal**: #169 — `url_guard` 只查字面主机：解析到内网的域名绕过 SSRF 防护
+- **Baseline HEAD**: 6c724056（issue 正文的 `path:line` 证据写于 14bac15a，行号已漂）
+
+## 根因
+
+两层都缺：
+
+1. **连接期不校验**。`validate_url`（`src/tools/policy_domain/url_guard.rs`）只有字面层：
+   `Host::Domain` 仅拦 `localhost` / `*.localhost` / `metadata.google.internal`
+   与「写得像 IP」的串；全仓无自定义 DNS resolver，reqwest 拿到 `getaddrinfo`
+   的结果直接连。于是 `http://127.0.0.1.nip.io:6379/`、
+   `http://169.254.169.254.nip.io/latest/meta-data/` 这类**域名**通过校验后落到
+   环回 / 云元数据地址；DNS rebinding 同理（第二次解析无人管）。
+2. **保留段不全**。`is_private_ip` 只看 127/8、RFC1918、169.254/16、
+   255.255.255.255、0.0.0.0；漏 CGNAT `100.64.0.0/10`、`0.0.0.0/8` 的其余地址、
+   IPv4-compatible `::a.b.c.d`（只用了 `to_ipv4_mapped`）、NAT64。
+
+**红线证据（未修复的 6c724056）**：把 issue 的复现写成测试，`WebFetch::new()` +
+`execute("http://127.0.0.1.nip.io:<port>/latest/meta-data/")` 的请求真的打到了本机
+环回 mock 服务并读回 body：
+
+```
+SSRF bypass: http://127.0.0.1.nip.io:64480/latest/meta-data/ resolved to loopback
+and was fetched; body=Ok("IMDS-SECRET-LOOPBACK"), loopback_hits=1
+```
+
+同一次运行里保留段测试也红：
+
+```
+assertion failed: is_private_ip("100.64.0.1".parse().unwrap())
+expected http://100.64.0.1/ to be rejected
+assertion failed: is_private_ip("::127.0.0.1".parse().unwrap())
+```
+
+## 改动
+
+- **`src/tools/policy_domain/url_guard.rs`**
+  - `GuardedResolver`（`reqwest::dns::Resolve`）：先经 `AddrSource` 取地址
+    （生产 `SystemResolver` = `tokio::net::lookup_host`；测试可换桩），再过
+    `guard_addrs`。**整份答卷任一地址命中即整份拒绝**——过滤掉私网地址会让连接回退到
+    下一个地址，攻击者仍能把连接钉在私网。
+  - `guarded_resolver()` 生产装配入口；`ALLOW_PRIVATE_DNS_ENV`
+    （`RECURSIVE_SSRF_ALLOW_PRIVATE_DNS`，默认关）给「企业代理 / 内网服务名解析到私网」
+    的部署留豁免。
+  - 拒答时 `tracing::warn!`：reqwest 只渲染最外层 `error sending request`，工具层
+    `Error::Tool` 又把 cause 拍平成字符串，日志是唯一能看到「哪个域名 / 哪个地址被拒」
+    的地方。
+  - `is_private_ip` 补齐：`0.0.0.0/8`（RFC 1122 §3.2.1.3）、CGNAT `100.64.0.0/10`
+    （RFC 6598）、`to_ipv4` 覆盖 mapped + compatible、NAT64。
+  - `nat64_rejects`：`64:ff9b:1::/48`（RFC 8215 local-use，专用于非全局 v4）整段拒绝；
+    `64:ff9b::/96`（RFC 6052 WKP，DNS64 用它合成**全局**目标）只按内嵌 v4 判定 ——
+    `64:ff9b::7f00:1`（127.0.0.1）与 `64:ff9b::a00:1`（10.0.0.1）拒，
+    `64:ff9b::808:808`（8.8.8.8）放行。
+- **`src/tools/web_fetch.rs`**：拆出 `client_builder()` / `from_builder()`，`new()`
+  装上 `guarded_resolver()`（测试用同一 builder 注入桩 resolver）。
+- **`src/tools/a2a.rs`**：`build_client()` 装 `guarded_resolver()`，
+  a2a_call / a2a_card / a2a_task_check 共用。
+
+未新增依赖，未动 `Cargo.toml` / `Cargo.lock`：`tokio::net` 由 reqwest 的
+`tokio = { features = ["net", "time"] }` 依赖经 feature 统一提供。
+
+## 验证
+
+```
+cargo test -p recursive-agent --lib url_guard        → 27 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch        → 23 passed; 0 failed
+cargo test -p recursive-agent --lib                  → 3312 passed; 0 failed
+cargo test --test invariants                         → 55 passed; 0 failed
+cargo clippy -p recursive-agent --lib -- -D warnings → Finished（0 warning）
+cargo fmt --all -- --check                           → 通过
+```
+
+**反向对照（negative control）**：把 `is_private_ip` 还原成 6c724056 的函数体、并把
+`guard_addrs` 改成 `Ok(addrs)` 直通（**测试与装配全部保留**），同一组测试：
+
+```
+url_guard: FAILED. 20 passed; 7 failed
+  - 169.254.169.254 must be refused, got [169.254.169.254:0]
+  - assertion failed: validate_url("http://[::127.0.0.1]/").is_err()
+  - expected http://100.64.0.1/ to be rejected
+  - a private DNS answer must be refused
+web_fetch: FAILED. 22 passed; 1 failed
+  - the guard must refuse a loopback DNS answer: "LOOPBACK-SECRET"
+```
+
+随后按 sha256 还原（`url_guard.rs` 50b6ea4b…、`web_fetch.rs` bbb75c4f…、
+`a2a.rs` 5254c0ad…），scoped 测试重新全绿。
+
+**真实 DNS 端到端**：另跑一次性（已删除、未入库）测试，`WebFetch::new()` +
+`http://127.0.0.1.nip.io:<port>/latest/meta-data/`（真解析，非桩）修复后为 `Err` 且
+环回服务 `hits=0`；同一条路径在修复前 hits=1 并读回 body。
+
+## Notes
+
+- 未装 guard 的 client：**`http_call`**。它的 base URL 由运营者在 endpoint registry 里
+  配置，并显式支持 `allow_private: true`（内网业务网关是它的正常用法）；resolver 是
+  client 级、无法按 endpoint 生效，接上去会把这个 opt-in 直接打死。issue 的「边界」也
+  写明本单不含 `http_call` 的路径语义，故未动它 —— 需要的话应做成双 client
+  （guarded / unguarded）另开一单。其余 client（`web_search`、`install_skill`、
+  `providers_cache`、`skills`、`llm/*`）的目标 URL 来自运营者配置而非模型，同样未动。
+- **代理残余风险**：设了 `HTTP_PROXY`/`HTTPS_PROXY` 时 reqwest 把目标名交给代理解析，
+  本 resolver 只看得到代理地址，这条路径上的 SSRF 校验失效（既有行为，非本单引入）。
+  需要 `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS` 的部署也正是这类。
+- **错误可见性**：guard 拒绝在用户可见错误里只表现为
+  `request failed: error sending request for url (...)`（见上），只有 `tracing` 的 warn
+  能看到原因。没有改 `web_fetch` / `a2a` 的错误渲染（不在本单范围）。
+- **NAT64 精度**：只按内嵌 v4 判定 `64:ff9b::/96`，而不是整段拒绝 —— 整段拒绝会让
+  IPv6-only + DNS64 的网络把所有公网站点都判成私网。运营者自定义的 DNS64 前缀（非 WKP）
+  无法通用识别，属已知残余缺口。
+- **仍未覆盖的保留段**（本单未改，避免过度拦截）：`192.0.0.0/24`、`198.18.0.0/15`、
+  `240.0.0.0/4`、`2001:db8::/32`（后者被既有测试显式要求放行）。要收需另开单并同步调整
+  既有断言。
+- **spec drift**：
+  - spec 写 `url_guard.rs:58-145`，main 已漂到 `Host::Domain` 分支 `:79-112`、
+    `is_private_ip` `:126-145` —— 行为与 spec 描述一致，只是行号变了。
+  - spec 设计稿里的 `reqwest::dns::GaiResolver` **在 0.12.28 不是公开 API**
+    （registry `src/dns/mod.rs` 是 `pub(crate) mod gai`）。spec 自己允许「或直接包系统
+    解析」，实现取了这条：`SystemResolver` + `tokio::net::lookup_host`。
+  - spec 的 `fn guard_addrs(Vec<SocketAddr>)` 多了一个显式 `allow_private` 参数，以免测试
+    去改进程环境（本仓惯例，测试不 `set_var`）。
