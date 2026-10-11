@@ -437,6 +437,152 @@ mod tests {
         }
     }
 
+    // ── #154: headless approval hooks must not fail open ─────────────────
+
+    /// Write `body` as an executable `/bin/sh` hook for the `PermissionRequest`
+    /// event and return a headless registry whose interactive `echo` tool goes
+    /// through it. `dir` must outlive the returned registry.
+    #[cfg(unix)]
+    fn headless_registry_with_hook(
+        dir: &std::path::Path,
+        body: &str,
+        timeout: u64,
+    ) -> ToolRegistry {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_path = dir.join("approval.sh");
+        std::fs::write(&hook_path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
+
+        let cfg = crate::hooks::HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PermissionRequest".to_string(),
+                vec![crate::hooks::HookMatcher {
+                    matcher: None,
+                    hooks: vec![crate::hooks::HookCommand {
+                        r#type: crate::hooks::HookCommandType::Command,
+                        command: Some(hook_path.to_string_lossy().to_string()),
+                        timeout,
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+
+        let config = crate::permissions::LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![crate::permissions::PermissionLayer {
+                source: crate::permissions::RuleSource::User,
+                interactive: vec!["echo".into()],
+                ..Default::default()
+            }],
+        };
+        ToolRegistry::local()
+            .with_permissions(config)
+            .with_headless(true)
+            .with_hook_runner(crate::hooks::ExternalHookRunner::from_config(cfg))
+            .register(Arc::new(Echo))
+    }
+
+    /// `permissionDecision: "deny"` without an `action` field → denied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_permission_decision_deny_blocks_without_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = headless_registry_with_hook(
+            tmp.path(),
+            r#"echo '{"permissionDecision":"deny","permissionDecisionReason":"policy says no"}'"#,
+            5,
+        );
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    /// `permissionDecision: "allow"` → the tool runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_permission_decision_allow_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg =
+            headless_registry_with_hook(tmp.path(), r#"echo '{"permissionDecision":"allow"}'"#, 5);
+        let result = reg
+            .invoke("echo", serde_json::json!({"msg": "ok"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "ok");
+    }
+
+    /// Output with neither `action` nor `permissionDecision` is not consent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_hook_missing_action_is_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = headless_registry_with_hook(tmp.path(), "echo '{}'", 5);
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied { .. }),
+            "an approval hook that returns no decision must not approve, got {err:?}"
+        );
+    }
+
+    /// Hook timeout (unconfigured fail_mode) → denied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_hook_timeout_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = headless_registry_with_hook(tmp.path(), "sleep 30", 1);
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied { .. }),
+            "a timed-out approval hook must deny, got {err:?}"
+        );
+    }
+
+    /// Hook exits non-zero (unconfigured fail_mode) → denied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_hook_nonzero_exit_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = headless_registry_with_hook(tmp.path(), "exit 1", 5);
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied { .. }),
+            "a failing approval hook must deny, got {err:?}"
+        );
+    }
+
+    /// Hook emits unparseable output (unconfigured fail_mode) → denied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_hook_malformed_json_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = headless_registry_with_hook(tmp.path(), "echo 'not json'", 5);
+        let err = reg
+            .invoke("echo", serde_json::json!({"msg": "nope"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PermissionDenied { .. }),
+            "malformed approval-hook output must deny, got {err:?}"
+        );
+    }
+
     /// headless=false → interactive tools go through normal path (Passthrough)
     #[tokio::test]
     async fn non_headless_interactive_not_auto_denied() {

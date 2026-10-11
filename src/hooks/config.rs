@@ -97,9 +97,14 @@ pub struct HookCommand {
     #[serde(default)]
     pub async_rewake: bool,
     /// Fail behavior on timeout / error / non-zero exit.
-    /// Default: `open` (fail-open, same as pre-Goal-281 behavior).
+    ///
+    /// `None` (the default) means "use the per-event default": approval
+    /// events (`PermissionRequest`, `PreToolCall`) fail **closed** — a
+    /// broken approval hook must not silently approve — while every other
+    /// (notification-style) event fails open. Set `"open"` explicitly to
+    /// opt back into fail-open on approval events.
     #[serde(default)]
-    pub fail_mode: HookFailMode,
+    pub fail_mode: Option<HookFailMode>,
 }
 
 /// Supported hook execution types.
@@ -298,14 +303,24 @@ mod tests {
         assert!(!cmd.once);
         assert!(!cmd.r#async);
         assert!(!cmd.async_rewake);
-        assert_eq!(cmd.fail_mode, HookFailMode::Open);
+        // Unset → per-event default resolved at dispatch time.
+        assert_eq!(cmd.fail_mode, None);
     }
 
     #[test]
     fn hook_command_explicit_closed() {
         let json = r#"{"type": "command", "command": "echo hi", "fail_mode": "closed"}"#;
         let cmd: HookCommand = serde_json::from_str(json).unwrap();
-        assert_eq!(cmd.fail_mode, HookFailMode::Closed);
+        assert_eq!(cmd.fail_mode, Some(HookFailMode::Closed));
+    }
+
+    #[test]
+    fn hook_command_explicit_open_is_preserved() {
+        // An operator who explicitly opts into fail-open on an approval
+        // event keeps that choice (the runner logs a warning).
+        let json = r#"{"type": "command", "command": "echo hi", "fail_mode": "open"}"#;
+        let cmd: HookCommand = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.fail_mode, Some(HookFailMode::Open));
     }
 
     #[test]
