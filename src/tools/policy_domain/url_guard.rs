@@ -437,6 +437,89 @@ pub(crate) fn guarded_resolver() -> Arc<GuardedResolver> {
     Arc::new(GuardedResolver::from_env())
 }
 
+// ── Issue #169: environment gate for the wiring pins ───────────────────────
+
+/// Test gate for the wiring pins in `web_fetch.rs` / `a2a.rs`.
+///
+/// Those pins observe the connection-time guard through the *production*
+/// client, so the loopback request must not be intercepted by an ambient proxy.
+/// reqwest consults `NO_PROXY` first, then `no_proxy`; when the effective list
+/// does not exempt the loopback names, an `HTTP_PROXY` / `HTTPS_PROXY` /
+/// `ALL_PROXY` in the environment turns the pin into a **false green**: the
+/// guarded arm dies at the unreachable proxy, so `expect_err` plus "no hit on
+/// the listener" are satisfied for the wrong reason and deleting the guard
+/// changes nothing. `.cargo/config.toml` provides
+/// `NO_PROXY=127.0.0.1,localhost,::1` for cargo-invoked processes, but it
+/// deliberately does not override a value the developer already exported —
+/// hence this loud gate instead of a quietly weakened pin.
+///
+/// # Panics
+///
+/// When the effective no-proxy list is unset, or does not exempt both
+/// `localhost` and `127.0.0.1`.
+#[cfg(test)]
+pub(crate) fn assert_loopback_bypasses_proxy() {
+    let proxies: Vec<&str> = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+    .collect();
+
+    // reqwest's precedence: `NO_PROXY` if set, otherwise `no_proxy`.
+    let decisive = std::env::var("NO_PROXY")
+        .map(|value| ("NO_PROXY", value))
+        .ok()
+        .or_else(|| {
+            std::env::var("no_proxy")
+                .map(|value| ("no_proxy", value))
+                .ok()
+        });
+    let (name, value) = match decisive {
+        Some(pair) => pair,
+        None => panic!(
+            "connection_time_guard relies on the loopback names being exempted from any ambient \
+             proxy, but neither NO_PROXY nor no_proxy is set. Export \
+             `NO_PROXY=127.0.0.1,localhost,::1`, or run the suite through cargo (whose \
+             .cargo/config.toml provides it). Proxy env vars currently set: {proxies:?}"
+        ),
+    };
+
+    let missing = loopback_missing_from_no_proxy(&value);
+    assert!(
+        missing.is_empty(),
+        "connection_time_guard would pass for the wrong reason: {name}={value:?} does not exempt \
+         {missing:?}, so the request would be sent to the proxy and fail there instead of being \
+         refused by the connection-time SSRF guard (deleting the guard would stay green). Unset \
+         {name} or add the loopback names. Proxy env vars currently set: {proxies:?}"
+    );
+}
+
+/// The loopback names in `value` (a `NO_PROXY`-format list) that are **not**
+/// exempted.
+#[cfg(test)]
+fn loopback_missing_from_no_proxy(value: &str) -> Vec<&'static str> {
+    ["localhost", "127.0.0.1"]
+        .into_iter()
+        .filter(|host| !no_proxy_covers(value, host))
+        .collect()
+}
+
+/// True when a `NO_PROXY`-format list exempts `host`: comma / whitespace
+/// separated, case-insensitive, one leading `.` and the `*` wildcard tolerated.
+#[cfg(test)]
+fn no_proxy_covers(value: &str, host: &str) -> bool {
+    value
+        .split([',', ';', ' ', '\t', '\n', '\r'])
+        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
+        .any(|entry| entry == "*" || entry == host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +879,37 @@ mod tests {
         // that `ClientBuilder::dns_resolver` accepts.
         let resolver: Arc<dyn reqwest::dns::Resolve> = guarded_resolver();
         drop(resolver);
+    }
+
+    /// The env gate's parser (`no_proxy_covers`): all separator/case shapes the
+    /// pins may meet, plus the near-misses that must stay "not covered".
+    #[test]
+    fn no_proxy_covers_tolerates_separators_case_and_wildcard() {
+        assert!(no_proxy_covers("127.0.0.1,localhost,::1", "localhost"));
+        assert!(no_proxy_covers("127.0.0.1,localhost,::1", "127.0.0.1"));
+        assert!(no_proxy_covers("EXAMPLE.com localhost", "localhost"));
+        assert!(no_proxy_covers("127.0.0.1\tlocalhost", "127.0.0.1"));
+        assert!(no_proxy_covers(".localhost", "localhost"));
+        assert!(no_proxy_covers("*", "127.0.0.1"));
+        assert!(!no_proxy_covers("example.com", "localhost"));
+        assert!(!no_proxy_covers("", "localhost"));
+        assert!(!no_proxy_covers("notlocalhost", "localhost"));
+        assert!(!no_proxy_covers("127.0.0.10", "127.0.0.1"));
+    }
+
+    /// The env gate's decision (`loopback_missing_from_no_proxy`): this is what
+    /// turns "the pin would be vacuous here" into a loud failure.
+    #[test]
+    fn loopback_missing_from_no_proxy_is_reported() {
+        assert!(loopback_missing_from_no_proxy("127.0.0.1,localhost,::1").is_empty());
+        assert!(loopback_missing_from_no_proxy("*").is_empty());
+        assert_eq!(
+            loopback_missing_from_no_proxy("example.com"),
+            vec!["localhost", "127.0.0.1"]
+        );
+        assert_eq!(
+            loopback_missing_from_no_proxy("127.0.0.1"),
+            vec!["localhost"]
+        );
     }
 }

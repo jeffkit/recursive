@@ -1826,6 +1826,11 @@ mod tests {
     /// `localhost` on `NO_PROXY` so the request cannot be handed to a proxy.
     #[tokio::test]
     async fn a2a_build_client_installs_connection_time_guard() {
+        // Refuse to run when an ambient proxy would intercept the loopback
+        // request: the pin would then pass for the wrong reason (see the gate's
+        // doc comment in `url_guard.rs`).
+        crate::tools::url_guard::assert_loopback_bypasses_proxy();
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));

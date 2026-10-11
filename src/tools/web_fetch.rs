@@ -887,6 +887,11 @@ mod tests {
     /// cannot be handed to a proxy.
     #[tokio::test]
     async fn web_fetch_new_installs_connection_time_guard() {
+        // Refuse to run when an ambient proxy would intercept the loopback
+        // request: the pin would then pass for the wrong reason (see the gate's
+        // doc comment in `url_guard.rs`).
+        crate::tools::url_guard::assert_loopback_bypasses_proxy();
+
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;

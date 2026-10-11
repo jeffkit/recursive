@@ -58,9 +58,13 @@ assertion failed: is_private_ip("::127.0.0.1".parse().unwrap())
   装上 `guarded_resolver()`（测试用同一 builder 注入桩 resolver）。
 - **`src/tools/a2a.rs`**：`build_client()` 装 `guarded_resolver()`，
   a2a_call / a2a_card / a2a_task_check 共用。
+- **`src/tools/policy_domain/url_guard.rs`**（review 返工 2 补）：接线钉的环境门
+  `assert_loopback_bypasses_proxy`（`#[cfg(test)]`）——`NO_PROXY`/`no_proxy` 未豁免
+  `localhost` + `127.0.0.1` 时直接 `panic!`，不让 pin 在代理环境里假绿。
 - **`docs/architecture/tools/web-tools.md`** / **`docs/architecture/tools/a2a-tools.md`**
-  （review 返工补）：用户可见文档写明两层校验与豁免开关
-  `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS`（默认关，设置后连接期放行私网地址）。
+  （review 返工补）：用户可见文档写明两层校验、豁免开关
+  `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS`（默认关，设置后连接期放行私网地址），以及代理路径
+  的已知限制（"Known limitation (proxy)"）。
 
 未新增依赖，未动 `Cargo.toml` / `Cargo.lock`：`tokio::net` 由 reqwest 的
 `tokio = { features = ["net", "time"] }` 依赖经 feature 统一提供。
@@ -143,6 +147,62 @@ cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished
 cargo fmt --all -- --check                                          → 通过
 ```
 
+### review 返工 2（第三个 commit）：pin 在被覆盖的 `NO_PROXY` 下不再假绿
+
+验收者指出 pin 的**假绿**：`.cargo/config.toml` 的 `[env]` 不覆盖用户已导出的值，所以
+`NO_PROXY=example.com` + 一个不可达 `HTTP_PROXY` 时，生产臂在"代理不可达"处就失败了，
+`expect_err` + 命中 0 被**以错误的理由**满足 —— 即使删掉 `.dns_resolver(...)`，两条 pin
+仍然绿（=守卫可被静默删除）。
+
+修法：两条 pin 的第一句调用 `url_guard::assert_loopback_bypasses_proxy()`
+（`#[cfg(test)]`）。reqwest 的取值顺序是 `NO_PROXY` → `no_proxy`；该值必须豁免
+`localhost` 与 `127.0.0.1`（`,`/空白/`;` 分隔、大小写不敏感、容忍一个前导 `.` 与 `*`），
+否则 `panic!` 并列出当前设置的代理变量（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 大小写
+两种）。**没有**改用自建 `.no_proxy()` builder —— 那就不再钉生产
+`WebFetch::new()` / `build_client()` 的接线。
+
+证据：
+
+```
+# 默认环境：两条 pin 有意义地通过（gate 由 .cargo/config.toml 提供的 NO_PROXY 满足）
+cargo test -p recursive-agent --lib connection_time_guard
+  → 2 passed; 0 failed
+
+# 被覆盖环境 + 接线完好：gate 大声失败（该环境下这条用例不可信，拒跑）
+NO_PROXY=example.com HTTP_PROXY=http://127.0.0.1:1 cargo test -p recursive-agent --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed
+  panicked at src/tools/policy_domain/url_guard.rs:494:
+  connection_time_guard would pass for the wrong reason: NO_PROXY="example.com" does not exempt
+  ["localhost", "127.0.0.1"], so the request would be sent to the proxy and fail there instead of
+  being refused by the connection-time SSRF guard (deleting the guard would stay green). Unset
+  NO_PROXY or add the loopback names. Proxy env vars currently set: ["HTTP_PROXY"]
+
+# 被覆盖环境 + 接线被人为删除：修复前这里是静默绿，现在同样大声失败（gate 先拦下）
+NO_PROXY=example.com HTTP_PROXY=http://127.0.0.1:1 cargo test -p recursive-agent --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed（同样 panic 在 url_guard.rs:494）
+
+# 同一变异 + 默认环境：pin 按设计报出接线缺失
+cargo test -p recursive-agent --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed
+  web_fetch.rs:929 WebFetch::new() no longer installs the DNS guard: "PINNED-SECRET"
+  a2a.rs:1861       A2aCallTool::build_client() no longer installs the DNS guard: Response { ... }
+```
+
+按 sha256 还原（`web_fetch.rs` abcde778…、`a2a.rs` 839c4970…）后默认环境重新全绿。
+同轮把代理限制写进用户文档（`web-tools.md` "Known limitation (proxy)"）。
+
+返工 2 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 29 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3316 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
 ## 提交与 diff stat（真实数字，`git show --numstat`）
 
 首版 commit（被验收的哈希，未 amend）：
@@ -169,6 +229,17 @@ review 返工 commit（不含本 journal 自身的改动）：
 
 `git diff --stat -- src docs`：`4 files changed, 179 insertions(+), 0 deletions(-)`。
 
+review 返工 2 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `docs/architecture/tools/web-tools.md` | 8 | 0 |
+| `src/tools/a2a.rs` | 5 | 0 |
+| `src/tools/policy_domain/url_guard.rs` | 115 | 0 |
+| `src/tools/web_fetch.rs` | 5 | 0 |
+
+`git diff --stat -- src docs`：`4 files changed, 133 insertions(+), 0 deletions(-)`。
+
 ## Notes
 
 - 未装 guard 的 client：**`http_call`**。它的 base URL 由运营者在 endpoint registry 里
@@ -192,7 +263,8 @@ review 返工 commit（不含本 journal 自身的改动）：
   > `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS` 语义，并补一条「带代理时守卫仍生效」的测试。
 
   当前缓解：`GuardedResolver` 的上述语义 + `.cargo/config.toml` 里
-  `NO_PROXY=127.0.0.1,localhost,::1`（仅 cargo 起的进程）。
+  `NO_PROXY=127.0.0.1,localhost,::1`（仅 cargo 起的进程）。用户可见版本见
+  `docs/architecture/tools/web-tools.md` 的 "Known limitation (proxy)"。
 - **错误可见性**：guard 拒绝在用户可见错误里只表现为
   `request failed: error sending request for url (...)`（见上），只有 `tracing` 的 warn
   能看到原因。没有改 `web_fetch` / `a2a` 的错误渲染（不在本单范围）。
