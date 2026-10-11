@@ -146,6 +146,43 @@ pub fn read_log(path: &Path) -> Result<Vec<CheckpointRecord>> {
     Ok(out)
 }
 
+/// The `turn` value the next checkpoint should carry for the session whose
+/// log lives at `path`: one past the highest recorded turn, or `0` when the
+/// log is missing, empty, or unreadable.
+///
+/// **Issue #173**: this is the single seeding source for
+/// [`AgentRuntime::enable_checkpoints`](crate::AgentRuntime::enable_checkpoints).
+/// `resume` (CLI), the batch CLI, and AG-UI all rebuild the runtime — and with
+/// it the turn counter — over an *existing* session directory; without a seed
+/// they restart at 0 and write `turn` values that collide with records already
+/// in the same `checkpoints.jsonl`. `sessions rewind --to-turn N` filters on
+/// `turn`, so a colliding record falls below the cutoff and its files are
+/// silently left in the workspace while the transcript is truncated.
+///
+/// `max(turn) + 1` rather than "last record + 1": a pre-fix log can be
+/// non-monotonic (that is the bug), and healing it must not re-issue an
+/// existing number.
+pub fn next_turn_index(path: &Path) -> usize {
+    match read_log(path) {
+        Ok(recs) => recs
+            .iter()
+            .map(|r| r.turn)
+            .max()
+            .map_or(0, |max_turn| max_turn.saturating_add(1)),
+        Err(e) => {
+            // A corrupt log must not disable checkpoints (the caller is
+            // mid-wiring); fall back to the historical behaviour of 0 and
+            // surface the reason.
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "checkpoint-log: unreadable log; turn numbering restarts at 0"
+            );
+            0
+        }
+    }
+}
+
 /// Truncate the log to records with `turn < cutoff`. Atomic via temp
 /// file + rename.
 pub fn truncate_to_turn(path: &Path, cutoff: usize) -> Result<()> {
@@ -202,6 +239,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.jsonl");
         assert!(read_log(&path).unwrap().is_empty());
+    }
+
+    /// Issue #173: a missing log seeds 0 (fresh session), an empty log seeds
+    /// 0, and the first record moves the seed to 1.
+    #[test]
+    fn next_turn_index_zero_for_missing_or_empty_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoints.jsonl");
+        assert_eq!(next_turn_index(&path), 0, "missing log");
+        let w = CheckpointLogWriter::open(&path).unwrap();
+        assert_eq!(next_turn_index(&path), 0, "empty log");
+        w.append(&rec(0, "aaa")).unwrap();
+        assert_eq!(next_turn_index(&path), 1, "one record at turn 0");
+    }
+
+    /// The seed is `max(turn) + 1`, not "last record + 1": a pre-fix log can
+    /// be non-monotonic (that is exactly the #173 corruption), and healing it
+    /// must not re-issue a number that is already in the file.
+    #[test]
+    fn next_turn_index_uses_max_turn_not_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoints.jsonl");
+        let w = CheckpointLogWriter::open(&path).unwrap();
+        w.append(&rec(3, "a")).unwrap();
+        w.append(&rec(1, "b")).unwrap();
+        w.append(&rec(2, "c")).unwrap();
+        assert_eq!(next_turn_index(&path), 4);
+    }
+
+    /// A corrupt log must not panic and must not fabricate a seed.
+    #[test]
+    fn next_turn_index_zero_on_malformed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoints.jsonl");
+        std::fs::write(&path, "{ not json }\n").unwrap();
+        assert_eq!(next_turn_index(&path), 0);
     }
 
     #[test]
