@@ -14,6 +14,27 @@
 #   Exits 0 if all dep changes have journal justification.
 #   Exits 1 if any dep change lacks a journal entry.
 #   Exits 2 if the base ref cannot be resolved (the gate fails closed, #184).
+#
+# Known limitation (deliberately not fixed, #184 review): comment stripping
+# tracks double quotes only, so a `#` inside a *single-quoted* TOML literal
+# ('1#x') or inside a multi-line literal ('''…''' / """…""") still starts a
+# comment. Measured consequence (NOT "the entry is dropped"):
+#
+#     [dependencies]
+#     bad  = { version = '1#x' }     # gets truncated to `bad = { version = '1`
+#     next = "2"                     # swallowed into bad's spec, never compared
+#
+# `bad` is still reported (the entry is flushed at EOF), but because its closing
+# brace was eaten, every *following* entry in that table is merged into its spec
+# and therefore never compared — those dependencies are the ones silently missed,
+# and `bad` itself looks "modified". Same for `features = ['a#b'] }` on a
+# continuation line.
+#
+# Cargo itself always writes double quotes for [dependencies]; `cargo add` and
+# Cargo.lock round-trips never produce these shapes, so closing it would mean
+# hand-writing a TOML lexer for a form the toolchain does not emit. If it ever
+# shows up for real: add a `'` state bit (handling ''' too) plus a fixture case
+# covering the *following sibling entries*, which is the part that actually leaks.
 
 set -euo pipefail
 

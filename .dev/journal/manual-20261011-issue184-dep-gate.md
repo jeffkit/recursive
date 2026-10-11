@@ -195,3 +195,30 @@ keeper 没提这一条，是我把"依赖表比对"的**键形态**做了一遍�
   它守的是 v5 的引号归一化与整体键模式，不是 v4 的漏判。
 - `cargo test --test invariants` **70 passed**（+3）；`clippy -D warnings`、`fmt --all -- --check` 干净；
   `check-new-deps.sh eef5f42b^` 仍识别 `libc`。
+
+## 后续 5 · keeper 复验 v3 后的收官（2026-10-12）
+
+keeper 对 **v3（`357dfe93`）** 的复验通过：补丁完整性（干净基线 apply + 增量链逐字节一致）、15 例矩阵 7/12/13/15 逐个复现、
+Rust 侧 65 passed、负向对照 2/2 转红、真仓冒烟与 CI 回路均一致；结论是"建议收官落地，不再加码"。
+
+它留了一条**只记不改**的残余边界：`strip_comment()` 只跟踪双引号，单引号字面量（`'1#x'`）与多行字面量（`'''`/`"""`）
+里的 `#` 仍会被当注释起点。**按实测更正它的说法**（它测的是 v3 之前的行为）：
+
+- 被截断的那条依赖**仍会被报出来** —— v4 加的 `END { emit() }` 会在 EOF 把未闭合条目 flush 出去；
+- **真正漏的是同表里它后面的条目**：闭合括号被吃掉 → 深度回不到 0 → 后续同级条目被并进上一条的 spec、永不参与比对。
+
+实测（本仓 worktree，HEAD~1 为基线）：
+
+```
+[dependencies]
+keep = "1"
+bad  = { version = '1#x' }      # 截断成 `bad = { version = '1`
+newdep = "2"                    # 新依赖 → 未被报出（并入 bad 的 spec）
+```
+→ `Changed dependencies: bad`（只报 bad）。即：**漏的是 `newdep`**，而 keeper 描述的"整条被丢掉"在 v4 之后已不成立。
+
+按 keeper 建议**不改代码**，改为在 `scripts/check-new-deps.sh` 头部注释里写清**实测后果**与"若真出现该怎么补"
+（加 `'` 状态位、覆盖 `'''`，并**针对"后续同级条目"这一真正泄漏点**加夹具用例）。本题材不会由 cargo 产出
+（`[dependencies]` 恒为双引号、`cargo add`/Cargo.lock 往返也不会生成），继续处理等于手写 TOML 词法器。
+
+**验证**：注释为纯文档改动，仍实跑 `check-new-deps.sh HEAD~1`（exit 0）与 23 例夹具（23/23）确认未破坏任何行为。
