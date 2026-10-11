@@ -222,3 +222,34 @@ newdep = "2"                    # 新依赖 → 未被报出（并入 bad 的 sp
 （`[dependencies]` 恒为双引号、`cargo add`/Cargo.lock 往返也不会生成），继续处理等于手写 TOML 词法器。
 
 **验证**：注释为纯文档改动，仍实跑 `check-new-deps.sh HEAD~1`（exit 0）与 23 例夹具（23/23）确认未破坏任何行为。
+
+## 后续 6 · keeper 六提交复验收官（2026-10-12，24/24）
+
+keeper 对**六提交形态**（`f35ecf02` + 四条增量链 + `5fdf3e04`）给出完整复验并**确认 gist 与我方工作树逐字节一致**（`issue184-dep-gate.patch` 的 md5 相同、gist 12 个文件）：
+
+| 版本 | 24 例通过 |
+|---|---|
+| `origin/main` | 9/24 |
+| v1 `f35ecf02` | 15/24 |
+| v2 `a12501e2` | 17/24 |
+| v3 `357dfe93` | 19/24 |
+| v4 `29fdebe8` | 20/24 |
+| **v5 `dcd177fb`** | **24/24** ⇒ 建议冻结并落地 |
+
+- **v5 非装饰**：只装到 v4 为 20/24，失败项正是 `"quoted-crate"`、`dotted.crate`、`"quoted-inline"` 三个键形态漏判 + `[dependencies."quoted-table"]` 引号导致 journal 匹配失败。
+- **keeper 自做的两组负向对照**：A) 3 条新用例对 v4 跑 → `dep_gate_flags_quoted_dependency_key`、`dep_gate_flags_dotted_dependency_key` 转红；B) 保留 v5 但删掉 `END { emit() }` → 24/24 掉到 **20/24**，失掉的四例全是「表形态位于文件末尾」⇒ 该兜底**确实承重**。
+- `[workspace.dependencies]`、`[target.'cfg(unix)'.dependencies]`、`[build-dependencies]`、`[dev-dependencies]` 逐一带实跑确认会红。
+- **真仓冒烟**：`check-new-deps.sh eef5f42b^` 仍识别 `libc` 并命中 #150 的 journal → exit 0。
+- Rust 侧：`--test invariants` 70 passed（`dep_` 子集 18 passed）、clippy `-D warnings`、fmt 干净。
+
+### keeper 确认的三条收口（均无异议）
+
+1. **单引号更正**：接受"v4 的 EOF flush 改变了症状；真正漏掉的是被并进 `bad` 的 spec、因而永不参与比对的同级条目 `newdep`（v3 连 `bad` 都不报）"——按更正后说法写入脚本头部注释，**纯文档、不改代码**。
+2. **`[patch.*]` / `[replace]` 判为范围外**（本单采纳）：它们不给依赖集合新增 crate，只是给已在树里的名字换源；扩进不变量 #6 会让常规上游 pin 变成噪声，源码层面已由 `supply-chain` job（cargo-audit + machete）覆盖。
+3. **`bash -n` 不可替代实跑**（存在引号数恰好配对、shell 语法仍成立的漏判情形）——与本 journal「踩坑记录」一致，本轮复验全程实跑。
+
+### 结算
+
+**本单收官**：形态覆盖已穷举（24 例矩阵 24/24）、`[patch.*]` 判为范围外、残余边界按「只记不改」落进脚本注释，**复验侧无待办**。落地由值守/作者执行（`git checkout -b fix/184-dep-gate 6c724056` + 应用 gist 全量补丁或其等价增量链，PR 正文注明来源 gist、本线程复验结论与单引号更正）。三项留作后续议题、不在本单内解决：`crates/*/Cargo.toml`、`Cargo.lock`、journal 侧兜底分支。
+
+**验证**：本节为**纯文档追加**，追加后仍实跑 `bash scripts/check-new-deps.sh eef5f42b^` 确认行为未变（见下）。
