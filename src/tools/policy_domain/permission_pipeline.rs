@@ -19,7 +19,9 @@
 //!    result is re-checked against L1 policy before being accepted.
 //! 6. **Headless external hook** (Goal 199) — for headless + interactive
 //!    tools, dispatch a `PermissionRequest` event to the external hook
-//!    runner.
+//!    runner. The hook's `permissionDecision` is authoritative; a hook
+//!    that fails to produce one (timeout, crash, malformed output) is
+//!    resolved fail-closed by the runner.
 //! 7. **L1 policy check** — shell/fs policies from the registry's
 //!    `PolicyConfig`. The same logic is exposed as `recheck_policy` for
 //!    re-validation of hook-mutated arguments.
@@ -257,16 +259,36 @@ impl<'a> PermissionPipeline<'a> {
                 // avoid holding the lock across an await point.
                 drop(guard);
                 let hook_result = self.registry.hook_runner.dispatch(&hook_input).await;
-                if !matches!(hook_result.action, crate::hooks::HookAction::Continue) {
-                    return CheckOutcome::Deny {
-                        error: Error::PermissionDenied {
-                            name: tool_name.into(),
-                            reason: DecisionReason::Hook {
-                                name: "PermissionRequest".into(),
+                // The external hook is the approval authority in headless
+                // mode: an explicit `permissionDecision` wins, and only an
+                // explicit `continue` passes. A hook that could not run
+                // never reaches the `continue` arm — its fail mode resolves
+                // it to `Error` (closed for approval events).
+                let hook_reason = hook_result
+                    .permission_decision_reason
+                    .clone()
+                    .unwrap_or_else(|| "PermissionRequest".to_string());
+                match (&hook_result.permission_decision, &hook_result.action) {
+                    (Some(crate::hooks::PermissionDecision::Allow), _) => {}
+                    (Some(crate::hooks::PermissionDecision::Deny), _) => {
+                        return CheckOutcome::Deny {
+                            error: Error::PermissionDenied {
+                                name: tool_name.into(),
+                                reason: DecisionReason::Hook { name: hook_reason },
                             },
-                        },
-                        audit: AuditMeta::synthetic_unknown_tool(tool_name),
-                    };
+                            audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                        };
+                    }
+                    (_, crate::hooks::HookAction::Continue) => {}
+                    _ => {
+                        return CheckOutcome::Deny {
+                            error: Error::PermissionDenied {
+                                name: tool_name.into(),
+                                reason: DecisionReason::Hook { name: hook_reason },
+                            },
+                            audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                        };
+                    }
                 }
             } else {
                 // Drop guard before tool execution (not holding across await).

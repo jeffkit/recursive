@@ -3,7 +3,9 @@
 //! External hooks are executable scripts/programs placed in hook directories
 //! (`~/.recursive/hooks/` or `<workspace>/.recursive/hooks/`). They receive
 //! a JSON event on stdin and must reply with a JSON decision on stdout within
-//! 5 seconds. Timeout or non-parseable output is treated as "continue".
+//! 5 seconds. Timeout or non-parseable output resolves through the hook's
+//! fail mode: fail-open for notification events, fail-closed for approval
+//! events (`PermissionRequest`, `PreToolCall`) unless the config opts out.
 //!
 //! # Protocol
 //!
@@ -76,6 +78,23 @@ pub enum HookEvent {
     SubagentStop,
     Notification,
     Setup,
+}
+
+impl HookEvent {
+    /// Approval events decide whether a tool call proceeds. They are the
+    /// only events where a hook failure must not be read as consent.
+    fn is_approval(&self) -> bool {
+        matches!(self, HookEvent::PermissionRequest | HookEvent::PreToolCall)
+    }
+
+    /// Fail mode used when the hook config does not state one.
+    fn default_fail_mode(&self) -> HookFailMode {
+        if self.is_approval() {
+            HookFailMode::Closed
+        } else {
+            HookFailMode::Open
+        }
+    }
 }
 
 /// Input payload sent to the external hook on stdin.
@@ -208,8 +227,9 @@ impl HookResult {
 
     /// Produce a hook result based on the fail mode.
     ///
-    /// - `Open` (default): returns `Continue` — preserves pre-Goal-281
-    ///   fail-open behavior for notification hooks.
+    /// - `Open`: returns `Continue` — preserves pre-Goal-281 fail-open
+    ///   behavior. This is the default for notification events; approval
+    ///   events only use it when the operator opts in explicitly.
     /// - `Closed`: for gating events (`PreToolCall`, `UserPromptSubmit`,
     ///   `PermissionRequest`) returns `Error(reason)` so the agent sees
     ///   the failure as a rejection. For all other event types
@@ -236,15 +256,26 @@ impl HookResult {
 
 impl HookOutput {
     /// Convert the external hook's JSON output into a `HookResult`.
-    fn into_hook_result(self) -> HookResult {
-        let action = match self.action.unwrap_or(JsonAction::Continue) {
-            JsonAction::Continue => HookAction::Continue,
-            JsonAction::Skip => HookAction::Skip,
-            JsonAction::Error => HookAction::Error(
+    ///
+    /// `event` decides the meaning of an omitted `action`: for approval
+    /// events (`PermissionRequest`, `PreToolCall`) silence is not consent,
+    /// so it resolves to `Error` — an enterprise hook that only emits
+    /// `permissionDecision` must not be read as "continue".
+    fn into_hook_result(self, event: &HookEvent) -> HookResult {
+        let action = match self.action {
+            Some(JsonAction::Continue) => HookAction::Continue,
+            Some(JsonAction::Skip) => HookAction::Skip,
+            Some(JsonAction::Error) => HookAction::Error(
                 self.message
                     .clone()
                     .unwrap_or_else(|| "external hook blocked".to_string()),
             ),
+            None if event.is_approval() => HookAction::Error(
+                self.message
+                    .clone()
+                    .unwrap_or_else(|| "external hook returned no decision".to_string()),
+            ),
+            None => HookAction::Continue,
         };
         let permission_decision = self
             .permission_decision
@@ -302,8 +333,9 @@ struct ResolvedHook {
     r#async: bool,
     /// When `true`, run in background and cancel Agent on exit code 2.
     async_rewake: bool,
-    /// Fail behavior on timeout / error / non-zero exit.
-    fail_mode: HookFailMode,
+    /// Fail behavior on timeout / error / non-zero exit. `None` → the
+    /// per-event default from [`HookEvent::default_fail_mode`].
+    fail_mode: Option<HookFailMode>,
 }
 
 // ── Runner ─────────────────────────────────────────────────────────
@@ -369,7 +401,7 @@ impl ExternalHookRunner {
                             once: false,
                             r#async: false,
                             async_rewake: false,
-                            fail_mode: HookFailMode::Open,
+                            fail_mode: None,
                         });
                     }
                 }
@@ -558,8 +590,11 @@ impl ExternalHookRunner {
 
     /// Dispatch an event to all matching hooks.
     ///
-    /// Returns the first non-`Continue` `HookResult`. Hooks that fail,
-    /// timeout, or return unparseable output are silently skipped (fail-open).
+    /// Returns the first decisive `HookResult` — one whose `action` is not
+    /// `Continue`, or that carries an explicit `permissionDecision`. A
+    /// failing hook (timeout, spawn error, non-zero exit, unparseable
+    /// output) resolves through its fail mode: open for notification events,
+    /// closed for approval events (`PermissionRequest` / `PreToolCall`).
     pub async fn dispatch(&self, input: &HookInput) -> HookResult {
         // Claude SDK host callbacks take precedence when registered.
         if let Some(fwd) = &self.sdk_forwarder {
@@ -680,7 +715,13 @@ impl ExternalHookRunner {
                     outcome,
                     duration_ms,
                 });
-                if !matches!(result.action, HookAction::Continue) {
+                // A hook that states a `permissionDecision` has decided the
+                // call even when its `action` is `continue`; returning here
+                // keeps a later hook (or the `continue_default` tail) from
+                // silently discarding that decision.
+                if !matches!(result.action, HookAction::Continue)
+                    || result.permission_decision.is_some()
+                {
                     return result;
                 }
             }
@@ -706,6 +747,19 @@ impl ExternalHookRunner {
             .map(Duration::from_secs)
             .unwrap_or_else(default_hook_timeout);
 
+        // Unset fail mode → per-event default; approval events fail closed so
+        // a broken approval hook can never be mistaken for a yes.
+        let fail_mode = hook
+            .fail_mode
+            .unwrap_or_else(|| input.event.default_fail_mode());
+        if hook.fail_mode == Some(HookFailMode::Open) && input.event.is_approval() {
+            tracing::warn!(
+                event = ?input.event,
+                "hook configured fail_mode=open on an approval event; \
+                 hook failures will be treated as approval"
+            );
+        }
+
         match &hook.kind {
             ResolvedHookKind::Http {
                 url,
@@ -718,7 +772,7 @@ impl ExternalHookRunner {
                     hook_timeout.as_secs(),
                     headers.as_ref(),
                     allowed_env_vars.as_deref(),
-                    hook.fail_mode,
+                    fail_mode,
                 )
                 .await;
                 Ok(result)
@@ -726,19 +780,21 @@ impl ExternalHookRunner {
             ResolvedHookKind::Prompt { prompt } => {
                 if let Some(llm) = &self.llm {
                     let result =
-                        run_prompt_hook(llm.as_ref(), prompt, input, hook_timeout, hook.fail_mode)
-                            .await;
+                        run_prompt_hook(llm.as_ref(), prompt, input, hook_timeout, fail_mode).await;
                     Ok(result)
                 } else {
-                    // No LLM configured — fail-open with a warning.
                     tracing::warn!(
                         "prompt hook configured but no LLM provider available; skipping"
                     );
-                    Ok(HookResult::continue_default())
+                    Ok(HookResult::from_fail_mode(
+                        fail_mode,
+                        "prompt hook has no LLM provider",
+                        &input.event,
+                    ))
                 }
             }
             ResolvedHookKind::Command(path, args) => {
-                self.run_command_hook(path, args, input, hook_timeout, hook.fail_mode)
+                self.run_command_hook(path, args, input, hook_timeout, fail_mode)
                     .await
             }
         }
@@ -868,7 +924,7 @@ impl ExternalHookRunner {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         match serde_json::from_str::<HookOutput>(stdout.trim()) {
-            Ok(parsed) => Ok(parsed.into_hook_result()),
+            Ok(parsed) => Ok(parsed.into_hook_result(&input.event)),
             Err(e) => Ok(HookResult::from_fail_mode(
                 fail_mode,
                 &format!("hook output parse {}: {e}", path.display()),
@@ -926,7 +982,7 @@ async fn run_prompt_hook(
     };
 
     match serde_json::from_str::<HookOutput>(completion.content.trim()) {
-        Ok(output) => output.into_hook_result(),
+        Ok(output) => output.into_hook_result(&input.event),
         Err(_) => {
             // Non-JSON or empty response — use fail_mode.
             HookResult::from_fail_mode(fail_mode, "prompt hook returned non-JSON", &input.event)
@@ -998,7 +1054,7 @@ pub(crate) async fn run_http_hook(
     };
 
     match serde_json::from_str::<HookOutput>(body.trim()) {
-        Ok(output) => output.into_hook_result(),
+        Ok(output) => output.into_hook_result(&input.event),
         Err(e) => {
             tracing::warn!("http hook response parse failed: {e}");
             HookResult::from_fail_mode(
@@ -1165,7 +1221,7 @@ mod tests {
     fn hook_output_into_hook_action_continue() {
         let json = r#"{"action":"continue"}"#;
         let out: HookOutput = serde_json::from_str(json).unwrap();
-        let result = out.into_hook_result();
+        let result = out.into_hook_result(&HookEvent::PreToolCall);
         assert!(matches!(result.action, HookAction::Continue));
     }
 
@@ -1173,7 +1229,7 @@ mod tests {
     fn hook_output_into_hook_action_skip() {
         let json = r#"{"action":"skip","message":"blocked"}"#;
         let out: HookOutput = serde_json::from_str(json).unwrap();
-        let result = out.into_hook_result();
+        let result = out.into_hook_result(&HookEvent::PreToolCall);
         assert!(matches!(result.action, HookAction::Skip));
     }
 
@@ -1181,7 +1237,7 @@ mod tests {
     fn hook_output_into_hook_action_error_with_message() {
         let json = r#"{"action":"error","message":"not allowed"}"#;
         let out: HookOutput = serde_json::from_str(json).unwrap();
-        let result = out.into_hook_result();
+        let result = out.into_hook_result(&HookEvent::PreToolCall);
         assert!(matches!(result.action, HookAction::Error(ref msg) if msg == "not allowed"));
     }
 
@@ -1189,7 +1245,7 @@ mod tests {
     fn hook_output_into_hook_action_error_without_message() {
         let json = r#"{"action":"error"}"#;
         let out: HookOutput = serde_json::from_str(json).unwrap();
-        let result = out.into_hook_result();
+        let result = out.into_hook_result(&HookEvent::PreToolCall);
         assert!(
             matches!(result.action, HookAction::Error(ref msg) if msg == "external hook blocked")
         );
@@ -1313,7 +1369,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn dispatch_treats_timeout_as_continue() {
+    async fn dispatch_treats_timeout_as_closed_on_approval_event() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hook_path = tmp.path().join("hang.sh");
@@ -1325,6 +1381,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&hook_path, perms).unwrap();
 
+        // No `fail_mode` configured → per-event default. PreToolCall is an
+        // approval event, so a timeout must NOT read as consent.
         let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
         assert_eq!(runner.len(), 1);
         let input = make_tool_input(
@@ -1333,13 +1391,16 @@ mod tests {
             serde_json::json!({"command": "ls"}),
         );
         let result = runner.dispatch(&input).await;
-        // Timeout → fail-open → Continue.
-        assert!(matches!(result.action, HookAction::Continue));
+        assert!(
+            matches!(result.action, HookAction::Error(_)),
+            "approval-event timeout must fail closed, got {:?}",
+            result.action
+        );
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn dispatch_treats_bad_output_as_continue() {
+    async fn dispatch_treats_bad_output_as_closed_on_approval_event() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let hook_path = tmp.path().join("bad.sh");
@@ -1359,8 +1420,40 @@ mod tests {
             serde_json::json!({"command": "ls"}),
         );
         let result = runner.dispatch(&input).await;
-        // Bad output → fail-open → Continue.
-        assert!(matches!(result.action, HookAction::Continue));
+        assert!(
+            matches!(result.action, HookAction::Error(_)),
+            "unparseable approval-hook output must fail closed, got {:?}",
+            result.action
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dispatch_treats_timeout_as_continue_on_notification_event() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("hang_notify.sh");
+
+        let script = "#!/bin/sh\nsleep 30\n";
+        std::fs::write(&hook_path, script).unwrap();
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
+
+        // Same unconfigured hook, notification event → still fail-open so a
+        // broken logger can't wedge the session.
+        let runner = ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
+        let input = make_tool_input(
+            HookEvent::PostToolCall,
+            "Bash",
+            serde_json::json!({"command": "ls"}),
+        );
+        let result = runner.dispatch(&input).await;
+        assert!(
+            matches!(result.action, HookAction::Continue),
+            "notification-event timeout must stay fail-open, got {:?}",
+            result.action
+        );
     }
 
     #[tokio::test]
@@ -1475,7 +1568,7 @@ mod tests {
     fn hook_output_parses_additional_context() {
         let json = r#"{"action":"continue","additionalContext":"extra info"}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert!(matches!(result.action, HookAction::Continue));
         assert_eq!(result.additional_context.as_deref(), Some("extra info"));
     }
@@ -1484,7 +1577,7 @@ mod tests {
     fn hook_output_parses_updated_input() {
         let json = r#"{"action":"continue","updatedInput":{"command":"ls -la"}}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert_eq!(
             result.updated_input,
             Some(serde_json::json!({"command": "ls -la"}))
@@ -1495,7 +1588,7 @@ mod tests {
     fn hook_output_parses_permission_decision_allow() {
         let json = r#"{"action":"continue","permissionDecision":"allow","permissionDecisionReason":"safe"}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert_eq!(result.permission_decision, Some(PermissionDecision::Allow));
         assert_eq!(result.permission_decision_reason.as_deref(), Some("safe"));
     }
@@ -1504,7 +1597,7 @@ mod tests {
     fn hook_output_parses_permission_decision_deny() {
         let json = r#"{"action":"skip","permissionDecision":"deny"}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
         assert!(matches!(result.action, HookAction::Skip));
     }
@@ -1513,7 +1606,7 @@ mod tests {
     fn hook_output_parses_permission_decision_passthrough() {
         let json = r#"{"action":"continue","permissionDecision":"passthrough"}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert_eq!(
             result.permission_decision,
             Some(PermissionDecision::Passthrough)
@@ -1536,7 +1629,7 @@ mod tests {
     fn hook_output_system_message_included() {
         let json = r#"{"action":"continue","systemMessage":"Please review before proceeding"}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert_eq!(
             result.system_message.as_deref(),
             Some("Please review before proceeding")
@@ -1547,7 +1640,7 @@ mod tests {
     fn hook_output_suppress_output_default_false() {
         let json = r#"{"action":"continue"}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert!(!result.suppress_output);
     }
 
@@ -1555,7 +1648,7 @@ mod tests {
     fn hook_output_suppress_output_true() {
         let json = r#"{"action":"continue","suppressOutput":true}"#;
         let output: HookOutput = serde_json::from_str(json).unwrap();
-        let result = output.into_hook_result();
+        let result = output.into_hook_result(&HookEvent::PreToolCall);
         assert!(result.suppress_output);
     }
 
@@ -1742,7 +1835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_llm_prompt_hook_returns_continue() {
+    async fn no_llm_prompt_hook_fails_closed_on_approval_event() {
         use crate::hooks::config::HooksConfig;
         let json = r#"{"PreToolCall":[{"hooks":[{"type":"prompt","prompt":"Is this safe? $ARGUMENTS"}]}]}"#;
         let cfg: HooksConfig = serde_json::from_str(json).unwrap();
@@ -1752,8 +1845,12 @@ mod tests {
 
         let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
         let result = runner.dispatch(&input).await;
-        // Should fail-open because no LLM is configured.
-        assert!(matches!(result.action, HookAction::Continue));
+        // A prompt hook that cannot run is a broken approval hook.
+        assert!(
+            matches!(result.action, HookAction::Error(_)),
+            "prompt hook without an LLM must fail closed on PreToolCall, got {:?}",
+            result.action
+        );
     }
 
     // ── Goal 206 tests ─────────────────────────────────────────────
@@ -2041,7 +2138,7 @@ mod tests {
                         r#type: HookCommandType::Command,
                         command: Some(hook_path.to_string_lossy().to_string()),
                         timeout: 1,
-                        fail_mode: HookFailMode::Open,
+                        fail_mode: Some(HookFailMode::Open),
                         ..Default::default()
                     }],
                 }],
@@ -2085,7 +2182,7 @@ mod tests {
                         r#type: HookCommandType::Command,
                         command: Some(hook_path.to_string_lossy().to_string()),
                         timeout: 1,
-                        fail_mode: HookFailMode::Closed,
+                        fail_mode: Some(HookFailMode::Closed),
                         ..Default::default()
                     }],
                 }],
@@ -2129,7 +2226,7 @@ mod tests {
                         r#type: HookCommandType::Command,
                         command: Some(hook_path.to_string_lossy().to_string()),
                         timeout: 5,
-                        fail_mode: HookFailMode::Closed,
+                        fail_mode: Some(HookFailMode::Closed),
                         ..Default::default()
                     }],
                 }],
@@ -2173,7 +2270,7 @@ mod tests {
                         r#type: HookCommandType::Command,
                         command: Some(hook_path.to_string_lossy().to_string()),
                         timeout: 1,
-                        fail_mode: HookFailMode::Closed,
+                        fail_mode: Some(HookFailMode::Closed),
                         ..Default::default()
                     }],
                 }],
@@ -2190,6 +2287,117 @@ mod tests {
         assert!(
             matches!(result.action, HookAction::Continue),
             "Closed PostToolCall timeout should return Continue, got {:?}",
+            result.action
+        );
+    }
+
+    // ── #154: approval hooks fail closed ───────────────────────────
+
+    #[test]
+    fn default_fail_mode_is_closed_for_approval_events_only() {
+        assert_eq!(
+            HookEvent::PermissionRequest.default_fail_mode(),
+            HookFailMode::Closed
+        );
+        assert_eq!(
+            HookEvent::PreToolCall.default_fail_mode(),
+            HookFailMode::Closed
+        );
+        for event in [
+            HookEvent::PostToolCall,
+            HookEvent::SessionStart,
+            HookEvent::SessionEnd,
+            HookEvent::UserPromptSubmit,
+            HookEvent::Stop,
+            HookEvent::Notification,
+        ] {
+            assert_eq!(
+                event.default_fail_mode(),
+                HookFailMode::Open,
+                "{event:?} must keep the fail-open default"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_event_missing_action_does_not_continue() {
+        let out: HookOutput = serde_json::from_str(r#"{"permissionDecision":"deny"}"#).unwrap();
+        let result = out.into_hook_result(&HookEvent::PermissionRequest);
+        assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
+        assert!(
+            matches!(result.action, HookAction::Error(_)),
+            "a decision-only approval hook must not resolve to Continue, got {:?}",
+            result.action
+        );
+    }
+
+    #[test]
+    fn approval_event_empty_output_does_not_continue() {
+        let out: HookOutput = serde_json::from_str("{}").unwrap();
+        let result = out.into_hook_result(&HookEvent::PreToolCall);
+        assert!(matches!(result.action, HookAction::Error(_)));
+        assert!(result.permission_decision.is_none());
+    }
+
+    #[test]
+    fn notification_event_missing_action_continues() {
+        let out: HookOutput = serde_json::from_str("{}").unwrap();
+        let result = out.into_hook_result(&HookEvent::PostToolCall);
+        assert!(matches!(result.action, HookAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_permission_decision_even_when_action_continues() {
+        use crate::hooks::config::{HookCommand, HookCommandType, HookMatcher, HooksConfig};
+        let cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PermissionRequest".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![
+                        HookCommand {
+                            r#type: HookCommandType::Command,
+                            command: Some("/bin/true".to_string()),
+                            timeout: 5,
+                            ..Default::default()
+                        },
+                        HookCommand {
+                            r#type: HookCommandType::Command,
+                            command: Some("/bin/true".to_string()),
+                            timeout: 5,
+                            ..Default::default()
+                        },
+                    ],
+                }],
+            )]),
+        };
+        let deciding = HookResult {
+            action: HookAction::Continue,
+            permission_decision: Some(PermissionDecision::Deny),
+            ..Default::default()
+        };
+        let second = HookResult {
+            action: HookAction::Skip,
+            ..Default::default()
+        };
+        let runner = ExternalHookRunner::from_config(cfg)
+            .with_mock_results(vec![Some(deciding), Some(second)]);
+        let input = HookInput {
+            event: HookEvent::PermissionRequest,
+            tool_name: Some("Bash".to_string()),
+            args: Some(serde_json::json!({"command": "rm -rf /"})),
+            mode: "default".to_string(),
+            content: None,
+            message: None,
+            depth: None,
+            reason: None,
+            error: None,
+        };
+        let result = runner.dispatch(&input).await;
+        assert_eq!(result.permission_decision, Some(PermissionDecision::Deny));
+        assert!(
+            matches!(result.action, HookAction::Continue),
+            "the deciding hook's result must be returned verbatim, got {:?}",
             result.action
         );
     }
