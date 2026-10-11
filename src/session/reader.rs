@@ -189,29 +189,27 @@ impl SessionReader {
     /// tool-call/tool-result chain (invariant #8).
     ///
     /// An empty `answers` is exactly [`Self::load_messages`].
+    ///
+    /// Issue #168 review: the splice index is computed by
+    /// [`crate::session::splice_orphan_results`] **on the filtered message
+    /// vector** — the same vector it splices into. An earlier revision of this
+    /// fix filtered the messages but kept the insert index from the raw
+    /// `TranscriptEntry` list, which panicked
+    /// (`range end index 5 out of range for slice of length 4`) on a legacy
+    /// transcript that carried an empty assistant row plus an orphan tool
+    /// call, and would otherwise have placed the synthetic result after later
+    /// turns (breaking invariant #8) even when the indices happened to fit.
     pub fn load_messages_with_orphan_results(
         session_dir: &Path,
         answers: &[(String, String)],
     ) -> std::io::Result<Vec<crate::message::Message>> {
         let entries = Self::load_transcript(session_dir)?;
-        if answers.is_empty() {
-            return Ok(entries
-                .into_iter()
-                .map(entry_to_message)
-                .filter(|m| !crate::message::is_empty_assistant(m))
-                .collect());
-        }
-        let insert_at = orphan_result_insert_at(&entries);
-        let mut messages: Vec<crate::message::Message> = entries
+        let messages: Vec<crate::message::Message> = entries
             .into_iter()
             .map(entry_to_message)
             .filter(|m| !crate::message::is_empty_assistant(m))
             .collect();
-        let synthetic = answers
-            .iter()
-            .map(|(id, content)| crate::message::Message::tool_result(id.clone(), content.clone()));
-        messages.splice(insert_at..insert_at, synthetic);
-        Ok(messages)
+        Ok(super::orphan::splice_orphan_results(messages, answers))
     }
 
     /// Goal-153: scan the transcript for "orphan" tool calls — tool_calls
@@ -413,28 +411,6 @@ impl SessionReader {
     }
 }
 
-/// Index into a transcript's entry list where results for its unanswered
-/// tool calls belong: right after the last `tool` result that follows the
-/// issuing assistant message, so the call/result chain stays contiguous.
-///
-/// Falls back to the end of the transcript when it holds no assistant
-/// message with tool calls (nothing to pair against).
-fn orphan_result_insert_at(entries: &[TranscriptEntry]) -> usize {
-    let Some(asst_idx) = entries
-        .iter()
-        .rposition(|e| e.role == "assistant" && !e.tool_calls.is_empty())
-    else {
-        return entries.len();
-    };
-    match entries[asst_idx + 1..]
-        .iter()
-        .rposition(|e| e.role == "tool")
-    {
-        Some(offset) => asst_idx + 2 + offset,
-        None => asst_idx + 1,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +505,44 @@ mod tests {
         assert!(!entries[0].timestamp.is_empty());
     }
 
+    /// Invariant #8 checker for the splice tests: every `Role::Tool` message
+    /// must be preceded by an assistant whose `tool_calls` contains its id,
+    /// and every tool call in that assistant must be answered.
+    fn assert_pairing(messages: &[crate::message::Message]) {
+        for (i, m) in messages.iter().enumerate() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            let id = m
+                .tool_call_id
+                .as_deref()
+                .unwrap_or_else(|| panic!("message [{i}] is Tool without tool_call_id"));
+            let parent = messages[..i]
+                .iter()
+                .rev()
+                .find(|p| p.role == Role::Assistant)
+                .unwrap_or_else(|| panic!("message [{i}] Tool({id}) has no preceding assistant"));
+            assert!(
+                parent.tool_calls.iter().any(|tc| tc.id == id),
+                "message [{i}] Tool({id}) is not paired with its assistant: {messages:?}",
+            );
+        }
+        for (i, m) in messages.iter().enumerate() {
+            if m.role != Role::Assistant {
+                continue;
+            }
+            for tc in &m.tool_calls {
+                assert!(
+                    messages[i + 1..].iter().any(|r| {
+                        r.role == Role::Tool && r.tool_call_id.as_deref() == Some(tc.id.as_str())
+                    }),
+                    "assistant [{i}] tool_call {} is left unanswered: {messages:?}",
+                    tc.id,
+                );
+            }
+        }
+    }
+
     #[test]
     fn legacy_empty_assistant_is_filtered_on_load() {
         // Issue #168 (spec test `legacy_empty_assistant_is_filtered_on_load`):
@@ -592,8 +606,194 @@ mod tests {
         assert_eq!(msgs[2].role, Role::Tool, "tool result must survive (#8)");
 
         // The resume seed with orphan answers goes through the same filter.
-        let spliced = SessionReader::load_messages_with_orphan_results(&session_dir, &[]).unwrap();
-        assert_eq!(spliced.len(), 3);
+        // NOTE: this MUST pass a non-empty `answers` slice to reach the splice
+        // branch — an empty one takes the early return above and would leave
+        // the insertion-index arithmetic untested (that is exactly how the
+        // index-on-unfiltered-entries regression got through).
+        let reopened = SessionReader::load_messages_with_orphan_results(&session_dir, &[]).unwrap();
+        assert_eq!(reopened.len(), 3);
+
+        let spliced = SessionReader::load_messages_with_orphan_results(
+            &session_dir,
+            &[("call_1".to_string(), "repaired".to_string())],
+        )
+        .unwrap();
+        assert!(
+            spliced
+                .iter()
+                .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1")),
+            "the synthetic tool result must be spliced in: {spliced:?}",
+        );
+        assert_pairing(&spliced);
+    }
+
+    /// Issue #168 review regression — the reviewer's falsifier, verbatim shape.
+    ///
+    /// `load_messages_with_orphan_results` computed the splice index on the
+    /// **unfiltered** `entries` but spliced into the **filtered** `messages`,
+    /// so a legacy transcript carrying an empty assistant row plus a trailing
+    /// orphan tool call panicked with
+    /// `range end index 5 out of range for slice of length 4`. That is the
+    /// real `recursive resume --orphans=skip|redo` path
+    /// (`crates/recursive-cli/src/cli/resume.rs`), and the empty `answers`
+    /// test above never reached it.
+    ///
+    /// Also pins *position*: the synthetic result must land immediately after
+    /// the last real tool result (or immediately after the issuing assistant
+    /// when there is none), never after later user/assistant turns — otherwise
+    /// invariant #8 is broken even without a panic.
+    #[test]
+    fn legacy_empty_assistant_plus_orphan_tool_call_splices_at_the_filtered_index() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut writer = SessionWriter::create(ws, "g168 splice", "model", "anthropic").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+
+        writer
+            .append(&Message::user("hello".to_string()), None, None)
+            .unwrap();
+        writer
+            .append(&Message::assistant("".to_string()), None, None)
+            .unwrap();
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "".to_string(),
+                    vec![crate::llm::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: serde_json::json!({"path": "x"}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+        drop(writer);
+
+        // JSONL has 3 rows (user, empty assistant, assistant+tool_call); the
+        // filtered message seed has 2. The insert index must be computed on
+        // the latter.
+        assert_eq!(
+            SessionReader::load_transcript(&session_dir).unwrap().len(),
+            3
+        );
+        let messages = SessionReader::load_messages(&session_dir).unwrap();
+        assert_eq!(messages.len(), 2, "empty assistant filtered: {messages:?}");
+
+        let spliced = SessionReader::load_messages_with_orphan_results(
+            &session_dir,
+            &[(
+                "call_1".to_string(),
+                "[interrupted: no result recorded]".to_string(),
+            )],
+        )
+        .expect("must not panic and must not index past the filtered vector");
+
+        assert_eq!(
+            spliced.len(),
+            3,
+            "user + assistant(tool_call) + synthetic tool result: {spliced:?}",
+        );
+        assert_eq!(spliced[0].role, Role::User);
+        assert_eq!(spliced[1].role, Role::Assistant);
+        assert_eq!(spliced[1].tool_calls.len(), 1);
+        assert_eq!(
+            spliced[2].role,
+            Role::Tool,
+            "the synthetic result must sit directly after its issuing assistant, \
+             not after a later turn: {spliced:?}",
+        );
+        assert_eq!(spliced[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_pairing(&spliced);
+    }
+
+    /// Issue #168 review — the *position* half of the splice fix, where the
+    /// buggy index happens to fit and therefore does **not** panic.
+    ///
+    /// Transcript: `user, <empty assistant>, assistant(tool_call), tool,
+    /// user`. Filtering drops one row, so the raw-entry index (4) is still
+    /// within the filtered vector (len 4) and `splice(4..4)` silently appends
+    /// the synthetic result *after the trailing user turn* — invariant #8
+    /// broken with no panic to show for it. The answer must land at index 3,
+    /// immediately after the existing result batch.
+    #[test]
+    fn legacy_empty_assistant_plus_orphan_answer_lands_before_later_turns() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut writer = SessionWriter::create(ws, "g168 position", "model", "anthropic").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+
+        writer
+            .append(&Message::user("hello".to_string()), None, None)
+            .unwrap();
+        writer
+            .append(&Message::assistant("".to_string()), None, None)
+            .unwrap();
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "".to_string(),
+                    vec![crate::llm::ToolCall {
+                        id: "call_1".to_string(),
+                        name: "Read".to_string(),
+                        arguments: serde_json::json!({"path": "x"}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(
+                &Message::tool_result("call_1".to_string(), "old output".to_string()),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(&Message::user("next question".to_string()), None, None)
+            .unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+        drop(writer);
+
+        assert_eq!(
+            SessionReader::load_transcript(&session_dir).unwrap().len(),
+            5,
+            "5 raw rows, one of which is filtered",
+        );
+        let messages = SessionReader::load_messages(&session_dir).unwrap();
+        assert_eq!(messages.len(), 4, "filtered seed: {messages:?}");
+
+        let spliced = SessionReader::load_messages_with_orphan_results(
+            &session_dir,
+            &[("call_1".to_string(), "repaired".to_string())],
+        )
+        .expect("must not panic");
+
+        assert_eq!(
+            spliced.len(),
+            5,
+            "one synthetic result is added: {spliced:?}",
+        );
+        assert_eq!(spliced[0].role, Role::User);
+        assert_eq!(spliced[1].role, Role::Assistant);
+        assert_eq!(spliced[2].role, Role::Tool);
+        assert_eq!(spliced[2].content, "old output");
+        assert_eq!(
+            spliced[3].role,
+            Role::Tool,
+            "the answer must join the result batch before the later user turn: {spliced:?}",
+        );
+        assert_eq!(spliced[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(spliced[3].content, "repaired");
+        assert_eq!(
+            spliced[4].role,
+            Role::User,
+            "the later user turn must stay last: {spliced:?}",
+        );
+        assert_pairing(&spliced);
     }
 
     #[test]
@@ -1113,58 +1313,5 @@ mod tests {
         .unwrap();
         assert_eq!(spliced.len(), 3);
         assert_eq!(spliced[2].tool_call_id.as_deref(), Some("tc-1"));
-    }
-
-    #[test]
-    fn orphan_result_insert_at_pins_the_only_assistant_call() {
-        // Pins the index arithmetic: `asst_idx + 1` when no result exists,
-        // `asst_idx + 2 + offset` when one does (offset is relative to
-        // `asst_idx + 1`, so the `+ 1` must not be forgotten).
-        let entry = |role: &str, tools: bool| {
-            let mut e = TranscriptEntry {
-                uuid: String::new(),
-                parent_uuid: None,
-                source_tool_assistant_uuid: None,
-                id: "id".into(),
-                parent_id: None,
-                role: role.into(),
-                content: String::new(),
-                tool_calls: vec![],
-                tool_call_id: None,
-                reasoning_content: None,
-                usage: None,
-                timestamp: String::new(),
-                audit: None,
-                step: None,
-            };
-            if tools {
-                e.tool_calls = vec![crate::llm::ToolCall {
-                    id: "tc".into(),
-                    name: "Read".into(),
-                    arguments: serde_json::json!({}),
-                }];
-            }
-            e
-        };
-
-        let no_result = vec![entry("user", false), entry("assistant", true)];
-        assert_eq!(orphan_result_insert_at(&no_result), 2);
-
-        let one_result = vec![
-            entry("user", false),
-            entry("assistant", true),
-            entry("tool", false),
-        ];
-        assert_eq!(orphan_result_insert_at(&one_result), 3);
-
-        let unrelated_tail = vec![
-            entry("assistant", true),
-            entry("tool", false),
-            entry("user", false),
-        ];
-        assert_eq!(orphan_result_insert_at(&unrelated_tail), 2);
-
-        let none = vec![entry("user", false)];
-        assert_eq!(orphan_result_insert_at(&none), 1);
     }
 }

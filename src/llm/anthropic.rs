@@ -1312,8 +1312,15 @@ fn serialize_messages_anthropic(messages: &[Message]) -> Vec<Value> {
             // session. Belt-and-braces alongside
             // `SessionReader::load_messages` + `finish_interrupted`. Scoped to
             // the empty shape only: an assistant carrying tool_use blocks has
-            // its own arm above and invariant #8's pairing is untouched.
-            if !crate::message::is_empty_assistant(m) {
+            // its own arm above and invariant #8's pairing is untouched. The
+            // drop is logged — a request silently rewritten is undiagnosable.
+            if crate::message::is_empty_assistant(m) {
+                tracing::warn!(
+                    target: "recursive::llm",
+                    provider = "anthropic",
+                    "dropping empty assistant message from request (issue #168)"
+                );
+            } else {
                 out.push(serialize_message(m));
             }
             i += 1;
@@ -3409,11 +3416,13 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn serializer_skips_empty_assistant() {
         // Issue #168 (spec test `serializer_skips_empty_assistant`): a
         // persisted `{role: "assistant", content: ""}` message (no tool_calls)
         // must never reach the Anthropic wire — an empty text block is a hard
-        // 400 ("text content blocks must be non-empty"). It must be dropped.
+        // 400 ("text content blocks must be non-empty"). It must be dropped,
+        // and the drop logged, so a rewritten request is diagnosable.
         let msgs = vec![
             Message::user("hello".to_string()),
             Message::assistant("".to_string()),
@@ -3441,6 +3450,10 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
             }),
             "no empty text block may be emitted: {}",
             body["messages"],
+        );
+        assert!(
+            logs_contain("dropping empty assistant message from request"),
+            "the silent rewrite must be visible in the logs",
         );
     }
 

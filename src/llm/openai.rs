@@ -1207,9 +1207,10 @@ fn build_request(
         // blocks must be non-empty"). Drop it on the way out (belt-and-braces
         // alongside `SessionReader::load_messages` + `finish_interrupted`)
         // instead of letting a poisoned transcript kill every later turn.
+        // `is_droppable_empty_assistant` makes the silent rewrite visible in logs.
         "messages": messages
             .iter()
-            .filter(|m| !crate::message::is_empty_assistant(m))
+            .filter(|m| !is_droppable_empty_assistant(m))
             .map(serialize_message)
             .collect::<Vec<_>>(),
     });
@@ -1242,6 +1243,22 @@ fn build_request(
         req["reasoning_split"] = Value::Bool(true);
     }
     req
+}
+
+/// `true` when `m` is the issue-#168 poisoned shape (`assistant`, empty
+/// content, no tool calls) — in which case the caller drops it from the
+/// request. The drop is logged: a request silently rewritten is
+/// undiagnosable from the wire capture alone.
+fn is_droppable_empty_assistant(m: &Message) -> bool {
+    let empty = crate::message::is_empty_assistant(m);
+    if empty {
+        tracing::warn!(
+            target: "recursive::llm",
+            provider = "openai",
+            "dropping empty assistant message from request (issue #168)"
+        );
+    }
+    empty
 }
 
 /// MiniMax OpenAI-compatible models that honour `reasoning_split`.
@@ -3165,13 +3182,15 @@ data: [DONE]
     }
 
     #[test]
+    #[tracing_test::traced_test]
     fn serializer_skips_empty_assistant() {
         // Issue #168 (spec test `serializer_skips_empty_assistant`): a
         // persisted `{role: "assistant", content: ""}` message (no
         // tool_calls) must never reach the OpenAI-compatible wire — a strict
         // OpenAI→Anthropic gateway materialises it as an empty text block and
         // rejects the whole request with 400. It must be dropped, not turned
-        // into `content: ""` or `content: null`.
+        // into `content: ""` or `content: null`. The drop is logged, so a
+        // rewritten request is diagnosable.
         let msgs = vec![
             Message::user("hello".to_string()),
             Message::assistant("".to_string()),
@@ -3190,6 +3209,10 @@ data: [DONE]
                 .is_some_and(|a| a.iter().all(|m| m["role"] != "assistant")),
             "no assistant message may survive when it was empty: {}",
             req["messages"],
+        );
+        assert!(
+            logs_contain("dropping empty assistant message from request"),
+            "the silent rewrite must be visible in the logs",
         );
     }
 
