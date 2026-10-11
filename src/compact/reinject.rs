@@ -19,6 +19,21 @@ use crate::tools::fs::ReadFileState;
 use crate::tools::plan_mode::PlanApprovalGate;
 use crate::tools::todo::{TodoItem, TodoStatus};
 
+/// Truncate `s` to at most `max_bytes` bytes without splitting a char.
+///
+/// `str::floor_char_boundary` is still nightly, so this walks back to the
+/// nearest char boundary by hand. Returns `s` unchanged when it already fits.
+pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Post-compaction re-injector for recently-read files.
 ///
 /// Only emits [`Role::System`] messages — no [`Role::Tool`] messages, so
@@ -76,12 +91,14 @@ impl FileReinjector {
                 continue;
             }
 
-            // Truncate content to per_file_budget tokens (chars / 4).
-            let max_chars = self.per_file_budget * 4;
-            let truncated = if content.len() > max_chars {
+            // Truncate content to per_file_budget tokens. Budget is in
+            // tokens, applied as bytes (≈ 4 bytes/token), so truncate on a
+            // char boundary to avoid splitting a multi-byte char.
+            let max_bytes = self.per_file_budget * 4;
+            let truncated = if content.len() > max_bytes {
                 format!(
                     "{}...\n[... truncated for compaction; use Read on the path for full text]",
-                    &content[..max_chars]
+                    truncate_on_char_boundary(&content, max_bytes)
                 )
             } else {
                 content
@@ -284,12 +301,13 @@ impl SkillReinjector {
             };
             let body = crate::skills::extract_skill_body(&content).to_string();
 
-            // Head-truncate to per_skill_budget * 4 chars.
-            let max_chars = self.per_skill_budget.saturating_mul(4);
-            let body = if body.len() > max_chars {
+            // Head-truncate to per_skill_budget tokens, applied as bytes
+            // (≈ 4 bytes/token) on a char boundary.
+            let max_bytes = self.per_skill_budget.saturating_mul(4);
+            let body = if body.len() > max_bytes {
                 format!(
                     "{}...\n\n[... skill content truncated for compaction; use Read on the skill path if you need the full text]",
-                    &body[..max_chars]
+                    truncate_on_char_boundary(&body, max_bytes)
                 )
             } else {
                 body
@@ -487,6 +505,66 @@ mod tests {
         }
         drop(locked);
         state
+    }
+
+    // ── truncate_on_char_boundary ─────────────────────────────────────────
+
+    #[test]
+    fn truncate_stops_at_char_boundary() {
+        let s = "中".repeat(10); // 30 bytes, 3 bytes/char
+        let out = truncate_on_char_boundary(&s, 5);
+        assert_eq!(out, "中", "5-byte cut must back off to the 3-byte char");
+        assert_eq!(out.len(), 3);
+        assert!(s.starts_with(out));
+    }
+
+    #[test]
+    fn truncate_returns_full_string_when_short() {
+        let s = "中文";
+        assert_eq!(truncate_on_char_boundary(s, 6), s);
+        assert_eq!(truncate_on_char_boundary(s, 100), s);
+        assert_eq!(truncate_on_char_boundary("", 0), "");
+    }
+
+    #[test]
+    fn file_reinjector_survives_cjk_over_budget() {
+        // 7000 CJK chars = 21000 bytes > 20000-byte budget; the cut at 20000
+        // lands mid-char (20000 % 3 != 0), so this panicked before the fix.
+        let content = "中".repeat(7_000);
+        let state = make_state_with(vec![("cjk.md", &content)]);
+        let r = FileReinjector::new(state);
+        let msgs = r.reinject(&[]);
+        assert_eq!(msgs.len(), 1);
+        let out = &msgs[0].content;
+        assert!(out.contains("[... truncated for compaction; use Read on the path for full text]"));
+        // 20000 bytes backs off to 6666 chars = 19998 bytes, all valid UTF-8.
+        assert!(out.starts_with("[post-compact file restore: cjk.md]\n"));
+        assert!(out.contains(&"中".repeat(6_666)));
+        assert_eq!(out.chars().filter(|&c| c == '中').count(), 6_666);
+    }
+
+    #[test]
+    fn skill_reinjector_survives_cjk_over_budget() {
+        let s1 = create_skill_on_disk("cjk-skill", &"中".repeat(7_000));
+        let reinjector = SkillReinjector {
+            token_budget: 50_000,
+            per_skill_budget: 5_000,
+            skills: vec![s1],
+        };
+        let pre_compact = vec![
+            Message::assistant_with_tool_calls(
+                "Loading".to_string(),
+                vec![skill_tool_call("cjk-skill")],
+            ),
+            Message::tool_result("call_1", "CJK body"),
+        ];
+        let msgs = reinjector.reinject(&pre_compact);
+        assert_eq!(msgs.len(), 1);
+        let out = &msgs[0].content;
+        assert!(out.contains(
+            "[... skill content truncated for compaction; use Read on the skill path if you need the full text]"
+        ));
+        assert_eq!(out.chars().filter(|&c| c == '中').count(), 6_666);
     }
 
     // ── reinject_returns_recent_files_as_system_messages ──────────────────
