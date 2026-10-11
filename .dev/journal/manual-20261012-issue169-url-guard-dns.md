@@ -248,10 +248,19 @@ $ (mutated) NO_PROXY='localhost 127.0.0.1' HTTP_PROXY=http://127.0.0.1:1 cargo t
   → FAILED. 0 passed; 2 failed（同样 panic 于 url_guard.rs:496）
 
 # (3) 无代理变量 + NO_PROXY/no_proxy 均未设：直接跑测试二进制 → 通过（不再误红）
-$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-      ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
-  NO_PROXY=<unset> HTTP_PROXY=<unset>
-  test result: ok. 2 passed; 0 failed
+#     先确认这两个变量在测试进程环境里确实不存在（printenv 无输出、退出码 1）：
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+      -u ALL_PROXY -u all_proxy printenv NO_PROXY HTTP_PROXY
+printenv exit=1
+#     再跑（下面是 libtest 的完整真实输出）：
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+      -u ALL_PROXY -u all_proxy ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+
+running 2 tests
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... ok
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3318 filtered out; finished in 0.06s
 
 # (4) 对照：同一干净环境 + 设了 HTTP_PROXY 但无 NO_PROXY → 门大声失败
 $ env -u NO_PROXY -u no_proxy HTTP_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-... connection_time_guard
@@ -280,6 +289,72 @@ cargo fmt --all -- --check                                          → 通过
 文档措辞修正（N2-a）：`docs/architecture/tools/web-tools.md` 的 "Known limitation (proxy)"
 由 "is tracked as a follow-up" 改为 "A fix is a planned follow-up with no issue filed yet"
 ——复核者指出该限制**没有 issue 号**，"tracked" 不成立。
+
+### review 返工 4（第五个 commit）：CIDR 前缀严格解析 + `get_first_env` 类别优先级 + 证据更正
+
+复核者又实测出两条"门与 reqwest 不一致"，加一条文档事实问题：
+
+1. **L1（潜在假绿）**：`cidr_contains` 对前缀做了 `prefix.trim()`，而 hyper-util 用的
+   `ipnet` 解析严格——`NO_PROXY='127.0.0.0/ 8'`、`'127.0.0.1/ 32'`、`'0.0.0.0/ 0'`
+   在门看来"已豁免"，reqwest 实际不豁免。今天不可达（`PIN_HOSTS` 是主机名，IP/CIDR
+   分支要求可解析的 IP 宿主），但 journal 自己写了"将来 pin 改用 IP 字面量时把
+   `127.0.0.1` 加进 `PIN_HOSTS`"——那一刻就是真实假绿。**已去掉 `prefix.trim()`**，
+   新增单测 `no_proxy_covers_rejects_padded_cidr_prefix`。
+2. **L2（误红，fails-safe）**：`HTTP_PROXY=""`（空）+ `http_proxy=<死代理>` +
+   `NO_PROXY=example.com` 时 reqwest **走直连**（hyper-util `get_first_env` 取每个类别里
+   第一个**已设置**的名字，即使值为空；空串解析不出 Uri ⇒ 该类不装代理，也不再看小写），
+   而旧门把 `http_proxy` 当"已配置"→ 无故报红。**新增 `configured_proxies(lookup)`**
+   按类别 `[UPPER, lower]` 取第一个"已设置"者、空值即该类无代理（不再落到小写），门改用它；
+   新增单测 `configured_proxies_mirrors_hyper_util_first_env`。
+3. **证据不实（必修 1）**：上一轮 journal 证据块 (3) 里混进了两行**不是测试输出**的内容
+   （我 shell 包装里 `echo` 出来的"变量未设置"提示被贴进了输出块，测试本身并不打印它）。
+   **已删除**，改为：先用 `printenv NO_PROXY HTTP_PROXY`（无输出、退出码 1）单独证明变量
+   不存在，再贴 libtest 的真实输出（见上文本轮块 (3)）。
+
+证据（本轮）：
+
+```
+# (A) L1：删掉两处 .dns_resolver(guarded_resolver()) + 带空格前缀的 CIDR + 死代理
+$ (mutated) NO_PROXY='127.0.0.0/ 8' HTTP_PROXY=http://127.0.0.1:1 cargo test --lib connection_time_guard
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... FAILED
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... FAILED
+panicked at src/tools/policy_domain/url_guard.rs:493:
+connection_time_guard would pass for the wrong reason: NO_PROXY="127.0.0.0/ 8" does not exempt
+["localhost"], so the request would be sent to the proxy and fail there instead of being refused
+by the connection-time SSRF guard (deleting the guard would stay green). Unset NO_PROXY or add the
+loopback names. Proxy env vars currently set: ["HTTP_PROXY"]
+test result: FAILED. 0 passed; 2 failed
+#（修复前：门把这个带空格前缀当成豁免 → 静默绿）
+
+# (B) L2：空的大写 HTTP_PROXY 遮蔽死的小写 http_proxy → reqwest 直连 → 门不再误红
+$ HTTP_PROXY="" http_proxy=http://127.0.0.1:1 NO_PROXY=example.com cargo test --lib connection_time_guard
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... ok
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... ok
+test result: ok. 2 passed; 0 failed
+
+# (B2) 对照：HTTP_PROXY 未设、只有死的小写 http_proxy → 门仍大声失败
+$ env -u HTTP_PROXY http_proxy=http://127.0.0.1:1 NO_PROXY=example.com cargo test --lib connection_time_guard
+test result: FAILED. 0 passed; 2 failed
+"... NO_PROXY=\"example.com\" does not exempt [\"localhost\"] ... Proxy env vars currently set: [\"http_proxy\"]"
+```
+
+本轮新增/改写的纯逻辑单测：`no_proxy_covers_rejects_padded_cidr_prefix`、
+`configured_proxies_mirrors_hyper_util_first_env`（既有
+`no_proxy_covers_splits_on_comma_only` / `no_proxy_covers_matches_hyper_util_per_host_kind` /
+`loopback_missing_from_no_proxy_is_reported` / `loopback_gate_verdict_matches_reqwest_reality`
+保留）。
+
+返工 4 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 33 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3320 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
 
 ## 提交与 diff stat（真实数字，`git show --numstat`）
 
@@ -326,6 +401,14 @@ review 返工 3 commit（不含本 journal 自身的改动）：
 | `src/tools/policy_domain/url_guard.rs` | 201 | 51 |
 
 `git diff --stat -- src docs`：`2 files changed, 205 insertions(+), 55 deletions(-)`。
+
+review 返工 4 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `src/tools/policy_domain/url_guard.rs` | 103 | 14 |
+
+`git diff --stat -- src docs`：`1 file changed, 103 insertions(+), 14 deletions(-)`。
 
 ## Notes
 
