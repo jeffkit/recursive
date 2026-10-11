@@ -116,13 +116,100 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 3299 filtered ou
   第一个 worker 仍能用 `task_id` 真正驱动一个 turn。
 - `remove_worker_if_current` 是新增的模块级函数（非 `pub`），仍按 invariant #4 在同文件
   加了单元测试 `remove_worker_if_current_checks_task_identity`（空表 no-op / 异 task 不删 / 同 task 删）。
-- 本单**未**改 `send_message` 的 `worker_id` 分支（`src/tools/send_message.rs:298-349`）：
-  该路径按 `worker_id` 直接 `get`，句柄存在但通道已关时返回
-  `Ok("Message queued for worker '<id>', but it has exited and cannot continue.")` —— 措辞易被误读，
-  但已明说无法继续、且兜底走 legacy `WorkerRegistry`（无条目时返回 "not found"），
-  不是「静默不执行却报已投递」，不在 #176 的根因面上。若后续要统一「无活句柄即 Err」，
-  应连这条一起收口（另开小单），避免本单扩大 blast radius。
+- ~~本单未改 `send_message` 的 `worker_id` 分支~~ → **该判定已被 reviewer 推翻并收口**，
+  详见下节「复查返工」。另：legacy `WorkerRegistry` 的「无条目 → Ok(not found)」清单式回复
+  仍按原契约保留（被 `verifier_probe_send_message_by_worker_id_after_exit` 钉住）。
 - 残余不确定性：旧 worker 的 guard 迟到时，若期间 `task_stop` 已把新 worker 也停掉，
   槽位会由新 worker 自己的 guard 清理；A 方案下不存在「槽位属于谁」的歧义，
   因为同一时刻一个 `worker_id` 至多一个活条目。
+
+## 复查返工（review rework · 第二个 commit）
+
+### 1. `worker_id` 分支的「无活 handle」必须返回失败（reviewer 要求，已收口）
+
+原实现该分支在 `tx.send()` 失败（receiver 已 drop）时返回
+`Ok("Message queued for worker '<id>', but it has exited and cannot continue.")`，
+与 `task_id` 分支的 `Err(ToolRejected "…has no live worker…")` 不一致；规格验收项写的是
+「无活句柄 → **返回失败**（不是"已投递"）」。现改为同口径 `Err(ToolRejected)`，措辞含
+`has no live worker … channel is closed … no turn will run`。
+
+**可达性我更正了 reviewer 给的机制**（不是判断题，做了实测探针）：
+
+- 探针（临时文件，已删）测 async block 的 drop 顺序：
+  `PROBE aborted drop order: ["LOCAL", "UPVAR"]`、`PROBE completed drop order: ["LOCAL", "UPVAR"]`
+  —— **body 局部变量先 drop，`async move` 捕获的 upvar 后 drop**。
+- 因此 `WorkerDeregisterGuard`（body 局部）**先于** `rx`（upvar）被 drop：正常退出与
+  「跑到一半被 abort」两条路径上，**表项先被移除、通道后关闭**，所以 reviewer 描述的
+  「rx 已 drop 但 guard 还没拿到表锁」这个窗口在该路径上**不成立**。
+- 但该状态**确实可达**，只是路径不同：`task_stop` 若在 worker **第一次被 poll 之前**落地，
+  body 局部根本不存在（guard 从未构造），而 `rx` 在 future 构造时就已 move 进去、随 future
+  被 drop。探针：`PROBE abort-before-first-poll: guard_ran=false, send_err=true`
+  —— 表项残留 + 通道已关。
+- 该真实窗口被并发的验收者探针独立复现：
+  `VERIFIER immediate-stop: provider_calls=0 slot_present_after_stop=true`
+  （worker 从未被 poll，槽位残留）。故这条 `Err` 收口是**必要**的。
+
+### 2. 顺带收口同函数的 legacy 假成功（同一标准）
+
+`WorkerRegistry::get` 不查 `is_done()`；`ParallelDeregister::drop` 的
+`deregister_sync` 只用 `try_write`（竞争失败即放弃，条目残留待下次 `register` 清扫，见其文档），
+所以「worker 已结束但 done 邮箱还在表里」可达。原实现向该邮箱 `push` 后回
+`Ok("Message delivered to worker '<id>'.")` —— 与 #1 同类假成功，现改为 `Err(ToolRejected)`。
+「无条目 → Ok(not found 清单)」**未动**（既有契约，且被验收者探针钉住）。
+
+### 3. 返工中发现并修复的方案 A 自身缺陷（`src/tools/agent.rs`）
+
+**(a) 死槽位把 worker_id 永久锁死（我自己引入的回归）**：
+规格原文是「拒绝复用一个**仍然存活**的 worker_id」，而首版实现只做 `contains_key`。
+结合上文 1 的真实窗口（`task_stop` 先于首次 poll → 死槽位残留），
+`task_stop` 之后**再也无法复用该 worker_id**（无限期 `already live`）。
+现改为**按存活判定**：`existing.tx.is_closed()` 为真视为死槽位，**驱逐**后继续派发；
+只有存活槽位才 `Err`。既有测试 `second_spawn_with_live_worker_id_is_rejected` 仍绿。
+
+**(b) 派发前置检查存在 TOCTOU（原 #176 覆盖在并发下仍可达）**：
+前置检查发生在 `build_worker_runtime`（async 且慢）**之前**，两个并发同 id 派发可同时通过，
+随后盲目 `insert` 即回到「覆盖登记」。并发的验收者探针实测：
+`VERIFIER RACE: both concurrent spawns succeeded in 2/400 iterations`。
+现改为**检查+插入在同一把锁内**（失败方 `task_registry.forget(&task_id)` 撤销自己刚注册的 task，
+不留下孤儿；此时尚未 spawn，无需 abort）；同一探针随后实测
+`VERIFIER RACE: both concurrent spawns succeeded in 0/2000 iterations`。
+
+**残余（未做，需要时另开）**：`task_stop` 本身仍会留下那个死槽位（`slot_present_after_stop=true`），
+现在只是「可驱逐 / 可复用」而非「立即释放」。要让 `task_stop` 当场清槽，需要把 `WorkerTable`
+接进 `TaskState`/`TaskRegistry`（动 `src/tasks/`），超出本单文件面，故不做。
+
+### 4. 并发事故记录（非本单代码问题）
+
+返工期间，另一个验收者在**同一 worktree** 里把它会话开始时的快照 `cp` 回
+`src/tools/agent.rs`/`src/tools/send_message.rs`，**覆盖了我未提交的返工**（本轮 `send_message.rs`
+的 `worker_id`/done-mailbox 改动与其新增测试、`agent.rs` 的死槽位/原子插入改动）。
+我从自己的快照 `/tmp/issue176/send_message.rs.rework`（sha `6b03d022…`）恢复了
+`send_message.rs`，并逐项复核 `agent.rs`（`is_closed()`/`forget`/`remove_worker_if_current`/
+`task_id` 身份校验均在，验收者探针残留 0 行），随后立即提交以消除未提交窗口。
+验收者本人的残余不确定（01:56:47 之后是否有第三版未被捕获）：我核对恢复后的
+`send_message.rs` sha 与我的快照一致，且下述 5 条新测试全绿，故**无丢失**。
+
+### 5. 返工的门禁与负向对照
+
+新增/改测试：
+- `tools::send_message::tests::send_message_to_dead_worker_by_worker_id_reports_failure`（直接构造死句柄）
+- `tools::send_message::tests::send_message_to_done_legacy_mailbox_reports_failure`
+- `tools::agent::tests::dead_worker_slot_is_evicted_so_worker_id_is_reusable`
+- `tools::agent::tests::worker_id_is_reusable_after_stop_before_first_poll`
+- `tools::agent::tests::concurrent_same_worker_id_spawn_admits_at_most_one`（竞态护栏，命中率实测 ~0.5%/迭代）
+
+负向对照（各自只回退一处，测试保持不动，观察转红后按 sha256 复原）：
+- 回退 `worker_id` 分支为 `Ok("Message queued …")`
+  → `send_message_to_dead_worker_by_worker_id_reports_failure` FAILED
+  （`worker_id with a closed channel must fail, not report queued: "Message queued for worker 'w-dead', but it has exited and cannot continue."`）
+- 回退 legacy `is_done()` 守卫
+  → `send_message_to_done_legacy_mailbox_reports_failure` FAILED
+  （`a done legacy mailbox must not report delivery: "Message delivered to worker 'w-done'."`）
+- 回退死槽位驱逐（改回 `contains_key`）
+  → `dead_worker_slot_is_evicted_so_worker_id_is_reusable`、
+    `worker_id_is_reusable_after_stop_before_first_poll` FAILED（`already live`）
+- 回退原子插入（改回盲目 `insert`）
+  → `concurrent_same_worker_id_spawn_admits_at_most_one` FAILED
+    （`both concurrent spawns registered worker_id 'w1'`）
+
 - 未把 worker 表落盘（#106 范围）；未改 `background:true` 启动语义。无新增依赖。

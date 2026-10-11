@@ -936,23 +936,42 @@ impl AgentTool {
         // sender), its `rx.recv()` returned `None`, and its exit guard
         // removed the *new* worker's entry. The displaced worker also became
         // unreachable for `send_message`/`task_stop`, so failing loudly is
-        // the honest outcome. Checked before the runtime build so a rejected
-        // spawn allocates no runtime, registers no task, and enqueues no
-        // prompt.
-        if self
-            .workers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(worker_id)
+        // the honest outcome.
+        //
+        // Only a *live* key conflicts (the spec's wording: 拒绝复用一个仍然存活
+        // 的 worker_id). A slot whose receiver is already gone is a dead
+        // worker: `task_stop` can abort a worker before its first poll, in
+        // which case `WorkerDeregisterGuard` (a body local of the spawned
+        // task) is never constructed and the slot leaks with a closed channel.
+        // Treating that stale slot as a conflict would lock the worker_id out
+        // forever — the very thing `task_stop` promises to free — so dead slots
+        // are evicted here and only live ones are rejected.
+        //
+        // Checked before the runtime build so a rejected spawn allocates no
+        // runtime, registers no task, and enqueues no prompt. Because that
+        // build is async and slow, the insert phase re-checks under the lock
+        // (see the `insert` below) so a concurrent spawn cannot slip in.
         {
-            return Err(Error::ToolRejected {
-                name: "agent".into(),
-                reason: format!(
-                    "worker_id '{worker_id}' is already live; choose another worker_id or \
-                     task_stop the running worker first (reusing a live worker_id would \
-                     displace its registration and orphan its turns)"
-                ),
-            });
+            let mut table = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            match table.get(worker_id) {
+                Some(existing) if !existing.tx.is_closed() => {
+                    return Err(Error::ToolRejected {
+                        name: "agent".into(),
+                        reason: format!(
+                            "worker_id '{worker_id}' is already live; choose another worker_id or \
+                             task_stop the running worker first (reusing a live worker_id would \
+                             displace its registration and orphan its turns)"
+                        ),
+                    });
+                }
+                Some(_) => {
+                    // Stale slot: the receiver is gone, so this handle can
+                    // never drive a turn again. Evict it to make the id
+                    // reusable.
+                    table.remove(worker_id);
+                }
+                None => {}
+            }
         }
 
         // Issue #119: mint the task id before building the runtime (the
@@ -989,10 +1008,33 @@ impl AgentTool {
             task_id: task_id.clone(),
             worker_id: worker_id_arc.clone(),
         });
-        self.workers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(worker_id.to_string(), handle.clone());
+        // Issue #176: check-and-insert under one lock. The pre-check above ran
+        // before the (async, slow) runtime build, so a concurrent spawn with
+        // the same worker_id can still slip in between; inserting blindly here
+        // would resurrect the original overwrite bug. On a lost race we forget
+        // our just-registered task and report the conflict — nothing has been
+        // spawned yet, so there is nothing to abort. The lock scope ends here
+        // because the guard is `!Send` and the cleanup below awaits.
+        let inserted = {
+            let mut table = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(table.get(worker_id), Some(existing) if !existing.tx.is_closed()) {
+                false
+            } else {
+                // A stale slot (closed receiver) is replaced: its worker is gone.
+                table.insert(worker_id.to_string(), handle.clone());
+                true
+            }
+        };
+        if !inserted {
+            self.task_registry.forget(&task_id).await;
+            return Err(Error::ToolRejected {
+                name: "agent".into(),
+                reason: format!(
+                    "worker_id '{worker_id}' is already live; choose another worker_id or \
+                     task_stop the running worker first (a concurrent spawn registered it first)"
+                ),
+            });
+        }
 
         // Spawn the long-lived worker task.
         let state_for_task = state.clone();
@@ -2637,6 +2679,199 @@ allowed_tools:
             "the new worker's continuation channel must still accept turns"
         );
         assert_eq!(new_rx.try_recv().as_deref(), Ok("next turn"));
+    }
+
+    /// Issue #176 review rework: a slot whose continuation channel is already
+    /// closed is a *dead* worker, not a live one, so spawn must evict it and
+    /// keep the worker_id reusable. Rejecting it would lock the id out
+    /// permanently after a `task_stop` that lands before the worker's first
+    /// poll (the `WorkerDeregisterGuard` is a body local of the spawned task,
+    /// so it is never constructed on that path and the slot leaks).
+    #[tokio::test]
+    async fn dead_worker_slot_is_evicted_so_worker_id_is_reusable() {
+        let provider = mock_provider(vec![Completion {
+            content: "live again".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let task_registry = Arc::new(TaskRegistry::new());
+        let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
+
+        // A leaked dead slot: handle present, receiver already gone.
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        drop(rx);
+        worker_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "w1".to_string(),
+                Arc::new(WorkerHandle {
+                    tx,
+                    task_id: TaskId("task-dead".to_string()),
+                    worker_id: Arc::new("w1".to_string()),
+                }),
+            );
+
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_task_registry(task_registry.clone())
+            .with_workers(worker_table.clone());
+        let spawned = agent
+            .execute(json!({
+                "mode": "single",
+                "background": true,
+                "manifest": { "w1": { "system_prompt": "You are a helper." } },
+                "prompt": "reuse the id"
+            }))
+            .await;
+        assert!(
+            spawned.is_ok(),
+            "a dead slot must not lock the worker_id out: {spawned:?}"
+        );
+
+        let handle = worker_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("w1")
+            .cloned()
+            .expect("the fresh worker must be registered");
+        assert!(
+            !handle.tx.is_closed(),
+            "the replacement entry must be a live worker"
+        );
+        assert_eq!(
+            task_registry.list().await.len(),
+            1,
+            "only the new worker should be registered"
+        );
+    }
+
+    /// Issue #176 review rework: `task_stop` immediately after a background
+    /// spawn can abort the worker before its first poll. The leaked dead slot
+    /// must not turn into a permanent lockout — the same worker_id has to be
+    /// spawnable again.
+    #[tokio::test]
+    async fn worker_id_is_reusable_after_stop_before_first_poll() {
+        let provider = mock_provider(vec![
+            Completion {
+                content: "t1".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "t2".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let task_registry = Arc::new(TaskRegistry::new());
+        let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_task_registry(task_registry.clone())
+            .with_workers(worker_table.clone());
+        let spawn_args = |prompt: &str| {
+            json!({
+                "mode": "single",
+                "background": true,
+                "manifest": { "w1": { "system_prompt": "You are a helper." } },
+                "prompt": prompt
+            })
+        };
+
+        let first = agent.execute(spawn_args("first worker")).await.unwrap();
+        let first_task = first
+            .split("task '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("task id in spawn result")
+            .to_string();
+
+        // No yield first: the abort may land before the worker is polled, in
+        // which case no deregister guard ever exists and the slot is left with
+        // a closed channel.
+        assert!(
+            task_registry.stop(&TaskId(first_task)).await,
+            "task_stop must abort the worker"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let second = agent.execute(spawn_args("second worker")).await;
+        assert!(
+            second.is_ok(),
+            "worker_id must stay reusable after an immediate task_stop: {second:?}"
+        );
+    }
+
+    /// Issue #176 review rework: the spawn pre-check alone is TOCTOU — it runs
+    /// before the (async, slow) `build_worker_runtime`, so two concurrent
+    /// spawns on the same worker_id could both pass it and the second insert
+    /// would overwrite the first (the original bug; measured at 2/400
+    /// iterations before the insert-phase re-check). Check-and-insert now
+    /// happens under one lock, so at most one of the two may succeed.
+    ///
+    /// This is a race guard, not a proof: it is deterministic in the passing
+    /// direction, and it reproduced the overwrite roughly 0.5% of iterations
+    /// before the fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_worker_id_spawn_admits_at_most_one() {
+        fn race_completion(text: &str) -> Completion {
+            Completion {
+                content: text.to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            }
+        }
+
+        let iters = 400usize;
+        for i in 0..iters {
+            let provider = mock_provider(vec![race_completion("a"), race_completion("b")]);
+            let tmp = tempfile::tempdir().unwrap();
+            let all_tools = full_tool_registry(tmp.path());
+            let task_registry = Arc::new(TaskRegistry::new());
+            let worker_table: WorkerTable = Arc::new(Mutex::new(HashMap::new()));
+            let agent = Arc::new(
+                AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+                    .with_task_registry(task_registry.clone())
+                    .with_workers(worker_table.clone()),
+            );
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let spawn_from = |prompt: &'static str,
+                              agent: Arc<AgentTool>,
+                              barrier: Arc<tokio::sync::Barrier>| {
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    agent
+                        .execute(json!({
+                            "mode": "single",
+                            "background": true,
+                            "manifest": { "w1": { "system_prompt": "You are a helper." } },
+                            "prompt": prompt
+                        }))
+                        .await
+                        .is_ok()
+                })
+            };
+            let ha = spawn_from("race A", agent.clone(), barrier.clone());
+            let hb = spawn_from("race B", agent.clone(), barrier.clone());
+            barrier.wait().await;
+            let ra = ha.await.unwrap();
+            let rb = hb.await.unwrap();
+            assert!(
+                !(ra && rb),
+                "iteration {i}: both concurrent spawns registered worker_id 'w1'"
+            );
+        }
     }
 
     /// Issue #176: `remove_worker_if_current` is the identity-checked
