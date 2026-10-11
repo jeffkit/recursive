@@ -79,6 +79,87 @@ fn resolve_within_rejects_symlink_escape() {
     );
 }
 
+/// `resolve_within` must reject a *new* file reached through a symlinked
+/// parent directory. The link itself is inside the root; following it lands
+/// outside. Before the ancestor fix only the already-existing file was caught.
+#[cfg(unix)]
+#[test]
+fn resolve_within_rejects_new_file_through_symlinked_parent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("docs")).unwrap();
+
+    let result = recursive::tools::resolve_within(tmp.path(), "docs/new.txt");
+    assert!(
+        result.is_err(),
+        "a new file under a symlinked parent must be rejected; got {:?}",
+        result
+    );
+}
+
+/// The same link, but the target file already exists — this case was already
+/// rejected and must stay that way.
+#[cfg(unix)]
+#[test]
+fn resolve_within_rejects_existing_file_through_symlinked_parent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("exists.txt"), "outside").unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("docs")).unwrap();
+
+    let result = recursive::tools::resolve_within(tmp.path(), "docs/exists.txt");
+    assert!(
+        result.is_err(),
+        "an existing file under a symlinked parent must be rejected; got {:?}",
+        result
+    );
+}
+
+/// A *dangling* symlink as the final component must be rejected: the link is
+/// a directory entry, its target is not. `exists()` is blind to this (it
+/// follows the link), so a write through it would create the target outside.
+#[cfg(unix)]
+#[test]
+fn resolve_within_rejects_dangling_symlink_leaf() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let target = outside.path().join("created_by_agent.txt");
+    std::os::unix::fs::symlink(&target, tmp.path().join("notes")).unwrap();
+    assert!(
+        !target.exists(),
+        "precondition: the link target must be absent"
+    );
+
+    let result = recursive::tools::resolve_within(tmp.path(), "notes");
+    assert!(
+        result.is_err(),
+        "a dangling symlink leaf must be rejected; got {:?}",
+        result
+    );
+}
+
+/// A root that does not exist on disk yet is not an escape: it must resolve to
+/// itself (through any symlinked parent) just like the candidate does, instead
+/// of being rejected as a symlink escape.
+#[cfg(unix)]
+#[test]
+fn resolve_within_allows_uncreated_root_under_symlinked_parent() {
+    let holder = tempfile::TempDir::new().unwrap();
+    let real = holder.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = holder.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let root = link.join("not_created_yet");
+    assert!(!root.exists(), "precondition: the root must not exist");
+
+    let result = recursive::tools::resolve_within(&root, "a.txt");
+    assert!(
+        result.is_ok(),
+        "an un-materialised root must not be rejected; got {:?}",
+        result
+    );
+}
+
 /// `resolve_within` must accept normal relative paths inside the root.
 #[test]
 fn resolve_within_allows_normal_relative_path() {
@@ -178,6 +259,96 @@ async fn writefile_rejects_escape() {
     assert!(
         err.contains("escapes") || err.contains("outside") || err.contains("path"),
         "WriteFile error must mention path violation: {err}"
+    );
+}
+
+/// The `WriteFile` tool must not write through a symlinked parent directory —
+/// neither the file nor any parent directory may appear outside the sandbox.
+#[cfg(unix)]
+#[tokio::test]
+async fn writefile_rejects_symlinked_parent_dir() {
+    use tempfile::tempdir;
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("docs")).unwrap();
+
+    let tool = recursive::tools::WriteFile::new(tmp.path());
+    let args = serde_json::json!({"path": "docs/new.txt", "contents": "escaped"});
+    let result = tool.execute(args).await;
+    assert!(
+        result.is_err(),
+        "WriteFile must reject a symlinked parent dir; got {:?}",
+        result
+    );
+    assert!(
+        !outside.path().join("new.txt").exists(),
+        "no file may be created outside the sandbox"
+    );
+
+    let args = serde_json::json!({"path": "docs/.ssh/newdir/x", "contents": "escaped"});
+    let result = tool.execute(args).await;
+    assert!(
+        result.is_err(),
+        "WriteFile must reject nested creation under a symlinked parent; got {:?}",
+        result
+    );
+    assert!(
+        !outside.path().join(".ssh").exists(),
+        "no directory may be created outside the sandbox"
+    );
+}
+
+/// A dangling symlink *leaf* must not let `Write` create the target outside
+/// the sandbox — `Path::exists` is false for such a link, so this used to slip
+/// past the symlink check and leave a file outside the workspace.
+#[cfg(unix)]
+#[tokio::test]
+async fn writefile_rejects_dangling_symlink_leaf() {
+    use tempfile::tempdir;
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let target = outside.path().join("created_by_agent.txt");
+    std::os::unix::fs::symlink(&target, tmp.path().join("notes")).unwrap();
+
+    let tool = recursive::tools::WriteFile::new(tmp.path());
+    let args = serde_json::json!({"path": "notes", "contents": "escaped"});
+    let result = tool.execute(args).await;
+    assert!(
+        result.is_err(),
+        "Write must reject a dangling symlink leaf; got {:?}",
+        result
+    );
+    assert!(
+        !target.exists(),
+        "no file may be created outside the sandbox"
+    );
+}
+
+/// The same dangling leaf must not let `Edit` write outside the sandbox.
+#[cfg(unix)]
+#[tokio::test]
+async fn edit_rejects_dangling_symlink_leaf() {
+    use tempfile::tempdir;
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let target = outside.path().join("created_by_agent.txt");
+    std::os::unix::fs::symlink(&target, tmp.path().join("notes")).unwrap();
+
+    let tool = recursive::tools::EditTool::new(tmp.path());
+    let args = serde_json::json!({
+        "file_path": "notes",
+        "old_string": "foo",
+        "new_string": "bar"
+    });
+    let result = tool.execute(args).await;
+    assert!(
+        result.is_err(),
+        "Edit must reject a dangling symlink leaf; got {:?}",
+        result
+    );
+    assert!(
+        !target.exists(),
+        "no file may be created outside the sandbox"
     );
 }
 

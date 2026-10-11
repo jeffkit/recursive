@@ -254,13 +254,16 @@ pub fn args_preview_for_permission(arguments: &Value) -> String {
 /// Resolve a possibly-relative path against the workspace root.
 ///
 /// Normalises both the root and candidate to absolute, dot-free form first,
-/// then performs a second check via `canonicalize()` (which follows symlinks)
-/// when the path already exists on disk.  This prevents symlink-based escapes
-/// where a link inside the workspace points to a location outside it.
+/// then resolves the candidate's longest *existing* ancestor and re-checks
+/// containment. This prevents symlink-based escapes where a link inside the
+/// workspace points to a location outside it — including when the path itself
+/// does not exist yet, because the ancestor walk follows those links, and a
+/// link whose target is missing is followed explicitly rather than mistaken
+/// for a component that is about to be created.
 ///
-/// For paths that do not yet exist (e.g. a new file being written), only the
-/// lexical normalisation check is performed — the caller is responsible for
-/// ensuring no symlink is created that would bridge outside the root.
+/// The containment check is done on the resolved form (canonical ancestor plus
+/// the links followed below it), but the returned path keeps the caller's
+/// spelling (see the note at the end of [`resolve_within_any`]).
 pub fn resolve_within(root: &Path, path: &str) -> Result<PathBuf> {
     resolve_within_any(&[(root.to_path_buf(), AccessTier::ReadWrite)], path, false)
 }
@@ -299,6 +302,14 @@ pub fn new_shared_sandbox_roots() -> SharedSandboxRoots {
 /// falls under at least one root. Symlink-aware canonicalisation is applied
 /// per-root exactly as in the single-root case.
 ///
+/// Canonicalisation covers paths that do not exist yet: the longest existing
+/// ancestor is canonicalised and the remaining components re-attached, so a
+/// symlinked *parent* directory cannot smuggle a new file outside the roots.
+/// Symlinks met by that walk are followed even when their target is missing,
+/// so a dangling link as the final component (`notes -> <outside>/f.txt`) is
+/// rejected too. That resolved form is used for the containment check; the
+/// returned path keeps the caller's spelling.
+///
 /// `write` selects the tier check: a path that is only contained by
 /// `ReadOnly` roots is rejected for write operations (`Write` / `Edit` /
 /// `StrReplace`) with a clear error, while remaining readable.
@@ -327,51 +338,58 @@ pub fn resolve_within_any(
     };
     let abs_joined = absolutise(&joined);
 
-    // Lexical containment check against every root (works for paths that
-    // don't exist yet).
-    let mut lexical_matches: Vec<AccessTier> = Vec::new();
-    for (root, tier) in roots {
+    // Cheap lexical check first: rejects obvious `..` / absolute escapes with
+    // a stable error, and is the only check possible when a root does not
+    // exist on disk.
+    let mut lexical_match = false;
+    for (root, _tier) in roots {
         if abs_joined.starts_with(absolutise(root)) {
-            lexical_matches.push(*tier);
+            lexical_match = true;
+            break;
         }
     }
-    if lexical_matches.is_empty() {
+    if !lexical_match {
         return Err(Error::BadToolArgs {
             name: "<fs>".into(),
             message: format!("path `{path}` escapes sandbox roots"),
         });
     }
 
-    // Symlink-aware check: if the path exists, canonicalise it once and
-    // re-check containment against each root. A link that lexically appears
-    // inside a root but canonicalises outside *all* roots is rejected.
-    let tier_matches: Vec<AccessTier> = if abs_joined.exists() {
-        let canonical_joined = abs_joined.canonicalize().map_err(|e| Error::BadToolArgs {
+    // Symlink-aware check: resolve the candidate's longest *existing* ancestor
+    // and re-attach the not-yet-existing tail, following links found on the
+    // way. This is what makes a symlink fatal for a *new* file: whether it is
+    // a parent directory (`docs -> ~`) or the leaf itself (`notes -> ~/f.txt`,
+    // target not created yet), the candidate resolves out of the roots.
+    let resolved =
+        canonicalise_with_existing_ancestor(&abs_joined).map_err(|e| Error::BadToolArgs {
             name: "<fs>".into(),
             message: format!("cannot resolve path `{path}`: {e}"),
         })?;
-        let mut matches = Vec::new();
-        for (root, tier) in roots {
-            let abs_root = absolutise(root);
-            // Roots that don't exist yet fall back to the lexical form; the
-            // candidate's canonical form is then checked against it.
-            let canonical_root = abs_root.canonicalize().unwrap_or(abs_root);
-            if canonical_joined.starts_with(&canonical_root) {
-                matches.push(*tier);
-            }
+
+    // Re-check containment using the resolved form of both sides: a root may
+    // itself be reached through a symlink (`/tmp` → `/private/tmp`, a symlinked
+    // workspace), so comparing a resolved candidate against a lexical root
+    // would falsely reject everything under it. Both sides go through the same
+    // resolver, so a root that does not exist on disk yet (an `--add-dir`
+    // directory created later, a work dir still to be made) degrades to its own
+    // spelling exactly like the candidate does, instead of half-canonical being
+    // compared against fully-canonical.
+    let mut tier_matches: Vec<AccessTier> = Vec::new();
+    for (root, tier) in roots {
+        let abs_root = absolutise(root);
+        let resolved_root = canonicalise_with_existing_ancestor(&abs_root).unwrap_or(abs_root);
+        if resolved.starts_with(&resolved_root) {
+            tier_matches.push(*tier);
         }
-        if matches.is_empty() {
-            return Err(Error::BadToolArgs {
-                name: "<fs>".into(),
-                message: format!(
-                    "path `{path}` resolves via symlink to a location outside all sandbox roots"
-                ),
-            });
-        }
-        matches
-    } else {
-        lexical_matches
-    };
+    }
+    if tier_matches.is_empty() {
+        return Err(Error::BadToolArgs {
+            name: "<fs>".into(),
+            message: format!(
+                "path `{path}` resolves via symlink to a location outside all sandbox roots"
+            ),
+        });
+    }
 
     // Tier gate: writes require at least one matching ReadWrite root.
     if write && !tier_matches.contains(&AccessTier::ReadWrite) {
@@ -382,7 +400,98 @@ pub fn resolve_within_any(
             ),
         });
     }
+
+    // Return the caller-shaped absolute path, not `resolved`: the two differ
+    // whenever a root (or an ancestor below it) is reached through a symlink —
+    // e.g. a `TempDir` under `/var` on macOS canonicalises to `/private/var`.
+    // The resolved form is used for *validation* only; handing it back would
+    // change the path identity seen by the read-state cache, the transport
+    // boundary (paths are tier-relative, so host-side canonicalisation is not
+    // generally right) and the deliverables ledger's workspace-relative
+    // derivation. The checks above guarantee the path *resolves* inside a
+    // root — every symlink in it has been followed, including a dangling link
+    // as the final component — so the caller's spelling cannot name an escape.
     Ok(abs_joined)
+}
+
+/// Bound on symlink chains followed by [`resolve_links`]; mirrors the kernel's
+/// `ELOOP` limit closely enough to reject link cycles instead of looping.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Fully resolve `abs`, including the components that do not exist yet:
+/// canonicalise the longest existing ancestor, re-attach the remaining
+/// components, and follow any symlink found on the way.
+///
+/// `abs` itself may not exist (a file about to be created, or a nested
+/// directory that `create_dir_all` will make), so `canonicalize()` cannot be
+/// called on it directly. Walking up to the first ancestor that *does* exist
+/// still resolves every symlink on the way in — which is the escape we care
+/// about: the OS follows symlinked parent directories when it later creates
+/// the file. See [`resolve_links`] for the dangling-link case.
+fn canonicalise_with_existing_ancestor(abs: &Path) -> std::io::Result<PathBuf> {
+    resolve_links(abs, 0)
+}
+
+/// Implementation of [`canonicalise_with_existing_ancestor`], `followed`
+/// counting the hops already taken.
+///
+/// The "does this component exist" probe is `symlink_metadata`, not
+/// `Path::exists`/`canonicalize`: a symlink is a directory entry of its own
+/// even when its target is missing, and `exists()` follows the link and
+/// reports `false` for a dangling one. Such a link would otherwise be treated
+/// as a component "to be created" and re-attached to the canonical ancestor
+/// unchanged — while the OS, when the file is later opened, follows it and
+/// creates the target wherever it points. Links found by the walk are
+/// therefore followed here, with relative targets rebased on the link's
+/// canonical parent, so `docs -> <outside>` + `docs/new.txt` *and* a dangling
+/// `notes -> <outside>/f.txt` both resolve out of the roots and are rejected.
+fn resolve_links(abs: &Path, followed: usize) -> std::io::Result<PathBuf> {
+    let mut cur = abs.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while std::fs::symlink_metadata(&cur).is_err() {
+        let Some(name) = cur.file_name().map(|n| n.to_os_string()) else {
+            break;
+        };
+        tail.push(name);
+        if !cur.pop() {
+            break;
+        }
+    }
+
+    let is_link = std::fs::symlink_metadata(&cur)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        if followed >= MAX_SYMLINK_HOPS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "too many levels of symbolic links",
+            ));
+        }
+        let target = std::fs::read_link(&cur)?;
+        let base = if target.is_absolute() {
+            PathBuf::new()
+        } else {
+            // Relative targets are resolved against the directory holding the
+            // link — canonicalised, so a `..` inside the target lands where
+            // the kernel would put it.
+            let parent = cur.parent().unwrap_or(Path::new(""));
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf())
+        };
+        let mut next = normalise(&base.join(&target));
+        for part in tail.iter().rev() {
+            next.push(part);
+        }
+        return resolve_links(&next, followed + 1);
+    }
+
+    let mut out = cur.canonicalize()?;
+    for part in tail.iter().rev() {
+        out.push(part);
+    }
+    Ok(out)
 }
 
 /// Turn a path into an absolute, normalised form. Does not touch the disk,
@@ -483,6 +592,182 @@ mod tests {
         let roots = vec![rw(ws.path())];
         // Following the symlink lands outside every root.
         assert!(resolve_within_any(&roots, "trap", false).is_err());
+    }
+
+    /// A symlinked *parent* directory must not let a not-yet-existing file
+    /// through: the link resolves outside every root, so the candidate does.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_blocks_new_file() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("docs")).unwrap();
+        let roots = vec![rw(ws.path())];
+        let err = resolve_within_any(&roots, "docs/new.txt", false).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "symlinked parent must be rejected as a symlink escape: {err}"
+        );
+    }
+
+    /// Same link, target file *exists* — this path was already rejected before
+    /// the ancestor fix; keep it rejected so the fix can't regress it.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_blocks_existing_file() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("exists.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("docs")).unwrap();
+        let roots = vec![rw(ws.path())];
+        assert!(resolve_within_any(&roots, "docs/exists.txt", false).is_err());
+    }
+
+    /// Nested creation through the link must be rejected too — otherwise
+    /// `create_dir_all` would materialise directories outside the sandbox.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_blocks_nested_creation() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("docs")).unwrap();
+        let roots = vec![rw(ws.path())];
+        assert!(resolve_within_any(&roots, "docs/.ssh/newdir/x", true).is_err());
+    }
+
+    /// Ordinary nested paths (parents still to be created) must keep working.
+    #[test]
+    fn legit_nested_path_still_allowed() {
+        let ws = TempDir::new().unwrap();
+        let roots = vec![rw(ws.path())];
+        let got = resolve_within_any(&roots, "sub/dir/new.txt", true).unwrap();
+        assert!(got.is_absolute(), "resolved path must be absolute: {got:?}");
+        assert!(
+            got.ends_with("sub/dir/new.txt"),
+            "resolved path must keep the tail: {got:?}"
+        );
+        // The returned path keeps the caller's spelling (rooted at the
+        // workspace as given), not the canonicalised form.
+        assert_eq!(got, ws.path().join("sub").join("dir").join("new.txt"));
+    }
+
+    /// The root itself may be a symlink (`/tmp` → `/private/tmp`, or a
+    /// `TempDir` under `/var/folders`). Paths inside it must still resolve.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_itself_is_a_symlink() {
+        let real = TempDir::new().unwrap();
+        std::fs::write(real.path().join("exists.txt"), "inside").unwrap();
+        let holder = TempDir::new().unwrap();
+        let link = holder.path().join("ws");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let roots = vec![rw(&link)];
+
+        // Both a new and an existing file must pass — the canonical root used
+        // for the check must not be compared against the link-spelled
+        // candidate (that would reject every write under such a root).
+        let new = resolve_within_any(&roots, "new.txt", true).unwrap();
+        assert!(new.ends_with("new.txt"), "unexpected path: {new:?}");
+        assert_eq!(new.parent().unwrap(), link.as_path());
+
+        let existing = resolve_within_any(&roots, "exists.txt", false).unwrap();
+        assert!(
+            existing.ends_with("exists.txt"),
+            "unexpected path: {existing:?}"
+        );
+        assert!(existing.exists(), "resolution must reach the real file");
+    }
+
+    /// A *dangling* symlink as the final component: the link exists, its
+    /// target does not — so `exists()` is false and the candidate cannot be
+    /// canonicalised. Writing through it would create the target outside, so
+    /// the link itself has to be followed for the containment check.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_leaf_is_rejected() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        // Parent of the target exists, the target itself does not.
+        std::os::unix::fs::symlink(outside.path().join("created.txt"), ws.path().join("notes"))
+            .unwrap();
+        let roots = vec![rw(ws.path())];
+        let err = resolve_within_any(&roots, "notes", true).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "a dangling leaf link must be rejected as a symlink escape: {err}"
+        );
+        assert!(
+            resolve_within_any(&roots, "notes", false).is_err(),
+            "reads through a dangling leaf link must be rejected too"
+        );
+    }
+
+    /// Relative target, rebased on the link's directory: `ws/notes -> ../../x`
+    /// points outside the root and must be rejected even though nothing on the
+    /// target path exists.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_leaf_with_relative_target_is_rejected() {
+        let ws = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("../../escaped.txt", ws.path().join("notes")).unwrap();
+        let roots = vec![rw(ws.path())];
+        assert!(resolve_within_any(&roots, "notes", true).is_err());
+    }
+
+    /// Link chains must be followed, and a cycle must be reported rather than
+    /// looped on.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_leaf_chains_and_cycles() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("target.txt"), ws.path().join("hop2"))
+            .unwrap();
+        std::os::unix::fs::symlink("hop2", ws.path().join("hop1")).unwrap();
+        let roots = vec![rw(ws.path())];
+        assert!(
+            resolve_within_any(&roots, "hop1", true).is_err(),
+            "a chain ending outside the root must be rejected"
+        );
+
+        std::os::unix::fs::symlink("cycle_b", ws.path().join("cycle_a")).unwrap();
+        std::os::unix::fs::symlink("cycle_a", ws.path().join("cycle_b")).unwrap();
+        assert!(
+            resolve_within_any(&roots, "cycle_a", false).is_err(),
+            "a symlink cycle must be rejected, not followed forever"
+        );
+    }
+
+    /// A dangling leaf link that points back *inside* the root is not an
+    /// escape and stays allowed (writing through it creates a file inside).
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_leaf_inside_root_is_allowed() {
+        let ws = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("sub/missing.txt", ws.path().join("notes")).unwrap();
+        let roots = vec![rw(ws.path())];
+        let got = resolve_within_any(&roots, "notes", true).unwrap();
+        assert_eq!(got, ws.path().join("notes"));
+    }
+
+    /// A root that does not exist yet (an `--add-dir` directory created later,
+    /// a work dir still to be made) must not be falsely rejected just because
+    /// its own path runs through a symlinked parent: root and candidate are
+    /// resolved by the same helper, so both keep that spelling.
+    #[cfg(unix)]
+    #[test]
+    fn uncreated_root_under_symlinked_parent_still_matches() {
+        let holder = TempDir::new().unwrap();
+        let real = holder.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let root = link.join("not_created_yet");
+        assert!(!root.exists(), "precondition: the root must not exist");
+        let roots = vec![rw(&root)];
+        let got = resolve_within_any(&roots, "a.txt", true).unwrap();
+        assert_eq!(got, root.join("a.txt"));
     }
 
     #[test]
