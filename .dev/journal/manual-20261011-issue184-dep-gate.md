@@ -252,4 +252,15 @@ keeper 对**六提交形态**（`f35ecf02` + 四条增量链 + `5fdf3e04`）给�
 
 **本单收官**：形态覆盖已穷举（24 例矩阵 24/24）、`[patch.*]` 判为范围外、残余边界按「只记不改」落进脚本注释，**复验侧无待办**。落地由值守/作者执行（`git checkout -b fix/184-dep-gate 6c724056` + 应用 gist 全量补丁或其等价增量链，PR 正文注明来源 gist、本线程复验结论与单引号更正）。三项留作后续议题、不在本单内解决：`crates/*/Cargo.toml`、`Cargo.lock`、journal 侧兜底分支。
 
-**验证**：本节为**纯文档追加**，追加后仍实跑 `bash scripts/check-new-deps.sh eef5f42b^` 确认行为未变（见下）。
+**验证**：本节为**纯文档追加**，追加后仍实跑 `bash scripts/check-new-deps.sh eef5f42b^` 确认行为未变：
+
+```
+$ bash scripts/check-new-deps.sh eef5f42b^
+
+  libc
+
+  + libc justified in manual-20261010-issue150-parent-environ.md
+
+OK: All dependency changes have journal justification.
+exit=0
+```
