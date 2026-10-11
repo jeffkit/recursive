@@ -235,9 +235,14 @@ reader 在 writer 开始前就跑完了。**这个绿是顺序侥幸**，改名 
 `build_runtime(` / `build_tools(` / `Cli::parse_from(` / `cmd_resume(` /
 `run_resumed(` / `prepare_replay_seed(` / `probe_storage(` 等入口且函数体内没有
 `EnvGuard::` 的，逐个判读 env 依赖并补锁（**已知盲区：间接调用，见上**）。
-计数澄清：commit 2（8536e2ba）实际新增 **18** 行 `let _env = EnvGuard::lock();`
-—— builder 6 + resume 9 + main 3；加上 commit 1 的 2 处，两轮合计 **20** 处。
-（此前正文误写「16 处」，是把 resume 的 9 处漏算成 7 处。）
+计数澄清（两种口径，均可 grep 复现）：
+
+- **持锁 reader 测试数：23 个**（最终树 grep：`let _env = EnvGuard::lock();` **22 行**
+  —— builder 6 + resume 12 + main 4；**外加** commit 1 在
+  `build_runtime_construction_smoke` 里用的 1 处 `let mut env = EnvGuard::lock();`）。
+- 按 commit 增量：commit 1 = 2 处；commit 2（8536e2ba）= **18** 行 `let _env`
+  （builder 6 + resume 9 + main 3）；commit 3（e8153ba8）= resume 3 处。
+  （此前正文误写「本轮 16 处」，是把 resume 的 9 处漏算成 7 处。）
 
 ### 静态 grep 不变量（spec 的可选项，本轮补上）
 
@@ -356,12 +361,16 @@ build_runtime must succeed with a valid config: unknown agent preset "no-such-pr
 **盲区教训**：上一轮扫描器只匹配直接的 `build_runtime(` / `build_tools(`，
 漏掉 `tools_for(...)` 这层间接。此后新增 env reader 必须**独立枚举**
 （如 `grep -n "tools_for(" crates/recursive-cli/src/cli/resume.rs`），不能只信扫描器。
-合计：两轮 20 处 + 本轮 3 处 = **23** 处 reader 持锁。
+合计：**23 个持锁 reader 测试**（22 行 `let _env = EnvGuard::lock();` + commit 1 的 1 处 `let mut env`）。
 
 ### 本轮负向对照（3 把新锁确实承重）
 
-今天没有测试会写非 local 的 `RECURSIVE_SANDBOX`（复核者也确认当前值都试不出来），
-所以用**合成 probe** 让它有牙：临时加一个持锁写者，把 `RECURSIVE_SANDBOX` 持续置为
+今天**没有测试会把这 3 个 reader 逼进失败态**——唯一经 env 写非 local 档位的是
+`main.rs:4225` 的 `sandbox_flag_parses_all_tiers_env_and_garbage`，它在持锁下短暂写
+`RECURSIVE_SANDBOX=policy`；本机复核：删掉这 3 把锁后
+`-- redo_orphan sandbox_flag_parses` ×10 **仍 0 red**，因为 `policy` 只构建一个受限
+registry，不会 `exit(2)`。所以**只有合成 probe 能让它们变红**，这也是本轮用 probe
+而不是既有用例做阳性对照的原因：临时加一个持锁写者，把 `RECURSIVE_SANDBOX` 持续置为
 `bogus`（`build_tools` 读到会 `process::exit(2)`），过滤跑
 `-- redo_orphan nc185_sandbox_probe`：
 
@@ -402,9 +411,13 @@ probe 0 处，`-- redo_orphan` 立即回到 `ok. 3 passed`。
   `main()` 产品代码豁免按行号比较，可能被**错误豁免**。现在字符串内换行也保留，
   扫描时加 `assert_eq!(text.lines().count(), code.lines().count())` 防回归，
   并新增多行字符串单测。（第一版 NC 打印出 `cli/resume.rs:1698: )` 才暴露出来。）
-- **仍存在的边界**（不声称完备）：这是纯词法检查——宏体内的 env 变更、或把 guard
-  类型改名/再导出（`use crate::test_env::EnvGuard as G;`）都会绕过；后者会**误报**
-  （fail-closed，不是漏报）。
+- **仍存在的边界**（词法检查，不声称完备；复核者实测以下拼写都能溜过匹配器）：
+  turbofish `std::env::set_var::<&str, &str>(…)`；名字与 `(` 之间换行；
+  `use std::env::set_var as sv; sv(…)`；`set_var (…)`（多空格）；同一行出现
+  `fn set_var()` 会触发整行豁免；字符字面量 `'"'` 会让字符串状态失同步；
+  以 `\` 结尾的裸字符串；在**被豁免文件**里定义宏、再到别处调用。
+  反向地：guard 类型别名/再导出（`use crate::test_env::EnvGuard as G;`）会**误报**
+  ——fail-closed，不是漏报。
 
 ### 建议 2：命令写法
 

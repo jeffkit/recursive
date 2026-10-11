@@ -4209,7 +4209,7 @@ mod tests {
 
     #[test]
     fn hook_timing_flag_accepted() {
-        // Issue #185 (review follow-up): this test reads env-derived state
+        // Issue #185: this test reads env-derived state
         // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
         // so it holds the shared env lock for its whole body.
         let _env = EnvGuard::lock();
@@ -4288,7 +4288,7 @@ mod tests {
 
     #[test]
     fn hook_timing_flag_defaults_to_false() {
-        // Issue #185 (review follow-up): this test reads env-derived state
+        // Issue #185: this test reads env-derived state
         // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
         // so it holds the shared env lock for its whole body.
         let _env = EnvGuard::lock();
@@ -4580,7 +4580,7 @@ mod tests {
 
     #[test]
     fn sessions_and_agents_accept_the_json_and_show_flags() {
-        // Issue #185 (review follow-up): this test reads env-derived state
+        // Issue #185: this test reads env-derived state
         // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
         // so it holds the shared env lock for its whole body.
         let _env = EnvGuard::lock();

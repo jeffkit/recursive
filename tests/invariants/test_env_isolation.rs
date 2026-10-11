@@ -19,10 +19,20 @@
 // catches `std::env::set_var(`, `env::set_var(` after `use std::env;`, and a
 // bare `set_var(` after `use std::env::set_var;`.
 //
-// Known boundary: this is a lexical check, not a resolver. A raw mutation
-// hidden inside a macro body, or a guard type re-exported/aliased under a
-// different name, can still slip through — code review and clippy remain the
-// backstop.
+// Known boundary: this is a lexical check, not a resolver. Review measured
+// these spellings slipping past the matcher — do not rely on it as the only
+// gate:
+//   - turbofish: `std::env::set_var::<&str, &str>(…)`
+//   - a newline between the name and `(`
+//   - `use std::env::set_var as sv; sv(…)`
+//   - `set_var (…)` with a space before the paren
+//   - a same-line `fn set_var()` trips the definition exemption for that line
+//   - a `'"'` char literal desynchronises the string-literal state
+//   - a bare string ending in `\`
+//   - a macro defined in an exempted file and invoked elsewhere
+// Conversely a guard type aliased/re-exported under another name is a false
+// positive (fail-closed, never a silent miss). Code review and clippy remain
+// the backstop.
 //
 // Run with: `cargo test --test invariants`
 
