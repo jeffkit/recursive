@@ -439,37 +439,43 @@ pub(crate) fn guarded_resolver() -> Arc<GuardedResolver> {
 
 // ── Issue #169: environment gate for the wiring pins ───────────────────────
 
+/// The hosts the wiring pins in `web_fetch.rs` / `a2a.rs` actually request; the
+/// gate demands an exemption for each. Keep in sync when a pin changes its URL:
+/// both pins use the *name* `localhost`, and a name is the only kind a
+/// `NO_PROXY=*` entry covers (hyper-util routes IP literals through
+/// `IpMatcher`), so a future IP-literal pin must be added here explicitly and
+/// will then correctly *fail* under `NO_PROXY=*`.
+#[cfg(test)]
+const PIN_HOSTS: [&str; 1] = ["localhost"];
+
 /// Test gate for the wiring pins in `web_fetch.rs` / `a2a.rs`.
 ///
 /// Those pins observe the connection-time guard through the *production*
-/// client, so the loopback request must not be intercepted by an ambient proxy.
-/// reqwest consults `NO_PROXY` first, then `no_proxy`; when the effective list
-/// does not exempt the loopback names, an `HTTP_PROXY` / `HTTPS_PROXY` /
-/// `ALL_PROXY` in the environment turns the pin into a **false green**: the
-/// guarded arm dies at the unreachable proxy, so `expect_err` plus "no hit on
-/// the listener" are satisfied for the wrong reason and deleting the guard
-/// changes nothing. `.cargo/config.toml` provides
+/// client, so the request must not be intercepted by an ambient proxy. When an
+/// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` is set and the effective no-proxy
+/// list does not exempt [`PIN_HOSTS`], the pin becomes a **false green**: the
+/// guarded arm dies at the (often unreachable) proxy, so `expect_err` plus "no
+/// hit on the listener" are satisfied for the wrong reason and deleting the
+/// guard changes nothing. `.cargo/config.toml` provides
 /// `NO_PROXY=127.0.0.1,localhost,::1` for cargo-invoked processes, but it
 /// deliberately does not override a value the developer already exported —
 /// hence this loud gate instead of a quietly weakened pin.
 ///
+/// With no proxy variable set at all, nothing can intercept the request, so the
+/// gate passes even without a no-proxy list (IDE runners and direct
+/// test-binary runs).
+///
 /// # Panics
 ///
-/// When the effective no-proxy list is unset, or does not exempt both
-/// `localhost` and `127.0.0.1`.
+/// When a proxy variable is set and the effective no-proxy list (`NO_PROXY`
+/// first, then `no_proxy`, matching reqwest) is unset or does not exempt a
+/// [`PIN_HOSTS`] entry.
 #[cfg(test)]
 pub(crate) fn assert_loopback_bypasses_proxy() {
-    let proxies: Vec<&str> = [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .into_iter()
-    .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
-    .collect();
+    let proxies: Vec<&str> = OUTBOUND_PROXY_ENV
+        .into_iter()
+        .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+        .collect();
 
     // reqwest's precedence: `NO_PROXY` if set, otherwise `no_proxy`.
     let decisive = std::env::var("NO_PROXY")
@@ -480,44 +486,137 @@ pub(crate) fn assert_loopback_bypasses_proxy() {
                 .map(|value| ("no_proxy", value))
                 .ok()
         });
-    let (name, value) = match decisive {
-        Some(pair) => pair,
-        None => panic!(
+
+    if let Err(message) = loopback_gate_verdict(
+        &proxies,
+        decisive
+            .as_ref()
+            .map(|(name, value)| (*name, value.as_str())),
+    ) {
+        panic!("{message}");
+    }
+}
+
+/// The outgoing-proxy environment variables reqwest documents, both cases.
+#[cfg(test)]
+const OUTBOUND_PROXY_ENV: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// Pure decision core of [`assert_loopback_bypasses_proxy`]: `Ok(())` when the
+/// pins cannot be intercepted, `Err(explanation)` when the environment would
+/// make them vacuous.
+#[cfg(test)]
+fn loopback_gate_verdict(proxies: &[&str], decisive: Option<(&str, &str)>) -> Result<(), String> {
+    if proxies.is_empty() {
+        // No proxy configured ⇒ the request goes direct ⇒ the pins observe the
+        // guard whatever the no-proxy list says. (Not a hole: a request can
+        // only be intercepted when one of these variables is set.)
+        return Ok(());
+    }
+    let Some((name, value)) = decisive else {
+        return Err(format!(
             "connection_time_guard relies on the loopback names being exempted from any ambient \
              proxy, but neither NO_PROXY nor no_proxy is set. Export \
              `NO_PROXY=127.0.0.1,localhost,::1`, or run the suite through cargo (whose \
              .cargo/config.toml provides it). Proxy env vars currently set: {proxies:?}"
-        ),
+        ));
     };
-
-    let missing = loopback_missing_from_no_proxy(&value);
-    assert!(
-        missing.is_empty(),
+    let missing = loopback_missing_from_no_proxy(value);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
         "connection_time_guard would pass for the wrong reason: {name}={value:?} does not exempt \
          {missing:?}, so the request would be sent to the proxy and fail there instead of being \
          refused by the connection-time SSRF guard (deleting the guard would stay green). Unset \
          {name} or add the loopback names. Proxy env vars currently set: {proxies:?}"
-    );
+    ))
 }
 
-/// The loopback names in `value` (a `NO_PROXY`-format list) that are **not**
-/// exempted.
+/// The [`PIN_HOSTS`] entries that `value` (a `NO_PROXY`-format list) does not
+/// exempt.
 #[cfg(test)]
 fn loopback_missing_from_no_proxy(value: &str) -> Vec<&'static str> {
-    ["localhost", "127.0.0.1"]
+    PIN_HOSTS
         .into_iter()
         .filter(|host| !no_proxy_covers(value, host))
         .collect()
 }
 
-/// True when a `NO_PROXY`-format list exempts `host`: comma / whitespace
-/// separated, case-insensitive, one leading `.` and the `*` wildcard tolerated.
+/// True when hyper-util/reqwest would let `host` bypass the proxy for the
+/// `NO_PROXY`-format list `value`.
+///
+/// Faithful to `hyper-util-0.1.20/src/client/proxy/matcher.rs`: entries are
+/// split on **`,` only** and trimmed (so `"a b"` is a single entry that matches
+/// nothing); an entry that parses as an IP address (or CIDR) goes to
+/// `IpMatcher` and can only match an IP host — in particular `*` is a *domain*
+/// entry and does **not** exempt `127.0.0.1`; otherwise the entry is a domain
+/// and matches case-insensitively with `.name` ≡ `name` and `*` ≡ any name.
+///
+/// Not modelled: hyper-util's subdomain/suffix rule (`example.com` also matches
+/// `www.example.com`). It cannot add a match for [`PIN_HOSTS`] (the rule needs a
+/// dot boundary and `localhost` has no dot), and not modelling it errs toward
+/// "not exempted", i.e. toward failing this gate loudly.
 #[cfg(test)]
 fn no_proxy_covers(value: &str, host: &str) -> bool {
-    value
-        .split([',', ';', ' ', '\t', '\n', '\r'])
-        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
-        .any(|entry| entry == "*" || entry == host)
+    let host_ip = host.parse::<IpAddr>().ok();
+    value.split(',').map(str::trim).any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        if let Ok(entry_ip) = entry.parse::<IpAddr>() {
+            // `IpMatcher::Ip::Address`: exact address only.
+            return host_ip == Some(entry_ip);
+        }
+        if entry.contains('/') {
+            // `IpMatcher::Ip::Network`.
+            return host_ip.is_some_and(|ip| cidr_contains(entry, ip));
+        }
+        // `DomainMatcher`: only a name host can match a domain entry.
+        host_ip.is_none()
+            && (entry == "*"
+                || entry.eq_ignore_ascii_case(host)
+                || entry
+                    .strip_prefix('.')
+                    .is_some_and(|bare| bare.eq_ignore_ascii_case(host)))
+    })
+}
+
+/// True when the CIDR entry `entry` contains `ip` (hyper-util's
+/// `IpMatcher::Ip::Network` arm). Unparseable entries contain nothing.
+#[cfg(test)]
+fn cidr_contains(entry: &str, ip: IpAddr) -> bool {
+    let Some((network, prefix)) = entry.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.trim().parse::<u32>() else {
+        return false;
+    };
+    match (network.parse::<IpAddr>(), ip) {
+        (Ok(IpAddr::V4(net)), IpAddr::V4(host)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(net) & mask == u32::from(host) & mask
+        }
+        (Ok(IpAddr::V6(net)), IpAddr::V6(host)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(net) & mask == u128::from(host) & mask
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -881,35 +980,86 @@ mod tests {
         drop(resolver);
     }
 
-    /// The env gate's parser (`no_proxy_covers`): all separator/case shapes the
-    /// pins may meet, plus the near-misses that must stay "not covered".
+    /// The env gate's parser (`no_proxy_covers`) follows hyper-util's list
+    /// format exactly: **`,` is the only separator** (`matcher.rs:448` is
+    /// `no_proxy_list.split(',').map(str::trim)`), so space/semicolon/tab lists
+    /// are one entry that exempts nothing.
     #[test]
-    fn no_proxy_covers_tolerates_separators_case_and_wildcard() {
-        assert!(no_proxy_covers("127.0.0.1,localhost,::1", "localhost"));
-        assert!(no_proxy_covers("127.0.0.1,localhost,::1", "127.0.0.1"));
-        assert!(no_proxy_covers("EXAMPLE.com localhost", "localhost"));
-        assert!(no_proxy_covers("127.0.0.1\tlocalhost", "127.0.0.1"));
-        assert!(no_proxy_covers(".localhost", "localhost"));
-        assert!(no_proxy_covers("*", "127.0.0.1"));
-        assert!(!no_proxy_covers("example.com", "localhost"));
+    fn no_proxy_covers_splits_on_comma_only() {
+        // The four review inputs.
+        assert!(!no_proxy_covers("localhost 127.0.0.1", "localhost"));
+        assert!(!no_proxy_covers("127.0.0.1;localhost", "localhost"));
+        assert!(no_proxy_covers("localhost,127.0.0.1", "localhost"));
+        assert!(no_proxy_covers(" localhost , 127.0.0.1 ", "localhost"));
+        // Other non-separators / near misses stay "not exempted".
+        assert!(!no_proxy_covers("localhost\t127.0.0.1", "localhost"));
         assert!(!no_proxy_covers("", "localhost"));
         assert!(!no_proxy_covers("notlocalhost", "localhost"));
         assert!(!no_proxy_covers("127.0.0.10", "127.0.0.1"));
+        // Empty entries (`,,`) are dropped rather than matching everything.
+        assert!(!no_proxy_covers("example.com,,", "localhost"));
     }
 
-    /// The env gate's decision (`loopback_missing_from_no_proxy`): this is what
-    /// turns "the pin would be vacuous here" into a loud failure.
+    /// Host-kind semantics mirror hyper-util: domain entries (including `*`)
+    /// match names only, IP/CIDR entries match IP literals only.
+    #[test]
+    fn no_proxy_covers_matches_hyper_util_per_host_kind() {
+        // Case-insensitive; one leading dot is equivalent.
+        assert!(no_proxy_covers("LOCALHOST", "localhost"));
+        assert!(no_proxy_covers(".localhost", "localhost"));
+        // `*` is a DomainMatcher entry: exempts the name, never an IP literal.
+        assert!(no_proxy_covers("*", "localhost"));
+        assert!(!no_proxy_covers("*", "127.0.0.1"));
+        // An IP entry matches the literal, not the name.
+        assert!(no_proxy_covers("127.0.0.1", "127.0.0.1"));
+        assert!(!no_proxy_covers("127.0.0.1", "localhost"));
+        // A network entry contains the literal; a mismatched/invalid one does not.
+        assert!(no_proxy_covers("127.0.0.0/8", "127.0.0.1"));
+        assert!(!no_proxy_covers("10.0.0.0/8", "127.0.0.1"));
+        assert!(!no_proxy_covers("127.0.0.0/33", "127.0.0.1"));
+    }
+
+    /// The env gate's decision (`loopback_missing_from_no_proxy`) covers exactly
+    /// the hosts the pins request ([`PIN_HOSTS`]); this is what turns "the pin
+    /// would be vacuous here" into a loud failure.
     #[test]
     fn loopback_missing_from_no_proxy_is_reported() {
         assert!(loopback_missing_from_no_proxy("127.0.0.1,localhost,::1").is_empty());
         assert!(loopback_missing_from_no_proxy("*").is_empty());
         assert_eq!(
             loopback_missing_from_no_proxy("example.com"),
-            vec!["localhost", "127.0.0.1"]
+            vec!["localhost"]
         );
+        // An IP-only exemption does not exempt the *name* the pins use.
         assert_eq!(
             loopback_missing_from_no_proxy("127.0.0.1"),
             vec!["localhost"]
         );
+    }
+
+    /// The gate's pure core: no proxy ⇒ pass (even with no no-proxy list, N2-b);
+    /// proxy + insufficient list ⇒ loud `Err`; proxy + name exempted ⇒ `Ok`.
+    #[test]
+    fn loopback_gate_verdict_matches_reqwest_reality() {
+        let proxy: &[&str] = &["HTTP_PROXY"];
+
+        // Nothing can intercept the request when no proxy variable is set.
+        assert!(loopback_gate_verdict(&[], None).is_ok());
+        assert!(loopback_gate_verdict(&[], Some(("NO_PROXY", "example.com"))).is_ok());
+
+        // A proxy is configured: the pin's host must be exempted.
+        assert!(loopback_gate_verdict(proxy, None).is_err());
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "example.com"))).is_err());
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "localhost 127.0.0.1"))).is_err());
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "127.0.0.1;localhost"))).is_err());
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "127.0.0.1"))).is_err());
+
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "localhost"))).is_ok());
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "localhost,127.0.0.1"))).is_ok());
+        assert!(
+            loopback_gate_verdict(proxy, Some(("NO_PROXY", " localhost , 127.0.0.1 "))).is_ok()
+        );
+        assert!(loopback_gate_verdict(proxy, Some(("NO_PROXY", "*"))).is_ok());
+        assert!(loopback_gate_verdict(proxy, Some(("no_proxy", "localhost"))).is_ok());
     }
 }

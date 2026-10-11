@@ -47,10 +47,10 @@ outbound web and A2A request in that process.
 **Known limitation (proxy).** With `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
 set, reqwest hands the request to the proxy and the **proxy** resolves the target
 name, so layer 2 never runs for that request — an internal target can be reached
-through the proxy. This predates the guard (there was none) and is tracked as a
-follow-up: reject a non-loopback proxy by default, or pre-resolve and vet the
-target name in proxy mode. `NO_PROXY` entries keep the affected hosts on the
-direct path.
+through the proxy. This predates the guard (there was none). A fix is a planned
+follow-up with no issue filed yet: reject a non-loopback proxy by default, or
+pre-resolve and vet the target name in proxy mode. `NO_PROXY` entries keep the
+affected hosts on the direct path.
 
 ## web_search (`WebSearch`)
 
