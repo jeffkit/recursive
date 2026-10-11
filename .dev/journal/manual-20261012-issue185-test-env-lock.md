@@ -209,7 +209,10 @@ reader 在 writer 开始前就跑完了。**这个绿是顺序侥幸**，改名 
 
 1. 上述 2 个 reader 首行加 `let _env = EnvGuard::lock();`
    （anthropic 那条放在 `use tokio::io::AsyncReadExt;` 之后，避免 items-after-statements）。
-2. 用同一把锁把**所有读 env 派生状态的测试**补齐（reviewer 的"建议"逐条处理）：
+2. 用同一把锁补齐**由 `build_runtime(` / `build_tools(` **直接**调用读 env 的测试**
+   （由扫描器枚举，见下表）。**扫描器的已知盲区是「间接调用」**：经
+   `tools_for(...)` → `build_tools(...)` 到达的 3 个 `redo_orphan_*` 未被它枚举出来，
+   是第三轮**独立枚举**发现的（见下面「返工 3」）。下表：
 
 | 位置 | 测试（行号为返工前） | 读什么 | 处置 |
 |---|---|---|---|
@@ -231,8 +234,10 @@ reader 在 writer 开始前就跑完了。**这个绿是顺序侥幸**，改名 
 枚举方法：对每个 `mod tests` 内的函数做静态扫描——命中
 `build_runtime(` / `build_tools(` / `Cli::parse_from(` / `cmd_resume(` /
 `run_resumed(` / `prepare_replay_seed(` / `probe_storage(` 等入口且函数体内没有
-`EnvGuard::` 的，逐个判读 env 依赖并补锁。两轮共新增 **18** 处 reader 持锁
-（commit 1 的 2 处 + 本轮 16 处）。
+`EnvGuard::` 的，逐个判读 env 依赖并补锁（**已知盲区：间接调用，见上**）。
+计数澄清：commit 2（8536e2ba）实际新增 **18** 行 `let _env = EnvGuard::lock();`
+—— builder 6 + resume 9 + main 3；加上 commit 1 的 2 处，两轮合计 **20** 处。
+（此前正文误写「16 处」，是把 resume 的 9 处漏算成 7 处。）
 
 ### 静态 grep 不变量（spec 的可选项，本轮补上）
 
@@ -333,3 +338,106 @@ build_runtime must succeed with a valid config: unknown agent preset "no-such-pr
 
 当前代码没有触发这两条（本轮新增的持锁测试都不嵌套、也不 spawn 会取锁的任务），
 但这是可复现的脚枪，后续任何 reader 加锁都必须避开。
+
+## 返工 3（review 终判 PASS-WITH-NITS 后，commit 3）
+
+### 必修 1：`tools_for` 间接 reader（真实缺口，已补）
+
+`redo_orphan_*` 3 个测试经 `tools_for(&cfg)` **间接**调用 `build_tools`，后者读
+`SandboxMode::from_env()`（`RECURSIVE_SANDBOX`）与 `discover_loaded_skills`
+（`RECURSIVE_SKILL_PATHS` / `HOME`）。补锁：
+
+| 测试 | 函数行 | 锁行 |
+|---|---|---|
+| `redo_orphan_replays_a_readonly_call` | :1715 | **:1719** |
+| `redo_orphan_replays_external_calls_without_a_tty` | :1735 | **:1739** |
+| `redo_orphan_answers_with_the_error_when_the_replay_fails` | :1758 | **:1762** |
+
+**盲区教训**：上一轮扫描器只匹配直接的 `build_runtime(` / `build_tools(`，
+漏掉 `tools_for(...)` 这层间接。此后新增 env reader 必须**独立枚举**
+（如 `grep -n "tools_for(" crates/recursive-cli/src/cli/resume.rs`），不能只信扫描器。
+合计：两轮 20 处 + 本轮 3 处 = **23** 处 reader 持锁。
+
+### 本轮负向对照（3 把新锁确实承重）
+
+今天没有测试会写非 local 的 `RECURSIVE_SANDBOX`（复核者也确认当前值都试不出来），
+所以用**合成 probe** 让它有牙：临时加一个持锁写者，把 `RECURSIVE_SANDBOX` 持续置为
+`bogus`（`build_tools` 读到会 `process::exit(2)`），过滤跑
+`-- redo_orphan nc185_sandbox_probe`：
+
+- **保留 3 把锁（对照）**：`ok. 4 passed; 0 failed; 0 ignored … 10.81s`
+  （3 个 reader 阻塞等锁，probe 释放后读到已还原的 env）。
+- **删掉这 3 把锁 + probe 存活**：连跑 5 次，**5/5 进程异常退出**：
+
+```
+running 4 tests
+recursive: RECURSIVE_SANDBOX: unknown sandbox tier `bogus` (expected none|policy|container|microvm)
+  process didn't exit successfully: `.../deps/recursive-70bbb39ab26526b1` (exit status: 2)
+```
+
+按 `/tmp/resume.round3.bak` 还原，sha256
+`7ff10e7d8df7bd94c1e90cab1a16502b71135f8c03472bf7667e4a921eba8be3` 一致、
+probe 0 处，`-- redo_orphan` 立即回到 `ok. 3 passed`。
+**如实说明**：没有这个 probe、只用当前测试会写的值，这 3 个 reader 今天无法变红
+（良性），所以证据只能来自合成 probe。
+
+### 建议 1：静态不变量匹配面扩大（顺带修掉一个对齐 bug）
+
+- 匹配面从字面量 `std::env::set_var(` / `remove_var(` 扩为「**先剥离注释与字符串
+  字面量**，再看任何接收者不是 guard（`EnvGuard::` / `.`）的 `set_var(` /
+  `remove_var(` 调用」⇒ `env::set_var(`、裸 `set_var(` 也会被抓住。
+  新增单测 `raw_env_call_matcher_covers_aliases_and_ignores_the_guard_api`。
+- 变体负向对照（每个都实跑 `cargo test --test invariants`）：
+
+| 变体 | 结果 |
+|---|---|
+| `std::env::set_var("NC_A", "1");` | FAILED，打印 `cli/resume.rs:1716: std::env::set_var("NC_A", "1");` |
+| `env::set_var("NC_B", "1");` | FAILED，打印 `cli/resume.rs:1716: env::set_var("NC_B", "1");` |
+| `set_var("NC_C", "1");`（裸调用） | FAILED，打印 `cli/resume.rs:1716: set_var("NC_C", "1");` |
+| `/* std::env::set_var("NC_D", "1"); */` | ok（注释被剥离，不误报） |
+| `// std::env::set_var("NC_E", "1");` | ok（注释被剥离，不误报） |
+
+- **期间发现并修掉一个真 bug**：初版 `code_only` 在字符串字面量内部**丢弃换行**，
+  多行字符串会把后续行号整体前移——检测仍命中但**报错行号错误**；更危险的是
+  `main()` 产品代码豁免按行号比较，可能被**错误豁免**。现在字符串内换行也保留，
+  扫描时加 `assert_eq!(text.lines().count(), code.lines().count())` 防回归，
+  并新增多行字符串单测。（第一版 NC 打印出 `cli/resume.rs:1698: )` 才暴露出来。）
+- **仍存在的边界**（不声称完备）：这是纯词法检查——宏体内的 env 变更、或把 guard
+  类型改名/再导出（`use crate::test_env::EnvGuard as G;`）都会绕过；后者会**误报**
+  （fail-closed，不是漏报）。
+
+### 建议 2：命令写法
+
+`tests/invariants.rs` 属于**根包**，正确命令是 `cargo test --test invariants`；
+`cargo test -p recursive-cli --test invariants` 无效。仓库内 grep 未发现错误写法，
+本 journal 与汇报全部使用正确命令。
+
+### 方法论（复核者提出，保留）
+
+**「全量 ×N 全绿」本身不构成证据**，必须配"同样条件下解锁后能红"的阳性对照：
+复核者试过把 writer 改名 `aaa_unknown_preset_…` 强制排最前再跑全量 ×10 → 0 red/10，
+但同条件删掉两把锁的阳性对照也是 0 red/5 ⇒ 该实验没有检验力，其 0 red 被主动放弃。
+可靠的是**定向过滤器**（解锁后 6 red/10，见返工 2 的 NC-2）。本 issue 的全量 20×
+之所以有意义，是因为同时给了三元组的正/负对照。
+
+### 门禁（本轮，commit 3 前，全部通过）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test -p recursive-cli --bin recursive` | `ok. 171 passed; 0 failed`（35.47s） |
+| `cargo test -p recursive-cli`（7 个 target） | exit 0；171+28+3+12+17+2+13 全绿 |
+| `cargo test --test invariants` | `ok. 57 passed; 0 failed`（含扩大后的静态检查 + matcher 单测） |
+| `cargo clippy -p recursive-cli --all-targets -- -D warnings` | clean |
+| `cargo fmt --all -- --check` | clean |
+| 额外：`cargo clippy --test invariants -- -D warnings` | clean |
+
+日志 `/tmp/gates185c.log`、`/tmp/gate2c.log`。
+
+### 验收（本轮，commit 3 前）
+
+- 定向三元组 ×10：**0 red / 10**
+- 全量 `--bin recursive` ×10：**0 red / 10**
+- `--test-threads=1`：`ok. 171 passed`
+
+日志 `/tmp/accept185c.log`。注意：按上面「方法论」一节，这些绿灯只作为回归确认，
+本轮的**证据主体**是 3 把新锁的合成 probe 正/负对照。

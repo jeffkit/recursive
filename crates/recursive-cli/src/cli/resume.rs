@@ -1713,6 +1713,10 @@ mod tests {
 
     #[tokio::test]
     async fn redo_orphan_replays_a_readonly_call() {
+        // Issue #185 (review rework 2): `tools_for` -> `build_tools` reads
+        // `RECURSIVE_SANDBOX` (SandboxMode::from_env) and the skills env, so this
+        // indirect reader holds the shared env lock too.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
         let cfg = test_config(ws.path());
@@ -1729,6 +1733,10 @@ mod tests {
 
     #[tokio::test]
     async fn redo_orphan_replays_external_calls_without_a_tty() {
+        // Issue #185 (review rework 2): `tools_for` -> `build_tools` reads
+        // `RECURSIVE_SANDBOX` (SandboxMode::from_env) and the skills env, so this
+        // indirect reader holds the shared env lock too.
+        let _env = EnvGuard::lock();
         // `External` orphans normally ask a human first. With no TTY there is
         // nobody to ask: the explicit `--orphans=redo` opt-in is honoured
         // (with the warning) instead of the resume refusing to proceed.
@@ -1748,6 +1756,10 @@ mod tests {
 
     #[tokio::test]
     async fn redo_orphan_answers_with_the_error_when_the_replay_fails() {
+        // Issue #185 (review rework 2): `tools_for` -> `build_tools` reads
+        // `RECURSIVE_SANDBOX` (SandboxMode::from_env) and the skills env, so this
+        // indirect reader holds the shared env lock too.
+        let _env = EnvGuard::lock();
         // A failing replay must not abort the resume: the error text is the
         // tool result the model would have seen had the call returned.
         let ws = tempfile::tempdir().unwrap();
