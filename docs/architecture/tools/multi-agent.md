@@ -43,8 +43,16 @@ task that drains an mpsc channel of turn prompts against a single retained `Agen
   flag), provided the handle was attached via `set_handle` at spawn time.
 
 The continuation handle (`WorkerHandle`) is stored in a shared `WorkerTable`
-(`Arc<RwLock<HashMap<worker_id, Arc<WorkerHandle>>>>`), wired through `register_subagent_if_enabled`
-so the `agent` tool (spawner) and `send_message` tool (continuer) share one table per coordinator.
+(`Arc<Mutex<HashMap<worker_id, Arc<WorkerHandle>>>>`, a synchronous mutex so the deregister
+`Drop` guard can run on the `task_stop` abort path), wired through
+`register_subagent_if_enabled` so the `agent` tool (spawner) and `send_message` tool
+(continuer) share one table per coordinator.
+
+A live `worker_id` may not be reused: a second `background: true` spawn with the same
+`worker_id` is rejected (issue #176). The old behaviour overwrote the first worker's
+registration and then let its exit guard delete the *new* entry, after which `send_message`
+silently stopped driving turns. The exit guard now removes a slot only while it still holds
+that worker's own `task_id`.
 
 ## send_message / ListWorkers
 
@@ -53,6 +61,10 @@ so the `agent` tool (spawner) and `send_message` tool (continuer) share one tabl
   workers, addressing by `task_id` drives a new turn (cross-turn continuation).
 - **Backed by**: `WorkerRegistry` + `WorkerMailbox` (legacy, same-turn injection) and the
   `WorkerTable` of background `WorkerHandle`s (cross-turn continuation).
+- **No live handle = error**: a `task_id` that is registered but has no live continuation
+  handle (the worker exited or was stopped) returns a `tool rejected` error saying the task
+  has no live worker. It never reports `Message delivered` for a message nothing will run
+  (issue #176).
 
 ## Team Tools
 

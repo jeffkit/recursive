@@ -7,9 +7,14 @@
 //!    Phase D `agent` tool with `team_name+name` (or `run_in_background`).
 //!    The message is pushed into the task's output channel, which the
 //!    worker's prompt loop can poll between steps (or, more practically,
-//!    which the human can read on the next `task_output` call).
+//!    which the human can read on the next `task_output` call). For a
+//!    background worker this also drives a new turn on its retained runtime.
+//!    If the task is registered but no live continuation handle exists (the
+//!    worker exited or was stopped), this is an **error** — never a
+//!    "delivered" success (issue #176).
 //! 2. **`worker_id`** — legacy, addresses a worker registered in
-//!    `WorkerRegistry` (from pre-Phase-D `spawn_worker`).
+//!    `WorkerRegistry` (from pre-Phase D `spawn_worker`), or a background
+//!    worker by its `WorkerTable` key.
 //!
 //! If both are present, `task_id` wins.  If neither resolves, the tool
 //! returns a helpful message listing active workers and tasks.
@@ -248,24 +253,46 @@ impl Tool for SendMessageTool {
             // pushing the message onto the worker's continuation channel.
             // The worker runtime is retained across turns, so this continues
             // the same conversation (transcript preserved).
-            let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
-            for handle in workers.values() {
-                if handle.task_id == task_id {
-                    match handle.tx.send(message.clone()) {
-                        Ok(()) => {
-                            return Ok(format!(
-                                "Message delivered to task '{task_id_str}'; worker will run it as a new turn."
-                            ));
-                        }
-                        Err(_) => {
-                            return Ok(format!(
-                                "Message queued for task '{task_id_str}', but the worker has exited and cannot continue."
-                            ));
+            //
+            // Issue #176: "no handle" must NOT be reported as success. The
+            // task registry and the worker table are separate records — a
+            // task can outlive its continuation handle (the worker exited,
+            // its deregister guard ran, or `task_stop` aborted it) — and the
+            // old fall-through answered `Message delivered to task ...` while
+            // nothing would ever run the message. That silent false success
+            // is exactly what makes a caller believe a dead worker is working.
+            {
+                let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+                for handle in workers.values() {
+                    if handle.task_id == task_id {
+                        match handle.tx.send(message.clone()) {
+                            Ok(()) => {
+                                return Ok(format!(
+                                    "Message delivered to task '{task_id_str}'; worker will run it as a new turn."
+                                ));
+                            }
+                            Err(_) => {
+                                return Err(Error::ToolRejected {
+                                    name: "send_message".into(),
+                                    reason: format!(
+                                        "task '{task_id_str}' has no live worker: its continuation \
+                                         channel is closed, so the message was not delivered and no \
+                                         turn will run (the message was written to task output only)"
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
             }
-            return Ok(format!("Message delivered to task '{task_id_str}'."));
+            return Err(Error::ToolRejected {
+                name: "send_message".into(),
+                reason: format!(
+                    "task '{task_id_str}' has no live worker: no continuation handle is registered \
+                     (it may have exited or been stopped), so no turn will run (the message was \
+                     written to task output only)"
+                ),
+            });
         }
 
         // Fall back to worker_id. For a background worker registered in the
@@ -585,12 +612,25 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_to_task() {
+        // A task that IS backed by a live continuation handle is delivered to
+        // and drives a new turn.
         let reg = WorkerRegistry::new();
         let tr = Arc::new(TaskRegistry::new());
         let (state, id) = TaskState::new("t", "alpha", "r");
         tr.register(state).await;
 
-        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
+        let workers: crate::tools::agent::WorkerTable = Default::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        workers.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            "alpha".to_string(),
+            Arc::new(crate::tools::agent::WorkerHandle {
+                tx,
+                task_id: id.clone(),
+                worker_id: Arc::new("alpha".to_string()),
+            }),
+        );
+
+        let tool = SendMessageTool::new(reg, tr, workers);
         let result = tool
             .execute(json!({
                 "task_id": id.to_string(),
@@ -599,7 +639,40 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains(&id.to_string()));
-        assert!(result.contains("delivered"));
+        assert!(result.contains("new turn"), "got: {result}");
+        assert_eq!(rx.try_recv().as_deref(), Ok("do thing"));
+    }
+
+    /// Issue #176: a `task_id` with no live continuation handle must report a
+    /// failure. The task registry and the worker table are independent, so a
+    /// task can outlive its worker; the old code answered
+    /// `Message delivered to task ...` while no turn would ever run.
+    #[tokio::test]
+    async fn send_message_to_dead_worker_reports_failure() {
+        let reg = WorkerRegistry::new();
+        let tr = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("t", "alpha", "r");
+        tr.register(state).await;
+
+        // Task is registered but nothing backs it (worker exited / was
+        // stopped) — the exact shape of the #176 false success.
+        let tool = SendMessageTool::new(reg, tr, crate::tools::agent::WorkerTable::default());
+        let res = tool
+            .execute(json!({
+                "task_id": id.to_string(),
+                "message": "anyone home?"
+            }))
+            .await;
+
+        let err = res.expect_err("no live handle must be reported as a failure, not delivered");
+        assert!(
+            err.to_string().contains("no live worker"),
+            "error must say there is no live worker, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("delivered"),
+            "error must not claim delivery, got: {err}"
+        );
     }
 
     #[tokio::test]
