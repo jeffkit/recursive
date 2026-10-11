@@ -145,6 +145,9 @@ e2e/
    journal entry. Prefer std + what's already in `Cargo.toml`.
    Automated test: `tests/invariants/dep_justification.rs` +
    `scripts/check-new-deps.sh`
+   That script's exit codes: `0` = clean, `1` = a dependency change lacks a
+   journal justification, `2` = the base ref could not be resolved — the gate
+   fails **closed**, so CI must check out with `fetch-depth: 2` (#184).
 7. **Finish reasons are data, not errors.** `AgentRuntime::run` returns
    `Ok(RuntimeOutcome { finish_reason: ... })` for every termination mode
    (`NoMoreToolCalls`, `BudgetExceeded`, `Stuck`, `TranscriptLimit`,

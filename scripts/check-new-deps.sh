@@ -65,6 +65,11 @@ fi
 # whole (possibly multi-line) spec is what gets compared — otherwise the
 # continuation line `features = [...]` reads as a dependency named "features"
 # (#184 review) and an edit inside the table goes unnoticed.
+#
+# Comments are stripped only outside double-quoted strings: a `#` inside a spec
+# (`features = ["a#b"] }`) must not swallow the closing brace, otherwise the
+# depth never returns to 0 and the dependency is dropped from the comparison
+# entirely — a fail-open hole in a gate that is supposed to fail closed.
 list_dependency_entries() {
     awk '
         function emit(   s) {
@@ -76,11 +81,31 @@ list_dependency_entries() {
             pending = ""
             spec = ""
         }
+        # Drop a trailing `# …` comment, keeping `#` that sits inside a string.
+        function strip_comment(s,   i, c, in_str, out) {
+            in_str = 0
+            out = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c == "\\" && in_str) {
+                    out = out c substr(s, i + 1, 1)
+                    i++
+                    continue
+                }
+                if (c == "\"") {
+                    in_str = !in_str
+                    out = out c
+                    continue
+                }
+                if (c == "#" && !in_str) break
+                out = out c
+            }
+            return out
+        }
         /^[[:space:]]*\[/ {
             emit()
             depth = 0
-            header = $0
-            sub(/[[:space:]]*#.*/, "", header)
+            header = strip_comment($0)
             gsub(/[][[:space:]]/, "", header)
             if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)$/) {
                 in_deps = 1
@@ -98,8 +123,7 @@ list_dependency_entries() {
         }
         !in_deps { next }
         {
-            line = $0
-            sub(/[[:space:]]*#.*/, "", line)
+            line = strip_comment($0)
             opens = gsub(/\{/, "{", line)
             closes = gsub(/\}/, "}", line)
             if (depth == 0 && line ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {

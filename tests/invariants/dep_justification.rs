@@ -431,3 +431,47 @@ fn dep_gate_flags_edits_inside_an_inline_table() {
         "the report must name the dependency whose spec changed"
     );
 }
+
+/// A `#` inside a spec *string* must not be read as a comment start. When it
+/// is, the strip eats the inline table's closing brace, the brace depth never
+/// returns to 0, and the dependency disappears from the comparison — the gate
+/// fails open, which is the one failure mode this script must never have.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_hash_inside_inline_table_string() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"a#b\"");
+    fixture.commit("add a dependency whose feature name contains a hash");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a dependency spec containing a '#'");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("rand"),
+        "the gate must still see the dependency, not silently skip it"
+    );
+}
+
+/// Same hole on a single line: `foo = { git = "…/x#v1" }` used to vanish.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_single_line_spec_with_hash() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}foo = {{ git = \"https://example.invalid/x#v1\" }}\n"),
+    );
+    fixture.commit("add a git dependency with a fragment");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a single-line spec containing a '#'");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("foo"),
+        "the gate must still see the dependency, not silently skip it"
+    );
+}

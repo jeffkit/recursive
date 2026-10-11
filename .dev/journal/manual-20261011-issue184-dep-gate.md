@@ -98,3 +98,38 @@ rand = { version = "0.8", default-features = false,
   md5 校验一致。
 - `cargo test --test invariants` 63 passed（+3）；`cargo clippy --test invariants -- -D warnings`、
   `cargo fmt --all -- --check` 干净；`check-new-deps.sh eef5f42b^` 仍识别 `libc`。
+
+## 后续 2 · keeper 复验后的边界收口（2026-10-12）
+
+keeper 的 v2 复验结论是"通过、建议进 PR"，只留下一个**可选、不阻塞**的边界，并给了最小复现：
+
+```toml
+[dependencies]
+rand = { version = "0.8",
+         features = ["a#b"] }
+```
+
+`#` 在**字符串里**，却被当成注释起点 → 该行的 `#b"] }` 一起被剥掉 → 花括号深度永远回不到 0 →
+pending 条目不输出 → **这个依赖完全不出现在比对结果里**，门禁 `exit 0` 放行（fail-open）。
+单行形态同理：`foo = { git = "https://example.invalid/x#v1" }` 也会整条消失。
+该洞在 v1 就存在（非 v2 回归），但"本该失败关闭的门在静默漏判"正是本单要根除的失败模式，故收掉。
+
+**修法**：awk 增加 `strip_comment()`，只在**双引号外**把 `#` 当注释起点（字符串内保留 `\` 转义）；
+表头行与正文行都改用它，替换原先的 `sub(/[[:space:]]*#.*/, "")`。
+
+新增回归用例 2 条：
+
+| 用例 | 断言 |
+|---|---|
+| `dep_gate_flags_hash_inside_inline_table_string` | `features = ["a#b"]` 未说明 → 红，且必须点名 `rand` |
+| `dep_gate_flags_single_line_spec_with_hash` | `foo = { git = "…/x#v1" }` 未说明 → 红，且必须点名 `foo` |
+
+另按 keeper 建议，把门禁退出码写进 `.dev/AGENTS.md` 不变量 #6 的说明（`2` = base ref 不可解析 = 失败关闭）。
+
+**验证**：
+
+- 夹具矩阵扩到 15 例：v2 **13/15**（漏的两例报 `OK: No dependency changes detected`）、v3 **15/15**。
+- 负向对照：把 2 条新用例对着 **v2 脚本**跑 → **2/2 转红**，报错
+  `invariant #6 must fail for … but the gate passed`；脚本还原并 md5 校验一致。
+- `cargo test --test invariants` 65 passed（+2）；`cargo clippy --test invariants -- -D warnings`、
+  `cargo fmt --all -- --check` 干净；`check-new-deps.sh eef5f42b^` 仍识别 `libc`。
