@@ -475,3 +475,74 @@ fn dep_gate_flags_single_line_spec_with_hash() {
         "the gate must still see the dependency, not silently skip it"
     );
 }
+
+/// A `[dependencies.foo]` table's *body* is the dependency's spec: a version
+/// bump or an added feature inside it must be reported. Reporting only the
+/// table's existence let every edit inside it pass silently (fail-open).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_edits_inside_a_table_form_dependency() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+
+[dependencies.serde]
+version = "1"
+"#,
+    );
+    fixture.commit("base with a table-form dependency");
+    fixture.write(
+        "Cargo.toml",
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+
+[dependencies.serde]
+version = "2"
+features = ["derive"]
+"#,
+    );
+    fixture.commit("bump the table-form dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an edit inside a `[dependencies.foo]` table");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("serde"),
+        "the report must name the table-form dependency"
+    );
+}
+
+/// A dependency table sitting at EOF must still be reported: its body is
+/// buffered until the next table header, so the awk program needs an explicit
+/// flush at end-of-input.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_reports_table_form_dependency_at_eof() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!(
+            r#"{BASELINE_CARGO_TOML}
+[dependencies.trailing-crate-abc]
+version = "1"
+"#
+        ),
+    );
+    fixture.commit("append a table-form dependency as the last section");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a table-form dependency at EOF");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("trailing-crate-abc"),
+        "a dependency table at EOF must not be dropped"
+    );
+}

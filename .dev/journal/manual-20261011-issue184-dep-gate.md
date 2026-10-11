@@ -133,3 +133,34 @@ pending 条目不输出 → **这个依赖完全不出现在比对结果里**，
   `invariant #6 must fail for … but the gate passed`；脚本还原并 md5 校验一致。
 - `cargo test --test invariants` 65 passed（+2）；`cargo clippy --test invariants -- -D warnings`、
   `cargo fmt --all -- --check` 干净；`check-new-deps.sh eef5f42b^` 仍识别 `libc`。
+
+## 后续 3 · 自审出的同类 fail-open：`[dependencies.foo]` 表内部改动被忽略（2026-10-12）
+
+keeper 未提这一条，是我复核自己 README 里"覆盖 `[dependencies.foo]` 表形态"这句时发现它是 **overclaim**：
+
+表形态走的是 `printf "%s\t<table>"` —— 只要表名还在，spec 恒为 `<table>`，于是
+
+```toml
+[dependencies.serde]
+version = "1"                →   version = "2"
+                                 features = ["derive"]
+```
+
+两侧条目完全相同 → 门禁 `exit 0`（实测 v3 报 `No dependency changes detected`）。同属"本该失败关闭却静默漏判"。
+
+**修法**：表形态改为把**整个表体**当作 spec —— 进入表形态时 `pending = <表名>`、`spec = "<table>"`，
+其后每行（去注释后）追加进 spec，到下一个表头时由 `emit()` 统一输出。
+这引入一个新的 EOF 风险：**文件最后一个表若没有后续表头就永不输出** → 增加 `END { emit() }` 兜底。
+
+**验证**：
+
+- 夹具矩阵扩到 19 例：v3 **18/19**（漏的正是"表体改动"）、v4 **19/19**。
+- 负向对照 A（表体改动）：2 条新用例对着 **v3 脚本**跑 →
+  `dep_gate_flags_edits_inside_a_table_form_dependency` **转红**
+  （`invariant #6 must fail for an edit inside a [dependencies.foo] table, but the gate passed`）；
+  如实记录：`dep_gate_reports_table_form_dependency_at_eof` 在 v3 上是**绿**的（v3 立即输出、不会丢末尾表），
+  它守的是 v4 的新缓冲设计，不是 v3 的 bug。
+- 负向对照 B（END flush 的必要性）：保留 v4 但删掉 `END { emit() }` → `..._at_eof` **转红**；
+  shell 层同理（去掉该行后夹具 18/19）。
+- `cargo test --test invariants` 67 passed（+2）；clippy `-D warnings`、`fmt --all -- --check` 干净；
+  `check-new-deps.sh eef5f42b^` 仍识别 `libc`；本仓 `HEAD~1` 报 `Cargo.toml unchanged`（exit 0，符合预期）。

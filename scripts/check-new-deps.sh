@@ -105,23 +105,33 @@ list_dependency_entries() {
         /^[[:space:]]*\[/ {
             emit()
             depth = 0
+            in_table = 0
             header = strip_comment($0)
             gsub(/[][[:space:]]/, "", header)
             if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)$/) {
                 in_deps = 1
             } else if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)\./) {
-                # Table form: [dependencies.serde] + version/features keys.
-                # The dependency name is the part after the table keyword.
+                # Table form: `[dependencies.serde]` followed by version/features
+                # keys. The dependency is the part after the table keyword, and
+                # its *whole body* is its spec — otherwise an edit inside the
+                # table (a version bump, an added feature) would leave the
+                # name/spec pair unchanged and the gate would silently pass it.
                 in_deps = 0
+                in_table = 1
                 name = header
                 sub(/^.*(dependencies|dev-dependencies|build-dependencies)\./, "", name)
-                printf "%s\t<table>\n", name
+                pending = name
+                spec = "<table>"
             } else {
                 in_deps = 0
             }
             next
         }
-        !in_deps { next }
+        !in_deps && !in_table { next }
+        in_table {
+            spec = spec " " strip_comment($0)
+            next
+        }
         {
             line = strip_comment($0)
             opens = gsub(/\{/, "{", line)
@@ -141,6 +151,9 @@ list_dependency_entries() {
                 emit()
             }
         }
+        # A dependency table at EOF (or an unterminated inline table) must still
+        # be reported: table-form entries are buffered until the next header.
+        END { emit() }
     '
 }
 
