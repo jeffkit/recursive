@@ -356,6 +356,92 @@ cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished
 cargo fmt --all -- --check                                          → 通过
 ```
 
+### review 返工 5（第六个 commit）：门按 pin 的 scheme 过滤 + 规范 CIDR 前缀 + feature 范围限定
+
+复核者 F2 实测（**今天就可达的误红**）：只设 `HTTPS_PROXY` 时，`http://` 的 pin 实际直连
+（守卫完全有效），但旧门把 `HTTPS_PROXY` 也算"有代理" → 大声失败。"只设 HTTPS_PROXY"是
+企业代理环境的常见配置，无故报红会诱使人关掉这道门。
+
+处理：
+
+1. **N-a 按 scheme 过滤代理变量**：新增常量 `PIN_SCHEME = "http"`（pin 的 URL 是
+   `http://localhost:<port>`）与 `configured_proxies(scheme, cgi, lookup)`，依据 registry
+   源码 `hyper-util-0.1.20/src/client/proxy/matcher.rs:238`：
+   ```
+   http:  parse_env_uri(&self.http).or_else(|| all.clone())
+   https: parse_env_uri(&self.https).or(all)
+   ```
+   即 `http://` 请求只受 `[HTTP_PROXY, http_proxy]` **与** `[ALL_PROXY, all_proxy]` 影响；
+   `HTTPS_PROXY`/`https_proxy` 拦不到它。scheme 判断只有这一处（+ `PIN_SCHEME`），不散落。
+   顺带对齐同一函数的 CGI 短路：`Builder::build` 在 `REQUEST_METHOD` 已设时完全禁用代理，
+   故门在 CGI 下也直接通过（否则是另一处误红）。
+2. **N-b 规范十进制 CIDR 前缀**：`ipnet` 只接受 `/8` 这类规范写法，`/+8`、`/008`、
+   `/0000000000000008` 全部拒绝，而 Rust 的 `u32::from_str` 会接受。`cidr_contains` 现在
+   先要求"全为 ASCII 数字、且除 `0` 本身外无前导零"，再 parse；新增单测
+   `no_proxy_covers_rejects_non_canonical_cidr_prefix`。
+3. **N-c feature 范围限定**：原注释"环境变量是唯一代理来源（无 OS 级代理）"说过头了。
+   实测 `cargo tree -e features --features weixin -i reqwest`：
+   ```
+   └── reqwest feature "system-proxy"
+   ```
+   默认 feature 集（门禁所跑的那套）只有 hyper-util `client-proxy`；`--features weixin` /
+   `--all-features` 会经 `wechatbot`（未设 `default-features = false`）带出
+   `reqwest/system-proxy` → `hyper-util/client-proxy-system`，此时**还存在 OS 级代理来源**，
+   "无代理变量 ⇒ 提前通过"须在该配置下重新评估。注释已按此限定；**默认构建下门的行为不变**。
+
+证据：
+
+```
+# (1) N-a：只设 HTTPS_PROXY（死代理）、无其它代理变量、NO_PROXY/no_proxy 未设 → 通过
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+      HTTPS_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+running 2 tests
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... ok
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3320 filtered out; finished in 0.06s
+#（修复前：门把 HTTPS_PROXY 当成会拦截 http → 无故大声失败）
+
+# (2) 对照：只设 HTTP_PROXY（死代理）→ 仍然大声失败
+$ env -u NO_PROXY -u no_proxy -u HTTPS_PROXY -u https_proxy -u ALL_PROXY -u all_proxy \
+      HTTP_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+test result: FAILED. 0 passed; 2 failed
+connection_time_guard relies on the loopback names being exempted from any ambient proxy, but
+neither NO_PROXY nor no_proxy is set. Export `NO_PROXY=127.0.0.1,localhost,::1`, or run the suite
+through cargo (whose .cargo/config.toml provides it). Proxy env vars currently set: ["HTTP_PROXY"]
+
+# (3) 只设 ALL_PROXY（死代理）→ 同样大声失败（ALL_PROXY 对 http 也生效）
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+      ALL_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+test result: FAILED. 0 passed; 2 failed（同样的 "neither NO_PROXY nor no_proxy is set"）
+
+# (4) N-b：删掉两处 .dns_resolver(guarded_resolver()) + NO_PROXY='127.0.0.0/+8' + 死 HTTP_PROXY
+$ NO_PROXY='127.0.0.0/+8' HTTP_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+test result: FAILED. 0 passed; 2 failed
+connection_time_guard would pass for the wrong reason: NO_PROXY="127.0.0.0/+8" does not exempt
+["localhost"], so the request would be sent to the proxy and fail there instead of being refused
+by the connection-time SSRF guard (deleting the guard would stay green). Unset NO_PROXY or add the
+loopback names. Proxy env vars currently set: ["HTTP_PROXY"]
+#（修复前：门的 u32 parse 接受 +8 → 误判"已豁免" → 静默绿）
+```
+
+本轮新增/改写的纯逻辑单测：
+`configured_proxies_only_counts_scheme_applicable_variables`（仅 `HTTPS_PROXY`/`https_proxy`
+⇒ **不算**；仅 `HTTP_PROXY`/`http_proxy` ⇒ 算；仅 `ALL_PROXY`/`all_proxy` ⇒ 算；`ftp` 等其它
+scheme ⇒ 都不算；CGI ⇒ 都不算）、`no_proxy_covers_rejects_non_canonical_cidr_prefix`；
+`configured_proxies_mirrors_hyper_util_first_env` 更新到新签名（L2 语义不变）。
+
+返工 5 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 35 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3322 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
 ## 提交与 diff stat（真实数字，`git show --numstat`）
 
 首版 commit（被验收的哈希，未 amend）：
@@ -409,6 +495,14 @@ review 返工 4 commit（不含本 journal 自身的改动）：
 | `src/tools/policy_domain/url_guard.rs` | 103 | 14 |
 
 `git diff --stat -- src docs`：`1 file changed, 103 insertions(+), 14 deletions(-)`。
+
+review 返工 5 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `src/tools/policy_domain/url_guard.rs` | 174 | 53 |
+
+`git diff --stat -- src docs`：`1 file changed, 174 insertions(+), 53 deletions(-)`。
 
 ## Notes
 

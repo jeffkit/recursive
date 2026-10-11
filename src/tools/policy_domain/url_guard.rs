@@ -448,12 +448,21 @@ pub(crate) fn guarded_resolver() -> Arc<GuardedResolver> {
 #[cfg(test)]
 const PIN_HOSTS: [&str; 1] = ["localhost"];
 
+/// The scheme of the URLs the wiring pins request (`http://localhost:<port>` in
+/// both `web_fetch.rs` and `a2a.rs`). Only proxy variables that can intercept
+/// this scheme count — see [`configured_proxies`]; keep in sync with
+/// [`PIN_HOSTS`].
+#[cfg(test)]
+const PIN_SCHEME: &str = "http";
+
 /// Test gate for the wiring pins in `web_fetch.rs` / `a2a.rs`.
 ///
 /// Those pins observe the connection-time guard through the *production*
-/// client, so the request must not be intercepted by an ambient proxy. When an
-/// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` is set and the effective no-proxy
-/// list does not exempt [`PIN_HOSTS`], the pin becomes a **false green**: the
+/// client, so the request must not be intercepted by an ambient proxy. When a
+/// proxy variable that applies to [`PIN_SCHEME`] is set (`HTTP_PROXY` /
+/// `http_proxy` / `ALL_PROXY` / `all_proxy` for the `http://` pins — *not*
+/// `HTTPS_PROXY`, which cannot intercept them) and the effective no-proxy list
+/// does not exempt [`PIN_HOSTS`], the pin becomes a **false green**: the
 /// guarded arm dies at the (often unreachable) proxy, so `expect_err` plus "no
 /// hit on the listener" are satisfied for the wrong reason and deleting the
 /// guard changes nothing. `.cargo/config.toml` provides
@@ -472,7 +481,9 @@ const PIN_HOSTS: [&str; 1] = ["localhost"];
 /// [`PIN_HOSTS`] entry.
 #[cfg(test)]
 pub(crate) fn assert_loopback_bypasses_proxy() {
-    let proxies = configured_proxies(|name| std::env::var(name).ok());
+    // hyper-util's `Builder::build` short-circuits under CGI.
+    let cgi = std::env::var_os("REQUEST_METHOD").is_some();
+    let proxies = configured_proxies(PIN_SCHEME, cgi, |name| std::env::var(name).ok());
 
     // reqwest's precedence: `NO_PROXY` if set, otherwise `no_proxy`.
     let decisive = std::env::var("NO_PROXY")
@@ -494,48 +505,85 @@ pub(crate) fn assert_loopback_bypasses_proxy() {
     }
 }
 
-/// The proxy variables that actually configure a proxy, mirroring hyper-util's
-/// `get_first_env` (`src/client/proxy/matcher.rs:323`): within each category
-/// (`ALL` / `HTTPS` / `HTTP`, uppercase first) the first **set** name wins even
-/// when its value is empty, and an empty value means "no proxy for this
-/// category" — the lowercase fallback is then *not* consulted. (`""` also fails
-/// hyper-util's `parse_env_uri`, so no interception is installed.)
+/// The proxy variables that could intercept a `scheme` request, mirroring
+/// hyper-util's `get_first_env` (`src/client/proxy/matcher.rs:323`) and
+/// `Builder::build` (`matcher.rs:238`):
 ///
-/// reqwest enables hyper-util's `client-proxy` but **not**
-/// `client-proxy-system`, so these variables are the only proxy source (no
-/// OS-level proxy); that is what makes "no variable set" a safe early return in
-/// [`loopback_gate_verdict`].
+/// - `ALL_PROXY` / `all_proxy` applies to both `http` and `https`;
+/// - `HTTP_PROXY` / `http_proxy` **only** to `http` requests;
+/// - `HTTPS_PROXY` / `https_proxy` **only** to `https` requests
+///   (`http: parse_env_uri(&self.http).or_else(all)`,
+///   `https: parse_env_uri(&self.https).or(all)` — a machine with only
+///   `HTTPS_PROXY` set cannot intercept the `http://` pins);
+/// - within a category the first **set** name wins (uppercase first) and a
+///   blank value means "no proxy in this category" — the lowercase fallback is
+///   then *not* consulted (`""` also fails `parse_env_uri`);
+/// - under CGI (`REQUEST_METHOD` set) `Builder::build` disables proxying
+///   entirely (and empties the no-proxy list), hence the `cgi` short-circuit.
+///
+/// Feature note (scope of the "environment variables are the only proxy source"
+/// claim): in the **default feature set** — the one the gates build — reqwest
+/// enables hyper-util's `client-proxy` but not `client-proxy-system`, so no
+/// OS-level proxy exists. `--features weixin` / `--all-features` pull in
+/// `reqwest/system-proxy` (via `wechatbot`'s reqwest dependency, which does not
+/// set `default-features = false`), re-enabling OS-level proxies; the logic here
+/// is unchanged, but "no proxy variable ⇒ cannot be intercepted" would have to
+/// be re-evaluated in that configuration.
 #[cfg(test)]
-fn configured_proxies(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
-    const CATEGORIES: [[&str; 2]; 3] = [
-        ["ALL_PROXY", "all_proxy"],
-        ["HTTPS_PROXY", "https_proxy"],
-        ["HTTP_PROXY", "http_proxy"],
-    ];
+fn configured_proxies(
+    scheme: &str,
+    cgi: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
+    if cgi {
+        return Vec::new();
+    }
     let mut configured = Vec::new();
-    for [upper, lower] in CATEGORIES {
-        let chosen = match lookup(upper) {
-            Some(value) => Some((upper, value)),
-            None => lookup(lower).map(|value| (lower, value)),
-        };
-        if let Some((name, value)) = chosen {
-            if !value.trim().is_empty() {
-                configured.push(name);
-            }
-        }
+    if let Some(name) = first_set_non_empty(["ALL_PROXY", "all_proxy"], &lookup) {
+        configured.push(name);
+    }
+    let scheme_specific = match scheme {
+        "http" => ["HTTP_PROXY", "http_proxy"],
+        "https" => ["HTTPS_PROXY", "https_proxy"],
+        // `Matcher::intercept` returns `None` for anything else, so no proxy
+        // (not even `ALL_PROXY`) applies.
+        _ => return Vec::new(),
+    };
+    if let Some(name) = first_set_non_empty(scheme_specific, &lookup) {
+        configured.push(name);
     }
     configured
 }
 
+/// hyper-util's `get_first_env`: the first **set** name in `[upper, lower]`
+/// wins — a set-but-blank upper shadows the lower — and a blank value means
+/// "nothing configured in this category".
+#[cfg(test)]
+fn first_set_non_empty(
+    [upper, lower]: [&'static str; 2],
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    let (name, value) = match lookup(upper) {
+        Some(value) => (upper, value),
+        None => (lower, lookup(lower)?),
+    };
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Pure decision core of [`assert_loopback_bypasses_proxy`]: `Ok(())` when the
 /// pins cannot be intercepted, `Err(explanation)` when the environment would
-/// make them vacuous.
+/// make them vacuous. `proxies` must already be filtered for the pins' scheme
+/// (see [`configured_proxies`] / [`PIN_SCHEME`]).
 #[cfg(test)]
 fn loopback_gate_verdict(proxies: &[&str], decisive: Option<(&str, &str)>) -> Result<(), String> {
     if proxies.is_empty() {
-        // No proxy configured ⇒ the request goes direct ⇒ the pins observe the
-        // guard whatever the no-proxy list says. (Not a hole: a request can
-        // only be intercepted when one of these variables is set.)
+        // Nothing can intercept the pins' `http://` request (in the default
+        // feature set, where no OS-level proxy exists) ⇒ they observe the guard
+        // whatever the no-proxy list says.
         return Ok(());
     }
     let Some((name, value)) = decisive else {
@@ -610,14 +658,25 @@ fn no_proxy_covers(value: &str, host: &str) -> bool {
 /// True when the CIDR entry `entry` contains `ip` (hyper-util's
 /// `IpMatcher::Ip::Network` arm). Unparseable entries contain nothing.
 ///
-/// Strict on purpose: `ipnet` does not accept whitespace anywhere in the entry,
-/// so neither the prefix (`127.0.0.0/ 8`) nor the address is trimmed — a padded
-/// CIDR must not be read as an exemption here when reqwest would ignore it.
+/// Strict on purpose, because `ipnet` is: no whitespace anywhere (so neither
+/// the prefix of `127.0.0.0/ 8` nor the address is trimmed) and the prefix must
+/// be **canonical decimal** — `/8` only, never `/+8`, `/008` or
+/// `/0000000000000008` (Rust's `u32::from_str` would happily take those, ipnet
+/// does not). A padded or signed CIDR must not read as an exemption here when
+/// reqwest would ignore it.
 #[cfg(test)]
 fn cidr_contains(entry: &str, ip: IpAddr) -> bool {
     let Some((network, prefix)) = entry.split_once('/') else {
         return false;
     };
+    let prefix_bytes = prefix.as_bytes();
+    let canonical_decimal = !prefix_bytes.is_empty()
+        && prefix_bytes.iter().all(|b| b.is_ascii_digit())
+        // `0` is fine; `008` / `00` are not.
+        && !(prefix_bytes.len() > 1 && prefix_bytes[0] == b'0');
+    if !canonical_decimal {
+        return false;
+    }
     let Ok(prefix) = prefix.parse::<u32>() else {
         return false;
     };
@@ -1056,6 +1115,20 @@ mod tests {
         assert!(no_proxy_covers("0.0.0.0/0", "127.0.0.1"));
     }
 
+    /// `ipnet` accepts only canonical decimal prefixes, so a signed or
+    /// zero-padded prefix exempts nothing (Rust's `u32::from_str` would take
+    /// `+8` and `008`, which is exactly the divergence to avoid).
+    #[test]
+    fn no_proxy_covers_rejects_non_canonical_cidr_prefix() {
+        assert!(!no_proxy_covers("127.0.0.0/+8", "127.0.0.1"));
+        assert!(!no_proxy_covers("127.0.0.0/008", "127.0.0.1"));
+        assert!(!no_proxy_covers("127.0.0.0/0000000000000008", "127.0.0.1"));
+        assert!(!no_proxy_covers("0.0.0.0/+0", "127.0.0.1"));
+        // Canonical forms (including the literal `0` prefix) still match.
+        assert!(no_proxy_covers("127.0.0.0/8", "127.0.0.1"));
+        assert!(no_proxy_covers("0.0.0.0/0", "127.0.0.1"));
+    }
+
     /// The env gate's decision (`loopback_missing_from_no_proxy`) covers exactly
     /// the hosts the pins request ([`PIN_HOSTS`]); this is what turns "the pin
     /// would be vacuous here" into a loud failure.
@@ -1100,11 +1173,11 @@ mod tests {
         assert!(loopback_gate_verdict(proxy, Some(("no_proxy", "localhost"))).is_ok());
     }
 
-    /// `configured_proxies` mirrors hyper-util's `get_first_env`: per category
-    /// the first *set* name wins (uppercase first), and a set-but-empty value
-    /// means "no proxy in this category" — the lowercase fallback is then not
-    /// consulted (the `HTTP_PROXY=""` + dead `http_proxy` combination, which
-    /// must not make the gate cry wolf).
+    /// `configured_proxies` mirrors hyper-util's `get_first_env`: within a
+    /// category the first *set* name wins (uppercase first), and a
+    /// set-but-empty value means "no proxy in this category" — the lowercase
+    /// fallback is then not consulted (the `HTTP_PROXY=""` + dead `http_proxy`
+    /// combination, which must not make the gate cry wolf).
     #[test]
     fn configured_proxies_mirrors_hyper_util_first_env() {
         fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -1119,36 +1192,84 @@ mod tests {
                     .map(|(_, value)| value.clone())
             }
         }
+        let http =
+            |lookup: &dyn Fn(&str) -> Option<String>| configured_proxies("http", false, lookup);
 
         // The pathological combination from the review: an empty `HTTP_PROXY`
         // shadows the dead `http_proxy` ⇒ reqwest goes direct.
-        assert!(configured_proxies(env(&[
+        assert!(http(&env(&[
             ("HTTP_PROXY", ""),
             ("http_proxy", "http://127.0.0.1:1"),
         ]))
         .is_empty());
         // Uppercase unset ⇒ the lowercase value is used.
         assert_eq!(
-            configured_proxies(env(&[("http_proxy", "http://127.0.0.1:1")])),
+            http(&env(&[("http_proxy", "http://127.0.0.1:1")])),
             vec!["http_proxy"]
         );
         // Both set and non-empty ⇒ uppercase wins.
         assert_eq!(
-            configured_proxies(env(&[
+            http(&env(&[
                 ("HTTP_PROXY", "http://a"),
                 ("http_proxy", "http://b"),
             ])),
             vec!["HTTP_PROXY"]
         );
-        // Categories are independent, reported ALL / HTTPS / HTTP.
-        assert_eq!(
-            configured_proxies(env(&[
-                ("ALL_PROXY", "http://a"),
-                ("HTTPS_PROXY", "http://b"),
-            ])),
-            vec!["ALL_PROXY", "HTTPS_PROXY"]
-        );
+        // `ALL_PROXY` applies to `http` too, and is reported first.
+        assert_eq!(http(&env(&[("ALL_PROXY", "http://a")])), vec!["ALL_PROXY"]);
         // Whitespace-only is not a usable proxy URI ⇒ counts as empty.
-        assert!(configured_proxies(env(&[("ALL_PROXY", "   ")])).is_empty());
+        assert!(http(&env(&[("ALL_PROXY", "   ")])).is_empty());
+    }
+
+    /// Scheme filtering (`Matcher::build` / `intercept`): the pins request
+    /// `http://`, so `HTTPS_PROXY` / `https_proxy` cannot intercept them — a
+    /// machine with only the HTTPS proxy set must **not** fail this gate. CGI
+    /// (`REQUEST_METHOD`) disables proxying entirely in hyper-util.
+    #[test]
+    fn configured_proxies_only_counts_scheme_applicable_variables() {
+        fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            move |name: &str| {
+                owned
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        }
+
+        // Effective for the pins' `http://` requests.
+        assert_eq!(
+            configured_proxies("http", false, env(&[("HTTP_PROXY", "http://a")])),
+            vec!["HTTP_PROXY"]
+        );
+        assert_eq!(
+            configured_proxies("http", false, env(&[("ALL_PROXY", "http://a")])),
+            vec!["ALL_PROXY"]
+        );
+        // Not effective: HTTPS-only proxies cannot intercept `http://`.
+        assert!(
+            configured_proxies("http", false, env(&[("HTTPS_PROXY", "http://127.0.0.1:1")]))
+                .is_empty()
+        );
+        assert!(
+            configured_proxies("http", false, env(&[("https_proxy", "http://127.0.0.1:1")]))
+                .is_empty()
+        );
+        // ... but they do count for `https`, and `ALL_PROXY` also applies there.
+        assert_eq!(
+            configured_proxies("https", false, env(&[("HTTPS_PROXY", "http://a")])),
+            vec!["HTTPS_PROXY"]
+        );
+        assert_eq!(
+            configured_proxies("https", false, env(&[("all_proxy", "http://a")])),
+            vec!["all_proxy"]
+        );
+        // Any other scheme: `intercept` returns `None`, so nothing applies.
+        assert!(configured_proxies("ftp", false, env(&[("ALL_PROXY", "http://a")])).is_empty());
+        // CGI short-circuit, independent of the variables.
+        assert!(configured_proxies("http", true, env(&[("HTTP_PROXY", "http://a")])).is_empty());
     }
 }
