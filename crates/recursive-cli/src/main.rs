@@ -4209,6 +4209,10 @@ mod tests {
 
     #[test]
     fn hook_timing_flag_accepted() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         // Verify --hook-timing is accepted by the CLI parser
         let args = vec!["recursive", "--hook-timing", "run", "test goal"];
         let cli = Cli::parse_from(args);
@@ -4284,6 +4288,10 @@ mod tests {
 
     #[test]
     fn hook_timing_flag_defaults_to_false() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let args = vec!["recursive", "run", "test goal"];
         let cli = Cli::parse_from(args);
         assert!(!cli.hook_timing);
@@ -4572,6 +4580,10 @@ mod tests {
 
     #[test]
     fn sessions_and_agents_accept_the_json_and_show_flags() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let cli = Cli::parse_from(vec!["recursive", "sessions", "list", "--json"]);
         assert!(matches!(
             cli.cmd,

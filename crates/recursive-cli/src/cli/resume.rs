@@ -1296,6 +1296,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_propagates_target_resolution_error() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         // A `--from-file` pointing at a missing, non-`.json`, non-dir path must
         // surface as an error rather than silently returning Ok(()).
         let ws = tempfile::tempdir().unwrap();
@@ -1323,6 +1327,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_refuses_tool_registry_hash_mismatch() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let sdir = ws.path().join("sess-a");
@@ -1359,6 +1367,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_allow_tool_drift_degrades_mismatch_to_warning() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let sdir = ws.path().join("sess-drift");
@@ -1394,6 +1406,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_accepts_matching_tool_registry_hash() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let hash = current_tool_hash(&cfg).await;
@@ -1429,6 +1445,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_resumed_propagates_runtime_failure() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = test_config(ws.path());
         // Unreachable endpoint + no retries → the runtime fails fast and
@@ -1785,6 +1805,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_skip_answers_the_orphan() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let tools = tools_for(&cfg).await;
@@ -1800,6 +1824,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_redo_replays_the_call() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
         let cfg = test_config(ws.path());
@@ -1819,6 +1847,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_abort_refuses_the_unanswered_tail() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let tools = tools_for(&cfg).await;
@@ -1831,6 +1863,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_leaves_a_paired_seed_untouched() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let tools = tools_for(&cfg).await;

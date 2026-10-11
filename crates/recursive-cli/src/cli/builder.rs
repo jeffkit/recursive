@@ -1128,6 +1128,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_tools_returns_shared_read_state_when_none() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let cfg = test_config();
         let (tools, read_state) = build_tools(&cfg, None).await;
         let from_registry = tools
@@ -1142,6 +1146,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_tools_reuses_supplied_read_state_when_some() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let cfg = test_config();
         let custom = Arc::new(Mutex::new(ReadFileState::new()));
         let (_tools, read_state) = build_tools(&cfg, Some(custom.clone())).await;
@@ -1352,6 +1360,10 @@ done
     /// The touched-files collector must be attached for checkpoint recording.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_tool_surface_registers_mcp_then_applies_allow_list() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = mock_mcp_server_script(tmp.path());
         let mcp_config = explicit_mcp_config(tmp.path(), &script);
@@ -1386,6 +1398,10 @@ done
     /// only added to — MCP registers, nothing is pruned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_tool_surface_keeps_full_registry_without_filters() {
+        // Issue #185 (review follow-up): this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = test_config();
         cfg.workspace = tmp.path().to_path_buf();
@@ -1555,8 +1571,15 @@ done
 
     /// A non-empty seed is installed on the runtime transcript (kills the
     /// `!seed.is_empty()` guard mutant).
+    ///
+    /// Issue #185 (review follow-up): `build_runtime` resolves the agent preset
+    /// from the process env, so this test takes the shared env lock for its
+    /// whole body. Without it the full-suite green was order luck — libtest
+    /// runs it ('b') before `unknown_preset_env_fails_the_cli_build` ('u'), but
+    /// any rename/sharding/reschedule lets the writer race this reader.
     #[tokio::test]
     async fn build_runtime_seeds_the_transcript_from_seed_messages() {
+        let _env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = test_config();
         cfg.workspace = tmp.path().to_path_buf();
@@ -1776,6 +1799,12 @@ done
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_runtime_uses_the_anthropic_endpoint_for_an_anthropic_config() {
         use tokio::io::AsyncReadExt;
+
+        // Issue #185 (review follow-up): same unguarded-reader hazard as
+        // `build_runtime_seeds_the_transcript_from_seed_messages` — this test
+        // also resolves the agent preset from the process env via
+        // `build_runtime`, so it must hold the shared env lock.
+        let _env = EnvGuard::lock();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
