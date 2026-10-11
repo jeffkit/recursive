@@ -55,9 +55,30 @@ fi
 # never be mistaken for a dependency change. The old implementation regex-ed the
 # raw diff, and its `^[+-]\+` alternation matched every `+`/`-` line, so
 # DEP_CHANGES was always empty (#184).
+#
+# Inline tables may span lines:
+#
+#     rand = { version = "0.8", default-features = false,
+#              features = ["small_rng"] }
+#
+# so a key only counts as a dependency when it starts at brace depth 0, and the
+# whole (possibly multi-line) spec is what gets compared — otherwise the
+# continuation line `features = [...]` reads as a dependency named "features"
+# (#184 review) and an edit inside the table goes unnoticed.
 list_dependency_entries() {
     awk '
+        function emit(   s) {
+            if (pending == "") return
+            s = spec
+            gsub(/[[:space:]]+/, " ", s)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+            printf "%s\t%s\n", pending, s
+            pending = ""
+            spec = ""
+        }
         /^[[:space:]]*\[/ {
+            emit()
+            depth = 0
             header = $0
             sub(/[[:space:]]*#.*/, "", header)
             gsub(/[][[:space:]]/, "", header)
@@ -76,15 +97,25 @@ list_dependency_entries() {
             next
         }
         !in_deps { next }
-        /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/ {
+        {
             line = $0
             sub(/[[:space:]]*#.*/, "", line)
-            eq = index(line, "=")
-            name = substr(line, 1, eq - 1)
-            spec = substr(line, eq + 1)
-            gsub(/[[:space:]]/, "", name)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", spec)
-            if (name != "") printf "%s\t%s\n", name, spec
+            opens = gsub(/\{/, "{", line)
+            closes = gsub(/\}/, "}", line)
+            if (depth == 0 && line ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+                emit()
+                eq = index(line, "=")
+                pending = substr(line, 1, eq - 1)
+                gsub(/[[:space:]]/, "", pending)
+                spec = substr(line, eq + 1)
+            } else if (pending != "") {
+                spec = spec " " line
+            }
+            depth += opens - closes
+            if (depth <= 0) {
+                depth = 0
+                emit()
+            }
         }
     '
 }

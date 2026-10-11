@@ -64,3 +64,37 @@
   改成「只认本 run 的 journal」是策略收紧，会让「重新引入一个历史提过的依赖」
   之类合法改动变红，需单独评审；#184 正文的 5 条设计项里也不含它。
 - `crates/*/Cargo.toml` 与 `Cargo.lock` 仍未纳入不变量 #6 的检查面（本单不改面）。
+
+## 后续 · review 反馈收口（2026-10-11 晚）
+
+issue-keeper 的独立复验（#184 评论）通过全部验收项，只指出一处**非阻塞误报**：跨行内联表依赖。
+
+```toml
+[dependencies]
+rand = { version = "0.8", default-features = false,
+         features = ["small_rng"] }
+```
+
+续行 `features = [...]` 命中键正则 → 被当成名为 `features` 的新依赖 → 即使 journal 已正确说明
+`rand` 也照样 exit 1（门禁失败关闭 ⇒ 一次误报挡一次合法提交）。
+
+**修法**：`list_dependency_entries()` 内维护**花括号深度**，只有 depth == 0 的行才算新依赖；
+并把整段（可能跨行的）spec 缓冲到表闭合再输出 —— 顺带修掉「行内表内部的编辑不算 spec 变更」
+这个漏判。
+
+新增 3 条回归用例（`tests/invariants/dep_justification.rs`）：
+
+| 用例 | 断言 |
+|---|---|
+| `dep_gate_ignores_inline_table_continuation_keys` | 未说明 → 红，且**只点名 `rand`**，输出中不得出现 `features` |
+| `dep_gate_passes_when_inline_table_dependency_is_justified` | journal 说明 `rand` → 绿（v1 上会假红） |
+| `dep_gate_flags_edits_inside_an_inline_table` | 行内表内部加 feature（首行未变）→ 红 |
+
+**验证**：
+
+- 夹具矩阵扩到 12 例：`origin/main` 6/12、v1（本单首版补丁 `f35ecf02`）10/12、本次 12/12。
+- 负向对照：把新增的 3 个用例对着 v1 脚本跑 → **3/3 转红**，报错正是
+  `✗ features: NO JOURNAL JUSTIFICATION FOUND`（证明新断言不是同义反复）；脚本随后还原，
+  md5 校验一致。
+- `cargo test --test invariants` 63 passed（+3）；`cargo clippy --test invariants -- -D warnings`、
+  `cargo fmt --all -- --check` 干净；`check-new-deps.sh eef5f42b^` 仍识别 `libc`。

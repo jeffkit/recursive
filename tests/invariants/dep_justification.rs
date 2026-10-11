@@ -218,6 +218,27 @@ impl DepGateFixture {
             &format!("{BASELINE_CARGO_TOML}{UNJUSTIFIED_DEP} = \"2\"\n"),
         );
     }
+
+    /// A dependency whose inline table spans two lines. The continuation line
+    /// (`features = [...]`) is *not* a dependency — this is the shape that
+    /// reported a phantom `features` dependency in review.
+    fn write_multiline_inline_table(&self, features: &str) {
+        self.write(
+            "Cargo.toml",
+            &format!(
+                r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+rand = {{ version = "0.8", default-features = false,
+         features = [{features}] }}
+"#
+            ),
+        );
+    }
 }
 
 fn assert_gate_red(out: &std::process::Output, what: &str) {
@@ -341,4 +362,72 @@ fn dep_gate_verdict_is_independent_of_caller_cwd() {
     let elsewhere = tempfile::tempdir().expect("temp dir");
     let out = fixture.run(elsewhere.path(), "HEAD~1");
     assert_gate_red(&out, "an unjustified dependency when run from another cwd");
+}
+
+/// A multi-line inline table is one dependency, not one dependency plus one
+/// phantom per continuation key: the report must name `rand` and never the
+/// `features` key of its inline table.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_ignores_inline_table_continuation_keys() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"small_rng\"");
+    fixture.commit("add a multi-line inline table dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an unjustified multi-line inline table dependency");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("rand"),
+        "the report must name the dependency itself:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("features"),
+        "the inline table's continuation key must not be reported as a dependency:\n{stdout}"
+    );
+}
+
+/// The same shape with a journal entry naming the dependency must stay green —
+/// a phantom `features` entry used to turn this into a false red.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_passes_when_inline_table_dependency_is_justified() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"small_rng\"");
+    fixture.write(
+        ".dev/journal/manual-run.md",
+        "# Run\n\nWe add rand for small_rng.\n",
+    );
+    fixture.commit("add a justified multi-line inline table dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_green(&out, "a justified multi-line inline table dependency");
+}
+
+/// An edit *inside* a multi-line inline table still changes the dependency
+/// spec, so it must be caught even though the first line is untouched.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_edits_inside_an_inline_table() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"small_rng\"");
+    fixture.commit("base with a multi-line inline table");
+    fixture.write_multiline_inline_table("\"small_rng\", \"std\"");
+    fixture.commit("add a feature inside the inline table");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an edit inside a multi-line inline table");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("rand"),
+        "the report must name the dependency whose spec changed"
+    );
 }
