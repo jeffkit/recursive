@@ -72,6 +72,15 @@ fi
 # entirely — a fail-open hole in a gate that is supposed to fail closed.
 list_dependency_entries() {
     awk '
+        BEGIN {
+            # A dependency key is a bare key, a quoted key ("async-trait"), or a
+            # dotted key. The regex is assembled here because the single-quote
+            # character cannot appear literally inside this single-quoted awk
+            # program: it would terminate it (see strip_quotes below).
+            Q = "\047"
+            KEY = "(\"[^\"]*\"|" Q "[^" Q "]*" Q "|[A-Za-z0-9_-]+)"
+            KEYPAT = "^[[:space:]]*" KEY "([[:space:]]*\\.[[:space:]]*" KEY ")*[[:space:]]*="
+        }
         function emit(   s) {
             if (pending == "") return
             s = spec
@@ -80,6 +89,15 @@ list_dependency_entries() {
             printf "%s\t%s\n", pending, s
             pending = ""
             spec = ""
+        }
+        # TOML quotes are syntax, not part of the crate name. The single-quote
+        # character is written as \047 on purpose: used literally it would
+        # terminate the single-quoted awk program that wraps this function
+        # (a mistake that `bash -n` does not catch, so always run the script).
+        function strip_quotes(s) {
+            gsub(/"/, "", s)
+            gsub("\047", "", s)
+            return s
         }
         # Drop a trailing `# …` comment, keeping `#` that sits inside a string.
         function strip_comment(s,   i, c, in_str, out) {
@@ -120,6 +138,7 @@ list_dependency_entries() {
                 in_table = 1
                 name = header
                 sub(/^.*(dependencies|dev-dependencies|build-dependencies)\./, "", name)
+                name = strip_quotes(name)
                 pending = name
                 spec = "<table>"
             } else {
@@ -136,11 +155,17 @@ list_dependency_entries() {
             line = strip_comment($0)
             opens = gsub(/\{/, "{", line)
             closes = gsub(/\}/, "}", line)
-            if (depth == 0 && line ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+            # A dependency key may be a bare key, a quoted key (`"async-trait"`)
+            # or a dotted key — anything else would make the whole entry
+            # invisible to the comparison, i.e. a fail-open hole.
+            if (depth == 0 && line ~ KEYPAT) {
                 emit()
                 eq = index(line, "=")
                 pending = substr(line, 1, eq - 1)
                 gsub(/[[:space:]]/, "", pending)
+                # Quotes are TOML syntax, not part of the crate name: strip them
+                # so the journal-mention check looks for the real name.
+                pending = strip_quotes(pending)
                 spec = substr(line, eq + 1)
             } else if (pending != "") {
                 spec = spec " " line

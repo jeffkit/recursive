@@ -164,3 +164,34 @@ version = "1"                →   version = "2"
   shell 层同理（去掉该行后夹具 18/19）。
 - `cargo test --test invariants` 67 passed（+2）；clippy `-D warnings`、`fmt --all -- --check` 干净；
   `check-new-deps.sh eef5f42b^` 仍识别 `libc`；本仓 `HEAD~1` 报 `Cargo.toml unchanged`（exit 0，符合预期）。
+
+## 后续 4 · 系统性形态扫描：非裸标识符的键被整条跳过（2026-10-12）
+
+keeper 没提这一条，是我把"依赖表比对"的**键形态**做了一遍系统扫描（8 种键/值形态 × 新增依赖），
+发现 3 种会让依赖**整条从比对里消失**（同为 fail-open）：
+
+| 形态 | v4 行为 |
+|---|---|
+| `"quoted-crate" = "1"` | 漏判（键正则只认裸标识符） |
+| `dotted.crate = "1"` | 漏判 |
+| `"quoted-inline" = { version = "1" }` | 漏判 |
+| `[dependencies."quoted-table"]` | 能发现，但条目名带引号（journal 匹配会错） |
+
+**修法**：
+
+- 键正则改为「裸键 | 双引号键 | 单引号键」并允许点分组合；正则在 `BEGIN` 里拼成 `KEYPAT`。
+- 新增 `strip_quotes()` 去掉键上的 TOML 引号（引号是语法、不是 crate 名），让 journal 匹配用真实名字；
+  单引号字符统一写 `\047`。
+
+**踩坑记录（值得写下来）**：`bash -n` **抓不到**这类内嵌引号错误。我先后在 awk 程序里写了 `["']`、
+在注释里写了 `shell's`、在正则里写了 `'[^']*'` —— 三次 `bash -n` 都通过，但**实际执行**报
+`syntax error near unexpected token`。结论：**这类脚本必须实跑（至少跑一遍夹具），不能只做语法检查。**
+
+**验证**：
+
+- 夹具矩阵扩到 23 例：v4 **21/23**、v5 **23/23**。
+- 负向对照：3 条新用例对着 **v4 脚本**跑 → `quoted` 与 `dotted` 两条**转红**（`… but the gate passed`）；
+  如实说明第三条（`quoted table-form`）在 v4 上是**绿**的 —— v4 会立即输出表头名（带引号），
+  它守的是 v5 的引号归一化与整体键模式，不是 v4 的漏判。
+- `cargo test --test invariants` **70 passed**（+3）；`clippy -D warnings`、`fmt --all -- --check` 干净；
+  `check-new-deps.sh eef5f42b^` 仍识别 `libc`。

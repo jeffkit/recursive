@@ -546,3 +546,72 @@ version = "1"
         "a dependency table at EOF must not be dropped"
     );
 }
+
+/// A quoted TOML key is a legal way to name a dependency (`"async-trait" = …`).
+/// The gate used to match bare keys only, so such a dependency was invisible —
+/// the entry never reached the comparison and the gate passed silently.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_quoted_dependency_key() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}\"quoted-crate\" = \"1\"\n"),
+    );
+    fixture.commit("add a dependency with a quoted key");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a dependency declared with a quoted key");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("quoted-crate"),
+        "the report must name the dependency without its TOML quotes:\n{stdout}"
+    );
+}
+
+/// Dotted keys are legal TOML too; they must not slip past the key pattern.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_dotted_dependency_key() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}dotted.crate = \"1\"\n"),
+    );
+    fixture.commit("add a dependency with a dotted key");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a dependency declared with a dotted key");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dotted.crate"),
+        "the report must name the dotted key"
+    );
+}
+
+/// `[dependencies."quoted-table"]` is the table form of a quoted key.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_quoted_table_form_dependency() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}\n[dependencies.\"quoted-table\"]\nversion = \"1\"\n"),
+    );
+    fixture.commit("add a quoted table-form dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a quoted table-form dependency");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("quoted-table"),
+        "the report must name the quoted table without quotes"
+    );
+}
