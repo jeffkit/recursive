@@ -254,8 +254,27 @@ impl Compactor {
         ))
     }
 
+    /// Length of the leading System run — the rebuilt prompt(s) at the head of
+    /// the transcript that compaction must never summarise (issue #158).
+    ///
+    /// A compaction summary is *also* a `Role::System` message, but it is NOT
+    /// part of the prefix: freezing it there would re-preserve it verbatim on
+    /// every later compaction and let summaries accumulate forever. The run
+    /// therefore stops at the first summary, so it stays in the older slice and
+    /// is folded into the next summary.
+    pub fn leading_system_prefix_len(transcript: &[Message]) -> usize {
+        transcript
+            .iter()
+            .take_while(|m| m.role == crate::message::Role::System && !m.is_compaction_summary)
+            .count()
+    }
+
     /// Compute the safe split point for compaction: the index at which to
     /// divide "older messages to summarize" from "recent messages to keep".
+    ///
+    /// The returned index is never inside the leading System prefix
+    /// ([`Self::leading_system_prefix_len`]) — that prefix is preserved
+    /// verbatim and a summary is spliced in after it.
     ///
     /// The retained ("kept") segment must start with a User (or System)
     /// message, because OpenAI/Anthropic require that the first non-System
@@ -269,6 +288,7 @@ impl Compactor {
     ///    an Assistant-with-tool-calls, which would produce an invalid
     ///    `[System(summary), Assistant(tool_calls), Tool, …]` sequence.
     pub fn safe_split_point(transcript: &[Message], keep_n: usize) -> usize {
+        let prefix_len = Self::leading_system_prefix_len(transcript);
         let mut split = transcript.len().saturating_sub(keep_n);
         // Back up past Tool / Assistant-with-tool_calls to preserve pairing.
         loop {
@@ -284,14 +304,16 @@ impl Compactor {
                 break;
             }
         }
-        // Advance past leading System messages — never compact the system
-        // prompt.  Goal 345: without this a compaction whose `keep_recent_n`
-        // would put the system message into `older` produces a garbage summary
-        // ("No conversation found to summarize").
+        // Advance past a System message sitting exactly on the split, so the
+        // retained segment does not *start* with one. This handles System
+        // messages in the middle of the transcript; the leading run is handled
+        // separately by the `split.max(prefix_len)` clamp below.
         while split < transcript.len() && transcript[split].role == crate::message::Role::System {
             split += 1;
         }
-        split
+        // Never split inside the leading System prefix — that prefix is
+        // preserved verbatim and a summary is spliced in after it (issue #158).
+        split.max(prefix_len)
     }
 
     /// Apply compaction in-place to `transcript`, returning `(removed, summary_chars)`.
@@ -320,9 +342,14 @@ impl Compactor {
         if transcript.len() < keep_n + 2 {
             return (0, false);
         }
+        let prefix_len = Self::leading_system_prefix_len(transcript);
         let split = Self::safe_split_point(transcript, keep_n);
-        let acceptable = if split > 0 {
-            let conversational_count = transcript[..split]
+        // The summarised slice is `transcript[prefix_len..split]`: the leading
+        // System run is preserved verbatim, never counted as conversational
+        // content. `split <= prefix_len` means there is nothing but the prefix
+        // to compact — reject it instead of producing a garbage summary.
+        let acceptable = if split > prefix_len {
+            let conversational_count = transcript[prefix_len..split]
                 .iter()
                 .filter(|m| {
                     m.role == crate::message::Role::User
@@ -331,13 +358,7 @@ impl Compactor {
                 .count();
             conversational_count >= Self::MIN_CONVERSATIONAL_IN_OLDER
         } else {
-            // split == 0: older slice is empty. Preserve the pre-existing
-            // behaviour (proceed) rather than tightening it here — the g331
-            // failure mode was split > 0 with only a system-prompt older, not
-            // the empty-older edge. Tightening split == 0 is out of scope and
-            // risks breaking tests that rely on compaction firing at the
-            // minimum-length boundary.
-            true
+            false
         };
         (split, acceptable)
     }
@@ -369,11 +390,15 @@ impl Compactor {
             return Ok(None);
         }
 
+        // The leading System run is never compacted: the summary is spliced in
+        // *after* it, so `[prefix..., older...]` becomes
+        // `[prefix..., summary, kept...]` (issue #158).
+        let prefix_len = Self::leading_system_prefix_len(transcript);
         let (summary_msg, usage) = self.compact(provider, transcript, step).await?;
         let summary_chars = summary_msg.content.len();
-        let removed = split;
-        transcript.drain(..split);
-        transcript.insert(0, summary_msg);
+        let removed = split.saturating_sub(prefix_len);
+        transcript.drain(prefix_len..split);
+        transcript.insert(prefix_len, summary_msg);
         Ok(Some(CompactionOutcome {
             removed,
             summary_chars,
@@ -466,8 +491,11 @@ impl Compactor {
         transcript: &[Message],
         step: usize,
     ) -> Result<(Message, TokenUsage)> {
+        let prefix_len = Self::leading_system_prefix_len(transcript);
         let split = Self::safe_split_point(transcript, self.keep_recent_n);
-        let older = &transcript[..split];
+        // Only the messages *after* the leading System prefix are summarised —
+        // the prefix stays verbatim (issue #158).
+        let older = &transcript[prefix_len..split];
         let _recent = &transcript[split..];
 
         // Retry loop: if the summarisation call itself exceeds the context
@@ -584,11 +612,12 @@ mod tests {
             Message::assistant("recent reply".to_string()),
         ];
 
-        // keep_recent_n=2 should keep the last 2 messages verbatim
+        // keep_recent_n=2 should keep the last 2 messages verbatim; the leading
+        // System prompt stays in the prefix and is NOT part of the summary.
         let compactor = Compactor::new(100).keep_recent_n(2);
         let (summary_msg, _usage) = compactor.compact(&provider, &transcript, 5).await.unwrap();
 
-        assert!(summary_msg.content.contains("[compacted: 3 messages →"));
+        assert!(summary_msg.content.contains("[compacted: 2 messages →"));
         // The summary should mention the older messages
         assert!(summary_msg.content.contains("Summary of older messages."));
     }
@@ -1099,7 +1128,8 @@ mod tests {
             Message::user("msg3".to_string()),
         ];
 
-        // keep_recent_n=2 → split=4, compact first 4 msgs → removed=4
+        // keep_recent_n=2 → split=4; prefix=[sys] is preserved, so the three
+        // conversational messages msg1..=msg2 are summarised → removed=3.
         let compactor = Compactor::new(50).keep_recent_n(2);
         let result = compactor
             .apply_to_transcript(&provider, &mut transcript, 5)
@@ -1120,11 +1150,19 @@ mod tests {
         );
         assert_eq!(outcome.usage.completion_tokens, 56);
 
-        // Transcript must start with the compaction summary
+        assert_eq!(outcome.removed, 3, "only non-prefix messages are removed");
+        // The leading system prompt stays verbatim at index 0; the summary
+        // follows it (issue #158).
         assert_eq!(transcript[0].role, crate::message::Role::System);
-        assert!(transcript[0].is_compaction_summary);
+        assert_eq!(transcript[0].content, "sys");
+        assert!(!transcript[0].is_compaction_summary);
+        assert!(transcript[1].is_compaction_summary);
+        assert_eq!(transcript[1].role, crate::message::Role::System);
         // The 2 recent messages are preserved after the summary
-        assert!(transcript.len() >= 3, "summary + at least 2 recent");
+        assert!(
+            transcript.len() >= 3,
+            "prefix + summary + at least 2 recent"
+        );
     }
 
     #[tokio::test]
@@ -1320,10 +1358,10 @@ mod tests {
 
     #[test]
     fn safe_split_point_keeps_system_message_in_kept() {
-        // Scenario: a transcript where keep_recent_n would put the
-        // system prompt into the older portion.  After the fix, the
-        // split must advance past the system message so it stays
-        // verbatim in `kept` — never summarised.
+        // Scenario: a transcript where keep_recent_n would otherwise put the
+        // system prompt into the summarised slice. The split must never fall
+        // inside the leading System prefix, and the slice that *is* summarised
+        // (`transcript[prefix..split]`) must not contain a System message.
         let msgs = vec![
             Message::system("You are a coding agent. Be thorough.".to_string()),
             Message::user("Do task A".to_string()),
@@ -1335,8 +1373,32 @@ mod tests {
         ];
         // keep_n=4: initial split = 7-4 = 3 (msgs[3] = "Now do task B")
         // That's a User message — no backup, no forward advance.
+        let prefix = Compactor::leading_system_prefix_len(&msgs);
         let split = Compactor::safe_split_point(&msgs, 4);
-        assert_eq!(split, 3, "valid split must not be disturbed");
+        assert!(split >= 1, "split must leave room for the System prefix");
+        assert!(
+            split >= prefix,
+            "split ({split}) must never fall inside the leading System prefix ({prefix})"
+        );
+        assert!(
+            !msgs[prefix..split]
+                .iter()
+                .any(|m| m.role == crate::message::Role::System),
+            "the summarised slice must not contain a System message"
+        );
+    }
+
+    #[test]
+    fn leading_system_prefix_len_stops_at_compaction_summary() {
+        // A compaction summary is a System message but must NOT be frozen into
+        // the prefix — otherwise it would be preserved verbatim by every later
+        // compaction and summaries would accumulate without bound.
+        let msgs = vec![
+            Message::system("sys".to_string()),
+            Message::system("summary".to_string()).with_compaction_summary(),
+            Message::user("hi".to_string()),
+        ];
+        assert_eq!(Compactor::leading_system_prefix_len(&msgs), 1);
     }
 
     #[test]
@@ -1420,8 +1482,9 @@ mod tests {
             Message::user("Test everything".to_string()),
             Message::assistant("All tests pass".to_string()),
         ];
-        // keep_recent_n=2: older = transcript[..5] = [sys, user, asst, user, asst]
-        // conversational_count = 4 (≥2) → compaction proceeds
+        // keep_recent_n=2 → split=5; the summarised slice is
+        // transcript[1..5] = [user, asst, user, asst] (4 conversational, ≥2)
+        // while the System prefix stays verbatim at index 0.
         let compactor = Compactor::new(0).keep_recent_n(2);
         let result = compactor
             .apply_to_transcript(&provider, &mut transcript, 1)
@@ -1429,10 +1492,155 @@ mod tests {
             .unwrap();
 
         let outcome = result.expect("should compact when older has real conversation");
-        assert!(outcome.removed > 0);
+        assert_eq!(outcome.removed, 4);
         assert!(outcome.summary_chars > 0);
+        assert_eq!(transcript[0].content, "System prompt");
+        assert!(!transcript[0].is_compaction_summary);
+        assert_eq!(transcript[1].role, crate::message::Role::System);
+        assert!(transcript[1].is_compaction_summary);
+    }
+
+    // ========================================================================
+    // Issue #158: compaction must never swallow the leading System prefix
+    // ========================================================================
+
+    #[tokio::test]
+    async fn compaction_keeps_system_prefix_verbatim() {
+        let provider = MockProvider::new(vec![Completion {
+            content: "summary of the older conversation".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let system_text = "SYSTEM PROMPT — tools, sandbox, AGENTS.md rules.";
+        let mut transcript = vec![Message::system(system_text.to_string())];
+        for i in 0..10 {
+            transcript.push(Message::user(format!("u{i}")));
+            transcript.push(Message::assistant(format!("a{i}")));
+        }
+
+        let compactor = Compactor::new(0).keep_recent_n(8);
+        let outcome = compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap()
+            .expect("compaction must fire");
+
+        assert!(outcome.removed > 0);
+        // transcript[0..p] is the original System prompt, byte-for-byte.
+        assert_eq!(Compactor::leading_system_prefix_len(&transcript), 1);
+        assert_eq!(transcript[0].content, system_text);
         assert_eq!(transcript[0].role, crate::message::Role::System);
-        assert!(transcript[0].is_compaction_summary);
+        assert!(!transcript[0].is_compaction_summary);
+        // The summary — not the prompt — now holds the compacted history.
+        assert!(transcript[1].is_compaction_summary);
+        assert!(transcript[1]
+            .content
+            .contains("summary of the older conversation"));
+        // The prompt was never fed to the summariser.
+        let calls = provider.calls();
+        assert!(!calls.is_empty(), "summariser must have been called");
+        assert!(
+            !calls[0][0].content.contains("AGENTS.md rules."),
+            "the leading System prompt must not be rewritten into the summary"
+        );
+        assert!(
+            calls[0][0].content.contains("u0"),
+            "the older conversation must reach the summariser"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_is_inserted_after_prefix() {
+        let provider = MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        // Two leading System messages (prompt + skill-catalog anchor).
+        let mut transcript = vec![
+            Message::system("prompt".to_string()),
+            Message::system("anchor".to_string()),
+            Message::user("u1".to_string()),
+            Message::assistant("a1".to_string()),
+            Message::user("u2".to_string()),
+            Message::assistant("a2".to_string()),
+            Message::user("u3".to_string()),
+            Message::assistant("a3".to_string()),
+        ];
+
+        let compactor = Compactor::new(0).keep_recent_n(2);
+        compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap()
+            .expect("compaction must fire");
+
+        let prefix_len = Compactor::leading_system_prefix_len(&transcript);
+        assert_eq!(prefix_len, 2, "both leading System messages are the prefix");
+        assert_eq!(transcript[0].content, "prompt");
+        assert_eq!(transcript[1].content, "anchor");
+        assert!(
+            transcript[prefix_len].is_compaction_summary,
+            "the summary must be spliced in right after the prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_does_not_accumulate_summaries() {
+        // A summary is itself a System message. If it were frozen into the
+        // leading prefix it would survive every later compaction verbatim and
+        // summaries would pile up forever.
+        let provider = MockProvider::new(vec![
+            Completion {
+                content: "first summary".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+            Completion {
+                content: "second summary".to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]);
+        let mut transcript = vec![Message::system("sys".to_string())];
+        for i in 0..10 {
+            transcript.push(Message::user(format!("u{i}")));
+            transcript.push(Message::assistant(format!("a{i}")));
+        }
+        let compactor = Compactor::new(0).keep_recent_n(4);
+
+        compactor
+            .apply_to_transcript(&provider, &mut transcript, 1)
+            .await
+            .unwrap()
+            .expect("first compaction must fire");
+        for i in 10..16 {
+            transcript.push(Message::user(format!("u{i}")));
+            transcript.push(Message::assistant(format!("a{i}")));
+        }
+        compactor
+            .apply_to_transcript(&provider, &mut transcript, 2)
+            .await
+            .unwrap()
+            .expect("second compaction must fire");
+
+        assert_eq!(transcript[0].content, "sys");
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|m| m.is_compaction_summary)
+                .count(),
+            1,
+            "exactly one summary must remain after repeated compaction"
+        );
     }
 
     #[tokio::test]
@@ -1648,10 +1856,10 @@ mod tests {
     /// after applying the compaction splice.
     ///
     /// Computes the split point, serialises the expected recent messages (the
-    /// transcript slice from `split..`), applies `drain(..split)` +
-    /// `insert(0, summary)` (the same splice `apply_to_transcript` uses),
-    /// then asserts the messages at indices `1..` are byte-identical (via
-    /// `serde_json` serialisation) to the pre-compaction recent region.
+    /// transcript slice from `split..`), applies `drain(prefix..split)` +
+    /// `insert(prefix, summary)` (the same splice `apply_to_transcript` uses),
+    /// then asserts the messages after the spliced summary are byte-identical
+    /// (via `serde_json` serialisation) to the pre-compaction recent region.
     ///
     /// This proves compaction never touches the recent tail — the only thing
     /// that changes is what precedes the recent region (the summary vs. the
@@ -1661,6 +1869,7 @@ mod tests {
         keep_n: usize,
         summary_content: &str,
     ) {
+        let prefix_len = Compactor::leading_system_prefix_len(transcript);
         let split = Compactor::safe_split_point(transcript, keep_n);
 
         // Serialize expected recent messages before any mutation.
@@ -1669,19 +1878,20 @@ mod tests {
             .map(|m| serde_json::to_string(m).unwrap())
             .collect();
 
-        // Apply the same splice that `apply_to_transcript` uses:
-        // drain older, insert summary at head.
+        // Apply the same splice that `apply_to_transcript` uses: keep the
+        // leading System prefix, drain the older slice, insert the summary
+        // immediately after the prefix.
         let mut compacted = transcript.to_vec();
         let summary_msg = Message::system(format!(
             "[compacted: test summary at step 1]\n{}",
             summary_content
         ))
         .with_compaction_summary();
-        compacted.drain(..split);
-        compacted.insert(0, summary_msg);
+        compacted.drain(prefix_len..split);
+        compacted.insert(prefix_len, summary_msg);
 
-        // After splice, recent messages are at compacted[1..] (after the summary).
-        let recent_after_json: Vec<String> = compacted[1..]
+        // After splice, recent messages follow the prefix + summary.
+        let recent_after_json: Vec<String> = compacted[prefix_len + 1..]
             .iter()
             .map(|m| serde_json::to_string(m).unwrap())
             .collect();

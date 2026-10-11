@@ -944,15 +944,27 @@ struct SseAccum {
     current_event: Option<String>,
 }
 
-/// Extract system message if present, return (system_content, remaining_messages).
+/// Extract the leading System run, returning `(system_content, remaining_messages)`.
+///
+/// Anthropic's Messages API has no `system` role inside `messages` — the system
+/// prompt is a top-level field. Every *leading* System message is therefore
+/// folded into that field: the rebuilt prompt, a compaction summary spliced in
+/// after it (issue #158), and post-compact System attachments. Anything from
+/// the first non-System message onward is left untouched.
 fn extract_system_message(messages: &[Message]) -> (Option<String>, Vec<Message>) {
-    if messages.first().is_some_and(|m| m.role == Role::System) {
-        let system = messages[0].content.clone();
-        let rest = messages[1..].to_vec();
-        (Some(system), rest)
-    } else {
-        (None, messages.to_vec())
+    let leading = messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count();
+    if leading == 0 {
+        return (None, messages.to_vec());
     }
+    let system = messages[..leading]
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (Some(system), messages[leading..].to_vec())
 }
 
 /// Filter out any leading assistant messages that would cause Anthropic to reject the request.
@@ -1405,6 +1417,23 @@ mod tests {
         let (system, rest) = extract_system_message(&msgs);
         assert_eq!(system, None);
         assert_eq!(rest.len(), 1);
+    }
+
+    #[test]
+    fn extract_system_message_joins_leading_systems() {
+        // Issue #158: [prompt, summary, ...] must yield one top-level system
+        // field (API has no mid-array system role) and no System message left
+        // in `messages`.
+        let msgs = vec![
+            Message::system("prompt".to_string()),
+            Message::system("summary".to_string()).with_compaction_summary(),
+            Message::system("attachment".to_string()),
+            Message::user("Hello".to_string()),
+        ];
+        let (system, rest) = extract_system_message(&msgs);
+        assert_eq!(system, Some("prompt\n\nsummary\n\nattachment".to_string()));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].role, Role::User);
     }
 
     #[test]

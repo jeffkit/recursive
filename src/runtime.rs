@@ -881,26 +881,35 @@ impl AgentRuntime {
                     .await;
                 self.last_compact_turn =
                     Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
-                if let Some(summary) = self.transcript.first().cloned() {
+                // Issue #158: the summary is spliced in after the leading
+                // System prefix, not at index 0. Locate it explicitly; the
+                // reinjected attachments are inserted directly after it so a
+                // later compaction folds them into the older slice instead of
+                // freezing them into the prefix.
+                let summary_idx = self.transcript.iter().position(|m| m.is_compaction_summary);
+                let summary_base = summary_idx.map_or(0, |i| i + 1);
+                if let Some(idx) = summary_idx {
                     self.event_sink
                         .emit(AgentEvent::MessageAppended {
-                            message: summary,
+                            message: self.transcript[idx].clone(),
                             usage: None,
                             step: None,
                         })
                         .await;
                 }
                 // Goal-334: re-inject recently-read files right after the summary.
-                // Transcript = [summary, <file-atts>, <skill-atts>, ...preserved].
+                // Transcript = [prefix, summary, <file-atts>, <skill-atts>, ...preserved].
                 if let Some(r) = &self.file_reinjector {
                     // Capture the preserved tail BEFORE we start inserting, so the
-                    // slice indices stay valid. Summary is at index 0; preserved
-                    // messages follow.
-                    let preserved: Vec<_> = self.transcript.iter().skip(1).cloned().collect();
+                    // slice indices stay valid. The summary is at `summary_base - 1`;
+                    // preserved messages follow `summary_base`.
+                    let preserved: Vec<_> =
+                        self.transcript.iter().skip(summary_base).cloned().collect();
                     let atts = r.reinject(&preserved);
-                    // Insert at index 1, shifting forward for final order.
+                    // Insert at `summary_base`, shifting forward for final order.
                     for (offset, att) in atts.into_iter().enumerate() {
-                        Arc::make_mut(&mut self.transcript).insert(1 + offset, att.clone());
+                        Arc::make_mut(&mut self.transcript)
+                            .insert(summary_base + offset, att.clone());
                         self.event_sink
                             .emit(AgentEvent::MessageAppended {
                                 message: att,
@@ -913,20 +922,22 @@ impl AgentRuntime {
                 // Goal-335: re-invoke skills (scans pre-compact for Skill tool calls).
                 if let Some(sr) = &self.skill_reinjector {
                     let atts = sr.reinject(&pre_compact);
-                    // Insert after file attachments (which start at index 1).
-                    let insert_base: usize = 1 + self.file_reinjector.as_ref().map_or(0, |r| {
-                        // Approximate: the number of file attachments inserted.
-                        // We don't track the count directly, but we know the
-                        // file-reinjector reserves at most r.max_files slots.
-                        // Use a safer heuristic: count existing system messages
-                        // after index 1 that start with the file restore prefix.
-                        self.transcript
-                            .iter()
-                            .skip(1)
-                            .take(r.max_files)
-                            .filter(|m| m.content.starts_with("[post-compact file restore:"))
-                            .count()
-                    });
+                    // Insert after the file attachments (which start at
+                    // `summary_base`, immediately after the summary).
+                    let insert_base: usize = summary_base
+                        + self.file_reinjector.as_ref().map_or(0, |r| {
+                            // Approximate: the number of file attachments inserted.
+                            // We don't track the count directly, but we know the
+                            // file-reinjector reserves at most r.max_files slots.
+                            // Use a safer heuristic: count existing system messages
+                            // after the summary that start with the file restore prefix.
+                            self.transcript
+                                .iter()
+                                .skip(summary_base)
+                                .take(r.max_files)
+                                .filter(|m| m.content.starts_with("[post-compact file restore:"))
+                                .count()
+                        });
                     for (offset, att) in atts.into_iter().enumerate() {
                         Arc::make_mut(&mut self.transcript)
                             .insert(insert_base + offset, att.clone());
@@ -945,15 +956,16 @@ impl AgentRuntime {
                     if !atts.is_empty() {
                         // Count all already-inserted post-compact attachments so we
                         // insert right after them, before the preserved tail.
-                        let insert_base: usize = 1 + self
-                            .transcript
-                            .iter()
-                            .skip(1)
-                            .take_while(|m| {
-                                m.content.starts_with("[post-compact file restore:")
-                                    || m.content.starts_with("[post-compact skill restore:")
-                            })
-                            .count();
+                        let insert_base: usize = summary_base
+                            + self
+                                .transcript
+                                .iter()
+                                .skip(summary_base)
+                                .take_while(|m| {
+                                    m.content.starts_with("[post-compact file restore:")
+                                        || m.content.starts_with("[post-compact skill restore:")
+                                })
+                                .count();
                         for (offset, att) in atts.into_iter().enumerate() {
                             Arc::make_mut(&mut self.transcript)
                                 .insert(insert_base + offset, att.clone());
@@ -1051,7 +1063,14 @@ impl AgentRuntime {
             })
             .await;
         self.last_compact_turn = Some(turn as u32);
-        if let Some(summary) = self.transcript.first().cloned() {
+        // Issue #158: the summary sits after the leading System prefix, not at
+        // index 0 — locate it by its marker.
+        if let Some(summary) = self
+            .transcript
+            .iter()
+            .find(|m| m.is_compaction_summary)
+            .cloned()
+        {
             self.event_sink
                 .emit(AgentEvent::MessageAppended {
                     message: summary,
@@ -1669,7 +1688,11 @@ impl AgentRuntime {
         // Consider the sub-transcript up to and including the pivot.
         let scope = &transcript[..=pivot_index];
         let split = Compactor::safe_split_point(scope, compactor.keep_recent_n);
-        if split == 0 {
+        // Issue #158: never summarise the leading System prefix. `split` is
+        // clamped to at least the prefix length, so `split <= prefix_len` means
+        // there is nothing but the prefix in the compacted slice.
+        let prefix_len = Compactor::leading_system_prefix_len(transcript);
+        if split <= prefix_len {
             return Ok(());
         }
         // Create a temporary compactor with keep_recent_n=0 so that
@@ -1684,8 +1707,8 @@ impl AgentRuntime {
         let (summary_msg, usage) = zero_keep
             .compact(self.kernel.llm().as_ref(), &transcript[..split], step)
             .await?;
-        transcript.drain(..split);
-        transcript.insert(0, summary_msg);
+        transcript.drain(prefix_len..split);
+        transcript.insert(prefix_len, summary_msg);
         self.pending_compact_usage = self.pending_compact_usage.accumulate(usage);
         self.mark_transcript_rewritten();
         self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
@@ -1728,6 +1751,9 @@ impl AgentRuntime {
                 break;
             }
         }
+        // Issue #158: the leading System prefix is never summarised — a pivot
+        // inside it would otherwise truncate the rebuilt prompt away.
+        start = start.max(Compactor::leading_system_prefix_len(transcript));
         if start >= transcript.len() {
             return Ok(());
         }

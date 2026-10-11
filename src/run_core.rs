@@ -183,6 +183,10 @@ pub(crate) struct RunInnerOutcome {
     /// the API response. It represents the actual current context size and is
     /// the correct input to cross-turn compaction's `should_compact` check.
     pub(crate) last_prompt_tokens: u32,
+    /// Issue #158: number of intra-turn compactions performed. `> 0` means a
+    /// summary was spliced into `messages` (after the leading System prefix,
+    /// not at index 0), so the wrapper must find and forward it explicitly.
+    pub(crate) intra_turn_compactions: u32,
 }
 
 /// Private core holding all state needed for one run of the ReAct loop.
@@ -288,6 +292,11 @@ pub(crate) struct RunCore<'a> {
     /// the turn's `total_usage` in [`Self::make_outcome`] (the compaction call
     /// re-sends the whole history, so dropping it undercounted every run).
     pub(crate) compaction_usage: TokenUsage,
+    /// Issue #158: how many proactive intra-turn compactions ran. The summary
+    /// is spliced in *after* the leading System prefix (not at index 0), so
+    /// the wrapper can no longer detect it by position — it keys off this
+    /// count instead (`RunInnerOutcome::intra_turn_compactions`).
+    pub(crate) intra_turn_compactions: u32,
     /// Issue #115/#112: where to publish the partial outcome (usage, steps,
     /// LLM latency) when the loop exits with `Err` instead of an outcome.
     /// `None` (tests) drops it as before.
@@ -1012,6 +1021,7 @@ impl<'a> RunCore<'a> {
             steps,
             tool_audits,
             last_prompt_tokens: self.last_prompt_tokens,
+            intra_turn_compactions: self.intra_turn_compactions,
         }
     }
 
@@ -1347,6 +1357,7 @@ impl<'a> RunCore<'a> {
                 self.compaction_usage = self.compaction_usage.accumulate(outcome.usage);
                 // Success — reset the circuit breaker.
                 self.consecutive_compact_failures = 0;
+                self.intra_turn_compactions += 1;
                 let kept = kept_before - removed;
                 self.hooks.dispatch(HookEvent::PostCompact {
                     removed,
@@ -1358,12 +1369,12 @@ impl<'a> RunCore<'a> {
                     summary_chars,
                     step,
                 });
-                // The summary is inserted at index 0 by `apply_to_transcript`
-                // (never routed through `push_message`), so announce it here —
-                // otherwise it would never reach persistence sinks and the
-                // transcript would silently lose the compaction boundary's
-                // summary row.
-                if let Some(summary) = self.messages.first().filter(|m| m.is_compaction_summary) {
+                // The summary is spliced in by `apply_to_transcript` after the
+                // leading System prefix (issue #158), never routed through
+                // `push_message`, so announce it here — otherwise it would
+                // never reach persistence sinks and the transcript would
+                // silently lose the compaction boundary's summary row.
+                if let Some(summary) = self.messages.iter().find(|m| m.is_compaction_summary) {
                     self.emit(AgentEvent::MessageAppended {
                         message: summary.clone(),
                         usage: None,
@@ -2059,6 +2070,7 @@ mod tests {
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
             compaction_usage: TokenUsage::default(),
+            intra_turn_compactions: 0,
             failure_outcome: None,
         }
     }
@@ -2191,6 +2203,7 @@ mod tests {
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
             compaction_usage: TokenUsage::default(),
+            intra_turn_compactions: 0,
             failure_outcome: None,
         }
     }
@@ -2621,11 +2634,13 @@ mod tests {
         core.compactor = Some(Compactor::new(0).keep_recent_n(2));
 
         core.maybe_compact(1).await;
-        // After compaction the transcript starts with a compaction summary
+        // Issue #158: the System prefix stays at index 0; the summary follows.
+        assert_eq!(core.messages[0].content, "sys");
         assert!(
-            core.messages[0].is_compaction_summary,
-            "first message must be a compaction summary after compaction"
+            core.messages[1].is_compaction_summary,
+            "summary must directly follow the preserved System prefix"
         );
+        assert!(core.intra_turn_compactions > 0);
     }
 
     #[tokio::test]
@@ -2660,7 +2675,7 @@ mod tests {
 
         core.maybe_compact(1).await;
         assert!(
-            core.messages[0].is_compaction_summary,
+            core.messages[1].is_compaction_summary,
             "compaction must fire when bytes == threshold (bytes is NOT less than threshold)"
         );
     }
@@ -2704,7 +2719,7 @@ mod tests {
 
         core.maybe_compact(1).await;
         assert!(
-            core.messages[0].is_compaction_summary,
+            core.messages[1].is_compaction_summary,
             "compaction must fire via token threshold even though chars are below char threshold"
         );
     }
@@ -3083,6 +3098,7 @@ mod tests {
             step_retry: crate::llm::RetryPolicy::default(),
             cost_budget: None,
             compaction_usage: TokenUsage::default(),
+            intra_turn_compactions: 0,
             failure_outcome: None,
         }
     }

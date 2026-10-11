@@ -636,8 +636,8 @@ async fn compact_partial_before_summarizes_prefix_keeps_suffix() {
 
     // Compact before index 5 (u2). The exact split depends on
     // safe_split_point; assert the invariants that matter: compaction
-    // happened (transcript shrank, a summary now leads), and the tail
-    // (pivot and after) is preserved verbatim.
+    // happened (transcript shrank), the System prefix survives verbatim,
+    // the summary follows it, and the tail (pivot and after) is preserved.
     let len_before = rt.transcript().len();
     rt.compact_partial_before(5).await.unwrap();
 
@@ -648,9 +648,13 @@ async fn compact_partial_before_summarizes_prefix_keeps_suffix() {
         len_before,
         after.len()
     );
+    assert_eq!(
+        after[0].content, "sys",
+        "System prefix must survive verbatim"
+    );
     assert!(
-        after[0].content.starts_with("[compacted:"),
-        "summary must lead the transcript after compact_partial_before"
+        after[1].content.starts_with("[compacted:"),
+        "summary must follow the System prefix after compact_partial_before"
     );
     // The pivot (index 5 = "u2") and the message after it (a2) must be
     // preserved verbatim in the tail.

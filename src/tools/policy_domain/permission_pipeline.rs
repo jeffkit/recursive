@@ -49,9 +49,14 @@ use crate::tools::ToolRegistry;
 ///   must surface `error` to the user and persist `audit` alongside it.
 /// - [`CheckOutcome::Allow`] — the call is allowed. `arguments` is the
 ///   final argument set (possibly hook-transformed) to pass to the tool.
+///
+/// `Deny` boxes its `AuditMeta`: at ~150 bytes it would make that variant
+/// ~250 bytes against `Allow`'s 32, tripping `clippy::large_enum_variant`
+/// in the bare feature matrix. Denials are rare, so the allocation is off
+/// the hot path.
 #[derive(Debug)]
 pub enum CheckOutcome {
-    Deny { error: Error, audit: AuditMeta },
+    Deny { error: Error, audit: Box<AuditMeta> },
     Allow { arguments: Value },
 }
 
@@ -118,7 +123,7 @@ impl<'a> PermissionPipeline<'a> {
                     name: tool_name.into(),
                     reason: DecisionReason::SafetyCheck { path },
                 },
-                audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
             };
         }
 
@@ -139,7 +144,7 @@ impl<'a> PermissionPipeline<'a> {
                                     error: Error::PermissionDeniedLimit {
                                         name: tool_name.into(),
                                     },
-                                    audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                                    audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                                 };
                             }
                             return CheckOutcome::Deny {
@@ -147,7 +152,7 @@ impl<'a> PermissionPipeline<'a> {
                                     name: tool_name.into(),
                                     reason: DecisionReason::Mode(PermissionMode::Auto),
                                 },
-                                audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                                audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                             };
                         }
                         Ok((false, _)) => {
@@ -188,7 +193,7 @@ impl<'a> PermissionPipeline<'a> {
                             name: tool_name.into(),
                             reason: reason.clone(),
                         },
-                        audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                        audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                     };
                 }
                 Permission::Unknown => {
@@ -204,7 +209,7 @@ impl<'a> PermissionPipeline<'a> {
                         name: tool_name.into(),
                         reason: DecisionReason::Mode(PermissionMode::Strict),
                     },
-                    audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                    audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                 };
             }
 
@@ -219,7 +224,7 @@ impl<'a> PermissionPipeline<'a> {
                                     name: tool_name.into(),
                                     reason: DecisionReason::Hook { name: reason },
                                 },
-                                audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                                audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                             };
                         }
                         PermissionDecision::Transform(new_args) => {
@@ -230,7 +235,7 @@ impl<'a> PermissionPipeline<'a> {
                             if let Err(e) = self.recheck_policy(canonical, &new_args) {
                                 return CheckOutcome::Deny {
                                     error: e,
-                                    audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                                    audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                                 };
                             }
                             arguments = new_args;
@@ -245,7 +250,7 @@ impl<'a> PermissionPipeline<'a> {
                             if let Err(e) = self.recheck_policy(canonical, &arguments) {
                                 return CheckOutcome::Deny {
                                     error: e,
-                                    audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                                    audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                                 };
                             }
                         }
@@ -265,7 +270,7 @@ impl<'a> PermissionPipeline<'a> {
                                 name: "PermissionRequest".into(),
                             },
                         },
-                        audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                        audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                     };
                 }
                 let hook_input = crate::hooks::external::HookInput {
@@ -300,7 +305,7 @@ impl<'a> PermissionPipeline<'a> {
                                 name: tool_name.into(),
                                 reason: DecisionReason::Hook { name: hook_reason },
                             },
-                            audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                            audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                         };
                     }
                     (_, crate::hooks::HookAction::Continue) => {}
@@ -310,7 +315,7 @@ impl<'a> PermissionPipeline<'a> {
                                 name: tool_name.into(),
                                 reason: DecisionReason::Hook { name: hook_reason },
                             },
-                            audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                            audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
                         };
                     }
                 }
@@ -337,7 +342,7 @@ impl<'a> PermissionPipeline<'a> {
         if let Err(e) = self.recheck_policy(canonical, &arguments) {
             return CheckOutcome::Deny {
                 error: e,
-                audit: AuditMeta::synthetic_unknown_tool(tool_name),
+                audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
             };
         }
 
@@ -958,7 +963,10 @@ mod goal_h2_perm_pipeline {
             message: "blocked".into(),
         };
         let audit = crate::tools::AuditMeta::synthetic_unknown_tool("test");
-        let outcome = CheckOutcome::Deny { error: err, audit };
+        let outcome = CheckOutcome::Deny {
+            error: err,
+            audit: Box::new(audit),
+        };
         assert!(
             outcome.is_deny(),
             "Deny outcome must return true from is_deny()"

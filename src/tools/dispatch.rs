@@ -133,7 +133,7 @@ impl ToolRegistry {
         match pipeline.check(name, arguments).await {
             permission_pipeline::CheckOutcome::Deny { error, audit } => ToolDispatch {
                 result: Err(error),
-                audit,
+                audit: *audit,
             },
             permission_pipeline::CheckOutcome::Allow { arguments } => {
                 self.dispatch_after_permission_check(name, arguments).await

@@ -572,9 +572,12 @@ fn load_thread_seed(session_dir: &Path) -> Vec<crate::message::Message> {
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
+    // The stored system prompt is dropped (the runtime rebuilds its own), but
+    // a compaction summary is also a `Role::System` message and carries real
+    // conversation state — keep it (issue #158).
     if msgs
         .first()
-        .is_some_and(|m| m.role == crate::message::Role::System)
+        .is_some_and(|m| m.role == crate::message::Role::System && !m.is_compaction_summary)
     {
         msgs.remove(0);
     }
@@ -2230,6 +2233,32 @@ mod tests {
             vec!["real turn"],
             "the runtime assembles its own prompt and an unpaired tool result \
              would break invariant #8"
+        );
+    }
+
+    #[test]
+    fn load_thread_seed_keeps_a_compaction_summary() {
+        // Issue #158: a persisted transcript is [system, summary, ...]. The
+        // stored prompt is dropped (rebuilt at runtime) but the compaction
+        // summary is real conversation state and must survive the seed.
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-compact").unwrap();
+        write_transcript(
+            &dir,
+            &[
+                crate::message::Message::system("stored prompt"),
+                crate::message::Message::system("summary").with_compaction_summary(),
+                user("real turn"),
+            ],
+        );
+
+        let seed = load_thread_seed(&dir);
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["summary", "real turn"],
+            "the stored prompt is dropped but the compaction summary survives"
         );
     }
 

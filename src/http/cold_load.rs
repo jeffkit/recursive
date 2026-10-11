@@ -302,8 +302,13 @@ pub(super) async fn get_or_load_session(
 /// the 404 semantics and never materialize a ghost session.
 fn normalize_stored_transcript(msgs: Vec<Message>) -> Option<Vec<Message>> {
     let mut msgs = msgs;
-    // 1. Stored system message → dropped (the runtime rebuilds its own).
-    if msgs.first().is_some_and(|m| m.role == Role::System) {
+    // 1. Stored system message → dropped (the runtime rebuilds its own). A
+    //    compaction summary is also a `Role::System` message but carries real
+    //    conversation state, so it is kept (issue #158).
+    if msgs
+        .first()
+        .is_some_and(|m| m.role == Role::System && !m.is_compaction_summary)
+    {
         msgs.remove(0);
     }
     // 2. Leading orphan tool results → dropped until the first non-Tool
@@ -502,6 +507,35 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(!out.iter().any(|m| m.role == Role::System));
         assert_eq!(out[0].content, "ping");
+    }
+
+    #[test]
+    fn normalize_keeps_compaction_summary_behind_system_prompt() {
+        // Issue #158: compaction leaves [system, summary, ...]. The stored
+        // prompt is dropped (the runtime rebuilds it), but the summary must
+        // survive — otherwise cold load loses all compacted history.
+        let out = normalize_stored_transcript(vec![
+            system("stored prompt"),
+            Message::system("summary".to_string()).with_compaction_summary(),
+            user("ping"),
+            assistant("pong"),
+        ])
+        .expect("restorable");
+        assert_eq!(out.len(), 3);
+        assert!(out[0].is_compaction_summary);
+        assert_eq!(out[0].content, "summary");
+        assert_eq!(out[1].content, "ping");
+    }
+
+    #[test]
+    fn normalize_keeps_leading_compaction_summary_without_prompt() {
+        let out = normalize_stored_transcript(vec![
+            Message::system("summary".to_string()).with_compaction_summary(),
+            user("ping"),
+        ])
+        .expect("restorable");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].is_compaction_summary);
     }
 
     #[test]

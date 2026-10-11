@@ -146,13 +146,20 @@ async fn http_session_compacts_cross_turn_and_continues() {
     let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let messages = detail["messages"].as_array().expect("messages array");
     assert!(
-        !messages.is_empty(),
-        "compacted transcript must lead with the summary message"
+        messages.len() >= 2,
+        "compacted transcript must hold the System prompt + summary"
     );
-    let head = messages[0]["content"].as_str().unwrap_or_default();
+    // Issue #158: the rebuilt System prompt stays at index 0; the compaction
+    // summary is spliced in immediately after it.
+    assert_eq!(
+        messages[0]["role"].as_str(),
+        Some("system"),
+        "the System prompt must survive compaction at index 0"
+    );
+    let head = messages[1]["content"].as_str().unwrap_or_default();
     assert!(
         head.contains(marker_a),
-        "after turn 5 the transcript must start with the compaction summary, got: {head:?}"
+        "after turn 5 the summary must follow the System prompt, got: {head:?}"
     );
 
     // 3) Conversation continues past compaction — the pre-393 failure mode
@@ -182,10 +189,15 @@ async fn http_session_compacts_cross_turn_and_continues() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let messages = detail["messages"].as_array().expect("messages array");
-    let head = messages[0]["content"].as_str().unwrap_or_default();
+    assert_eq!(
+        messages[0]["role"].as_str(),
+        Some("system"),
+        "the System prompt must still lead after a second compaction"
+    );
+    let head = messages[1]["content"].as_str().unwrap_or_default();
     assert!(
         head.contains(marker_b),
-        "turn 6 must trigger a second compaction pass, transcript head: {head:?}"
+        "turn 6 must trigger a second compaction pass, summary after System prompt: {head:?}"
     );
     assert!(
         messages.len() <= 10,

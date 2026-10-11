@@ -409,6 +409,7 @@ impl AgentKernel {
                     self.budget_pricing,
                 ),
                 compaction_usage: TokenUsage::default(),
+                intra_turn_compactions: 0,
                 failure_outcome: ctx.failure_outcome,
             }
         };
@@ -418,12 +419,16 @@ impl AgentKernel {
         // Extract only the messages produced during this turn.
         //
         // If `RunCore` performed intra-turn compaction, a summary message
-        // (marked with `is_compaction_summary`) is inserted at position 0.
-        // `inner.messages[input_len..]` would miss that summary, so detect
-        // it and prepend.
+        // (marked with `is_compaction_summary`) is spliced in *after* the
+        // leading System prefix — so it is neither part of
+        // `inner.messages[input_len..]` nor necessarily at index 0 (issue
+        // #158). `RunCore` reports the compaction count; use it to detect the
+        // event and locate the summary by its marker.
         let mut new_messages = turn_delta_messages(&inner.messages, input_len);
-        if !inner.messages.is_empty() && inner.messages[0].is_compaction_summary {
-            new_messages.insert(0, inner.messages[0].clone());
+        if inner.intra_turn_compactions > 0 {
+            if let Some(summary) = inner.messages.iter().find(|m| m.is_compaction_summary) {
+                new_messages.insert(0, summary.clone());
+            }
         }
 
         Ok(TurnOutcome {
