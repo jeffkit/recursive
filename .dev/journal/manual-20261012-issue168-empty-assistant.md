@@ -266,12 +266,43 @@ tool-call-only 中断返回空 partial / transcript 里出现空 assistant 行�
   不判空，写的是事件流里的任何 `MessageAppended`。加在那里最“终极”，但会让
   `SessionWriter`（测试/工具也直接用）不能如实写出调用方给的内容，改动面更大；
   本次按规格只做“生产端 + 序列化 + 加载”三层。
-- **`#[mutants::skip]` 的必要性**：`has_persistable_partial` 的 `reasoning_content`
-  项在“返回即退出”的语义下不可达可观测差异；别的变异（判据整体替换、常量 true/false）
-  本可被新用例杀掉，故 skip 只覆盖这一项不可判定的等价性，不掩盖行为变异。
-  `is_empty_assistant` / `has_persistable_interrupt` 同样按此标准标注，且各自都有
-  同文件单测。该仓 `mutants` 是 dev-dependency 且 `#[cfg_attr(test, …)]`，生产
-  二进制零影响。
+- **`#[mutants::skip]` 的适用范围（keeper 复核后收窄）**：只有两个
+  `has_persistable_partial`（openai / anthropic）带 skip，且各自在 doc comment 里
+  给出了等价性论证（`reasoning_content` 项在“返回即退出”的语义下不可达可观测差异）。
+  `message::is_empty_assistant` / `message::has_persistable_interrupt` **不再**带
+  skip —— 它们是本单的核心判据，而 `agent-mutants.sh` 的作用域正是变更文件，
+  skip 掉等于让门禁对本单“守住了什么”失明。cargo-mutants 会将
+  `#[cfg_attr(test, mutants::skip)]` 视同 `#[mutants::skip]`（`visit.rs:918-920`）。
+  skip 计数因此为 27（基线）→ 31（本单初版）→ **29**（现）。
+  可删除的依据：keeper 的整函数替换实验（`is_empty_assistant` 恒 true、
+  `has_persistable_interrupt` 恒 false）经 `--lib -- message:: session::reader run_core`
+  得 129 passed / 15 failed（恒 true 被 4 条 `is_empty_assistant_*` +
+  `session::reader::*` 杀死；恒 false 被
+  `has_persistable_interrupt_keeps_text_and_reasoning_only` + 3 条
+  `run_core::interrupted_*` 杀死），算子级变异（`&&`→`||`、`==`→`!=`、去 `.trim()`、
+  去掉 reasoning / tool_calls 项）也都各有断言钉住。删除后同筛选
+  **144 passed / 0 failed**。该仓 `mutants` 是 dev-dependency 且
+  `#[cfg_attr(test, …)]`，生产二进制零影响。
 - 真实 Anthropic 端点未打（无凭据）；结论建立在“空文本块被拒”这一已文档化约束与
   本仓序列化路径上，mock 断言的是过去会 400 的那个确切 wire shape。
 - 全程未 push、未建 PR/gist、未评论 issue；仅本地提交。
+
+## review 收尾（keeper 复核第二批）
+
+两项必改，均不动逻辑：
+
+1. **删掉 `message::is_empty_assistant` / `message::has_persistable_interrupt` 的
+   `#[cfg_attr(test, mutants::skip)]`**（原因与实测见上面 Notes 的 skip 条目）。
+   两个函数的 doc comment 同步改写：不再声称“同样按等价性标准标注”，改为写明
+   “**故意不 skip**”以及每条变异由哪条断言杀死。
+2. **修掉注释指向已删除符号**：`src/session/orphan.rs` 的
+   `orphan_result_insert_at_messages` 原本写 “mirroring / Same shape as
+   `reader::orphan_result_insert_at`”，而该 entry 版函数已在本单返工中删除。
+   改为说明它是该规则的**唯一**实现：`SessionReader::load_messages_with_orphan_results`
+   先过滤成 `Message` 再经 `splice_orphan_results` 委托到这里，索引与 splice 目标
+   永远是同一序列；并记录了 entry 版孪生函数为何被删（两边混用正是越界 splice 的成因）。
+
+（keeper 提到的行号漂移 `has_persistable_partial` → `openai.rs:988` /
+anthropic 谓词 → `:670`：journal 与 doc comment 原先并未引用这两个函数的行号，
+故无需对齐。当前坐标：openai skip 属性 `:988` / 函数 `:989`；anthropic skip 属性
+`:669` / 函数 `:670`。）

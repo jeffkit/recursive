@@ -155,7 +155,16 @@ impl Message {
 /// equally empty on the wire) and messages carrying `tool_calls` are NEVER
 /// matched, because dropping one would orphan its `Role::Tool` results and
 /// break invariant #8.
-#[cfg_attr(test, mutants::skip)]
+///
+/// Deliberately **not** `#[mutants::skip]`: this predicate is the core of the
+/// issue-#168 guard, so the scoped mutation gate must be able to see it. Every
+/// mutant is killed by the tests below — whole-function replacement with `true`
+/// / `false` by `is_empty_assistant_matches_empty_and_whitespace_only` +
+/// `..._rejects_non_empty_content` + `..._never_matches_a_tool_call_carrier` +
+/// `..._rejects_every_other_role`; `==`→`!=` and `&&`→`||` by
+/// `..._rejects_every_other_role` / `..._rejects_non_empty_content`; dropping
+/// `.trim()` by `..._matches_empty_and_whitespace_only`; dropping the
+/// `tool_calls` term by `..._never_matches_a_tool_call_carrier`.
 pub fn is_empty_assistant(m: &Message) -> bool {
     m.role == Role::Assistant && m.content.trim().is_empty() && m.tool_calls.is_empty()
 }
@@ -186,7 +195,17 @@ pub fn is_empty_assistant(m: &Message) -> bool {
 /// So: persist when there is text **or** reasoning; drop only when there is
 /// neither. Same carve-out for `tool_calls`: such a message is never
 /// "nothing".
-#[cfg_attr(test, mutants::skip)]
+///
+/// Deliberately **not** `#[mutants::skip]`: whole-function replacement with
+/// `true` / `false` is killed by
+/// `has_persistable_interrupt_drops_only_nothing` (empty and whitespace-only
+/// content, blank reasoning) together with
+/// `..._keeps_text_and_reasoning_only` and the
+/// `run_core::tests::interrupted_*` cases; `==`→`!=` and `&&`→`||` by
+/// `..._rejects_non_assistant_roles` / `..._drops_only_nothing`, dropping
+/// `.trim()` by `..._drops_only_nothing` (whitespace-only reasoning), and
+/// deleting the `reasoning_content` or `tool_calls` term by
+/// `..._keeps_text_and_reasoning_only`.
 pub fn has_persistable_interrupt(m: &Message) -> bool {
     m.role == Role::Assistant
         && (!m.content.trim().is_empty()
