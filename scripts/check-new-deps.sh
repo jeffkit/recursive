@@ -13,6 +13,7 @@
 #   base-ref: git ref to diff against (default: HEAD~1)
 #   Exits 0 if all dep changes have journal justification.
 #   Exits 1 if any dep change lacks a journal entry.
+#   Exits 2 if the base ref cannot be resolved (the gate fails closed, #184).
 
 set -euo pipefail
 
@@ -27,33 +28,86 @@ if [ ! -d "$JOURNAL_DIR" ]; then
     exit 0
 fi
 
+# The base ref must resolve, and the gate must FAIL when it does not. A shallow
+# CI clone (actions/checkout defaults to fetch-depth: 1) has no HEAD~1; the old
+# code swallowed that git error with `2>/dev/null` and reported "unchanged", so
+# the gate never actually ran (#184).
+if ! git -C "$WORKSPACE" rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null; then
+    echo "FAIL: base ref '$BASE_REF' does not resolve — cannot check invariant #6." >&2
+    echo "      CI must check out with fetch-depth >= 2 (see issue #184)." >&2
+    exit 2
+fi
+
+# All git calls use -C "$WORKSPACE" so the verdict does not depend on the
+# caller's cwd (the invariant test runs the script from a fixture repo). The
+# newline padding lets the checks below match a whole path (never a prefix or
+# suffix of one) without piping into `grep -q`.
+CHANGED_FILES=$'\n'"$(git -C "$WORKSPACE" diff --name-only "$BASE_REF" HEAD)"$'\n'
+
 # Check if Cargo.toml changed vs base-ref
-if ! git diff --name-only "$BASE_REF" HEAD 2>/dev/null | grep -q 'Cargo.toml'; then
+if [[ "$CHANGED_FILES" != *$'\nCargo.toml'$'\n'* ]]; then
     echo "OK: Cargo.toml unchanged vs $BASE_REF"
     exit 0
 fi
 
-# Extract dependency changes from the diff
-echo "=== Cargo.toml dependency changes vs $BASE_REF ==="
-DEP_CHANGES=$(git diff "$BASE_REF" HEAD -- Cargo.toml | grep '^[+-]' | grep -v '^[+-]\+\|^[+-]version\|^[+-]authors\|^[+-]description\|^[+-]license\|^[+-]repository\|^[+-]homepage\|^[+-]documentation\|^[+-]keywords\|^[+-]categories\|^[+-]rust-version\|^[+-]exclude\|^[+-]default-run\|^[+-]edition' || true)
+# List "<name>\t<spec>" for every key of a dependency table in the Cargo.toml
+# read from stdin. Section-aware on purpose: `[package] version = "0.8.3"` must
+# never be mistaken for a dependency change. The old implementation regex-ed the
+# raw diff, and its `^[+-]\+` alternation matched every `+`/`-` line, so
+# DEP_CHANGES was always empty (#184).
+list_dependency_entries() {
+    awk '
+        /^[[:space:]]*\[/ {
+            header = $0
+            sub(/[[:space:]]*#.*/, "", header)
+            gsub(/[][[:space:]]/, "", header)
+            if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)$/) {
+                in_deps = 1
+            } else if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)\./) {
+                # Table form: [dependencies.serde] + version/features keys.
+                # The dependency name is the part after the table keyword.
+                in_deps = 0
+                name = header
+                sub(/^.*(dependencies|dev-dependencies|build-dependencies)\./, "", name)
+                printf "%s\t<table>\n", name
+            } else {
+                in_deps = 0
+            }
+            next
+        }
+        !in_deps { next }
+        /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            eq = index(line, "=")
+            name = substr(line, 1, eq - 1)
+            spec = substr(line, eq + 1)
+            gsub(/[[:space:]]/, "", name)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", spec)
+            if (name != "") printf "%s\t%s\n", name, spec
+        }
+    '
+}
 
-if [ -z "$DEP_CHANGES" ]; then
+# Extract dependency changes by comparing the two revisions' dependency tables,
+# not the diff text: a dependency needs justification when it is new, or when
+# its spec changed (the name/spec pair exists only on the HEAD side). Removing a
+# dependency never needs one, and a `[package]` metadata edit is invisible here.
+echo "=== Cargo.toml dependency changes vs $BASE_REF ==="
+BASE_DEPS=$(git -C "$WORKSPACE" show "$BASE_REF:Cargo.toml" 2>/dev/null \
+    | list_dependency_entries | sort || true)
+HEAD_DEPS=$(list_dependency_entries < "$CARGO_TOML" | sort)
+
+CHANGED_DEPS=$(comm -13 <(printf '%s\n' "$BASE_DEPS") <(printf '%s\n' "$HEAD_DEPS") \
+    | cut -f1 | grep -v '^$' | sort -u || true)
+
+if [ -z "$CHANGED_DEPS" ]; then
     echo "OK: No dependency changes detected in Cargo.toml"
     exit 0
 fi
 
-echo "$DEP_CHANGES"
-echo ""
-
-# Get list of changed/new deps
-CHANGED_DEPS=$(echo "$DEP_CHANGES" | grep '^[+-]' | sed 's/^[+-]\s*//' | grep -oP '^\w[\w-]*' | sort -u || true)
-
-if [ -z "$CHANGED_DEPS" ]; then
-    echo "OK: No dependency names extracted"
-    exit 0
-fi
-
-echo "Changed dependencies: $CHANGED_DEPS"
+echo "Changed dependencies:"
+echo "$CHANGED_DEPS" | sed 's/^/  /'
 echo ""
 
 # Check journal entries since base-ref for justification
@@ -63,7 +117,8 @@ for dep in $CHANGED_DEPS; do
     for journal_file in "$JOURNAL_DIR"/*.md; do
         [ -f "$journal_file" ] || continue
         # Check if this journal was created/modified after the base ref
-        if git diff --name-only "$BASE_REF" HEAD 2>/dev/null | grep -q "$(basename "$journal_file")"; then
+        journal_rel=".dev/journal/$(basename "$journal_file")"
+        if [[ "$CHANGED_FILES" == *$'\n'"$journal_rel"$'\n'* ]]; then
             if grep -qi "$dep" "$journal_file" 2>/dev/null; then
                 echo "  + $dep justified in $(basename "$journal_file")"
                 FOUND=true
