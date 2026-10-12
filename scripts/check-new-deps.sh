@@ -13,6 +13,28 @@
 #   base-ref: git ref to diff against (default: HEAD~1)
 #   Exits 0 if all dep changes have journal justification.
 #   Exits 1 if any dep change lacks a journal entry.
+#   Exits 2 if the base ref cannot be resolved (the gate fails closed, #184).
+#
+# Known limitation (deliberately not fixed, #184 review): comment stripping
+# tracks double quotes only, so a `#` inside a *single-quoted* TOML literal
+# ('1#x') or inside a multi-line literal ('''…''' / """…""") still starts a
+# comment. Measured consequence (NOT "the entry is dropped"):
+#
+#     [dependencies]
+#     bad  = { version = '1#x' }     # gets truncated to `bad = { version = '1`
+#     next = "2"                     # swallowed into bad's spec, never compared
+#
+# `bad` is still reported (the entry is flushed at EOF), but because its closing
+# brace was eaten, every *following* entry in that table is merged into its spec
+# and therefore never compared — those dependencies are the ones silently missed,
+# and `bad` itself looks "modified". Same for `features = ['a#b'] }` on a
+# continuation line.
+#
+# Cargo itself always writes double quotes for [dependencies]; `cargo add` and
+# Cargo.lock round-trips never produce these shapes, so closing it would mean
+# hand-writing a TOML lexer for a form the toolchain does not emit. If it ever
+# shows up for real: add a `'` state bit (handling ''' too) plus a fixture case
+# covering the *following sibling entries*, which is the part that actually leaks.
 
 set -euo pipefail
 
@@ -27,33 +49,179 @@ if [ ! -d "$JOURNAL_DIR" ]; then
     exit 0
 fi
 
+# The base ref must resolve, and the gate must FAIL when it does not. A shallow
+# CI clone (actions/checkout defaults to fetch-depth: 1) has no HEAD~1; the old
+# code swallowed that git error with `2>/dev/null` and reported "unchanged", so
+# the gate never actually ran (#184).
+if ! git -C "$WORKSPACE" rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null; then
+    echo "FAIL: base ref '$BASE_REF' does not resolve — cannot check invariant #6." >&2
+    echo "      CI must check out with fetch-depth >= 2 (see issue #184)." >&2
+    exit 2
+fi
+
+# All git calls use -C "$WORKSPACE" so the verdict does not depend on the
+# caller's cwd (the invariant test runs the script from a fixture repo). The
+# newline padding lets the checks below match a whole path (never a prefix or
+# suffix of one) without piping into `grep -q`.
+CHANGED_FILES=$'\n'"$(git -C "$WORKSPACE" diff --name-only "$BASE_REF" HEAD)"$'\n'
+
 # Check if Cargo.toml changed vs base-ref
-if ! git diff --name-only "$BASE_REF" HEAD 2>/dev/null | grep -q 'Cargo.toml'; then
+if [[ "$CHANGED_FILES" != *$'\nCargo.toml'$'\n'* ]]; then
     echo "OK: Cargo.toml unchanged vs $BASE_REF"
     exit 0
 fi
 
-# Extract dependency changes from the diff
-echo "=== Cargo.toml dependency changes vs $BASE_REF ==="
-DEP_CHANGES=$(git diff "$BASE_REF" HEAD -- Cargo.toml | grep '^[+-]' | grep -v '^[+-]\+\|^[+-]version\|^[+-]authors\|^[+-]description\|^[+-]license\|^[+-]repository\|^[+-]homepage\|^[+-]documentation\|^[+-]keywords\|^[+-]categories\|^[+-]rust-version\|^[+-]exclude\|^[+-]default-run\|^[+-]edition' || true)
+# List "<name>\t<spec>" for every key of a dependency table in the Cargo.toml
+# read from stdin. Section-aware on purpose: `[package] version = "0.8.3"` must
+# never be mistaken for a dependency change. The old implementation regex-ed the
+# raw diff, and its `^[+-]\+` alternation matched every `+`/`-` line, so
+# DEP_CHANGES was always empty (#184).
+#
+# Inline tables may span lines:
+#
+#     rand = { version = "0.8", default-features = false,
+#              features = ["small_rng"] }
+#
+# so a key only counts as a dependency when it starts at brace depth 0, and the
+# whole (possibly multi-line) spec is what gets compared — otherwise the
+# continuation line `features = [...]` reads as a dependency named "features"
+# (#184 review) and an edit inside the table goes unnoticed.
+#
+# Comments are stripped only outside double-quoted strings: a `#` inside a spec
+# (`features = ["a#b"] }`) must not swallow the closing brace, otherwise the
+# depth never returns to 0 and the dependency is dropped from the comparison
+# entirely — a fail-open hole in a gate that is supposed to fail closed.
+list_dependency_entries() {
+    awk '
+        BEGIN {
+            # A dependency key is a bare key, a quoted key ("async-trait"), or a
+            # dotted key. The regex is assembled here because the single-quote
+            # character cannot appear literally inside this single-quoted awk
+            # program: it would terminate it (see strip_quotes below).
+            Q = "\047"
+            KEY = "(\"[^\"]*\"|" Q "[^" Q "]*" Q "|[A-Za-z0-9_-]+)"
+            KEYPAT = "^[[:space:]]*" KEY "([[:space:]]*\\.[[:space:]]*" KEY ")*[[:space:]]*="
+        }
+        function emit(   s) {
+            if (pending == "") return
+            s = spec
+            gsub(/[[:space:]]+/, " ", s)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+            printf "%s\t%s\n", pending, s
+            pending = ""
+            spec = ""
+        }
+        # TOML quotes are syntax, not part of the crate name. The single-quote
+        # character is written as \047 on purpose: used literally it would
+        # terminate the single-quoted awk program that wraps this function
+        # (a mistake that `bash -n` does not catch, so always run the script).
+        function strip_quotes(s) {
+            gsub(/"/, "", s)
+            gsub("\047", "", s)
+            return s
+        }
+        # Drop a trailing `# …` comment, keeping `#` that sits inside a string.
+        function strip_comment(s,   i, c, in_str, out) {
+            in_str = 0
+            out = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c == "\\" && in_str) {
+                    out = out c substr(s, i + 1, 1)
+                    i++
+                    continue
+                }
+                if (c == "\"") {
+                    in_str = !in_str
+                    out = out c
+                    continue
+                }
+                if (c == "#" && !in_str) break
+                out = out c
+            }
+            return out
+        }
+        /^[[:space:]]*\[/ {
+            emit()
+            depth = 0
+            in_table = 0
+            header = strip_comment($0)
+            gsub(/[][[:space:]]/, "", header)
+            if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)$/) {
+                in_deps = 1
+            } else if (header ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)\./) {
+                # Table form: `[dependencies.serde]` followed by version/features
+                # keys. The dependency is the part after the table keyword, and
+                # its *whole body* is its spec — otherwise an edit inside the
+                # table (a version bump, an added feature) would leave the
+                # name/spec pair unchanged and the gate would silently pass it.
+                in_deps = 0
+                in_table = 1
+                name = header
+                sub(/^.*(dependencies|dev-dependencies|build-dependencies)\./, "", name)
+                name = strip_quotes(name)
+                pending = name
+                spec = "<table>"
+            } else {
+                in_deps = 0
+            }
+            next
+        }
+        !in_deps && !in_table { next }
+        in_table {
+            spec = spec " " strip_comment($0)
+            next
+        }
+        {
+            line = strip_comment($0)
+            opens = gsub(/\{/, "{", line)
+            closes = gsub(/\}/, "}", line)
+            # A dependency key may be a bare key, a quoted key (`"async-trait"`)
+            # or a dotted key — anything else would make the whole entry
+            # invisible to the comparison, i.e. a fail-open hole.
+            if (depth == 0 && line ~ KEYPAT) {
+                emit()
+                eq = index(line, "=")
+                pending = substr(line, 1, eq - 1)
+                gsub(/[[:space:]]/, "", pending)
+                # Quotes are TOML syntax, not part of the crate name: strip them
+                # so the journal-mention check looks for the real name.
+                pending = strip_quotes(pending)
+                spec = substr(line, eq + 1)
+            } else if (pending != "") {
+                spec = spec " " line
+            }
+            depth += opens - closes
+            if (depth <= 0) {
+                depth = 0
+                emit()
+            }
+        }
+        # A dependency table at EOF (or an unterminated inline table) must still
+        # be reported: table-form entries are buffered until the next header.
+        END { emit() }
+    '
+}
 
-if [ -z "$DEP_CHANGES" ]; then
+# Extract dependency changes by comparing the two revisions' dependency tables,
+# not the diff text: a dependency needs justification when it is new, or when
+# its spec changed (the name/spec pair exists only on the HEAD side). Removing a
+# dependency never needs one, and a `[package]` metadata edit is invisible here.
+echo "=== Cargo.toml dependency changes vs $BASE_REF ==="
+BASE_DEPS=$(git -C "$WORKSPACE" show "$BASE_REF:Cargo.toml" 2>/dev/null \
+    | list_dependency_entries | sort || true)
+HEAD_DEPS=$(list_dependency_entries < "$CARGO_TOML" | sort)
+
+CHANGED_DEPS=$(comm -13 <(printf '%s\n' "$BASE_DEPS") <(printf '%s\n' "$HEAD_DEPS") \
+    | cut -f1 | grep -v '^$' | sort -u || true)
+
+if [ -z "$CHANGED_DEPS" ]; then
     echo "OK: No dependency changes detected in Cargo.toml"
     exit 0
 fi
 
-echo "$DEP_CHANGES"
-echo ""
-
-# Get list of changed/new deps
-CHANGED_DEPS=$(echo "$DEP_CHANGES" | grep '^[+-]' | sed 's/^[+-]\s*//' | grep -oP '^\w[\w-]*' | sort -u || true)
-
-if [ -z "$CHANGED_DEPS" ]; then
-    echo "OK: No dependency names extracted"
-    exit 0
-fi
-
-echo "Changed dependencies: $CHANGED_DEPS"
+echo "Changed dependencies:"
+echo "$CHANGED_DEPS" | sed 's/^/  /'
 echo ""
 
 # Check journal entries since base-ref for justification
@@ -63,7 +231,8 @@ for dep in $CHANGED_DEPS; do
     for journal_file in "$JOURNAL_DIR"/*.md; do
         [ -f "$journal_file" ] || continue
         # Check if this journal was created/modified after the base ref
-        if git diff --name-only "$BASE_REF" HEAD 2>/dev/null | grep -q "$(basename "$journal_file")"; then
+        journal_rel=".dev/journal/$(basename "$journal_file")"
+        if [[ "$CHANGED_FILES" == *$'\n'"$journal_rel"$'\n'* ]]; then
             if grep -qi "$dep" "$journal_file" 2>/dev/null; then
                 echo "  + $dep justified in $(basename "$journal_file")"
                 FOUND=true

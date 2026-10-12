@@ -4,7 +4,9 @@
 // Cargo.toml."
 //
 // This test verifies that the dep-checking script exists, is executable,
-// and runs successfully.
+// and runs successfully. It also drives the script against throwaway fixture
+// repos (#184): a gate that never goes red is not a gate, so the negative
+// controls below assert the red/green/fail-closed behaviour directly.
 
 use std::path::PathBuf;
 
@@ -91,5 +93,525 @@ fn cargo_toml_is_valid() {
     assert!(
         content.contains("[dependencies]"),
         "Cargo.toml must contain [dependencies]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gate self-validity fixtures (#184)
+//
+// scripts/check-new-deps.sh only counts as an invariant guard if it goes RED
+// for an unjustified dependency, GREEN for a justified one, and fails closed
+// when its base ref is missing. Before #184 the filter regex ate every diff
+// line, so every case below was silently green.
+// ---------------------------------------------------------------------------
+
+/// A throwaway git repo containing a copy of the real gate script.
+struct DepGateFixture {
+    dir: tempfile::TempDir,
+    script: std::path::PathBuf,
+}
+
+/// The dependency used by the fixtures. It must not appear in any journal of
+/// the fixture repo unless the test puts it there.
+const UNJUSTIFIED_DEP: &str = "totally-new-crate-xyz";
+
+const BASELINE_CARGO_TOML: &str = r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+"#;
+
+impl DepGateFixture {
+    /// `None` when the platform cannot run the bash script (Windows) or git /
+    /// bash are unavailable — the caller then skips instead of failing.
+    fn new() -> Option<Self> {
+        if cfg!(target_os = "windows") {
+            return None;
+        }
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+            || std::process::Command::new("bash")
+                .arg("--version")
+                .output()
+                .is_err()
+        {
+            return None;
+        }
+        let dir = tempfile::tempdir().ok()?;
+        let script = dir.path().join("scripts").join("check-new-deps.sh");
+        std::fs::create_dir_all(script.parent()?).ok()?;
+        std::fs::create_dir_all(dir.path().join(".dev").join("journal")).ok()?;
+        std::fs::copy(
+            workspace_root().join("scripts").join("check-new-deps.sh"),
+            &script,
+        )
+        .ok()?;
+
+        let fixture = DepGateFixture { dir, script };
+        fixture.write("Cargo.toml", BASELINE_CARGO_TOML);
+        fixture.write(".dev/journal/manual-baseline.md", "# baseline\n");
+        fixture.git(&["init", "-q", "."]);
+        fixture.commit("base");
+        Some(fixture)
+    }
+
+    fn root(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    fn write(&self, rel: &str, body: &str) {
+        let path = self.root().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture dir");
+        }
+        std::fs::write(&path, body).expect("write fixture file");
+    }
+
+    /// Run git in the fixture repo, with identity / signing pinned so a
+    /// developer's global config cannot change the outcome.
+    fn git(&self, args: &[&str]) -> std::process::Output {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=invariant@recursive.local",
+                "-c",
+                "user.name=Invariant Fixture",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(self.root())
+            .output()
+            .expect("git must be runnable");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn commit(&self, message: &str) {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-qm", message]);
+    }
+
+    /// Run the gate script from `cwd` with `base_ref`.
+    fn run(&self, cwd: &std::path::Path, base_ref: &str) -> std::process::Output {
+        std::process::Command::new("bash")
+            .arg(&self.script)
+            .arg(base_ref)
+            .current_dir(cwd)
+            .output()
+            .expect("bash must be runnable")
+    }
+
+    fn add_unjustified_dep(&self) {
+        self.write(
+            "Cargo.toml",
+            &format!("{BASELINE_CARGO_TOML}{UNJUSTIFIED_DEP} = \"2\"\n"),
+        );
+    }
+
+    /// A dependency whose inline table spans two lines. The continuation line
+    /// (`features = [...]`) is *not* a dependency — this is the shape that
+    /// reported a phantom `features` dependency in review.
+    fn write_multiline_inline_table(&self, features: &str) {
+        self.write(
+            "Cargo.toml",
+            &format!(
+                r#"[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+rand = {{ version = "0.8", default-features = false,
+         features = [{features}] }}
+"#
+            ),
+        );
+    }
+}
+
+fn assert_gate_red(out: &std::process::Output, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "invariant #6 must fail for {what}, but the gate passed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("VIOLATION") || stdout.contains("FAIL"),
+        "gate failed for {what} without saying why:\n{stdout}"
+    );
+}
+
+fn assert_gate_green(out: &std::process::Output, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "invariant #6 must pass for {what}, but the gate failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// The regression that started #184: a brand-new dependency with no journal
+/// justification anywhere must turn the gate red.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_fails_for_new_dependency_without_journal() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.add_unjustified_dep();
+    fixture.commit("add an unjustified dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an unjustified new dependency");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(UNJUSTIFIED_DEP),
+        "the report must name the offending dependency"
+    );
+}
+
+/// Positive control: the same change passes once a journal from this run names
+/// the dependency — the gate must not simply always fail.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_passes_for_new_dependency_with_journal_justification() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.add_unjustified_dep();
+    fixture.write(
+        ".dev/journal/manual-run.md",
+        &format!("# Run\n\nWe need {UNJUSTIFIED_DEP} because serde cannot do it.\n"),
+    );
+    fixture.commit("add a dependency with justification");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_green(&out, "a new dependency justified in this run's journal");
+}
+
+/// False positives are just as damaging as false negatives: bumping the
+/// `[package] version` is not a dependency change.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_ignores_package_metadata_changes() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &BASELINE_CARGO_TOML.replace("version = \"0.1.0\"", "version = \"0.2.0\""),
+    );
+    fixture.commit("bump the package version");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_green(&out, "a [package] version bump");
+}
+
+/// A shallow CI clone has no HEAD~1. The gate must fail closed instead of
+/// reporting "Cargo.toml unchanged" (that silence is exactly how #184 hid).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_fails_closed_when_base_ref_is_missing() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.add_unjustified_dep();
+    fixture.commit("add an unjustified dependency");
+
+    let out = fixture.run(fixture.root(), "refs/heads/does-not-exist");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a missing base ref must exit 2 (fail closed):\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("does not resolve"),
+        "the failure must name the unresolvable base ref:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// The verdict must not depend on the caller's cwd: the script resolves the
+/// workspace from its own path.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_verdict_is_independent_of_caller_cwd() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.add_unjustified_dep();
+    fixture.commit("add an unjustified dependency");
+
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    let out = fixture.run(elsewhere.path(), "HEAD~1");
+    assert_gate_red(&out, "an unjustified dependency when run from another cwd");
+}
+
+/// A multi-line inline table is one dependency, not one dependency plus one
+/// phantom per continuation key: the report must name `rand` and never the
+/// `features` key of its inline table.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_ignores_inline_table_continuation_keys() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"small_rng\"");
+    fixture.commit("add a multi-line inline table dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an unjustified multi-line inline table dependency");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("rand"),
+        "the report must name the dependency itself:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("features"),
+        "the inline table's continuation key must not be reported as a dependency:\n{stdout}"
+    );
+}
+
+/// The same shape with a journal entry naming the dependency must stay green —
+/// a phantom `features` entry used to turn this into a false red.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_passes_when_inline_table_dependency_is_justified() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"small_rng\"");
+    fixture.write(
+        ".dev/journal/manual-run.md",
+        "# Run\n\nWe add rand for small_rng.\n",
+    );
+    fixture.commit("add a justified multi-line inline table dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_green(&out, "a justified multi-line inline table dependency");
+}
+
+/// An edit *inside* a multi-line inline table still changes the dependency
+/// spec, so it must be caught even though the first line is untouched.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_edits_inside_an_inline_table() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"small_rng\"");
+    fixture.commit("base with a multi-line inline table");
+    fixture.write_multiline_inline_table("\"small_rng\", \"std\"");
+    fixture.commit("add a feature inside the inline table");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an edit inside a multi-line inline table");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("rand"),
+        "the report must name the dependency whose spec changed"
+    );
+}
+
+/// A `#` inside a spec *string* must not be read as a comment start. When it
+/// is, the strip eats the inline table's closing brace, the brace depth never
+/// returns to 0, and the dependency disappears from the comparison — the gate
+/// fails open, which is the one failure mode this script must never have.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_hash_inside_inline_table_string() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write_multiline_inline_table("\"a#b\"");
+    fixture.commit("add a dependency whose feature name contains a hash");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a dependency spec containing a '#'");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("rand"),
+        "the gate must still see the dependency, not silently skip it"
+    );
+}
+
+/// Same hole on a single line: `foo = { git = "…/x#v1" }` used to vanish.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_single_line_spec_with_hash() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}foo = {{ git = \"https://example.invalid/x#v1\" }}\n"),
+    );
+    fixture.commit("add a git dependency with a fragment");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a single-line spec containing a '#'");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("foo"),
+        "the gate must still see the dependency, not silently skip it"
+    );
+}
+
+/// A `[dependencies.foo]` table's *body* is the dependency's spec: a version
+/// bump or an added feature inside it must be reported. Reporting only the
+/// table's existence let every edit inside it pass silently (fail-open).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_edits_inside_a_table_form_dependency() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+
+[dependencies.serde]
+version = "1"
+"#,
+    );
+    fixture.commit("base with a table-form dependency");
+    fixture.write(
+        "Cargo.toml",
+        r#"[package]
+name = "fixture"
+version = "0.1.0"
+
+[dependencies.serde]
+version = "2"
+features = ["derive"]
+"#,
+    );
+    fixture.commit("bump the table-form dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "an edit inside a `[dependencies.foo]` table");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("serde"),
+        "the report must name the table-form dependency"
+    );
+}
+
+/// A dependency table sitting at EOF must still be reported: its body is
+/// buffered until the next table header, so the awk program needs an explicit
+/// flush at end-of-input.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_reports_table_form_dependency_at_eof() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!(
+            r#"{BASELINE_CARGO_TOML}
+[dependencies.trailing-crate-abc]
+version = "1"
+"#
+        ),
+    );
+    fixture.commit("append a table-form dependency as the last section");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a table-form dependency at EOF");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("trailing-crate-abc"),
+        "a dependency table at EOF must not be dropped"
+    );
+}
+
+/// A quoted TOML key is a legal way to name a dependency (`"async-trait" = …`).
+/// The gate used to match bare keys only, so such a dependency was invisible —
+/// the entry never reached the comparison and the gate passed silently.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_quoted_dependency_key() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}\"quoted-crate\" = \"1\"\n"),
+    );
+    fixture.commit("add a dependency with a quoted key");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a dependency declared with a quoted key");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("quoted-crate"),
+        "the report must name the dependency without its TOML quotes:\n{stdout}"
+    );
+}
+
+/// Dotted keys are legal TOML too; they must not slip past the key pattern.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_dotted_dependency_key() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}dotted.crate = \"1\"\n"),
+    );
+    fixture.commit("add a dependency with a dotted key");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a dependency declared with a dotted key");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dotted.crate"),
+        "the report must name the dotted key"
+    );
+}
+
+/// `[dependencies."quoted-table"]` is the table form of a quoted key.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn dep_gate_flags_quoted_table_form_dependency() {
+    let Some(fixture) = DepGateFixture::new() else {
+        eprintln!("SKIP: git/bash unavailable");
+        return;
+    };
+    fixture.write(
+        "Cargo.toml",
+        &format!("{BASELINE_CARGO_TOML}\n[dependencies.\"quoted-table\"]\nversion = \"1\"\n"),
+    );
+    fixture.commit("add a quoted table-form dependency");
+
+    let out = fixture.run(fixture.root(), "HEAD~1");
+    assert_gate_red(&out, "a quoted table-form dependency");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("quoted-table"),
+        "the report must name the quoted table without quotes"
     );
 }

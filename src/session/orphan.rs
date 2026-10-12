@@ -121,8 +121,19 @@ pub fn splice_orphan_results(
     messages
 }
 
-/// Index the orphan answers are inserted at, mirroring
-/// `reader::orphan_result_insert_at` for the in-memory representation.
+/// Index the orphan answers are inserted at.
+///
+/// This is the **single** definition of the rule: the on-disk resume path
+/// ([`SessionReader::load_messages_with_orphan_results`]) first turns the
+/// transcript into `Message`s (dropping the empty assistants of issue #168)
+/// and then delegates here through [`splice_orphan_results`], so the index is
+/// always computed on the very vector it is spliced into. An entry-shaped twin
+/// used to live in `session::reader`; it was removed in the issue-#168 review
+/// because mixing the two representations is what produced an out-of-range
+/// splice.
+///
+/// [`SessionReader::load_messages_with_orphan_results`]:
+///     crate::session::SessionReader::load_messages_with_orphan_results
 fn orphan_result_insert_at_messages(messages: &[crate::message::Message]) -> usize {
     use crate::message::Role;
     let Some(asst_idx) = messages
@@ -131,8 +142,8 @@ fn orphan_result_insert_at_messages(messages: &[crate::message::Message]) -> usi
     else {
         return messages.len();
     };
-    // Same shape as `reader::orphan_result_insert_at`: after the anchor's
-    // own message (`skip(1)`), the last recorded result wins.
+    // After the anchor's own message (`skip(1)`), the last recorded result
+    // wins; when nothing follows it, the answers go straight after the anchor.
     match messages[asst_idx..]
         .iter()
         .skip(1)

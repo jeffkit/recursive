@@ -43,8 +43,22 @@ task that drains an mpsc channel of turn prompts against a single retained `Agen
   flag), provided the handle was attached via `set_handle` at spawn time.
 
 The continuation handle (`WorkerHandle`) is stored in a shared `WorkerTable`
-(`Arc<RwLock<HashMap<worker_id, Arc<WorkerHandle>>>>`), wired through `register_subagent_if_enabled`
-so the `agent` tool (spawner) and `send_message` tool (continuer) share one table per coordinator.
+(`Arc<Mutex<HashMap<worker_id, Arc<WorkerHandle>>>>`, a synchronous mutex so the deregister
+`Drop` guard can run on the `task_stop` abort path), wired through
+`register_subagent_if_enabled` so the `agent` tool (spawner) and `send_message` tool
+(continuer) share one table per coordinator.
+
+A **live** `worker_id` may not be reused: a second `background: true` spawn with the same
+`worker_id` is rejected (issue #176). The old behaviour overwrote the first worker's
+registration and then let its exit guard delete the *new* entry, after which `send_message`
+silently stopped driving turns. The exit guard now removes a slot only while it still holds
+that worker's own `task_id`, and the spawn pre-check plus the check-and-insert are evaluated
+under the table lock, so concurrent spawns on one id cannot both register.
+
+A slot whose continuation channel is already closed is a *dead* worker, not a live one: it is
+evicted rather than treated as a conflict, so a `worker_id` stays reusable after a `task_stop`
+that lands before the worker's first poll (that path never constructs the deregister guard and
+leaves the slot behind).
 
 ## send_message / ListWorkers
 
@@ -53,6 +67,15 @@ so the `agent` tool (spawner) and `send_message` tool (continuer) share one tabl
   workers, addressing by `task_id` drives a new turn (cross-turn continuation).
 - **Backed by**: `WorkerRegistry` + `WorkerMailbox` (legacy, same-turn injection) and the
   `WorkerTable` of background `WorkerHandle`s (cross-turn continuation).
+- **No live handle = error**, on both addressing modes (issue #176):
+  - `task_id` registered but no live continuation handle (worker exited or was stopped) →
+    `tool rejected` "has no live worker".
+  - `worker_id` present in the `WorkerTable` but its continuation channel is closed → the same
+    `tool rejected` error (it used to answer `Message queued …`, which read as success).
+  - `worker_id` resolving to a legacy `WorkerRegistry` mailbox already marked `done` → the same
+    `tool rejected` error (it used to push into a queue nothing would drain and answer
+    `Message delivered`).
+  A not-found `worker_id` still returns the legacy listing of active workers/tasks.
 
 ## Team Tools
 

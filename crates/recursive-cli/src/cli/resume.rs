@@ -1044,6 +1044,10 @@ mod tests {
         ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
     };
     use crate::cli::session::resolve_session_path;
+    // Issue #185: one crate-wide env guard for the whole binary — this module
+    // used to keep its own `HOME_LOCK`, which could not serialise against
+    // `builder.rs` / `main.rs` env mutations.
+    use crate::test_env::EnvGuard;
     use std::path::Path;
 
     #[test]
@@ -1085,8 +1089,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
 
-        let prev_home = std::env::var_os("RECURSIVE_HOME");
-        std::env::set_var("RECURSIVE_HOME", home.path());
+        // Issue #185: pin RECURSIVE_HOME under the shared env guard; `Drop`
+        // restores the prior value.
+        let mut env = EnvGuard::lock();
+        env.set_var("RECURSIVE_HOME", home.path());
 
         // Legacy in-tree session dir is searched by resolve_session_path;
         // the file's stem contains the query id, so it is the unique match.
@@ -1097,11 +1103,6 @@ mod tests {
 
         let resolved = resolve_session_path(workspace.path(), "hello-world");
         assert_eq!(resolved.unwrap(), session_path);
-
-        match prev_home {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
-        }
     }
 
     // ── prompt_orphan_choice / classify_orphan_answer ────────────────────────
@@ -1295,6 +1296,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_propagates_target_resolution_error() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         // A `--from-file` pointing at a missing, non-`.json`, non-dir path must
         // surface as an error rather than silently returning Ok(()).
         let ws = tempfile::tempdir().unwrap();
@@ -1322,6 +1327,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_refuses_tool_registry_hash_mismatch() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let sdir = ws.path().join("sess-a");
@@ -1358,6 +1367,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_allow_tool_drift_degrades_mismatch_to_warning() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let sdir = ws.path().join("sess-drift");
@@ -1393,6 +1406,10 @@ mod tests {
 
     #[tokio::test]
     async fn cmd_resume_accepts_matching_tool_registry_hash() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let hash = current_tool_hash(&cfg).await;
@@ -1428,6 +1445,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_resumed_propagates_runtime_failure() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = test_config(ws.path());
         // Unreachable endpoint + no retries → the runtime fails fast and
@@ -1492,27 +1513,6 @@ mod tests {
             format!("{user}\n{assistant}\n"),
         )
         .unwrap();
-    }
-
-    /// Serialises the tests that pin `RECURSIVE_HOME`. This crate cannot use
-    /// `recursive::test_util`'s env lock (it needs the `test-utils` feature),
-    /// and a tokio mutex is the one whose guard may be held across awaits.
-    static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Pin `RECURSIVE_HOME` for a test that drives a full resume: the
-    /// checkpoint wiring resolves the shadow-git dir through the user data
-    /// dir, which must not be the developer's real one.
-    fn pin_recursive_home(home: &Path) -> Option<std::ffi::OsString> {
-        let prev = std::env::var_os("RECURSIVE_HOME");
-        std::env::set_var("RECURSIVE_HOME", home);
-        prev
-    }
-
-    fn restore_recursive_home(prev: Option<std::ffi::OsString>) {
-        match prev {
-            Some(v) => std::env::set_var("RECURSIVE_HOME", v),
-            None => std::env::remove_var("RECURSIVE_HOME"),
-        }
     }
 
     /// Read one whole HTTP request (headers + `Content-Length` body) so the
@@ -1591,10 +1591,13 @@ mod tests {
     /// note, sent the unpaired seed, and died on the provider's HTTP 400).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cmd_resume_skip_answers_the_orphan_and_round_trips_the_provider() {
-        let _guard = HOME_LOCK.lock().await;
+        // Issue #185: the shared crate-wide env guard replaces this module's
+        // old `HOME_LOCK`, so pinning RECURSIVE_HOME serialises against every
+        // other env-touching test in the binary; `Drop` restores it.
+        let mut env = EnvGuard::lock();
         let home = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
-        let prev_home = pin_recursive_home(home.path());
+        env.set_var("RECURSIVE_HOME", home.path());
 
         let mut cfg = test_config(ws.path());
         let hash = current_tool_hash(&cfg).await;
@@ -1627,7 +1630,6 @@ mod tests {
         )
         .await;
         let request = server.await.unwrap();
-        restore_recursive_home(prev_home);
 
         res.expect("--orphans=skip must let the session reach the provider");
         assert!(
@@ -1656,10 +1658,13 @@ mod tests {
     /// result is the tool's output, not a note saying it will be replayed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cmd_resume_redo_replays_the_orphaned_call() {
-        let _guard = HOME_LOCK.lock().await;
+        // Issue #185: the shared crate-wide env guard replaces this module's
+        // old `HOME_LOCK`, so pinning RECURSIVE_HOME serialises against every
+        // other env-touching test in the binary; `Drop` restores it.
+        let mut env = EnvGuard::lock();
         let home = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
-        let prev_home = pin_recursive_home(home.path());
+        env.set_var("RECURSIVE_HOME", home.path());
         std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
 
         let mut cfg = test_config(ws.path());
@@ -1692,7 +1697,6 @@ mod tests {
             false,
         )
         .await;
-        restore_recursive_home(prev_home);
 
         let entries = recursive::session::SessionReader::load_transcript(&sdir).unwrap();
         let answer = entries
@@ -1709,6 +1713,10 @@ mod tests {
 
     #[tokio::test]
     async fn redo_orphan_replays_a_readonly_call() {
+        // Issue #185: `tools_for` -> `build_tools` reads
+        // `RECURSIVE_SANDBOX` (SandboxMode::from_env) and the skills env, so this
+        // indirect reader holds the shared env lock too.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
         let cfg = test_config(ws.path());
@@ -1725,6 +1733,10 @@ mod tests {
 
     #[tokio::test]
     async fn redo_orphan_replays_external_calls_without_a_tty() {
+        // Issue #185: `tools_for` -> `build_tools` reads
+        // `RECURSIVE_SANDBOX` (SandboxMode::from_env) and the skills env, so this
+        // indirect reader holds the shared env lock too.
+        let _env = EnvGuard::lock();
         // `External` orphans normally ask a human first. With no TTY there is
         // nobody to ask: the explicit `--orphans=redo` opt-in is honoured
         // (with the warning) instead of the resume refusing to proceed.
@@ -1744,6 +1756,10 @@ mod tests {
 
     #[tokio::test]
     async fn redo_orphan_answers_with_the_error_when_the_replay_fails() {
+        // Issue #185: `tools_for` -> `build_tools` reads
+        // `RECURSIVE_SANDBOX` (SandboxMode::from_env) and the skills env, so this
+        // indirect reader holds the shared env lock too.
+        let _env = EnvGuard::lock();
         // A failing replay must not abort the resume: the error text is the
         // tool result the model would have seen had the call returned.
         let ws = tempfile::tempdir().unwrap();
@@ -1801,6 +1817,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_skip_answers_the_orphan() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let tools = tools_for(&cfg).await;
@@ -1816,6 +1836,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_redo_replays_the_call() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("note.txt"), "hello from disk").unwrap();
         let cfg = test_config(ws.path());
@@ -1835,6 +1859,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_abort_refuses_the_unanswered_tail() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let tools = tools_for(&cfg).await;
@@ -1847,6 +1875,10 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_replay_seed_leaves_a_paired_seed_untouched() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let ws = tempfile::tempdir().unwrap();
         let cfg = test_config(ws.path());
         let tools = tools_for(&cfg).await;
@@ -1864,10 +1896,13 @@ mod tests {
     /// synthetic result is persisted with the run's transcript.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replay_resume_from_skip_round_trips_the_provider_and_persists_the_result() {
-        let _guard = HOME_LOCK.lock().await;
+        // Issue #185: the shared crate-wide env guard replaces this module's
+        // old `HOME_LOCK`, so pinning RECURSIVE_HOME serialises against every
+        // other env-touching test in the binary; `Drop` restores it.
+        let mut env = EnvGuard::lock();
         let home = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
-        let prev_home = pin_recursive_home(home.path());
+        env.set_var("RECURSIVE_HOME", home.path());
 
         let mut cfg = test_config(ws.path());
         let (api_base, server) = spawn_one_shot_provider().await;
@@ -1896,7 +1931,6 @@ mod tests {
         )
         .await;
         let request = server.await.unwrap();
-        restore_recursive_home(prev_home);
 
         res.expect("the answered seed must complete a provider round-trip");
         assert!(
