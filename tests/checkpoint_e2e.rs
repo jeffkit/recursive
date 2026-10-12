@@ -6,6 +6,7 @@
 //! together restore both the workspace and the conversation state to
 //! a chosen turn boundary.
 
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -110,6 +111,225 @@ fn final_completion(text: &str) -> Completion {
         usage: None,
         reasoning_content: None,
     }
+}
+
+/// Issue #173: build a runtime wired to an *existing* session checkpoint
+/// chain — the shape `resume` (`cli/resume.rs`) and AG-UI (`http/agui.rs`)
+/// produce when they re-open a session on a brand-new runtime.
+fn wired_runtime(
+    dir: &Path,
+    shadow: &Arc<ShadowRepo>,
+    session_id: &str,
+    log_path: &Path,
+    completions: Vec<Completion>,
+) -> (AgentRuntime, Arc<Mutex<TouchedFiles>>) {
+    let touched = Arc::new(Mutex::new(TouchedFiles::new()));
+    let tools = ToolRegistry::local()
+        .register(Arc::new(WriteFile::new(dir)))
+        .with_touched_files(touched.clone());
+    let mut runtime = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(completions)))
+        .tools(tools)
+        .build()
+        .expect("runtime builds");
+    runtime
+        .enable_checkpoints(
+            Arc::clone(shadow),
+            session_id.to_string(),
+            log_path.to_path_buf(),
+            Some(touched.clone()),
+        )
+        .expect("enable_checkpoints");
+    (runtime, touched)
+}
+
+/// Call the session's `checkpoint_save` tool the way the agent does.
+async fn save_checkpoint(runtime: &AgentRuntime, message: &str) {
+    let save = runtime
+        .kernel()
+        .tools()
+        .get("checkpoint_save")
+        .expect("checkpoint_save tool registered");
+    save.execute(json!({ "message": message }))
+        .await
+        .expect("checkpoint_save succeeds");
+}
+
+/// The `turn` column of the session's checkpoint log, in file order.
+fn log_turns(log_path: &Path) -> Vec<usize> {
+    recursive::read_checkpoint_log(log_path)
+        .expect("checkpoint log readable")
+        .iter()
+        .map(|r| r.turn)
+        .collect()
+}
+
+/// Issue #173: a runtime rebuilt for `resume` must continue the session's
+/// turn numbering instead of restarting at 0.
+///
+/// Pre-fix the resumed runtime's `turn_index` is 0, so the first
+/// post-resume `checkpoint_save` writes a `turn` that duplicates a
+/// pre-resume record — exactly what made `sessions rewind --to-turn N`
+/// skip the post-resume changes.
+#[tokio::test]
+async fn resume_continues_turn_numbering() {
+    if !has_git() {
+        return;
+    }
+    let _home = HomeOverride::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sw = SessionWriter::create(dir.path(), "e2e-resume-numbering", "mock", "mock").unwrap();
+    let session_dir = sw.session_dir().to_path_buf();
+    let log_path = session_dir.join("checkpoints.jsonl");
+    let session_id = sw.session_id().to_string();
+    let shadow = Arc::new(ShadowRepo::open(dir.path()).unwrap());
+
+    // Pre-resume: three snapshots taken during turns 0/1/2 — the issue's
+    // "会话在 turn 0-2 有快照" state.
+    let (mut rt_a, _touched_a) = wired_runtime(
+        dir.path(),
+        &shadow,
+        &session_id,
+        &log_path,
+        vec![
+            write_file_call("c0", "a.txt", "a-v0"),
+            final_completion("turn 0 done"),
+            write_file_call("c1", "b.txt", "b-v1"),
+            final_completion("turn 1 done"),
+            write_file_call("c2", "c.txt", "c-v2"),
+            final_completion("turn 2 done"),
+        ],
+    );
+    save_checkpoint(&rt_a, "turn 0").await;
+    rt_a.run("write a.txt").await.unwrap();
+    save_checkpoint(&rt_a, "turn 1").await;
+    rt_a.run("write b.txt").await.unwrap();
+    save_checkpoint(&rt_a, "turn 2").await;
+    rt_a.run("write c.txt").await.unwrap();
+    drop(rt_a);
+    assert_eq!(log_turns(&log_path), vec![0, 1, 2], "pre-resume log");
+
+    // ── "resume": a brand-new runtime over the same session dir + log.
+    let (rt_b, _touched_b) = wired_runtime(dir.path(), &shadow, &session_id, &log_path, vec![]);
+
+    assert_eq!(
+        rt_b.turn_index(),
+        3,
+        "resume must seed turn_index from the log (max(turn) + 1)"
+    );
+
+    // The first post-resume snapshot must not reuse an existing turn number.
+    save_checkpoint(&rt_b, "resumed turn").await;
+    let turns = log_turns(&log_path);
+    assert_eq!(
+        turns,
+        vec![0, 1, 2, 3],
+        "resumed record continues numbering"
+    );
+    let mut unique = turns.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        turns.len(),
+        "turn numbers must be unique: {turns:?}"
+    );
+}
+
+/// Issue #173: `rewind --to-turn N` after a resume must include the
+/// post-resume changes in the restored file set.
+///
+/// Pre-fix the post-resume record reuses an old `turn` (< cutoff), so it is
+/// invisible to `plan_rewind`: `z.rs` is left on disk while everything else
+/// is restored — code and history silently diverge.
+#[tokio::test]
+async fn rewind_after_resume_restores_expected_files() {
+    if !has_git() {
+        return;
+    }
+    let _home = HomeOverride::new();
+    let dir = tempfile::tempdir().unwrap();
+    let sw = SessionWriter::create(dir.path(), "e2e-rewind-resume", "mock", "mock").unwrap();
+    let session_dir = sw.session_dir().to_path_buf();
+    let log_path = session_dir.join("checkpoints.jsonl");
+    let session_id = sw.session_id().to_string();
+    let shadow = Arc::new(ShadowRepo::open(dir.path()).unwrap());
+
+    // Pre-resume: records 0/1/2. `turn_index` counts completed runs, so a
+    // record written *during* turn N carries N; the session ends after the
+    // third run, leaving the counter at 3 = max(turn) + 1.
+    std::fs::write(dir.path().join("a.txt"), "a-v0").unwrap();
+    let (mut rt_a, _touched_a) = wired_runtime(
+        dir.path(),
+        &shadow,
+        &session_id,
+        &log_path,
+        vec![
+            write_file_call("r1", "b.txt", "b-v1"),
+            final_completion("t1"),
+            write_file_call("r2", "a.txt", "a-v2"),
+            final_completion("t2"),
+            final_completion("t3"),
+        ],
+    );
+    save_checkpoint(&rt_a, "turn 0").await;
+    rt_a.run("write b.txt").await.unwrap();
+    save_checkpoint(&rt_a, "turn 1").await;
+    rt_a.run("overwrite a.txt").await.unwrap();
+    save_checkpoint(&rt_a, "turn 2").await;
+    rt_a.run("anything else?").await.unwrap();
+    drop(rt_a);
+    assert_eq!(log_turns(&log_path), vec![0, 1, 2]);
+
+    // ── resume: new runtime over the same session, continue with z.rs.
+    let (mut rt_b, _touched_b) = wired_runtime(
+        dir.path(),
+        &shadow,
+        &session_id,
+        &log_path,
+        vec![
+            write_file_call("r3", "z.rs", "z-resumed"),
+            final_completion("t4"),
+        ],
+    );
+    rt_b.run("write z.rs").await.unwrap();
+    save_checkpoint(&rt_b, "after z.rs").await;
+    drop(rt_b);
+
+    // Rewind to turn 2 (the issue's `sessions rewind --to-turn 2`) → turns 2
+    // and 4 are rewound away, so the target is the turn-1 snapshot
+    // (a.txt=a-v0, b.txt=b-v1) and z.rs must be dropped.
+    //
+    // Pre-fix the post-resume record carries turn 1, so it is invisible to
+    // this filter and z.rs is silently left behind while a.txt is still
+    // restored — code and history diverge.
+    let plan = plan_rewind(&log_path, 2).unwrap();
+    assert!(
+        plan.touched_paths.iter().any(|p| p == "z.rs"),
+        "z.rs was touched by a rewound-away turn and must be restored; got {:?}",
+        plan.touched_paths
+    );
+    assert_eq!(plan.turns_to_drop, vec![2, 4]);
+    assert_eq!(
+        log_turns(&log_path),
+        vec![0, 1, 2, 4],
+        "post-resume record continues past the pre-resume max"
+    );
+
+    apply_rewind(&shadow, &log_path, &plan, false).expect("apply rewind");
+    assert!(
+        !dir.path().join("z.rs").exists(),
+        "post-resume z.rs must be removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "a-v0"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "b-v1"
+    );
+    assert_eq!(log_turns(&log_path), vec![0, 1], "log truncated to < 2");
 }
 
 #[tokio::test]

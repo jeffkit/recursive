@@ -2236,6 +2236,31 @@ impl AgentRuntime {
         let writer = Arc::new(Mutex::new(CheckpointLogWriter::open(&log_path)?));
         let session_id = session_id.into();
 
+        // Issue #173 — turn numbering has exactly one source: the session's
+        // checkpoint log. `mode` = **seed-from-log** (option A in the issue
+        // spec), deliberately not seed-from-transcript: `CheckpointRecord::turn`
+        // is what `plan_rewind` filters on, so continuing from
+        // `max(turn) + 1` is the only seed that guarantees the next record
+        // cannot collide with one already in the same `checkpoints.jsonl`. A
+        // transcript-derived count would drift from the log whenever a turn
+        // saves twice or a rewind truncated only one side.
+        //
+        // All re-open points funnel through here — `resume`
+        // (crates/recursive-cli/src/cli/resume.rs), the batch CLI
+        // (crates/recursive-cli/src/main.rs) and AG-UI (src/http/agui.rs) each
+        // build a *new* runtime over an *existing* session directory — so a
+        // single seed here covers every one of them. (HTTP REST sessions do
+        // not enable checkpoints at this base; `http/cold_load.rs` has no
+        // `enable_checkpoints` call to seed.)
+        //
+        // Seeding happens in the wiring phase, strictly before the first
+        // `fetch_add(1)` in the run loop, so `Relaxed` is sufficient: there is
+        // no concurrent writer to order against yet, and the reader
+        // (`checkpoint_save`'s `load(Relaxed)`) runs later on the same thread
+        // of control. No memory-order change is needed.
+        let seed = crate::checkpoint_log::next_turn_index(&log_path);
+        self.checkpoints.turn_index.store(seed, Ordering::Relaxed);
+
         // Register session-scoped read-only checkpoint tools onto the
         // kernel's registry. The shadow repo is shared via
         // Arc<Mutex<ShadowRepo>> so the tools and the runtime see the

@@ -469,6 +469,63 @@ async fn checkpoint_save_tool_is_registered() {
     );
 }
 
+/// Issue #173: `enable_checkpoints` must seed the turn counter from the
+/// session's existing log (`max(turn) + 1`). Resume / AG-UI rebuild the
+/// runtime over the same `checkpoints.jsonl`; restarting at 0 makes the new
+/// records collide with old ones, and `sessions rewind` then skips them.
+#[tokio::test]
+async fn enable_checkpoints_seeds_from_existing_log() {
+    if !has_git() {
+        return;
+    }
+    let mk_rec = |turn: usize| crate::checkpoint_log::CheckpointRecord {
+        turn,
+        pre: None,
+        id: crate::CheckpointId(format!("ckpt-{turn}")),
+        message: None,
+        touched_files: vec![],
+        touched_via: crate::checkpoint_log::TouchedVia::Structured,
+        started_at: 0,
+        finished_at: 0,
+        saved_at: 0,
+    };
+
+    // Existing log with turns 0, 1, 2 → the next record must be turn 3.
+    let dir = shadow_ws();
+    let log_path = dir.path().join("checkpoints.jsonl");
+    let writer = crate::checkpoint_log::CheckpointLogWriter::open(&log_path).unwrap();
+    for turn in [0usize, 1, 2] {
+        writer.append(&mk_rec(turn)).unwrap();
+    }
+    let shadow = Arc::new(crate::ShadowRepo::open_at(dir.path(), dir.shadow_dir()).unwrap());
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .unwrap();
+    rt.enable_checkpoints(shadow, "sess", log_path, None)
+        .unwrap();
+    assert_eq!(
+        rt.turn_index(),
+        3,
+        "seed must be max(turn) + 1, not 0 (issue #173)"
+    );
+
+    // A missing / empty log keeps the old behaviour: numbering starts at 0.
+    let dir2 = shadow_ws();
+    let shadow2 = Arc::new(crate::ShadowRepo::open_at(dir2.path(), dir2.shadow_dir()).unwrap());
+    let mut rt2 = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .unwrap();
+    rt2.enable_checkpoints(shadow2, "sess", dir2.path().join("checkpoints.jsonl"), None)
+        .unwrap();
+    assert_eq!(
+        rt2.turn_index(),
+        0,
+        "a fresh session still starts at turn 0"
+    );
+}
+
 #[tokio::test]
 async fn runtime_works_when_checkpoints_disabled() {
     // No call to enable_checkpoints → outcome.checkpoint_id is None,

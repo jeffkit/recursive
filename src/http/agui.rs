@@ -2491,4 +2491,63 @@ mod tests {
             runtime.kernel().wall_timeout_secs
         );
     }
+
+    /// Issue #173: an AG-UI run builds a *fresh* runtime on every request and
+    /// re-enables checkpoints on the thread's existing session directory.
+    /// `turn_index` must continue from the thread's `checkpoints.jsonl`
+    /// (`max(turn) + 1`) instead of restarting at 0 — otherwise a resumed
+    /// thread writes duplicate `turn` numbers and `sessions rewind` skips its
+    /// changes.
+    #[test]
+    fn agui_thread_continues_turn_numbering() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let thread = "t-turn-seed";
+
+        // The thread already has three snapshots (turns 0/1/2) on disk.
+        let session_dir =
+            crate::agui_session::session_dir(ws.path(), thread).expect("session dir resolves");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let log_path = session_dir.join("checkpoints.jsonl");
+        let writer = crate::checkpoint_log::CheckpointLogWriter::open(&log_path).unwrap();
+        for turn in 0..3usize {
+            writer
+                .append(&crate::checkpoint_log::CheckpointRecord {
+                    turn,
+                    pre: None,
+                    id: crate::CheckpointId(format!("agui-ckpt-{turn}")),
+                    message: Some(format!("turn {turn}")),
+                    touched_files: vec![],
+                    touched_via: crate::checkpoint_log::TouchedVia::Structured,
+                    started_at: 0,
+                    finished_at: 0,
+                    saved_at: 0,
+                })
+                .unwrap();
+        }
+
+        let (runtime, _hooks) = build_agui_runtime(
+            ws.path(),
+            thread,
+            runtime_deps(ToolRegistry::local(), &[], &[]),
+        )
+        .expect("runtime builds");
+        assert!(
+            runtime.checkpoints_enabled(),
+            "checkpoints must be wired, otherwise the turn assertion is vacuous"
+        );
+        assert_eq!(
+            runtime.turn_index(),
+            3,
+            "AG-UI must seed turn_index from the thread's checkpoint log"
+        );
+    }
 }
