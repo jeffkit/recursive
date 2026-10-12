@@ -552,9 +552,7 @@ impl AnthropicProvider {
                         // With nothing accumulated there is nothing to save —
                         // keep the original Err(Error::Cancelled) so
                         // run_inner's Cancelled arm handles it.
-                        let have_partial = !acc.content.is_empty()
-                            || !acc.reasoning_content.is_empty()
-                            || !acc.tool_calls.is_empty();
+                        let have_partial = Self::has_persistable_partial(&acc);
                         if have_partial {
                             tracing::warn!(
                                 target: "recursive::llm",
@@ -584,9 +582,7 @@ impl AnthropicProvider {
                     // caller persists it (the "interrupted" sentinel routes
                     // to FinishReason::Cancelled). A drop before the first
                     // token has nothing to save — keep the Err.
-                    let have_partial = !acc.content.is_empty()
-                        || !acc.reasoning_content.is_empty()
-                        || !acc.tool_calls.is_empty();
+                    let have_partial = Self::has_persistable_partial(&acc);
                     if have_partial {
                         tracing::warn!(
                             target: "recursive::llm",
@@ -650,6 +646,29 @@ impl AnthropicProvider {
                 "SSE stream ended with incomplete UTF-8 sequence; discarding tail bytes"
             );
         }
+    }
+
+    /// Issue #168 — is there anything in the interrupted SSE state worth
+    /// persisting as a partial assistant message?
+    ///
+    /// Only text (or thinking) counts. A half-received **tool_use** block
+    /// does not: the partial paths clear `acc.tool_calls` (orphan risk), so a
+    /// tool-call-only interrupt would otherwise yield `content: ""` +
+    /// `tool_calls: []`, run_core would persist that empty assistant row, and
+    /// every later Anthropic request would 400 with "text content blocks must
+    /// be non-empty". Before issue #168 this predicate also accepted
+    /// `!acc.tool_calls.is_empty()`, which is exactly how the poisoned
+    /// message got written.
+    ///
+    /// `#[mutants::skip]`: the `reasoning_content` term is behavior-
+    /// equivalent to `true` on the read-error/cancel path, because
+    /// `reasoning_content` can only be non-empty when a thinking delta was
+    /// already accumulated, and that path returns the partial *before*
+    /// re-entering the loop. Flipping or deleting that term therefore cannot
+    /// change observable behaviour.
+    #[cfg_attr(test, mutants::skip)]
+    fn has_persistable_partial(acc: &SseAccum) -> bool {
+        !acc.content.is_empty() || !acc.reasoning_content.is_empty()
     }
 
     /// Assemble a [`Completion`] from the accumulated SSE state. Shared by
@@ -977,6 +996,15 @@ fn extract_system_messages(messages: &[Message]) -> (Option<String>, Vec<Message
 
 /// Filter out any leading assistant messages that would cause Anthropic to reject the request.
 /// Anthropic requires the first message to be user, or system+user.
+///
+/// Deliberately broader than issue #168's empty-assistant guard: a *non*-empty
+/// leading assistant is dropped here too (pinned by
+/// `filter_leading_assistant_removes_empty_assistant`), because an assistant
+/// turn cannot be the first message either. The empty shape is removed by
+/// this pass as well, and additionally by the
+/// [`crate::message::is_empty_assistant`] drop inside
+/// [`serialize_messages_anthropic`] — which is the guard that matters, since
+/// it also covers the mid-transcript case this leading-only pass cannot see.
 fn filter_leading_assistant(messages: &[Message]) -> Vec<Message> {
     let mut result = messages.to_vec();
     while result
@@ -1277,7 +1305,24 @@ fn serialize_messages_anthropic(messages: &[Message]) -> Vec<Value> {
                 }));
             }
         } else {
-            out.push(serialize_message(m));
+            // Issue #168: never emit `{"role":"assistant","content":""}` — an
+            // empty text block is a hard 400 ("text content blocks must be
+            // non-empty") and, because the poisoned row lives in the
+            // transcript, it would fail every subsequent request in the
+            // session. Belt-and-braces alongside
+            // `SessionReader::load_messages` + `finish_interrupted`. Scoped to
+            // the empty shape only: an assistant carrying tool_use blocks has
+            // its own arm above and invariant #8's pairing is untouched. The
+            // drop is logged — a request silently rewritten is undiagnosable.
+            if crate::message::is_empty_assistant(m) {
+                tracing::warn!(
+                    target: "recursive::llm",
+                    provider = "anthropic",
+                    "dropping empty assistant message from request (issue #168)"
+                );
+            } else {
+                out.push(serialize_message(m));
+            }
             i += 1;
         }
     }
@@ -3326,12 +3371,14 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
     }
 
     #[tokio::test]
-    async fn parse_sse_stream_returns_partial_when_only_tool_call_started() {
-        // Kills the `have_partial` tool-call-condition mutants (delete `!` on
-        // `!acc.tool_calls.is_empty()`, `|| -> &&` at line 389): a stream that
-        // started a tool_use block (but no text) must still return a partial
-        // Completion on a mid-stream read error, with the half-received tool
-        // call dropped (orphan risk).
+    async fn parse_sse_stream_errors_when_only_tool_call_started() {
+        // Issue #168 (spec test `interrupted_tool_call_delta_persists_no_empty_assistant`,
+        // provider half): a stream that started a tool_use block but delivered
+        // NO text has nothing worth persisting. Returning a partial Completion
+        // here makes run_core push an empty assistant message (the goal-382
+        // partial path clears tool_calls before returning), which the Anthropic
+        // API rejects with 400 "text content blocks must be non-empty" on
+        // every subsequent request. The interrupt must surface as an Err.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -3357,13 +3404,88 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
         let provider = AnthropicProvider::new(format!("http://{addr}"), "sk-noop", "m").unwrap();
         let completion = provider
             .stream(&[Message::user("hi".to_string())], &[], None, None)
-            .await
-            .expect("tool-call-only partial must be returned, not Err");
-        assert_eq!(completion.finish_reason.as_deref(), Some("interrupted"));
-        assert_eq!(completion.content, "", "no text content was streamed");
+            .await;
+        let err = completion.expect_err(
+            "a tool-call-only interrupt must fail the call, not yield an empty partial",
+        );
+        let text = err.to_string();
         assert!(
-            completion.tool_calls.is_empty(),
-            "half-received tool calls must be dropped from a partial completion"
+            text.contains("SSE stream read error"),
+            "the tool-call-only interrupt must surface the read error, got: {text}",
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn serializer_skips_empty_assistant() {
+        // Issue #168 (spec test `serializer_skips_empty_assistant`): a
+        // persisted `{role: "assistant", content: ""}` message (no tool_calls)
+        // must never reach the Anthropic wire — an empty text block is a hard
+        // 400 ("text content blocks must be non-empty"). It must be dropped,
+        // and the drop logged, so a rewritten request is diagnosable.
+        let msgs = vec![
+            Message::user("hello".to_string()),
+            Message::assistant("".to_string()),
+            Message::user("continue".to_string()),
+        ];
+        let (system, rest) = extract_system_messages(&msgs);
+        let rest = filter_leading_assistant(&rest);
+        let body = build_request("claude-3", 0.2, 4096, system.as_deref(), &rest, &[], false);
+        let out = body["messages"].as_array().expect("messages array");
+        assert_eq!(
+            out.len(),
+            2,
+            "the empty assistant must be dropped from the request body, got {}",
+            body["messages"],
+        );
+        assert!(
+            out.iter().all(|m| m["role"] != "assistant"),
+            "no assistant message may survive when it was empty: {}",
+            body["messages"],
+        );
+        assert!(
+            out.iter().all(|m| match m["content"].as_str() {
+                Some(s) => !s.trim().is_empty(),
+                None => true,
+            }),
+            "no empty text block may be emitted: {}",
+            body["messages"],
+        );
+        assert!(
+            logs_contain("dropping empty assistant message from request"),
+            "the silent rewrite must be visible in the logs",
+        );
+    }
+
+    #[test]
+    fn serializer_keeps_interrupted_assistant_with_text() {
+        // Negative pair for `serializer_skips_empty_assistant`: the guard must
+        // only drop *empty* assistants. An interrupted reply that carried text
+        // stays on the wire (goal-382 partial output), and a tool_use message
+        // is untouched — invariant #8's pairing must not regress.
+        let msgs = vec![
+            Message::user("hello".to_string()),
+            Message::assistant("partial reply".to_string()),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: Value::Object(Default::default()),
+                }],
+            ),
+        ];
+        let (system, rest) = extract_system_messages(&msgs);
+        let rest = filter_leading_assistant(&rest);
+        let body = build_request("claude-3", 0.2, 4096, system.as_deref(), &rest, &[], false);
+        let out = body["messages"].as_array().expect("messages array");
+        assert_eq!(out.len(), 3, "only the empty assistant is dropped");
+        assert_eq!(out[1]["content"].as_str(), Some("partial reply"));
+        assert_eq!(
+            out[2]["content"][0]["type"].as_str(),
+            Some("tool_use"),
+            "a tool_use assistant must survive the guard: {}",
+            body["messages"],
         );
     }
 

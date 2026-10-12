@@ -1140,6 +1140,32 @@ impl<'a> RunCore<'a> {
         // `MessageAppended` event carries it.
         let mut msg = Message::assistant(completion.content.clone());
         msg.reasoning_content = completion.reasoning_content.clone();
+        // Issue #168: an interrupt that carries neither text nor reasoning nor
+        // tool calls has nothing to persist. Pushing it writes
+        // `{"role":"assistant","content":""}` to transcript.jsonl, and from
+        // then on every Anthropic request replays that empty text block and
+        // 400s for good. The providers no longer emit that shape (a
+        // tool-call-only interrupt is an Err), so this is the second layer:
+        // another provider, a future partial path, or a replayed transcript
+        // must not be able to poison the session here. The turn still ends
+        // Cancelled — only the empty row is dropped.
+        //
+        // The predicate is `has_persistable_interrupt`, NOT
+        // `is_empty_assistant`: the latter would also swallow reasoning-only
+        // interrupts, which the issue's 「不做」 clause pins as out of scope.
+        // Note the division of labour — this guard only decides whether the row
+        // is *written*; the serializers and the load filter use
+        // `is_empty_assistant`, so a reasoning-only row is recorded on disk but
+        // never sent and never replayed from a resumed seed (see the doc
+        // comments on both predicates in `crate::message`).
+        if !crate::message::has_persistable_interrupt(&msg) {
+            tracing::warn!(
+                target: "recursive::agent",
+                "interrupted completion carried no text, no reasoning and no \
+                 tool calls; skipping the empty assistant message"
+            );
+            return self.make_cancelled_outcome(step, None, total_usage, tool_audits);
+        }
         self.push_message(step, msg);
         self.make_cancelled_outcome(
             step,
@@ -3361,6 +3387,145 @@ mod tests {
         );
     }
 
+    /// Issue #168 — HEADLINE persistence guard.
+    ///
+    /// The goal-382 partial path returned a Completion with
+    /// `finish_reason = "interrupted"`, empty content and (because the SSE
+    /// parsers drop half-received tool calls) no tool_calls when the only
+    /// thing that had arrived was a tool_call/tool_use delta. `finish_interrupted`
+    /// then pushed `Message::assistant("")` — content empty AND no tool_calls —
+    /// and `emit_turn_messages` wrote it to `transcript.jsonl`. Every later
+    /// Anthropic request then carried `{"role":"assistant","content":""}` and
+    /// 400'd forever.
+    ///
+    /// The providers no longer *produce* that completion (a tool-call-only
+    /// interrupt is an Err now), but the persistence path is the second layer
+    /// of defence: if such a completion ever reaches us anyway (another
+    /// provider, a future partial path, a replayed transcript) it must not be
+    /// pushed.
+    #[tokio::test]
+    async fn interrupted_tool_call_delta_persists_no_empty_assistant() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        // Exactly the shape the buggy provider path produced: the SSE
+        // tool_call delta was dropped, so content and tool_calls are both
+        // empty while the interrupted sentinel remains.
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![],
+            finish_reason: Some("interrupted".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(outcome.finish_reason, FinishReason::Cancelled),
+            "an interrupted completion must still finish as Cancelled, got {:?}",
+            outcome.finish_reason,
+        );
+        assert!(
+            !outcome.messages.iter().any(|m| m.role == Role::Assistant
+                && m.content.trim().is_empty()
+                && m.tool_calls.is_empty()),
+            "no empty assistant message may be pushed: {:?}",
+            outcome.messages,
+        );
+        assert_eq!(
+            outcome
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .count(),
+            0,
+            "an empty interrupted completion has nothing to persist",
+        );
+    }
+
+    /// Issue #168 negative control for the persistence guard: an interrupted
+    /// completion that DID carry text — or only **reasoning** — is still
+    /// persisted (goal-382's intent is preserved; the issue's 「不做」 clause
+    /// explicitly keeps reasoning-only interrupts untouched), and a tool-call
+    /// assistant message is never touched.
+    #[tokio::test]
+    async fn interrupted_assistant_with_text_is_still_pushed() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "half a reply".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("interrupted".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
+        let assistant: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant.len(),
+            1,
+            "an interrupted reply with text must still be persisted",
+        );
+        assert_eq!(assistant[0].content, "half a reply");
+    }
+
+    /// Issue #168 不做 clause — a **reasoning-only** interrupted completion must
+    /// still be persisted. The guard uses `has_persistable_interrupt`, not
+    /// `is_empty_assistant`: with the latter this row silently disappeared
+    /// (`[(User,"hi"), (Assistant,"", Some("thinking hard"))]` →
+    /// `[(User,"hi")]`), which is a behaviour change the issue forbids without
+    /// a separate note and assertion. This test is the assertion.
+    #[tokio::test]
+    async fn interrupted_reasoning_only_assistant_is_still_pushed() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![],
+            finish_reason: Some("interrupted".to_string()),
+            usage: None,
+            reasoning_content: Some("thinking hard".to_string()),
+        }]));
+        let messages = vec![Message::user("hi".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(matches!(outcome.finish_reason, FinishReason::Cancelled));
+        let assistant: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant.len(),
+            1,
+            "reasoning-only interrupts must not be dropped (issue #168 不做 clause): {:?}",
+            outcome.messages,
+        );
+        assert_eq!(assistant[0].content, "", "no text arrived");
+        assert_eq!(
+            assistant[0].reasoning_content.as_deref(),
+            Some("thinking hard"),
+        );
+    }
     /// Goal 353 — regression guard for the PRE-EXISTING path.
     ///
     /// When the shutdown token is ALREADY cancelled at loop top (before any
