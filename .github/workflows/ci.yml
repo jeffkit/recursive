@@ -65,6 +65,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
+      # #181 的核心主张「tools/call 使用独立超时、默认 >10s」只能由两个慢测试
+      # 证明（各约 12s 墙钟），故它们被 `#[ignore]`，默认 `cargo test` 不会执行。
+      # 若不显式跑，这条修复将来被无声破坏时 CI 不会发现——即「修复存在但无人守护」。
+      # 这里显式执行，把它纳入强制门禁。
+      - name: Test (ignored — timeout proofs)
+        run: cargo test --test mcp_e2e -- --ignored
+
   # Feature-matrix guards: the lib must build and pass clippy with no
   # default features and with each optional feature in isolation, so a
   # feature-gated item can never strand its callers (54/63/65/74).
