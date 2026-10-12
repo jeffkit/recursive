@@ -5,6 +5,8 @@
 //   loop_size_orthogonality:  #1 (loop size) + #2 (orthogonality)
 //   sandbox:                  #3 (sandbox path resolution)
 //   test_coverage:            #4 (test coverage)
+//   test_env_isolation:       #185 (process-env mutation only through the
+//                             shared crate-wide test guard)
 //   finish_reason_data:       #7 (finish reasons are data, not errors)
 //   tool_call_pairing:        #8 (tool-call ↔ tool-result pairing)
 //   dep_justification:        #6 (no new deps without justification)
@@ -29,5 +31,7 @@ mod loop_size_orthogonality;
 mod sandbox;
 #[path = "invariants/test_coverage.rs"]
 mod test_coverage;
+#[path = "invariants/test_env_isolation.rs"]
+mod test_env_isolation;
 #[path = "invariants/tool_call_pairing.rs"]
 mod tool_call_pairing;

@@ -882,12 +882,17 @@ pub(crate) async fn build_runtime(
 mod tests {
     use super::*;
 
+    // Issue #185: the env guard is crate-wide now (`crate::test_env`), so
+    // `main.rs` and `cli/resume.rs` tests share this exact lock instead of
+    // racing against this module's private one.
+    use crate::test_env::EnvGuard;
+
     // ── skills_from_http_sources (issue #74 拆单 3/3) ────────────────────
 
     /// Unset / blank RECURSIVE_SKILL_SOURCE_URL is a no-op: empty catalog,
-    /// no network. Each half is scoped: ENV_LOCK is a non-reentrant
-    /// std Mutex, so a second `EnvGuard::set` while the first guard is
-    /// still alive self-deadlocks the whole test binary.
+    /// no network. Each half is scoped: the shared env lock is a
+    /// non-reentrant std Mutex, so a second `EnvGuard::set` while the first
+    /// guard is still alive self-deadlocks the whole test binary.
     #[test]
     fn skills_from_http_sources_unset_or_blank_is_empty() {
         {
@@ -1123,6 +1128,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_tools_returns_shared_read_state_when_none() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let cfg = test_config();
         let (tools, read_state) = build_tools(&cfg, None).await;
         let from_registry = tools
@@ -1137,6 +1146,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_tools_reuses_supplied_read_state_when_some() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let cfg = test_config();
         let custom = Arc::new(Mutex::new(ReadFileState::new()));
         let (_tools, read_state) = build_tools(&cfg, Some(custom.clone())).await;
@@ -1148,44 +1161,11 @@ mod tests {
 
     // ── Test harness helpers ─────────────────────────────────────────────
 
-    /// Serialises tests that mutate process-wide env vars. Every env-writing
-    /// test holds this lock via [`EnvGuard`] and restores the prior value on
-    /// drop, so the developer's real environment (and parallel tests) are
-    /// never left modified.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        saved: Vec<(String, Option<std::ffi::OsString>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&str, Option<&str>)]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let saved = vars
-                .iter()
-                .map(|(k, _)| ((*k).to_string(), std::env::var_os(k)))
-                .collect();
-            for (k, v) in vars {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-            EnvGuard { saved, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    // The `ENV_LOCK` + `EnvGuard` that used to live here moved to
+    // `crate::test_env` (issue #185) so every env-mutating test in this
+    // binary — builder, `main.rs`, `cli/resume.rs` — serialises on ONE lock.
+    // The `use crate::test_env::EnvGuard;` import above keeps every call site
+    // in this module unchanged.
 
     /// A discovered skill lives at `<root>/<dir>/SKILL.md`. Returns `root`.
     fn seed_skill(root: &Path, dir: &str, name: &str) {
@@ -1380,6 +1360,10 @@ done
     /// The touched-files collector must be attached for checkpoint recording.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_tool_surface_registers_mcp_then_applies_allow_list() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let script = mock_mcp_server_script(tmp.path());
         let mcp_config = explicit_mcp_config(tmp.path(), &script);
@@ -1414,6 +1398,10 @@ done
     /// only added to — MCP registers, nothing is pruned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_tool_surface_keeps_full_registry_without_filters() {
+        // Issue #185: this test reads env-derived state
+        // (`build_runtime` preset / `RecursiveHome` / sandbox tier / skills),
+        // so it holds the shared env lock for its whole body.
+        let _env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = test_config();
         cfg.workspace = tmp.path().to_path_buf();
@@ -1583,8 +1571,15 @@ done
 
     /// A non-empty seed is installed on the runtime transcript (kills the
     /// `!seed.is_empty()` guard mutant).
+    ///
+    /// Issue #185: `build_runtime` resolves the agent preset
+    /// from the process env, so this test takes the shared env lock for its
+    /// whole body. Without it the full-suite green was order luck — libtest
+    /// runs it ('b') before `unknown_preset_env_fails_the_cli_build` ('u'), but
+    /// any rename/sharding/reschedule lets the writer race this reader.
     #[tokio::test]
     async fn build_runtime_seeds_the_transcript_from_seed_messages() {
+        let _env = EnvGuard::lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = test_config();
         cfg.workspace = tmp.path().to_path_buf();
@@ -1804,6 +1799,12 @@ done
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_runtime_uses_the_anthropic_endpoint_for_an_anthropic_config() {
         use tokio::io::AsyncReadExt;
+
+        // Issue #185: same unguarded-reader hazard as
+        // `build_runtime_seeds_the_transcript_from_seed_messages` — this test
+        // also resolves the agent preset from the process env via
+        // `build_runtime`, so it must hold the shared env lock.
+        let _env = EnvGuard::lock();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
