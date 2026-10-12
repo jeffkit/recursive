@@ -181,6 +181,11 @@ impl A2aCallTool {
             // call site rejects it explicitly instead of issuing a second
             // request.
             .redirect(reqwest::redirect::Policy::none())
+            // Issue #169: `validate_url` only sees literal hosts, so a name
+            // that resolves into private space (`127.0.0.1.nip.io`, DNS
+            // rebinding) would still get a socket. The guarded resolver vets
+            // every DNS answer at connect time.
+            .dns_resolver(crate::tools::url_guard::guarded_resolver())
             .build()
     }
 }
@@ -1804,5 +1809,83 @@ mod tests {
         assert!(result.contains("TASK_ID: t-123_abc.xyz"), "got: {result}");
         assert!(result.contains("curl"), "got: {result}");
         assert!(result.contains("tasks/t-123_abc.xyz"), "got: {result}");
+    }
+
+    // ── Issue #169: pin the production client wiring ──────────────────────
+
+    /// `build_client()` is the single client factory shared by `a2a_call`,
+    /// `a2a_card` and `a2a_task_check`; it must install the connection-time
+    /// DNS guard. Without it a *name* that resolves to a loopback address —
+    /// `localhost` here: private, and present in every `/etc/hosts` — reaches
+    /// the listener below.
+    ///
+    /// Hermetic: no external DNS, no external network. The URL is driven
+    /// through the client directly because `validate_url` (the first layer)
+    /// already rejects the literal word `localhost`; this test is about the
+    /// resolver layer, not the URL layer. `.cargo/config.toml` keeps
+    /// `localhost` on `NO_PROXY` so the request cannot be handed to a proxy.
+    #[tokio::test]
+    async fn a2a_build_client_installs_connection_time_guard() {
+        // Refuse to run when an ambient proxy would intercept the loopback
+        // request: the pin would then pass for the wrong reason (see the gate's
+        // doc comment in `url_guard.rs`).
+        crate::tools::url_guard::assert_loopback_bypasses_proxy();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                hits_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "PINNED-SECRET";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.flush();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let url = format!("http://localhost:{port}/pinned");
+
+        // Production wiring: the loopback DNS answer must be refused.
+        let client = A2aCallTool::build_client().expect("client build");
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("A2aCallTool::build_client() no longer installs the DNS guard");
+        assert!(!err.to_string().contains("PINNED-SECRET"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the guarded client must not connect"
+        );
+
+        // Control: a plain client (no resolver) reaches the listener, so the
+        // assertion above is not vacuous.
+        let control = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("control client build");
+        let body = control
+            .get(&url)
+            .send()
+            .await
+            .expect("control: an unguarded client must reach the loopback listener")
+            .text()
+            .await
+            .expect("control body");
+        assert_eq!(body, "PINNED-SECRET");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

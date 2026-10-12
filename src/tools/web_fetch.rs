@@ -11,7 +11,7 @@ use super::Tool;
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
 use crate::tools::tool_kind::ToolKind;
-use crate::tools::url_guard::validate_url;
+use crate::tools::url_guard::{guarded_resolver, validate_url};
 
 const DEFAULT_MAX_BYTES: usize = 65536;
 const REQUEST_TIMEOUT_SECS: u64 = 15;
@@ -29,23 +29,38 @@ impl Default for WebFetch {
 }
 
 impl WebFetch {
-    pub fn new() -> Self {
-        let client = Client::builder()
+    /// Request options shared by production and tests.
+    ///
+    /// - timeouts: 15 s request / 5 s connect;
+    /// - identifying user agent;
+    /// - **no redirects**: `validate_url` (url_guard) checks only the
+    ///   *initial* URL, so reqwest's default policy (follow up to 10
+    ///   redirects) would let a public URL 302-redirect the fetch to a
+    ///   private/internal host — an SSRF bypass. Under `Policy::none()`, a
+    ///   3xx comes back as a normal response and `fetch` surfaces it as an
+    ///   error instead of issuing a second request. (Goal 372)
+    fn client_builder() -> reqwest::ClientBuilder {
+        Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .user_agent(format!("recursive-agent/{}", env!("CARGO_PKG_VERSION")))
-            // Do not follow redirects. `validate_url` (url_guard) checks only
-            // the *initial* URL, so reqwest's default policy (follow up to 10
-            // redirects) would let a public URL 302-redirect the fetch to a
-            // private/internal host — an SSRF bypass. Under `Policy::none()`, a
-            // 3xx comes back as a normal response and `fetch` surfaces it as an
-            // error instead of issuing a second request. (Goal 372)
             .redirect(reqwest::redirect::Policy::none())
-            // Construction carve-out: if TLS backend fails to initialize, the
-            // process cannot perform HTTP requests at all. This is a fatal
-            // startup condition equivalent to the providers.rs TOML parse
-            // (Invariant #5 §construction).
-            .build();
+    }
+
+    pub fn new() -> Self {
+        // Issue #169: the URL guard only sees literal hosts, so install the
+        // connection-time DNS guard as well — a name that resolves into
+        // private space (`127.0.0.1.nip.io`, DNS rebinding) must not get a
+        // socket.
+        Self::from_builder(Self::client_builder().dns_resolver(guarded_resolver()))
+    }
+
+    /// Build the tool from a prepared builder. Construction carve-out: if the
+    /// TLS backend fails to initialize, the process cannot perform HTTP
+    /// requests at all. This is a fatal startup condition equivalent to the
+    /// providers.rs TOML parse (Invariant #5 §construction).
+    fn from_builder(builder: reqwest::ClientBuilder) -> Self {
+        let client = builder.build();
         #[allow(
             clippy::expect_used,
             reason = "TLS backend unavailable is a fatal startup error"
@@ -740,5 +755,192 @@ mod tests {
         assert!(is_private_ip(link_local), "link-local must be private");
         assert!(is_private_ip(broadcast), "broadcast must be private");
         assert!(is_private_ip(unspecified), "unspecified must be private");
+    }
+
+    // ── Issue #169: connection-time DNS guard (nip.io / rebinding) ───────
+
+    /// Stub DNS: answers every name with the same fixed addresses, playing
+    /// the role of a `*.nip.io` / rebinding zone without touching real DNS.
+    struct StubResolver(Vec<std::net::SocketAddr>);
+
+    impl crate::tools::url_guard::AddrSource for StubResolver {
+        fn lookup(&self, _host: &str) -> crate::tools::url_guard::LookupFuture {
+            let addrs = self.0.clone();
+            Box::pin(async move { Ok(addrs) })
+        }
+    }
+
+    /// `http://127.0.0.1.nip.io:PORT/` is a *name*, so `validate_url` passes
+    /// it — that is the issue's repro. The control arm (same client options,
+    /// guard opted out) proves the stub answer alone reaches the loopback
+    /// service; the production wiring must refuse the answer instead and never
+    /// send a request.
+    ///
+    /// The refusal *text* is asserted on the resolver itself
+    /// (`url_guard::tests::guarded_resolver_vets_stub_answers`) because
+    /// reqwest renders only the outermost "error sending request" and
+    /// `Error::Tool` flattens the cause into a string.
+    #[tokio::test]
+    async fn web_fetch_nip_io_style_host_rejected() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A loopback "internal service" the fetch must never reach.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            // Two accepts: the control arm's request, plus (if the guard
+            // regresses) the guarded arm's leaked connection.
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                hits_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "LOOPBACK-SECRET";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.flush();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stub: Arc<dyn crate::tools::url_guard::AddrSource> =
+            Arc::new(StubResolver(vec![std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                port,
+            ))]));
+        let url = format!("http://127.0.0.1.nip.io:{port}/redis");
+
+        // Control arm: the same stub behind the opt-out (i.e. the pre-fix
+        // behaviour — private answers are passed straight through).
+        let unguarded =
+            WebFetch::from_builder(WebFetch::client_builder().no_proxy().dns_resolver(Arc::new(
+                crate::tools::url_guard::GuardedResolver::with_source(Arc::clone(&stub), true),
+            )));
+        let body = unguarded
+            .execute(json!({ "url": url }))
+            .await
+            .expect("control arm: the opt-out client must reach the loopback server");
+        assert_eq!(body, "LOOPBACK-SECRET");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Guarded arm: the production wiring around the same stub answer.
+        let guarded =
+            WebFetch::from_builder(WebFetch::client_builder().no_proxy().dns_resolver(Arc::new(
+                crate::tools::url_guard::GuardedResolver::with_source(Arc::clone(&stub), false),
+            )));
+        let err = guarded
+            .execute(json!({ "url": url }))
+            .await
+            .expect_err("the guard must refuse a loopback DNS answer");
+        assert!(
+            !err.to_string().contains("LOOPBACK-SECRET"),
+            "the guarded request must not read a loopback body: {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the guarded request must not reach the loopback service"
+        );
+
+        // The issue's cloud-metadata example: `169.254.169.254.nip.io`.
+        // `validate_url` cannot see the answer, so the failure has to come
+        // from the request stage (the DNS guard), not from args validation.
+        let imds = Arc::new(StubResolver(vec![std::net::SocketAddr::from((
+            [169, 254, 169, 254],
+            80,
+        ))]));
+        let guarded =
+            WebFetch::from_builder(WebFetch::client_builder().no_proxy().dns_resolver(Arc::new(
+                crate::tools::url_guard::GuardedResolver::with_source(imds, false),
+            )));
+        let err = guarded
+            .execute(json!({ "url": "http://169.254.169.254.nip.io/latest/meta-data/" }))
+            .await
+            .expect_err("the guard must refuse the IMDS DNS answer");
+        assert!(
+            err.to_string().contains("request failed"),
+            "expected a request-stage refusal, got: {err}"
+        );
+    }
+
+    // ── Issue #169: pin the production client wiring ────────────────────
+
+    /// `WebFetch::new()` must install the connection-time guard. Without it a
+    /// *name* that resolves to a loopback address — `localhost` here: private,
+    /// and present in every `/etc/hosts` — is fetched, so the guard can be
+    /// deleted from `new()` with the rest of the suite still green.
+    ///
+    /// Driven through `fetch` (not `execute`) because `validate_url` — the
+    /// first layer — already rejects the literal word `localhost`; this test
+    /// pins the *resolver* layer. Hermetic: no external DNS, and
+    /// `.cargo/config.toml` keeps `localhost` on `NO_PROXY` so the request
+    /// cannot be handed to a proxy.
+    #[tokio::test]
+    async fn web_fetch_new_installs_connection_time_guard() {
+        // Refuse to run when an ambient proxy would intercept the loopback
+        // request: the pin would then pass for the wrong reason (see the gate's
+        // doc comment in `url_guard.rs`).
+        crate::tools::url_guard::assert_loopback_bypasses_proxy();
+
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                hits_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "PINNED-SECRET";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.flush();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let url = format!("http://localhost:{port}/pinned");
+
+        // Production wiring: the loopback DNS answer must be refused.
+        let err = WebFetch::new()
+            .fetch(&url, DEFAULT_MAX_BYTES)
+            .await
+            .expect_err("WebFetch::new() no longer installs the DNS guard");
+        assert!(!err.to_string().contains("PINNED-SECRET"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the guarded client must not connect"
+        );
+
+        // Control: the same client options without the resolver reach the
+        // listener, so the assertion above is not vacuous.
+        let body = WebFetch::from_builder(WebFetch::client_builder().no_proxy())
+            .fetch(&url, DEFAULT_MAX_BYTES)
+            .await
+            .expect("control: an unguarded client must reach the loopback listener");
+        assert_eq!(body, "PINNED-SECRET");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

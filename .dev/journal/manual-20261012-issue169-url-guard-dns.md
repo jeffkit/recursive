@@ -1,0 +1,549 @@
+# manual-20261012-issue169-url-guard-dns
+
+- **Date**: 2026-10-12
+- **Goal**: #169 — `url_guard` 只查字面主机：解析到内网的域名绕过 SSRF 防护
+- **Baseline HEAD**: 6c724056（issue 正文的 `path:line` 证据写于 14bac15a，行号已漂）
+
+## 根因
+
+两层都缺：
+
+1. **连接期不校验**。`validate_url`（`src/tools/policy_domain/url_guard.rs`）只有字面层：
+   `Host::Domain` 仅拦 `localhost` / `*.localhost` / `metadata.google.internal`
+   与「写得像 IP」的串；全仓无自定义 DNS resolver，reqwest 拿到 `getaddrinfo`
+   的结果直接连。于是 `http://127.0.0.1.nip.io:6379/`、
+   `http://169.254.169.254.nip.io/latest/meta-data/` 这类**域名**通过校验后落到
+   环回 / 云元数据地址；DNS rebinding 同理（第二次解析无人管）。
+2. **保留段不全**。`is_private_ip` 只看 127/8、RFC1918、169.254/16、
+   255.255.255.255、0.0.0.0；漏 CGNAT `100.64.0.0/10`、`0.0.0.0/8` 的其余地址、
+   IPv4-compatible `::a.b.c.d`（只用了 `to_ipv4_mapped`）、NAT64。
+
+**红线证据（未修复的 6c724056）**：把 issue 的复现写成测试，`WebFetch::new()` +
+`execute("http://127.0.0.1.nip.io:<port>/latest/meta-data/")` 的请求真的打到了本机
+环回 mock 服务并读回 body：
+
+```
+SSRF bypass: http://127.0.0.1.nip.io:64480/latest/meta-data/ resolved to loopback
+and was fetched; body=Ok("IMDS-SECRET-LOOPBACK"), loopback_hits=1
+```
+
+同一次运行里保留段测试也红：
+
+```
+assertion failed: is_private_ip("100.64.0.1".parse().unwrap())
+expected http://100.64.0.1/ to be rejected
+assertion failed: is_private_ip("::127.0.0.1".parse().unwrap())
+```
+
+## 改动
+
+- **`src/tools/policy_domain/url_guard.rs`**
+  - `GuardedResolver`（`reqwest::dns::Resolve`）：先经 `AddrSource` 取地址
+    （生产 `SystemResolver` = `tokio::net::lookup_host`；测试可换桩），再过
+    `guard_addrs`。**整份答卷任一地址命中即整份拒绝**——过滤掉私网地址会让连接回退到
+    下一个地址，攻击者仍能把连接钉在私网。
+  - `guarded_resolver()` 生产装配入口；`ALLOW_PRIVATE_DNS_ENV`
+    （`RECURSIVE_SSRF_ALLOW_PRIVATE_DNS`，默认关）给「企业代理 / 内网服务名解析到私网」
+    的部署留豁免。
+  - 拒答时 `tracing::warn!`：reqwest 只渲染最外层 `error sending request`，工具层
+    `Error::Tool` 又把 cause 拍平成字符串，日志是唯一能看到「哪个域名 / 哪个地址被拒」
+    的地方。
+  - `is_private_ip` 补齐：`0.0.0.0/8`（RFC 1122 §3.2.1.3）、CGNAT `100.64.0.0/10`
+    （RFC 6598）、`to_ipv4` 覆盖 mapped + compatible、NAT64。
+  - `nat64_rejects`：`64:ff9b:1::/48`（RFC 8215 local-use，专用于非全局 v4）整段拒绝；
+    `64:ff9b::/96`（RFC 6052 WKP，DNS64 用它合成**全局**目标）只按内嵌 v4 判定 ——
+    `64:ff9b::7f00:1`（127.0.0.1）与 `64:ff9b::a00:1`（10.0.0.1）拒，
+    `64:ff9b::808:808`（8.8.8.8）放行。
+- **`src/tools/web_fetch.rs`**：拆出 `client_builder()` / `from_builder()`，`new()`
+  装上 `guarded_resolver()`（测试用同一 builder 注入桩 resolver）。
+- **`src/tools/a2a.rs`**：`build_client()` 装 `guarded_resolver()`，
+  a2a_call / a2a_card / a2a_task_check 共用。
+- **`src/tools/policy_domain/url_guard.rs`**（review 返工 2/3 补）：接线钉的环境门
+  `assert_loopback_bypasses_proxy`（`#[cfg(test)]`）。语义对齐 hyper-util 的真实匹配器
+  （只按 `,` 分隔并 `trim`；IP/CIDR 条目只匹配 IP 字面量，域名条目含 `*`、`.localhost`
+  只匹配主机名），检查 `PIN_HOSTS`（= pin 实际请求的 `localhost`）；**设了代理变量但未豁免
+  时 `panic!`，一个代理变量都没设时直接通过**——既不假绿也不误红。
+- **`docs/architecture/tools/web-tools.md`** / **`docs/architecture/tools/a2a-tools.md`**
+  （review 返工补）：用户可见文档写明两层校验、豁免开关
+  `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS`（默认关，设置后连接期放行私网地址），以及代理路径
+  的已知限制（"Known limitation (proxy)"）。
+
+未新增依赖，未动 `Cargo.toml` / `Cargo.lock`：`tokio::net` 由 reqwest 的
+`tokio = { features = ["net", "time"] }` 依赖经 feature 统一提供。
+
+## 验证
+
+```
+cargo test -p recursive-agent --lib url_guard        → 27 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch        → 23 passed; 0 failed
+cargo test -p recursive-agent --lib                  → 3312 passed; 0 failed
+cargo test --test invariants                         → 55 passed; 0 failed
+cargo clippy -p recursive-agent --lib -- -D warnings → Finished（0 warning）
+cargo fmt --all -- --check                           → 通过
+```
+
+**反向对照（negative control）**：把 `is_private_ip` 还原成 6c724056 的函数体、并把
+`guard_addrs` 改成 `Ok(addrs)` 直通（**测试与装配全部保留**），同一组测试：
+
+```
+url_guard: FAILED. 20 passed; 7 failed
+  - 169.254.169.254 must be refused, got [169.254.169.254:0]
+  - assertion failed: validate_url("http://[::127.0.0.1]/").is_err()
+  - expected http://100.64.0.1/ to be rejected
+  - a private DNS answer must be refused
+web_fetch: FAILED. 22 passed; 1 failed
+  - the guard must refuse a loopback DNS answer: "LOOPBACK-SECRET"
+```
+
+随后按 sha256 还原（`url_guard.rs` 50b6ea4b…、`web_fetch.rs` bbb75c4f…、
+`a2a.rs` 5254c0ad…），scoped 测试重新全绿。
+
+**真实 DNS 端到端**：另跑一次性（已删除、未入库）测试，`WebFetch::new()` +
+`http://127.0.0.1.nip.io:<port>/latest/meta-data/`（真解析，非桩）修复后为 `Err` 且
+环回服务 `hits=0`；同一条路径在修复前 hits=1 并读回 body。
+
+### review 返工（第二个 commit）
+
+验收者做了变异：删掉 `WebFetch::new()` 与 `a2a::build_client()` 里的
+`.dns_resolver(guarded_resolver())` 后**已提交的测试没有任何一条转红**（守卫可被静默
+删除而 CI 全绿）。补两条 hermetic「接线钉」：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard
+  → web_fetch_new_installs_connection_time_guard ... ok
+  → a2a_build_client_installs_connection_time_guard ... ok
+test result: ok. 2 passed; 0 failed
+```
+
+两条都用 `localhost`（必然解析到私有地址，且不依赖外网 DNS、不依赖真实域名）：
+
+- 生产 client（`WebFetch::new()` / `A2aCallTool::build_client()`）访问
+  `http://localhost:<port>/pinned` 必须 `Err`，且环回 listener 命中数为 **0**；
+- 对照组（同一 builder 去掉 resolver / 裸 client）命中 **1** 并读回 body，证明断言
+  非空转。
+
+`web_fetch` 侧走私有 `fetch()` 而不是 `execute()`：`validate_url`（第一层）本来就会拦掉
+字面 `localhost`，本测试钉的是 resolver 层。`.cargo/config.toml` 的
+`NO_PROXY=127.0.0.1,localhost,::1` 保证 cargo 起的进程不会把 `localhost` 交给代理，
+因此 resolver 一定被调用。
+
+**接线负向对照**：删掉两处 `.dns_resolver(guarded_resolver())` 后同两条测试：
+
+```
+web_fetch: FAILED — WebFetch::new() no longer installs the DNS guard: "PINNED-SECRET"
+a2a:       FAILED — A2aCallTool::build_client() no longer installs the DNS guard:
+                    Response { url: "http://localhost:65443/pinned", status: 200, ... }
+test result: FAILED. 0 passed; 2 failed
+```
+
+按 sha256 还原（`web_fetch.rs` 545a614e…、`a2a.rs` 91f89b37…），两条测试重新全绿。
+
+返工后门禁：
+
+```
+cargo test -p recursive-agent --lib url_guard                       → 27 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3314 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
+### review 返工 2（第三个 commit）：pin 在被覆盖的 `NO_PROXY` 下不再假绿
+
+验收者指出 pin 的**假绿**：`.cargo/config.toml` 的 `[env]` 不覆盖用户已导出的值，所以
+`NO_PROXY=example.com` + 一个不可达 `HTTP_PROXY` 时，生产臂在"代理不可达"处就失败了，
+`expect_err` + 命中 0 被**以错误的理由**满足 —— 即使删掉 `.dns_resolver(...)`，两条 pin
+仍然绿（=守卫可被静默删除）。
+
+修法：两条 pin 的第一句调用 `url_guard::assert_loopback_bypasses_proxy()`
+（`#[cfg(test)]`）。reqwest 的取值顺序是 `NO_PROXY` → `no_proxy`；该值必须豁免
+`localhost` 与 `127.0.0.1`（`,`/空白/`;` 分隔、大小写不敏感、容忍一个前导 `.` 与 `*`），
+否则 `panic!` 并列出当前设置的代理变量（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 大小写
+两种）。**没有**改用自建 `.no_proxy()` builder —— 那就不再钉生产
+`WebFetch::new()` / `build_client()` 的接线。
+
+证据：
+
+```
+# 默认环境：两条 pin 有意义地通过（gate 由 .cargo/config.toml 提供的 NO_PROXY 满足）
+cargo test -p recursive-agent --lib connection_time_guard
+  → 2 passed; 0 failed
+
+# 被覆盖环境 + 接线完好：gate 大声失败（该环境下这条用例不可信，拒跑）
+NO_PROXY=example.com HTTP_PROXY=http://127.0.0.1:1 cargo test -p recursive-agent --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed
+  panicked at src/tools/policy_domain/url_guard.rs:494:
+  connection_time_guard would pass for the wrong reason: NO_PROXY="example.com" does not exempt
+  ["localhost", "127.0.0.1"], so the request would be sent to the proxy and fail there instead of
+  being refused by the connection-time SSRF guard (deleting the guard would stay green). Unset
+  NO_PROXY or add the loopback names. Proxy env vars currently set: ["HTTP_PROXY"]
+
+# 被覆盖环境 + 接线被人为删除：修复前这里是静默绿，现在同样大声失败（gate 先拦下）
+NO_PROXY=example.com HTTP_PROXY=http://127.0.0.1:1 cargo test -p recursive-agent --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed（同样 panic 在 url_guard.rs:494）
+
+# 同一变异 + 默认环境：pin 按设计报出接线缺失
+cargo test -p recursive-agent --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed
+  web_fetch.rs:929 WebFetch::new() no longer installs the DNS guard: "PINNED-SECRET"
+  a2a.rs:1861       A2aCallTool::build_client() no longer installs the DNS guard: Response { ... }
+```
+
+按 sha256 还原（`web_fetch.rs` abcde778…、`a2a.rs` 839c4970…）后默认环境重新全绿。
+同轮把代理限制写进用户文档（`web-tools.md` "Known limitation (proxy)"）。
+
+返工 2 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 29 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3316 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
+### review 返工 3（第四个 commit）：分隔符按 reqwest 收紧 + 无代理时提前通过
+
+验收者实证第二条同类假绿：门的分隔符模型比 reqwest **宽松**。registry 事实（逐行核对，
+非推测）：
+
+- reqwest `proxy.rs:476-479`：`NO_PROXY` 优先于 `no_proxy`（设成空串也算"已设"）——门一致 ✓
+- hyper-util `src/client/proxy/matcher.rs:448`：`no_proxy_list.split(',').map(str::trim)`
+  ——**只按逗号分隔**
+- 于是 `NO_PROXY='localhost 127.0.0.1'`、`'127.0.0.1;localhost'` 在门看来"已豁免"，
+  在 reqwest 看来却是**一个**域名条目、`localhost` 仍走代理 → 删掉 resolver 也绿。
+
+处理：
+
+1. `no_proxy_covers` 改为**只按 `,` 分隔 + `trim`**，空条目丢弃；`;`/空格/`\t` 不再算分隔符，
+   上述两种写法一律判"未豁免"。
+2. 主机类型语义与 hyper-util 对齐：IP 条目（`127.0.0.1`、`127.0.0.0/8`）只匹配 IP 字面量
+   （`IpMatcher`），域名条目（`*`、`.localhost`、大小写不敏感）只匹配主机名
+   （`DomainMatcher`）。所以 `*` 不豁免 `127.0.0.1`。子域后缀规则未建模：对 `localhost`
+   不可能命中（需要点边界），且"未豁免"方向只会让门更响。
+3. 门的必需集合收敛为 `PIN_HOSTS = ["localhost"]`，即 **pin 实际请求的主机名**。返工 3 之前
+   还要求 `127.0.0.1` 也被豁免，那会让 `NO_PROXY=*` 变成**误红**（`*` 只豁免主机名），而 pin
+   从不请求这个 IP 字面量。将来 pin 若改成 IP 字面量，把它加进 `PIN_HOSTS` 即可，届时
+   `NO_PROXY=*` 会（正确地）失败——这正是要防的假绿。
+4. **没有任何代理变量时提前返回 `Ok`**：请求不可能被代理，门不该误红（IDE runner、直接跑
+   测试二进制、预导出了不含 loopback 的 NO_PROXY 且无代理等场景）。
+
+证据：
+
+```
+# (1) 接线完好 + 死的 HTTP_PROXY + 空格/分号写法 → 门大声失败
+$ NO_PROXY='localhost 127.0.0.1' HTTP_PROXY=http://127.0.0.1:1 cargo test --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed
+  panicked at src/tools/policy_domain/url_guard.rs:496:
+  connection_time_guard would pass for the wrong reason: NO_PROXY="localhost 127.0.0.1" does not
+  exempt ["localhost"], ... Proxy env vars currently set: ["HTTP_PROXY"]
+$ NO_PROXY='127.0.0.1;localhost' HTTP_PROXY=http://127.0.0.1:1 ... → FAILED. 0 passed; 2 failed
+
+# (2) 关键：删掉两处 .dns_resolver(guarded_resolver()) 后，(1) 的两条**仍然**大声失败
+#     （返工 3 之前这里是 "ok. 2 passed" 的静默绿）
+$ (mutated) NO_PROXY='localhost 127.0.0.1' HTTP_PROXY=http://127.0.0.1:1 cargo test --lib connection_time_guard
+  → FAILED. 0 passed; 2 failed（同样 panic 于 url_guard.rs:496）
+
+# (3) 无代理变量 + NO_PROXY/no_proxy 均未设：直接跑测试二进制 → 通过（不再误红）
+#     先确认这两个变量在测试进程环境里确实不存在（printenv 无输出、退出码 1）：
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+      -u ALL_PROXY -u all_proxy printenv NO_PROXY HTTP_PROXY
+printenv exit=1
+#     再跑（下面是 libtest 的完整真实输出）：
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+      -u ALL_PROXY -u all_proxy ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+
+running 2 tests
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... ok
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3318 filtered out; finished in 0.06s
+
+# (4) 对照：同一干净环境 + 设了 HTTP_PROXY 但无 NO_PROXY → 门大声失败
+$ env -u NO_PROXY -u no_proxy HTTP_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-... connection_time_guard
+  → FAILED. 0 passed; 2 failed
+  "... but neither NO_PROXY nor no_proxy is set. Export `NO_PROXY=127.0.0.1,localhost,::1` ..."
+```
+
+纯逻辑单测（不依赖环境，正是这轮要的"不只靠环境实验"）：
+`no_proxy_covers_splits_on_comma_only`（含验收者给的四种输入）、
+`no_proxy_covers_matches_hyper_util_per_host_kind`（`*` / IP / CIDR / 大小写 / 前导点）、
+`loopback_missing_from_no_proxy_is_reported`、
+`loopback_gate_verdict_matches_reqwest_reality`（含"无代理 → `Ok`"这一条 N2-b）。
+
+返工 3 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 31 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3318 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
+文档措辞修正（N2-a）：`docs/architecture/tools/web-tools.md` 的 "Known limitation (proxy)"
+由 "is tracked as a follow-up" 改为 "A fix is a planned follow-up with no issue filed yet"
+——复核者指出该限制**没有 issue 号**，"tracked" 不成立。
+
+### review 返工 4（第五个 commit）：CIDR 前缀严格解析 + `get_first_env` 类别优先级 + 证据更正
+
+复核者又实测出两条"门与 reqwest 不一致"，加一条文档事实问题：
+
+1. **L1（潜在假绿）**：`cidr_contains` 对前缀做了 `prefix.trim()`，而 hyper-util 用的
+   `ipnet` 解析严格——`NO_PROXY='127.0.0.0/ 8'`、`'127.0.0.1/ 32'`、`'0.0.0.0/ 0'`
+   在门看来"已豁免"，reqwest 实际不豁免。今天不可达（`PIN_HOSTS` 是主机名，IP/CIDR
+   分支要求可解析的 IP 宿主），但 journal 自己写了"将来 pin 改用 IP 字面量时把
+   `127.0.0.1` 加进 `PIN_HOSTS`"——那一刻就是真实假绿。**已去掉 `prefix.trim()`**，
+   新增单测 `no_proxy_covers_rejects_padded_cidr_prefix`。
+2. **L2（误红，fails-safe）**：`HTTP_PROXY=""`（空）+ `http_proxy=<死代理>` +
+   `NO_PROXY=example.com` 时 reqwest **走直连**（hyper-util `get_first_env` 取每个类别里
+   第一个**已设置**的名字，即使值为空；空串解析不出 Uri ⇒ 该类不装代理，也不再看小写），
+   而旧门把 `http_proxy` 当"已配置"→ 无故报红。**新增 `configured_proxies(lookup)`**
+   按类别 `[UPPER, lower]` 取第一个"已设置"者、空值即该类无代理（不再落到小写），门改用它；
+   新增单测 `configured_proxies_mirrors_hyper_util_first_env`。
+3. **证据不实（必修 1）**：上一轮 journal 证据块 (3) 里混进了两行**不是测试输出**的内容
+   （我 shell 包装里 `echo` 出来的"变量未设置"提示被贴进了输出块，测试本身并不打印它）。
+   **已删除**，改为：先用 `printenv NO_PROXY HTTP_PROXY`（无输出、退出码 1）单独证明变量
+   不存在，再贴 libtest 的真实输出（见上文本轮块 (3)）。
+
+证据（本轮）：
+
+```
+# (A) L1：删掉两处 .dns_resolver(guarded_resolver()) + 带空格前缀的 CIDR + 死代理
+$ (mutated) NO_PROXY='127.0.0.0/ 8' HTTP_PROXY=http://127.0.0.1:1 cargo test --lib connection_time_guard
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... FAILED
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... FAILED
+panicked at src/tools/policy_domain/url_guard.rs:493:
+connection_time_guard would pass for the wrong reason: NO_PROXY="127.0.0.0/ 8" does not exempt
+["localhost"], so the request would be sent to the proxy and fail there instead of being refused
+by the connection-time SSRF guard (deleting the guard would stay green). Unset NO_PROXY or add the
+loopback names. Proxy env vars currently set: ["HTTP_PROXY"]
+test result: FAILED. 0 passed; 2 failed
+#（修复前：门把这个带空格前缀当成豁免 → 静默绿）
+
+# (B) L2：空的大写 HTTP_PROXY 遮蔽死的小写 http_proxy → reqwest 直连 → 门不再误红
+$ HTTP_PROXY="" http_proxy=http://127.0.0.1:1 NO_PROXY=example.com cargo test --lib connection_time_guard
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... ok
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... ok
+test result: ok. 2 passed; 0 failed
+
+# (B2) 对照：HTTP_PROXY 未设、只有死的小写 http_proxy → 门仍大声失败
+$ env -u HTTP_PROXY http_proxy=http://127.0.0.1:1 NO_PROXY=example.com cargo test --lib connection_time_guard
+test result: FAILED. 0 passed; 2 failed
+"... NO_PROXY=\"example.com\" does not exempt [\"localhost\"] ... Proxy env vars currently set: [\"http_proxy\"]"
+```
+
+本轮新增/改写的纯逻辑单测：`no_proxy_covers_rejects_padded_cidr_prefix`、
+`configured_proxies_mirrors_hyper_util_first_env`（既有
+`no_proxy_covers_splits_on_comma_only` / `no_proxy_covers_matches_hyper_util_per_host_kind` /
+`loopback_missing_from_no_proxy_is_reported` / `loopback_gate_verdict_matches_reqwest_reality`
+保留）。
+
+返工 4 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 33 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3320 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
+### review 返工 5（第六个 commit）：门按 pin 的 scheme 过滤 + 规范 CIDR 前缀 + feature 范围限定
+
+复核者 F2 实测（**今天就可达的误红**）：只设 `HTTPS_PROXY` 时，`http://` 的 pin 实际直连
+（守卫完全有效），但旧门把 `HTTPS_PROXY` 也算"有代理" → 大声失败。"只设 HTTPS_PROXY"是
+企业代理环境的常见配置，无故报红会诱使人关掉这道门。
+
+处理：
+
+1. **N-a 按 scheme 过滤代理变量**：新增常量 `PIN_SCHEME = "http"`（pin 的 URL 是
+   `http://localhost:<port>`）与 `configured_proxies(scheme, cgi, lookup)`，依据 registry
+   源码 `hyper-util-0.1.20/src/client/proxy/matcher.rs:238`：
+   ```
+   http:  parse_env_uri(&self.http).or_else(|| all.clone())
+   https: parse_env_uri(&self.https).or(all)
+   ```
+   即 `http://` 请求只受 `[HTTP_PROXY, http_proxy]` **与** `[ALL_PROXY, all_proxy]` 影响；
+   `HTTPS_PROXY`/`https_proxy` 拦不到它。scheme 判断只有这一处（+ `PIN_SCHEME`），不散落。
+   顺带对齐同一函数的 CGI 短路：`Builder::build` 在 `REQUEST_METHOD` 已设时完全禁用代理，
+   故门在 CGI 下也直接通过（否则是另一处误红）。
+2. **N-b 规范十进制 CIDR 前缀**：`ipnet` 只接受 `/8` 这类规范写法，`/+8`、`/008`、
+   `/0000000000000008` 全部拒绝，而 Rust 的 `u32::from_str` 会接受。`cidr_contains` 现在
+   先要求"全为 ASCII 数字、且除 `0` 本身外无前导零"，再 parse；新增单测
+   `no_proxy_covers_rejects_non_canonical_cidr_prefix`。
+3. **N-c feature 范围限定**：原注释"环境变量是唯一代理来源（无 OS 级代理）"说过头了。
+   实测 `cargo tree -e features --features weixin -i reqwest`：
+   ```
+   └── reqwest feature "system-proxy"
+   ```
+   默认 feature 集（门禁所跑的那套）只有 hyper-util `client-proxy`；`--features weixin` /
+   `--all-features` 会经 `wechatbot`（未设 `default-features = false`）带出
+   `reqwest/system-proxy` → `hyper-util/client-proxy-system`，此时**还存在 OS 级代理来源**，
+   "无代理变量 ⇒ 提前通过"须在该配置下重新评估。注释已按此限定；**默认构建下门的行为不变**。
+
+证据：
+
+```
+# (1) N-a：只设 HTTPS_PROXY（死代理）、无其它代理变量、NO_PROXY/no_proxy 未设 → 通过
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+      HTTPS_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+running 2 tests
+test tools::a2a::tests::a2a_build_client_installs_connection_time_guard ... ok
+test tools::web_fetch::tests::web_fetch_new_installs_connection_time_guard ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3320 filtered out; finished in 0.06s
+#（修复前：门把 HTTPS_PROXY 当成会拦截 http → 无故大声失败）
+
+# (2) 对照：只设 HTTP_PROXY（死代理）→ 仍然大声失败
+$ env -u NO_PROXY -u no_proxy -u HTTPS_PROXY -u https_proxy -u ALL_PROXY -u all_proxy \
+      HTTP_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+test result: FAILED. 0 passed; 2 failed
+connection_time_guard relies on the loopback names being exempted from any ambient proxy, but
+neither NO_PROXY nor no_proxy is set. Export `NO_PROXY=127.0.0.1,localhost,::1`, or run the suite
+through cargo (whose .cargo/config.toml provides it). Proxy env vars currently set: ["HTTP_PROXY"]
+
+# (3) 只设 ALL_PROXY（死代理）→ 同样大声失败（ALL_PROXY 对 http 也生效）
+$ env -u NO_PROXY -u no_proxy -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+      ALL_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+test result: FAILED. 0 passed; 2 failed（同样的 "neither NO_PROXY nor no_proxy is set"）
+
+# (4) N-b：删掉两处 .dns_resolver(guarded_resolver()) + NO_PROXY='127.0.0.0/+8' + 死 HTTP_PROXY
+$ NO_PROXY='127.0.0.0/+8' HTTP_PROXY=http://127.0.0.1:1 ./target/debug/deps/recursive-f7c98336a2e9aefd connection_time_guard
+test result: FAILED. 0 passed; 2 failed
+connection_time_guard would pass for the wrong reason: NO_PROXY="127.0.0.0/+8" does not exempt
+["localhost"], so the request would be sent to the proxy and fail there instead of being refused
+by the connection-time SSRF guard (deleting the guard would stay green). Unset NO_PROXY or add the
+loopback names. Proxy env vars currently set: ["HTTP_PROXY"]
+#（修复前：门的 u32 parse 接受 +8 → 误判"已豁免" → 静默绿）
+```
+
+本轮新增/改写的纯逻辑单测：
+`configured_proxies_only_counts_scheme_applicable_variables`（仅 `HTTPS_PROXY`/`https_proxy`
+⇒ **不算**；仅 `HTTP_PROXY`/`http_proxy` ⇒ 算；仅 `ALL_PROXY`/`all_proxy` ⇒ 算；`ftp` 等其它
+scheme ⇒ 都不算；CGI ⇒ 都不算）、`no_proxy_covers_rejects_non_canonical_cidr_prefix`；
+`configured_proxies_mirrors_hyper_util_first_env` 更新到新签名（L2 语义不变）。
+
+返工 5 后门禁：
+
+```
+cargo test -p recursive-agent --lib connection_time_guard           → 2 passed; 0 failed
+cargo test -p recursive-agent --lib url_guard                       → 35 passed; 0 failed
+cargo test -p recursive-agent --lib web_fetch                       → 24 passed; 0 failed
+cargo test -p recursive-agent --lib                                 → 3322 passed; 0 failed
+cargo test --test invariants                                        → 55 passed; 0 failed
+cargo clippy -p recursive-agent --all-targets -- -D warnings        → Finished（0 warning）
+cargo fmt --all -- --check                                          → 通过
+```
+
+## 提交与 diff stat（真实数字，`git show --numstat`）
+
+首版 commit（被验收的哈希，未 amend）：
+
+| file | + | - |
+|---|---|---|
+| `.dev/journal/manual-20261012-issue169-url-guard-dns.md` | 123 | 0 |
+| `src/tools/a2a.rs` | 5 | 0 |
+| `src/tools/policy_domain/url_guard.rs` | 428 | 5 |
+| `src/tools/web_fetch.rs` | 145 | 14 |
+
+`git show --stat`：`4 files changed, 701 insertions(+), 19 deletions(-)`。
+注意 `--stat` 的 per-file 列是**增删之和**（`url_guard.rs` 433、`web_fetch.rs` 159），
+与该文件**总行数**（`url_guard.rs` 800 行）不是一回事。
+
+review 返工 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `src/tools/a2a.rs` | 73 | 0 |
+| `src/tools/web_fetch.rs` | 66 | 0 |
+| `docs/architecture/tools/web-tools.md` | 27 | 0 |
+| `docs/architecture/tools/a2a-tools.md` | 13 | 0 |
+
+`git diff --stat -- src docs`：`4 files changed, 179 insertions(+), 0 deletions(-)`。
+
+review 返工 2 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `docs/architecture/tools/web-tools.md` | 8 | 0 |
+| `src/tools/a2a.rs` | 5 | 0 |
+| `src/tools/policy_domain/url_guard.rs` | 115 | 0 |
+| `src/tools/web_fetch.rs` | 5 | 0 |
+
+`git diff --stat -- src docs`：`4 files changed, 133 insertions(+), 0 deletions(-)`。
+
+review 返工 3 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `docs/architecture/tools/web-tools.md` | 4 | 4 |
+| `src/tools/policy_domain/url_guard.rs` | 201 | 51 |
+
+`git diff --stat -- src docs`：`2 files changed, 205 insertions(+), 55 deletions(-)`。
+
+review 返工 4 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `src/tools/policy_domain/url_guard.rs` | 103 | 14 |
+
+`git diff --stat -- src docs`：`1 file changed, 103 insertions(+), 14 deletions(-)`。
+
+review 返工 5 commit（不含本 journal 自身的改动）：
+
+| file | + | - |
+|---|---|---|
+| `src/tools/policy_domain/url_guard.rs` | 174 | 53 |
+
+`git diff --stat -- src docs`：`1 file changed, 174 insertions(+), 53 deletions(-)`。
+
+## Notes
+
+- 未装 guard 的 client：**`http_call`**。它的 base URL 由运营者在 endpoint registry 里
+  配置，并显式支持 `allow_private: true`（内网业务网关是它的正常用法）；resolver 是
+  client 级、无法按 endpoint 生效，接上去会把这个 opt-in 直接打死。issue 的「边界」也
+  写明本单不含 `http_call` 的路径语义，故未动它 —— 需要的话应做成双 client
+  （guarded / unguarded）另开一单。其余 client（`web_search`、`install_skill`、
+  `providers_cache`、`skills`、`llm/*`）的目标 URL 来自运营者配置而非模型，同样未动。
+- **代理路径 fail-open（已知限制，本单不修）**：进程设了 `HTTP_PROXY` /
+  `HTTPS_PROXY` 时，reqwest 把请求交给代理、由**代理**解析目标名，`GuardedResolver`
+  根本不被调用（只有直连才会走 resolver）。验收者在带代理的环境复现：
+  `http://<内网主机>:port/` 返回 `Ok("PROXY-SECRET")`。这是修复前就存在的行为（此前
+  也没有守卫），不属本单验收项，**本单不实现**。
+  建议后续单（可直接用的措辞）：
+
+  > security(net): #1xx proxy 路径上 SSRF 守卫 fail-open —— reqwest 在
+  > `HTTP_PROXY`/`HTTPS_PROXY` 下让**代理**解析目标名，`GuardedResolver` 不参与，
+  > 内网目标可经代理访问。建议二选一：(a) 默认拒绝非 loopback 代理（只有显式
+  > `RECURSIVE_ALLOW_PROXY=1` 才启用系统代理）；(b) 代理模式下先对目标名做 DNS
+  > 预解析并拒绝私网地址（代理侧可能再次解析，需注明残余风险）。两者都要保留
+  > `RECURSIVE_SSRF_ALLOW_PRIVATE_DNS` 语义，并补一条「带代理时守卫仍生效」的测试。
+
+  当前缓解：`GuardedResolver` 的上述语义 + `.cargo/config.toml` 里
+  `NO_PROXY=127.0.0.1,localhost,::1`（仅 cargo 起的进程）。用户可见版本见
+  `docs/architecture/tools/web-tools.md` 的 "Known limitation (proxy)"（措辞为
+  planned follow-up、**尚未提 issue**）。
+- **错误可见性**：guard 拒绝在用户可见错误里只表现为
+  `request failed: error sending request for url (...)`（见上），只有 `tracing` 的 warn
+  能看到原因。没有改 `web_fetch` / `a2a` 的错误渲染（不在本单范围）。
+- **NAT64 精度**：只按内嵌 v4 判定 `64:ff9b::/96`，而不是整段拒绝 —— 整段拒绝会让
+  IPv6-only + DNS64 的网络把所有公网站点都判成私网。运营者自定义的 DNS64 前缀（非 WKP）
+  无法通用识别，属已知残余缺口。
+- **仍未覆盖的保留段**（本单未改，避免过度拦截）：`192.0.0.0/24`、`198.18.0.0/15`、
+  `240.0.0.0/4`、`2001:db8::/32`（后者被既有测试显式要求放行）。要收需另开单并同步调整
+  既有断言。
+- **spec drift**：
+  - spec 写 `url_guard.rs:58-145`，main 已漂到 `Host::Domain` 分支 `:79-112`、
+    `is_private_ip` `:126-145` —— 行为与 spec 描述一致，只是行号变了。
+  - spec 设计稿里的 `reqwest::dns::GaiResolver` **在 0.12.28 不是公开 API**
+    （registry `src/dns/mod.rs` 是 `pub(crate) mod gai`）。spec 自己允许「或直接包系统
+    解析」，实现取了这条：`SystemResolver` + `tokio::net::lookup_host`。
+  - spec 的 `fn guard_addrs(Vec<SocketAddr>)` 多了一个显式 `allow_private` 参数，以免测试
+    去改进程环境（本仓惯例，测试不 `set_var`）。
