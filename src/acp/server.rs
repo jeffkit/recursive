@@ -1498,8 +1498,9 @@ pub struct AcpServer;
 impl AcpServer {
     /// Run the server on real stdio. Implements 60-second idle timeout (S1-C9):
     /// if no input arrives on stdin for 60 seconds, shuts down cleanly with exit
-    /// code 0 and logs "ServerShutdown" to stderr. EOF (e.g. /dev/null) causes
-    /// a brief sleep then retry — the server never exits on EOF alone.
+    /// code 0 and logs "ServerShutdown" to stderr. EOF on stdin (peer exited,
+    /// pipe closed, /dev/null) also shuts the server down (#183) — the peer is
+    /// gone, so no further request can ever arrive.
     ///
     /// `llm` is the shared chat provider used to construct AgentRuntimes for
     /// new sessions. Pass `None` only when you only need `initialize` support
@@ -1520,28 +1521,40 @@ impl AcpServer {
         let mut lines = BufReader::new(reader).lines();
         let mut state = ServerState::Uninitialized;
         let mut sessions = AcpSessionManager::new();
+        let idle_timeout = std::time::Duration::from_secs(60);
+        // Idle is measured from the last input, not from the current read (#183).
+        let mut last_input = tokio::time::Instant::now();
 
         loop {
             // S1-C9: 60-second idle timeout on stdin read.
-            let line =
-                tokio::time::timeout(std::time::Duration::from_secs(60), lines.next_line()).await;
+            let line = tokio::time::timeout(idle_timeout, lines.next_line()).await;
 
             let line = match line {
-                Ok(Ok(Some(l))) => l,
+                Ok(Ok(Some(l))) => {
+                    last_input = tokio::time::Instant::now();
+                    l
+                }
                 Ok(Ok(None)) => {
-                    // EOF — for /dev/null this happens immediately.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
+                    // EOF: the peer closed our stdin. This used to sleep 100ms
+                    // and retry, which made the process spin at 10 Hz forever
+                    // and left the idle-timeout branch below unreachable (#183).
+                    tracing::info!("ACP stdin closed (EOF), shutting down");
+                    break;
                 }
                 Ok(Err(e)) => {
                     debug!(%e, "ACP stdin read error");
                     break;
                 }
                 Err(_elapsed) => {
-                    // S1-C9: 60-second idle timeout
-                    tracing::info!("ACP server idle timeout (60s), shutting down");
-                    eprintln!("ServerShutdown");
-                    break;
+                    // S1-C9: only genuine 60s of silence shuts the server down.
+                    if last_input.elapsed() >= idle_timeout {
+                        tracing::info!("ACP server idle timeout (60s), shutting down");
+                        eprintln!("ServerShutdown");
+                        break;
+                    }
+                    // Woken early (e.g. a paused/fast-forwarded test clock):
+                    // keep waiting instead of treating it as a real timeout.
+                    continue;
                 }
             };
 
@@ -1556,7 +1569,10 @@ impl AcpServer {
             .await;
         }
 
-        debug!("ACP stdin idle timeout or read error, server shutting down");
+        // The transport is gone: no session can outlive its stdio pipe, so
+        // release their MCP children instead of orphaning them (#183).
+        sessions.kill_all_mcp_children().await;
+        debug!("ACP stdin closed or idle, server shutting down");
     }
 
     /// Dispatch a single input line (single request/notification or batch).
@@ -2666,6 +2682,83 @@ mod tests {
         assert!(
             result.is_ok(),
             "server should shut down after 61s total idle time"
+        );
+    }
+
+    /// #183: closing the peer's write end (EOF) must end `run_stdio`.
+    ///
+    /// The old loop treated `Ok(Ok(None))` as "try again": it slept 100ms and
+    /// re-read, so a closed pipe idled at 10 Hz forever. This test uses real
+    /// time (no `pause()`) precisely because the failure mode is a hang.
+    #[tokio::test]
+    async fn eof_shuts_down_server() {
+        let (reader, writer) = tokio::io::duplex(64);
+        let reader = tokio::io::BufReader::new(reader);
+        let mut output = Vec::<u8>::new();
+
+        let handle = tokio::spawn(async move {
+            AcpServer::run_stdio(reader, &mut output, None).await;
+            output
+        });
+
+        // Close the write end → the server's `next_line()` sees EOF.
+        drop(writer);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        match result {
+            Ok(Ok(output)) => assert!(
+                output.is_empty(),
+                "EOF is not a request, so no stdout output is expected"
+            ),
+            Ok(Err(join_err)) => panic!("server task panicked: {join_err}"),
+            Err(_) => panic!("run_stdio must return after stdin EOF (#183)"),
+        }
+    }
+
+    /// #183: the 60s idle budget is measured from the *last input*, so a line
+    /// arriving at t=50s must buy another 60s (the old code re-armed the
+    /// timeout per read too, but a fixed-deadline rewrite would break this).
+    #[tokio::test]
+    async fn idle_timer_resets_on_input() {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::time::pause();
+
+        let (reader, mut writer) = tokio::io::duplex(512);
+        let reader = tokio::io::BufReader::new(reader);
+        let mut output = Vec::<u8>::new();
+
+        let handle = tokio::spawn(async move {
+            AcpServer::run_stdio(reader, &mut output, None).await;
+            output
+        });
+
+        tokio::task::yield_now().await;
+
+        // 50s of silence — not yet an idle timeout.
+        tokio::time::advance(std::time::Duration::from_secs(50)).await;
+
+        // A well-formed request arrives and resets the budget.
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write to duplex");
+        writer.flush().await.expect("flush duplex");
+        tokio::task::yield_now().await;
+
+        // 50s more: 100s total, but only 50s since the last input.
+        tokio::time::advance(std::time::Duration::from_secs(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "input must reset the idle budget (#183)"
+        );
+
+        // 11s of real silence crosses the 60s budget.
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "server must shut down 60s after the last input"
         );
     }
 
