@@ -535,7 +535,11 @@ impl SshTransport {
 
     /// Execute a command via SSH and capture stdout/stderr.
     async fn ssh_exec(&self, command: &str) -> std::io::Result<ExecResult> {
-        let mut child = self.build_ssh_command(command).spawn()?;
+        // Goal 412: one spawn entry — the ssh client leads its own process
+        // group, so termination (timeout / future cancel) reaches the client
+        // and anything it spawned locally.
+        let mut cmd = self.build_ssh_command(command);
+        let mut child = crate::process::spawn_grouped(&mut cmd)?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
@@ -559,8 +563,7 @@ impl SshTransport {
                 // readers block on the pipes until the child is dead, so
                 // kill/wait BEFORE awaiting them. Best-effort cleanup on
                 // the error path — swallow secondary failures from it.
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                crate::process::terminate_group(&mut child).await;
                 let _ = drain_with_grace(stdout_task, stdout_mirror).await;
                 let _ = drain_with_grace(stderr_task, stderr_mirror).await;
                 return Err(std::io::Error::new(
@@ -712,7 +715,8 @@ impl ToolTransport for SshTransport {
             command
         );
 
-        let mut child = self.build_ssh_command(&remote_cmd).spawn()?;
+        let mut cmd = self.build_ssh_command(&remote_cmd);
+        let mut child = crate::process::spawn_grouped(&mut cmd)?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
@@ -733,8 +737,7 @@ impl ToolTransport for SshTransport {
                 // client must die before the reader tasks can unblock,
                 // and awaiting them here prevents their JoinHandles from
                 // detaching with buffered output.
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                crate::process::terminate_group(&mut child).await;
                 let _ = drain_with_grace(stdout_task, stdout_mirror).await;
                 let _ = drain_with_grace(stderr_task, stderr_mirror).await;
                 return Err(std::io::Error::new(
@@ -907,11 +910,6 @@ impl ToolTransport for LocalTransport {
         cmd.current_dir(cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // Defence in depth against orphan processes on timeout: Tokio's
-        // `Child` defaults to `kill_on_drop = false`, so a bare `return Err`
-        // in the timeout branch would leave the shell and any of its
-        // descendants running after the error is surfaced.
-        cmd.kill_on_drop(true);
 
         // Issue #89: the default tier must not leak the service process's
         // credentials into LLM-authored commands — scrub the inherited env,
@@ -921,7 +919,22 @@ impl ToolTransport for LocalTransport {
             cmd.env(key, val);
         }
 
-        let mut child = cmd.spawn()?;
+        // Goal 412: register the exec in the task table before spawning, so a
+        // cancel routed by scope (the workspace root — the closest
+        // execution-level identity a transport owns) can end it. The
+        // registration's lifetime is this future's: dropping the future (a
+        // cancelled background job) deregisters the entry.
+        let scope = cwd.to_string_lossy().into_owned();
+        let registration =
+            crate::process::TaskRegistration::spawn(crate::process::CancelKind::Exec, Some(&scope));
+        registration.note_stage("spawning");
+
+        // Goal 412: single spawn entry — the shell leads its own process
+        // group (`kill_on_drop` + `process_group(0)`), so a timeout or cancel
+        // can reap the whole tree instead of just the shell (issues #165,
+        // #47①).
+        let mut child = crate::process::spawn_owned(&mut cmd)?;
+        registration.note_stage("running");
 
         let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout pipe not available")
@@ -934,25 +947,46 @@ impl ToolTransport for LocalTransport {
         let (stdout_task, stdout_mirror) = spawn_reader(stdout, max);
         let (stderr_task, stderr_mirror) = spawn_reader(stderr, max);
 
-        let wait = child.wait();
-        let status = match tokio::time::timeout(timeout, wait).await {
-            Ok(s) => s?,
-            Err(_) => {
-                // Best-effort SIGKILL of the timed-out process; then drain
-                // both reader tasks through the same bounded grace as the
-                // SSH arms — an orphaned descendant (`cmd &`, `nohup`) that
-                // inherited the pipe write ends keeps EOF from ever arriving,
-                // and the reader tasks would otherwise park forever (issue
-                // #47①). `kill_on_drop(true)` set at spawn is the safety net
-                // for any other early-exit path.
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = drain_with_grace(stdout_task, stdout_mirror).await;
-                let _ = drain_with_grace(stderr_task, stderr_mirror).await;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("command timed out after {:?}", timeout),
-                ));
+        let status = {
+            // The select only *decides*; the killing happens after it, so the
+            // `child.wait()` future is dropped before we borrow `child` again.
+            enum Wait {
+                Done(std::io::Result<std::process::ExitStatus>),
+                TimedOut,
+                Cancelled,
+            }
+            let outcome = tokio::select! {
+                status = child.wait() => Wait::Done(status),
+                _ = tokio::time::sleep(timeout) => Wait::TimedOut,
+                _ = registration.cancelled() => Wait::Cancelled,
+            };
+            match outcome {
+                Wait::Done(status) => status?,
+                Wait::TimedOut => {
+                    // Terminate the whole group, then drain both reader tasks
+                    // through the same bounded grace as the SSH arms — an
+                    // orphaned descendant (`cmd &`, `nohup`) that inherited the
+                    // pipe write ends keeps EOF from ever arriving, and the
+                    // reader tasks would otherwise park forever (issue #47①).
+                    registration.note_stage("timed-out");
+                    crate::process::terminate_group(&mut child).await;
+                    let _ = drain_with_grace(stdout_task, stdout_mirror).await;
+                    let _ = drain_with_grace(stderr_task, stderr_mirror).await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("command timed out after {:?}", timeout),
+                    ));
+                }
+                Wait::Cancelled => {
+                    registration.note_stage("reaping-process-group");
+                    crate::process::terminate_group(&mut child).await;
+                    let _ = drain_with_grace(stdout_task, stdout_mirror).await;
+                    let _ = drain_with_grace(stderr_task, stderr_mirror).await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "command cancelled",
+                    ));
+                }
             }
         };
 
@@ -1247,6 +1281,90 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Goal 412: a foreground exec registers a cancel handle in the task table
+    /// under its workspace scope, so a cancel routed by scope ends it (killing
+    /// the process group) and the registration does not outlive the call.
+    ///
+    /// Mutation guard (Scope 6, "cancel 路径断裂 → 红"): drop the registration
+    /// or the `cancelled()` arm of the waiter and the exec runs its full 30s
+    /// instead of returning `Interrupted`.
+    #[tokio::test]
+    async fn local_transport_exec_shell_is_cancellable_by_scope() {
+        let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("exec.pid");
+        let scope = tmp.path().to_string_lossy().into_owned();
+        let command = format!("echo $$ > '{}' && exec sleep 30", pid_file.display());
+
+        let exec = tokio::spawn({
+            let cwd = tmp.path().to_path_buf();
+            async move {
+                LocalTransport
+                    .exec_shell(&command, &cwd, &[], Duration::from_secs(60), 128 * 1024)
+                    .await
+            }
+        });
+
+        // Wait until the exec is registered and running.
+        let mut registered = false;
+        for _ in 0..200 {
+            let active = crate::process::cancel_tasks()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active_in_scope(&scope);
+            if active > 0 && pid_file.exists() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered,
+            "the exec should register a cancel handle under its cwd scope"
+        );
+
+        assert_eq!(
+            crate::process::cancel_scope(&scope),
+            1,
+            "scope-routed cancel must reach the exec's handle"
+        );
+
+        let err = exec
+            .await
+            .expect("exec task must not panic")
+            .expect_err("a cancelled exec returns an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("exec should record its pid")
+            .trim()
+            .parse()
+            .expect("pid file holds a number");
+        let mut gone = false;
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            if !alive {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "cancelled exec process {pid} still alive");
+
+        assert_eq!(
+            crate::process::cancel_tasks()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active_in_scope(&scope),
+            0,
+            "the registration must be dropped when the exec returns"
+        );
     }
 
     // TODO(goal-360): the SSH timeout arms in `ssh_exec` and `exec_shell`

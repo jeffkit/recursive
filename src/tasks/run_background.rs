@@ -23,10 +23,21 @@ use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::llm::ToolSpec;
+use crate::process::{CancelHandle, CancelKind, CancelReason, TaskRegistration};
 use crate::tools::{resolve_within, SessionToolState, Tool};
 
 /// Maximum bytes of stdout/stderr to capture per job.
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+
+/// How long destroy-time liquidation waits for each cancelled job to report
+/// that it reaped its process group before calling it *unreclaimed*.
+pub const DEFAULT_RECLAIM_GRACE: Duration = Duration::from_secs(2);
+
+/// Bound on how long the stdout/stderr readers may keep the job waiting for
+/// EOF once the process group is gone. A descendant that escaped the group
+/// (`setsid`) can hold the write end open forever, so the drain is bounded
+/// exactly like the transport's.
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Default grace period for subprocess graceful shutdown (SIGTERM → wait →
 /// SIGKILL). Lives here (not in `mcp`) so `acp` can use it without depending
@@ -43,6 +54,17 @@ const DEFAULT_JOB_TIMEOUT: u64 = 3600; // 1 hour
 /// How long a completed/failed job's output is kept before cleanup.
 const JOB_TTL: Duration = Duration::from_secs(3600);
 
+/// Monotonic discriminator for job tables inside one process: a process can
+/// host several sessions, each with its own table and therefore its own
+/// cancellation scope.
+fn next_scope_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "bgm-{}",
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// State of a background job.
 #[derive(Debug, Clone)]
 pub enum JobState {
@@ -56,6 +78,10 @@ pub enum JobState {
         message: String,
     },
     TimedOut,
+    /// Goal 412: a cancel handle was consumed and the job's process group was
+    /// reaped. Distinct from [`JobState::TimedOut`] so the caller can tell an
+    /// operator/destroy stop from a budget overrun.
+    Cancelled,
 }
 
 impl JobState {
@@ -63,7 +89,10 @@ impl JobState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut
+            JobState::Completed { .. }
+                | JobState::Failed { .. }
+                | JobState::TimedOut
+                | JobState::Cancelled
         )
     }
 }
@@ -72,6 +101,16 @@ impl JobState {
 pub struct Job {
     pub state: JobState,
     pub created_at: Instant,
+}
+
+impl Job {
+    /// A freshly spawned, still-running job.
+    pub fn running() -> Self {
+        Self {
+            state: JobState::Running,
+            created_at: Instant::now(),
+        }
+    }
 }
 
 /// A file registered for mid-run event wakes. The TUI loop arbiter polls the
@@ -95,9 +134,19 @@ pub enum LoopControl {
 /// Shared manager for background jobs.
 pub struct BackgroundJobManager {
     jobs: HashMap<String, Job>,
+    /// Goal 412: one cancel registration per live job, keyed by job id. While
+    /// an entry lives the job is addressable — a cancel routed by key or scope
+    /// (or destroy-time liquidation) reaches the job loop, which reaps the
+    /// process group. Removing the entry (terminal state, TTL cleanup, table
+    /// clear) deregisters it, so a finished job is never left routable.
+    cancels: HashMap<String, TaskRegistration>,
     next_id: u64,
+    /// Goal 412: this job table's own scope id. Every job it registers is
+    /// addressable as `background-job:<scope>/<job-id>`, so cancellation can be
+    /// routed per *execution* — one process may host several sessions.
+    scope: String,
     /// Notifies waiters when a job enters a terminal state
-    /// (Completed, Failed, TimedOut). Used by the TUI loop arbiter
+    /// (Completed, Failed, TimedOut, Cancelled). Used by the TUI loop arbiter
     /// to wake on background job completion.
     completed_notify: Arc<Notify>,
     /// Optional file registered via the `watch_file` tool for mid-run
@@ -119,11 +168,18 @@ impl BackgroundJobManager {
     pub fn new() -> Self {
         Self {
             jobs: HashMap::new(),
+            cancels: HashMap::new(),
             next_id: 1,
+            scope: next_scope_id(),
             completed_notify: Arc::new(Notify::new()),
             watch: None,
             loop_control: None,
         }
+    }
+
+    /// This job table's cancellation scope (opaque, stable for its lifetime).
+    pub fn scope(&self) -> &str {
+        &self.scope
     }
 
     /// Return a clone of the completed-notify handle.
@@ -146,10 +202,74 @@ impl BackgroundJobManager {
     }
 
     /// Insert a new job and return its ID.
+    ///
+    /// Goal 412: insertion registers a cancel handle for the job in the
+    /// process-wide task table, keyed `background-job:<scope>/<job-id>` — every
+    /// job is cancellable and routable from the moment it exists.
     pub fn insert(&mut self, job: Job) -> String {
         let id = self.next_id();
+        let registration = TaskRegistration::spawn_keyed(
+            CancelKind::BackgroundJob,
+            Some(&self.scope),
+            format!(
+                "{}:{}/{}",
+                CancelKind::BackgroundJob.as_str(),
+                self.scope,
+                id
+            ),
+        );
+        registration.note_stage("spawned");
+        self.cancels.insert(id.clone(), registration);
         self.jobs.insert(id.clone(), job);
         id
+    }
+
+    /// Clone the cancel handle of a tracked job, if it still has one.
+    pub fn cancel_handle(&self, id: &str) -> Option<CancelHandle> {
+        self.cancels
+            .get(id)
+            .map(|registration| registration.handle().clone())
+    }
+
+    /// Cancel one running job by ID. The job loop observes the cancel, reaps
+    /// the process group and records [`JobState::Cancelled`].
+    pub fn cancel(&mut self, id: &str) -> bool {
+        match self.cancels.get(id) {
+            Some(registration) if !self.is_terminal(id) => registration.cancel(),
+            _ => false,
+        }
+    }
+
+    /// Cancel every running job (destroy-time liquidation). Returns how many
+    /// were newly cancelled. State is *not* mutated here: the job loop owns the
+    /// transition, so a job that never reports back stays visibly Running and
+    /// surfaces as unreclaimed (see [`reclaim_all`]).
+    pub fn cancel_all(&mut self) -> usize {
+        let live: Vec<String> = self
+            .cancels
+            .keys()
+            .filter(|id| !self.is_terminal(id))
+            .cloned()
+            .collect();
+        live.iter()
+            .filter_map(|id| self.cancels.get(id))
+            .filter(|registration| registration.cancel_with(CancelReason::Destroy))
+            .count()
+    }
+
+    fn is_terminal(&self, id: &str) -> bool {
+        self.jobs
+            .get(id)
+            .map(|job| job.state.is_terminal())
+            .unwrap_or(true)
+    }
+
+    /// Number of jobs still reported as running.
+    pub fn running(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|job| matches!(job.state, JobState::Running))
+            .count()
     }
 
     /// Get a reference to a job's state.
@@ -164,6 +284,10 @@ impl BackgroundJobManager {
             job.state = state;
         }
         if is_terminal {
+            // Terminal: the job is no longer cancellable, so deregister it. A
+            // stale routable entry would make a later cancel look handled while
+            // nothing owns the task any more.
+            self.cancels.remove(id);
             self.completed_notify.notify_one();
         }
     }
@@ -179,11 +303,30 @@ impl BackgroundJobManager {
             .checked_sub(JOB_TTL)
             .unwrap_or_else(Instant::now);
         self.jobs.retain(|_, job| job.created_at > cutoff);
+        // A job evicted here can no longer be cancelled; drop its registration
+        // so the task table does not keep a stale routable entry (Goal 412).
+        let live: Vec<String> = self.jobs.keys().cloned().collect();
+        self.cancels.retain(|id, _| live.contains(id));
     }
 
     /// Remove all jobs immediately.
+    ///
+    /// Dropping a job deregisters its cancel handle, so nothing is left
+    /// routable. Clearing a table that still has *running* jobs is a silent
+    /// process leak (issue #177) — it is reported here, and destroy paths go
+    /// through [`reclaim_all`] instead.
     pub fn clear(&mut self) {
+        let running = self.running();
+        if running > 0 {
+            tracing::warn!(
+                target: crate::process::CANCEL_TARGET,
+                scope = %self.scope,
+                running,
+                "background job table cleared with running jobs — their processes were not liquidated by this call"
+            );
+        }
         self.jobs.clear();
+        self.cancels.clear();
     }
 
     /// Register a file for mid-run event wakes. `offset` is the byte offset to
@@ -265,9 +408,10 @@ impl BackgroundJobManager {
     /// completed job has a scheduled wake until it is drained (goal-379).
     pub fn take_completed(&mut self) -> Option<(String, String)> {
         let id = self.jobs.iter().find_map(|(id, job)| match &job.state {
-            JobState::Completed { .. } | JobState::Failed { .. } | JobState::TimedOut => {
-                Some(id.clone())
-            }
+            JobState::Completed { .. }
+            | JobState::Failed { .. }
+            | JobState::TimedOut
+            | JobState::Cancelled => Some(id.clone()),
             JobState::Running => None,
         })?;
         let job = self.jobs.remove(&id)?;
@@ -283,12 +427,53 @@ impl BackgroundJobManager {
                 format!("failed: {message}")
             }
             JobState::TimedOut => "timed out".to_string(),
+            JobState::Cancelled => "cancelled".to_string(),
             JobState::Running => unreachable!(), // filtered above
         };
         if self.jobs.values().any(|j| j.state.is_terminal()) {
             self.completed_notify.notify_one();
         }
         Some((id, output))
+    }
+}
+
+/// Outcome of destroy-time liquidation of a background job table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimReport {
+    /// Jobs that were cancelled by this call.
+    pub cancelled: usize,
+    /// Jobs still reported as running when the grace period expired. Non-zero
+    /// is a liquidation failure and must be surfaced (WARNING), never assumed
+    /// away — the whole point of #177 is that a silent leak looked like success.
+    pub unreclaimed: usize,
+}
+
+/// Destroy-time liquidation (Goal 412 / issue #177).
+///
+/// Cancels every running job, waits (bounded) for each job loop to report a
+/// terminal state — which it only does after `killpg`-ing its process group —
+/// and then drops the table. Returns what happened so the caller can be loud
+/// about a failure; this function itself never claims more than it observed.
+pub async fn reclaim_all(
+    manager: &Arc<Mutex<BackgroundJobManager>>,
+    grace: Duration,
+) -> ReclaimReport {
+    let cancelled = {
+        let mut mgr = manager.lock().await;
+        mgr.cancel_all()
+    };
+    let deadline = Instant::now() + grace;
+    let unreclaimed = loop {
+        let running = manager.lock().await.running();
+        if running == 0 || Instant::now() >= deadline {
+            break running;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    manager.lock().await.clear();
+    ReclaimReport {
+        cancelled,
+        unreclaimed,
     }
 }
 
@@ -414,10 +599,8 @@ impl Tool for RunBackground {
         if let Some(transport) = self.transport.clone() {
             let mut manager = self.manager.lock().await;
             manager.cleanup();
-            let job_id = manager.insert(Job {
-                state: JobState::Running,
-                created_at: Instant::now(),
-            });
+            let job_id = manager.insert(Job::running());
+            let cancel = manager.cancel_handle(&job_id);
             drop(manager);
 
             let manager_clone = self.manager.clone();
@@ -425,28 +608,47 @@ impl Tool for RunBackground {
             let command_display = command.to_string();
             let command = command.to_string();
             tokio::spawn(async move {
-                let result = match transport
-                    .exec_shell(
-                        &command,
-                        &cwd,
-                        &env_pairs,
-                        Duration::from_secs(timeout_secs),
-                        MAX_OUTPUT_BYTES,
-                    )
-                    .await
-                {
-                    Ok(r) => match r.failure {
-                        Some(_) => JobState::Failed { message: r.stderr },
-                        None => JobState::Completed {
-                            stdout: r.stdout,
-                            stderr: r.stderr,
-                            exit_code: r.exit_code.unwrap_or(-1),
+                let exec = async {
+                    match transport
+                        .exec_shell(
+                            &command,
+                            &cwd,
+                            &env_pairs,
+                            Duration::from_secs(timeout_secs),
+                            MAX_OUTPUT_BYTES,
+                        )
+                        .await
+                    {
+                        Ok(r) => match r.failure {
+                            Some(_) => JobState::Failed { message: r.stderr },
+                            None => JobState::Completed {
+                                stdout: r.stdout,
+                                stderr: r.stderr,
+                                exit_code: r.exit_code.unwrap_or(-1),
+                            },
                         },
-                    },
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => JobState::TimedOut,
-                    Err(e) => JobState::Failed {
-                        message: format!("exec failed: {e}"),
-                    },
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => JobState::TimedOut,
+                        Err(e) => JobState::Failed {
+                            message: format!("exec failed: {e}"),
+                        },
+                    }
+                };
+                // Goal 412: the job is cancellable here too. Dropping the exec
+                // future is the only way to stop a sandbox execution early —
+                // the local tier reaps its child via `kill_on_drop`, and the
+                // container tier's own `destroy()` removes the environment
+                // right after (destroy is the next step of `destroy_environment`).
+                let result = match &cancel {
+                    Some(handle) => {
+                        tokio::select! {
+                            result = exec => result,
+                            _ = handle.cancelled() => {
+                                handle.note_stage("cancelled-in-sandbox");
+                                JobState::Cancelled
+                            }
+                        }
+                    }
+                    None => exec.await,
                 };
                 let mut mgr = manager_clone.lock().await;
                 mgr.update(&job_id_clone, result);
@@ -475,8 +677,10 @@ impl Tool for RunBackground {
             cmd.env(key, val);
         }
 
-        // Spawn the process
-        let mut child = cmd.spawn().map_err(|e| Error::Tool {
+        // Spawn the process. Goal 412: through the single spawn entry, so the
+        // shell leads its own process group and a timeout/cancel can reap the
+        // whole tree instead of just `sh` (issue #165).
+        let mut child = crate::process::spawn_owned(&mut cmd).map_err(|e| Error::Tool {
             name: "run_background".into(),
             call_id: None,
             message: format!("spawn failed: {e}"),
@@ -485,13 +689,12 @@ impl Tool for RunBackground {
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
 
-        // Generate a job ID and store it
+        // Generate a job ID and store it (the insert registers the job's cancel
+        // handle in the task table).
         let mut manager = self.manager.lock().await;
         manager.cleanup();
-        let job_id = manager.insert(Job {
-            state: JobState::Running,
-            created_at: Instant::now(),
-        });
+        let job_id = manager.insert(Job::running());
+        let cancel = manager.cancel_handle(&job_id);
         drop(manager);
 
         // Spawn a background task to wait for the process and capture output
@@ -503,6 +706,7 @@ impl Tool for RunBackground {
                 stdout_handle,
                 stderr_handle,
                 Duration::from_secs(timeout_secs),
+                cancel,
             )
             .await;
 
@@ -616,92 +820,184 @@ impl Tool for CheckBackground {
                 "message": "Job exceeded its timeout."
             })
             .to_string()),
+            Some(JobState::Cancelled) => Ok(json!({
+                "job_id": job_id,
+                "status": "cancelled",
+                "message": "Job was cancelled and its process group reaped."
+            })
+            .to_string()),
+        }
+    }
+}
+
+/// How a job's process finished.
+enum WaitOutcome {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
+}
+
+/// Mirror of the bytes a reader has captured so far, so a drain that has to be
+/// abandoned still returns what was read.
+type OutputMirror = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Read one stream to EOF (or to the output cap), draining the rest so a
+/// chatty command never blocks on a full pipe.
+async fn read_stream<R>(reader: Option<R>, label: &'static str, mirror: OutputMirror) -> String
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut reader = match reader {
+        Some(reader) => reader,
+        None => return String::new(),
+    };
+    let mut out = String::new();
+    let mut buf = [0u8; 8192];
+    let mut total = 0usize;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if total + n > MAX_OUTPUT_BYTES {
+                    let take = MAX_OUTPUT_BYTES.saturating_sub(total);
+                    out.push_str(&String::from_utf8_lossy(&buf[..take]));
+                    out.push_str(&format!("\n... [{label} truncated]"));
+                    // Keep draining so the writer is never wedged on a full pipe.
+                    let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+                    break;
+                }
+                out.push_str(&String::from_utf8_lossy(&buf[..n]));
+                total += n;
+                let mut mirrored = mirror
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if mirrored.len() < MAX_OUTPUT_BYTES {
+                    mirrored.extend_from_slice(&buf[..n]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn mirrored_text(mirror: &OutputMirror) -> String {
+    let mirrored = mirror
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    String::from_utf8_lossy(&mirrored).into_owned()
+}
+
+/// Bounded drain of a reader task: once the process group is gone EOF should
+/// arrive, but a descendant that escaped the group (`setsid`) can hold the
+/// write end open, so we never park forever — the mirror returns whatever was
+/// already captured.
+async fn drain_reader(
+    task: tokio::task::JoinHandle<String>,
+    mirror: &OutputMirror,
+    label: &'static str,
+) -> String {
+    match timeout(READER_DRAIN_GRACE, task).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: crate::process::CANCEL_TARGET,
+                stream = label,
+                error = %e,
+                "background job reader task failed; captured output may be incomplete"
+            );
+            mirrored_text(mirror)
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: crate::process::CANCEL_TARGET,
+                stream = label,
+                grace_ms = READER_DRAIN_GRACE.as_millis() as u64,
+                "background job reader did not reach EOF after the process group died; keeping the bytes captured so far"
+            );
+            mirrored_text(mirror)
         }
     }
 }
 
 /// Wait for a background process to finish, capturing its output.
+///
+/// The reader tasks are spawned **before** the waiter is polled: a command that
+/// writes more than the pipe buffer blocks in `write(2)` until someone drains
+/// the pipe, so waiting for the process while nobody reads deadlocks the job
+/// until its timeout (issue #164). Timeout and cancellation are handled here so
+/// both end the whole process group through [`crate::process::terminate_group`]
+/// (issue #165) and leave a job state the caller can act on.
 async fn run_background_job(
     mut child: tokio::process::Child,
     stdout_opt: Option<tokio::process::ChildStdout>,
     stderr_opt: Option<tokio::process::ChildStderr>,
     job_timeout: Duration,
+    cancel: Option<CancelHandle>,
 ) -> JobState {
-    let stdout_task = async {
-        let mut out = String::new();
-        if let Some(mut reader) = stdout_opt {
-            let mut buf = [0u8; 8192];
-            let mut total = 0usize;
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if total + n > MAX_OUTPUT_BYTES {
-                            let take = MAX_OUTPUT_BYTES.saturating_sub(total);
-                            out.push_str(&String::from_utf8_lossy(&buf[..take]));
-                            out.push_str("\n... [stdout truncated]");
-                            // Drain remaining
-                            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-                            break;
-                        }
-                        out.push_str(&String::from_utf8_lossy(&buf[..n]));
-                        total += n;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        out
+    let stdout_mirror: OutputMirror = OutputMirror::default();
+    let stderr_mirror: OutputMirror = OutputMirror::default();
+    let stdout_task = tokio::spawn(read_stream(
+        stdout_opt,
+        "stdout",
+        OutputMirror::clone(&stdout_mirror),
+    ));
+    let stderr_task = tokio::spawn(read_stream(
+        stderr_opt,
+        "stderr",
+        OutputMirror::clone(&stderr_mirror),
+    ));
+
+    if let Some(handle) = &cancel {
+        handle.note_stage("running");
+    }
+    let token = match &cancel {
+        Some(handle) => handle.token(),
+        None => tokio_util::sync::CancellationToken::new(),
     };
 
-    let stderr_task = async {
-        let mut err = String::new();
-        if let Some(mut reader) = stderr_opt {
-            let mut buf = [0u8; 8192];
-            let mut total = 0usize;
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if total + n > MAX_OUTPUT_BYTES {
-                            let take = MAX_OUTPUT_BYTES.saturating_sub(total);
-                            err.push_str(&String::from_utf8_lossy(&buf[..take]));
-                            err.push_str("\n... [stderr truncated]");
-                            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-                            break;
-                        }
-                        err.push_str(&String::from_utf8_lossy(&buf[..n]));
-                        total += n;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        err
+    let outcome = tokio::select! {
+        status = child.wait() => WaitOutcome::Exited(status),
+        _ = tokio::time::sleep(job_timeout) => WaitOutcome::TimedOut,
+        _ = token.cancelled() => WaitOutcome::Cancelled,
     };
 
-    // Wait for the process with a timeout
-    let wait_result = timeout(job_timeout, child.wait()).await;
-
-    match wait_result {
-        Err(_) => {
-            // Timed out — kill the process
-            let _ = child.start_kill();
-            JobState::TimedOut
+    match &outcome {
+        WaitOutcome::Exited(_) => {
+            if let Some(handle) = &cancel {
+                handle.note_stage("draining-output");
+            }
         }
-        Ok(Err(e)) => JobState::Failed {
+        WaitOutcome::TimedOut => {
+            if let Some(handle) = &cancel {
+                handle.note_stage("timed-out");
+            }
+            crate::process::terminate_group(&mut child).await;
+        }
+        WaitOutcome::Cancelled => {
+            if let Some(handle) = &cancel {
+                handle.note_stage("reaping-process-group");
+            }
+            crate::process::terminate_group(&mut child).await;
+        }
+    }
+
+    let (stdout, stderr) = tokio::join!(
+        drain_reader(stdout_task, &stdout_mirror, "stdout"),
+        drain_reader(stderr_task, &stderr_mirror, "stderr"),
+    );
+
+    match outcome {
+        WaitOutcome::Exited(Ok(status)) => JobState::Completed {
+            stdout,
+            stderr,
+            exit_code: status.code().unwrap_or(-1),
+        },
+        WaitOutcome::Exited(Err(e)) => JobState::Failed {
             message: format!("wait failed: {e}"),
         },
-        Ok(Ok(status)) => {
-            let stdout = stdout_task.await;
-            let stderr = stderr_task.await;
-            let exit_code = status.code().unwrap_or(-1);
-            JobState::Completed {
-                stdout,
-                stderr,
-                exit_code,
-            }
-        }
+        WaitOutcome::TimedOut => JobState::TimedOut,
+        WaitOutcome::Cancelled => JobState::Cancelled,
     }
 }
 
@@ -1375,6 +1671,276 @@ mod tests {
         assert!(
             mgr.get_state(&id).is_some(),
             "freshly-created job must survive cleanup"
+        );
+    }
+
+    // ── Goal 412 process/cancel contract ───────────────────────────────────
+
+    /// `kill -0` probe: true while `pid` exists.
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    async fn wait_gone(pid: u32, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        !pid_alive(pid)
+    }
+
+    /// Read a pid marker file written by a spawned command.
+    async fn read_pid(path: &std::path::Path) -> Option<u32> {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// Contract: a long-running job carries a cancel handle in the task table,
+    /// and consuming it ends the job's process group while the job's output is
+    /// being drained concurrently.
+    ///
+    /// Mutation guards (Scope 6):
+    /// * drop the `token.cancelled()` arm of the waiter in
+    ///   [`run_background_job`] → the job runs to completion → red
+    ///   ("cancel 路径断裂");
+    /// * replace `terminate_group` with `child.start_kill()` → the descendant
+    ///   holding the pipe survives → red.
+    #[tokio::test]
+    async fn test_process_contract_cancel_handle() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+        let check_tool = CheckBackground::new(manager.clone());
+        let pid_file = tmp.path().join("job.pid");
+
+        // Floods far past the pipe buffer *and then* sleeps: the cancel can
+        // only be observed if the readers are polled concurrently (issue #164).
+        let command = format!(
+            "echo $$ > '{}'; yes x | head -c 200000; exec sleep 60",
+            pid_file.display()
+        );
+        let result = run_tool
+            .execute(json!({"command": command, "timeout_secs": 3600}))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let job_id = parsed["job_id"].as_str().unwrap().to_string();
+
+        let pid = read_pid(&pid_file)
+            .await
+            .expect("job should record its pid before sleeping");
+        assert!(pid_alive(pid), "job process should be alive before cancel");
+
+        // Route the cancel the way an edge would: by key through the
+        // process-wide task table (no access to the handle object itself).
+        let key = manager
+            .lock()
+            .await
+            .cancel_handle(&job_id)
+            .expect("a running job must be registered in the task table")
+            .key()
+            .to_string();
+        assert!(key.contains(&job_id), "handle key names the job: {key}");
+        assert!(
+            crate::process::cancel_task(&key),
+            "routed cancel must reach the job's handle"
+        );
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(10)).await;
+        assert_eq!(
+            parsed["status"], "cancelled",
+            "cancelled job must report `cancelled`, got {parsed}"
+        );
+        assert!(
+            wait_gone(pid, Duration::from_secs(5)).await,
+            "job process {pid} survived cancellation"
+        );
+        assert!(
+            manager.lock().await.get_state(&job_id).is_some(),
+            "the cancelled job's row stays readable for check_background"
+        );
+    }
+
+    /// Contract: destroy is liquidation — cancel, reap, then drop the table.
+    ///
+    /// Mutation guard (Scope 6, "destroy 漏清算 → 红"): make [`reclaim_all`]
+    /// clear the table without cancelling, or skip the process-group kill, and
+    /// the process is still alive here → red (issue #177).
+    #[tokio::test]
+    async fn test_process_contract_destroy_reclaim() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+        let pid_file = tmp.path().join("destroy.pid");
+
+        let command = format!("echo $$ > '{}' && exec sleep 60", pid_file.display());
+        run_tool
+            .execute(json!({"command": command, "timeout_secs": 3600}))
+            .await
+            .unwrap();
+        let pid = read_pid(&pid_file)
+            .await
+            .expect("job should record its pid");
+        assert!(pid_alive(pid), "job process should be alive before destroy");
+
+        let report = reclaim_all(&manager, DEFAULT_RECLAIM_GRACE).await;
+        assert_eq!(report.cancelled, 1, "the running job must be cancelled");
+        assert_eq!(
+            report.unreclaimed, 0,
+            "liquidation must observe every job reaping its group"
+        );
+        assert!(
+            wait_gone(pid, Duration::from_secs(5)).await,
+            "companion process {pid} survived destroy — destroy must liquidate (issue #177)"
+        );
+        assert!(
+            manager.lock().await.get_state("bg-1").is_none(),
+            "reclaim drops the job table"
+        );
+
+        // An empty table reclaims cleanly.
+        let empty = reclaim_all(&manager, Duration::from_millis(50)).await;
+        assert_eq!(
+            empty,
+            ReclaimReport {
+                cancelled: 0,
+                unreclaimed: 0
+            }
+        );
+    }
+
+    /// Contract: liquidation is counted, not assumed. A job that never reports
+    /// back (no job loop owns it) must surface as `unreclaimed` so the caller
+    /// can be loud about the leak.
+    ///
+    /// Mutation guard: make [`reclaim_all`] report `unreclaimed: 0`
+    /// unconditionally and this goes red.
+    #[tokio::test]
+    async fn reclaim_reports_jobs_that_never_reap() {
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        manager.lock().await.insert(Job::running());
+
+        let report = reclaim_all(&manager, Duration::from_millis(50)).await;
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(
+            report.unreclaimed, 1,
+            "a job that never reports a terminal state is an unproven liquidation"
+        );
+    }
+
+    /// Issue #164 regression: output far beyond the pipe buffer must not
+    /// deadlock the job. Before the fix the waiter was polled alone — the child
+    /// blocked in `write(2)` on a full pipe and the job wedged until its
+    /// timeout.
+    ///
+    /// Mutation guard: poll `child.wait()` without the concurrent reader tasks
+    /// and this test times out instead of seeing `completed`.
+    #[tokio::test]
+    async fn background_output_beyond_pipe_buffer_does_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+        let check_tool = CheckBackground::new(manager.clone());
+
+        // ~400 KiB on stdout and ~200 KiB on stderr, both >> the 64 KiB pipe
+        // buffer, while the per-stream capture cap is 128 KiB.
+        let result = run_tool
+            .execute(json!({
+                "command": "yes x | head -c 400000; yes y | head -c 200000 1>&2; echo done",
+                "timeout_secs": 60,
+            }))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let job_id = parsed["job_id"].as_str().unwrap().to_string();
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(20)).await;
+        assert_eq!(
+            parsed["status"], "completed",
+            "the job must finish, not wedge on a full pipe: {parsed}"
+        );
+        assert_eq!(parsed["exit_code"], 0);
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[stdout truncated]"),
+            "the 128 KiB cap must have truncated 400 KiB of output"
+        );
+        assert!(
+            stdout.len() > 64 * 1024,
+            "the reader must have captured well past the pipe buffer, got {} bytes",
+            stdout.len()
+        );
+        assert!(
+            parsed["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("[stderr truncated]"),
+            "stderr must be drained and capped too"
+        );
+    }
+
+    /// Issue #165 regression: a timeout kills the shell's descendants too.
+    ///
+    /// Mutation guard: `child.start_kill()` instead of
+    /// [`crate::process::terminate_group`] leaves the `sleep` grandchild alive
+    /// → red.
+    #[tokio::test]
+    async fn background_timeout_kills_descendants() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+        let check_tool = CheckBackground::new(manager.clone());
+        let pid_file = tmp.path().join("pids");
+
+        // `sh` spawns a grandchild and waits, so the grandchild is *not* the
+        // process the job directly waits on.
+        let command = format!("sleep 60 & echo $$ $! > '{}'; wait", pid_file.display());
+        let result = run_tool
+            .execute(json!({"command": command, "timeout_secs": 1}))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let job_id = parsed["job_id"].as_str().unwrap().to_string();
+
+        let mut pids: Option<(u32, u32)> = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                let mut parts = text.split_whitespace();
+                if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
+                    if let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>()) {
+                        pids = Some((a, b));
+                        break;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        let (leader, descendant) = pids.expect("child should record both pids");
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(10)).await;
+        assert_eq!(parsed["status"], "timed_out");
+        assert!(
+            wait_gone(leader, Duration::from_secs(5)).await,
+            "timed-out leader {leader} still alive"
+        );
+        assert!(
+            wait_gone(descendant, Duration::from_secs(5)).await,
+            "descendant {descendant} survived the timeout — the group was not killed (issue #165)"
         );
     }
 }

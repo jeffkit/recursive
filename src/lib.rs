@@ -57,6 +57,7 @@ pub mod observability;
 pub mod paths;
 pub mod permissions;
 pub mod preset;
+pub mod process;
 pub mod providers;
 pub mod providers_cache;
 pub mod rewind;

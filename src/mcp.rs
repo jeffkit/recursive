@@ -595,7 +595,10 @@ impl McpClient {
         if let Some(env) = &server.env {
             cmd.envs(env);
         }
-        let mut child = cmd.spawn().map_err(|e| Error::Mcp {
+        // Goal 412: the server leads its own process group, so the graceful
+        // shutdown below signals the server *and* the wrappers it spawned
+        // (a `npx`/`uvx` launcher leaves a real server as its child).
+        let mut child = crate::process::spawn_grouped(&mut cmd).map_err(|e| Error::Mcp {
             server: server.name.clone(),
             message: format!("failed to spawn: {e}"),
         })?;
@@ -2248,8 +2251,14 @@ pub async fn kill_gracefully(
         use std::os::unix::process::ExitStatusExt;
         use tokio::time::timeout;
 
-        // Phase 1: send SIGTERM
+        // Phase 1: SIGTERM to the whole process group (Goal 412) — a launcher
+        // (`npx`, `uvx`) leaves the real server as a child, and signalling only
+        // the launcher would strand it.
         tracing::info!(server = %server_name, "kill-gracefully: sending SIGTERM");
+        let group_pid = child.id();
+        if let Some(pid) = group_pid {
+            crate::process::signal_group(pid, crate::process::GroupSignal::Terminate);
+        }
         let _ = child.start_kill(); // sends SIGTERM on Unix
 
         // Phase 2: wait for grace period
@@ -2267,6 +2276,11 @@ pub async fn kill_gracefully(
                         "kill-gracefully: process exited gracefully"
                     );
                 }
+                // Anything the server spawned is still in its group; a
+                // graceful exit of the leader is not proof the tree is gone.
+                if let Some(pid) = group_pid {
+                    crate::process::kill_group(pid);
+                }
                 KillOutcome::Graceful
             }
             Ok(Err(e)) => {
@@ -2276,24 +2290,17 @@ pub async fn kill_gracefully(
                     error = %e,
                     "kill-gracefully: wait() error after SIGTERM, sending SIGKILL"
                 );
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                crate::process::terminate_group(child).await;
                 KillOutcome::Timeout
             }
             Err(_elapsed) => {
-                // Phase 3: timeout -- send SIGKILL
+                // Phase 3: timeout -- SIGKILL the group, then reap the leader.
                 tracing::warn!(
                     server = %server_name,
                     grace_ms = grace_period.as_millis(),
                     "kill-gracefully: SIGTERM timeout, sending SIGKILL"
                 );
-                // On Unix, start_kill sends SIGKILL after a SIGTERM for a process
-                // that hasn't exited. We need to forcefully kill.
-                let pid = child.id().unwrap_or(0);
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .status();
-                let _ = child.wait().await;
+                crate::process::terminate_group(child).await;
                 KillOutcome::Timeout
             }
         }

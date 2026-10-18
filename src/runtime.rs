@@ -1405,25 +1405,45 @@ impl AgentRuntime {
         }
     }
 
-    /// Issue #31: session-bound environment teardown. Drains the session's
-    /// background-job manager (transport-backed jobs die with the
-    /// environment) and calls `destroy()` on the registry's transport —
-    /// idempotent by contract, safe on every teardown path (DELETE / idle
-    /// eviction / graceful shutdown).
+    /// Issue #31 / Goal 412: session-bound environment teardown. **Destroy is
+    /// liquidation, not a table reset** (issue #177): every background job is
+    /// cancelled through its handle, its process group is reaped, and only then
+    /// is the job table dropped — followed by `destroy()` on the registry's
+    /// transport. Idempotent by contract, safe on every teardown path (DELETE /
+    /// idle eviction / graceful shutdown).
     pub async fn destroy_environment(&mut self) {
-        // Issue #31 §D: session teardown order — drain the session's
-        // background jobs (transport-backed jobs die with the environment
-        // when the transport is destroyed below), then destroy the
-        // transport itself. The once-guard makes this idempotent even for
-        // transports whose own destroy isn't; the manager clear runs first
-        // so a late-arriving job completion finds an empty map instead of
-        // a destroyed environment it cannot record into.
+        // Issue #31 §D: session teardown order — liquidate the session's
+        // background jobs (transport-backed jobs die with the environment when
+        // the transport is destroyed below), then destroy the transport. The
+        // once-guard makes this idempotent even for transports whose own
+        // destroy isn't.
         if self.session.environment_destroyed {
             return;
         }
         self.session.environment_destroyed = true;
         let tools = self.kernel.tools();
-        tools.bg_manager().lock().await.clear();
+        let report = crate::tools::run_background::reclaim_all(
+            tools.bg_manager(),
+            crate::tools::run_background::DEFAULT_RECLAIM_GRACE,
+        )
+        .await;
+        if report.unreclaimed > 0 {
+            // Owner ruling 2026-10-18: every degradation must be observable.
+            // A companion task that did not report back is a leak we cannot
+            // fix here, but we must never let it look like a clean teardown.
+            tracing::warn!(
+                target: crate::process::CANCEL_TARGET,
+                cancelled = report.cancelled,
+                unreclaimed = report.unreclaimed,
+                "destroy_environment: companion background tasks still running after the reclaim grace — their processes may leak"
+            );
+        } else {
+            tracing::info!(
+                target: crate::process::CANCEL_TARGET,
+                cancelled = report.cancelled,
+                "destroy_environment: background tasks reclaimed"
+            );
+        }
         tools.transport().destroy().await;
     }
 

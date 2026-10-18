@@ -137,11 +137,25 @@ async fn environment_binding_local_transport_destroy_is_noop() {
 
 /// Plan §D: session destroy drains the background-job manager and destroys
 /// the transport exactly once; repeated destroy_environment is a no-op.
+///
+/// Goal 412 / issue #177: destroy is *liquidation* — the seeded job really owns
+/// a process, and the assertion after destroy is that the process is gone, not
+/// merely untracked.
 #[tokio::test]
+#[cfg(not(target_os = "windows"))]
 async fn environment_binding_destroy_drains_background_jobs() {
-    use crate::tools::run_background::{BackgroundJobManager, Job, JobState};
+    use crate::tools::run_background::{BackgroundJobManager, RunBackground};
+    use crate::tools::Tool;
     use crate::AgentRuntime;
-    use std::time::Instant;
+
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
 
     let transport = Arc::new(CountingDestroyTransport::default());
     // Seed the manager FIRST, then build the registry through the real
@@ -150,10 +164,33 @@ async fn environment_binding_destroy_drains_background_jobs() {
     // jobs. (Issue #31 review: rewiring the field by hand in the test hid
     // the builder never wiring it back.)
     let manager = Arc::new(tokio::sync::Mutex::new(BackgroundJobManager::new()));
-    manager.lock().await.insert(Job {
-        state: JobState::Running,
-        created_at: Instant::now(),
-    });
+    let workspace = tempfile::tempdir().unwrap();
+    let pid_file = workspace.path().join("bg.pid");
+    let run_tool = RunBackground::new(workspace.path(), manager.clone());
+    run_tool
+        .execute(serde_json::json!({
+            // `exec` makes the shell *become* the sleeper, so the pid recorded
+            // is the process the job owns.
+            "command": format!("echo $$ > '{}' && exec sleep 30", pid_file.display()),
+            "timeout_secs": 60,
+        }))
+        .await
+        .unwrap();
+    let mut pid: Option<u32> = None;
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            pid = text.trim().parse().ok();
+            if pid.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid = pid.expect("background job should record its pid");
+    assert!(
+        pid_alive(pid),
+        "job process should be running before destroy"
+    );
     assert!(
         Arc::ptr_eq(
             crate::tools::registry::build_standard_tools_with_transport(
@@ -199,6 +236,10 @@ async fn environment_binding_destroy_drains_background_jobs() {
     assert!(
         manager.lock().await.get_state("bg-1").is_none(),
         "session destroy must drain the background-job manager"
+    );
+    assert!(
+        !pid_alive(pid),
+        "job process {pid} survived destroy_environment — destroy must liquidate (issue #177)"
     );
     assert_eq!(
         transport.destroy_calls.load(Ordering::SeqCst),

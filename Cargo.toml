@@ -150,7 +150,12 @@ shell-words = "1"
 # direct dependency before, but it is already in `Cargo.lock` (a
 # transitive dep of tokio/reqwest), so this adds no new crate to the
 # graph — see `.dev/journal/manual-20261010-issue150-parent-environ.md`.
-[target.'cfg(target_os = "linux")'.dependencies]
+#
+# Goal 412: widened from `target_os = "linux"` to `unix` — `killpg` (goal
+# 412's single termination point, `src/process.rs::signal_group`) is POSIX,
+# not Linux-specific, and `libc` is already in the graph on every unix (tokio
+# / reqwest pull it). No crate is added to `Cargo.lock`.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

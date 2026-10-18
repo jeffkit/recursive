@@ -281,6 +281,9 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
     for (key, value) in child_env() {
         cmd.env(key, value);
     }
+    // Goal 412: the runtime leads its own process group so a timed-out program
+    // that spawned its own children is ended as a tree, not just at the root.
+    crate::process::attach_group(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -417,6 +420,12 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
     }
 
     if timed_out || aborted {
+        // Goal 412: kill the group the runtime leads, then the root process —
+        // a program that spawned children must not leave them behind on a
+        // timeout (issue #165 class).
+        if let Some(pid) = child.id() {
+            crate::process::kill_group(pid);
+        }
         let _ = child.start_kill();
     }
     let status = match tokio::time::timeout(REAP_GRACE, child.wait()).await {
