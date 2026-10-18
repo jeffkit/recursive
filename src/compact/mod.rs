@@ -10,6 +10,17 @@
 //!   count. Runs before the LLM-driven compactor each step so the transcript
 //!   may drop below the compaction threshold and the expensive LLM summary
 //!   is skipped entirely.
+//!
+//! # SINGLE application point (goal 411)
+//!
+//! [`Compactor::apply`] is the one place a transcript may be rewritten by
+//! compaction. It computes the cut exactly once ([`CompactionBounds`]),
+//! summarises that slice, and performs the splice — so the split decision,
+//! the "is this worth compacting?" check ([`Compactor::would_compact`]) and
+//! the summarisation prompt can never disagree. Partial compactions go
+//! through [`Compactor::apply_before`] / [`Compactor::apply_after`], which
+//! reuse the same bounds and splice. Callers outside this module never
+//! compute a split point, drain a transcript, or splice a summary.
 
 pub mod micro;
 pub mod prompt;
@@ -29,7 +40,28 @@ pub const MAX_CONSECUTIVE_COMPACT_FAILURES: u32 = 3;
 
 use crate::error::Result;
 use crate::llm::{ChatProvider, StructuredRequest, TokenUsage, ToolSpec};
-use crate::message::Message;
+use crate::message::{Message, Role};
+use std::ops::Range;
+
+/// Where a compaction cuts a transcript, computed exactly once per
+/// application by [`Compactor::apply`] (goal 411: one split computation).
+///
+/// All ranges index the **pre-compaction** transcript. The splice replaces
+/// `summarized` with the summary message, so the post-compaction transcript
+/// is `prefix + [summary] + preserved` with `summarized` gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionBounds {
+    /// Leading run of non-summary `Role::System` messages — the rebuilt
+    /// prompt. Never summarised; preserved verbatim at the head.
+    pub prefix: Range<usize>,
+    /// The older slice folded into the summary (removed by the splice).
+    pub summarized: Range<usize>,
+    /// Messages kept verbatim. For [`Compactor::apply`] /
+    /// [`Compactor::apply_before`] this is the recent tail after the split;
+    /// for [`Compactor::apply_after`] it is the untouched head (which
+    /// contains `prefix`).
+    pub preserved: Range<usize>,
+}
 
 /// Result of a successful compaction pass.
 ///
@@ -37,7 +69,11 @@ use crate::message::Message;
 /// history is re-sent, so this is one of the most expensive single calls in a
 /// session. It used to be dropped (issue #115); the caller now folds it into
 /// the turn's cost.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `bounds` and `summary` make the rewrite auditable: together they say
+/// exactly what changed, so [`verify_compaction_rewrite`] can tell a
+/// `Compactor::apply` splice apart from a second, bypassing rewrite path.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompactionOutcome {
     /// Number of older messages removed from the transcript.
     pub removed: usize,
@@ -46,6 +82,36 @@ pub struct CompactionOutcome {
     /// Token usage reported by the summarisation call(s) — summed across PTL
     /// retries. `Default` when the provider reported none.
     pub usage: TokenUsage,
+    /// Where the splice happened (indices into the pre-compaction transcript).
+    pub bounds: CompactionBounds,
+    /// The summary message that was spliced in at `bounds.summarized.start`.
+    pub summary: Message,
+}
+
+/// Check that `after` is exactly `before` with `outcome.bounds.summarized`
+/// replaced by `outcome.summary` — the only rewrite compaction may perform.
+///
+/// A rewrite site that produces a transcript any other way (a second splice,
+/// a drain at a different offset, ...) fails this predicate. Tests use it as
+/// the red-light control for the goal-411 single-path contract.
+pub fn verify_compaction_rewrite(
+    before: &[Message],
+    after: &[Message],
+    outcome: &CompactionOutcome,
+) -> bool {
+    let (Some(head), Some(tail)) = (
+        before.get(..outcome.bounds.summarized.start),
+        before.get(outcome.bounds.summarized.end..),
+    ) else {
+        return false;
+    };
+    let expected_len = head.len() + 1 + tail.len();
+    if after.len() != expected_len {
+        return false;
+    }
+    after[..head.len()] == *head
+        && after[head.len()] == outcome.summary
+        && after[head.len() + 1..] == *tail
 }
 
 /// Configuration for LLM-driven transcript compaction.
@@ -316,14 +382,160 @@ impl Compactor {
         split.max(prefix_len)
     }
 
-    /// Apply compaction in-place to `transcript`, returning `(removed, summary_chars)`.
+    /// Apply compaction in-place to `transcript` and report what changed.
     ///
-    /// Finds the correct split point (never splits inside a tool-call pair),
-    /// calls `compact()` to get the summary message, splices the transcript,
-    /// and returns how many messages were removed and the summary char count.
+    /// This is the single application point (goal 411): the cut is computed
+    /// once ([`Self::plan`]), the older slice is summarised, and the splice
+    /// replaces it with the summary. Returns `None` when the transcript is
+    /// too short to compact (`< keep_recent_n + 2` messages) or the older
+    /// slice is degenerate (Goal 345).
+    pub async fn apply(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &mut Vec<Message>,
+        step: usize,
+    ) -> Result<Option<CompactionOutcome>> {
+        let Some(bounds) = self.plan(transcript) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.apply_bounds(provider, transcript, bounds, step)
+                .await?,
+        ))
+    }
+
+    /// Kept name for the intra-turn caller in `run_core` (which goal 411 must
+    /// not touch). Delegates to [`Self::apply`] — one path, two spellings.
+    pub async fn apply_to_transcript(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &mut Vec<Message>,
+        step: usize,
+    ) -> Result<Option<CompactionOutcome>> {
+        self.apply(provider, transcript, step).await
+    }
+
+    /// Apply a *partial* compaction: summarise the older portion that ends at
+    /// or before `pivot`, keeping `transcript[pivot + 1..]` verbatim.
     ///
-    /// Returns `None` when the transcript is too short to compact
-    /// (`< keep_recent_n + 2` messages).
+    /// The split is [`Self::safe_split_point`] on the sub-transcript
+    /// `[..=pivot]`, so a tool-call pair at the boundary is kept whole
+    /// (invariant #8). Returns `None` when there is nothing but the leading
+    /// System prefix to summarise.
+    pub async fn apply_before(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &mut Vec<Message>,
+        pivot: usize,
+        step: usize,
+    ) -> Result<Option<CompactionOutcome>> {
+        if pivot >= transcript.len() {
+            return Ok(None);
+        }
+        let split = Self::safe_split_point(&transcript[..=pivot], self.keep_recent_n);
+        let bounds = Self::bounds_at(transcript, split);
+        if bounds.summarized.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.apply_bounds(provider, transcript, bounds, step)
+                .await?,
+        ))
+    }
+
+    /// Apply a *partial* compaction: summarise everything from `pivot` to the
+    /// end, keeping `transcript[..pivot]` (backed up over tool-call pairs and
+    /// the leading System prefix) verbatim.
+    ///
+    /// Returns `None` when the suffix is a single message or empty — there is
+    /// nothing meaningful to summarise.
+    pub async fn apply_after(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &mut Vec<Message>,
+        pivot: usize,
+        step: usize,
+    ) -> Result<Option<CompactionOutcome>> {
+        if pivot >= transcript.len() {
+            return Ok(None);
+        }
+        // Back up from the pivot so a tool-call pair at the boundary is
+        // included with its partner rather than split.
+        let mut start = pivot;
+        while start > 0 {
+            let msg = &transcript[start];
+            let should_back_up = msg.role == Role::Tool
+                || (msg.role == Role::Assistant && !msg.tool_calls.is_empty());
+            if !should_back_up {
+                break;
+            }
+            start -= 1;
+        }
+        // The leading System prefix is never summarised — a pivot inside it
+        // would truncate the rebuilt prompt away (issue #158).
+        let prefix_len = Self::leading_system_prefix_len(transcript);
+        start = start.max(prefix_len);
+        let suffix_len = transcript.len() - start;
+        if suffix_len <= 1 {
+            return Ok(None);
+        }
+        let bounds = CompactionBounds {
+            prefix: 0..prefix_len,
+            summarized: start..transcript.len(),
+            preserved: 0..start,
+        };
+        Ok(Some(
+            self.apply_bounds(provider, transcript, bounds, step)
+                .await?,
+        ))
+    }
+
+    /// Summarise `bounds.summarized` and splice the summary in. The caller
+    /// has already made the "worth compacting?" decision.
+    #[tracing::instrument(skip(self, provider, transcript, bounds))]
+    async fn apply_bounds(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &mut Vec<Message>,
+        bounds: CompactionBounds,
+        step: usize,
+    ) -> Result<CompactionOutcome> {
+        let (summary, usage) = self
+            .summarize_bounds(provider, transcript, &bounds, step)
+            .await?;
+        let summary_chars = summary.content.len();
+        let removed = bounds.summarized.len();
+        transcript.drain(bounds.summarized.clone());
+        transcript.insert(bounds.summarized.start, summary.clone());
+        let outcome = CompactionOutcome {
+            removed,
+            summary_chars,
+            usage,
+            bounds,
+            summary,
+        };
+        Ok(outcome)
+    }
+
+    /// The single "where does compaction cut?" computation, shared by
+    /// [`Self::would_compact`] and [`Self::apply`].
+    ///
+    /// `Some(bounds)` iff a standard compaction would rewrite the transcript.
+    pub fn plan(&self, transcript: &[Message]) -> Option<CompactionBounds> {
+        let (split, acceptable) = Self::split_for_compaction(transcript, self.keep_recent_n);
+        acceptable.then(|| Self::bounds_at(transcript, split))
+    }
+
+    /// Map a split index to the pre-compaction bounds it describes.
+    fn bounds_at(transcript: &[Message], split: usize) -> CompactionBounds {
+        let prefix_len = Self::leading_system_prefix_len(transcript);
+        CompactionBounds {
+            prefix: 0..prefix_len,
+            summarized: prefix_len..split,
+            preserved: split..transcript.len(),
+        }
+    }
+
     /// Minimum number of non-System conversational messages (User or
     /// Assistant) that must appear in the `older` slice for a compaction
     /// to be worth running.  Fewer than this means the older portion is
@@ -335,15 +547,15 @@ impl Compactor {
     /// slice is acceptable to summarise. Returns `(split, false)` when the
     /// transcript is too short or the older slice is degenerate (fewer than
     /// `MIN_CONVERSATIONAL_IN_OLDER` conversational messages). Single source
-    /// of truth shared by [`apply_to_transcript`] and [`would_compact`] so the
-    /// "will compaction actually fire?" decision cannot drift between them.
+    /// of truth shared by [`Self::plan`] so the "will compaction actually
+    /// fire?" decision cannot drift from the rewrite.
     /// (Goal 345)
     fn split_for_compaction(transcript: &[Message], keep_n: usize) -> (usize, bool) {
+        let split = Self::safe_split_point(transcript, keep_n);
         if transcript.len() < keep_n + 2 {
-            return (0, false);
+            return (split, false);
         }
         let prefix_len = Self::leading_system_prefix_len(transcript);
-        let split = Self::safe_split_point(transcript, keep_n);
         // The summarised slice is `transcript[prefix_len..split]`: the leading
         // System run is preserved verbatim, never counted as conversational
         // content. `split <= prefix_len` means there is nothing but the prefix
@@ -351,10 +563,7 @@ impl Compactor {
         let acceptable = if split > prefix_len {
             let conversational_count = transcript[prefix_len..split]
                 .iter()
-                .filter(|m| {
-                    m.role == crate::message::Role::User
-                        || m.role == crate::message::Role::Assistant
-                })
+                .filter(|m| m.role == Role::User || m.role == Role::Assistant)
                 .count();
             conversational_count >= Self::MIN_CONVERSATIONAL_IN_OLDER
         } else {
@@ -363,7 +572,7 @@ impl Compactor {
         (split, acceptable)
     }
 
-    /// Returns `true` iff [`apply_to_transcript`] would actually compact this
+    /// Returns `true` iff [`Self::apply`] would actually compact this
     /// transcript (return `Ok(Some(..))`): long enough AND the older slice has
     /// enough real conversation. Pure — no provider call, no mutation.
     ///
@@ -373,37 +582,7 @@ impl Compactor {
     /// this guard the Goal 345 degenerate-slice rejection made `PreCompact`
     /// fire without a matching `PostCompact`. (Goal 345)
     pub fn would_compact(&self, transcript: &[Message]) -> bool {
-        Self::split_for_compaction(transcript, self.keep_recent_n).1
-    }
-
-    pub async fn apply_to_transcript(
-        &self,
-        provider: &dyn ChatProvider,
-        transcript: &mut Vec<Message>,
-        step: usize,
-    ) -> Result<Option<CompactionOutcome>> {
-        // Goal 345: delegate the "is this worth compacting?" decision to
-        // `split_for_compaction` (shared with `would_compact`) so callers can
-        // pre-check without dispatching `PreCompact` into the void.
-        let (split, acceptable) = Self::split_for_compaction(transcript, self.keep_recent_n);
-        if !acceptable {
-            return Ok(None);
-        }
-
-        // The leading System run is never compacted: the summary is spliced in
-        // *after* it, so `[prefix..., older...]` becomes
-        // `[prefix..., summary, kept...]` (issue #158).
-        let prefix_len = Self::leading_system_prefix_len(transcript);
-        let (summary_msg, usage) = self.compact(provider, transcript, step).await?;
-        let summary_chars = summary_msg.content.len();
-        let removed = split.saturating_sub(prefix_len);
-        transcript.drain(prefix_len..split);
-        transcript.insert(prefix_len, summary_msg);
-        Ok(Some(CompactionOutcome {
-            removed,
-            summary_chars,
-            usage,
-        }))
+        self.plan(transcript).is_some()
     }
 
     /// Render a slice of messages into a single text block for the
@@ -470,16 +649,16 @@ impl Compactor {
         }
     }
 
-    /// Compact the transcript: summarize older messages into a single system
-    /// message, keeping the last `keep_recent_n` messages verbatim.
+    /// Summarise the older messages into a single system message, keeping the
+    /// last `keep_recent_n` messages verbatim.
     ///
     /// `step` is the current turn number and is embedded in the compaction
     /// header for debuggability.
     ///
-    /// Returns the summary `Message` that should replace the older portion,
-    /// together with the token usage the summarisation call(s) burned. The
-    /// caller is responsible for splicing the message into the transcript and
-    /// folding the usage into the turn's cost.
+    /// Returns the summary `Message` that would replace the older portion,
+    /// together with the token usage the summarisation call(s) burned. Pure
+    /// with respect to the transcript — the splice itself belongs to
+    /// [`Self::apply`], which is the only rewrite path (goal 411).
     ///
     /// If the summarisation call returns a context-window-exceeded error,
     /// the oldest message groups are dropped (via [`truncate_head_for_retry`])
@@ -491,12 +670,27 @@ impl Compactor {
         transcript: &[Message],
         step: usize,
     ) -> Result<(Message, TokenUsage)> {
-        let prefix_len = Self::leading_system_prefix_len(transcript);
         let split = Self::safe_split_point(transcript, self.keep_recent_n);
-        // Only the messages *after* the leading System prefix are summarised —
-        // the prefix stays verbatim (issue #158).
-        let older = &transcript[prefix_len..split];
-        let _recent = &transcript[split..];
+        self.summarize_bounds(
+            provider,
+            transcript,
+            &Self::bounds_at(transcript, split),
+            step,
+        )
+        .await
+    }
+
+    /// Summarise exactly `bounds.summarized` and render the summary message.
+    /// The split was computed once by the caller ([`Self::apply_bounds`] or
+    /// [`Self::compact`]).
+    async fn summarize_bounds(
+        &self,
+        provider: &dyn ChatProvider,
+        transcript: &[Message],
+        bounds: &CompactionBounds,
+        step: usize,
+    ) -> Result<(Message, TokenUsage)> {
+        let older = &transcript[bounds.summarized.clone()];
 
         // Retry loop: if the summarisation call itself exceeds the context
         // window, drop oldest message groups and try again.

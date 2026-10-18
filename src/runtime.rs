@@ -834,10 +834,11 @@ impl AgentRuntime {
         self.kernel.hooks().dispatch(HookEvent::PreCompact {
             transcript_len: bytes,
         });
-        // Snapshot pre-compact for file+skill reinjection (apply_to_transcript drains).
+        // Snapshot pre-compact for file+skill reinjection and for the
+        // single-path contract check (`Compactor::apply` is the only rewrite).
         let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
         let result = compactor
-            .apply_to_transcript(
+            .apply(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
                 self.checkpoints
@@ -848,6 +849,14 @@ impl AgentRuntime {
         let mut compact_usage = TokenUsage::default();
         match result {
             Ok(Some(outcome)) => {
+                debug_assert!(
+                    crate::compact::verify_compaction_rewrite(
+                        &pre_compact,
+                        &self.transcript,
+                        &outcome
+                    ),
+                    "compaction rewrite does not match CompactionOutcome bounds"
+                );
                 let (removed, summary_chars) = (outcome.removed, outcome.summary_chars);
                 compact_usage = outcome.usage;
                 // Success — reset the circuit breaker.
@@ -1026,8 +1035,10 @@ impl AgentRuntime {
             .checkpoints
             .turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
         let Some(outcome) = compactor
-            .apply_to_transcript(
+            .apply(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
                 turn,
@@ -1036,6 +1047,11 @@ impl AgentRuntime {
         else {
             return Ok(None);
         };
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            crate::compact::verify_compaction_rewrite(&pre_compact, &self.transcript, &outcome),
+            "compaction rewrite does not match CompactionOutcome bounds"
+        );
         let (removed, summary_chars) = (outcome.removed, outcome.summary_chars);
         // Emergency compaction rewrote the transcript in place, exactly like
         // the cross-turn path — the persisted prefix is stale.
@@ -1646,8 +1662,10 @@ impl AgentRuntime {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
+        #[cfg(debug_assertions)]
+        let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
         if let Some(outcome) = compactor
-            .apply_to_transcript(
+            .apply(
                 self.kernel.llm().as_ref(),
                 Arc::make_mut(&mut self.transcript),
                 self.checkpoints
@@ -1656,6 +1674,11 @@ impl AgentRuntime {
             )
             .await?
         {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                crate::compact::verify_compaction_rewrite(&pre_compact, &self.transcript, &outcome),
+                "compaction rewrite does not match CompactionOutcome bounds"
+            );
             // Issue #115: a manual `/compact` burns real tokens outside any
             // turn — park the spend so the next turn's cost still includes it.
             self.pending_compact_usage = self.pending_compact_usage.accumulate(outcome.usage);
@@ -1670,117 +1693,76 @@ impl AgentRuntime {
     /// transcript index, keeping everything from `pivot_index` onward
     /// (plus the compactor's `keep_recent_n` safety margin) verbatim.
     ///
-    /// `pivot_index` is a transcript message index (0-based, same indexing
-    /// as `transcript()`). Uses `Compactor::safe_split_point` on the
-    /// sub-transcript `[..=pivot_index]` to find a safe split that never
-    /// breaks tool-call pairs (invariant #8).
+    /// The split is computed by [`Compactor::apply_before`] — the same single
+    /// application point as full compaction (goal 411), so no split point is
+    /// computed outside `src/compact/`.
     ///
     /// No-op when no compactor is configured, `pivot_index` is out of
-    /// range, or the computed split is 0 (nothing to compact).
+    /// range, or there is nothing but the leading System prefix to compact.
     pub async fn compact_partial_before(&mut self, pivot_index: usize) -> Result<()> {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        let transcript = Arc::make_mut(&mut self.transcript);
-        if pivot_index >= transcript.len() {
-            return Ok(());
-        }
-        // Consider the sub-transcript up to and including the pivot.
-        let scope = &transcript[..=pivot_index];
-        let split = Compactor::safe_split_point(scope, compactor.keep_recent_n);
-        // Issue #158: never summarise the leading System prefix. `split` is
-        // clamped to at least the prefix length, so `split <= prefix_len` means
-        // there is nothing but the prefix in the compacted slice.
-        let prefix_len = Compactor::leading_system_prefix_len(transcript);
-        if split <= prefix_len {
-            return Ok(());
-        }
-        // Create a temporary compactor with keep_recent_n=0 so that
-        // compact() summarises *all* of transcript[..split] (not just
-        // the oldest part of it as the full keep_recent_n would).
-        let zero_keep = Compactor {
-            threshold_chars: compactor.threshold_chars,
-            threshold_prompt_tokens: compactor.threshold_prompt_tokens,
-            keep_recent_n: 0,
-        };
         let step = self.checkpoints.turn_index.load(Ordering::Relaxed);
-        let (summary_msg, usage) = zero_keep
-            .compact(self.kernel.llm().as_ref(), &transcript[..split], step)
-            .await?;
-        transcript.drain(prefix_len..split);
-        transcript.insert(prefix_len, summary_msg);
-        self.pending_compact_usage = self.pending_compact_usage.accumulate(usage);
+        #[cfg(debug_assertions)]
+        let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
+        let Some(outcome) = compactor
+            .apply_before(
+                self.kernel.llm().as_ref(),
+                Arc::make_mut(&mut self.transcript),
+                pivot_index,
+                step,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            crate::compact::verify_compaction_rewrite(&pre_compact, &self.transcript, &outcome),
+            "compaction rewrite does not match CompactionOutcome bounds"
+        );
+        self.pending_compact_usage = self.pending_compact_usage.accumulate(outcome.usage);
         self.mark_transcript_rewritten();
-        self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
+        self.last_compact_turn = Some(step as u32);
         Ok(())
     }
 
     /// Goal-342: partial compaction — summarise messages *after* a given
     /// transcript index, keeping everything *before* `pivot_index` verbatim.
     ///
-    /// `pivot_index` is a transcript message index (0-based). Backs up
-    /// from the pivot as needed to avoid splitting tool-call pairs
-    /// (invariant #8): any `Tool` or `Assistant` carrying `tool_calls`
-    /// at the boundary is included with its pair.
+    /// [`Compactor::apply_after`] backs up from the pivot as needed to avoid
+    /// splitting tool-call pairs (invariant #8): any `Tool` or `Assistant`
+    /// carrying `tool_calls` at the boundary is included with its pair.
     ///
-    /// No-op when no compactor is configured or `pivot_index` is out of
-    /// range.
+    /// No-op when no compactor is configured, `pivot_index` is out of
+    /// range, or the suffix is a single message.
     pub async fn compact_partial_after(&mut self, pivot_index: usize) -> Result<()> {
         let Some(ref compactor) = self.compactor else {
             return Ok(());
         };
-        let transcript = Arc::make_mut(&mut self.transcript);
-        if pivot_index >= transcript.len() {
-            return Ok(());
-        }
-        // Back up from the pivot to avoid splitting tool-call pairs.
-        // If the message at pivot_index is a Tool result or an
-        // Assistant that issued tool_calls, include its pair by
-        // starting earlier.
-        let mut start = pivot_index;
-        loop {
-            if start == 0 {
-                break;
-            }
-            let msg = &transcript[start];
-            let should_back_up = msg.role == crate::message::Role::Tool
-                || (msg.role == crate::message::Role::Assistant && !msg.tool_calls.is_empty());
-            if should_back_up {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        // Issue #158: the leading System prefix is never summarised — a pivot
-        // inside it would otherwise truncate the rebuilt prompt away.
-        start = start.max(Compactor::leading_system_prefix_len(transcript));
-        if start >= transcript.len() {
-            return Ok(());
-        }
-        let suffix = transcript[start..].to_vec();
-        // Nothing meaningful to summarise when the suffix is a single message
-        // (or empty) — mirror compact_partial_before's `split == 0` no-op so a
-        // degenerate slice does not surface a compact() error. (Goal 347
-        // follow-up: surfaced by the too_short test once lib-test compilation
-        // was re-enabled.)
-        if suffix.len() <= 1 {
-            return Ok(());
-        }
-        // Same zero-keep trick so compact() summarises everything in the suffix.
-        let zero_keep = Compactor {
-            threshold_chars: compactor.threshold_chars,
-            threshold_prompt_tokens: compactor.threshold_prompt_tokens,
-            keep_recent_n: 0,
-        };
         let step = self.checkpoints.turn_index.load(Ordering::Relaxed);
-        let (summary_msg, usage) = zero_keep
-            .compact(self.kernel.llm().as_ref(), &suffix, step)
-            .await?;
-        transcript.truncate(start);
-        transcript.push(summary_msg);
-        self.pending_compact_usage = self.pending_compact_usage.accumulate(usage);
+        #[cfg(debug_assertions)]
+        let pre_compact: Vec<Message> = self.transcript.iter().cloned().collect();
+        let Some(outcome) = compactor
+            .apply_after(
+                self.kernel.llm().as_ref(),
+                Arc::make_mut(&mut self.transcript),
+                pivot_index,
+                step,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            crate::compact::verify_compaction_rewrite(&pre_compact, &self.transcript, &outcome),
+            "compaction rewrite does not match CompactionOutcome bounds"
+        );
+        self.pending_compact_usage = self.pending_compact_usage.accumulate(outcome.usage);
         self.mark_transcript_rewritten();
-        self.last_compact_turn = Some(self.checkpoints.turn_index.load(Ordering::Relaxed) as u32);
+        self.last_compact_turn = Some(step as u32);
         Ok(())
     }
 
