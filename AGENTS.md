@@ -26,6 +26,25 @@ before editing `src/`.**
 - **`cargo clippy --all-targets -- -D warnings` is enforced** — a lint rolls
   back the entire product commit in the self-improve flow.
 - **`cargo fmt --all` before committing.**
+- **Landing gate before integrating into `main`.** Run
+  `python3 scripts/landing_gate.py ci` — red main CI = freeze（双 ack 豁免：
+  `--override "原因 / ack 人"`，原样留痕）. Policy-touching commits carry
+  `[policy]` + `Policy-ack:` trailer. Convention:
+  `docs/landing-and-acceptance.md`（镜像自 plaita，owner 拍板 2026-10-18）.
+
+## Owner architecture rulings (2026-10-18)
+
+Two standing principles ratified by the owner — treat them as design law.
+Deliberately **not** added to the numbered invariants in `.dev/AGENTS.md`
+(to avoid the doc-conflict drift of issue #61):
+
+- **任何降级必须可观测。** Swallowed errors, default fallbacks, fail-open
+  gates, capacity/clamp diversions must leave a WARNING-or-louder trace.
+  Silent diversion is a defect even when the fallback "works"（#167/#151 类）.
+- **运行时租户透明。** Multi-tenancy belongs to the serving/business layer.
+  kernel/runtime/tools never see tenant identity（`TurnContext` 无 identity
+  字段是设计而非缺口）；tenancy is resolved at the serving edge into plain
+  per-session inputs（路径 / skill 来源 / 凭据引用）. Ruling on #146.
 
 ## Before touching code (源码 invariants)
 
