@@ -14,17 +14,22 @@ use crate::tools::memory::memory_summary;
 use crate::tools::memory::scratchpad_summary;
 use tracing::warn;
 
-/// Conservative per-turn step ceiling used when neither `--max-steps` nor
-/// `RECURSIVE_MAX_STEPS` is set (issue #94 — the default used to be `0`,
-/// i.e. unlimited). 200 matches the operational budget documented in
-/// `.dev/OPERATIONS.md`; an explicit `0` restores unlimited steps.
-pub const DEFAULT_MAX_STEPS: usize = 200;
+/// Per-turn step ceiling used when neither `--max-steps` nor
+/// `RECURSIVE_MAX_STEPS` is set. `0` = unlimited — the default since
+/// 2026-10-19 (owner decision: modern agents routinely run hundreds to
+/// thousands of steps; a 200 default produced false deaths on contract-class
+/// goals — selfimprove-1792338600/1792389711). Duration remains bounded by
+/// the wall clock (`DEFAULT_WALL_TIMEOUT_SECS`), and spend stays observable
+/// via usage accounting (#113/#114). Deployments wanting a hard action cap
+/// set the env/config explicitly; issue #94 history retained below.
+pub const DEFAULT_MAX_STEPS: usize = 0;
 
-/// Conservative per-turn wall-clock ceiling (seconds) used when neither
+/// Primary per-turn wall-clock ceiling (seconds) used when neither
 /// `--wall-timeout` nor `RECURSIVE_WALL_TIMEOUT_SECS` is set (issue #94 —
-/// the default used to be `0`, i.e. no cap). Deliberately roomier than the
-/// HTTP session default (1800 s) so a long `recursive run` is not cut before
-/// the step ceiling bites; an explicit `0` restores the uncapped behaviour.
+/// the default used to be `0`, i.e. no cap). Since 2026-10-19 this is the
+/// ONLY default budget: with the step ceiling defaulting to unlimited, this
+/// wall clock is what bounds runaway turns. Deliberately roomier than the
+/// HTTP session default (1800 s); an explicit `0` restores no cap.
 pub const DEFAULT_WALL_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Clone)]
@@ -891,7 +896,7 @@ pub fn default_system_prompt() -> String {
         "Don't:",
         "- Do not run `git checkout`, `git reset`, `git restore`, or any command that mutates the working tree. The orchestrator owns rollback.",
         "- Do not edit source files via `sed -i`, `tail > file`, or `cat <<EOF`. Use Edit or Write (whole file).",
-        "- Verify behavior via `cargo test`, never via `cargo run | jq`. Cargo build noise on a fresh tree breaks jq parsing and burns your step budget.",
+        "- Verify behavior via `cargo test`, never via `cargo run | jq`. Cargo build noise on a fresh tree breaks jq parsing and burns wall-clock budget.",
         "",
         "Output should be terse and concrete. Avoid filler.",
         "",
@@ -1037,9 +1042,10 @@ mod tests {
     }
 
     #[test]
-    fn default_max_steps_is_finite_but_zero_still_unlimited() {
-        // Issue #94: the unset default is now a conservative finite ceiling
-        // (200), while an explicit `0` keeps the legacy unlimited behaviour.
+    fn default_max_steps_is_unlimited_explicit_cap_still_honored() {
+        // 2026-10-19 (owner decision): the unset default is unlimited again —
+        // duration is bounded by the wall clock, not by step count. An
+        // explicit finite value still wins over the default.
         let _env_lock = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
@@ -1053,11 +1059,11 @@ mod tests {
         let config = Config::from_env().unwrap();
         assert_eq!(
             config.max_steps, DEFAULT_MAX_STEPS,
-            "unset RECURSIVE_MAX_STEPS must fall back to the finite default"
+            "unset RECURSIVE_MAX_STEPS must fall back to the default (0 = unlimited)"
         );
         assert_eq!(
-            DEFAULT_MAX_STEPS, 200,
-            "conservative default is the documented 200-step budget"
+            DEFAULT_MAX_STEPS, 0,
+            "owner 2026-10-19: no step ceiling by default; wall clock bounds duration"
         );
 
         // SAFETY: env lock still held. Explicit `0` restores unlimited.
