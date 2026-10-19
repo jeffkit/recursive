@@ -20,6 +20,9 @@ use crate::assemble_system_prompt_with_environment;
 use crate::tools::transport::{EnvironmentCapabilities, ExecResult, LocalTransport, ToolTransport};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+// windows runner（20261012 镜像滚动后）clippy 对本文件误报 unused——unix 侧 5 处使用
+// 全绿；定向 allow 待 runner/lint 行为澄清后移除。追踪：#204。
+#[cfg_attr(target_os = "windows", allow(unused_imports))]
 use std::sync::Arc;
 use std::time::Duration;
 
