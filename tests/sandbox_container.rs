@@ -205,6 +205,134 @@ async fn exec_output_respects_max_bytes() {
     t.remove().await;
 }
 
+/// Poll until `path` (in the container tmpfs) exists. Markers are written
+/// by the command itself, so a successful poll proves it started.
+async fn wait_for_container_file(t: &ContainerTransport, ws: &std::path::Path, path: &str) {
+    for _ in 0..100 {
+        let r = t
+            .exec_shell(
+                &format!("test -f {path} && echo yes || echo no"),
+                ws,
+                &[],
+                Duration::from_secs(10),
+                1024,
+            )
+            .await
+            .expect("marker poll exec failed");
+        if r.stdout.trim() == "yes" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("marker {path} never appeared"); // test helper: panic is the signal
+}
+
+/// Issue #166 regression: concurrent execs in one container must each kill
+/// only their own command on timeout. Before the fix every exec wrote its
+/// PID to the same `/tmp/.recursive-exec.pid`, so a short-timeout exec could
+/// read the long command's PID and kill it instead of itself.
+///
+/// Ordering makes the pre-fix failure deterministic: the short exec starts
+/// first, then the long one overwrites the shared PID file. When the short
+/// timeout fires, the long process must still be alive and the short one
+/// must be gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_execs_kill_only_their_own_pid() {
+    if !docker_available() {
+        return;
+    }
+    let (t, dir) = transport().await;
+    let t = std::sync::Arc::new(t);
+    let ws = dir.path().to_path_buf();
+
+    let short = {
+        let t = std::sync::Arc::clone(&t);
+        let ws = ws.clone();
+        tokio::spawn(async move {
+            t.exec_shell(
+                "echo $$ > /tmp/short.pid && exec sleep 60",
+                &ws,
+                &[],
+                Duration::from_secs(8),
+                65536,
+            )
+            .await
+        })
+    };
+    wait_for_container_file(&t, &ws, "/tmp/short.pid").await;
+
+    let long = {
+        let t = std::sync::Arc::clone(&t);
+        let ws = ws.clone();
+        tokio::spawn(async move {
+            t.exec_shell(
+                "echo $$ > /tmp/long.pid && exec sleep 60",
+                &ws,
+                &[],
+                Duration::from_secs(30),
+                65536,
+            )
+            .await
+        })
+    };
+    wait_for_container_file(&t, &ws, "/tmp/long.pid").await;
+
+    let err = short
+        .await
+        .expect("short task panicked")
+        .expect_err("short exec must time out");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+    let alive = t
+        .exec_shell(
+            "kill -0 \"$(cat /tmp/long.pid)\" 2>/dev/null && echo alive || echo dead",
+            &ws,
+            &[],
+            Duration::from_secs(20),
+            65536,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        alive.stdout.trim(),
+        "alive",
+        "the long exec must survive the other exec's timeout (killed wrong PID)"
+    );
+
+    let short_state = t
+        .exec_shell(
+            "kill -0 \"$(cat /tmp/short.pid)\" 2>/dev/null && echo alive || echo dead",
+            &ws,
+            &[],
+            Duration::from_secs(20),
+            65536,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        short_state.stdout.trim(),
+        "dead",
+        "the timed-out exec must kill its own process"
+    );
+
+    // Release the long command so its task (and the test) finishes now.
+    let _ = t
+        .exec_shell(
+            "kill -TERM \"$(cat /tmp/long.pid)\" 2>/dev/null || true",
+            &ws,
+            &[],
+            Duration::from_secs(20),
+            65536,
+        )
+        .await;
+    let long_res = long.await.expect("long task panicked");
+    assert!(
+        long_res.is_ok(),
+        "after an external TERM the long exec must return a result, got {long_res:?}"
+    );
+    t.remove().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn capabilities_report_matches_environment() {
     if !docker_available() {

@@ -444,18 +444,110 @@ fn parse_find_line(line: &str, root: &str) -> Option<WalkEntry> {
     })
 }
 
-/// Truncate a captured output stream at `max` bytes with the same marker
-/// text as `LocalTransport`'s `read_capped`.
-fn cap_output(s: &mut String, max: usize) {
-    if s.len() > max {
-        let tail = "\n... [output truncated]";
-        let keep = max.saturating_sub(tail.len());
-        // Byte truncate is fine (from_utf8-safe reassembly below).
-        let prefix = String::from_utf8_lossy(&s.as_bytes()[..keep]).into_owned();
-        s.clear();
-        s.push_str(&prefix);
-        s.push_str(tail);
+/// Marker appended once when an output stream exceeds the byte budget
+/// (same text as `LocalTransport`'s `read_capped`).
+const OUTPUT_TRUNCATION_MARKER: &str = "\n... [output truncated]";
+
+/// Bounded stdout/stderr accumulator for `exec_shell` (issue #166).
+///
+/// The previous path appended every bollard chunk to a `String` and only
+/// called `cap_output` after the stream closed, so `max_output_bytes` never
+/// bounded *host* memory: `yes` inside the container grew the agent process
+/// until OOM. This drops bytes once the budget is spent; the caller keeps
+/// draining the stream so the child never blocks on a full pipe (the #164
+/// deadlock shape).
+struct BoundedOutput {
+    text: String,
+    max: usize,
+    truncated: bool,
+}
+
+impl BoundedOutput {
+    fn new(max: usize) -> Self {
+        Self {
+            text: String::new(),
+            max,
+            truncated: false,
+        }
     }
+
+    /// Append `chunk`, keeping body + marker within `max` bytes. Bytes past
+    /// the budget are dropped (memory is bounded by `max`); `finish` appends
+    /// the truncation marker so the degradation stays observable.
+    fn push(&mut self, chunk: &str) {
+        if self.truncated {
+            return;
+        }
+        let budget = self.max.saturating_sub(OUTPUT_TRUNCATION_MARKER.len());
+        let room = budget.saturating_sub(self.text.len());
+        if chunk.len() <= room {
+            self.text.push_str(chunk);
+            return;
+        }
+        // Chunks are valid UTF-8, but the byte budget can land mid-codepoint.
+        let mut cut = room;
+        while cut > 0 && !chunk.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.text.push_str(&chunk[..cut]);
+        self.truncated = true;
+    }
+
+    /// Append the truncation marker (once) if anything was dropped.
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.text.push_str(OUTPUT_TRUNCATION_MARKER);
+        }
+        self.text
+    }
+}
+
+/// Build the wrapper script for one `exec_shell` call and the **per-exec**
+/// PID file it records into (issue #166).
+///
+/// The wrapper writes its own PID (`$$`, unchanged by `exec`) to the tmpfs so
+/// the timeout branch can kill the actual command — docker exec processes do
+/// NOT die with the exec stream. The path carries a random suffix: a fixed
+/// `/tmp/.recursive-exec.pid` let concurrent execs (foreground Bash,
+/// `run_background`) overwrite each other, and a timeout then killed whichever
+/// command wrote last.
+fn exec_script(command: &str, cwd: &str, env: &[(String, String)]) -> (String, String) {
+    let mut env_prefix = String::new();
+    for (k, v) in env {
+        env_prefix.push_str(&format!("{}={} ", k, shell_quote(v)));
+    }
+    let pid_file = format!("/tmp/.recursive-exec-{}.pid", uuid::Uuid::new_v4().simple());
+    // umask 077: the PID file is created 0600. The random suffix is what
+    // keeps concurrent execs apart; the mode keeps the file private to the
+    // exec uid (the timeout kill runs as that same uid — root has no DAC
+    // override under cap_drop: ALL, so a root reader would be denied).
+    let script = format!(
+        "umask 077; echo $$ > {pid_file}; cd {cwd} && {env}exec sh -c {cmd}",
+        pid_file = pid_file,
+        cwd = shell_quote(cwd),
+        env = env_prefix,
+        cmd = shell_quote(command),
+    );
+    (script, pid_file)
+}
+
+/// Timeout kill script for the PID recorded by one exec (runs as the exec
+/// uid, so it can read the 0600 file under `cap_drop: ALL`).
+///
+/// Guards: empty/non-numeric content and PID 1 (container init) are never
+/// signalled. The unique file binds the PID to this exec; a recycled PID
+/// after the command already exited just makes `kill` a no-op.
+fn timeout_kill_script(pid_file: &str) -> String {
+    let pid_file = shell_quote(pid_file);
+    format!(
+        "p=$(cat {pid_file} 2>/dev/null); \
+         case \"$p\" in ''|*[!0-9]*) p=;; esac; \
+         if [ -n \"$p\" ] && [ \"$p\" -gt 1 ]; then \
+             kill -TERM \"$p\" 2>/dev/null; sleep 1; \
+             kill -KILL \"$p\" 2>/dev/null; \
+         fi; \
+         rm -f {pid_file}; true"
+    )
 }
 
 #[async_trait]
@@ -648,20 +740,9 @@ impl ToolTransport for ContainerTransport {
         max_output_bytes: usize,
     ) -> std::io::Result<ExecResult> {
         let inner_cwd = map_path(&self.workspace, cwd)?;
-        let mut env_prefix = String::new();
-        for (k, v) in env {
-            env_prefix.push_str(&format!("{}={} ", k, shell_quote(v)));
-        }
-        // The wrapper shell records its own PID (same PID after `exec`) to
-        // the tmpfs so the timeout branch can kill the actual command
-        // process — docker exec processes do NOT die with the exec stream.
-        let pid_file = "/tmp/.recursive-exec.pid";
-        let script = format!(
-            "echo $$ > {pid_file}; cd {cwd} && {env}exec sh -c {cmd}",
-            cwd = shell_quote(&inner_cwd.to_string_lossy()),
-            env = env_prefix,
-            cmd = shell_quote(command),
-        );
+        // Per-exec PID file (issue #166): concurrent execs in the same
+        // container must never share the path a timeout kills through.
+        let (script, pid_file) = exec_script(command, &inner_cwd.to_string_lossy(), env);
         let exec = match self
             .docker
             .create_exec(
@@ -693,8 +774,10 @@ impl ToolTransport for ContainerTransport {
             Err(e) => return Err(docker_io_error(e)),
         };
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        // Output is bounded *while* the stream is read (issue #166), not
+        // only after it closes — `yes` must not grow host memory.
+        let mut stdout = BoundedOutput::new(max_output_bytes);
+        let mut stderr = BoundedOutput::new(max_output_bytes);
         match self
             .docker
             .start_exec(&exec.id, None)
@@ -709,27 +792,20 @@ impl ToolTransport for ContainerTransport {
                 loop {
                     tokio::select! {
                         _ = &mut deadline => {
-                            // Actually kill the timed-out command: the wrapper
-                            // recorded its PID on the tmpfs; kill TERM then
-                            // KILL as root (docker exec processes do NOT die
-                            // with the exec stream — local parity:
-                            // LocalTransport start_kill, transport.rs).
-                            // `raw_exec_as` drains its stream until that exec
-                            // finishes, so this awaits the kill completing.
+                            // Actually kill the timed-out command: this exec's
+                            // own PID file (random suffix) was written by the
+                            // wrapper; kill TERM then KILL as the same uid
+                            // (docker exec processes do NOT die with the exec
+                            // stream — local parity: LocalTransport
+                            // start_kill, transport.rs). Same-uid signalling
+                            // needs no capability, and the 0600 PID file is
+                            // readable without DAC override — which root
+                            // lacks under cap_drop: ALL. `raw_exec_as` drains
+                            // its stream until that exec finishes, so this
+                            // awaits the kill completing.
                             let _ = self
-                                .raw_exec_as(
-                                    "root",
-                                    &format!(
-                                        "p=$(cat {pid_file} 2>/dev/null); \
-                                         kill -TERM \"$p\" 2>/dev/null; sleep 1; \
-                                         kill -KILL \"$p\" 2>/dev/null; \
-                                         rm -f {pid_file}; true"
-                                    ),
-                                )
+                                .raw_exec_as(RUN_AS_USER, &timeout_kill_script(&pid_file))
                                 .await;
-                            // Drain what was captured so far, capped.
-                            cap_output(&mut stdout, max_output_bytes);
-                            cap_output(&mut stderr, max_output_bytes);
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
                                 format!("container command timed out after {timeout:?}"),
@@ -737,10 +813,13 @@ impl ToolTransport for ContainerTransport {
                         }
                         chunk = stream.next() => match chunk {
                             Some(Ok(bollard::container::LogOutput::StdOut { message })) => {
-                                stdout.push_str(&String::from_utf8_lossy(&message));
+                                // Still read every chunk (drain). Once the
+                                // budget is spent the bytes are dropped, so a
+                                // runaway producer cannot grow host memory.
+                                stdout.push(&String::from_utf8_lossy(&message));
                             }
                             Some(Ok(bollard::container::LogOutput::StdErr { message })) => {
-                                stderr.push_str(&String::from_utf8_lossy(&message));
+                                stderr.push(&String::from_utf8_lossy(&message));
                             }
                             Some(Ok(_)) => {}
                             Some(Err(_)) => {
@@ -765,12 +844,16 @@ impl ToolTransport for ContainerTransport {
         // Container no longer running ⇒ environment failure (OOM/kill),
         // not a Tool failure (issue contract).
         let failure = self.classify_dead_container().await;
-        cap_output(&mut stdout, max_output_bytes);
-        cap_output(&mut stderr, max_output_bytes);
+        // Remove this exec's PID file on the normal path too: the timeout
+        // branch already removed it, and leaving one file per successful
+        // exec on the tmpfs would just be a slower unbounded leak.
+        let _ = self
+            .raw_exec_as(RUN_AS_USER, &format!("rm -f {}", shell_quote(&pid_file)))
+            .await;
         Ok(ExecResult {
             exit_code,
-            stdout,
-            stderr,
+            stdout: stdout.finish(),
+            stderr: stderr.finish(),
             failure,
         })
     }
@@ -1054,20 +1137,111 @@ mod tests {
     }
 
     #[test]
-    fn cap_output_truncates_with_marker() {
-        let mut s = "x".repeat(10_000);
-        cap_output(&mut s, 100);
-        assert!(s.len() < 200);
-        assert!(s.ends_with("[output truncated]"));
-        // no-op under the cap
-        let mut small = String::from("abc");
-        cap_output(&mut small, 100);
-        assert_eq!(small, "abc");
-        // multibyte-safe: a cut mid-char yields lossy-replacement, never a panic
-        let mut mb = "é".repeat(1000);
-        cap_output(&mut mb, 101);
-        assert!(mb.contains('é'));
-        assert!(mb.ends_with("[output truncated]"));
+    fn bounded_output_stops_accumulating_at_cap() {
+        // Issue #166: the old code buffered every chunk before capping, so
+        // offering 16 MiB grew the String to 16 MiB. The accumulator must
+        // stop at the budget while the caller keeps draining the stream.
+        let max = 1024;
+        let mut out = BoundedOutput::new(max);
+        let chunk = "x".repeat(64 * 1024);
+        for _ in 0..256 {
+            out.push(&chunk);
+            assert!(
+                out.text.len() <= max,
+                "accumulator grew past max_output_bytes: {} > {max}",
+                out.text.len()
+            );
+        }
+        let text = out.finish();
+        assert!(text.len() <= max, "finished output exceeds the cap");
+        assert!(text.ends_with("[output truncated]"));
+        assert_eq!(
+            text.matches("[output truncated]").count(),
+            1,
+            "marker must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn bounded_output_keeps_small_output_verbatim() {
+        let mut out = BoundedOutput::new(100);
+        out.push("hello ");
+        out.push("world");
+        assert_eq!(out.finish(), "hello world");
+        // Exactly-at-budget output is not truncation (the marker's own
+        // bytes are reserved inside the cap, so fill the remaining room).
+        let mut exact = BoundedOutput::new(OUTPUT_TRUNCATION_MARKER.len() + 5);
+        exact.push("abcde");
+        assert_eq!(exact.finish(), "abcde");
+    }
+
+    #[test]
+    fn bounded_output_truncates_on_char_boundary() {
+        // Marker is reserved inside the cap; a mid-codepoint budget must
+        // retreat to a char boundary, not slice the chunk blindly.
+        let max = 32;
+        let mut out = BoundedOutput::new(max);
+        out.push(&"é".repeat(1000));
+        let text = out.finish();
+        assert!(text.len() <= max);
+        assert!(text.starts_with('é'));
+        assert!(text.ends_with("[output truncated]"));
+        assert!(!text.contains('\u{FFFD}'), "must not split a codepoint");
+    }
+
+    #[test]
+    fn exec_script_pid_file_is_unique_per_exec() {
+        // Two calls (concurrent execs in production) must never share the
+        // path the timeout branch kills through.
+        let (a, pid_a) = exec_script("sleep 60", "/workspace", &[]);
+        let (b, pid_b) = exec_script("sleep 60", "/workspace", &[]);
+        assert_ne!(pid_a, pid_b, "PID file must be per-exec");
+        assert!(pid_a.starts_with("/tmp/.recursive-exec-"));
+        assert!(pid_a.ends_with(".pid"));
+        assert!(a.contains(&format!("umask 077; echo $$ > {pid_a};")));
+        assert!(b.contains(&pid_b));
+        assert!(!a.contains(&pid_b) && !b.contains(&pid_a));
+        // The fixed path from the bug report must be gone.
+        assert!(!a.contains("/tmp/.recursive-exec.pid"));
+    }
+
+    #[test]
+    fn timeout_kill_script_rejects_forged_or_missing_pid() {
+        let script = timeout_kill_script("/tmp/.recursive-exec-deadbeef.pid");
+        // Non-numeric / empty content is discarded before any kill.
+        assert!(script.contains("case \"$p\" in ''|*[!0-9]*) p=;; esac"));
+        // Container init (PID 1) is never signalled.
+        assert!(script.contains("[ \"$p\" -gt 1 ]"));
+        // The per-exec file is always cleaned up.
+        assert!(script.contains("rm -f '/tmp/.recursive-exec-deadbeef.pid'"));
+    }
+
+    /// The kill script is exercised against a real (host) child: the PID
+    /// read from the per-exec file dies, and the 1-second TERM→KILL path
+    /// completes without the test hanging.
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kill_script_kills_the_recorded_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let dir = std::env::temp_dir();
+        let pid_file = dir.join(format!(".recursive-exec-test-{}.pid", std::process::id()));
+        std::fs::write(&pid_file, child.id().to_string()).unwrap();
+        let script = timeout_kill_script(&pid_file.to_string_lossy());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run kill script");
+        assert!(status.success(), "kill script must exit 0");
+        let exited = child.wait().expect("wait child");
+        assert!(
+            !exited.success(),
+            "the recorded process must have been signalled"
+        );
+        assert!(!pid_file.exists(), "kill script must remove the PID file");
     }
 
     #[test]
