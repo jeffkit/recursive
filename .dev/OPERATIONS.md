@@ -362,8 +362,9 @@ Stop and call HITL when **any** of:
 ### Auto-resume on BudgetExceeded
 
 `self-improve.sh` transparently re-attempts once when the first run
-exits with `reason: BudgetExceeded`. Default `RECURSIVE_MAX_STEPS=200`.
-Effective ceiling = 400 steps across two attempts.
+exits with `reason: BudgetExceeded`. Default `RECURSIVE_MAX_STEPS=0`
+(unlimited since 2026-10-19 — duration is bounded by the wall clock,
+`RECURSIVE_WALL_TIMEOUT_SECS`, default 3600 s).
 
 ## 7. State recovery (you are a new orchestrator)
 
