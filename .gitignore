@@ -80,3 +80,6 @@ mutants.out/
 mutants.out.old/
 .gate-*-output.log
 .gate-*-rerun.log
+
+# cargo-audit 豁免清单需随仓分发（#204）
+!.cargo/audit.toml

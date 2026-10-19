@@ -1,0 +1,15 @@
+# cargo-audit 配置——#204 红灯归因后的临时豁免清单。
+# 原则：能 update 到 patched 版本的不进本清单（rustls 0.23.46 / anyhow 1.0.104 /
+# quinn-proto 0.11.19 已随 #205 锁文件更新）；进来的每条必须带暴露面与解禁条件，
+# patched 版本可见即 update 并移除。跟进单：#204。
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]
+# 0367/0368/0369 = zip 4.6.1 的 ZipArchive::extract 符号链接外逃 / SUID 位保留族。
+# 暴露面：src/tools/install_skill.rs（远程技能 zip 解压，不可信输入；#103 已做路径
+# 穿越与完整性校验，extract 符号链接面需单独复核）+ src/session/export.rs（本地
+# 导出，低暴露）。zip 无 patched 版本可锁（镜像与上游均未发）；解禁条件 = zip
+# patched 版本发布即 cargo update -p zip 并删除本清单。
