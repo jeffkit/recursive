@@ -21,13 +21,28 @@
 //! through [`Compactor::apply_before`] / [`Compactor::apply_after`], which
 //! reuse the same bounds and splice. Callers outside this module never
 //! compute a split point, drain a transcript, or splice a summary.
+//!
+//! # SINGLE rebuild point (goal 413)
+//!
+//! The boundary `apply` splices in — a `Role::System` row carrying
+//! `is_compaction_summary`, right after the leading System prefix — is also
+//! the persisted marker: it survives every serializer (`Message` serialises
+//! the bit), so rebuild consumers have one thing to read.
+//! [`rebuild::rebuild_seed`] is the one place a persisted transcript may be
+//! turned back into a model seed from it — resume, AG-UI thread reload and
+//! cold load all go through it instead of slicing by their own arithmetic.
+//! Readers of append-only files join it through
+//! [`rebuild::rebuild_declared_seed`], which is also the one place the g157
+//! `compact_boundary` declaration is honoured (cut + legacy-marker backfill).
 
 pub mod micro;
 pub mod prompt;
+pub mod rebuild;
 pub mod reinject;
 pub mod retry;
 
 pub use micro::{Microcompactor, MICROCOMPACT_PLACEHOLDER};
+pub use rebuild::{rebuild_declared_seed, rebuild_seed, RebuiltSeed};
 pub use reinject::{
     build_skill_reinjector_from_env, FileReinjector, PlanTodoReinjector, SkillReinjector,
 };

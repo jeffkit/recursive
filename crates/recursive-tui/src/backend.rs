@@ -1264,26 +1264,31 @@ async fn worker_loop(
                         continue;
                     };
                     // Two distinct loads:
-                    //  - model seed: `load_messages` drops everything
-                    //    before the last compact_boundary so the runtime
-                    //    transcript matches the post-compaction context
-                    //    the model should see.
+                    //  - model seed: `load_seed_for_existing_runtime` drops
+                    //    everything before the last compact_boundary so the
+                    //    runtime transcript matches the post-compaction
+                    //    context the model should see, and re-attaches this
+                    //    runtime's own prompt because `set_transcript`
+                    //    replaces the whole transcript (goal 413).
                     //  - UI display: `load_full_history` keeps every
                     //    message and surfaces each compaction as a
                     //    `LoadedEntry::CompactBoundary` marker, so the
                     //    user sees the whole conversation (not just the
                     //    post-compaction tail). The compact markers render
                     //    inline as `⊕ Conversation compacted: …`.
-                    let seed = match recursive::session::SessionReader::load_messages(&session_dir)
-                    {
-                        Ok(m) => m,
-                        Err(e) => {
-                            let _ = event_tx.send(UiEvent::Error {
-                                message: format!("Failed to load session: {e}"),
-                            });
-                            continue;
-                        }
-                    };
+                    let seed =
+                        match recursive::session::SessionReader::load_seed_for_existing_runtime(
+                            &session_dir,
+                            rt.transcript(),
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                let _ = event_tx.send(UiEvent::Error {
+                                    message: format!("Failed to load session: {e}"),
+                                });
+                                continue;
+                            }
+                        };
                     let loaded =
                         match recursive::session::SessionReader::load_full_history(&session_dir) {
                             Ok(e) => e,

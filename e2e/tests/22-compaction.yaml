@@ -1,14 +1,34 @@
 name: "Context compaction e2e test"
 description: |
-  Verify that the context compaction feature works correctly:
-    - Start server with a very low RECURSIVE_COMPACT_THRESHOLD (100 chars)
-      so compaction fires after the first long response.
-    - Send two messages in the same session.
-    - The first response is long enough to exceed the threshold.
-    - The second message must succeed — proving the agent is still functional
-      after compaction and does not crash or return an error.
+  Verify that context compaction actually fires and that the compaction
+  boundary survives persistence and the cold-load rebuild (issue #158 /
+  goal 413).
 
-  The compactor is enabled via RECURSIVE_COMPACT_THRESHOLD env var.
+  When compaction runs: `RECURSIVE_COMPACT_THRESHOLD=100` makes the *character*
+  threshold fire immediately, but `Compactor::would_compact` additionally
+  requires the split arithmetic (`split_for_compaction`) to accept:
+
+    - `transcript.len() >= keep_recent_n + 2` — keep_recent_n defaults to 8,
+      so at least 10 rows — and
+    - at least two User/Assistant rows in the older slice
+      `transcript[prefix_len..split]`, where
+      `split = safe_split_point(len - keep_recent_n)` and `prefix_len` is the
+      leading System prompt run.
+
+  With one prompt row (the runtime prepends exactly one) the end of turn 4
+  leaves 9 rows, below the length gate. From the end of turn 5 (11 rows:
+  `split = 11 - 8 = 3`, older slice `[u1, a1]` = two conversational rows)
+  every turn's arithmetic accepts a summary, so the marker lands somewhere on
+  the turn 5→6 boundary — cross-turn at the end of 5 or intra-turn on the
+  next call, depending on where the character-threshold check fires; both
+  paths persist exactly one marker. That is why this suite drives SIX turns:
+  the fixture carries one entry per turn plus the summarisation call, and two
+  turns (the pre-goal-413 shape) can never compact.
+
+  The summary row is the persisted boundary marker (`is_compaction_summary`).
+  The suite then restarts the server, which forces the session to be rebuilt
+  from its persisted transcript (cold load → `rebuild_seed`), and asserts the
+  marker survived: that round-trip is what every resume path depends on.
 sequential: true
 
 setup:
@@ -30,7 +50,7 @@ setup:
     ignoreError: true
     exec:
       container: recursive-e2e
-      command: export PORT=$(cat /tmp/e2e-host-port-22.txt); rm -f /tmp/compact-result.txt /tmp/compact-http.log && echo reset
+      command: export PORT=$(cat /tmp/e2e-host-port-22.txt); rm -f /tmp/compact-result.txt /tmp/compact-http.log /tmp/compact-session.txt && echo reset
 
   - name: "Start HTTP server on port 9099 with low compaction threshold"
     exec:
@@ -56,7 +76,7 @@ setup:
       output:
         contains: "ok"
 
-  - name: "Create a session and run two turns to trigger compaction"
+  - name: "Create a session and run six turns to trigger compaction"
     exec:
       container: recursive-e2e
       command: |
@@ -67,43 +87,105 @@ setup:
           -d '{"system_prompt":"You are a test assistant."}' \
           | jq -r '.id')
         echo "session=$SESSION"
+        echo "$SESSION" > /tmp/compact-session.txt
 
-        # Turn 1: long response to exceed 100-char threshold
-        RESP1=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SESSION/messages \
-          -H 'Content-Type: application/json' \
-          -d '{"content":"compaction-turn-1"}')
-        echo "turn1_role=$(echo $RESP1 | jq -r '.role')"
+        # Six turns. Turns 1-4 stay under the `keep_recent_n + 2` length gate
+        # (9 rows at the end of turn 4); from turn 5 on the split arithmetic
+        # accepts a summary (see the suite description). Every turn must
+        # answer normally, including the one whose call sees the summary.
+        TURN1=""
+        TURN2=""
+        for i in 1 2 3 4 5 6; do
+          RESP=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SESSION/messages \
+            -H 'Content-Type: application/json' \
+            -d "{\"content\":\"compaction-turn-$i\"}")
+          ROLE=$(printf '%s' "$RESP" | jq -r '.role')
+          echo "turn${i}_role=$ROLE"
+          case $i in
+            1) TURN1=$ROLE ;;
+            2) TURN2=$ROLE ;;
+          esac
+        done
 
-        # Turn 2: after compaction — must still work
-        RESP2=$(curl -sf -X POST -H 'X-API-Key: test-secret-key' http://localhost:$PORT/sessions/$SESSION/messages \
-          -H 'Content-Type: application/json' \
-          -d '{"content":"compaction-turn-2"}')
-        echo "turn2_role=$(echo $RESP2 | jq -r '.role')"
-
-        # Save results
+        # Save results (the marker assertion is appended by the step after the
+        # restart, so it reads the *persisted* transcript, not the live one).
         printf "session=%s\nturn1_role=%s\nturn2_role=%s\n" \
-          "$SESSION" \
-          "$(echo $RESP1 | jq -r '.role')" \
-          "$(echo $RESP2 | jq -r '.role')" \
+          "$SESSION" "$TURN1" "$TURN2" \
           > /tmp/compact-result.txt
         cat /tmp/compact-result.txt
     expect:
       exitCode: 0
 
+  - name: "Restart the server so the session is rebuilt from its persisted transcript"
+    exec:
+      container: recursive-e2e
+      command: |
+        export PORT=$(cat /tmp/e2e-host-port-22.txt)
+        pkill -f 'recursive.*http --addr' 2>/dev/null || true
+        sleep 1
+        RECURSIVE_COMPACT_THRESHOLD=100 RECURSIVE_RATE_LIMIT_BURST=200 RECURSIVE_RATE_LIMIT_RPM=6000 \
+         RECURSIVE_HTTP_AUTH_KEYS=test-secret-key \
+          nohup recursive \
+            --api-base http://aimock:4010/v1 \
+            --api-key mock-key -m mock-chat \
+            http --addr 0.0.0.0:$PORT \
+            > /tmp/compact-http.log 2>&1 &
+        # The first GET cold-loads the session, so wait for readiness first.
+        for _ in $(seq 1 30); do
+          curl -sf http://localhost:$PORT/health > /dev/null && break
+          sleep 1
+        done
+        curl -sf http://localhost:$PORT/health
+    expect:
+      exitCode: 0
+      output:
+        contains: "ok"
+
+  - name: "Goal 413: the rebuilt session carries exactly one boundary marker"
+    exec:
+      container: recursive-e2e
+      command: |
+        export PORT=$(cat /tmp/e2e-host-port-22.txt)
+        SESSION=$(cat /tmp/compact-session.txt)
+        # Cold load path: the session is not in memory after the restart, so
+        # this exercises writer → TranscriptEntry → entry_to_message →
+        # rebuild_seed. Exactly one marker row must survive; zero means the
+        # boundary bit did not round-trip, more than one means a summary was
+        # duplicated next to the history it folded.
+        COUNTS=$(curl -sf -H 'X-API-Key: test-secret-key' \
+          http://localhost:$PORT/sessions/$SESSION \
+          | jq -r '[(.messages | length),
+                    ([.messages[] | select(.is_compaction_summary == true)] | length)] | @tsv')
+        ROWS=$(printf '%s' "$COUNTS" | cut -f1)
+        MARKERS=$(printf '%s' "$COUNTS" | cut -f2)
+        # Bracketed so a short `contains` assertion cannot match 11/21 —
+        # a duplicated summary is precisely what this case exists to catch.
+        printf "marker_rows=[%s]\nmessage_rows=%s\n" "$MARKERS" "$ROWS" >> /tmp/compact-result.txt
+        cat /tmp/compact-result.txt
+    expect:
+      exitCode: 0
+
 cases:
-  - name: "Turn 1 completes successfully (triggering compaction)"
+  - name: "Turn 1 completes successfully"
     file:
       container: recursive-e2e
       path: /tmp/compact-result.txt
       exists: true
       contains: "turn1_role=assistant"
 
-  - name: "Turn 2 completes successfully after compaction"
+  - name: "Turn 2 completes successfully"
     file:
       container: recursive-e2e
       path: /tmp/compact-result.txt
       exists: true
       contains: "turn2_role=assistant"
+
+  - name: "Goal 413: exactly one compaction boundary marker survives the persisted round-trip"
+    file:
+      container: recursive-e2e
+      path: /tmp/compact-result.txt
+      exists: true
+      contains: "marker_rows=[1]"
 
 teardown:
   - name: "Stop HTTP server on 9099 and clean up"
@@ -113,5 +195,5 @@ teardown:
       command: |
         export PORT=$(cat /tmp/e2e-host-port-22.txt)
         pkill -f 'recursive.*http --addr' 2>/dev/null || true
-        rm -f /tmp/compact-result.txt /tmp/compact-http.log
+        rm -f /tmp/compact-result.txt /tmp/compact-http.log /tmp/compact-session.txt
         echo stopped

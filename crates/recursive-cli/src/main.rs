@@ -3809,7 +3809,14 @@ fn switch_weixin_session(
         tracing::warn!(session_id = %id, "WeChat: bound session not found; starting fresh");
         return start_fresh_weixin_session(runtime, config, workspace, user_id, first_message);
     };
-    let seed = recursive::session::SessionReader::load_messages(&dir).unwrap_or_else(|e| {
+    // `set_transcript` replaces the whole transcript, so the runtime's own
+    // prompt is re-attached to the seed (goal 413) — otherwise the resumed
+    // WeChat session goes out promptless.
+    let seed = recursive::session::SessionReader::load_seed_for_existing_runtime(
+        &dir,
+        runtime.transcript(),
+    )
+    .unwrap_or_else(|e| {
         tracing::warn!(session_id = %id, error = %e, "WeChat: failed to load session");
         Vec::new()
     });

@@ -447,6 +447,9 @@ impl SessionWriter {
             timestamp: chrono_lite_now(),
             audit,
             step,
+            // Goal 413: the in-memory marker IS the persisted boundary —
+            // write it so rebuild consumers can find the summary on disk.
+            is_compaction_summary: msg.is_compaction_summary,
         };
 
         let line = serde_json::to_string(&entry)

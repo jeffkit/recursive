@@ -551,11 +551,19 @@ pub(crate) const CONTINUE_GOAL_DIRECTIVE: &str =
 /// Load a thread's persisted transcript as the seed for its next run
 /// (issue #147).
 ///
-/// The runtime assembles its own system prompt, so a stored system message
-/// (a pre-#147 teardown snapshot carries one) is dropped rather than seeded
-/// twice. A leading orphan tool result is dropped too: it must answer an
-/// assistant `tool_calls` that is no longer in the transcript, and an
-/// unpaired Tool message violates invariant #8 (HTTP 400 from the provider).
+/// The stored→seed framing — stored rebuilt prompt dropped (the runtime
+/// assembles its own), leading orphan tool results dropped (invariant #8),
+/// a compaction summary kept as the seed head (issue #158), poisoned
+/// empty-assistant rows dropped (#168) — is
+/// [`crate::compact::rebuild_declared_seed`], the canonical rebuild
+/// (goal 413). This consumer is append-only (`SessionPersistenceSink` never
+/// rewrites the file at a boundary), so it hands the whole file to that
+/// function, which is also the one place the g157 `compact_boundary`
+/// *declaration* is honoured — cut at the last one and mark the row after it
+/// when a pre-goal-413 writer left the bit off. The cut is never at the
+/// marker row itself: `rebuild_declared_seed`'s module docs spell out why a
+/// marker row alone cannot say which rows were folded (intra-turn compaction
+/// appends its summary after the preserved tail).
 ///
 /// A *trailing* orphan — the assistant `tool_calls` a host killed mid-tool-call
 /// never got a result for — is answered instead of dropped (see
@@ -567,32 +575,30 @@ fn load_thread_seed(session_dir: &Path) -> Vec<crate::message::Message> {
     let Ok(content) = std::fs::read_to_string(session_dir.join("transcript.jsonl")) else {
         return Vec::new();
     };
-    let mut msgs: Vec<crate::message::Message> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
-    // The stored system prompt is dropped (the runtime rebuilds its own), but
-    // a compaction summary is also a `Role::System` message and carries real
-    // conversation state — keep it (issue #158).
-    if msgs
-        .first()
-        .is_some_and(|m| m.role == crate::message::Role::System && !m.is_compaction_summary)
-    {
-        msgs.remove(0);
-    }
-    match msgs
-        .iter()
-        .position(|m| m.role != crate::message::Role::Tool)
-    {
-        Some(0) => {}
-        Some(n) => {
-            msgs.drain(..n);
+    let mut stored: Vec<crate::message::Message> = Vec::new();
+    // First row after the last compact_boundary declaration seen so far.
+    let mut after_boundary = None;
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if is_compact_boundary_line(line) {
+            after_boundary = Some(stored.len());
+            continue;
         }
-        None => msgs.clear(),
+        if let Ok(message) = serde_json::from_str(line) {
+            stored.push(message);
+        }
     }
+    let Some(rebuilt) = crate::compact::rebuild_declared_seed(&stored, after_boundary) else {
+        return Vec::new();
+    };
+    let msgs = rebuilt.seed;
     let unanswered = unanswered_tool_calls(&msgs);
     crate::session::splice_orphan_results(msgs, &unanswered)
+}
+
+/// Is this JSONL line a g157 `compact_boundary` marker rather than a message?
+fn is_compact_boundary_line(line: &str) -> bool {
+    serde_json::from_str::<crate::session::serialize::CompactBoundaryEntry>(line)
+        .is_ok_and(|entry| entry.entry_type == "system" && entry.subtype == "compact_boundary")
 }
 
 /// The `(tool_call_id, result)` answers for a seed's unpaired tool calls, which
@@ -2259,6 +2265,102 @@ mod tests {
             contents,
             vec!["summary", "real turn"],
             "the stored prompt is dropped but the compaction summary survives"
+        );
+    }
+
+    /// Goal 413: an AG-UI thread file is append-only, so after a compaction it
+    /// still holds every row the summary supersedes — pre-boundary rows, the
+    /// g157 `compact_boundary` line, then the summary `SessionPersistenceSink`
+    /// wrote. `load_thread_seed` reads the raw lines (it does not go through
+    /// `SessionReader`, which slices at the boundary), so the cut has to live
+    /// in the canonical rebuild: seeding history *plus* the summary that
+    /// already stands for it would defeat compaction on every later run.
+    #[test]
+    fn load_thread_seed_cuts_at_the_persisted_boundary() {
+        use crate::session::TranscriptEntry;
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-compacted-file").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let message = |m: &crate::message::Message| serde_json::to_string(m).unwrap();
+        let summary_entry = TranscriptEntry {
+            uuid: "summary-uuid".into(),
+            parent_uuid: None,
+            source_tool_assistant_uuid: None,
+            id: "summary-id".into(),
+            parent_id: None,
+            role: "system".into(),
+            content: "[compacted: turn 1]".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            usage: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            audit: None,
+            step: None,
+            is_compaction_summary: true,
+        };
+        let lines = [
+            message(&crate::message::Message::system("stored prompt")),
+            message(&user("turn 1")),
+            message(&crate::message::Message::assistant("answer 1")),
+            r#"{"type":"system","subtype":"compact_boundary","turn":1,"compacted_count":2,"timestamp":"2026-01-01T00:00:00Z"}"#.to_string(),
+            serde_json::to_string(&summary_entry).unwrap(),
+            message(&user("turn 2")),
+            message(&crate::message::Message::assistant("answer 2")),
+        ];
+        std::fs::write(dir.join("transcript.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let seed = load_thread_seed(&dir);
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["[compacted: turn 1]", "turn 2", "answer 2"],
+            "the seed is the post-compaction state, not history + its summary"
+        );
+        assert!(
+            seed[0].is_compaction_summary,
+            "the summary must stay the seed head"
+        );
+    }
+
+    /// Goal 413 review BLOCKER: a thread written before the marker bit was
+    /// persisted has `[prompt, u1, a1, <boundary>, SUMMARY(unmarked), u2,
+    /// a2]`. The boundary declaration is the only thing that says the summary
+    /// is conversation state, so the shared rebuild must mark it instead of
+    /// dropping it with the stored prompt — otherwise every folded turn is
+    /// lost silently (the #158 failure class, third consumer).
+    #[test]
+    fn load_thread_seed_marks_a_legacy_unmarked_summary_after_the_boundary() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-legacy-compacted-file").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let message = |m: &crate::message::Message| serde_json::to_string(m).unwrap();
+        let lines = [
+            message(&crate::message::Message::system("stored prompt")),
+            message(&user("turn 1")),
+            message(&crate::message::Message::assistant("answer 1")),
+            r#"{"type":"system","subtype":"compact_boundary","turn":1,"compacted_count":2,"timestamp":"2026-01-01T00:00:00Z"}"#.to_string(),
+            // Pre-goal-413 writer: no `is_compaction_summary` field at all.
+            message(&crate::message::Message::system("[compacted: turn 1]")),
+            message(&user("turn 2")),
+            message(&crate::message::Message::assistant("answer 2")),
+        ];
+        std::fs::write(dir.join("transcript.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let seed = load_thread_seed(&dir);
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["[compacted: turn 1]", "turn 2", "answer 2"],
+            "a legacy summary must not be dropped with the stored prompt"
+        );
+        assert!(
+            seed[0].is_compaction_summary,
+            "the backfilled marker is part of the rebuilt seed"
         );
     }
 

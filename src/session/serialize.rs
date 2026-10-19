@@ -4,6 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Serde helper: skip serializing `is_compaction_summary` when false, so old
+/// JSONL transcripts on disk deserialize cleanly without the field.
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// A single JSONL line representing one message in the transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
@@ -46,6 +53,12 @@ pub struct TranscriptEntry {
     /// assistant rows. Persistence-only — dropped by [`entry_to_message`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<usize>,
+    /// Goal 413: the persisted compaction boundary. `true` exactly on the
+    /// summary row `Compactor::apply` spliced in after the leading System
+    /// prefix — the marker every rebuild consumer keys off. Absent (older
+    /// transcripts) means `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_compaction_summary: bool,
 }
 
 /// A compact-boundary system entry written to the JSONL when cross-turn
@@ -105,6 +118,12 @@ pub enum LoadedEntry {
 /// transcript can't panic the resume handler — in practice this
 /// never fires because the writer only ever emits the four known
 /// roles.
+///
+/// Goal 413: the `is_compaction_summary` bit is round-tripped, not reset —
+/// it IS the persisted compaction boundary ([`crate::compact::rebuild_seed`]
+/// keys the canonical rebuild off it). Older rows without the field
+/// deserialize as `false` (the serde default), keeping pre-g161 transcripts
+/// loadable.
 pub fn entry_to_message(entry: TranscriptEntry) -> crate::message::Message {
     use crate::message::Role;
     let role = match entry.role.as_str() {
@@ -120,7 +139,7 @@ pub fn entry_to_message(entry: TranscriptEntry) -> crate::message::Message {
         tool_calls: entry.tool_calls,
         tool_call_id: entry.tool_call_id,
         reasoning_content: entry.reasoning_content,
-        is_compaction_summary: false,
+        is_compaction_summary: entry.is_compaction_summary,
     }
 }
 
@@ -145,6 +164,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".into(),
             audit: None,
             step: None,
+            is_compaction_summary: false,
         }
     }
 
@@ -197,11 +217,19 @@ mod tests {
     }
 
     #[test]
-    fn entry_to_message_is_not_compaction_summary() {
-        let msg = entry_to_message(make_entry("assistant"));
+    fn entry_to_message_round_trips_compaction_summary_bit() {
+        // Goal 413: the bit IS the persisted compaction boundary — it must
+        // survive the persisted→runtime conversion, not be reset.
+        let mut e = make_entry("system");
+        e.is_compaction_summary = true;
         assert!(
-            !msg.is_compaction_summary,
-            "entry_to_message must always produce is_compaction_summary=false"
+            entry_to_message(e).is_compaction_summary,
+            "a persisted compaction-summary row must stay marked in memory"
+        );
+        // Older rows (field absent) still default to false.
+        assert!(
+            !entry_to_message(make_entry("assistant")).is_compaction_summary,
+            "plain rows are not compaction summaries"
         );
     }
 

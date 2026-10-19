@@ -188,6 +188,7 @@ fn serialize_transcript(transcript: &[Message]) -> Option<String> {
             timestamp: chrono_lite_now(),
             audit: None,
             step: None,
+            is_compaction_summary: msg.is_compaction_summary,
         };
         let line = serde_json::to_string(&entry).ok()?;
         parent_uuid = Some(uuid);

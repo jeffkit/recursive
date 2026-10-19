@@ -1,6 +1,13 @@
 {
   "fixtures": [
     {
+      "_comment": "Summarisation call (the gates open on the turn 5→6 boundary). MUST stay first: its user message embeds the whole conversation, so the per-turn fixtures below would otherwise match it first (aimock is first-match-wins). Both the structured attempt (which cannot parse this plain text and degrades to free-text) and the free-text retry match on the 'Conversation to summarize:' marker.",
+      "match": { "userMessage": "Conversation to summarize:" },
+      "response": {
+        "content": "Summary: the conversation covered compaction turns 1 to 5, each of which only grew the transcript past the 100-char threshold."
+      }
+    },
+    {
       "_comment": "Compaction test turn 1: first message — response large enough to exceed the low 100-char threshold.",
       "match": { "userMessage": "compaction-turn-1" },
       "response": {
@@ -8,10 +15,38 @@
       }
     },
     {
-      "_comment": "Compaction test turn 2: after compaction the agent must still reply.",
+      "_comment": "Compaction test turn 2: the agent must keep answering.",
       "match": { "userMessage": "compaction-turn-2" },
       "response": {
         "content": "Compaction successful. The agent is still responding correctly after transcript compaction."
+      }
+    },
+    {
+      "_comment": "Turn 3: still below the keep_recent_n + 2 length gate.",
+      "match": { "userMessage": "compaction-turn-3" },
+      "response": {
+        "content": "Turn three continues normally; the transcript is still shorter than keep_recent_n + 2 messages."
+      }
+    },
+    {
+      "_comment": "Turn 4: still below the length gate.",
+      "match": { "userMessage": "compaction-turn-4" },
+      "response": {
+        "content": "Turn four continues normally; no compaction is expected yet."
+      }
+    },
+    {
+      "_comment": "Turn 5: at the end of this turn the transcript holds 11 rows, split = 11 - 8 = 3 and the older slice [user1, assistant1] has two conversational rows — the first turn whose gate accepts a summary (cross-turn here or intra-turn on the next call; either path persists exactly one marker).",
+      "match": { "userMessage": "compaction-turn-5" },
+      "response": {
+        "content": "Turn five continues normally; this is the first turn whose split arithmetic accepts a summary."
+      }
+    },
+    {
+      "_comment": "Turn 6: this turn's LLM call sees the spliced-in summary (whichever path produced it) and must still answer normally.",
+      "match": { "userMessage": "compaction-turn-6" },
+      "response": {
+        "content": "Turn six answered after the transcript was compacted."
       }
     }
   ]

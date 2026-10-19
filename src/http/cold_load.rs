@@ -48,7 +48,9 @@ use std::sync::Arc;
 
 use super::handlers::{ensure_access, format_timestamp};
 use super::{ApiError, AppState, AuthIdentity, SessionState};
-use crate::message::{Message, Role};
+use crate::message::Message;
+#[cfg(test)]
+use crate::message::Role;
 use crate::runtime::AgentRuntime;
 use std::time::SystemTime;
 
@@ -298,34 +300,14 @@ pub(super) async fn get_or_load_session(
 
 /// Normalize a stored transcript for seeding (see module docs).
 ///
+/// Goal 413: the framing is [`crate::compact::rebuild_seed`], the canonical
+/// rebuild — this wrapper only re-states the "404 when nothing restorable
+/// remains" contract the cold-load path owes its callers.
+///
 /// Returns `None` when nothing restorable remains — the caller must keep
 /// the 404 semantics and never materialize a ghost session.
 fn normalize_stored_transcript(msgs: Vec<Message>) -> Option<Vec<Message>> {
-    let mut msgs = msgs;
-    // 1. Stored system message → dropped (the runtime rebuilds its own). A
-    //    compaction summary is also a `Role::System` message but carries real
-    //    conversation state, so it is kept (issue #158).
-    if msgs
-        .first()
-        .is_some_and(|m| m.role == Role::System && !m.is_compaction_summary)
-    {
-        msgs.remove(0);
-    }
-    // 2. Leading orphan tool results → dropped until the first non-Tool
-    //    message (invariant #8: a Tool result must answer an Assistant
-    //    tool_call, which cannot exist before the first non-Tool message).
-    match msgs.iter().position(|m| m.role != Role::Tool) {
-        Some(0) => {}
-        Some(n) => {
-            msgs.drain(..n);
-        }
-        None => msgs.clear(),
-    }
-    if msgs.is_empty() {
-        None
-    } else {
-        Some(msgs)
-    }
+    crate::compact::rebuild_seed(&msgs).map(|rebuilt| rebuilt.seed)
 }
 
 /// Build a runtime for a cold-loaded session.

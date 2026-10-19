@@ -9,6 +9,53 @@ use super::orphan::OrphanToolCall;
 use super::serialize::{entry_to_message, CompactBoundaryEntry, LoadedEntry, TranscriptEntry};
 use super::SessionMeta;
 
+/// Read every transcript entry, plus the index of the first row after the
+/// last g157 `compact_boundary` declaration (`None` when there is none).
+///
+/// The declaration handling itself lives in
+/// [`crate::compact::rebuild_declared_seed`]: this is only the JSONL parse,
+/// shared by the display path ([`SessionReader::load_transcript`], which
+/// cuts) and the model-seed path ([`SessionReader::load_messages`], which
+/// hands both the rows and the index to the canonical rebuild).
+fn read_transcript(session_dir: &Path) -> std::io::Result<(Vec<TranscriptEntry>, Option<usize>)> {
+    let jsonl_path = session_dir.join("transcript.jsonl");
+    let file = std::fs::File::open(&jsonl_path)?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut entries: Vec<TranscriptEntry> = Vec::new();
+    // Index just after the last compact_boundary we saw.
+    let mut after_boundary = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // g157: detect compact_boundary system entries before trying to
+        // parse as TranscriptEntry (they have a different shape).
+        if let Ok(sys) = serde_json::from_str::<CompactBoundaryEntry>(&line) {
+            if sys.entry_type == "system" && sys.subtype == "compact_boundary" {
+                // Everything before this boundary is superseded; restart.
+                after_boundary = Some(entries.len());
+                continue;
+            }
+        }
+        match serde_json::from_str::<TranscriptEntry>(&line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                // Skip corrupt lines gracefully
+                eprintln!(
+                    "warning: skipping corrupt line in {}: {}",
+                    jsonl_path.display(),
+                    e
+                );
+                continue;
+            }
+        }
+    }
+    Ok((entries, after_boundary))
+}
+
 /// Reader for loading sessions from JSONL files.
 pub struct SessionReader;
 
@@ -19,44 +66,15 @@ impl SessionReader {
     /// entries **before** the last such boundary are discarded—they were
     /// already summarised and the summary is the first entry after the
     /// boundary. This makes resume `O(post-compaction size)`.
+    ///
+    /// The cut is all this method does. The first entry after the boundary
+    /// is left as stored; marking it `is_compaction_summary` when a
+    /// pre-goal-413 writer persisted no bit is
+    /// [`crate::compact::rebuild_declared_seed`], the one shared rebuild —
+    /// so the declaration rule cannot drift between readers.
     pub fn load_transcript(session_dir: &Path) -> std::io::Result<Vec<TranscriptEntry>> {
-        let jsonl_path = session_dir.join("transcript.jsonl");
-        let file = std::fs::File::open(&jsonl_path)?;
-        let reader = std::io::BufReader::new(file);
-
-        let mut all_entries: Vec<TranscriptEntry> = Vec::new();
-        // Index of the line immediately after the last compact_boundary we saw.
-        let mut boundary_after: usize = 0;
-
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            // g157: detect compact_boundary system entries before trying to
-            // parse as TranscriptEntry (they have a different shape).
-            if let Ok(sys) = serde_json::from_str::<CompactBoundaryEntry>(&line) {
-                if sys.entry_type == "system" && sys.subtype == "compact_boundary" {
-                    // Everything before this boundary is superseded; restart.
-                    boundary_after = all_entries.len();
-                    continue;
-                }
-            }
-            match serde_json::from_str::<TranscriptEntry>(&line) {
-                Ok(entry) => all_entries.push(entry),
-                Err(e) => {
-                    // Skip corrupt lines gracefully
-                    eprintln!(
-                        "warning: skipping corrupt line in {}: {}",
-                        jsonl_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            }
-        }
-        // Discard pre-boundary entries (g157).
-        Ok(all_entries.split_off(boundary_after))
+        let (mut entries, after_boundary) = read_transcript(session_dir)?;
+        Ok(entries.split_off(after_boundary.unwrap_or(0)))
     }
 
     /// Load the **full** on-disk history without discarding messages
@@ -150,9 +168,10 @@ impl SessionReader {
     /// are dropped here. The result is what `run_resumed` expects
     /// as its `seed` argument.
     ///
-    /// The `system` role is **kept** in the returned vec; callers
-    /// that want to rebuild the system prompt from `Config` can
-    /// filter it out manually.
+    /// The stored rebuilt system prompt is **dropped** (the runtime
+    /// assembles its own, and a seed carrying a second one would double
+    /// it). A compaction summary is also a `Role::System` row but is real
+    /// conversation state, so it stays — as the seed head.
     ///
     /// Issue #168: assistant messages with no text and no tool calls (written
     /// by pre-fix binaries when an interrupt hit during the tool_call phase)
@@ -161,13 +180,53 @@ impl SessionReader {
     /// is a permanent 400. Only that exact shape is dropped, so a
     /// tool_call-carrying assistant and every `Role::Tool` result survive and
     /// invariant #8 keeps holding.
+    /// Goal 413: the stored→seed framing (stored prompt dropped, orphan tool
+    /// results dropped, compaction summary kept as the head) is
+    /// [`crate::compact::rebuild_declared_seed`], the canonical rebuild — this
+    /// method is a thin JSONL adapter over it, not a framing of its own.
     pub fn load_messages(session_dir: &Path) -> std::io::Result<Vec<crate::message::Message>> {
-        let entries = Self::load_transcript(session_dir)?;
-        Ok(entries
-            .into_iter()
-            .map(entry_to_message)
-            .filter(|m| !crate::message::is_empty_assistant(m))
-            .collect())
+        let (entries, after_boundary) = read_transcript(session_dir)?;
+        let messages: Vec<crate::message::Message> =
+            entries.into_iter().map(entry_to_message).collect();
+        Ok(
+            crate::compact::rebuild_declared_seed(&messages, after_boundary)
+                .map_or_else(Vec::new, |rebuilt| rebuilt.seed),
+        )
+    }
+
+    /// Load a session as the **replacement transcript** of an already-built
+    /// runtime.
+    ///
+    /// [`Self::load_messages`] returns a builder *seed*: the stored prompt is
+    /// dropped because [`crate::runtime::AgentRuntimeBuilder::build`]
+    /// reassembles its own. A caller that instead hands the rows to
+    /// [`crate::runtime::AgentRuntime::set_transcript`] replaces the whole
+    /// transcript — including the prompt — so the runtime's own leading
+    /// system prompt is re-attached here. Without it the resumed run goes out
+    /// promptless (goal 413 review fix); with no prompt to keep, that
+    /// degradation is logged rather than silent.
+    pub fn load_seed_for_existing_runtime(
+        session_dir: &Path,
+        runtime_transcript: &[crate::message::Message],
+    ) -> std::io::Result<Vec<crate::message::Message>> {
+        use crate::message::Role;
+        let seed = Self::load_messages(session_dir)?;
+        let prompt_len = runtime_transcript
+            .iter()
+            .take_while(|m| m.role == Role::System && !m.is_compaction_summary)
+            .count();
+        if prompt_len == 0 {
+            tracing::warn!(
+                session = %session_dir.display(),
+                "resuming into an already-built runtime with no system prompt; \
+                 the resumed transcript will run without one"
+            );
+            return Ok(seed);
+        }
+        let mut out = Vec::with_capacity(prompt_len + seed.len());
+        out.extend_from_slice(&runtime_transcript[..prompt_len]);
+        out.extend(seed);
+        Ok(out)
     }
 
     /// Load the resume seed ([`Self::load_messages`]) with the results of
@@ -203,12 +262,10 @@ impl SessionReader {
         session_dir: &Path,
         answers: &[(String, String)],
     ) -> std::io::Result<Vec<crate::message::Message>> {
-        let entries = Self::load_transcript(session_dir)?;
-        let messages: Vec<crate::message::Message> = entries
-            .into_iter()
-            .map(entry_to_message)
-            .filter(|m| !crate::message::is_empty_assistant(m))
-            .collect();
+        let (entries, after_boundary) = read_transcript(session_dir)?;
+        let messages: Vec<_> = entries.into_iter().map(entry_to_message).collect();
+        let messages = crate::compact::rebuild_declared_seed(&messages, after_boundary)
+            .map_or_else(Vec::new, |rebuilt| rebuilt.seed);
         Ok(super::orphan::splice_orphan_results(messages, answers))
     }
 
@@ -1182,15 +1239,82 @@ mod tests {
             panic!("expected a Message after the boundary");
         }
 
-        // Model seed path is unchanged: load_messages still strips the
-        // 4 folded messages, leaving summary + turn 3 exchange (3 msgs).
+        // Model seed path: the `compact_boundary`-based skip in
+        // `load_transcript` still drops the 4 folded rows, and the row it
+        // marks as that boundary's summary leads the seed. The summary here
+        // carries no persisted marker bit (raw `SessionWriter::append` stores
+        // what it is given), so the canonical rebuild backfills it from the
+        // boundary line (goal 413) — the seed is the post-compaction
+        // conversation state, minus the stored prompt the runtime rebuilds.
         let seed = SessionReader::load_messages(&session_dir).unwrap();
         assert_eq!(
             seed.len(),
             3,
-            "load_messages keeps only post-compaction tail"
+            "load_messages keeps the summary and the post-compaction tail"
+        );
+        assert!(
+            seed[0].is_compaction_summary,
+            "the boundary summary row must stay marked as conversation state"
         );
         assert_eq!(seed[0].content, "summary of turn 1-2");
+    }
+
+    /// Goal 413 review fix: `load_messages` is a *builder seed* (the stored
+    /// prompt is dropped for `RuntimeBuilder::build`), so replacing an
+    /// already-built runtime's transcript with it wholesale would lose that
+    /// runtime's own prompt. `load_seed_for_existing_runtime` re-attaches it.
+    #[test]
+    fn load_seed_for_existing_runtime_keeps_the_runtime_prompt() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create(ws, "resume", "model", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+        w.append(&Message::user("hello".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("hi".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let runtime_transcript = vec![Message::system("RUNTIME PROMPT".to_string())];
+        let seed = SessionReader::load_seed_for_existing_runtime(&session_dir, &runtime_transcript)
+            .unwrap();
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["RUNTIME PROMPT", "hello", "hi"],
+            "a replacement transcript must keep the runtime's own prompt"
+        );
+    }
+
+    #[test]
+    fn load_seed_for_existing_runtime_keeps_a_compaction_summary_after_the_prompt() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let mut w = SessionWriter::create(ws, "resume-compacted", "model", "openai").unwrap();
+        let session_dir = w.session_dir().to_path_buf();
+        w.append(&Message::user("old".to_string()), None, None)
+            .unwrap();
+        w.write_compact_boundary(1, 1, None).unwrap();
+        w.append(
+            &Message::system("[compacted: old]".to_string()).with_compaction_summary(),
+            None,
+            None,
+        )
+        .unwrap();
+        w.append(&Message::user("new".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let runtime_transcript = vec![Message::system("RUNTIME PROMPT".to_string())];
+        let seed = SessionReader::load_seed_for_existing_runtime(&session_dir, &runtime_transcript)
+            .unwrap();
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["RUNTIME PROMPT", "[compacted: old]", "new"],
+            "prompt first, then the canonical rebuilt post-compaction state"
+        );
+        assert!(seed[1].is_compaction_summary);
     }
 
     #[test]
