@@ -13,7 +13,6 @@
 //! in the CLI crate.
 
 use std::sync::Arc;
-#[cfg(feature = "anthropic")]
 use std::time::Duration;
 
 use crate::config::Config;
@@ -37,6 +36,10 @@ pub fn build_llm_provider(
     max_search_rounds: Option<usize>,
     #[cfg_attr(not(feature = "anthropic"), allow(unused_variables))] thinking_budget: Option<u32>,
 ) -> Result<Arc<dyn ChatProvider>> {
+    // Issue #203: zero means "no time cap" (count-only), so only build a
+    // duration for a positive config value.
+    let network_budget = (config.retry_network_budget_secs > 0)
+        .then(|| Duration::from_secs(config.retry_network_budget_secs));
     let provider: Arc<dyn ChatProvider> = match config.provider_type.as_str() {
         #[cfg(feature = "anthropic")]
         "anthropic" => {
@@ -50,7 +53,8 @@ pub fn build_llm_provider(
                 .with_temperature(config.temperature)
                 .with_max_tokens(config.max_tokens)
                 .with_thinking_budget(thinking_budget)
-                .with_retry_policy(anthropic_retry);
+                .with_retry_policy(anthropic_retry)
+                .with_retry_network_budget(network_budget);
             if let Some(rounds) = max_search_rounds {
                 anthropic = anthropic.with_max_search_rounds(rounds);
             }
@@ -61,7 +65,8 @@ pub fn build_llm_provider(
                 .with_provider_name(config.provider_type.clone())
                 .with_temperature(config.temperature)
                 .with_max_tokens(config.max_tokens)
-                .with_retry_policy(retry);
+                .with_retry_policy(retry)
+                .with_retry_network_budget(network_budget);
             if let Some(rounds) = max_search_rounds {
                 openai = openai.with_max_search_rounds(rounds);
             }

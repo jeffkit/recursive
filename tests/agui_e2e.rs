@@ -107,6 +107,7 @@ fn mock_config(workspace: PathBuf) -> Config {
         retry_max: 0,
         retry_initial_backoff_secs: 1,
         retry_max_backoff_secs: 1,
+        retry_network_budget_secs: 600,
         shell_timeout_secs: 5,
         headless: false,
         memory_summary_limit: 5,

@@ -263,6 +263,50 @@ pub(crate) fn warn_provider_giving_up(label: &str, status: Option<u16>, request_
     );
 }
 
+/// Presence-only summary of proxy-related environment variables, for
+/// network-error WARN logs (issue #203).
+///
+/// Values are deliberately omitted: proxy URLs routinely embed credentials,
+/// and the attribution question is only "was a proxy configured at all, and
+/// which form". `direct` means no proxy variable was present. `NO_PROXY` is
+/// reported separately because it changes whether the configured proxy is
+/// bypassed for the failing endpoint.
+pub(crate) fn proxy_env_summary() -> String {
+    const KEYS: [&str; 8] = [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ];
+    let set: Vec<&str> = KEYS
+        .iter()
+        .copied()
+        .filter(|key| std::env::var_os(key).is_some())
+        .collect();
+    if set.is_empty() {
+        "direct".to_string()
+    } else {
+        set.join(",")
+    }
+}
+
+/// WARN once when network-class retries are exhausted (issue #203), including
+/// the elapsed wall clock and the proxy environment presence so a failure can
+/// be attributed to a direct path or a proxy path without another repro.
+pub(crate) fn warn_network_giving_up(label: &str, detail: &str, elapsed: std::time::Duration) {
+    tracing::warn!(
+        target: "recursive::llm",
+        elapsed_ms = elapsed.as_millis(),
+        proxy_env = %proxy_env_summary(),
+        detail,
+        "network retries exhausted; giving up ({label})"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,5 +757,43 @@ mod tests {
             rx.try_recv().is_err(),
             "empty content must not emit a Text chunk"
         );
+    }
+
+    /// Issue #203: the network-error WARN attribution reports which proxy env
+    /// vars are present but must never echo their values (proxy URLs often
+    /// embed credentials).
+    #[test]
+    fn proxy_env_summary_reports_presence_without_values() {
+        let _env_lock = crate::test_util::env_lock();
+        const KEYS: [&str; 8] = [
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ];
+        let originals: Vec<Option<String>> = KEYS.iter().map(|k| std::env::var(k).ok()).collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+
+        assert_eq!(proxy_env_summary(), "direct");
+        std::env::set_var("HTTPS_PROXY", "http://user:secret@proxy.local:7897");
+        let summary = proxy_env_summary();
+        assert_eq!(summary, "HTTPS_PROXY");
+        assert!(
+            !summary.contains("secret"),
+            "proxy values must not be logged"
+        );
+
+        for (key, original) in KEYS.iter().zip(originals) {
+            match original {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

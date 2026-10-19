@@ -63,6 +63,11 @@ pub struct OpenAiProvider {
     /// Issue #116: retries performed inside `post_json_with_retry` /
     /// `stream_inner`, drained by `run_core` and re-emitted as `LlmRetry`.
     retry_log: RetryLog,
+    /// Issue #203: wall-clock ceiling for retrying network-class failures
+    /// within one call. `RetryPolicy::max_retries` is the count floor;
+    /// network retries continue until this window is spent.
+    /// `None` = count-only (pre-#203 behaviour).
+    retry_network_budget: Option<Duration>,
     stream_tx: Option<StreamSender>,
     /// Algorithm used to resolve a `ToolSearchTool` query into a list of
     /// deferred tool names. Defaults to `KeywordSearchEngine`.
@@ -104,6 +109,7 @@ impl OpenAiProvider {
             max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
             retry_log: RetryLog::default(),
+            retry_network_budget: None,
             stream_tx: None,
             search_engine: Arc::new(KeywordSearchEngine::new()),
             max_search_rounds: 3,
@@ -230,6 +236,13 @@ impl OpenAiProvider {
         self
     }
 
+    /// Issue #203: cap the total wall-clock time spent retrying network-class
+    /// failures within one call. `None` (the default) keeps count-only retries.
+    pub fn with_retry_network_budget(mut self, budget: Option<Duration>) -> Self {
+        self.retry_network_budget = budget;
+        self
+    }
+
     /// POST `body` to `url` with retry, returning the raw response text on success.
     ///
     /// Handles: network errors, 5xx transient errors, and HTTP 200 with empty body
@@ -238,6 +251,10 @@ impl OpenAiProvider {
     async fn post_json_with_retry(&self, url: &str, body: &Value, label: &str) -> Result<String> {
         // Resolved once per call (per operation), not per retry attempt.
         let api_key = self.current_api_key()?;
+        // Issue #203: the network budget spans the whole call, including the
+        // time each attempt spends waiting for the connection. Reset only when
+        // the call returns (success or terminal failure).
+        let retry_started = std::time::Instant::now();
         let mut attempt = 0;
         loop {
             tracing::debug!(
@@ -259,11 +276,19 @@ impl OpenAiProvider {
                     if status.is_success() {
                         let text = resp.text().await?;
                         if text.trim().is_empty() {
-                            if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                            if let Some(backoff) = self.retry.backoff_for_budgeted(
+                                attempt,
+                                retry_started.elapsed(),
+                                None,
+                                true,
+                                self.retry_network_budget,
+                            ) {
                                 tracing::warn!(
                                     target: "recursive::llm",
                                     attempt,
                                     backoff_ms = backoff.as_millis(),
+                                    elapsed_ms = retry_started.elapsed().as_millis(),
+                                    proxy_env = %super::proxy_env_summary(),
                                     "HTTP 200 but empty body ({label}), retrying"
                                 );
                                 self.retry_log.record(attempt, backoff, None, "empty_body");
@@ -271,7 +296,11 @@ impl OpenAiProvider {
                                 attempt += 1;
                                 continue;
                             }
-                            Self::warn_provider_giving_up(label, None, None);
+                            super::warn_network_giving_up(
+                                label,
+                                "empty body",
+                                retry_started.elapsed(),
+                            );
                             return Err(self.make_err("HTTP 200 but response body is empty"));
                         }
                         return Ok(text);
@@ -319,11 +348,19 @@ impl OpenAiProvider {
                     ));
                 }
                 Err(e) => {
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                    if let Some(backoff) = self.retry.backoff_for_budgeted(
+                        attempt,
+                        retry_started.elapsed(),
+                        None,
+                        true,
+                        self.retry_network_budget,
+                    ) {
                         tracing::warn!(
                             target: "recursive::llm",
                             attempt,
                             backoff_ms = backoff.as_millis(),
+                            elapsed_ms = retry_started.elapsed().as_millis(),
+                            proxy_env = %super::proxy_env_summary(),
                             error = %e,
                             "network error, retrying ({label})"
                         );
@@ -332,7 +369,7 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
-                    Self::warn_provider_giving_up(label, None, None);
+                    super::warn_network_giving_up(label, &e.to_string(), retry_started.elapsed());
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -718,6 +755,8 @@ impl OpenAiProvider {
         // can't use post_json_with_retry (which returns text). Retry only on
         // non-2xx and network errors; a successful 2xx hands off to parse_sse_stream.
         let api_key = self.current_api_key()?;
+        // Issue #203: same count + wall-clock dual budget as the non-stream path.
+        let retry_started = std::time::Instant::now();
         let mut attempt = 0;
         loop {
             tracing::debug!(
@@ -779,11 +818,19 @@ impl OpenAiProvider {
                     ));
                 }
                 Err(e) => {
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                    if let Some(backoff) = self.retry.backoff_for_budgeted(
+                        attempt,
+                        retry_started.elapsed(),
+                        None,
+                        true,
+                        self.retry_network_budget,
+                    ) {
                         tracing::warn!(
                             target: "recursive::llm",
                             attempt,
                             backoff_ms = backoff.as_millis(),
+                            elapsed_ms = retry_started.elapsed().as_millis(),
+                            proxy_env = %super::proxy_env_summary(),
                             error = %e,
                             "network error, retrying (stream)"
                         );
@@ -792,7 +839,11 @@ impl OpenAiProvider {
                         attempt += 1;
                         continue;
                     }
-                    Self::warn_provider_giving_up("stream", None, None);
+                    super::warn_network_giving_up(
+                        "stream",
+                        &e.to_string(),
+                        retry_started.elapsed(),
+                    );
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -2725,6 +2776,118 @@ data: [DONE]
             result.is_err(),
             "must give up after max_retries empty-body responses"
         );
+    }
+
+    /// Issue #203: network failures are bounded by count **and** a total
+    /// wall-clock window. With a count budget far larger than the window, the
+    /// loop must keep retrying inside the window and give up once it expires.
+    #[tokio::test]
+    async fn network_retry_honours_total_time_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || loop {
+            if let Ok((stream, _)) = listener.accept() {
+                // Drop immediately: every attempt is a network-class failure.
+                drop(stream);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                // Deliberately tiny: the measured GLM failure was fast, so the
+                // count floor must not cut the 80 ms window short.
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(2),
+            })
+            .with_retry_network_budget(Some(Duration::from_millis(80)));
+
+        let started = std::time::Instant::now();
+        let result = provider
+            .post_json_with_retry(
+                &format!("http://{addr}/chat"),
+                &serde_json::json!({}),
+                "test",
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "network failures must eventually give up");
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "the loop must exhaust the time window before giving up; elapsed={elapsed:?}"
+        );
+        let recs = provider.take_retry_records();
+        assert!(
+            recs.len() > 2,
+            "the window must outlive the count floor (max_retries=2), got {} retries",
+            recs.len()
+        );
+        assert!(
+            recs.len() < 10_000,
+            "the time budget must stop the loop instead of running away"
+        );
+        assert!(
+            recs.iter().all(|r| r.reason == "network"),
+            "all retries must be classified as network failures"
+        );
+    }
+
+    /// Issue #203: a blip that clears inside the window must recover instead
+    /// of surfacing the transient error to the caller.
+    #[tokio::test]
+    async fn network_retry_recovers_inside_time_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for i in 0..5 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    if i < 4 {
+                        drop(stream);
+                        continue;
+                    }
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"ok":true}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    let _ = stream.flush();
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let provider = OpenAiProvider::new(format!("http://{addr}"), "sk-noop", "m")
+            .unwrap()
+            .with_retry_policy(RetryPolicy {
+                max_retries: 8,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(2),
+            })
+            .with_retry_network_budget(Some(Duration::from_secs(5)));
+
+        let result = provider
+            .post_json_with_retry(
+                &format!("http://{addr}/chat"),
+                &serde_json::json!({}),
+                "test",
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a blip that clears inside the window must recover: {result:?}"
+        );
+        let recs = provider.take_retry_records();
+        assert_eq!(recs.len(), 4, "one retry record per dropped connection");
+        assert!(recs.iter().all(|r| r.reason == "network"));
     }
 
     #[tokio::test]

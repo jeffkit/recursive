@@ -46,6 +46,11 @@ pub struct AnthropicProvider {
     /// Issue #116: retries performed inside `post_with_retry` / the streaming
     /// round, drained by `run_core` and re-emitted as `LlmRetry`.
     retry_log: RetryLog,
+    /// Issue #203: wall-clock ceiling for retrying network-class failures
+    /// within one call. `RetryPolicy::max_retries` is the count floor;
+    /// network retries continue until this window is spent.
+    /// `None` = count-only (pre-#203 behaviour).
+    retry_network_budget: Option<Duration>,
     /// Cap on `ToolSearchTool` round-trips. Set via `with_max_search_rounds()`
     /// for API parity with `OpenAiProvider`. Not yet consumed because Anthropic
     /// does not currently have a server-side deferred search loop. Wire it up
@@ -93,6 +98,7 @@ impl AnthropicProvider {
             max_tokens: crate::llm::DEFAULT_MAX_TOKENS,
             retry: RetryPolicy::default(),
             retry_log: RetryLog::default(),
+            retry_network_budget: None,
             max_search_rounds: 3,
             prompt_cache: None,
             thinking_budget: None,
@@ -211,6 +217,13 @@ impl AnthropicProvider {
         self
     }
 
+    /// Issue #203: cap the total wall-clock time spent retrying network-class
+    /// failures within one call. `None` (the default) keeps count-only retries.
+    pub fn with_retry_network_budget(mut self, budget: Option<Duration>) -> Self {
+        self.retry_network_budget = budget;
+        self
+    }
+
     /// Cap on `ToolSearchTool` round-trips per call. Stored for API parity
     /// with `OpenAiProvider`; wired up once Anthropic supports deferred search.
     pub fn with_max_search_rounds(mut self, n: usize) -> Self {
@@ -251,6 +264,9 @@ impl AnthropicProvider {
     async fn post_with_retry(&self, url: &str, body: &Value) -> Result<String> {
         // Resolved once per call (per operation), not per retry attempt.
         let api_key = self.current_api_key()?;
+        // Issue #203: the network budget spans the whole call, including the
+        // time each attempt spends waiting for the connection.
+        let retry_started = std::time::Instant::now();
         let mut attempt = 0;
         loop {
             tracing::debug!(
@@ -311,11 +327,19 @@ impl AnthropicProvider {
                     ));
                 }
                 Err(e) => {
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                    if let Some(backoff) = self.retry.backoff_for_budgeted(
+                        attempt,
+                        retry_started.elapsed(),
+                        None,
+                        true,
+                        self.retry_network_budget,
+                    ) {
                         tracing::warn!(
                             target: "recursive::llm",
                             attempt,
                             backoff_ms = backoff.as_millis(),
+                            elapsed_ms = retry_started.elapsed().as_millis(),
+                            proxy_env = %super::proxy_env_summary(),
                             error = %e,
                             "network error, retrying"
                         );
@@ -324,7 +348,11 @@ impl AnthropicProvider {
                         attempt += 1;
                         continue;
                     }
-                    super::warn_provider_giving_up("anthropic", None, None);
+                    super::warn_network_giving_up(
+                        "anthropic",
+                        &e.to_string(),
+                        retry_started.elapsed(),
+                    );
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }
@@ -415,6 +443,8 @@ impl AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url);
 
         let api_key = self.current_api_key()?;
+        // Issue #203: same count + wall-clock dual budget as the non-stream path.
+        let retry_started = std::time::Instant::now();
         let mut attempt = 0;
         loop {
             tracing::debug!(
@@ -483,11 +513,19 @@ impl AnthropicProvider {
                     ));
                 }
                 Err(e) => {
-                    if let Some(backoff) = self.retry.backoff_for(attempt, None, true) {
+                    if let Some(backoff) = self.retry.backoff_for_budgeted(
+                        attempt,
+                        retry_started.elapsed(),
+                        None,
+                        true,
+                        self.retry_network_budget,
+                    ) {
                         tracing::warn!(
                             target: "recursive::llm",
                             attempt,
                             backoff_ms = backoff.as_millis(),
+                            elapsed_ms = retry_started.elapsed().as_millis(),
+                            proxy_env = %super::proxy_env_summary(),
                             error = %e,
                             "network error, retrying (stream)"
                         );
@@ -497,7 +535,11 @@ impl AnthropicProvider {
                         continue;
                     }
 
-                    super::warn_provider_giving_up("anthropic-stream", None, None);
+                    super::warn_network_giving_up(
+                        "anthropic-stream",
+                        &e.to_string(),
+                        retry_started.elapsed(),
+                    );
                     return Err(self.make_err(format!("request failed: {e}")));
                 }
             }

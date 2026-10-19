@@ -32,6 +32,33 @@ pub const DEFAULT_MAX_STEPS: usize = 0;
 /// HTTP session default (1800 s); an explicit `0` restores no cap.
 pub const DEFAULT_WALL_TIMEOUT_SECS: u64 = 3600;
 
+/// Default provider-level retry count (issue #203).
+///
+/// Raised from 3: the measured GLM glitch burned three attempts in ~6 s, so a
+/// provider wobble lasting longer than a few seconds was fatal. For
+/// network-class failures this value is a **floor** (at least this many
+/// attempts); [`DEFAULT_RETRY_NETWORK_BUDGET_SECS`] is the wall-clock ceiling.
+/// HTTP 429/5xx keep using it as a hard count cap.
+pub const DEFAULT_RETRY_MAX: usize = 8;
+
+/// Default first backoff between provider retries, in seconds.
+pub const DEFAULT_RETRY_INITIAL_BACKOFF_SECS: u64 = 1;
+
+/// Default cap on the exponential backoff between provider retries, in
+/// seconds.
+pub const DEFAULT_RETRY_MAX_BACKOFF_SECS: u64 = 8;
+
+/// Default wall-clock budget, in seconds, for retrying **network-class**
+/// provider failures within one `llm.complete` call (issue #203).
+///
+/// Network failures are fast (`~6 s` for three attempts in the measured GLM
+/// outage), so the count floor alone cannot survive a multi-minute wobble.
+/// The wall clock is the operative ceiling: retries continue for up to this
+/// long, with exponential backoff capped by
+/// [`DEFAULT_RETRY_MAX_BACKOFF_SECS`]. `0` disables the time window and
+/// restores count-only retries.
+pub const DEFAULT_RETRY_NETWORK_BUDGET_SECS: u64 = 600;
+
 #[derive(Clone)]
 pub struct Config {
     pub workspace: PathBuf,
@@ -66,9 +93,17 @@ pub struct Config {
     pub max_tokens: u32,
     pub temperature: f64,
     pub system_prompt: String,
+    /// Count budget for 429/5xx retries and the **floor** for network-class
+    /// retries (at least this many attempts). `0` disables retries entirely.
     pub retry_max: usize,
     pub retry_initial_backoff_secs: u64,
     pub retry_max_backoff_secs: u64,
+    /// Wall-clock ceiling (seconds) for retrying network-class provider
+    /// failures within one LLM call (issue #203). `0` = no time window
+    /// (count-only; network retries then use `retry_max` as a cap).
+    /// Env `RECURSIVE_RETRY_NETWORK_BUDGET_SECS` > `[llm]
+    /// retry_network_budget_secs` > [`DEFAULT_RETRY_NETWORK_BUDGET_SECS`].
+    pub retry_network_budget_secs: u64,
     pub shell_timeout_secs: u64,
     /// Wall-clock deadline for the entire agent run (Goal 345).
     /// When > 0, the step loop checks an elapsed-time deadline and
@@ -190,6 +225,7 @@ impl std::fmt::Debug for Config {
                 &self.retry_initial_backoff_secs,
             )
             .field("retry_max_backoff_secs", &self.retry_max_backoff_secs)
+            .field("retry_network_budget_secs", &self.retry_network_budget_secs)
             .field("shell_timeout_secs", &self.shell_timeout_secs)
             .field("wall_timeout_secs", &self.wall_timeout_secs)
             .field("headless", &self.headless)
@@ -501,9 +537,34 @@ impl Config {
             }
         }
 
-        let retry_max = parse_env("RECURSIVE_RETRY_MAX", 3)?;
-        let retry_initial_backoff_secs = parse_env("RECURSIVE_RETRY_INITIAL_BACKOFF_SECS", 1)?;
-        let retry_max_backoff_secs = parse_env("RECURSIVE_RETRY_MAX_BACKOFF_SECS", 8)?;
+        // Issue #203: retry policy has both an env and a config-file face.
+        // Env wins (so a shell override still works); the file is what
+        // survives the bridge → sandbox path that strips the environment.
+        let file_llm = file_config.llm.as_ref();
+        let retry_max = parse_env(
+            "RECURSIVE_RETRY_MAX",
+            file_llm
+                .and_then(|l| l.retry_max)
+                .unwrap_or(DEFAULT_RETRY_MAX),
+        )?;
+        let retry_initial_backoff_secs = parse_env(
+            "RECURSIVE_RETRY_INITIAL_BACKOFF_SECS",
+            file_llm
+                .and_then(|l| l.retry_initial_backoff_secs)
+                .unwrap_or(DEFAULT_RETRY_INITIAL_BACKOFF_SECS),
+        )?;
+        let retry_max_backoff_secs = parse_env(
+            "RECURSIVE_RETRY_MAX_BACKOFF_SECS",
+            file_llm
+                .and_then(|l| l.retry_max_backoff_secs)
+                .unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_SECS),
+        )?;
+        let retry_network_budget_secs = parse_env(
+            "RECURSIVE_RETRY_NETWORK_BUDGET_SECS",
+            file_llm
+                .and_then(|l| l.retry_network_budget_secs)
+                .unwrap_or(DEFAULT_RETRY_NETWORK_BUDGET_SECS),
+        )?;
         let shell_timeout_secs = parse_env(
             "RECURSIVE_SHELL_TIMEOUT_SECS",
             file_agent.and_then(|a| a.shell_timeout_secs).unwrap_or(300),
@@ -707,6 +768,7 @@ impl Config {
             retry_max,
             retry_initial_backoff_secs,
             retry_max_backoff_secs,
+            retry_network_budget_secs,
             shell_timeout_secs,
             wall_timeout_secs,
             headless,
@@ -1646,6 +1708,7 @@ max_tokens = 20000
             retry_max: 2,
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
+            retry_network_budget_secs: 600,
             shell_timeout_secs: 300,
             wall_timeout_secs: 0,
             headless: false,
@@ -1719,6 +1782,124 @@ max_tokens = 20000
         }
         if let Ok(v) = original_max_backoff {
             std::env::set_var("RECURSIVE_RETRY_MAX_BACKOFF_SECS", v);
+        }
+    }
+
+    /// Issue #203: the retry knobs must survive on the config-file surface
+    /// because the bridge → sandbox path strips the environment. Env still
+    /// wins when present.
+    #[test]
+    fn retry_knobs_load_from_config_file_env_wins() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        std::fs::create_dir_all(tmp.path().join(".recursive")).unwrap();
+        std::fs::write(
+            tmp.path().join(".recursive").join("config.toml"),
+            r#"
+[llm]
+retry_max = 6
+retry_initial_backoff_secs = 2
+retry_max_backoff_secs = 20
+retry_network_budget_secs = 900
+"#,
+        )
+        .unwrap();
+
+        const KEYS: [&str; 6] = [
+            "RECURSIVE_RETRY_MAX",
+            "RECURSIVE_RETRY_INITIAL_BACKOFF_SECS",
+            "RECURSIVE_RETRY_MAX_BACKOFF_SECS",
+            "RECURSIVE_RETRY_NETWORK_BUDGET_SECS",
+            "RECURSIVE_MODEL",
+            "RECURSIVE_API_KEY",
+        ];
+        let originals: Vec<Option<String>> = KEYS.iter().map(|k| std::env::var(k).ok()).collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        // File values apply when the env is silent (sandbox path).
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.retry_max, 6);
+        assert_eq!(config.retry_initial_backoff_secs, 2);
+        assert_eq!(config.retry_max_backoff_secs, 20);
+        assert_eq!(config.retry_network_budget_secs, 900);
+
+        // Env overrides the file for both an existing and the new knob.
+        std::env::set_var("RECURSIVE_RETRY_MAX", "11");
+        std::env::set_var("RECURSIVE_RETRY_NETWORK_BUDGET_SECS", "1200");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.retry_max, 11, "env must win over [llm].retry_max");
+        assert_eq!(
+            config.retry_network_budget_secs, 1200,
+            "env must win over [llm].retry_network_budget_secs"
+        );
+
+        for (key, original) in KEYS.iter().zip(originals) {
+            match original {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// Issue #203: the out-of-the-box retry window must tolerate a provider
+    /// wobble long enough to cover the measured multi-minute GLM outage.
+    #[test]
+    fn retry_defaults_tolerate_multi_minute_provider_glitch() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        const KEYS: [&str; 6] = [
+            "RECURSIVE_RETRY_MAX",
+            "RECURSIVE_RETRY_INITIAL_BACKOFF_SECS",
+            "RECURSIVE_RETRY_MAX_BACKOFF_SECS",
+            "RECURSIVE_RETRY_NETWORK_BUDGET_SECS",
+            "RECURSIVE_MODEL",
+            "RECURSIVE_API_KEY",
+        ];
+        let originals: Vec<Option<String>> = KEYS.iter().map(|k| std::env::var(k).ok()).collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.retry_max, DEFAULT_RETRY_MAX);
+        assert!(
+            config.retry_max >= 8,
+            "issue #203 asks for at least 8 retries, got {}",
+            config.retry_max
+        );
+        assert_eq!(
+            config.retry_initial_backoff_secs,
+            DEFAULT_RETRY_INITIAL_BACKOFF_SECS
+        );
+        assert_eq!(
+            config.retry_max_backoff_secs,
+            DEFAULT_RETRY_MAX_BACKOFF_SECS
+        );
+        assert_eq!(
+            config.retry_network_budget_secs,
+            DEFAULT_RETRY_NETWORK_BUDGET_SECS
+        );
+        assert!(
+            config.retry_network_budget_secs >= 600,
+            "issue #203 asks for at least a 10-minute network budget, got {}s",
+            config.retry_network_budget_secs
+        );
+
+        for (key, original) in KEYS.iter().zip(originals) {
+            match original {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 
@@ -2351,6 +2532,7 @@ preset = "totally-bogus-id"
             retry_max: 2,
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
+            retry_network_budget_secs: 600,
             shell_timeout_secs: 300,
             wall_timeout_secs: 0,
             headless: false,
@@ -2498,6 +2680,7 @@ api_key = "sk-from-file"
                 retry_max: 2,
                 retry_initial_backoff_secs: 1,
                 retry_max_backoff_secs: 8,
+                retry_network_budget_secs: 600,
                 shell_timeout_secs: 300,
                 wall_timeout_secs: 0,
                 headless: false,
@@ -2548,6 +2731,7 @@ api_key = "sk-from-file"
             retry_max: 2,
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
+            retry_network_budget_secs: 600,
             shell_timeout_secs: 300,
             wall_timeout_secs: 0,
             headless: false,
@@ -2636,6 +2820,7 @@ api_key = "sk-from-file"
             retry_max: 2,
             retry_initial_backoff_secs: 1,
             retry_max_backoff_secs: 8,
+            retry_network_budget_secs: 600,
             shell_timeout_secs: 300,
             wall_timeout_secs: 0,
             headless: false,

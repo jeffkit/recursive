@@ -92,6 +92,51 @@ impl RetryPolicy {
         self.backoff_for(attempt, err.http_status(), err.is_network_error())
     }
 
+    /// Count + wall-clock dual budget (issue #203).
+    ///
+    /// `elapsed` is the time since the first attempt of the current call.
+    /// `network_total_budget` governs **network-class** failures: an outage
+    /// can outlast any reasonable retry count, and the measured GLM failures
+    /// were fast (`~6 s` for three attempts), so an attempt cap alone gives up
+    /// long before a multi-minute wobble clears. The wall clock is therefore
+    /// the operative ceiling, and `max_retries` is a floor: at least that
+    /// many attempts are made, then retrying continues until the window is
+    /// spent.
+    ///
+    /// `max_retries == 0` remains the explicit "never retry" switch and
+    /// disables the window too.
+    ///
+    /// HTTP 429/5xx stay count-only: the provider already tells us when to
+    /// come back via `Retry-After`, and a rate-limit window should not pin a
+    /// caller for the full network budget.
+    ///
+    /// `None` or a zero budget means count-only (pre-#203 behaviour).
+    pub fn backoff_for_budgeted(
+        &self,
+        attempt: usize,
+        elapsed: Duration,
+        status: Option<u16>,
+        is_network_error: bool,
+        network_total_budget: Option<Duration>,
+    ) -> Option<Duration> {
+        if self.max_retries == 0 {
+            return None;
+        }
+        if is_network_error {
+            if let Some(budget) = network_total_budget.filter(|b| !b.is_zero()) {
+                if elapsed >= budget {
+                    return None;
+                }
+                // Inside the window the count is only a floor: back off
+                // exactly as the count-only path would, saturating at
+                // `max_backoff`, and let the wall clock decide when to stop.
+                let backoff = self.initial_backoff * 2u32.saturating_pow(attempt as u32);
+                return Some(backoff.min(self.max_backoff));
+            }
+        }
+        self.backoff_for(attempt, status, is_network_error)
+    }
+
     /// Returns `Some(backoff)` if the caller should sleep-and-retry, or `None`
     /// to propagate the error. `attempt` is 0-indexed (0 = after the first failure).
     pub fn backoff_for(
@@ -356,6 +401,135 @@ mod tests {
         let result = policy.backoff_for(0, None, true);
         assert!(result.is_some(), "network error must trigger retry");
         assert_eq!(result.unwrap(), Duration::from_secs(1));
+    }
+
+    /// Issue #203: a network-class failure is bounded by total elapsed time.
+    /// Inside the window the loop keeps retrying; once the window is spent it
+    /// gives up.
+    #[test]
+    fn retry_policy_network_error_stops_when_time_budget_exhausted() {
+        let policy = RetryPolicy {
+            max_retries: 1_000,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_secs(1),
+        };
+        let budget = Some(Duration::from_secs(60));
+
+        assert!(
+            policy
+                .backoff_for_budgeted(0, Duration::from_secs(59), None, true, budget)
+                .is_some(),
+            "inside the time window a network error must still retry"
+        );
+        assert!(
+            policy
+                .backoff_for_budgeted(0, Duration::from_secs(60), None, true, budget)
+                .is_none(),
+            "at the time budget the loop must give up"
+        );
+        assert!(
+            policy
+                .backoff_for_budgeted(0, Duration::from_secs(61), None, true, budget)
+                .is_none(),
+            "past the time budget the loop must give up"
+        );
+    }
+
+    /// Issue #203: the measured GLM failure burned three attempts in ~6 s.
+    /// With a 10-minute window the loop must keep retrying past the count
+    /// floor, otherwise a 25-minute fast-failing outage still kills the run.
+    #[test]
+    fn retry_policy_network_window_outlives_count_floor() {
+        let policy = RetryPolicy {
+            max_retries: 8,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        };
+        let budget = Some(Duration::from_secs(600));
+        assert!(
+            policy
+                .backoff_for_budgeted(8, Duration::from_secs(10), None, true, budget)
+                .is_some(),
+            "past the count floor but inside the window must keep retrying"
+        );
+        assert!(
+            policy
+                .backoff_for_budgeted(100, Duration::from_secs(599), None, true, budget)
+                .is_some(),
+            "the wall clock, not the count, is the network-class ceiling"
+        );
+        assert!(
+            policy
+                .backoff_for_budgeted(9, Duration::from_secs(600), None, true, budget)
+                .is_none(),
+            "outside the window the loop must give up even under the count"
+        );
+    }
+
+    /// Issue #203: `RECURSIVE_RETRY_MAX=0` is the documented no-retry switch
+    /// and must also disable the network window.
+    #[test]
+    fn retry_policy_zero_count_disables_network_window() {
+        let policy = RetryPolicy {
+            max_retries: 0,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        };
+        assert!(policy
+            .backoff_for_budgeted(
+                0,
+                Duration::ZERO,
+                None,
+                true,
+                Some(Duration::from_secs(600))
+            )
+            .is_none());
+    }
+
+    /// Issue #203: HTTP 429/5xx stay count-only. A provider that supplies a
+    /// throttling window should not pin the caller for the full network
+    /// budget.
+    #[test]
+    fn retry_policy_http_status_ignores_network_time_budget() {
+        let policy = RetryPolicy {
+            max_retries: 8,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        };
+        let elapsed = Duration::from_secs(601);
+        assert!(
+            policy
+                .backoff_for_budgeted(0, elapsed, Some(503), false, Some(Duration::from_secs(600)))
+                .is_some(),
+            "5xx retries are count-bounded, not time-bounded"
+        );
+        assert!(
+            policy
+                .backoff_for_budgeted(0, elapsed, Some(429), false, Some(Duration::from_secs(600)))
+                .is_some(),
+            "429 retries are count-bounded, not time-bounded"
+        );
+    }
+
+    /// Issue #203: `None` (and zero) keep the pre-fix count-only behaviour so
+    /// existing embedders and tests are unaffected.
+    #[test]
+    fn retry_policy_none_or_zero_time_budget_is_count_only() {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        };
+        let ancient = Duration::from_secs(86_400);
+        assert!(policy
+            .backoff_for_budgeted(0, ancient, None, true, None)
+            .is_some());
+        assert!(policy
+            .backoff_for_budgeted(0, ancient, None, true, Some(Duration::ZERO))
+            .is_some());
+        assert!(policy
+            .backoff_for_budgeted(3, Duration::ZERO, None, true, None)
+            .is_none());
     }
 
     #[test]

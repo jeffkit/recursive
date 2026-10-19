@@ -51,6 +51,10 @@ pub struct FileConfig {
     /// Falls back to `RECURSIVE_*` env vars.
     #[serde(default)]
     pub limits: Option<LimitsSection>,
+    /// Optional `[llm]` section. Provider-level retry policy.
+    /// Falls back to `RECURSIVE_RETRY_*` env vars.
+    #[serde(default)]
+    pub llm: Option<LlmSection>,
 }
 
 /// [provider] section.
@@ -184,6 +188,42 @@ pub struct LimitsSection {
     /// evaluator judge on each turn.
     /// Corresponding env var: `RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL`. Default: 12.
     pub goal_eval_transcript_tail: Option<usize>,
+}
+
+/// `[llm]` section. Provider-level retry policy (issue #203).
+///
+/// Env vars win over these values, matching every other config-file field.
+/// The values live here so a sandboxed child that strips the environment
+/// (the bridge → sandbox path) still inherits a usable retry window.
+///
+/// Example:
+/// ```toml
+/// [llm]
+/// retry_max = 8
+/// retry_initial_backoff_secs = 1
+/// retry_max_backoff_secs = 8
+/// retry_network_budget_secs = 600
+/// ```
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct LlmSection {
+    /// Retry count budget: caps 429/5xx retries and is the minimum number of
+    /// attempts for network-class failures (their wall-clock budget is the
+    /// ceiling). `0` disables retries entirely.
+    /// Corresponding env var: `RECURSIVE_RETRY_MAX`. Default: 8.
+    pub retry_max: Option<usize>,
+    /// First retry backoff. Subsequent retries double, capped at
+    /// `retry_max_backoff_secs`.
+    /// Corresponding env var: `RECURSIVE_RETRY_INITIAL_BACKOFF_SECS`. Default: 1.
+    pub retry_initial_backoff_secs: Option<u64>,
+    /// Cap on the exponential backoff.
+    /// Corresponding env var: `RECURSIVE_RETRY_MAX_BACKOFF_SECS`. Default: 8.
+    pub retry_max_backoff_secs: Option<u64>,
+    /// Wall-clock ceiling (seconds) for retrying network-class failures,
+    /// measured from the first attempt of one LLM call. The loop keeps
+    /// retrying until this window is spent or the provider recovers. `0`
+    /// disables the window and restores count-only retries.
+    /// Corresponding env var: `RECURSIVE_RETRY_NETWORK_BUDGET_SECS`. Default: 600.
+    pub retry_network_budget_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
