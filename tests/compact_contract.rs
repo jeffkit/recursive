@@ -17,7 +17,7 @@ use std::sync::Arc;
 use recursive::compact::rebuild_declared_seed;
 use recursive::compact::rebuild_seed;
 use recursive::compact::verify_compaction_rewrite;
-use recursive::llm::{Completion, MockProvider};
+use recursive::llm::{Completion, MockProvider, TokenUsage};
 use recursive::message::{Message, Role};
 use recursive::session::{SessionPersistenceSink, SessionReader, SessionStatus, SessionWriter};
 use recursive::test_util::IsolatedWorkspace;
@@ -570,5 +570,196 @@ fn test_compact_contract_rebuild_161_marker_survives_entry_to_message() {
     assert!(
         !recursive::session::entry_to_message(entry).is_compaction_summary,
         "plain rows stay unmarked"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Goal 414 — token normalisation nail (#162 / #163)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Headline contract: the compaction trigger consumes the **normalised**
+/// input-token total (`cache_hit + cache_miss` folded in), so a provider
+/// that reports `prompt_tokens` without its cache reads cannot keep the
+/// threshold from firing (#162 was exactly that regression: cross-turn
+/// compaction consumed a `prompt_tokens` shape that undercounted the real
+/// context on a cached session).
+///
+/// The warning half (an un-normalised reading is announced, never silently
+/// compensated) is asserted in `src/compact/mod.rs`
+/// (`test_compact_contract_token_normalized_warns`) — `logs_contain` only
+/// captures events whose target shares the test crate's name, and an
+/// integration-test binary is not `recursive`.
+#[test]
+fn test_compact_contract_token_normalized() {
+    let compactor = Compactor::new(usize::MAX).threshold_prompt_tokens(500);
+
+    // Anthropic shape: `prompt_tokens` (100) excludes the 900 cached tokens.
+    let unnormalized = TokenUsage {
+        prompt_tokens: 100,
+        cache_hit_tokens: 900,
+        cache_miss_tokens: 0,
+        ..Default::default()
+    };
+    assert_eq!(unnormalized.input_tokens(), 900);
+    assert!(!unnormalized.is_normalized());
+    assert!(
+        !compactor.should_compact(0, unnormalized.prompt_tokens),
+        "the raw field alone must not decide — it is exactly the #162 shape"
+    );
+    assert!(
+        compactor.should_compact_usage(0, &unnormalized),
+        "the cache-folded total must fire the threshold"
+    );
+
+    // DeepSeek shape: `prompt_tokens` already is hit + miss → same decision.
+    let normalized = TokenUsage {
+        prompt_tokens: 900,
+        cache_hit_tokens: 900,
+        cache_miss_tokens: 0,
+        ..Default::default()
+    };
+    assert_eq!(normalized.input_tokens(), 900);
+    assert!(normalized.is_normalized());
+    assert!(compactor.should_compact_usage(0, &normalized));
+    assert_eq!(
+        compactor.should_compact(0, normalized.prompt_tokens),
+        compactor.should_compact_usage(0, &normalized),
+        "for a normalised provider the two entry points agree"
+    );
+
+    // A provider that reports no cache split at all is normalised by
+    // definition — behaviour unchanged.
+    let plain = TokenUsage {
+        prompt_tokens: 600,
+        ..Default::default()
+    };
+    assert!(plain.is_normalized());
+    assert_eq!(plain.input_tokens(), 600);
+    assert!(compactor.should_compact_usage(0, &plain));
+}
+
+/// Negative control — mutation: the cross-turn trigger falls back to the raw
+/// `prompt_tokens` field (`should_compact_usage` → `should_compact(bytes,
+/// usage.prompt_tokens)`). On the #162 shape the real context (900 ≥
+/// threshold) stops firing the trigger, so the runtime-level assertion below
+/// turns red: a compaction that must run does not.
+///
+/// Driven through `AgentRuntime::maybe_compact_cross_turn` so the nail is on
+/// the consumption site itself, not only on the predicate.
+#[tokio::test]
+async fn test_compact_contract_negative_control_unnormalized_trigger_bypass() {
+    let seeded = vec![
+        Message::system("reassembled prompt"),
+        Message::user("u0"),
+        Message::assistant("a0"),
+        Message::user("u1"),
+        Message::assistant("a1"),
+        Message::user("u2"),
+        Message::assistant("a2"),
+    ];
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![summary_completion(
+            "summary",
+        )])))
+        .compactor(
+            Compactor::new(usize::MAX)
+                .threshold_prompt_tokens(500)
+                .keep_recent_n(2),
+        )
+        .build()
+        .unwrap();
+    rt.set_transcript(seeded);
+
+    // #162 shape: 100 fresh tokens reported, 900 served from cache. The
+    // normalised total (900) is over the threshold; the raw field is not.
+    let usage = TokenUsage {
+        prompt_tokens: 100,
+        cache_hit_tokens: 900,
+        cache_miss_tokens: 0,
+        ..Default::default()
+    };
+    rt.maybe_compact_cross_turn(&usage)
+        .await
+        .expect("cross-turn compaction must run");
+
+    let transcript = rt.transcript();
+    assert!(
+        transcript.iter().any(|m| m.is_compaction_summary),
+        "an un-normalised usage must still fire the trigger once the cache \
+         share is folded in — a transcript without a summary means the \
+         trigger consumed the raw prompt_tokens (#162 regression)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Goal 414 — degradation observability
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Headline contract: a cross-turn compaction that replaces messages with a
+/// summary happens inside `Compactor::apply` — the single rewrite path (goal
+/// 411) — so the runtime-level guarantee is: when the transcript was
+/// rewritten, the WARNING line was emitted. The literal log text
+/// (`before=` / `after=` / `summarized_start/end=`) is pinned in
+/// `src/compact/mod.rs::test_compact_contract_degradation_warning`;
+/// `logs_contain` in an integration test cannot see `recursive::*` targets.
+#[tokio::test]
+async fn test_compact_contract_degradation_warning() {
+    let seeded = vec![
+        Message::system("reassembled prompt"),
+        Message::user("u0"),
+        Message::assistant("a0"),
+        Message::user("u1"),
+        Message::assistant("a1"),
+        Message::user("u2"),
+        Message::assistant("a2"),
+    ];
+    // Over the threshold the splice runs and must leave its observable
+    // boundary: the summary row, directly after the preserved prefix.
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![summary_completion(
+            "summary",
+        )])))
+        .compactor(Compactor::new(1).keep_recent_n(2))
+        .build()
+        .unwrap();
+    rt.set_transcript(seeded.clone());
+    let usage = TokenUsage {
+        prompt_tokens: 10_000,
+        ..Default::default()
+    };
+    rt.maybe_compact_cross_turn(&usage)
+        .await
+        .expect("compaction must run");
+
+    let transcript = rt.transcript();
+    assert_eq!(
+        transcript.len(),
+        4,
+        "7 messages → summary replaces 4 → 4 (the WARNING's before=7 after=4)"
+    );
+    assert!(
+        transcript[1].is_compaction_summary,
+        "the splice boundary must be visible in the transcript: {transcript:?}"
+    );
+    assert_eq!(&transcript[2..], &seeded[5..], "preserved tail verbatim");
+
+    // The no-op side of the contract: a fresh runtime with the char threshold
+    // disabled never fires the trigger, whatever the usage says — the
+    // transcript is untouched, so no splice is announced.
+    let mut idle = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![summary_completion(
+            "summary",
+        )])))
+        .compactor(Compactor::new(usize::MAX).keep_recent_n(2))
+        .build()
+        .unwrap();
+    idle.set_transcript(seeded.clone());
+    idle.maybe_compact_cross_turn(&usage)
+        .await
+        .expect("char threshold not met, compaction must not run");
+    assert_eq!(
+        idle.transcript().len(),
+        7,
+        "below the char threshold nothing may be replaced"
     );
 }

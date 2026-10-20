@@ -110,6 +110,19 @@ impl Microcompactor {
             pruned += 1;
         }
 
+        if pruned > 0 {
+            // Degradation (owner ruling: observable, not silent): tool output
+            // is replaced by a placeholder. Say how much, from a window of
+            // how many.
+            tracing::warn!(
+                target: "recursive::compact",
+                pruned,
+                tool_messages = count,
+                keep_recent = self.keep_recent,
+                trigger = self.trigger_tool_count,
+                "microcompaction replaced old tool results with placeholders"
+            );
+        }
         pruned
     }
 }

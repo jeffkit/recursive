@@ -143,6 +143,38 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Total input tokens of this call, cache included — the **only** figure a
+    /// compaction trigger or budget check may consume (goal 414, #162/#163).
+    ///
+    /// `prompt_tokens` is not that figure: providers disagree about whether it
+    /// counts cache reads. Anthropic reports the fresh portion only and puts
+    /// cache reads/creations in separate fields; DeepSeek reports the total.
+    /// Consuming the raw field therefore undercounts by the cached share —
+    /// on a cached multi-turn session the largest part of the prompt — and
+    /// the compaction threshold silently stops firing (#162 was exactly that
+    /// regression, once via accumulated turn usage, once via the cache cut).
+    ///
+    /// The normalised split (`cache_hit + cache_miss`, see [`Self`]) is the
+    /// authoritative total, so take the larger of it and `prompt_tokens`: a
+    /// provider that reports no split keeps its own figure.
+    pub fn input_tokens(&self) -> u32 {
+        let split = self.cache_hit_tokens.saturating_add(self.cache_miss_tokens);
+        self.prompt_tokens.max(split)
+    }
+
+    /// Whether `prompt_tokens` already equals the normalised input total
+    /// (`cache_hit + cache_miss`), i.e. whether the raw field *is* the figure
+    /// to decide on.
+    ///
+    /// `false` means the provider reported a shape the consumer has to fold.
+    /// Consumers warn (never divert silently — owner ruling) and use
+    /// [`Self::input_tokens`]. A provider that reports no cache split at all
+    /// (`hit + miss == 0`) is normalised by definition — nothing to fold in.
+    pub fn is_normalized(&self) -> bool {
+        let split = self.cache_hit_tokens.saturating_add(self.cache_miss_tokens);
+        split == 0 || split == self.prompt_tokens
+    }
+
     /// Saturating element-wise sum. Used to accumulate across LLM calls.
     pub fn accumulate(self, other: TokenUsage) -> TokenUsage {
         TokenUsage {
@@ -337,6 +369,44 @@ mod tests {
     }
 
     // ── TokenUsage::accumulate tests ─────────────────────────────────────────
+
+    // ── TokenUsage::input_tokens / is_normalized (goal 414, #162/#163) ──────
+
+    /// Goal 414: the normalised input total folds the cache split in, so a
+    /// provider that reports `prompt_tokens` without its cache reads cannot
+    /// make a compaction trigger undercount the real context size.
+    #[test]
+    fn input_tokens_folds_in_the_cache_split() {
+        // Anthropic shape: `input_tokens` is the fresh portion only; cache
+        // reads/creations arrive separately and the adapter folds them into
+        // `cache_miss_tokens` — so `prompt_tokens` alone undercounts.
+        let anthropic = TokenUsage {
+            prompt_tokens: 100,
+            cache_hit_tokens: 30,
+            cache_miss_tokens: 120,
+            ..Default::default()
+        };
+        assert_eq!(anthropic.input_tokens(), 150);
+        assert!(!anthropic.is_normalized());
+
+        // DeepSeek shape: `prompt_tokens` already is hit + miss.
+        let deepseek = TokenUsage {
+            prompt_tokens: 150,
+            cache_hit_tokens: 30,
+            cache_miss_tokens: 120,
+            ..Default::default()
+        };
+        assert_eq!(deepseek.input_tokens(), 150);
+        assert!(deepseek.is_normalized());
+
+        // No split reported: `prompt_tokens` stands, normalised by definition.
+        let plain = TokenUsage {
+            prompt_tokens: 42,
+            ..Default::default()
+        };
+        assert_eq!(plain.input_tokens(), 42);
+        assert!(plain.is_normalized());
+    }
 
     #[test]
     fn token_usage_accumulate_sums_all_fields() {

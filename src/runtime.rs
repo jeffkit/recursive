@@ -821,7 +821,12 @@ impl AgentRuntime {
         }
 
         let bytes = Compactor::estimate_bytes(&self.transcript);
-        if !compactor.should_compact(bytes, last_usage.prompt_tokens) {
+        // Goal 414 token-normalisation nail: the trigger consumes the
+        // adapter-normalised usage (`TokenUsage::input_tokens`, cache
+        // included), never the raw `prompt_tokens` field — see
+        // `Compactor::should_compact_usage`. #162/#163 were both regressions
+        // of consuming an un-normalised figure at exactly this site.
+        if !compactor.should_compact_usage(bytes, last_usage) {
             return Ok(TokenUsage::default());
         }
         // Goal 345: only dispatch PreCompact when compaction will actually run,

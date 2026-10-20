@@ -83,3 +83,6 @@ mutants.out.old/
 
 # cargo-audit 豁免清单需随仓分发（#204）
 !.cargo/audit.toml
+
+# agent 构建目录变体（414 事故：target-review 误入 commit 被 GitHub 拒）
+target-review/

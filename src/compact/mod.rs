@@ -224,6 +224,32 @@ impl Compactor {
         }
     }
 
+    /// Token-threshold check over a provider-reported [`TokenUsage`] — the
+    /// form every trigger site must use (goal 414 token-normalisation nail).
+    ///
+    /// The decision consumes [`TokenUsage::input_tokens`] (the cache-folded
+    /// input total), never the raw `prompt_tokens` field: on a cached session
+    /// the cached share is most of the prompt, and a provider that reports it
+    /// outside `prompt_tokens` (#162) would otherwise keep the threshold from
+    /// ever firing. A usage whose `prompt_tokens` disagrees with the
+    /// normalised split is a degraded reading, so it is announced — never
+    /// compensated for silently (owner ruling: every degradation must leave a
+    /// WARNING-or-louder trace).
+    pub fn should_compact_usage(&self, estimate_bytes: usize, usage: &TokenUsage) -> bool {
+        if !usage.is_normalized() {
+            tracing::warn!(
+                target: "recursive::compact",
+                prompt_tokens = usage.prompt_tokens,
+                cache_hit_tokens = usage.cache_hit_tokens,
+                cache_miss_tokens = usage.cache_miss_tokens,
+                input_tokens = usage.input_tokens(),
+                "compaction trigger consumed an un-normalised usage shape; \
+                 deciding on the cache-folded input total instead"
+            );
+        }
+        self.should_compact(estimate_bytes, usage.input_tokens())
+    }
+
     /// JSON schema for structured compaction output.
     const COMPACT_SCHEMA: &'static str = r#"{"type":"object","properties":{"summary":{"type":"string","description":"1-3 paragraph summary of the conversation so far, preserving key decisions, file paths touched, and outcomes."},"kept_facts":{"type":"array","items":{"type":"string"},"description":"Discrete facts worth remembering across compaction (e.g. 'goal=add_X_to_Y', 'compaction happened at step N', 'tool X failed 3 times')."},"next_steps":{"type":"array","items":{"type":"string"},"description":"Outstanding TODOs the agent identified before compaction (each one a single-sentence imperative)."}},"required":["summary","kept_facts"]}"#;
 
@@ -411,6 +437,14 @@ impl Compactor {
         step: usize,
     ) -> Result<Option<CompactionOutcome>> {
         let Some(bounds) = self.plan(transcript) else {
+            // A legitimate no-op (transcript short / nothing conversational to
+            // fold). Debug only — WARNING is reserved for real degradation.
+            tracing::debug!(
+                target: "recursive::compact",
+                messages = transcript.len(),
+                keep_recent_n = self.keep_recent_n,
+                "compaction no-op: nothing to summarise"
+            );
             return Ok(None);
         };
         Ok(Some(
@@ -520,8 +554,23 @@ impl Compactor {
             .await?;
         let summary_chars = summary.content.len();
         let removed = bounds.summarized.len();
+        let before = transcript.len();
         transcript.drain(bounds.summarized.clone());
         transcript.insert(bounds.summarized.start, summary.clone());
+        // Degradation (owner ruling: observable, not silent): conversation
+        // rows were replaced by a model-written summary. Record the exact
+        // range folded away and the sizes on both sides of the splice.
+        tracing::warn!(
+            target: "recursive::compact",
+            before,
+            after = transcript.len(),
+            summarized_start = bounds.summarized.start,
+            summarized_end = bounds.summarized.end,
+            removed,
+            summary_chars,
+            step,
+            "compaction replaced messages with a summary"
+        );
         let outcome = CompactionOutcome {
             removed,
             summary_chars,
@@ -729,11 +778,14 @@ impl Compactor {
                     let target = retry::estimate_target_from_error(&e);
                     match retry::truncate_head_for_retry(&to_summarize, target) {
                         Some(truncated) => {
-                            tracing::info!(
+                            // Degradation: history the summary would have
+                            // covered is dropped to fit the context window.
+                            tracing::warn!(
                                 target: "recursive::compact",
                                 ptl_attempts,
                                 original_len = to_summarize.len(),
                                 truncated_len = truncated.len(),
+                                dropped = to_summarize.len() - truncated.len(),
                                 "compaction PTL retry: dropped oldest groups"
                             );
                             to_summarize = truncated;
@@ -768,6 +820,138 @@ impl Compactor {
 mod tests {
     use super::*;
     use crate::llm::{Completion, MockProvider};
+
+    /// Goal 414 headline: a provider reading whose `prompt_tokens` disagrees
+    /// with the normalised cache split is announced on `recursive::compact`,
+    /// and the trigger still decides on the cache-folded input total (#162).
+    ///
+    /// Lives here rather than in `tests/compact_contract.rs` because
+    /// `logs_contain` from `tracing_test` only captures events whose target
+    /// shares the *test crate's* name — an integration-test binary is not
+    /// `recursive`, so a `recursive::compact` WARNING would be filtered out.
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_compact_contract_token_normalized_warns() {
+        let compactor = Compactor::new(usize::MAX).threshold_prompt_tokens(500);
+        // Anthropic shape: 100 fresh input tokens, 900 served from cache.
+        let unnormalized = TokenUsage {
+            prompt_tokens: 100,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 0,
+            ..Default::default()
+        };
+        assert!(
+            compactor.should_compact_usage(0, &unnormalized),
+            "the trigger must consume the cache-folded input total"
+        );
+        assert!(
+            logs_contain("un-normalised usage shape"),
+            "an un-normalised provider reading must be announced, not silently compensated"
+        );
+        assert!(
+            logs_contain("input_tokens=900"),
+            "the warning must state the total the decision actually used"
+        );
+
+        // A normalised reading (DeepSeek shape) adds no warning.
+        let normalized = TokenUsage {
+            prompt_tokens: 900,
+            cache_hit_tokens: 900,
+            cache_miss_tokens: 0,
+            ..Default::default()
+        };
+        assert!(compactor.should_compact_usage(0, &normalized));
+        assert!(
+            !logs_contain("prompt_tokens=900"),
+            "a normalised reading must not be reported as degraded"
+        );
+    }
+
+    /// Goal 414 headline: the degradations compaction performs (summary
+    /// replacement, PTL truncation) are WARNING-level with before/after
+    /// message counts and the summarised range; a legitimate no-op stays off
+    /// the warning channel (debug only).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_compact_contract_degradation_warning() {
+        let compactor = Compactor::new(1).keep_recent_n(2);
+
+        // A no-op first (short transcript): nothing is replaced, no warning.
+        let mut short = vec![Message::user("u0"), Message::assistant("a0")];
+        let idle = MockProvider::new(vec![]);
+        assert!(compactor
+            .apply(&idle, &mut short, 0)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            !logs_contain("compaction replaced"),
+            "a legitimate no-op must stay debug"
+        );
+        assert!(
+            logs_contain("compaction no-op"),
+            "the no-op is still logged — at debug"
+        );
+
+        let provider = MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let mut transcript = vec![
+            Message::system("prompt"),
+            Message::user("u0"),
+            Message::assistant("a0"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+        ];
+        let outcome = compactor
+            .apply(&provider, &mut transcript, 5)
+            .await
+            .unwrap()
+            .expect("compaction runs");
+
+        assert!(
+            logs_contain("compaction replaced messages with a summary"),
+            "summary replacement must be WARNING-visible"
+        );
+        assert!(
+            logs_contain("before=7"),
+            "the warning must carry the pre-splice message count"
+        );
+        assert!(
+            logs_contain("after=4"),
+            "the warning must carry the post-splice message count"
+        );
+        assert!(
+            logs_contain(&format!(
+                "summarized_start={} summarized_end={}",
+                outcome.bounds.summarized.start, outcome.bounds.summarized.end
+            )),
+            "the warning must name the summarised range"
+        );
+    }
+
+    /// Mutation negative control: the microcompactor's placeholder swap is a
+    /// degradation (tool output discarded) and must stay WARNING-visible.
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_compact_contract_microcompaction_warns() {
+        use crate::compact::Microcompactor;
+        let mut msgs: Vec<Message> = (0..15)
+            .map(|_| Message::tool_result("call_1", "x".repeat(300)))
+            .collect();
+        let pruned = Microcompactor::new(12, 4).prune(&mut msgs);
+        assert_eq!(pruned, 3, "the fixture must actually prune");
+        assert!(
+            logs_contain("microcompaction replaced old tool results"),
+            "placeholdering tool output is a degradation and must be observable"
+        );
+    }
 
     #[tokio::test]
     async fn compact_returns_system_message_with_summary() {
