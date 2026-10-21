@@ -1780,29 +1780,43 @@ async fn cmd_doctor(
     Ok(())
 }
 
-/// `--probe`: send one real chat request through the configured provider.
+/// Derive the single-shot config `doctor --probe` uses for its LLM request.
 ///
-/// This is the only check that can see a dead key or an unreachable gateway —
-/// the static "API key is set" check passes for a revoked key.
-async fn probe_llm(config: &Config) -> std::result::Result<String, String> {
-    // One request, no retry, on *both* arms: the Anthropic arm derives its
-    // policy from `config.retry_*` and ignores the `retry` argument, so zeroing
-    // only the latter would still sit through the configured retries and their
-    // backoff before reporting a dead gateway.
-    let probe_config = &Config {
+/// One request, no retry, on *both* provider arms: the Anthropic arm derives
+/// its policy from `config.retry_*` and ignores the `retry` argument, so
+/// zeroing only the latter would still sit through the configured retries
+/// and their backoff before reporting a dead gateway. Extracted from
+/// `probe_llm` (issue #212) so the single-shot contract has a unit-pinned
+/// seam: the deletion mutant on `retry_max: 0` inherited the operator's
+/// retry count (default 8, 600 s network budget) and turned the liveness
+/// probe into a minutes-long stall on a dead gateway. Only `retry_max` is
+/// asserted by tests — the backoff fields are unread once `retry_max == 0`
+/// (`RetryPolicy::backoff_for_budgeted` returns before consulting them), so
+/// their mutants are equivalent and deliberately unasserted (#195 triage
+/// 1782/1783).
+fn probe_config(config: &Config) -> Config {
+    Config {
         retry_max: 0,
         retry_initial_backoff_secs: 1,
         retry_max_backoff_secs: 1,
         retry_network_budget_secs: 600,
         ..config.clone()
-    };
-    let api_key = probe_config.require_api_key().map_err(|e| e.to_string())?;
+    }
+}
+
+/// `--probe`: send one real chat request through the configured provider.
+///
+/// This is the only check that can see a dead key or an unreachable gateway —
+/// the static "API key is set" check passes for a revoked key.
+async fn probe_llm(config: &Config) -> std::result::Result<String, String> {
+    let probe_cfg = probe_config(config);
+    let api_key = probe_cfg.require_api_key().map_err(|e| e.to_string())?;
     let retry = RetryPolicy {
-        max_retries: probe_config.retry_max,
-        initial_backoff: Duration::from_secs(probe_config.retry_initial_backoff_secs),
-        max_backoff: Duration::from_secs(probe_config.retry_max_backoff_secs),
+        max_retries: probe_cfg.retry_max,
+        initial_backoff: Duration::from_secs(probe_cfg.retry_initial_backoff_secs),
+        max_backoff: Duration::from_secs(probe_cfg.retry_max_backoff_secs),
     };
-    let provider = cli::builder::build_llm_provider(probe_config, api_key, retry, None)
+    let provider = cli::builder::build_llm_provider(&probe_cfg, api_key, retry, None)
         .map_err(|e| e.to_string())?;
     let messages = vec![recursive::message::Message::user("ping")];
     let started = std::time::Instant::now();
@@ -4057,6 +4071,26 @@ mod tests {
         assert!(
             detail.contains("(4 chars)"),
             "detail must count the completion content chars: {detail}"
+        );
+    }
+
+    /// Issue #212: the probe forces a single request. Deleting the
+    /// `retry_max: 0` override made `doctor --probe` inherit the operator's
+    /// retry count (default 8 + 600 s network budget) and stall health
+    /// checks for minutes on a dead gateway. Only `retry_max` is pinned:
+    /// the backoff fields are unread once `retry_max == 0`
+    /// (`RetryPolicy::backoff_for_budgeted` returns before consulting them),
+    /// so mutants there are equivalent and deliberately unasserted (#195
+    /// triage 1782/1783).
+    #[test]
+    fn probe_config_forces_single_shot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = dummy_config(tmp.path());
+        cfg.retry_max = 8;
+        let probed = probe_config(&cfg);
+        assert_eq!(
+            probed.retry_max, 0,
+            "probe must zero the operator retry count"
         );
     }
 
