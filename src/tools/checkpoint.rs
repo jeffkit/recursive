@@ -157,6 +157,12 @@ impl Tool for CheckpointDiff {
 /// Unlike the read-only tools, this holds the touched-files collector,
 /// log writer, turn index, and log path so it can snapshot the workspace,
 /// attribute file changes, and append a [`CheckpointRecord`].
+///
+/// The touched-files collector **accumulates across turns** (issue #174):
+/// turns that never call `checkpoint_save` keep their entries, and the
+/// next save records the union since the previous save — then flushes the
+/// collector. A per-turn reset would drop those changes from every
+/// future record and leave them outside `plan_rewind`'s recovery set.
 #[derive(Clone)]
 pub struct CheckpointSaveCtx {
     pub repo: Arc<Mutex<ShadowRepo>>,
@@ -295,6 +301,16 @@ impl Tool for CheckpointSave {
                 call_id: None,
                 message: format!("failed to append checkpoint record: {e}"),
             })?;
+        }
+
+        // Issue #174: the save just recorded everything accumulated since the
+        // previous save, so this is the one point where the collector may be
+        // cleared. Clearing only after a *successful* append keeps an unsaved
+        // turn's changes recoverable even when the save itself failed.
+        if let Some(slot) = &self.ctx.touched_files {
+            if let Ok(mut t) = slot.lock() {
+                *t = TouchedFiles::new();
+            }
         }
 
         Ok(id.0)
@@ -615,6 +631,97 @@ mod tests {
             recs[0].message.as_deref(),
             Some("turn 7"),
             "default message must be 'turn N' where N is the turn index"
+        );
+    }
+
+    /// Issue #174: a successful save flushes the touched-files collector —
+    /// it is the *only* clear point in the accumulation lifecycle.
+    #[tokio::test]
+    async fn checkpoint_save_flushes_touched_slot_after_append() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let log_path = w.path().join("checkpoints.jsonl");
+        fs::write(w.path().join("a.txt"), "hello").unwrap();
+
+        let repo = Arc::new(Mutex::new(
+            ShadowRepo::open_at(w.path(), w.shadow_dir()).unwrap(),
+        ));
+        let touched = Arc::new(Mutex::new(TouchedFiles::new()));
+        {
+            let mut t = touched.lock().unwrap();
+            t.paths.insert("a.txt".to_string());
+        }
+        let writer = Arc::new(Mutex::new(CheckpointLogWriter::open(&log_path).unwrap()));
+        let turn_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let tool = build_checkpoint_save_tool(
+            repo,
+            "sess".into(),
+            Some(touched.clone()),
+            writer,
+            turn_index,
+            log_path.clone(),
+        );
+        tool.execute(json!({"message": "flush check"}))
+            .await
+            .unwrap();
+
+        assert!(
+            touched.lock().unwrap().is_empty(),
+            "a successful save must flush the collector"
+        );
+        let recs = read_log(&log_path).unwrap();
+        assert_eq!(recs[0].touched_files, vec!["a.txt".to_string()]);
+    }
+
+    /// Issue #174: when the record cannot be appended the accumulated paths
+    /// must survive — they are the next save's raw material.
+    #[tokio::test]
+    async fn checkpoint_save_keeps_touched_when_append_fails() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let log_path = w.path().join("checkpoints.jsonl");
+        fs::write(w.path().join("a.txt"), "hello").unwrap();
+
+        let repo = Arc::new(Mutex::new(
+            ShadowRepo::open_at(w.path(), w.shadow_dir()).unwrap(),
+        ));
+        let touched = Arc::new(Mutex::new(TouchedFiles::new()));
+        {
+            let mut t = touched.lock().unwrap();
+            t.paths.insert("a.txt".to_string());
+        }
+        let writer = Arc::new(Mutex::new(CheckpointLogWriter::open(&log_path).unwrap()));
+        // Poison the writer lock (panic while holding it) so `writer.lock()`
+        // returns Err inside execute. The panic output below the test name is
+        // intentional — poisoning is the only way a std Mutex lock fails.
+        {
+            let w = writer.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = w.lock().unwrap();
+                panic!("poison checkpoint writer lock for failure-path test");
+            }));
+        }
+        let turn_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let tool = build_checkpoint_save_tool(
+            repo,
+            "sess".into(),
+            Some(touched.clone()),
+            writer,
+            turn_index,
+            log_path,
+        );
+        let res = tool.execute(json!({"message": "doomed"})).await;
+        assert!(res.is_err(), "poisoned writer lock must fail the save");
+        assert_eq!(
+            touched.lock().unwrap().paths_sorted(),
+            vec!["a.txt".to_string()],
+            "failed save must keep the accumulated paths"
         );
     }
 }

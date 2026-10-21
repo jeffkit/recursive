@@ -558,14 +558,137 @@ async fn rewind_does_not_touch_other_workspace_files() {
     // turn finished.
     std::fs::write(&untouched, "external-edit").unwrap();
 
-    // Rewind to turn 0 (the initial checkpoint): agent.txt should be
-    // deleted (it didn't exist), untouched.txt should NOT be reverted.
-    let plan = plan_rewind(&log_path, 0).unwrap();
+    // Rewind to turn 0 (the initial checkpoint boundary — the first save's
+    // id): agent.txt should be deleted (it didn't exist), untouched.txt
+    // should NOT be reverted. (Issue #174: `--to-turn 0` now demands a
+    // pre-session snapshot, which on-demand sessions don't have; the first
+    // save boundary is `--to-turn 1`.)
+    let plan = plan_rewind(&log_path, 1).unwrap();
     apply_rewind(&shadow, &log_path, &plan, false).unwrap();
     assert!(!dir.path().join("agent.txt").exists());
     assert_eq!(
         std::fs::read_to_string(&untouched).unwrap(),
         "external-edit",
         "untouched.txt must not be reverted by rewind"
+    );
+}
+
+/// Issue #174 (#189 cluster acceptance 2): files changed in turns that never
+/// called `checkpoint_save` must still be restored by a rewind.
+///
+/// Sequence: T0 save → T1 writes x.txt (no save) → T2 writes y.txt and
+/// saves. The T2 record must carry *both* paths (the collector accumulates
+/// across the unsaved turn), so `rewind --to-turn 1` restores x.txt and
+/// y.txt to the T1 start state, and the log is cut at the same boundary the
+/// transcript is.
+///
+/// Pre-fix the runtime reset the collector at every turn start, so the T2
+/// record only knew y.txt — x.txt stayed modified on disk while the
+/// transcript was truncated: code and history silently diverged.
+#[tokio::test]
+async fn rewind_restores_files_from_unsaved_turn() {
+    if !has_git() {
+        return;
+    }
+    let _home = HomeOverride::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut sw = SessionWriter::create(dir.path(), "e2e-unsaved-turn", "mock", "mock").unwrap();
+    let session_dir = sw.session_dir().to_path_buf();
+    let log_path = session_dir.join("checkpoints.jsonl");
+    let session_id = sw.session_id().to_string();
+    let shadow = Arc::new(ShadowRepo::open(dir.path()).unwrap());
+
+    // Pre-session state: both files exist; a rewind has real content to
+    // restore to (not just deletions).
+    std::fs::write(dir.path().join("x.txt"), "x-v0").unwrap();
+    std::fs::write(dir.path().join("y.txt"), "y-v0").unwrap();
+
+    let (mut rt, touched) = wired_runtime(
+        dir.path(),
+        &shadow,
+        &session_id,
+        &log_path,
+        vec![
+            write_file_call("c1", "x.txt", "x-v1"),
+            final_completion("turn for x done"),
+            write_file_call("c2", "y.txt", "y-v2"),
+            final_completion("turn for y done"),
+        ],
+    );
+
+    // T0: save the restore point before any work.
+    save_checkpoint(&rt, "initial").await;
+    // T1: change x.txt and do NOT save.
+    rt.run("please write x.txt").await.unwrap();
+    // T2: change y.txt and save — this record must capture T1's x.txt too.
+    rt.run("please write y.txt").await.unwrap();
+    save_checkpoint(&rt, "after y").await;
+
+    // Accumulation + flush: the save recorded everything since the last save
+    // and only then cleared the collector.
+    {
+        let t = touched.lock().unwrap();
+        assert!(t.is_empty(), "save must flush the collector");
+    }
+    let recs = recursive::read_checkpoint_log(&log_path).unwrap();
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0].turn, 0);
+    assert_eq!(recs[1].turn, 2);
+    assert!(
+        recs[1].touched_files.iter().any(|p| p == "x.txt"),
+        "the unsaved turn's file must be in the save record; got {:?}",
+        recs[1].touched_files
+    );
+    assert!(recs[1].touched_files.iter().any(|p| p == "y.txt"));
+
+    // Mirror the transcript the way the CLI run loop does.
+    for m in rt.transcript().iter() {
+        sw.append(m, None, None).unwrap();
+    }
+    sw.finish(SessionStatus::Completed).unwrap();
+
+    // ── rewind --to-turn 1: undo turns >= 1 (the x and y changes). ──
+    let plan = plan_rewind(&log_path, 1).unwrap();
+    assert_eq!(plan.to_turn, 1);
+    assert_eq!(plan.turns_to_drop, vec![2]);
+    assert!(
+        plan.touched_paths.iter().any(|p| p == "x.txt"),
+        "x.txt was changed in an unsaved turn and must be restored; got {:?}",
+        plan.touched_paths
+    );
+    assert!(plan.touched_paths.iter().any(|p| p == "y.txt"));
+
+    apply_rewind(&shadow, &log_path, &plan, false).expect("apply rewind");
+
+    // Both files are back to the T1 start state (= the initial save).
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("x.txt")).unwrap(),
+        "x-v0",
+        "x.txt (changed without a save) must be restored"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("y.txt")).unwrap(),
+        "y-v0",
+        "y.txt must be restored to the same boundary"
+    );
+
+    // The checkpoint log is cut at the same to_turn the transcript uses.
+    assert_eq!(log_turns(&log_path), vec![0], "log truncated to < 1");
+
+    // Transcript: no surviving exchange may claim work the workspace no
+    // longer reflects. Both tool turns were undone, so the transcript is
+    // cut before the first user message (transcript turn numbering counts
+    // user messages; the saved restore point predates both).
+    let stats = truncate_transcript_to_turn(&session_dir, 0).unwrap();
+    assert!(stats.dropped >= 2, "both undone turns must be dropped");
+    let entries = recursive::SessionReader::load_transcript(&session_dir).unwrap();
+    let texts: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("please write x.txt")),
+        "undone x.txt turn must not survive in the transcript: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("please write y.txt")),
+        "undone y.txt turn must not survive in the transcript: {texts:?}"
     );
 }

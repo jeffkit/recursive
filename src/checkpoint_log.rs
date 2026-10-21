@@ -85,6 +85,18 @@ fn is_zero_i64(v: &i64) -> bool {
     *v == 0
 }
 
+impl CheckpointRecord {
+    /// The canonical turn identity this record sorts and filters on
+    /// (issue #173/#189): `turn_id` when present, falling back to `turn`
+    /// for records written before the field existed. Issue #174's
+    /// recovery-set and cutoff filters hang off this so a future divergence
+    /// between the two columns cannot desync the recovery set from the
+    /// transcript cutoff.
+    pub fn turn_id_or_turn(&self) -> usize {
+        self.turn_id.unwrap_or(self.turn)
+    }
+}
+
 /// Current Unix timestamp in seconds (0 if the clock is before the epoch).
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -198,11 +210,15 @@ pub fn next_turn_index(path: &Path) -> usize {
     }
 }
 
-/// Truncate the log to records with `turn < cutoff`. Atomic via temp
-/// file + rename.
+/// Truncate the log to records whose canonical turn identity (see
+/// [`CheckpointRecord::turn_id_or_turn`]) is below `cutoff`. Atomic via
+/// temp file + rename.
 pub fn truncate_to_turn(path: &Path, cutoff: usize) -> Result<()> {
     let recs = read_log(path)?;
-    let kept: Vec<&CheckpointRecord> = recs.iter().filter(|r| r.turn < cutoff).collect();
+    let kept: Vec<&CheckpointRecord> = recs
+        .iter()
+        .filter(|r| r.turn_id_or_turn() < cutoff)
+        .collect();
 
     let tmp = path.with_extension("jsonl.tmp");
     {
@@ -500,5 +516,19 @@ mod tests {
         let recs = read_log(&path).unwrap();
         assert_eq!(recs.len(), 3);
         assert_eq!(recs[2].turn, 2, "turn 2 must be kept (< 3)");
+    }
+
+    /// Issue #174: the canonical identity filter — `turn_id` when present,
+    /// `turn` as the fallback for pre-#173 records.
+    #[test]
+    fn turn_id_or_turn_prefers_turn_id_falls_back_to_turn() {
+        let mut r = rec(7, "x");
+        assert_eq!(r.turn_id_or_turn(), 7, "Some(turn_id) wins");
+        r.turn_id = None;
+        assert_eq!(
+            r.turn_id_or_turn(),
+            r.turn,
+            "legacy record (no turn_id) falls back to turn"
+        );
     }
 }

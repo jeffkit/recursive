@@ -353,7 +353,10 @@ impl AgentRuntime {
                 .dispatch(HookEvent::SessionStart { goal: &user_text });
         }
 
-        self.reset_touched_files();
+        // Issue #174: the touched-files collector is *not* reset here. It
+        // accumulates until the next successful `checkpoint_save` flushes it,
+        // so files changed in turns that never saved still land in the next
+        // save's record — and therefore in `plan_rewind`'s recovery set.
         // Goal #133: arm the deliverables ledger for this turn. Cheap — the
         // baseline snapshot itself is captured lazily, before the first
         // mutating tool call (see `tools::dispatch`).
@@ -726,15 +729,6 @@ impl AgentRuntime {
                 self.kernel
                     .hooks()
                     .dispatch(HookEvent::SessionEnd { outcome });
-            }
-        }
-    }
-
-    /// Reset the touched-files collector at the start of a turn.
-    fn reset_touched_files(&self) {
-        if let Some(slot) = &self.checkpoints.touched_files {
-            if let Ok(mut t) = slot.lock() {
-                *t = TouchedFiles::new();
             }
         }
     }

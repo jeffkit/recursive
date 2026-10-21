@@ -39,6 +39,13 @@ pub struct RewindPlan {
     /// Turns that will be removed from `checkpoints.jsonl` and from
     /// the conversation transcript on commit.
     pub turns_to_drop: Vec<usize>,
+    /// The rewind request's cutoff — the single turn identity both
+    /// truncations hang off (issue #174): [`apply_rewind`] cuts
+    /// `checkpoints.jsonl` with it, and the caller cuts `transcript.jsonl`
+    /// with the same number. Derived from the canonical record identity
+    /// ([`crate::checkpoint_log::CheckpointRecord::turn_id_or_turn`]), so
+    /// recovery set and history cutoff cannot drift apart.
+    pub to_turn: usize,
 }
 
 /// Compute a [`RewindPlan`] for rewinding `to_turn`.
@@ -48,9 +55,15 @@ pub struct RewindPlan {
 /// preserves turns 0..=2 and undoes 3 and later.
 ///
 /// **Goal 284**: with on-demand checkpoints, the target checkpoint is
-/// the `id` field of the most recent log entry with `turn < to_turn`,
+/// the `id` field of the most recent log entry with turn identity `< to_turn`,
 /// or the `pre` field of the entry for `to_turn` (old auto-snapshot
-/// sessions). If neither is available, returns an error.
+/// sessions). `to_turn = 0` restores to the first entry's `pre` — the
+/// pre-session snapshot only old auto-snapshot sessions have. On-demand
+/// sessions never captured a pre-session tree, so `to_turn = 0` is an
+/// **explicit error** there: silently falling back to the first save's `id`
+/// would restore "after the first save" while dropping the whole history —
+/// a half-rewind that looks like a full one. Use `--to-turn 1` to restore
+/// to the first save point.
 ///
 /// Returns an error if the log doesn't reach `to_turn` or if no
 /// suitable checkpoint was recorded.
@@ -68,36 +81,37 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
     // entry before `to_turn`, falling back to the `pre` field of the
     // entry for `to_turn` (old auto-snapshot sessions).
     let target: CheckpointId = if to_turn == 0 {
-        // Rewind to start: use first record's pre (old auto-snapshot
-        // sessions), falling back to its id (new on-demand sessions).
-        // The id of the first record is the closest thing to "before
-        // turn 0" we have in the on-demand model.
+        // Issue #174: rewinding to the session start needs a pre-session
+        // tree. Only old auto-snapshot sessions recorded one (`pre` on the
+        // first entry); on-demand sessions must not silently degrade to
+        // "after the first save".
         recs.first()
-            .and_then(|r| r.pre.clone().or_else(|| Some(r.id.clone())))
+            .and_then(|r| r.pre.clone())
             .ok_or_else(|| Error::Tool {
                 name: "rewind".into(),
                 call_id: None,
-                message: "no checkpoint recorded before turn 0".into(),
+                message: "cannot rewind to turn 0: no pre-session snapshot exists \
+                          (on-demand checkpoints start at the first save); \
+                          use --to-turn 1 to restore to the first save point"
+                    .into(),
             })?
     } else {
-        // Find the most recent entry with turn < to_turn.
-        let prev = recs.iter().rev().find(|r| r.turn < to_turn);
+        // Find the most recent entry with turn identity < to_turn.
+        let prev = recs.iter().rev().find(|r| r.turn_id_or_turn() < to_turn);
         match prev {
             Some(r) => r.id.clone(),
             None => {
                 // Fall back to the pre field of the entry at to_turn
                 // (for old auto-snapshot sessions where pre marks the
                 // state before this turn's changes).
-                let target_rec =
-                    recs.iter()
-                        .find(|r| r.turn == to_turn)
-                        .ok_or_else(|| Error::Tool {
-                            name: "rewind".into(),
-                            call_id: None,
-                            message: format!(
-                                "turn {to_turn} is not in this session's checkpoint log"
-                            ),
-                        })?;
+                let target_rec = recs
+                    .iter()
+                    .find(|r| r.turn_id_or_turn() == to_turn)
+                    .ok_or_else(|| Error::Tool {
+                        name: "rewind".into(),
+                        call_id: None,
+                        message: format!("turn {to_turn} is not in this session's checkpoint log"),
+                    })?;
                 target_rec.pre.clone().ok_or_else(|| Error::Tool {
                     name: "rewind".into(),
                     call_id: None,
@@ -113,8 +127,8 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
     let mut touched: HashSet<String> = HashSet::new();
     let mut turns_to_drop = Vec::new();
     for r in &recs {
-        if r.turn >= to_turn {
-            turns_to_drop.push(r.turn);
+        if r.turn_id_or_turn() >= to_turn {
+            turns_to_drop.push(r.turn_id_or_turn());
             for p in &r.touched_files {
                 touched.insert(p.clone());
             }
@@ -130,6 +144,7 @@ pub fn plan_rewind(log_path: &Path, to_turn: usize) -> Result<RewindPlan> {
         touched_paths,
         last_known_post,
         turns_to_drop,
+        to_turn,
     })
 }
 
@@ -182,10 +197,11 @@ pub fn apply_rewind(
         }
     }
     let stats = repo.restore_paths(&plan.target, &plan.touched_paths)?;
-    truncate_to_turn(
-        log_path,
-        plan.turns_to_drop.iter().copied().min().unwrap_or(0),
-    )?;
+    // Issue #174: cut the log with the same `to_turn` the caller cuts the
+    // transcript with. Deriving the cutoff from `turns_to_drop` instead
+    // silently wiped the whole log when no record reached `to_turn` (the
+    // `unwrap_or(0)`), desyncing checkpoint history from the transcript.
+    truncate_to_turn(log_path, plan.to_turn)?;
     Ok(RewindResult {
         stats,
         dropped_turns: plan.turns_to_drop.clone(),
@@ -321,11 +337,12 @@ mod tests {
         assert_eq!(plan.turns_to_drop, vec![0, 1]);
     }
 
-    /// Goal 284: on-demand checkpoints have no `pre` field. Verify
-    /// `plan_rewind(to_turn=0)` uses the `id` of the first record
-    /// as the target when `pre` is absent.
+    /// Goal 284 + issue #174: on-demand checkpoints have no `pre` field, so
+    /// there is no pre-session tree to restore to. `plan_rewind(to_turn=0)`
+    /// must fail loudly instead of silently restoring to "after the first
+    /// save" while dropping the entire history.
     #[test]
-    fn plan_rewind_to_zero_uses_first_id_when_no_pre() {
+    fn plan_rewind_to_zero_without_pre_errors() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("c.jsonl");
         write_log(
@@ -335,9 +352,16 @@ mod tests {
                 rec(1, None, "q1", &["b.txt"]),
             ],
         );
-        let plan = plan_rewind(&log, 0).unwrap();
-        assert_eq!(plan.target.0, "q0");
-        assert_eq!(plan.turns_to_drop, vec![0, 1]);
+        let err = plan_rewind(&log, 0).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no pre-session snapshot"),
+            "error must explain the missing pre-session snapshot; got: {msg}"
+        );
+        assert!(
+            msg.contains("--to-turn 1"),
+            "error must point at the nearest available boundary; got: {msg}"
+        );
     }
 
     #[test]
@@ -350,6 +374,73 @@ mod tests {
         assert_eq!(plan.target.0, "q0");
         assert!(plan.turns_to_drop.is_empty());
         assert!(plan.touched_paths.is_empty());
+    }
+
+    /// Issue #174: when no record reaches `to_turn` there is nothing to
+    /// undo — the log must survive untouched. The old cutoff
+    /// (`min(turns_to_drop).unwrap_or(0)`) truncated to 0 in this case and
+    /// wiped the whole history while the transcript kept everything.
+    #[test]
+    fn apply_rewind_keeps_log_when_nothing_to_drop() {
+        if !has_git() {
+            return;
+        }
+        let dir = shadow_ws();
+        let log = dir.path().join("c.jsonl");
+        let f = dir.path().join("file.txt");
+        fs::write(&f, "v0").unwrap();
+        let repo = dir.open_repo().unwrap();
+        let _pre = repo.snapshot_for_session("s", "t0 pre").unwrap();
+        fs::write(&f, "v1").unwrap();
+        let post = repo.snapshot_for_session("s", "t0 post").unwrap();
+        fs::write(&f, "v3").unwrap();
+        let post3 = repo.snapshot_for_session("s", "t3 post").unwrap();
+
+        write_log(
+            &log,
+            &[
+                CheckpointRecord {
+                    turn: 0,
+                    turn_id: Some(0),
+                    pre: None,
+                    id: post.clone(),
+                    message: None,
+                    touched_files: vec!["file.txt".into()],
+                    touched_via: TouchedVia::Structured,
+                    started_at: 0,
+                    finished_at: 0,
+                    saved_at: 0,
+                },
+                CheckpointRecord {
+                    turn: 3,
+                    turn_id: Some(3),
+                    pre: Some(post),
+                    id: post3,
+                    message: None,
+                    touched_files: vec!["file.txt".into()],
+                    touched_via: TouchedVia::Structured,
+                    started_at: 0,
+                    finished_at: 0,
+                    saved_at: 0,
+                },
+            ],
+        );
+
+        // to_turn=5 is beyond every record: nothing to drop, nothing to restore.
+        let plan = plan_rewind(&log, 5).unwrap();
+        assert!(plan.turns_to_drop.is_empty());
+        let _ = apply_rewind(&repo, &log, &plan, false).unwrap();
+        let kept = read_log(&log).unwrap();
+        assert_eq!(
+            kept.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![0, 3],
+            "log must be intact when no record reaches the cutoff"
+        );
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "v3",
+            "workspace must be untouched when nothing is dropped"
+        );
     }
 
     #[test]
@@ -372,6 +463,7 @@ mod tests {
             touched_paths: vec!["a.txt".into()],
             last_known_post: Some(post),
             turns_to_drop: vec![0],
+            to_turn: 0,
         };
         let conflicts = detect_conflicts(&repo, &plan).unwrap();
         assert_eq!(conflicts, vec!["a.txt".to_string()]);
