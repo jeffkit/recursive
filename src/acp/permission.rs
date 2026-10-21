@@ -116,22 +116,39 @@ pub struct AcpPermissionHook {
     store: PendingPermissionStore,
     /// Session ID for ACP notification routing.
     session_id: String,
-    /// Sender for JSON-RPC notifications to the client.
-    notif_tx: tokio::sync::mpsc::UnboundedSender<Value>,
+    /// Sender into the server's writer channel (issue #179): the frame is
+    /// serialized with every other response/notification and reaches the
+    /// client while the prompt turn task is parked in `check` — the read
+    /// loop stays free to route the client's reply back via the store.
+    notif_tx: tokio::sync::mpsc::Sender<Value>,
+    /// How long to wait for the client's decision before failing closed.
+    /// 30 seconds by default; tests shorten it.
+    request_timeout: Duration,
 }
 
 impl AcpPermissionHook {
+    /// Default wait for a client permission decision.
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Create a new ACP permission hook.
     pub fn new(
         store: PendingPermissionStore,
         session_id: String,
-        notif_tx: tokio::sync::mpsc::UnboundedSender<Value>,
+        notif_tx: tokio::sync::mpsc::Sender<Value>,
     ) -> Self {
         Self {
             store,
             session_id,
             notif_tx,
+            request_timeout: Self::DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the client-response timeout (tests use a short value to
+    /// keep the suite fast; the wired-in default is 30 seconds).
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 }
 
@@ -158,10 +175,11 @@ impl PermissionHook for AcpPermissionHook {
             }
         });
 
-        let _ = self.notif_tx.send(notif);
+        let _ = self.notif_tx.send(notif).await;
 
-        // Wait for client response with 30-second timeout
-        tokio::time::timeout(Duration::from_secs(30), rx)
+        // Wait for the client response; silence past the timeout denies
+        // (fail-closed, same as B-cluster #154).
+        tokio::time::timeout(self.request_timeout, rx)
             .await
             .ok()
             .and_then(|r| r.ok())
@@ -384,5 +402,74 @@ mod tests {
         assert!(result["result"].is_object());
         let outcome = rx.try_recv().unwrap();
         assert_eq!(outcome, PermissionOutcome::Denied);
+    }
+
+    // ── AcpPermissionHook end-to-end (issue #180) ────────────────────────
+
+    /// The hook emits the request frame on its channel and a store reply
+    /// (what the server's read loop does) unblocks `check` with the decision.
+    #[tokio::test]
+    async fn hook_frame_and_store_reply_roundtrip_allow() {
+        let store = PendingPermissionStore::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(8);
+        let hook = Arc::new(AcpPermissionHook::new(
+            store.clone(),
+            "acp-sess-1".to_string(),
+            tx,
+        ));
+
+        let checker = {
+            let hook = hook.clone();
+            tokio::spawn(async move {
+                hook.check(
+                    "ClientWriteFile",
+                    &serde_json::json!({"file_path": "notes.txt"}),
+                )
+                .await
+            })
+        };
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("frame arrives")
+            .expect("channel open");
+        assert_eq!(frame["method"], "session/update");
+        assert_eq!(frame["params"]["sessionId"], "acp-sess-1");
+        assert_eq!(
+            frame["params"]["update"]["sessionUpdate"],
+            "request_permission"
+        );
+        assert_eq!(frame["params"]["update"]["toolName"], "ClientWriteFile");
+
+        let perm_id = frame["params"]["update"]["permissionId"]
+            .as_str()
+            .expect("permissionId")
+            .to_string();
+        let params = serde_json::json!({"permissionId": perm_id, "outcome": "allowed"});
+        let resp = handle_request_permission(&Value::from(7), Some(&params), &store);
+        assert!(resp["result"].is_object(), "reply must be accepted");
+
+        let decision = tokio::time::timeout(Duration::from_secs(2), checker)
+            .await
+            .expect("check resolves")
+            .expect("task ok");
+        assert_eq!(decision, PermissionDecision::Allow);
+    }
+
+    /// No client response → the wait times out and denies (fail-closed).
+    #[tokio::test]
+    async fn hook_timeout_denies_fail_closed() {
+        let store = PendingPermissionStore::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Value>(8);
+        let hook = AcpPermissionHook::new(store, "acp-sess-1".to_string(), tx)
+            .with_request_timeout(Duration::from_millis(50));
+
+        let decision = hook
+            .check("ClientWriteFile", &serde_json::json!({"file_path": "x"}))
+            .await;
+        assert_eq!(
+            decision,
+            PermissionDecision::Deny("permission timeout".to_string())
+        );
     }
 }

@@ -904,6 +904,17 @@ impl McpClient {
         Ok(())
     }
 
+    /// The OS pid of the stdio subprocess, if this client runs on the stdio
+    /// transport and the child has not been reaped yet (issue #180). ACP
+    /// sessions record it in `mcp_child_pids` so the kill-gracefully
+    /// shutdown path can reap the server; HTTP transports have no child.
+    pub fn stdio_child_pid(&self) -> Option<u32> {
+        match &self.transport {
+            McpTransport::Stdio { child, .. } => child.as_ref().and_then(|c| c.id()),
+            _ => None,
+        }
+    }
+
     /// Call `tools/list` and return the discovered tool specs.
     pub async fn list_tools(&mut self) -> Result<Vec<McpToolSpec>> {
         let result: Value = self

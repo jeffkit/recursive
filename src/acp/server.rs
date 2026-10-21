@@ -65,6 +65,7 @@
 //! subsequent turns work correctly.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -77,7 +78,7 @@ use tracing::debug;
 
 use super::bridge::sha256_first_12;
 use super::bridge::AcpBridge;
-use super::permission::handle_request_permission;
+use super::permission::{handle_request_permission, AcpPermissionHook};
 use super::protocol::{ClientCapabilities, Implementation, ProtocolVersion};
 use super::session::{
     compute_compaction_hints, summarize_transcript, AcpSession, AcpSessionManager,
@@ -85,8 +86,10 @@ use super::session::{
 use crate::acp::ToolKind;
 use crate::agent::FinishReason;
 use crate::llm::ChatProvider;
+use crate::mcp::{McpClient, McpServer, McpTool};
+use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, PermissionMode, RuleSource};
 use crate::runtime::AgentRuntime;
-use crate::tools::{AcpClientFsState, ClientReadFile, ClientWriteFile};
+use crate::tools::{AcpClientFsState, ClientReadFile, ClientWriteFile, ToolRegistry};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 error codes
@@ -319,6 +322,160 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Session tool-surface assembly (issue #180)
+// ---------------------------------------------------------------------------
+
+/// Tools that always require client approval in an ACP session (issue #180).
+///
+/// Registered as the `interactive` rule list of the session permission
+/// config, so the pipeline's hook phase (Goal-212) consults
+/// [`AcpPermissionHook`] for exactly these: writes into the client's buffer
+/// and every MCP tool (`mcp__*` — external side effects, untrusted by
+/// default). Read-only and internal bookkeeping tools stay non-interactive
+/// and run without a client round-trip.
+const ACP_INTERACTIVE_TOOLS: &[&str] = &["ClientWriteFile", "mcp__*"];
+
+/// The permission config for an ACP session: default mode plus one
+/// user-source layer carrying [`ACP_INTERACTIVE_TOOLS`].
+///
+/// Without it the pipeline's hook phase never runs — `permissions: None`
+/// short-circuits the whole pre-execution check, so a wired hook would
+/// stay inert.
+fn acp_permissions_config() -> LayeredPermissionsConfig {
+    LayeredPermissionsConfig {
+        mode: PermissionMode::Default,
+        layers: vec![PermissionLayer {
+            source: RuleSource::User,
+            allow: vec![],
+            deny: vec![],
+            interactive: ACP_INTERACTIVE_TOOLS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }],
+    }
+}
+
+/// Spawn one configured MCP server, list its tools, and register them in
+/// the session registry under their namespaced `mcp__<server>__<tool>`
+/// names. Returns the stdio child pid (`None` for HTTP servers) so the
+/// session can reap the process on close (issue #180).
+async fn spawn_mcp_server_tools(
+    registry: &mut ToolRegistry,
+    server: &McpServer,
+) -> crate::error::Result<Option<u32>> {
+    let mut client = McpClient::spawn(server).await?;
+    let pid = client.stdio_child_pid();
+    let tool_specs = client.list_tools().await?;
+    let client = Arc::new(tokio::sync::Mutex::new(client));
+    for spec in tool_specs {
+        registry.register_mut(Arc::new(McpTool::new(client.clone(), spec, &server.name)));
+    }
+    Ok(pid)
+}
+
+/// Assemble one ACP session's tool registry (issue #180):
+///
+/// - `ClientReadFile` / `ClientWriteFile` when the client declared the
+///   matching fs capability;
+/// - the tools of every configured MCP server, spawning each server
+///   subprocess and collecting its pid for the session's reap list;
+/// - the permission config whose interactive list routes
+///   `ClientWriteFile` / `mcp__*` through the permission hook.
+///
+/// Spawn/list failures are WARNed and skipped — one dead server must not
+/// sink the session (observable degradation, never silent).
+async fn build_session_registry(
+    workspace: &Path,
+    acp_state: &Arc<Mutex<AcpClientFsState>>,
+    mcp_servers: Option<&Value>,
+) -> (ToolRegistry, Vec<u32>) {
+    let mut registry = ToolRegistry::local();
+    let mut child_pids = Vec::new();
+
+    let (read_enabled, write_enabled) = {
+        let state = acp_state.lock().await;
+        (state.read_text_file, state.write_text_file)
+    };
+    if read_enabled {
+        registry.register_mut(Arc::new(
+            ClientReadFile::new(workspace)
+                .with_acp_state(acp_state.clone())
+                .with_client_read_timeout(client_rpc_timeout_ms()),
+        ));
+        tracing::info!("ACP session: registered ClientReadFile (client declared fs.readTextFile)");
+    }
+    if write_enabled {
+        registry.register_mut(Arc::new(
+            ClientWriteFile::new(workspace).with_acp_state(acp_state.clone()),
+        ));
+        tracing::info!(
+            "ACP session: registered ClientWriteFile (client declared fs.writeTextFile)"
+        );
+    }
+
+    if let Some(servers_value) = mcp_servers {
+        match serde_json::from_value::<Vec<McpServer>>(servers_value.clone()) {
+            Ok(servers) => {
+                for server in &servers {
+                    match spawn_mcp_server_tools(&mut registry, server).await {
+                        Ok(Some(pid)) => {
+                            tracing::info!(
+                                server = %server.name,
+                                pid,
+                                "ACP session: spawned MCP server"
+                            );
+                            child_pids.push(pid);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                server = %server.name,
+                                error = %e,
+                                "ACP session: MCP server failed to start; skipping its tools"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ACP session: invalid mcpServers config (expected an array of {{name, command|url, …}}); skipping"
+                );
+            }
+        }
+    }
+
+    let registry = registry.with_permissions(acp_permissions_config());
+    (registry, child_pids)
+}
+
+/// Wire the session's permission approval channel into the registry: an
+/// [`AcpPermissionHook`] whose `session/update` request frames flow through
+/// the shared writer channel (issue #179) and whose decisions are resolved
+/// by the read loop via the manager's shared permission store (issue #180).
+///
+/// Deliberately registry-level (`with_permission_hook`) and NOT
+/// [`AgentRuntime::set_permission_hook`]: the latter additionally arms
+/// RunCore's unconditional pre-dispatch consult, so an approved interactive
+/// tool would be offered to the client twice (once by RunCore, once by the
+/// pipeline's interactive-tools phase). The pipeline-level consult fires
+/// only for the interactive list (`ClientWriteFile`, `mcp__*`) and runs
+/// after the static permission phases, which is the contract ACP wants.
+fn permission_hook_for(
+    sessions: &mut AcpSessionManager,
+    session_id: &str,
+    control: &TurnControl,
+) -> Arc<AcpPermissionHook> {
+    Arc::new(AcpPermissionHook::new(
+        sessions.permission_store().clone(),
+        session_id.to_string(),
+        control.out.clone(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Method dispatch — sync dispatch table (HashMap) + async fallback
 // ---------------------------------------------------------------------------
 
@@ -368,7 +525,7 @@ async fn dispatch_async(
                 vec![],
             ),
             ServerState::Initialized => match llm {
-                Some(llm) => handle_session_new(id, params, sessions, llm).await,
+                Some(llm) => handle_session_new(id, params, sessions, llm, control).await,
                 None => (
                     Some(build_error(
                         id,
@@ -427,7 +584,7 @@ async fn dispatch_async(
                 vec![],
             ),
             ServerState::Initialized => match llm {
-                Some(llm) => handle_session_load(id, params, sessions, llm).await,
+                Some(llm) => handle_session_load(id, params, sessions, llm, control).await,
                 None => (
                     Some(build_error(
                         id,
@@ -450,7 +607,7 @@ async fn dispatch_async(
                 vec![],
             ),
             ServerState::Initialized => match llm {
-                Some(llm) => handle_session_resume(id, params, sessions, llm).await,
+                Some(llm) => handle_session_resume(id, params, sessions, llm, control).await,
                 None => (
                     Some(build_error(
                         id,
@@ -581,6 +738,7 @@ async fn handle_session_new(
     params: Option<&Value>,
     sessions: &mut AcpSessionManager,
     llm: &Arc<dyn ChatProvider>,
+    control: &TurnControl,
 ) -> (Option<Value>, Vec<Value>) {
     let params = match params {
         Some(p) => p,
@@ -688,26 +846,6 @@ async fn handle_session_new(
         false,
     );
 
-    // Build the AgentRuntime with streaming enabled
-    let runtime = match AgentRuntime::builder()
-        .llm(llm.clone())
-        .event_sink(bridge)
-        .streaming(true)
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            return (
-                Some(build_error(
-                    id,
-                    INVALID_PARAMS,
-                    &format!("Failed to create agent runtime: {e}"),
-                )),
-                vec![],
-            );
-        }
-    };
-
     // Extract optional systemPrompt and mcpServers from params
     let system_prompt = params
         .get("systemPrompt")
@@ -732,8 +870,43 @@ async fn handle_session_new(
     }
     let client_capabilities = sessions.get_client_capabilities().cloned();
 
+    // Issue #180: assemble the real tool surface BEFORE the runtime exists —
+    // client-fs tools per declared capability, MCP servers spawned with their
+    // subprocess pids tracked for reaping — plus the permission approval
+    // channel (registry-level, see `permission_hook_for`).
+    let (registry, mcp_child_pids) =
+        build_session_registry(&cwd, &acp_state, mcp_servers.as_ref()).await;
+    let registry =
+        registry.with_permission_hook(permission_hook_for(sessions, &session_id, control));
+
+    // Build the AgentRuntime with streaming enabled
+    let runtime = match AgentRuntime::builder()
+        .llm(llm.clone())
+        .event_sink(bridge)
+        .streaming(true)
+        .tools(registry)
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return (
+                Some(build_error(
+                    id,
+                    INVALID_PARAMS,
+                    &format!("Failed to create agent runtime: {e}"),
+                )),
+                vec![],
+            );
+        }
+    };
+
     // Store the session (note: we use the pre-generated id via insert_with_id)
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    // The session's actual tool surface, reported back so clients can see
+    // what was really assembled (fs tools per declared capability + MCP
+    // tools from spawned servers) instead of guessing.
+    let tool_names = runtime.kernel().tools().names();
+
     let session = AcpSession {
         runtime: Arc::new(Mutex::new(runtime)),
         cwd: cwd.clone(),
@@ -745,39 +918,14 @@ async fn handle_session_new(
         mcp_servers,
         client_capabilities,
         acp_state: acp_state.clone(),
-        mcp_child_pids: Vec::new(),
+        mcp_child_pids,
     };
     sessions.insert_with_id(session_id.clone(), session);
-
-    // S2-E20: if client has declared fs capabilities, register ClientReadFile/ClientWriteFile
-    // as additional tools on the session's runtime tool registry.
-    {
-        let state = acp_state.lock().await;
-        if state.read_text_file || state.write_text_file {
-            // Get the existing tool registry and add client FS tools
-            let workspace = std::path::Path::new(&cwd);
-            if state.read_text_file {
-                let _tool = Arc::new(
-                    ClientReadFile::new(workspace)
-                        .with_acp_state(acp_state.clone())
-                        .with_client_read_timeout(client_rpc_timeout_ms()),
-                );
-                // Register on the session's runtime tool registry
-                // The runtime builder stored the registry; we can access it via
-                // the session after insertion
-                tracing::info!("ACP session: ClientReadFile tool ready");
-            }
-            if state.write_text_file {
-                let _tool =
-                    Arc::new(ClientWriteFile::new(workspace).with_acp_state(acp_state.clone()));
-                tracing::info!("ACP session: ClientWriteFile tool ready");
-            }
-        }
-    }
 
     let result = serde_json::json!({
         "sessionId": session_id,
         "capabilities": {},
+        "tools": tool_names,
     });
 
     (Some(build_success(id, result)), vec![])
@@ -806,6 +954,7 @@ async fn handle_session_load(
     params: Option<&Value>,
     sessions: &mut AcpSessionManager,
     llm: &Arc<dyn ChatProvider>,
+    control: &TurnControl,
 ) -> (Option<Value>, Vec<Value>) {
     let params = match params {
         Some(p) => p,
@@ -894,7 +1043,12 @@ async fn handle_session_load(
         .cloned()
         .or(metadata.mcp_servers.clone());
 
-    // Build fresh AgentRuntime with a new bridge
+    // Build fresh AgentRuntime with a new bridge. Issue #180: assemble the
+    // same real tool surface as session/new — MCP servers from the params
+    // override or the persisted metadata are spawned (pids tracked), the
+    // permission hook is attached. Client fs capabilities are unknown for a
+    // reloaded session (no initialize-time declaration survives here), so no
+    // reverse-fs tools are registered — the tool gate keeps them honest.
     let turn = metadata.turn;
     let (bridge, _rx) = AcpBridge::new(
         sid.clone(),
@@ -903,10 +1057,16 @@ async fn handle_session_load(
         true, // tool_call notifications enabled for loaded sessions
     );
 
+    let acp_state = Arc::new(Mutex::new(AcpClientFsState::new()));
+    let (registry, mcp_child_pids) =
+        build_session_registry(&metadata.cwd, &acp_state, mcp_servers.as_ref()).await;
+    let registry = registry.with_permission_hook(permission_hook_for(sessions, &sid, control));
+
     let runtime = match AgentRuntime::builder()
         .llm(llm.clone())
         .event_sink(bridge)
         .streaming(true)
+        .tools(registry)
         .system_prompt(system_prompt_with_summary.clone())
         .build()
     {
@@ -942,8 +1102,8 @@ async fn handle_session_load(
         system_prompt: metadata.system_prompt,
         mcp_servers,
         client_capabilities: None,
-        acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
-        mcp_child_pids: Vec::new(),
+        acp_state,
+        mcp_child_pids,
     };
     sessions.insert_with_id(sid.clone(), session);
 
@@ -1095,6 +1255,7 @@ async fn handle_session_resume(
     params: Option<&Value>,
     sessions: &mut AcpSessionManager,
     llm: &Arc<dyn ChatProvider>,
+    control: &TurnControl,
 ) -> (Option<Value>, Vec<Value>) {
     let params = match params {
         Some(p) => p,
@@ -1190,7 +1351,10 @@ async fn handle_session_resume(
         })
         .collect();
 
-    // Build fresh AgentRuntime with a new bridge
+    // Build fresh AgentRuntime with a new bridge. Issue #180: same real tool
+    // surface as session/new (MCP servers spawned, pids tracked, permission
+    // hook attached); no reverse-fs tools — client capabilities are unknown
+    // on resume.
     let (bridge, _rx) = AcpBridge::new(
         sid.clone(),
         std::collections::HashMap::new(),
@@ -1198,10 +1362,16 @@ async fn handle_session_resume(
         true,
     );
 
+    let acp_state = Arc::new(Mutex::new(AcpClientFsState::new()));
+    let (registry, mcp_child_pids) =
+        build_session_registry(&metadata.cwd, &acp_state, mcp_servers.as_ref()).await;
+    let registry = registry.with_permission_hook(permission_hook_for(sessions, &sid, control));
+
     let runtime = match AgentRuntime::builder()
         .llm(llm.clone())
         .event_sink(bridge)
         .streaming(true)
+        .tools(registry)
         .system_prompt(metadata.system_prompt.clone().unwrap_or_default())
         .seed_transcript(messages.clone())
         .build()
@@ -1238,8 +1408,8 @@ async fn handle_session_resume(
         system_prompt: metadata.system_prompt.clone(),
         mcp_servers,
         client_capabilities: None,
-        acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
-        mcp_child_pids: Vec::new(),
+        acp_state,
+        mcp_child_pids,
     };
     sessions.insert_with_id(sid.clone(), session);
 
@@ -1769,6 +1939,11 @@ impl AcpServer {
             let _ = task.await;
         }
         sessions.kill_all_mcp_children().await;
+        // Issue #180: every session's permission hook holds a clone of the
+        // writer channel, so the sessions must be released *before* waiting
+        // for the writer — its exit condition is "all senders gone" and the
+        // manager outlives this line otherwise.
+        drop(sessions);
         drop(control);
         let _ = writer_task.await;
         debug!("ACP stdin closed or idle, server shutting down");
@@ -2051,6 +2226,10 @@ impl AcpServer {
         for task in control.take_tasks() {
             let _ = task.await;
         }
+        // Issue #180: session permission hooks hold writer-channel clones;
+        // release the sessions so the writer's "all senders gone" exit
+        // condition can actually fire.
+        drop(sessions);
         drop(control);
         let _ = writer_task.await;
         debug!("ACP stdin closed, server shutting down");
@@ -4126,5 +4305,320 @@ mod tests {
             let _: Value =
                 serde_json::from_str(line).unwrap_or_else(|_| panic!("malformed JSON: {line}"));
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // issue #180: real session tool surface (fs tools + permission bridge)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// In-process harness for assembly tests: drives `dispatch_one` directly
+    /// so tests can inspect the session manager between requests, while
+    /// prompt turns run detached and their frames land on the kept channel.
+    struct TestServer {
+        state: ServerState,
+        sessions: AcpSessionManager,
+        sync_table: HashMap<&'static str, SyncMethodHandler>,
+        control: TurnControl,
+        out_rx: mpsc::Receiver<Value>,
+        llm: Arc<dyn ChatProvider>,
+    }
+
+    impl TestServer {
+        fn new(llm: Arc<dyn ChatProvider>) -> Self {
+            let (out, out_rx) = mpsc::channel::<Value>(256);
+            Self {
+                state: ServerState::Uninitialized,
+                sessions: AcpSessionManager::new(),
+                sync_table: build_sync_dispatch_table(),
+                control: TurnControl::new(out),
+                out_rx,
+                llm,
+            }
+        }
+
+        async fn request(&mut self, mut v: Value) -> Option<Value> {
+            if v.get("jsonrpc").is_none() {
+                v["jsonrpc"] = Value::String("2.0".into());
+            }
+            let (resp, _notifs) = AcpServer::dispatch_one(
+                &v,
+                &mut self.state,
+                &mut self.sessions,
+                Some(&self.llm),
+                &self.sync_table,
+                &self.control,
+            )
+            .await;
+            resp
+        }
+
+        async fn initialize_and_open_session(&mut self, tmp: &tempfile::TempDir, fs_caps: bool) {
+            let capabilities = if fs_caps {
+                serde_json::json!({"fs": {"readTextFile": true, "writeTextFile": true}})
+            } else {
+                serde_json::json!({})
+            };
+            let init = serde_json::json!({
+                "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "capabilities": capabilities},
+            });
+            let resp = self.request(init).await.expect("initialize responds");
+            assert!(resp.get("result").is_some(), "initialize must succeed");
+
+            let new = serde_json::json!({
+                "id": 2, "method": "session/new",
+                "params": {"cwd": tmp.path().to_string_lossy()},
+            });
+            let resp = self.request(new).await.expect("session/new responds");
+            assert!(resp.get("result").is_some(), "session/new must succeed");
+        }
+
+        /// Read frames until the prompt response with `id` arrives.
+        async fn wait_for_response(&mut self, id: u64) -> Value {
+            let target = Value::from(id);
+            let deadline = std::time::Duration::from_secs(10);
+            loop {
+                let frame = tokio::time::timeout(deadline, self.out_rx.recv())
+                    .await
+                    .expect("frame arrives within 10s")
+                    .expect("writer channel stays open until the turn finishes");
+                if frame.get("id") == Some(&target) {
+                    return frame;
+                }
+            }
+        }
+
+        /// Read frames until the client-side `request_permission` update
+        /// arrives (the turn parks in the hook until the test answers it).
+        async fn wait_for_permission_frame(&mut self) -> Value {
+            let deadline = std::time::Duration::from_secs(10);
+            loop {
+                let frame = tokio::time::timeout(deadline, self.out_rx.recv())
+                    .await
+                    .expect("permission frame arrives within 10s")
+                    .expect("writer channel stays open");
+                if frame.get("method").and_then(|m| m.as_str()) == Some("session/update")
+                    && frame["params"]["update"]["sessionUpdate"] == "request_permission"
+                {
+                    return frame;
+                }
+            }
+        }
+    }
+
+    /// Provider that requests one `ClientWriteFile` tool call, then inspects
+    /// the tool result it receives on the second LLM call: the run sets
+    /// `saw_expected` iff the result content contains `expected_fragment`.
+    struct ToolResultInspectorProvider {
+        expected_fragment: &'static str,
+        saw_expected: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolResultInspectorProvider {
+        fn new(expected_fragment: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                expected_fragment,
+                saw_expected: std::sync::atomic::AtomicBool::new(false),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for ToolResultInspectorProvider {
+        async fn complete(
+            &self,
+            messages: &[crate::message::Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> crate::error::Result<crate::llm::Completion> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Ok(crate::llm::Completion {
+                    tool_calls: vec![crate::message::ToolCall {
+                        id: "tc-1".into(),
+                        name: "ClientWriteFile".into(),
+                        arguments: serde_json::json!({
+                            "file_path": "notes.txt",
+                            "content": "hello acp",
+                        }),
+                    }],
+                    ..Default::default()
+                });
+            }
+            for msg in messages {
+                if matches!(msg.role, crate::message::Role::Tool)
+                    && msg.content.contains(self.expected_fragment)
+                {
+                    self.saw_expected
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Ok(crate::llm::Completion {
+                content: "done".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Answer a `request_permission` frame the way a client would.
+    async fn reply_permission(srv: &mut TestServer, frame: &Value, outcome: &str) {
+        let perm_id = frame["params"]["update"]["permissionId"]
+            .as_str()
+            .expect("permissionId on the request frame")
+            .to_string();
+        let reply = serde_json::json!({
+            "id": 99, "method": "session/request_permission",
+            "params": {"permissionId": perm_id, "outcome": outcome},
+        });
+        let resp = srv.request(reply).await.expect("permission reply acked");
+        assert!(resp.get("result").is_some(), "reply must be acknowledged");
+    }
+
+    #[tokio::test]
+    async fn acp_tools_list_includes_client_fs_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, true).await;
+
+        let session = srv.sessions.get("acp-sess-1").expect("session stored");
+        let rt = session.runtime.lock().await;
+        assert!(
+            rt.kernel().tools().find_by_name("ClientReadFile").is_some(),
+            "ClientReadFile must be registered when the client declares fs.readTextFile"
+        );
+        assert!(
+            rt.kernel()
+                .tools()
+                .find_by_name("ClientWriteFile")
+                .is_some(),
+            "ClientWriteFile must be registered when the client declares fs.writeTextFile"
+        );
+        let names = rt.kernel().tools().names();
+        drop(rt);
+        assert!(
+            session.mcp_child_pids.is_empty(),
+            "no mcpServers configured — no pids to track"
+        );
+        assert!(
+            names.iter().any(|n| n == "ClientReadFile")
+                && names.iter().any(|n| n == "ClientWriteFile"),
+            "the session's tool surface must contain the fs tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_without_fs_capabilities_registers_no_fs_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        let session = srv.sessions.get("acp-sess-1").expect("session stored");
+        let rt = session.runtime.lock().await;
+        assert!(rt.kernel().tools().find_by_name("ClientReadFile").is_none());
+        assert!(rt
+            .kernel()
+            .tools()
+            .find_by_name("ClientWriteFile")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_tool_call_emits_request_permission_and_allow_runs_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let provider = ToolResultInspectorProvider::new("queued");
+        let mut srv = TestServer::new(provider.clone());
+
+        srv.initialize_and_open_session(&tmp, true).await;
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 3, "method": "session/prompt",
+                "params": {"sessionId": "acp-sess-1",
+                           "prompt": [{"type": "text", "text": "write the file"}]},
+            }))
+            .await;
+        assert!(
+            resp.is_none(),
+            "prompt turns are detached; response is a frame"
+        );
+
+        // The client sees a request_permission frame while the turn is parked.
+        let frame = srv.wait_for_permission_frame().await;
+        assert_eq!(frame["params"]["update"]["toolName"], "ClientWriteFile");
+        assert_eq!(frame["params"]["sessionId"], "acp-sess-1");
+        reply_permission(&mut srv, &frame, "allowed").await;
+
+        let response = srv.wait_for_response(3).await;
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        assert!(
+            provider
+                .saw_expected
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "an allowed tool call must have executed (tool result containing 'queued')"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_tool_call_denied_by_client_blocks_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let provider = ToolResultInspectorProvider::new("permission denied");
+        let mut srv = TestServer::new(provider.clone());
+
+        srv.initialize_and_open_session(&tmp, true).await;
+        srv.request(serde_json::json!({
+            "id": 3, "method": "session/prompt",
+            "params": {"sessionId": "acp-sess-1",
+                       "prompt": [{"type": "text", "text": "write the file"}]},
+        }))
+        .await;
+
+        let frame = srv.wait_for_permission_frame().await;
+        reply_permission(&mut srv, &frame, "denied").await;
+        srv.wait_for_response(3).await;
+
+        assert!(
+            provider
+                .saw_expected
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a denied tool call must surface 'permission denied' to the agent, not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_mcp_server_spawn_failure_degrades_without_killing_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 3, "method": "session/new",
+                "params": {
+                    "cwd": tmp.path().to_string_lossy(),
+                    "mcpServers": [{
+                        "name": "ghost",
+                        "command": "definitely-not-a-real-mcp-binary-xyz",
+                        "args": [],
+                    }],
+                },
+            }))
+            .await
+            .expect("session/new still succeeds");
+
+        let tools: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .expect("tools array present")
+            .iter()
+            .map(|v| v.as_str().expect("tool name string").to_string())
+            .collect();
+        assert!(
+            !tools.iter().any(|t| t.starts_with("mcp__ghost__")),
+            "a server that failed to spawn must contribute no tools: {tools:?}"
+        );
+        let session = srv
+            .sessions
+            .get("acp-sess-2")
+            .expect("second session stored");
+        assert!(session.mcp_child_pids.is_empty());
     }
 }
