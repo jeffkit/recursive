@@ -346,19 +346,69 @@ pub(crate) fn load_open_interrupts(session_dir: &Path) -> Vec<OpenInterrupt> {
 
 /// Save open interrupts to session metadata. Written atomically before
 /// emitting RunFinished with Interrupt outcome.
-pub(crate) fn save_open_interrupts(session_dir: &Path, interrupts: &[OpenInterrupt]) {
-    if let Ok(json) = serde_json::to_string_pretty(interrupts) {
-        let path = session_dir.join(".interrupts.json");
-        let _ = std::fs::create_dir_all(session_dir);
-        crate::atomic::atomic_write(&path, json.as_bytes()).ok();
-    }
+///
+/// Issue #215 — this file is the resume state machine's only backing
+/// store: `Err` here means the pending interrupt silently vanishes on
+/// resume (or a consumed one re-appears). The write itself stays
+/// non-fatal — the call site decides whether the Interrupt outcome may
+/// still be announced — but the failure must reach the log, so both the
+/// serialisation and the disk-write halves report through this `Result`.
+pub(crate) fn save_open_interrupts(
+    session_dir: &Path,
+    interrupts: &[OpenInterrupt],
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(interrupts)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let path = session_dir.join(".interrupts.json");
+    std::fs::create_dir_all(session_dir)?;
+    crate::atomic::atomic_write(&path, json.as_bytes())
 }
 
 /// Clear open interrupts (called after a successful resume that consumed
 /// all pending interrupts).
-pub(crate) fn clear_open_interrupts(session_dir: &Path) {
+///
+/// Issue #215 — `Ok` also covers the file being absent (nothing was ever
+/// persisted: the normal first-run shape). Only a real deletion failure
+/// surfaces, as `Err`: the consumed interrupts would re-appear on the
+/// next resume, and that must not be silent.
+pub(crate) fn clear_open_interrupts(session_dir: &Path) -> std::io::Result<()> {
     let path = session_dir.join(".interrupts.json");
-    let _ = std::fs::remove_file(&path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        // Nothing persisted — the benign no-op case, same as before.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Save open interrupts, announcing a failure. Issue #215 — the driver
+/// calls this right before emitting RunFinished(Interrupt); a failed
+/// persist used to be swallowed while the client entered the resume flow
+/// against an absent/stale backing store. The event behaviour is
+/// unchanged, but the resume break must be attributable from the log.
+fn save_open_interrupts_or_warn(thread_id: &str, session_dir: &Path, interrupts: &[OpenInterrupt]) {
+    if let Err(e) = save_open_interrupts(session_dir, interrupts) {
+        tracing::warn!(
+            thread_id = %thread_id,
+            path = %session_dir.join(".interrupts.json").display(),
+            error = %e,
+            "failed to persist open interrupts; resume may lose the pending interrupt"
+        );
+    }
+}
+
+/// Clear open interrupts, announcing a failure. Issue #215 — a failed
+/// clear used to be silent while the consumed interrupts would re-surface
+/// on the next resume; the stale store must be attributable. The absent
+/// file stays a benign no-op inside [`clear_open_interrupts`].
+fn clear_open_interrupts_or_warn(session_dir: &Path) {
+    if let Err(e) = clear_open_interrupts(session_dir) {
+        tracing::warn!(
+            path = %session_dir.join(".interrupts.json").display(),
+            error = %e,
+            "failed to clear open interrupts; consumed interrupts may re-appear on resume"
+        );
+    }
 }
 
 /// Which interrupt mechanism fired during an AG-UI run.
@@ -904,7 +954,7 @@ pub(crate) fn prepare_run(
     }
 
     // Clear the open interrupts now that they've been consumed.
-    clear_open_interrupts(&session_dir);
+    clear_open_interrupts_or_warn(&session_dir);
 
     Ok(PreparedAguiRun {
         goal,
@@ -1545,7 +1595,11 @@ pub(crate) fn spawn_agui_run(
             // Persist before emitting (crash safety).
             if let Some(session_dir) = agui_session_dir(&drv_workspace, &drv_thread) {
                 let _ = std::fs::create_dir_all(&session_dir);
-                save_open_interrupts(&session_dir, std::slice::from_ref(&open_interrupt));
+                save_open_interrupts_or_warn(
+                    &drv_thread,
+                    &session_dir,
+                    std::slice::from_ref(&open_interrupt),
+                );
 
                 // Emit StateSnapshot and MessagesSnapshot before RunFinished
                 // per spec requirement (snapshots must precede the interrupting
@@ -1679,12 +1733,12 @@ mod tests {
 
     /// Persist an interrupt fixture and prove it landed.
     ///
-    /// `save_open_interrupts` is a best-effort product write (no `Result`,
-    /// no log), so a failed write used to surface only much later as a
-    /// misleading "expected conflict, got Ok" at the assertion site. Read
-    /// the file back here instead, while the cause is still visible.
+    /// `save_open_interrupts` reports through `io::Result` (issue #215),
+    /// so a fixture failure surfaces here with the cause still visible;
+    /// the read-back also guards against a write that reports `Ok` but
+    /// never lands.
     fn write_interrupts(dir: &Path, interrupts: &[OpenInterrupt]) {
-        save_open_interrupts(dir, interrupts);
+        save_open_interrupts(dir, interrupts).expect("interrupt fixture write");
         let fixture = dir.join(".interrupts.json");
         let raw = std::fs::read_to_string(&fixture)
             .unwrap_or_else(|e| panic!("interrupt fixture {fixture:?} not written: {e}"));
@@ -1693,6 +1747,90 @@ mod tests {
             interrupts.len(),
             "interrupt fixture {fixture:?} did not round-trip: {raw}"
         );
+    }
+
+    // Issue #215 — write-side observability: a failed persist/clear must
+    // reach the log with the path and the error; the absent file stays the
+    // benign no-op it always was. A file standing in for the session dir
+    // makes every syscall below it fail (root-proof).
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn save_open_interrupts_failure_is_announced_with_path_and_error() {
+        let blocker = tempfile::tempdir().unwrap();
+        let stand_in = blocker.path().join("session-dir");
+        std::fs::write(&stand_in, b"not a directory").unwrap();
+
+        assert!(
+            save_open_interrupts(&stand_in, &[]).is_err(),
+            "save must report the failure through its Result"
+        );
+
+        save_open_interrupts_or_warn("t-blocked", &stand_in, &[]);
+        assert!(
+            logs_contain("failed to persist open interrupts"),
+            "the resume break must be announced"
+        );
+        assert!(logs_contain("t-blocked"), "the warning names the thread");
+        assert!(
+            logs_contain(".interrupts.json"),
+            "the warning names the file"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn clear_open_interrupts_failure_is_announced_with_path_and_error() {
+        let blocker = tempfile::tempdir().unwrap();
+        let stand_in = blocker.path().join("session-dir");
+        std::fs::write(&stand_in, b"not a directory").unwrap();
+
+        assert!(
+            clear_open_interrupts(&stand_in).is_err(),
+            "clear must report the failure through its Result"
+        );
+
+        clear_open_interrupts_or_warn(&stand_in);
+        assert!(
+            logs_contain("failed to clear open interrupts"),
+            "the stale store must be announced"
+        );
+        assert!(
+            logs_contain(".interrupts.json"),
+            "the warning names the file"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn clear_open_interrupts_absent_file_is_a_silent_no_op() {
+        let ws = tempfile::tempdir().unwrap();
+        assert!(
+            clear_open_interrupts(ws.path()).is_ok(),
+            "nothing persisted is not an error"
+        );
+        clear_open_interrupts_or_warn(ws.path());
+        assert!(
+            !logs_contain("failed to clear open interrupts"),
+            "the benign case must stay silent"
+        );
+    }
+
+    #[test]
+    fn save_open_interrupts_ok_then_clear_removes() {
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path().join("session");
+        let interrupts = [OpenInterrupt {
+            interrupt_id: "i1".into(),
+            tool_call_id: "tc-1".into(),
+            reason: "tool_call".into(),
+            message: None,
+            created_at: "now".into(),
+        }];
+        save_open_interrupts(&dir, &interrupts).expect("save succeeds");
+        assert_eq!(load_open_interrupts(&dir).len(), 1);
+        clear_open_interrupts(&dir).expect("clear succeeds");
+        assert!(load_open_interrupts(&dir).is_empty());
     }
 
     // ── converter: #66 anti-double-render ────────────────────────────────
