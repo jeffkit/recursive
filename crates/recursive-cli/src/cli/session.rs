@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use recursive::{SessionFile, SessionStatus, SessionWriter};
+use recursive::{SessionFile, SessionLock, SessionStatus, SessionWriter};
 
 /// Implementation of `recursive migrate`.
 pub(crate) fn cmd_migrate(workspace: &Path, dry_run: bool) -> anyhow::Result<()> {
@@ -220,6 +220,16 @@ pub(crate) fn cmd_session_rewind(
         );
     }
 
+    // Issue #175: the rewind replaces transcript.jsonl and
+    // checkpoints.jsonl by rename. An active writer holds an O_APPEND fd
+    // on the old inode (SessionWriter takes the same sentinel lock, see
+    // `SessionLock`), so renaming under it would strand every subsequent
+    // message on the orphaned inode — silent data loss. Take the lock for
+    // the whole operation and refuse while a live writer holds it; there
+    // is deliberately no --force bypass.
+    let _lock = SessionLock::acquire(&session_path)
+        .map_err(|e| anyhow::anyhow!("cannot rewind session {}: {e}", session_path.display()))?;
+
     let plan = recursive::plan_rewind(&log_path, to_turn)?;
 
     println!("Rewind plan:");
@@ -305,4 +315,195 @@ pub(crate) fn cmd_session_clean_checkpoints(workspace: &Path, force: bool) -> an
     repo.clean().map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("Shadow-git repo deleted. A fresh repo will be created on the next session.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn has_git() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// A minimal two-turn transcript. `truncate_transcript_to_turn` only
+    /// peeks the `role` field, so bare user/assistant objects suffice.
+    fn write_transcript(dir: &Path) {
+        let mut lines = String::new();
+        for t in 0..2 {
+            for role in ["user", "assistant"] {
+                let line = serde_json::json!({
+                    "role": role,
+                    "content": format!("{role} of turn {t}"),
+                });
+                lines.push_str(&line.to_string());
+                lines.push('\n');
+            }
+        }
+        fs::write(dir.join("transcript.jsonl"), lines).unwrap();
+    }
+
+    /// One `checkpoints.jsonl` record in the wire format `read_log` parses.
+    fn append_log_record(dir: &Path, turn: usize, id: &str, pre: Option<&str>) {
+        let rec = serde_json::json!({
+            "turn": turn,
+            "turn_id": turn,
+            "id": id,
+            "pre": pre,
+            "touched_files": ["file.txt"],
+            "touched_via": "structured",
+            "saved_at": 0,
+        });
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dir.join("checkpoints.jsonl"))
+            .unwrap();
+        writeln!(f, "{rec}").unwrap();
+    }
+
+    /// A rewindable session backed by real shadow snapshots: two turns,
+    /// each saved (`file.txt` "v1" after turn 0, "v2" after turn 1),
+    /// plus a matching two-turn transcript. Returns the session dir.
+    fn fabricate_saved_session(ws: &TempDir) -> PathBuf {
+        let sess = ws.path().join("sess-01");
+        fs::create_dir_all(&sess).unwrap();
+        let file = ws.path().join("file.txt");
+        fs::write(&file, "v0").unwrap();
+        let repo = recursive::ShadowRepo::open(ws.path()).unwrap();
+        let pre0 = repo.snapshot_for_session("sess-01", "t0 pre").unwrap();
+        fs::write(&file, "v1").unwrap();
+        let post0 = repo.snapshot_for_session("sess-01", "t0 post").unwrap();
+        fs::write(&file, "v2").unwrap();
+        let post1 = repo.snapshot_for_session("sess-01", "t1 post").unwrap();
+        drop(repo);
+        write_transcript(&sess);
+        append_log_record(&sess, 0, &post0.0, Some(pre0.0.as_str()));
+        append_log_record(&sess, 1, &post1.0, Some(post0.0.as_str()));
+        sess
+    }
+
+    fn read_bytes(p: &Path) -> Vec<u8> {
+        fs::read(p).unwrap()
+    }
+
+    fn assert_no_tmp_residue(dir: &Path) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".tmp-") && !name.contains("rewind-tmp"),
+                "no temp file may survive a completed rewind; found {name}"
+            );
+        }
+    }
+
+    /// Issue #175 (cluster acceptance 3a): while a live writer holds the
+    /// session's `SessionLock`, `sessions rewind` must refuse — before
+    /// touching the transcript or the checkpoint log — no matter what
+    /// --force says. After the lock is released the same rewind must go
+    /// through, proving the refusal came from the lock itself.
+    #[test]
+    fn rewind_refuses_while_session_locked() {
+        if !has_git() {
+            return;
+        }
+        let ws = TempDir::new().unwrap();
+        let sess = fabricate_saved_session(&ws);
+        let transcript_before = read_bytes(&sess.join("transcript.jsonl"));
+        let log_before = read_bytes(&sess.join("checkpoints.jsonl"));
+
+        let _held = SessionLock::acquire(&sess).unwrap();
+        let err = cmd_session_rewind(ws.path(), sess.to_str().unwrap(), 1, true, false)
+            .expect_err("rewind must refuse while the session lock is held");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot rewind"),
+            "error must name the refused operation; got: {msg}"
+        );
+        assert!(
+            msg.contains("pid"),
+            "busy error must say who holds the lock; got: {msg}"
+        );
+        assert_eq!(
+            read_bytes(&sess.join("transcript.jsonl")),
+            transcript_before,
+            "refused rewind must not touch the transcript"
+        );
+        assert_eq!(
+            read_bytes(&sess.join("checkpoints.jsonl")),
+            log_before,
+            "refused rewind must not touch the checkpoint log"
+        );
+        drop(_held);
+
+        // Lock released: the identical command now succeeds, so the
+        // refusal above was the lock, not the session shape.
+        cmd_session_rewind(ws.path(), sess.to_str().unwrap(), 1, true, false).unwrap();
+        assert_no_tmp_residue(&sess);
+    }
+
+    /// Issue #175 (cluster acceptance 3b): with no lock holder, the
+    /// rewind replaces transcript and checkpoint log atomically — the
+    /// on-disk files are complete and parseable, no temp residue — and a
+    /// writer that opens the transcript *after* the rename appends to the
+    /// new inode (its messages are not stranded on an orphaned file).
+    #[test]
+    fn rewind_replaces_transcript_atomically_and_appends_land_on_new_file() {
+        if !has_git() {
+            return;
+        }
+        let ws = TempDir::new().unwrap();
+        let sess = fabricate_saved_session(&ws);
+
+        cmd_session_rewind(ws.path(), sess.to_str().unwrap(), 1, true, false).unwrap();
+
+        // Workspace restored to the start of turn 1.
+        let file = ws.path().join("file.txt");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "v1",
+            "rewind --to-turn 1 must restore turn 0's post state"
+        );
+        // Transcript holds exactly turn 0 and is line-complete JSON.
+        let transcript = fs::read_to_string(sess.join("transcript.jsonl")).unwrap();
+        let lines: Vec<&str> = transcript.lines().collect();
+        assert_eq!(lines.len(), 2, "only turn 0 survives: {transcript}");
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("transcript line must parse: {line}: {e}"));
+        }
+        // Checkpoint log truncated to the same cutoff.
+        let log = fs::read_to_string(sess.join("checkpoints.jsonl")).unwrap();
+        let kept: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(kept.len(), 1, "only the turn-0 record survives: {log}");
+        assert_eq!(kept[0]["turn"], 0);
+        assert_no_tmp_residue(&sess);
+
+        // Post-rewind writer: a fresh O_APPEND open (what SessionWriter
+        // does after acquiring the lock) must land on the renamed file.
+        use std::io::Write as _;
+        let replay = serde_json::json!({"role":"user","content":"post-rewind turn"});
+        fs::OpenOptions::new()
+            .append(true)
+            .open(sess.join("transcript.jsonl"))
+            .unwrap()
+            .write_all(format!("{replay}\n").as_bytes())
+            .unwrap();
+        let transcript = fs::read_to_string(sess.join("transcript.jsonl")).unwrap();
+        let lines: Vec<&str> = transcript.lines().collect();
+        assert_eq!(lines.len(), 3, "appended message must reach the live file");
+        let last: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(last["content"], "post-rewind turn");
+        assert_no_tmp_residue(&sess);
+    }
 }

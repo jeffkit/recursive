@@ -211,8 +211,12 @@ pub fn next_turn_index(path: &Path) -> usize {
 }
 
 /// Truncate the log to records whose canonical turn identity (see
-/// [`CheckpointRecord::turn_id_or_turn`]) is below `cutoff`. Atomic via
-/// temp file + rename.
+/// [`CheckpointRecord::turn_id_or_turn`]) is below `cutoff`. The
+/// replacement goes through [`crate::atomic::atomic_write`] (issue #175):
+/// unique fsynced temp name + rename, so a crash mid-truncate can never
+/// leave a torn log — and `sessions rewind` (which holds the session lock
+/// while calling this) doesn't race a live `CheckpointLogWriter` onto a
+/// shared fixed temp name like the old `.jsonl.tmp`.
 pub fn truncate_to_turn(path: &Path, cutoff: usize) -> Result<()> {
     let recs = read_log(path)?;
     let kept: Vec<&CheckpointRecord> = recs
@@ -220,17 +224,12 @@ pub fn truncate_to_turn(path: &Path, cutoff: usize) -> Result<()> {
         .filter(|r| r.turn_id_or_turn() < cutoff)
         .collect();
 
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let f = File::create(&tmp).map_err(Error::Io)?;
-        let mut w = BufWriter::new(f);
-        for r in &kept {
-            serde_json::to_writer(&mut w, r).map_err(Error::Json)?;
-            w.write_all(b"\n").map_err(Error::Io)?;
-        }
-        w.flush().map_err(Error::Io)?;
+    let mut bytes = Vec::new();
+    for r in &kept {
+        serde_json::to_writer(&mut bytes, r).map_err(Error::Json)?;
+        bytes.push(b'\n');
     }
-    std::fs::rename(&tmp, path).map_err(Error::Io)?;
+    crate::atomic::atomic_write(path, &bytes).map_err(Error::Io)?;
     Ok(())
 }
 

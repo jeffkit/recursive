@@ -4,7 +4,7 @@
 //! `truncate_transcript_to_turn` and `read_last_message_uuid` from
 //! `session.rs` during the Goal 221 module refactor.
 
-use std::io::{BufRead, BufWriter, Write};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 // Crate-internal so the test suite can construct custom sentinel files
@@ -340,13 +340,17 @@ pub fn truncate_transcript_to_turn(
         });
     }
 
-    // Stream-read so we don't load the whole transcript into memory.
+    // Stream-read so we don't hold the file handle longer than needed,
+    // but buffer the kept prefix in memory: the replacement must go
+    // through `atomic_write` (issue #175) — the old fixed
+    // `.jsonl.rewind-tmp` temp name was neither fsynced nor unique, and
+    // a crash mid-truncate could leave a torn transcript or a colliding
+    // orphan. This is a one-shot CLI operation, so the buffered prefix's
+    // memory cost is acceptable next to the durability contract.
     let file = std::fs::File::open(&jsonl_path)?;
     let reader = std::io::BufReader::new(file);
 
-    let tmp_path = jsonl_path.with_extension("jsonl.rewind-tmp");
-    let tmp = std::fs::File::create(&tmp_path)?;
-    let mut writer = BufWriter::new(tmp);
+    let mut kept_bytes: Vec<u8> = Vec::new();
 
     let mut user_seen = 0usize;
     let mut kept = 0u64;
@@ -381,14 +385,12 @@ pub fn truncate_transcript_to_turn(
             user_seen += 1;
         }
 
-        writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")?;
+        kept_bytes.extend_from_slice(line.as_bytes());
+        kept_bytes.push(b'\n');
         kept += 1;
     }
-    writer.flush()?;
-    drop(writer);
 
-    std::fs::rename(&tmp_path, &jsonl_path)?;
+    crate::atomic::atomic_write(&jsonl_path, &kept_bytes)?;
 
     // Update .meta.json message_count if present.
     let meta_path = session_dir.join(".meta.json");
