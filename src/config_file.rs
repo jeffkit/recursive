@@ -3,6 +3,7 @@
 //! Priority chain: CLI flag > env var > config file > hardcoded default.
 //! The config file is optional — if absent, we gracefully fall back.
 
+use crate::atomic::{atomic_write, atomic_write_with_mode};
 use crate::error::{Error, Result};
 use crate::permissions::PermissionMode;
 use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
@@ -315,7 +316,26 @@ pub fn set_value(key: &str, value: &str) -> Result<()> {
         String::new()
     };
 
-    let mut doc: toml::Table = content.parse::<toml::Table>().unwrap_or_default();
+    // #213: an existing file that fails to parse must fail the write, not
+    // silently become an empty document — `unwrap_or_default()` here let a
+    // single `config set` replace the user's whole config (provider, model,
+    // agent, …) with a file containing only the new key. Mirrors `load_from`,
+    // which already rejects the same content on the read path.
+    let mut doc: toml::Table = content.parse::<toml::Table>().map_err(|e| {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "config.toml is unparseable; refusing to write a reduced replacement"
+        );
+        Error::Config {
+            message: format!(
+                "failed to parse config file {}: {}; refusing to overwrite it \
+                 with a reduced config — fix or remove the file and retry",
+                path.display(),
+                e
+            ),
+        }
+    })?;
 
     // Parse dotted key "provider.model" → table["provider"]["model"]
     let parts: Vec<&str> = key.splitn(2, '.').collect();
@@ -341,7 +361,7 @@ pub fn set_value(key: &str, value: &str) -> Result<()> {
     let toml_str = toml::to_string_pretty(&doc).map_err(|e| Error::Config {
         message: format!("failed to serialize config: {}", e),
     })?;
-    std::fs::write(&path, toml_str).map_err(Error::Io)?;
+    atomic_write(&path, toml_str.as_bytes()).map_err(Error::Io)?;
     Ok(())
 }
 
@@ -374,7 +394,30 @@ pub fn set_secret(env_name: &str, value: &str) -> Result<()> {
     // Read existing lines (preserve any other env vars the user previously
     // set via the same file). Idempotent: re-running with the same
     // (env_name, value) yields the same file.
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    //
+    // #213: only a *missing* file starts from empty. Any other read failure
+    // (permission drift, invalid UTF-8, IO error) must refuse the write —
+    // treating it as empty would replace the user's remaining secrets with
+    // just the new one.
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "secrets.env is unreadable; refusing to write a reduced replacement"
+            );
+            return Err(Error::Config {
+                message: format!(
+                    "failed to read existing secrets file {}: {}; refusing to \
+                     overwrite it — fix the file and retry",
+                    path.display(),
+                    e
+                ),
+            });
+        }
+    };
     let prefix = format!("export {env_name}=");
     let new_line = format!("{prefix}'{}'", shell_single_quote(value));
 
@@ -407,16 +450,11 @@ pub fn set_secret(env_name: &str, value: &str) -> Result<()> {
     content.push_str(&lines.join("\n"));
     content.push('\n');
 
-    std::fs::write(&path, content).map_err(Error::Io)?;
-
-    // Restrict permissions to owner. On Windows the chmod is a no-op, but
-    // the file is still per-user in the user's profile directory.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&path, perms).map_err(Error::Io)?;
-    }
+    // 0600 from the moment the file appears at `path`: `atomic_write_with_mode`
+    // applies the mode to the temp file before the rename, so there is no
+    // window where the secrets sit world-readable. On Windows the mode is
+    // inert, but the file is still per-user in the user's profile directory.
+    atomic_write_with_mode(&path, content.as_bytes(), 0o600).map_err(Error::Io)?;
 
     Ok(())
 }
@@ -1102,5 +1140,96 @@ interactive = ["delete_file"]
             !content.contains("keep-me'export"),
             "must not glue the new export onto the previous line; got:\n{content}"
         );
+    }
+
+    // ── #213: write-back must never clobber an unreadable/unparseable file ──
+
+    #[test]
+    fn set_value_rejects_unparseable_config_and_preserves_bytes() {
+        // A hand-edited config.toml with a syntax error must fail `config
+        // set` instead of silently replacing the whole file with one that
+        // contains only the new key.
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        let path = config_file_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let broken = "[provider]\nmodel = \"keep-me\"\nthis is [[[not valid toml";
+        std::fs::write(&path, broken).unwrap();
+
+        let err = set_value("agent.max_steps", "64")
+            .expect_err("set_value must refuse to replace an unparseable config");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to parse config file"),
+            "error must state the parse failure; got: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the offending file; got: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to overwrite"),
+            "error must tell the user the file was left alone; got: {msg}"
+        );
+        // The file on disk must be byte-for-byte untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            broken,
+            "refused write must leave the original file unchanged"
+        );
+        // The guard fires before any write: no temp leftovers either.
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".tmp-"),
+                "refused write must not leave temp files; found {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_secret_rejects_unreadable_secrets_and_preserves_bytes() {
+        // Invalid UTF-8 makes `read_to_string` fail while the file itself is
+        // still writable — exactly the "read fails, write would succeed"
+        // asymmetry that let the old code silently clobber every previously
+        // saved secret. (NotFound stays on the happy path: the fresh-write
+        // behaviour is pinned by set_secret_writes_to_secrets_env_with_0600.)
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path());
+
+        let path = secrets_env_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let corrupted: &[u8] = b"export OLD_API_KEY='\xff\xfe not utf8'";
+        std::fs::write(&path, corrupted).unwrap();
+
+        let err = set_secret(
+            "DEEPSEEK_API_KEY",
+            "sk-fixture-eeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .expect_err("set_secret must refuse to replace an unreadable secrets file");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("failed to read existing secrets file"),
+            "error must state the read failure; got: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the offending file; got: {msg}"
+        );
+        // Byte-for-byte untouched — the corrupted (but user-owned) file is
+        // preserved for inspection instead of being replaced.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            corrupted,
+            "refused write must leave the original bytes unchanged"
+        );
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".tmp-"),
+                "refused write must not leave temp files; found {name:?}"
+            );
+        }
     }
 }
