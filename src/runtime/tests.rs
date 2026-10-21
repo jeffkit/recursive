@@ -397,6 +397,11 @@ async fn failed_turn_reports_on_event_hook_and_checkpoint_surfaces() {
         "fallback record must be labelled as a failure: {:?}",
         recs[0].message
     );
+    assert_eq!(
+        recs[0].turn_id,
+        Some(0),
+        "the failure fallback carries the canonical turn identity too"
+    );
 }
 
 /// Issue #120: a *successful* turn must not leave a fallback checkpoint —
@@ -480,6 +485,7 @@ async fn enable_checkpoints_seeds_from_existing_log() {
     }
     let mk_rec = |turn: usize| crate::checkpoint_log::CheckpointRecord {
         turn,
+        turn_id: Some(turn),
         pre: None,
         id: crate::CheckpointId(format!("ckpt-{turn}")),
         message: None,

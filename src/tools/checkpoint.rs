@@ -280,6 +280,7 @@ impl Tool for CheckpointSave {
             })?;
             let rec = CheckpointRecord {
                 turn,
+                turn_id: Some(turn),
                 pre: last_id,
                 id: id.clone(),
                 message: Some(message),

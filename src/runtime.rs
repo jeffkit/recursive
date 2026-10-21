@@ -479,6 +479,7 @@ impl AgentRuntime {
             .unwrap_or_default();
         let rec = crate::checkpoint_log::CheckpointRecord {
             turn,
+            turn_id: Some(turn),
             pre: last_id,
             id,
             message: Some(message),

@@ -2600,8 +2600,9 @@ mod tests {
     /// (`max(turn) + 1`) instead of restarting at 0 — otherwise a resumed
     /// thread writes duplicate `turn` numbers and `sessions rewind` skips its
     /// changes.
-    #[test]
-    fn agui_thread_continues_turn_numbering() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_thread_continues_turn_numbering() {
         if std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -2624,6 +2625,7 @@ mod tests {
             writer
                 .append(&crate::checkpoint_log::CheckpointRecord {
                     turn,
+                    turn_id: Some(turn),
                     pre: None,
                     id: crate::CheckpointId(format!("agui-ckpt-{turn}")),
                     message: Some(format!("turn {turn}")),
@@ -2650,6 +2652,28 @@ mod tests {
             runtime.turn_index(),
             3,
             "AG-UI must seed turn_index from the thread's checkpoint log"
+        );
+
+        // The first post-reopen save continues the canonical identity:
+        // the record's `turn_id` must be the seeded value, not 0.
+        let save = runtime
+            .kernel()
+            .tools()
+            .get("checkpoint_save")
+            .expect("checkpoint_save registered");
+        save.execute(serde_json::json!({ "message": "post-reopen" }))
+            .await
+            .expect("post-reopen checkpoint_save succeeds");
+        let recs = crate::checkpoint_log::read_log(&log_path).unwrap();
+        assert_eq!(recs.len(), 4, "post-reopen record appended");
+        assert_eq!(
+            recs[3].turn, 3,
+            "post-reopen record continues the turn column"
+        );
+        assert_eq!(
+            recs[3].turn_id,
+            Some(3),
+            "AG-UI records carry the continued turn_id"
         );
     }
 }

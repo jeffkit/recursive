@@ -234,6 +234,25 @@ async fn resume_continues_turn_numbering() {
         turns.len(),
         "turn numbers must be unique: {turns:?}"
     );
+
+    // Every record carries the canonical `turn_id`, and the post-resume one
+    // continues past the pre-resume max instead of restarting (issue #173).
+    let recs = recursive::read_checkpoint_log(&log_path).unwrap();
+    let pre_max = recs[..3]
+        .iter()
+        .filter_map(|r| r.turn_id)
+        .max()
+        .expect("pre-resume records carry turn_id");
+    assert_eq!(pre_max, 2, "pre-resume turn_id runs 0..=2");
+    assert!(
+        recs[3].turn_id.unwrap() > pre_max,
+        "post-resume turn_id must continue past the pre-resume max"
+    );
+    assert_eq!(
+        recs[3].turn_id,
+        Some(3),
+        "post-resume record carries the seeded turn_id"
+    );
 }
 
 /// Issue #173: `rewind --to-turn N` after a resume must include the

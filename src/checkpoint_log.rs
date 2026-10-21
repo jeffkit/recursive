@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 /// **Goal 284**: With on-demand checkpoints (no automatic pre/post
 /// per turn), the schema is:
 /// - `turn` — which turn the agent was in when it saved.
+/// - `turn_id` — the canonical per-session turn identity (issue #173).
 /// - `id` — the checkpoint id (was `post`).
 /// - `message` — agent-supplied label (optional).
 /// - `touched_files` — files touched up to this point.
@@ -33,10 +34,24 @@ use crate::error::{Error, Result};
 /// **Backwards compatibility**: old `pre`/`post`/`started_at`/
 /// `finished_at` fields are accepted on deserialization but ignored
 /// in favour of the new fields. New records always use the new names.
+/// The same applies to `turn_id`: absent on pre-#173 records, always
+/// serialized on new ones.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointRecord {
     /// 0-indexed turn within the session.
     pub turn: usize,
+    /// Canonical per-session turn identity (issue #173): the number the
+    /// #189-cluster consumers sort and filter on — `sessions rewind`
+    /// cutoffs today, the #174 recovery-set / transcript-cutoff alignment
+    /// next. Seeded numbering (`next_turn_index`: `max(turn) + 1` over the
+    /// existing log) makes it continue across resume / AG-UI reopen
+    /// instead of colliding. Equal to `turn` by construction — both come
+    /// from the same seeded counter — but this is the named contract new
+    /// code attaches to. `None` on records written before the field
+    /// existed: those logs predate seeded numbering, so fall back to
+    /// `turn` for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<usize>,
     /// Deprecated (auto-snapshot era). Present on old records;
     /// ignored when `id` is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +225,7 @@ mod tests {
     fn rec(turn: usize, id: &str) -> CheckpointRecord {
         CheckpointRecord {
             turn,
+            turn_id: Some(turn),
             pre: None,
             id: CheckpointId(id.to_string()),
             message: None,
@@ -407,6 +423,67 @@ mod tests {
         std::fs::write(&path, "not-valid-json\n").unwrap();
         let result = read_log(&path);
         assert!(result.is_err(), "malformed JSON must return an Err");
+    }
+
+    /// Issue #173: new records serialize `turn_id` (the canonical identity
+    /// the #189-cluster consumers hang off), and a legacy line written
+    /// before the field existed deserializes to `None`.
+    #[test]
+    fn turn_id_serialized_on_new_records_none_on_legacy_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turn-id.jsonl");
+        let w = CheckpointLogWriter::open(&path).unwrap();
+        w.append(&rec(2, "cc")).unwrap();
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            line.contains("\"turn_id\":2"),
+            "new records must carry turn_id: {line}"
+        );
+        let read = read_log(&path).unwrap();
+        assert_eq!(read[0].turn_id, Some(2));
+
+        let legacy = r#"{"turn":5,"id":"legacy","touched_files":[],"touched_via":"structured","saved_at":0}"#;
+        let parsed: CheckpointRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.turn_id, None, "legacy records have no turn_id");
+        assert_eq!(parsed.turn, 5, "legacy turn column is untouched");
+    }
+
+    /// Rewriting the log (`truncate_to_turn`) must preserve `turn_id` on
+    /// new records and must not retrofit the field onto legacy ones — the
+    /// on-disk shape of untouched history stays byte-stable.
+    #[test]
+    fn truncate_preserves_turn_id_and_legacy_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trunc.jsonl");
+        let w = CheckpointLogWriter::open(&path).unwrap();
+        w.append(&rec(0, "a")).unwrap();
+        w.append(&rec(1, "b")).unwrap();
+        // A legacy record that must keep its legacy shape on rewrite.
+        let legacy = r#"{"turn":2,"id":"legacy","touched_files":[],"touched_via":"structured","saved_at":0}"#;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{legacy}").unwrap();
+        }
+
+        truncate_to_turn(&path, 3).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("\"turn_id\":0"), "kept: {}", lines[0]);
+        assert!(lines[1].contains("\"turn_id\":1"), "kept: {}", lines[1]);
+        assert!(
+            !lines[2].contains("turn_id"),
+            "legacy line must not gain the field on rewrite: {}",
+            lines[2]
+        );
+        let kept = read_log(&path).unwrap();
+        assert_eq!(kept[0].turn_id, Some(0));
+        assert_eq!(kept[1].turn_id, Some(1));
+        assert_eq!(kept[2].turn_id, None);
     }
 
     #[test]

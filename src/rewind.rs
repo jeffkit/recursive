@@ -272,6 +272,7 @@ mod tests {
     fn rec(turn: usize, pre: Option<&str>, id: &str, touched: &[&str]) -> CheckpointRecord {
         CheckpointRecord {
             turn,
+            turn_id: Some(turn),
             pre: pre.map(|s| CheckpointId(s.to_string())),
             id: CheckpointId(id.to_string()),
             message: None,
@@ -394,6 +395,7 @@ mod tests {
             &log,
             &[CheckpointRecord {
                 turn: 0,
+                turn_id: Some(0),
                 pre: Some(pre.clone()),
                 id: post.clone(),
                 message: None,
@@ -430,6 +432,7 @@ mod tests {
             &log,
             &[CheckpointRecord {
                 turn: 0,
+                turn_id: Some(0),
                 pre: Some(pre.clone()),
                 id: post.clone(),
                 message: None,
@@ -467,6 +470,7 @@ mod tests {
             &log,
             &[CheckpointRecord {
                 turn: 0,
+                turn_id: Some(0),
                 pre: Some(pre.clone()),
                 id: post.clone(),
                 message: None,
@@ -509,6 +513,7 @@ mod tests {
             &log_a,
             &[CheckpointRecord {
                 turn: 0,
+                turn_id: Some(0),
                 pre: Some(pre_a.clone()),
                 id: post_a.clone(),
                 message: None,
