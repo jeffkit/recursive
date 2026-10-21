@@ -74,14 +74,19 @@ impl LocalStorageBackend {
     /// recover (the in-memory transcript is lost with the process). `keep`
     /// excludes exactly those.
     ///
-    /// Returns the number of persisted session records removed.
+    /// Returns a [`crate::storage::ReclaimReport`]: `removed` counts sessions
+    /// every record of which was deleted; a session whose tombstone or
+    /// key/value records could not be removed warns and is counted in
+    /// `failed` instead — counting it as removed would tell the caller the
+    /// retention contract was fulfilled while plaintext session data is still
+    /// on disk (issue #214).
     pub async fn purge_sessions_older_than(
         &self,
         cutoff: SystemTime,
         keep: &HashSet<String>,
-    ) -> Result<usize> {
+    ) -> Result<crate::storage::ReclaimReport> {
         let dir = self.sessions_dir();
-        let mut removed = 0;
+        let mut report = crate::storage::ReclaimReport::default();
         match tokio::fs::read_dir(&dir).await {
             Ok(mut entries) => {
                 while let Some(entry) = entries.next_entry().await.map_err(|e| Error::Storage {
@@ -107,12 +112,26 @@ impl LocalStorageBackend {
                     // enumerates `memory/`, so a sweep that left them behind
                     // would retain the session's title, custom system prompt and
                     // ledger past its retention window indefinitely.
+                    let mut session_failed = false;
                     for key in std::iter::once(crate::storage::deleted_marker_key(id))
                         .chain(crate::storage::session_payload_keys(id))
                     {
-                        let _ = remove_ignoring_missing(&self.memory_path(&key)).await;
+                        if let Err(err) = remove_ignoring_missing(&self.memory_path(&key)).await {
+                            session_failed = true;
+                            tracing::warn!(
+                                session_id = id,
+                                key = %key,
+                                error = %err,
+                                "retention: failed to delete a session's key/value record; \
+                                 plaintext session data is still on disk"
+                            );
+                        }
                     }
-                    removed += 1;
+                    if session_failed {
+                        report.failed += 1;
+                    } else {
+                        report.removed += 1;
+                    }
                 }
             }
             // A missing sessions dir means nothing to reap here — but a
@@ -124,8 +143,8 @@ impl LocalStorageBackend {
                 })
             }
         }
-        removed += self.purge_orphan_tombstones(cutoff).await;
-        Ok(removed)
+        report.removed += self.purge_orphan_tombstones(cutoff).await;
+        Ok(report)
     }
 
     /// Delete tombstones that are older than `cutoff` and whose transcript is
@@ -324,7 +343,7 @@ impl StorageBackend for LocalStorageBackend {
         &self,
         max_age: Duration,
         keep: &HashSet<String>,
-    ) -> Result<usize> {
+    ) -> Result<crate::storage::ReclaimReport> {
         let cutoff = SystemTime::now()
             .checked_sub(max_age)
             .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -595,12 +614,12 @@ mod tests {
         }
 
         let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        assert_eq!(
-            b.purge_sessions_older_than(cutoff, &HashSet::new())
-                .await
-                .unwrap(),
-            1
-        );
+        let report = b
+            .purge_sessions_older_than(cutoff, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failed, 0);
 
         assert!(
             !b.transcript_path("old").exists(),
@@ -659,7 +678,8 @@ mod tests {
         assert_eq!(
             b.purge_expired_sessions(Duration::from_secs(30 * 86_400), &HashSet::new())
                 .await
-                .unwrap(),
+                .unwrap()
+                .removed,
             1
         );
         assert!(!b.transcript_path("ancient").exists());
@@ -694,7 +714,13 @@ mod tests {
 
         let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
         let keep: HashSet<String> = ["running".to_string()].into_iter().collect();
-        assert_eq!(b.purge_sessions_older_than(cutoff, &keep).await.unwrap(), 1);
+        assert_eq!(
+            b.purge_sessions_older_than(cutoff, &keep)
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
 
         assert!(
             b.transcript_path("running").exists(),
@@ -744,7 +770,8 @@ mod tests {
         assert_eq!(
             b.purge_sessions_older_than(cutoff, &HashSet::new())
                 .await
-                .unwrap(),
+                .unwrap()
+                .removed,
             2
         );
 
@@ -797,7 +824,8 @@ mod tests {
         assert_eq!(
             b.purge_sessions_older_than(cutoff, &HashSet::new())
                 .await
-                .unwrap(),
+                .unwrap()
+                .removed,
             0
         );
         assert!(
@@ -846,19 +874,19 @@ mod tests {
     async fn purge_on_missing_sessions_dir_is_zero() {
         use std::time::{Duration, SystemTime};
         let (b, _dir) = backend();
-        assert_eq!(
-            b.purge_sessions_older_than(SystemTime::now(), &HashSet::new())
-                .await
-                .unwrap(),
-            0
-        );
+        let report = b
+            .purge_sessions_older_than(SystemTime::now(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failed, 0);
         // The trait-facing entry point must be lenient too.
-        assert_eq!(
-            b.purge_expired_sessions(Duration::from_secs(86_400), &HashSet::new())
-                .await
-                .unwrap(),
-            0
-        );
+        let report = b
+            .purge_expired_sessions(Duration::from_secs(86_400), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failed, 0);
     }
 
     /// "Missing" is the only read error the sweep may swallow. Anything else
@@ -892,6 +920,106 @@ mod tests {
         assert!(
             b.delete_transcript("stuck").await.is_err(),
             "a failed removal must not be reported as success"
+        );
+    }
+
+    /// Issue #214: a tombstone/payload blob that cannot be deleted (here: a
+    /// directory standing in for the file — `remove_file` fails with
+    /// EPERM/EISDIR, neither of which is NotFound) must not be counted as
+    /// removed. The session lands in the report's `failed` count and every
+    /// failure warns with the session id and the key that held out.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_payload_delete_is_failed_not_removed_and_warns() {
+        use std::time::Duration;
+
+        let (b, dir) = backend();
+        b.save_transcript("stuck", &make_messages()).await.unwrap();
+        b.save_memory("session-deleted/stuck", "1").await.unwrap();
+        for key in crate::storage::session_payload_keys("stuck") {
+            b.save_memory(&key, "{}").await.unwrap();
+        }
+        // Only the meta blob becomes undeletable; the rest must still go.
+        let meta = dir.path().join(".recursive/memory/session-meta/stuck");
+        std::fs::remove_file(&meta).unwrap();
+        std::fs::create_dir(&meta).unwrap();
+
+        let old_mtime = SystemTime::now() - Duration::from_secs(90 * 86_400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(b.transcript_path("stuck"))
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+        drop(f);
+
+        let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        let report = b
+            .purge_sessions_older_than(cutoff, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.failed, 1,
+            "the stuck session must be reported as failed"
+        );
+        assert_eq!(
+            report.removed, 0,
+            "a partially erased session must not count as removed"
+        );
+        assert!(
+            !b.transcript_path("stuck").exists(),
+            "the transcript itself is still reaped"
+        );
+        assert!(
+            meta.is_dir(),
+            "the undeletable blob stays on disk (the report and warnings name it)"
+        );
+        assert!(
+            b.load_memory("session-deleted/stuck")
+                .await
+                .unwrap()
+                .is_none(),
+            "the deletable records are still erased"
+        );
+        assert!(logs_contain("retention: failed to delete"));
+        assert!(logs_contain("stuck"), "the warning names the session id");
+        assert!(
+            logs_contain("session-meta/stuck"),
+            "the warning names the key"
+        );
+    }
+
+    /// Issue #214 acceptance: "already gone" stays a success — a session whose
+    /// tombstone/payload blobs were never written (or were removed
+    /// out-of-band) still counts as `removed`, with no warning noise.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn missing_payload_records_still_count_as_removed() {
+        use std::time::Duration;
+
+        let (b, _dir) = backend();
+        b.save_transcript("bare", &make_messages()).await.unwrap();
+        let old_mtime = SystemTime::now() - Duration::from_secs(90 * 86_400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(b.transcript_path("bare"))
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+        drop(f);
+
+        let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        let report = b
+            .purge_sessions_older_than(cutoff, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failed, 0);
+        assert!(
+            !logs_contain("retention: failed to delete"),
+            "a NotFound record is a success, not a degradation"
         );
     }
 

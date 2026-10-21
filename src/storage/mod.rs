@@ -42,6 +42,23 @@ use async_trait::async_trait;
 // StorageBackend
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What a retention sweep actually did (issue #214).
+///
+/// `removed` counts sessions whose every persisted record was deleted — a
+/// session whose key/value records could not be removed is reported in
+/// `failed` instead, so a caller can never read a partially erased session
+/// (plaintext title / system prompt / ledger still on disk) as "retention
+/// fulfilled". `failed > 0` means an operator should look at the warnings
+/// the sweep emitted and at what is still on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReclaimReport {
+    /// Sessions fully erased by the sweep (plus orphan tombstones reclaimed).
+    pub removed: usize,
+    /// Sessions whose transcript was reaped but whose tombstone or key/value
+    /// records could not be deleted (each failure also warns with the key).
+    pub failed: usize,
+}
+
 /// Persistent storage for session transcript and memory entries.
 ///
 /// # Semantics
@@ -119,7 +136,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn delete_memory(&self, key: &str) -> Result<()>;
 
     /// Retention: delete every persisted session older than `max_age`,
-    /// returning the number of session records removed.
+    /// reporting what the sweep removed and what it could not ([`ReclaimReport`]).
     ///
     /// `keep` names sessions that are still live in memory and must never be
     /// reaped. Retention is keyed on the *persisted copy's* age, and that copy
@@ -129,17 +146,17 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// age-based cleanup of *closed* sessions rather than a data-loss window
     /// for open ones. Callers with no live sessions pass an empty set.
     ///
-    /// The default is a no-op (`Ok(0)`) for backends that cannot enumerate
-    /// their contents (object stores normally enforce retention through a
-    /// bucket lifecycle policy instead). Backends that own an enumerable
-    /// store — [`local::LocalStorageBackend`] — override this so an operator
-    /// can bound how long plaintext transcripts sit on disk.
+    /// The default is a no-op (`Ok(ReclaimReport::default())`) for backends
+    /// that cannot enumerate their contents (object stores normally enforce
+    /// retention through a bucket lifecycle policy instead). Backends that own
+    /// an enumerable store — [`local::LocalStorageBackend`] — override this so
+    /// an operator can bound how long plaintext transcripts sit on disk.
     async fn purge_expired_sessions(
         &self,
         _max_age: std::time::Duration,
         _keep: &std::collections::HashSet<String>,
-    ) -> Result<usize> {
-        Ok(0)
+    ) -> Result<ReclaimReport> {
+        Ok(ReclaimReport::default())
     }
 }
 
@@ -494,7 +511,8 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            0
+            ReclaimReport::default(),
+            "a backend that cannot enumerate reports 'nothing removed', never a fabricated count"
         );
     }
 

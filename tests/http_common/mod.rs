@@ -216,12 +216,15 @@ impl StorageBackend for MemoryStorage {
         &self,
         max_age: std::time::Duration,
         keep: &std::collections::HashSet<String>,
-    ) -> recursive::error::Result<usize> {
+    ) -> recursive::error::Result<recursive::storage::ReclaimReport> {
         self.purges.lock().unwrap().push(max_age);
         let mut keep: Vec<String> = keep.iter().cloned().collect();
         keep.sort();
         self.purge_keep.lock().unwrap().push(keep);
-        Ok(self.purge_result.load(std::sync::atomic::Ordering::Relaxed))
+        Ok(recursive::storage::ReclaimReport {
+            removed: self.purge_result.load(std::sync::atomic::Ordering::Relaxed),
+            failed: 0,
+        })
     }
 }
 

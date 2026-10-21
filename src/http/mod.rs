@@ -2218,7 +2218,7 @@ pub(super) fn session_retention_from_env() -> Option<std::time::Duration> {
 }
 
 /// One retention sweep: ask the storage backend to drop sessions older than
-/// `max_age`. Returns the number of session records removed.
+/// `max_age`. Returns the number of session records fully removed.
 ///
 /// The window is a parameter rather than an env read so the sweep is testable
 /// without racing process-global env; the reaper supplies
@@ -2226,17 +2226,30 @@ pub(super) fn session_retention_from_env() -> Option<std::time::Duration> {
 /// sweep can never reap the only copy a crash could recover (see
 /// [`StorageBackend::purge_expired_sessions`]). Backends that don't implement
 /// enumeration (object stores enforce retention through a lifecycle policy)
-/// answer `Ok(0)` — the trait default.
+/// answer a zero report — the trait default. Sessions the backend could not
+/// fully erase are reported in the report's `failed` count (#214) and warned
+/// here: they are *not* part of the returned "removed" figure.
 pub(super) async fn purge_expired_transcripts(
     state: &AppState,
     max_age: std::time::Duration,
 ) -> usize {
     let keep: HashSet<String> = state.host.sessions().read().await.keys().cloned().collect();
     match state.storage.purge_expired_sessions(max_age, &keep).await {
-        Ok(0) => 0,
-        Ok(n) => {
-            tracing::info!(removed = n, "retention: purged expired session records");
-            n
+        Ok(report) => {
+            if report.removed > 0 {
+                tracing::info!(
+                    removed = report.removed,
+                    "retention: purged expired session records"
+                );
+            }
+            if report.failed > 0 {
+                tracing::warn!(
+                    failed = report.failed,
+                    "retention: expired session records could not be fully erased; \
+                     plaintext data may remain on disk"
+                );
+            }
+            report.removed
         }
         Err(e) => {
             tracing::warn!(error = %e, "retention sweep failed");
@@ -2582,6 +2595,8 @@ mod goal_396_persistence_tests {
         purge_keep: std::sync::Mutex<Vec<Vec<String>>>,
         /// What `purge_expired_sessions` reports as "removed".
         purge_result: std::sync::atomic::AtomicUsize,
+        /// What `purge_expired_sessions` reports as "failed" (issue #214).
+        purge_failed: std::sync::atomic::AtomicUsize,
         probe_sessions: Option<Arc<RwLock<SessionsMap>>>,
     }
 
@@ -2650,12 +2665,15 @@ mod goal_396_persistence_tests {
             &self,
             max_age: std::time::Duration,
             keep: &std::collections::HashSet<String>,
-        ) -> crate::error::Result<usize> {
+        ) -> crate::error::Result<crate::storage::ReclaimReport> {
             self.purges.lock().unwrap().push(max_age);
             let mut keep: Vec<String> = keep.iter().cloned().collect();
             keep.sort();
             self.purge_keep.lock().unwrap().push(keep);
-            Ok(self.purge_result.load(std::sync::atomic::Ordering::Relaxed))
+            Ok(crate::storage::ReclaimReport {
+                removed: self.purge_result.load(std::sync::atomic::Ordering::Relaxed),
+                failed: self.purge_failed.load(std::sync::atomic::Ordering::Relaxed),
+            })
         }
     }
 
@@ -3246,6 +3264,34 @@ mod goal_396_persistence_tests {
             storage.purge_keep(),
             vec![vec!["live".to_string()]],
             "live session ids must be excluded from the sweep"
+        );
+    }
+
+    /// Issue #214: sessions the backend could not fully erase are reported in
+    /// the report's `failed` count — the caller sees only the removed figure,
+    /// and the partial erasure warns (plaintext data may remain on disk).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn retention_sweep_warns_when_records_cannot_be_erased() {
+        let host = test_host(0);
+        let storage = RecordingStorage::new();
+        storage
+            .purge_result
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        storage
+            .purge_failed
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let state = test_state(host, storage.clone(), None).await;
+
+        assert_eq!(
+            purge_expired_transcripts(&state, std::time::Duration::from_secs(86_400)).await,
+            3,
+            "failed sessions must not be counted as removed"
+        );
+        assert!(logs_contain("could not be fully erased"));
+        assert!(
+            logs_contain("failed=2"),
+            "the warning carries the failed count"
         );
     }
 }
