@@ -32,6 +32,29 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Issue #220: an env override that fails to parse must leave a trace — warn
+/// with the var name and raw value, keep the default. (The startup-stage
+/// `parse_env` error paradigm is not available here: the sole caller sits in
+/// the kernel builder, which has no error channel for this knob yet.)
+fn retry_env<T: std::str::FromStr>(name: &str, default: T) -> T
+where
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => raw.parse::<T>().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "recursive::llm",
+                var = name,
+                value = %raw,
+                error = %e,
+                "unparsable retry override; keeping the default (issue #220)"
+            );
+            default
+        }),
+    }
+}
+
 impl RetryPolicy {
     /// Cross-step retry policy for a whole ReAct step (issue #100).
     ///
@@ -54,28 +77,21 @@ impl RetryPolicy {
 
     /// [`RetryPolicy::for_step_loop`] with env overrides:
     /// `RECURSIVE_STEP_RETRY_MAX`, `RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS`
-    /// and `RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS`. Unset or unparseable
-    /// values keep the default.
+    /// and `RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS`. Unset values keep the
+    /// default; a present-but-unparsable value warns (issue #220 — the only
+    /// caller is kernel build, so the warn surfaces once at startup) and
+    /// keeps the default for that knob.
     pub fn for_step_loop_from_env() -> Self {
         let mut policy = Self::for_step_loop();
-        if let Some(v) = std::env::var("RECURSIVE_STEP_RETRY_MAX")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            policy.max_retries = v;
-        }
-        if let Some(v) = std::env::var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            policy.initial_backoff = Duration::from_secs(v);
-        }
-        if let Some(v) = std::env::var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            policy.max_backoff = Duration::from_secs(v);
-        }
+        policy.max_retries = retry_env("RECURSIVE_STEP_RETRY_MAX", policy.max_retries);
+        policy.initial_backoff = Duration::from_secs(retry_env(
+            "RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS",
+            policy.initial_backoff.as_secs(),
+        ));
+        policy.max_backoff = Duration::from_secs(retry_env(
+            "RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS",
+            policy.max_backoff.as_secs(),
+        ));
         policy
     }
 
@@ -638,15 +654,34 @@ mod tests {
         std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "9");
         std::env::set_var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS", "3");
         std::env::set_var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS", "120");
-        // A nonsense value must be ignored, not panic.
+        // A nonsense value must be ignored (with a warn — issue #220), not
+        // panic and not disable the other overrides.
         std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "not-a-number");
+        let policy = RetryPolicy::for_step_loop_from_env();
         assert_eq!(
-            RetryPolicy::for_step_loop_from_env().max_retries,
+            policy.max_retries,
             RetryPolicy::for_step_loop().max_retries,
             "unparseable env must fall back to the default"
         );
+        assert_eq!(policy.initial_backoff, Duration::from_secs(3));
+        assert_eq!(policy.max_backoff, Duration::from_secs(120));
+
+        // Same for the two backoff vars (issue #220 acceptance: every var
+        // gets a present-but-bad case).
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "9");
+        std::env::set_var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS", "soon");
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS", "lots");
+        let policy = RetryPolicy::for_step_loop_from_env();
+        assert_eq!(policy.max_retries, 9);
+        assert_eq!(
+            policy.initial_backoff,
+            RetryPolicy::for_step_loop().initial_backoff
+        );
+        assert_eq!(policy.max_backoff, RetryPolicy::for_step_loop().max_backoff);
 
         std::env::set_var("RECURSIVE_STEP_RETRY_MAX", "9");
+        std::env::set_var("RECURSIVE_STEP_RETRY_INITIAL_BACKOFF_SECS", "3");
+        std::env::set_var("RECURSIVE_STEP_RETRY_MAX_BACKOFF_SECS", "120");
         let policy = RetryPolicy::for_step_loop_from_env();
         assert_eq!(policy.max_retries, 9);
         assert_eq!(policy.initial_backoff, Duration::from_secs(3));

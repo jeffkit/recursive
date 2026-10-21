@@ -899,7 +899,11 @@ fn derive_max_tokens(
 /// user didn't set it → use the default/file fallback); only present-but-bad
 /// input is an error, so a typo like `RECURSIVE_MAX_STEPS=1o0` surfaces at
 /// startup instead of silently becoming unlimited.
-fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, Error>
+///
+/// `pub(crate)` since issue #220: startup-stage `from_env` helpers outside
+/// config (run_core's hard step cap, e2b's timeout) share this paradigm so a
+/// typo'd override fails loudly in the same shape everywhere.
+pub(crate) fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, Error>
 where
     <T as std::str::FromStr>::Err: std::fmt::Display,
 {

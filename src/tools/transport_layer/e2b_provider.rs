@@ -79,10 +79,9 @@ impl E2bConfig {
                 message: "RECURSIVE_E2B_API_KEY not set".into(),
             })?,
             template_id: std::env::var("RECURSIVE_E2B_TEMPLATE").unwrap_or_else(|_| "base".into()),
-            timeout_secs: std::env::var("RECURSIVE_E2B_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3600),
+            // Issue #220: a present-but-bad timeout is a startup error naming
+            // the var and raw value (the parse_env paradigm), not a silent 3600.
+            timeout_secs: crate::config::parse_env("RECURSIVE_E2B_TIMEOUT_SECS", 3600u32)?,
             api_base: std::env::var("RECURSIVE_E2B_API_BASE")
                 .unwrap_or_else(|_| "https://api.e2b.dev".into()),
         };
@@ -1058,10 +1057,22 @@ mod tests {
         assert_eq!(c.template_id, "custom");
         std::env::set_var("RECURSIVE_SANDBOX_NETWORK", "on");
 
-        // Non-numeric timeout falls back to the default (documented).
+        // Non-numeric timeout is a startup error naming the var and the raw
+        // value (issue #220 — a silent fallback to 3600 hid the typo).
         std::env::set_var("RECURSIVE_E2B_TIMEOUT_SECS", "not-a-number");
-        let c = E2bConfig::from_env().unwrap();
-        assert_eq!(c.timeout_secs, 3600);
+        match E2bConfig::from_env() {
+            Err(Error::Config { message }) => {
+                assert!(
+                    message.contains("RECURSIVE_E2B_TIMEOUT_SECS"),
+                    "error must name the var, got: {message}"
+                );
+                assert!(
+                    message.contains("not-a-number"),
+                    "error must carry the raw value, got: {message}"
+                );
+            }
+            other => panic!("expected a Config error for the bad timeout, got {other:?}"),
+        }
 
         // base + opted in → capabilities report network=true.
         std::env::remove_var("RECURSIVE_E2B_TEMPLATE");

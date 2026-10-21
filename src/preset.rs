@@ -239,31 +239,36 @@ impl AgentPreset {
     fn resolve_context(&self, model: &str, env: &PresetEnv) -> ContextFacts {
         let decl = self.context;
 
-        // Compaction: env `0`/`off`/`false` (or anything unparsable) disables;
-        // a positive integer is an explicit char threshold; unset takes the
-        // declaration. The token threshold is always derived from the model —
-        // it is the more reliable trigger for CJK content.
-        let compaction = match parse_toggle(env.compact_threshold.as_deref()) {
-            Toggle::Unset => decl.compaction,
-            Toggle::Disabled => None,
-            Toggle::Value(n) => Some(CompactionMode::Chars(n)),
-        }
-        .map(|mode| {
-            let threshold_chars = match mode {
-                CompactionMode::Auto => default_compact_threshold_chars(model),
-                CompactionMode::Chars(n) => n,
-            };
-            // Borrow the default keep-count from the compactor itself so the
-            // two cannot drift.
-            let template = Compactor::new(threshold_chars);
-            CompactionFacts {
-                threshold_chars,
-                threshold_prompt_tokens: Some(default_compact_threshold_tokens(model)),
-                keep_recent_n: template.keep_recent_n,
+        // Compaction: env `0`/`off`/`false` disables (an unparsable value
+        // warns and disables — issue #220); a positive integer is an explicit
+        // char threshold; unset takes the declaration. The token threshold is
+        // always derived from the model — it is the more reliable trigger for
+        // CJK content.
+        let compaction =
+            match parse_toggle(COMPACT_THRESHOLD_ENV, env.compact_threshold.as_deref()) {
+                Toggle::Unset => decl.compaction,
+                Toggle::Disabled => None,
+                Toggle::Value(n) => Some(CompactionMode::Chars(n)),
             }
-        });
+            .map(|mode| {
+                let threshold_chars = match mode {
+                    CompactionMode::Auto => default_compact_threshold_chars(model),
+                    CompactionMode::Chars(n) => n,
+                };
+                // Borrow the default keep-count from the compactor itself so the
+                // two cannot drift.
+                let template = Compactor::new(threshold_chars);
+                CompactionFacts {
+                    threshold_chars,
+                    threshold_prompt_tokens: Some(default_compact_threshold_tokens(model)),
+                    keep_recent_n: template.keep_recent_n,
+                }
+            });
 
-        let microcompaction = match parse_toggle(env.microcompact_trigger.as_deref()) {
+        let microcompaction = match parse_toggle(
+            MICROCOMPACT_TRIGGER_ENV,
+            env.microcompact_trigger.as_deref(),
+        ) {
             // Unset: the declaration is already the resolved shape.
             Toggle::Unset => decl.microcompaction,
             Toggle::Disabled => None,
@@ -276,7 +281,10 @@ impl AgentPreset {
             .map(MicrocompactionSpec::facts),
         };
 
-        let max_transcript_chars = match parse_toggle(env.max_transcript_chars.as_deref()) {
+        let max_transcript_chars = match parse_toggle(
+            MAX_TRANSCRIPT_CHARS_ENV,
+            env.max_transcript_chars.as_deref(),
+        ) {
             Toggle::Unset => decl.max_transcript_chars,
             Toggle::Disabled => None,
             Toggle::Value(n) => Some(n),
@@ -430,18 +438,27 @@ fn var(name: &str) -> Option<String> {
 enum Toggle {
     /// Not set — the declaration decides.
     Unset,
-    /// Explicitly off, or unparsable (the historical tolerance).
+    /// Explicitly off — or an unparsable value, which warns first and then
+    /// disables (issue #220: the degradation must be observable).
     Disabled,
     Value(usize),
 }
 
-fn parse_toggle(raw: Option<&str>) -> Toggle {
+fn parse_toggle(name: &str, raw: Option<&str>) -> Toggle {
     match raw {
         None => Toggle::Unset,
         Some("0") | Some("off") | Some("false") => Toggle::Disabled,
         Some(s) => match parse_positive(Some(s)) {
             Some(n) => Toggle::Value(n),
-            None => Toggle::Disabled,
+            None => {
+                tracing::warn!(
+                    target: "recursive::preset",
+                    var = name,
+                    value = s,
+                    "unparsable toggle value; treating the capability as disabled (issue #220)"
+                );
+                Toggle::Disabled
+            }
         },
     }
 }
@@ -943,6 +960,37 @@ mod tests {
     }
 
     // ── declaration / resolution ──────────────────────────────────────────
+
+    #[test]
+    fn parse_toggle_tri_state() {
+        // Issue #220: the off syntax and the unset/value arms are unchanged;
+        // only the unparsable arm gains a warn.
+        assert_eq!(parse_toggle("RECURSIVE_X", None), Toggle::Unset);
+        for off in ["0", "off", "false"] {
+            assert_eq!(
+                parse_toggle("RECURSIVE_X", Some(off)),
+                Toggle::Disabled,
+                "explicit off syntax must keep working: {off}"
+            );
+        }
+        assert_eq!(
+            parse_toggle("RECURSIVE_X", Some("8192")),
+            Toggle::Value(8192)
+        );
+    }
+
+    #[test]
+    fn parse_toggle_unparsable_disables() {
+        // Issue #220: the unparsable value still falls back to Disabled (the
+        // runtime-read class falls back + warns rather than erroring), but the
+        // capability being switched off is now observable — the warn carries
+        // the var name and raw value (asserted indirectly here: the fallback
+        // behaviour is pinned; the WARN itself is observational).
+        assert_eq!(
+            parse_toggle("RECURSIVE_COMPACT_THRESHOLD", Some("8o92")),
+            Toggle::Disabled
+        );
+    }
 
     #[test]
     fn standard_preset_declares_compaction_and_reinjection() {

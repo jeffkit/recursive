@@ -1706,7 +1706,7 @@ impl<'a> RunCore<'a> {
         > = std::collections::HashMap::new();
         self.total_llm_latency_ms = 0;
 
-        let step_cap = effective_step_limit(self.max_steps);
+        let step_cap = effective_step_limit(self.max_steps)?;
         for step in 1..=step_cap {
             // Attached with `.instrument()`, not an `enter()` guard: a guard
             // held across `.await` leaks the span onto other tasks.
@@ -1845,23 +1845,24 @@ impl<'a> RunCore<'a> {
 /// See `RECURSIVE_HARD_STEP_CAP` doc in `.dev/AGENTS.md` / README. If the
 /// env var is set to a positive integer, the cap is clamped to that value;
 /// when unset or zero, `max_steps=0` still means `usize::MAX`.
-fn effective_step_limit(max_steps: usize) -> usize {
+fn effective_step_limit(max_steps: usize) -> Result<usize, crate::error::Error> {
     let requested = if max_steps == 0 {
         usize::MAX
     } else {
         max_steps
     };
-    match hard_step_cap_from_env() {
-        Some(cap) if cap > 0 => requested.min(cap),
-        _ => requested,
-    }
+    Ok(match hard_step_cap_from_env()? {
+        Some(cap) => requested.min(cap),
+        None => requested,
+    })
 }
 
-/// Read `RECURSIVE_HARD_STEP_CAP`; `None`/unparseable/`0` = unset.
-fn hard_step_cap_from_env() -> Option<usize> {
-    std::env::var("RECURSIVE_HARD_STEP_CAP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+/// Read `RECURSIVE_HARD_STEP_CAP` (issue #220): absent or `0` → `None` (no
+/// override); present-but-bad → `Err` naming the var and raw value — a typo
+/// must not silently disarm the runaway-step insurance.
+fn hard_step_cap_from_env() -> Result<Option<usize>, crate::error::Error> {
+    crate::config::parse_env::<usize>("RECURSIVE_HARD_STEP_CAP", 0)
+        .map(|cap| (cap > 0).then_some(cap))
 }
 
 #[cfg(test)]
@@ -1905,8 +1906,8 @@ mod tests {
         // Env var must be unset for this test — its presence would clamp.
         let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
         std::env::remove_var("RECURSIVE_HARD_STEP_CAP");
-        assert_eq!(effective_step_limit(0), usize::MAX);
-        assert_eq!(effective_step_limit(32), 32);
+        assert_eq!(effective_step_limit(0).unwrap(), usize::MAX);
+        assert_eq!(effective_step_limit(32).unwrap(), 32);
         if let Some(v) = orig {
             std::env::set_var("RECURSIVE_HARD_STEP_CAP", v);
         }
@@ -1919,11 +1920,11 @@ mod tests {
         std::env::set_var("RECURSIVE_HARD_STEP_CAP", "1000");
 
         // Unlimited path is clamped to the cap.
-        assert_eq!(effective_step_limit(0), 1000);
+        assert_eq!(effective_step_limit(0).unwrap(), 1000);
         // Limited path below the cap stays as-is.
-        assert_eq!(effective_step_limit(32), 32);
+        assert_eq!(effective_step_limit(32).unwrap(), 32);
         // Limited path above the cap is clamped.
-        assert_eq!(effective_step_limit(5000), 1000);
+        assert_eq!(effective_step_limit(5000).unwrap(), 1000);
 
         if let Some(v) = orig {
             std::env::set_var("RECURSIVE_HARD_STEP_CAP", v);
@@ -1933,14 +1934,29 @@ mod tests {
     }
 
     #[test]
-    fn effective_step_limit_ignores_invalid_hard_cap() {
+    fn effective_step_limit_rejects_invalid_hard_cap() {
+        // Issue #220: a present-but-unparsable cap is a startup error naming
+        // the var and the raw value — a typo must not silently disarm the
+        // runaway-step insurance.
         let _guard = HARD_CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("RECURSIVE_HARD_STEP_CAP").ok();
         std::env::set_var("RECURSIVE_HARD_STEP_CAP", "not-a-number");
-        assert_eq!(effective_step_limit(0), usize::MAX);
+        match effective_step_limit(0) {
+            Err(crate::error::Error::Config { message }) => {
+                assert!(
+                    message.contains("RECURSIVE_HARD_STEP_CAP"),
+                    "error must name the var, got: {message}"
+                );
+                assert!(
+                    message.contains("not-a-number"),
+                    "error must carry the raw value, got: {message}"
+                );
+            }
+            other => panic!("expected a Config error for the bad cap, got {other:?}"),
+        }
         std::env::set_var("RECURSIVE_HARD_STEP_CAP", "0");
-        // Cap value of 0 is treated as "unset" → unlimited preserved.
-        assert_eq!(effective_step_limit(0), usize::MAX);
+        // Cap value of 0 is still "unset" → unlimited preserved.
+        assert_eq!(effective_step_limit(0).unwrap(), usize::MAX);
         if let Some(v) = orig {
             std::env::set_var("RECURSIVE_HARD_STEP_CAP", v);
         } else {

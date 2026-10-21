@@ -1126,12 +1126,30 @@ fn extract_body(content: &str) -> &str {
 ///
 /// Overridden by `RECURSIVE_SKILL_INDEX_BUDGET` env var. Reads on every
 /// call so test setups that toggle the env var take effect immediately.
+/// Issue #220: a present-but-unusable value (unparsable or non-positive)
+/// falls back to the default and warns once per process — the index renders
+/// per turn, so warning on every read would flood the log.
 pub fn default_skill_index_budget() -> usize {
-    std::env::var("RECURSIVE_SKILL_INDEX_BUDGET")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(8000)
+    const DEFAULT: usize = 8000;
+    static BUDGET_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match std::env::var("RECURSIVE_SKILL_INDEX_BUDGET") {
+        Err(_) => DEFAULT,
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                if !BUDGET_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "recursive::skills",
+                        var = "RECURSIVE_SKILL_INDEX_BUDGET",
+                        value = %raw,
+                        "unusable byte budget (expected a positive integer); \
+                         falling back to the default (issue #220)"
+                    );
+                }
+                DEFAULT
+            }
+        },
+    }
 }
 
 /// Per-entry description truncation cap used when the full rendering
@@ -2419,11 +2437,11 @@ mod tests {
         std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "1234");
         assert_eq!(default_skill_index_budget(), 1234);
 
-        // Garbage value → falls back to default (filter rejects non-parseable)
+        // Garbage value → falls back to default (and warns once — issue #220)
         std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "not-a-number");
         assert_eq!(default_skill_index_budget(), 8000);
 
-        // Zero → falls back to default (filter rejects n > 0)
+        // Zero → falls back to default (a budget must be positive)
         std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "0");
         assert_eq!(default_skill_index_budget(), 8000);
 
