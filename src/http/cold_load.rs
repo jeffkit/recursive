@@ -829,7 +829,7 @@ mod tests {
             "sess-98",
             &SessionMeta {
                 system_prompt: Some("You are a pirate.".into()),
-                permission_mode: Some("auto".into()),
+                permission_mode: Some("strict".into()),
                 title: Some("pirate chat".into()),
                 max_steps: Some(7),
                 preset: Some("standard".into()),
@@ -856,7 +856,7 @@ mod tests {
         assert!(
             matches!(
                 rt.kernel().tools().permission_mode(),
-                crate::permissions::PermissionMode::Auto
+                crate::permissions::PermissionMode::Strict
             ),
             "the persisted permission mode must be restored"
         );

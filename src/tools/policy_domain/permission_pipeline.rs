@@ -10,7 +10,9 @@
 //!    arguments so the static check can fire on protected paths (`.git`,
 //!    `.ssh`, etc.).
 //! 2. **Auto-mode LLM classifier** (Goal 200) — for `PermissionMode::Auto`,
-//!    delegate the decision to the configured `AutoClassifier`.
+//!    delegate the decision to the configured `AutoClassifier`. Without a
+//!    classifier the mode fails closed (issue #182): every call is denied
+//!    rather than silently falling back to `default` semantics.
 //! 3. **Static permission check** — `LayeredPermissionsConfig::check_static`.
 //! 4. **Strict-mode handling** — `Permission::Unknown` under Strict mode
 //!    becomes a `Denied`.
@@ -160,11 +162,30 @@ impl<'a> PermissionPipeline<'a> {
                             // Allowed by classifier — fall through to static check.
                         }
                         Err(_e) => {
-                            // Classifier error — conservative: allow static check to decide.
+                            // Classifier error — conservative: allow static check
+                            // to decide, but the degradation must be observable
+                            // (owner ruling: silent diversion is a defect).
+                            tracing::warn!(
+                                target: "recursive::permissions",
+                                "auto-classifier failed; falling back to static rules"
+                            );
                         }
                     }
+                } else {
+                    // Issue #182: `auto` advertises "the classifier decides",
+                    // but with no classifier wired the fall-through to the
+                    // static check silently degraded to `default` semantics —
+                    // an advertised safety switch that did nothing. Fail
+                    // closed instead: every tool call is denied until a
+                    // classifier is attached (`with_auto_classifier`).
+                    return CheckOutcome::Deny {
+                        error: Error::PermissionDenied {
+                            name: tool_name.into(),
+                            reason: DecisionReason::Mode(PermissionMode::Auto),
+                        },
+                        audit: Box::new(AuditMeta::synthetic_unknown_tool(tool_name)),
+                    };
                 }
-                // If no classifier configured in Auto mode, fall through to static check.
             }
 
             // Phase 3: static permission check.
@@ -595,6 +616,50 @@ mod tests {
             .check("Bash", serde_json::json!({"command": "ls"}))
             .await;
         assert!(outcome.is_deny());
+    }
+
+    // ── Issue #182: `auto` without a classifier fails closed ─────────────────
+    // The classifier-wired companion test lives in
+    // `tests/permission_auto_fail_closed.rs`: this module may not import
+    // `crate::llm` internals (invariant #2, orthogonality), and building an
+    // `AutoClassifier` needs a `ChatProvider` mock.
+
+    /// `auto` mode with no classifier attached denies every tool — including
+    /// read-only tools and explicitly allowed ones — instead of silently
+    /// degrading to `default` ("unknown = allow") semantics.
+    #[tokio::test]
+    async fn auto_without_classifier_denies_fail_closed() {
+        use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Auto,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                allow: vec!["Read".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = ToolRegistry::local().with_permissions(config);
+        let pipeline = PermissionPipeline::new(&registry);
+        for (name, args) in [
+            ("Bash", serde_json::json!({"command": "ls"})),
+            ("Read", serde_json::json!({"path": "src/lib.rs"})),
+        ] {
+            match pipeline.check(name, args).await {
+                CheckOutcome::Deny { error, .. } => assert!(
+                    matches!(
+                        error,
+                        Error::PermissionDenied {
+                            reason: DecisionReason::Mode(PermissionMode::Auto),
+                            ..
+                        }
+                    ),
+                    "`{name}` must be denied by the fail-closed auto mode, got: {error:?}"
+                ),
+                CheckOutcome::Allow { .. } => {
+                    panic!("`{name}` must not be allowed in auto mode without a classifier")
+                }
+            }
+        }
     }
 
     /// Hook Transform → CheckOutcome::Allow with transformed arguments.

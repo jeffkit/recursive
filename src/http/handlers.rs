@@ -907,10 +907,17 @@ pub(super) async fn run_agent(
 
 /// Parse `permission_mode` string from an API request body.
 ///
-/// Accepted values (case-insensitive): `"default"`, `"auto"`, `"strict"`,
+/// Accepted values (case-insensitive): `"default"`, `"strict"`,
 /// `"acceptEdits"`, `"dontAsk"`, `"plan"`, and `"bypass"` /
 /// `"bypass_permissions"` (the last only when the server was started with
 /// `allow_bypass_permissions`).
+///
+/// Issue #182: `"auto"` is rejected with a 400. The LLM classifier it
+/// promises is not wired into serving, so accepting it used to hand out a
+/// session that silently behaved as `default` (fail-open) — the opposite of
+/// the advertised classifier gating. The kernel also fails closed on an
+/// operator-configured `auto` without a classifier, so the value can no
+/// longer stand for "usable but does nothing".
 ///
 /// Issue #151: an unrecognised value — or `bypass` on a server that does not
 /// allow it — is an error. Both used to be folded into `Default`, so a typo
@@ -928,7 +935,12 @@ pub(super) async fn run_agent(
 pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> Result<PermissionMode, String> {
     match s.to_ascii_lowercase().as_str() {
         "default" => Ok(PermissionMode::Default),
-        "auto" => Ok(PermissionMode::Auto),
+        // Issue #182: fail closed at the vocabulary, with an auto-specific
+        // message rather than the generic unknown-value one.
+        "auto" => Err("permission_mode `auto` is not available: the auto \
+             classifier is not wired into serving; while unwired, an \
+             operator-configured `auto` denies every tool call"
+            .to_string()),
         "strict" => Ok(PermissionMode::Strict),
         "acceptedits" | "accept_edits" => Ok(PermissionMode::AcceptEdits),
         "dontask" | "dont_ask" => Ok(PermissionMode::DontAsk),
@@ -946,7 +958,7 @@ pub(super) fn parse_permission_mode(s: &str, allow_bypass: bool) -> Result<Permi
         }
         _ => Err(format!(
             "unknown permission_mode `{s}`; expected one of \
-             \"default\", \"auto\", \"strict\", \"acceptEdits\", \
+             \"default\", \"strict\", \"acceptEdits\", \
              \"dontAsk\", \"plan\", \"bypass\""
         )),
     }
@@ -5846,14 +5858,17 @@ mod tests {
 
     #[test]
     fn parse_permission_mode_all_variants() {
-        assert_eq!(
-            parse_permission_mode("auto", false),
-            Ok(PermissionMode::Auto)
-        );
-        assert_eq!(
-            parse_permission_mode("AUTO", true),
-            Ok(PermissionMode::Auto)
-        );
+        // Issue #182: `auto` is not in the request vocabulary while the
+        // classifier is unwired; both casings get the auto-specific message
+        // (not the generic unknown-value one).
+        for spelling in ["auto", "AUTO"] {
+            let err = parse_permission_mode(spelling, false)
+                .expect_err("auto must be rejected while the classifier is unwired");
+            assert!(
+                err.contains("auto classifier is not wired"),
+                "the error must explain why `auto` is unavailable: {err}"
+            );
+        }
         assert_eq!(
             parse_permission_mode("strict", false),
             Ok(PermissionMode::Strict)
@@ -6013,7 +6028,6 @@ mod tests {
         let err = parse_permission_mode("xyz", false).expect_err("unknown value");
         for allowed in [
             "default",
-            "auto",
             "strict",
             "acceptEdits",
             "dontAsk",

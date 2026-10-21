@@ -384,7 +384,7 @@ mod cold_load_tests {
             "/sessions",
             Some(serde_json::json!({
                 "system_prompt": "You are a pirate.",
-                "permission_mode": "auto",
+                "permission_mode": "strict",
             })),
         )
         .await;
@@ -426,12 +426,46 @@ mod cold_load_tests {
             system_msg["content"]
         );
         assert_eq!(
-            detail["permission_mode"], "auto",
+            detail["permission_mode"], "strict",
             "permission mode must survive the restart"
         );
         // The user prompt is still extracted from the restored transcript.
         assert_eq!(detail["first_prompt"], "hi");
         assert_eq!(detail["last_prompt"], "hi");
+    }
+
+    /// Issue #182: `permission_mode: "auto"` is not in the request vocabulary
+    /// while the classifier is unwired — a 400 with an auto-specific message,
+    /// not a session that silently behaves as `default`.
+    #[tokio::test]
+    async fn auto_permission_mode_is_rejected() {
+        let (_dir, backend) = fresh_storage();
+        SET_INSECURE_OK.call_once(|| {
+            unsafe { std::env::set_var("RECURSIVE_HTTP_AUTH_INSECURE_OK", "1") };
+        });
+        let state = sample_state_with_storage(Arc::new(MockProvider::new(vec![])), backend.clone());
+        let app = build_router(state);
+
+        for spelling in ["auto", "AUTO"] {
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/sessions",
+                Some(serde_json::json!({
+                    "system_prompt": "You are a pirate.",
+                    "permission_mode": spelling,
+                })),
+            )
+            .await;
+            assert_eq!(status, 400, "`{spelling}` must be rejected");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("auto classifier is not wired"),
+                "the error must explain why auto is unavailable: {body}"
+            );
+        }
     }
 
     /// Issue #102 acceptance: `DELETE ?purge=true` must leave **no copy** of the

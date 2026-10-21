@@ -423,9 +423,11 @@ pub struct CreateSessionRequest {
     /// *provider* setting, so setting it builds a provider for this session
     /// with `thinking.budget_tokens = n` instead of reusing the server's.
     pub thinking_budget: Option<u32>,
-    /// Permission mode: `"default"`, `"auto"`, `"strict"`, `"acceptEdits"`,
+    /// Permission mode: `"default"`, `"strict"`, `"acceptEdits"`,
     /// `"dontAsk"`, `"plan"`, or `"bypass"` (the last only where the operator
-    /// opted in with `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`).
+    /// opted in with `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`). `"auto"` is
+    /// rejected with a 400: the classifier it promises is not wired into
+    /// serving (issue #182).
     ///
     /// Issue #151: the server's operator-configured mode is a ceiling — a
     /// request may only tighten it, never loosen it (not even into `bypass`).
@@ -897,9 +899,11 @@ pub struct RunRequest {
     /// building a provider for this run with
     /// `thinking = {type: "enabled", budget_tokens: n}`.
     pub thinking_budget: Option<u32>,
-    /// Permission mode: `"default"`, `"auto"`, `"strict"`, `"acceptEdits"`,
+    /// Permission mode: `"default"`, `"strict"`, `"acceptEdits"`,
     /// `"dontAsk"`, `"plan"`, or `"bypass"` (the last only where the operator
-    /// opted in with `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`).
+    /// opted in with `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`). `"auto"` is
+    /// rejected with a 400: the classifier it promises is not wired into
+    /// serving (issue #182).
     ///
     /// Issue #151: the server's operator-configured mode is a ceiling — a
     /// request may only tighten it, never loosen it (not even into `bypass`).
@@ -1864,7 +1868,6 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             "type": "string",
                             "enum": [
                                 "default",
-                                "auto",
                                 "strict",
                                 "acceptEdits",
                                 "dontAsk",
@@ -1872,7 +1875,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
                                 "bypass"
                             ],
                             "nullable": true,
-                            "description": "Requested permission mode. The server's operator-configured mode is a ceiling: a request may tighten it, never loosen it. Accepted values (case-insensitive): default, auto, strict, acceptEdits, dontAsk, plan, bypass. Unknown values, `bypass` when RECURSIVE_ALLOW_BYPASS_PERMISSIONS is unset, and any value that would loosen the operator mode are rejected with 400 — `bypass` included: the opt-in only makes the value parseable, and widening an operator mode into it would skip that mode's rule layers."
+                            "description": "Requested permission mode. The server's operator-configured mode is a ceiling: a request may tighten it, never loosen it. Accepted values (case-insensitive): default, strict, acceptEdits, dontAsk, plan, bypass. `auto` is rejected with 400 — the classifier it promises is not wired into serving (issue #182). Unknown values, `bypass` when RECURSIVE_ALLOW_BYPASS_PERMISSIONS is unset, and any value that would loosen the operator mode are rejected with 400 — `bypass` included: the opt-in only makes the value parseable, and widening an operator mode into it would skip that mode's rule layers."
                         },
                         "max_budget_usd": { "type": "number", "nullable": true }
                     },
@@ -1948,7 +1951,6 @@ pub fn build_openapi_spec() -> serde_json::Value {
                             "type": "string",
                             "enum": [
                                 "default",
-                                "auto",
                                 "strict",
                                 "acceptEdits",
                                 "dontAsk",
@@ -1956,7 +1958,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
                                 "bypass"
                             ],
                             "nullable": true,
-                            "description": "Requested permission mode. The server's operator-configured mode is a ceiling: a request may tighten it, never loosen it. Accepted values (case-insensitive): default, auto, strict, acceptEdits, dontAsk, plan, bypass. Unknown values, `bypass` when RECURSIVE_ALLOW_BYPASS_PERMISSIONS is unset, and any value that would loosen the operator mode are rejected with 400 — `bypass` included: the opt-in only makes the value parseable, and widening an operator mode into it would skip that mode's rule layers."
+                            "description": "Requested permission mode. The server's operator-configured mode is a ceiling: a request may tighten it, never loosen it. Accepted values (case-insensitive): default, strict, acceptEdits, dontAsk, plan, bypass. `auto` is rejected with 400 — the classifier it promises is not wired into serving (issue #182). Unknown values, `bypass` when RECURSIVE_ALLOW_BYPASS_PERMISSIONS is unset, and any value that would loosen the operator mode are rejected with 400 — `bypass` included: the opt-in only makes the value parseable, and widening an operator mode into it would skip that mode's rule layers."
                         },
                         "max_budget_usd": { "type": "number", "nullable": true },
                         "preset": { "type": "string", "nullable": true, "description": "issue #127: agent preset id; unknown ids are rejected with 400. See GET /presets." }
