@@ -89,15 +89,34 @@ fn atomic_write_impl(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    // fsync the parent dir so the rename is durable. Best-effort:
-    // Windows may not support this, and a tmp file outside a
-    // directory we can open (e.g. a chrooted test) is still safe
-    // — the next `rename` will just not be dir-fsynced.
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    // fsync the parent dir so the rename is durable (see `sync_parent_dir`).
+    sync_parent_dir(parent);
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// fsync the parent directory so a just-renamed file's directory entry is
+/// durable. Best-effort by contract — the write itself already succeeded —
+/// but on non-Windows platforms a failure (the directory cannot be opened,
+/// or the fsync is refused) is a real durability degradation: after a crash
+/// the "written" file may roll back entirely. Per the owner red line that
+/// any degradation must be observable, it warns with the path; Windows is
+/// exempt because dir fsync is not portably supported there (issue #221).
+fn sync_parent_dir(parent: &Path) {
+    #[cfg(windows)]
+    {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(windows))]
+    if let Err(error) = File::open(parent).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(
+            parent = %parent.display(),
+            %error,
+            "atomic_write: parent dir fsync failed; rename durability degraded (best-effort)"
+        );
+    }
 }
 
 /// Async [`atomic_write_with_mode`] for async call sites.
@@ -322,5 +341,45 @@ mod tests {
                 format!("payload-{i}").as_bytes()
             );
         }
+    }
+
+    // ── Issue #221: an un-fsyncable parent dir must leave a warning ─────────
+
+    /// On non-Windows a failed parent-dir fsync is a durability degradation:
+    /// the rename's directory entry may not survive a crash, so "written"
+    /// state can roll back entirely. It must be attributable. The surrogate
+    /// parent — a path *inside a regular file* (ENOTDIR on open) — exercises
+    /// the single warn-on-Err arm that a refused fsync also takes; injecting
+    /// a pure `fsync(2)` failure would need a mock filesystem.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn parent_dir_fsync_failure_warns() {
+        let dir = TempDir::new().unwrap();
+        let regular = dir.path().join("regular-file");
+        std::fs::write(&regular, b"x").unwrap();
+        sync_parent_dir(&regular.join("child"));
+        assert!(
+            logs_contain("parent dir fsync failed"),
+            "the durability degradation must be observable, with the path"
+        );
+        assert!(
+            logs_contain("regular-file/child"),
+            "the warning names the un-fsyncable parent"
+        );
+    }
+
+    /// The healthy path stays silent — a normal directory fsync must not
+    /// produce warning noise on every write.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn healthy_parent_dir_fsync_is_silent() {
+        let dir = TempDir::new().unwrap();
+        sync_parent_dir(dir.path());
+        assert!(
+            !logs_contain("parent dir fsync failed"),
+            "a normal dir fsync must not warn"
+        );
     }
 }

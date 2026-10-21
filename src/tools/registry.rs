@@ -395,7 +395,19 @@ impl ToolRegistry {
             ))
         });
         let fork_roots = self.session_roots.as_ref().map(|slot| {
-            let seeded = slot.read().map(|roots| roots.clone()).unwrap_or_default();
+            // Same poison policy as `read_file_state` above: recover the
+            // inner roots — a poisoned slot must not silently strip the
+            // fork's inherited sandbox constraints (issue #221).
+            let seeded = match slot.read() {
+                Ok(roots) => roots.clone(),
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "session_roots lock poisoned during fork_session; \
+                         recovering the inner roots instead of seeding an empty set"
+                    );
+                    poisoned.into_inner().clone()
+                }
+            };
             Arc::new(std::sync::RwLock::new(seeded))
         });
         // ONE fresh ledger per fork, shared by the fork's `Present` /
@@ -2035,8 +2047,57 @@ mod tests {
         );
     }
 
-    // --- fork_session: deliverables ledger isolation (Goal #133) ---
+    /// Issue #221: a poisoned `session_roots` slot must not silently seed
+    /// the fork with an EMPTY root set — the fork would quietly lose its
+    /// inherited sandbox constraints. The poison policy matches the
+    /// `read_file_state` slot above: recover the inner roots and warn.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn fork_session_recovers_seeded_roots_when_slot_poisoned() {
+        use super::super::dispatch::{new_shared_sandbox_roots, AccessTier};
 
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let extra = tempfile::tempdir().expect("extra tempdir");
+        let slot = new_shared_sandbox_roots();
+        let reg = build_standard_tools_with_roots(
+            tmp.path(),
+            &[],
+            Some(slot.clone()),
+            &[],
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_session_roots(slot.clone());
+        // Seed one root, then poison the slot with a panicking holder.
+        slot.write()
+            .unwrap()
+            .push((extra.path().to_path_buf(), AccessTier::ReadOnly));
+        let poisoner = {
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                let _guard = slot.write().unwrap();
+                panic!("poison injection");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the poisoner must panic");
+
+        let fork = reg.fork_session();
+        assert!(
+            logs_contain("session_roots lock poisoned"),
+            "the recovery must be observable, not silent"
+        );
+        let fork_slot = fork.session_roots().expect("fork slot");
+        let roots = fork_slot.read().unwrap();
+        assert!(
+            roots.iter().any(|(p, _)| p == extra.path()),
+            "the fork must inherit the pre-fork root even though the slot was poisoned: {roots:?}"
+        );
+    }
+
+    // --- fork_session: deliverables ledger isolation (Goal #133) ---
     /// A registry carrying a ledger plus the two tools bound to it.
     fn ledger_registry(
         tmp: &tempfile::TempDir,

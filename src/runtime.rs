@@ -1632,10 +1632,21 @@ impl AgentRuntime {
 
     /// Goal-167: return a snapshot of the current agent task list.
     ///
-    /// Returns a clone of the list as it stands at call time. Returns an
-    /// empty vec if the internal lock is poisoned.
+    /// Returns a clone of the list as it stands at call time. If the lock
+    /// is poisoned (a previous panic while holding it), the inner snapshot
+    /// is still recovered — silently reporting an empty list would drift
+    /// the todo panel/API away from real state — and the poisoning is
+    /// logged (issue #221).
     pub fn current_todos(&self) -> Vec<TodoItem> {
-        self.todo_list.read().map(|l| l.clone()).unwrap_or_default()
+        match self.todo_list.read() {
+            Ok(list) => list.clone(),
+            Err(poisoned) => {
+                tracing::warn!(
+                    "todo list lock poisoned; recovering the inner snapshot instead of reporting an empty list"
+                );
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// Goal-161: attach a [`crate::tools::PermissionHook`] to the

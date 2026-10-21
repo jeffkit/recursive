@@ -3856,3 +3856,50 @@ fn alternating(n: usize) -> Vec<Message> {
         })
         .collect()
 }
+
+// ── Issue #221: a poisoned todo lock must not silently blank the panel ──
+
+/// Poison the runtime's todo lock with a panicking holder thread, then
+/// read it back: the snapshot must be RECOVERED (the HTTP todo surface at
+/// `handlers.rs` shows real state) and the poisoning must leave a warning
+/// — silently reporting an empty list is an unobservable state drift.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn current_todos_recovers_snapshot_when_lock_poisoned() {
+    let llm = Arc::new(MockProvider::new(vec![Completion {
+        content: "ok".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }]));
+    let rt = AgentRuntime::builder().llm(llm).build().unwrap();
+    *rt.todo_list.write().unwrap() = vec![TodoItem {
+        content: "survives poisoning".into(),
+        status: TodoStatus::Pending,
+        active_form: None,
+    }];
+
+    // The panic unwinds out of the thread while the write guard is held,
+    // which poisons the lock; join() also proves the guard was released.
+    let poisoner = {
+        let slot = rt.todo_list.clone();
+        std::thread::spawn(move || {
+            let _guard = slot.write().unwrap();
+            panic!("poison injection");
+        })
+    };
+    assert!(poisoner.join().is_err(), "the poisoner must panic");
+
+    let todos = rt.current_todos();
+    assert_eq!(
+        todos.len(),
+        1,
+        "a poisoned lock must not blank the todo snapshot"
+    );
+    assert_eq!(todos[0].content, "survives poisoning");
+    assert!(
+        logs_contain("todo list lock poisoned"),
+        "the recovery must be observable, not silent"
+    );
+}

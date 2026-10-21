@@ -45,13 +45,28 @@ pub fn user_workspace_dir(workspace: &Path) -> Result<PathBuf> {
         std::fs::create_dir_all(&dir).map_err(Error::Io)?;
         // Write path marker — best-effort; failing here would be
         // weird given we just created the directory, but we don't
-        // want a marker bug to brick the run.
+        // want a marker bug to brick the run. The failure is still
+        // logged: the marker is the only hash→path map a human has,
+        // so losing it silently contradicts "any degradation must be
+        // observable" (issue #221).
         let marker = dir.join("path.txt");
         if !marker.exists() {
-            let _ = std::fs::write(&marker, abs.display().to_string());
+            write_path_marker(&marker, &abs.display().to_string());
         }
     }
     Ok(dir)
+}
+
+/// Best-effort write of the workspace `path.txt` marker. Never fails the
+/// caller; a write error warns with the path instead of vanishing (#221).
+fn write_path_marker(marker: &Path, contents: &str) {
+    if let Err(error) = std::fs::write(marker, contents) {
+        tracing::warn!(
+            path = %marker.display(),
+            %error,
+            "workspace path.txt marker write failed; hash→path mapping unavailable (best-effort)"
+        );
+    }
 }
 
 /// `<user_workspace_dir>/sessions/`. Honors `RECURSIVE_SESSIONS_DIR`
@@ -255,6 +270,35 @@ mod tests {
         // Marker should resolve to the canonical workspace path.
         let abs = workspace.path().canonicalize().unwrap();
         assert_eq!(contents, abs.display().to_string());
+    }
+
+    /// Issue #221: the marker is the only hash→path map a human has, so a
+    /// failed write must warn even though it stays best-effort (never bricks
+    /// the run). The read-only directory stands in for the unwritable target.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn path_marker_write_failure_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let ro = home.path().join("read-only");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let marker = ro.join("path.txt");
+
+        write_path_marker(&marker, "/some/workspace");
+        assert!(
+            !marker.exists(),
+            "the marker must not appear (the write is still best-effort)"
+        );
+        assert!(
+            logs_contain("path.txt marker write failed"),
+            "the lost hash→path mapping must be observable, with the path"
+        );
+
+        // Restore so tempdir cleanup can remove the directory.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
