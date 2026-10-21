@@ -482,9 +482,14 @@ fn scratch_volume_free_bytes(_path: &Path) -> Option<u64> {
 /// fine. [`RLIMIT_HEADROOM_MIB`] keeps every supported heap budget on the
 /// safe side of that line while still capping the process well below
 /// "unbounded"; the enforced value is reported in the sandbox facts.
+///
+/// CI (ubuntu 24 x86_64, node 26) measured: a 528 MiB ceiling SIGKILLs node
+/// at startup (exit code lost — the kernel kills before V8 can classify its
+/// own heap abort), so the floor is 1 GiB: comfortably above every measured
+/// startup need while still bounding the process.
 #[cfg(any(unix, test))]
 fn address_space_limit_bytes(heap_limit_mib: usize) -> u64 {
-    (heap_limit_mib.saturating_add(RLIMIT_HEADROOM_MIB).max(256)) as u64 * 1024 * 1024
+    heap_limit_mib.saturating_add(RLIMIT_HEADROOM_MIB).max(1024) as u64 * 1024 * 1024
 }
 
 /// Install the RLIMIT_AS guard in the forked child. Returns the enforcement
