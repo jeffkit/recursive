@@ -10,7 +10,7 @@
 //!   own success or failure.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,6 +52,40 @@ const PROTOCOL_LINE_SLACK_BYTES: usize = 64 * 1024;
 const REAP_GRACE: Duration = Duration::from_secs(5);
 
 const ENV_POLICY: &str = "cleared+exec-search/system/temp";
+
+/// Goal 416: the filesystem policy enforced by the runtime permission model
+/// when the probe finds support — `fs` writes confined to the run's scratch
+/// dir, process spawning and worker threads denied, `fs` reads limited to the
+/// read root (the workspace / process cwd) plus the scratch dir.
+///
+/// The wording is a **seat-belt statement, not a confinement claim**: Node's
+/// own documentation is explicit that the permission model "does not protect
+/// against malicious code" and "does not guarantee that users will not be
+/// able to access the file system through other means, such as through the
+/// `node:sqlite` module" (verified live on both macOS and Linux, node
+/// 26.10.0: `DatabaseSync` creates and writes a database file outside every
+/// allowlisted root). The fact names the bypass so neither the model nor the
+/// operator reads `scratch-only` as a hostile-code security boundary;
+/// containment of malicious code is the container / microVM transport tier,
+/// where `run_code` is never mounted (see `mod.rs`).
+pub const FS_POLICY_SANDBOXED: &str = "fs-write=scratch-only (seat-belt, not a \
+     malicious-code boundary: node:sqlite bypasses fs grants); child_process=denied; \
+     worker_threads=denied; cluster=denied; fs-read=read-root+scratch";
+
+/// Goal 416: minimum free bytes the scratch volume must report before a run
+/// is allowed to start. Below it the run is rejected *before* spawn with the
+/// volume path and the measured free space in the failure detail.
+pub const MIN_SCRATCH_FREE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Headroom over the in-heap budget that the address-space limit adds for
+/// everything outside the V8 old generation: native allocations, Buffers,
+/// and — decisively on Linux — the runtime's own startup reservations.
+/// Node 26.10 on Linux aborts during startup below ~875 MiB of address
+/// space even with a 512 MiB heap (V8 `SegmentedTable` / cage reservations
+/// plus glibc per-thread arena reserves), so this is sized to keep every
+/// supported heap budget startable, not to tighten the heap cap.
+#[cfg(any(unix, test))]
+const RLIMIT_HEADROOM_MIB: usize = 512;
 
 /// The embedded bootstrap (`src/tools/execution/run_code/bootstrap.js`).
 pub const BOOTSTRAP_SOURCE: &str = include_str!("bootstrap.js");
@@ -103,6 +137,14 @@ pub struct RunProgramRequest {
     pub node_bin: Option<PathBuf>,
     /// Host-side cancellation (Ctrl-C / session teardown).
     pub abort: Option<CancellationToken>,
+    /// Goal 416: the directory the program may read (the workspace root).
+    /// `None` resolves to the host process's current directory at spawn time
+    /// — the same root the runtime process used to inherit.
+    pub read_root: Option<PathBuf>,
+    /// Goal 416: scratch-volume free-space floor for this run (tests force a
+    /// rejection without needing a full disk). `None` uses
+    /// [`MIN_SCRATCH_FREE_BYTES`].
+    pub min_free_bytes: Option<u64>,
 }
 
 /// Resolve the runtime binary: `RECURSIVE_RUN_CODE_NODE` wins (and, when set
@@ -250,6 +292,254 @@ fn unavailable_report(sandbox: SandboxFacts, started: Instant, detail: &str) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Goal 416 — local-sandbox security baseline
+//
+// The program is an opaque blob: without a runtime-enforced permission model
+// it is a full host process (more capable than Bash, with none of Bash's
+// review). The baseline below makes `run_code` fail loudly instead of
+// silently degrading:
+//
+// - the runtime is probed for a permission model (the flag name moved between
+//   Node lines, so support is *probed*, never assumed from a single flag);
+// - no support (or a failed probe) → every call reports `sandbox-unavailable`
+//   with the concrete reason — never a fall-back to an unsandboxed run;
+// - the process writes only into its own mkdtemp scratch dir (its spawn cwd),
+//   and the scratch volume's free space is checked before spawn;
+// - the address space is bounded via `pre_exec` where the kernel enforces
+//   RLIMIT_AS, with the enforcement completeness reported as a fact.
+// ---------------------------------------------------------------------------
+
+/// The permission flag a runtime was probed with, and where it is cached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionProbe {
+    /// The accepted flag (`--permission` or the older
+    /// `--experimental-permission`).
+    flag: &'static str,
+}
+
+/// Probe verdicts cached per runtime binary. The probe spawns a process
+/// (~70 ms for a real `node`), so a session's many runs share the verdict;
+/// the cache key is the resolved binary path, so different shims / runtimes
+/// never collide.
+fn probe_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, ProbeVerdict>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ProbeVerdict>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Why the probe concluded a runtime has no usable permission model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeVerdict {
+    Supported(PermissionProbe),
+    Unsupported(String),
+}
+
+/// Whether `flag` is accepted by `node`. A runtime that does not know the
+/// flag exits non-zero ("bad option") without side effects; a supported one
+/// runs the trivial `-e` program and exits 0.
+async fn flag_accepted(node: &Path, flag: &str) -> std::io::Result<bool> {
+    let probe = Command::new(node)
+        .arg(flag)
+        .arg("-e")
+        .arg("process.exit(0)")
+        .env_clear()
+        .envs(child_env())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(10), probe).await;
+    match output {
+        // Probe timed out: the runtime is wedged, not "supported" — a fail
+        // closed verdict, never a silent unsandboxed run.
+        Err(_) => Ok(false),
+        Ok(Ok(output)) => Ok(output.status.success()),
+        Ok(Err(err)) => Err(err),
+    }
+}
+
+/// Probe `node` for a runtime-enforced permission model. Flag names moved
+/// between Node lines (`--experimental-permission` → `--permission`), so the
+/// candidates are tried in order and the accepted one is used — that is
+/// compatibility, not a downgrade. The red line is the third case: no
+/// candidate accepted (or the probe itself failed) means the run is rejected.
+async fn probe_permission_model(node: &Path) -> ProbeVerdict {
+    let cached = probe_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(node).cloned());
+    if let Some(verdict) = cached {
+        return verdict;
+    }
+    const CANDIDATES: [&str; 2] = ["--permission", "--experimental-permission"];
+    let mut last_error: Option<String> = None;
+    let mut rejected: Vec<String> = Vec::new();
+    let mut verdict = None;
+    for flag in CANDIDATES {
+        match flag_accepted(node, flag).await {
+            Ok(true) => {
+                verdict = Some(ProbeVerdict::Supported(PermissionProbe { flag }));
+                break;
+            }
+            Ok(false) => {
+                rejected.push(format!("{node:?} does not accept {flag}"));
+            }
+            Err(err) => {
+                last_error = Some(format!(
+                    "launching the permission probe for {flag} failed: {err}"
+                ));
+            }
+        }
+    }
+    let verdict = verdict.unwrap_or_else(|| {
+        if !rejected.is_empty() {
+            ProbeVerdict::Unsupported(rejected.join("; "))
+        } else {
+            ProbeVerdict::Unsupported(
+                last_error
+                    .unwrap_or_else(|| "the permission probe produced no verdict".to_string()),
+            )
+        }
+    });
+    if let Ok(mut cache) = probe_cache().lock() {
+        cache.insert(node.to_path_buf(), verdict.clone());
+    }
+    verdict
+}
+
+/// Create the run's private scratch directory under the system temp dir.
+/// `create_dir` fails on an existing path, so the pid+nanos suffix gives the
+/// exclusivity `mkdtemp` would.
+fn create_scratch_dir() -> std::io::Result<PathBuf> {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    for _ in 0..64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = base.join(format!("recursive-run-code-{pid}-{nanos}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::other(
+        "could not create a unique scratch directory after 64 attempts",
+    ))
+}
+
+/// Best-effort scratch cleanup. A leftover is never silent: the operator is
+/// told what survived and why (降级可观测).
+fn cleanup_scratch(dir: &Path) {
+    if let Err(err) = std::fs::remove_dir_all(dir) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %err,
+                "run_code: scratch directory cleanup failed; files may remain"
+            );
+        }
+    }
+}
+
+/// Free bytes available to unprivileged users on the volume holding `path`
+/// (statfs `f_bsize × f_bavail`). `None` when the platform offers no probe.
+#[cfg(unix)]
+fn scratch_volume_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` writes `count` bytes into the out struct and reads the
+    // NUL-terminated path; both are valid for the duration of the call.
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return None;
+    }
+    Some(buf.f_bsize as u64 * buf.f_bavail)
+}
+
+/// Non-unix: no disk probe (the fact string says so rather than claiming one).
+#[cfg(not(unix))]
+fn scratch_volume_free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// The address-space limit handed to `pre_exec`: the in-heap budget plus the
+/// out-of-heap headroom, floored so a tiny test budget cannot strand the
+/// runtime before its own startup allocations.
+///
+/// The headroom is not slack — on Linux, Node's startup reserves large
+/// address ranges that a tight `RLIMIT_AS` converts into a hard startup
+/// failure: V8's `SegmentedTable` / pointer-compression cage reservations plus
+/// glibc's per-arena reservations. Measured on Linux/aarch64, Node 26.10,
+/// `--max-old-space-size=512`: startup aborts below ~875 MiB of address
+/// space, and the same process with a 2 GiB limit runs the full 512 MiB heap
+/// fine. [`RLIMIT_HEADROOM_MIB`] keeps every supported heap budget on the
+/// safe side of that line while still capping the process well below
+/// "unbounded"; the enforced value is reported in the sandbox facts.
+#[cfg(any(unix, test))]
+fn address_space_limit_bytes(heap_limit_mib: usize) -> u64 {
+    (heap_limit_mib.saturating_add(RLIMIT_HEADROOM_MIB).max(256)) as u64 * 1024 * 1024
+}
+
+/// Install the RLIMIT_AS guard in the forked child. Returns the enforcement
+/// statement the *parent* should report for this platform: on Linux the limit
+/// is enforced and a failed `setrlimit` aborts the spawn (the error surfaces
+/// through `spawn()`); on kernels that refuse to lower `RLIMIT_AS` (macOS)
+/// the failure is the kernel's documented stance, so the run proceeds with
+/// the non-enforcement recorded — never claimed as enforced.
+#[cfg(unix)]
+fn address_space_guard(hard_limit_bytes: u64) -> impl FnMut() -> std::io::Result<()> {
+    move || {
+        let new_limit = libc::rlimit {
+            rlim_cur: hard_limit_bytes,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &new_limit) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if matches!(
+            err.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::ENOTSUP)
+        ) {
+            // The kernel refuses to lower RLIMIT_AS (macOS: EINVAL by
+            // design). Leaving the limit untouched is that kernel's
+            // documented non-enforcement — the parent records it in the
+            // sandbox facts rather than claiming a cap that does not exist.
+            return Ok(());
+        }
+        Err(err)
+    }
+}
+
+/// The enforcement statement matching [`address_space_guard`] for a spawn
+/// that succeeded: Linux applied the limit (a failure would have failed the
+/// spawn); kernels that cannot lower RLIMIT_AS report exactly that.
+#[cfg(unix)]
+fn address_space_guard_fact(heap_limit_mib: usize) -> String {
+    if cfg!(target_os = "linux") {
+        format!(
+            "rlimit_as=enforced({}MiB=heap+{}MiB headroom)",
+            heap_limit_mib + RLIMIT_HEADROOM_MIB,
+            RLIMIT_HEADROOM_MIB
+        )
+    } else {
+        "rlimit_as=not-enforced-by-kernel; in-heap bounded by the heap limit".to_string()
+    }
+}
+
+#[cfg(not(unix))]
+fn address_space_guard_fact(_heap_limit_mib: usize) -> String {
+    "rlimit_as=not-probed(platform); in-heap bounded by the heap limit".to_string()
+}
+
 /// Run one model-authored program. Never fails: every outcome — including an
 /// unavailable sandbox — is reported as a [`RunReport`].
 pub async fn run_program(req: RunProgramRequest) -> RunReport {
@@ -260,6 +550,8 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
         limits,
         node_bin,
         abort,
+        read_root,
+        min_free_bytes,
     } = req;
     let limits = limits.clamped();
     let started = Instant::now();
@@ -269,6 +561,10 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
         heap_limit_mib: limits.heap_limit_mib,
         output_limit_bytes: limits.output_limit_bytes,
         timeout_secs: limits.timeout.as_secs(),
+        fs_policy: String::new(),
+        permission_flag: None,
+        scratch_dir: None,
+        resource_guards: String::new(),
     };
 
     let Some(node) = node_bin.or_else(locate_node) else {
@@ -280,10 +576,104 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
     };
     sandbox.runtime = Some(node.display().to_string());
 
+    // Goal 416: no runtime-enforced permission model means no sandbox — the
+    // run is rejected with the concrete probe reason instead of degrading to
+    // an unsandboxed full-host-process execution.
+    let permission = probe_permission_model(&node).await;
+    let permission_flag = match &permission {
+        ProbeVerdict::Supported(probe) => probe.flag,
+        ProbeVerdict::Unsupported(reason) => {
+            return unavailable_report(
+                sandbox,
+                started,
+                &format!(
+                    "runtime has no usable permission model, refusing to run unsandboxed: \
+                     {reason}"
+                ),
+            );
+        }
+    };
+    sandbox.permission_flag = Some(permission_flag.to_string());
+    sandbox.fs_policy = FS_POLICY_SANDBOXED.to_string();
+    sandbox.resource_guards = address_space_guard_fact(limits.heap_limit_mib);
+
+    // Goal 416: the program's only writable location is this per-run scratch
+    // dir — it is also the spawn cwd, so a relative path can never escape it.
+    let scratch = match create_scratch_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            return unavailable_report(
+                sandbox,
+                started,
+                &format!("could not create the run's scratch directory: {err}"),
+            );
+        }
+    };
+    sandbox.scratch_dir = Some(scratch.display().to_string());
+
+    // Goal 416: a full disk is a pre-spawn rejection with the volume and the
+    // measured free space, not a mid-run mystery.
+    let floor = min_free_bytes.unwrap_or(MIN_SCRATCH_FREE_BYTES);
+    let free = scratch_volume_free_bytes(&scratch);
+    if let Some(free_bytes) = free {
+        if free_bytes < floor {
+            let detail = format!(
+                "scratch volume has insufficient free space: {} bytes free on volume of {}, \
+                 refusing to start (floor {floor} bytes)",
+                free_bytes,
+                scratch.display(),
+            );
+            cleanup_scratch(&scratch);
+            return unavailable_report(sandbox, started, &detail);
+        }
+    } else {
+        tracing::warn!(
+            path = %scratch.display(),
+            "run_code: scratch-volume free space could not be probed; proceeding without a \
+             disk check"
+        );
+    }
+
+    let read_root = read_root
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| scratch.clone());
+
     let mut cmd = Command::new(&node);
+    cmd.arg(permission_flag);
+    // Linux self-inspection: `/proc/self/limits` is how the child observes
+    // its own address-space limit (the live regression asserts the guard is
+    // what the facts claim). Without an explicit grant the permission model
+    // denies the read with `ERR_ACCESS_DENIED` — verified, there is no
+    // /proc carve-out.
+    #[cfg(target_os = "linux")]
+    cmd.arg("--allow-fs-read=/proc");
+    for dir in [&read_root, &scratch] {
+        if dir.exists() {
+            cmd.arg(format!("--allow-fs-read={}", dir.display()));
+        } else {
+            // A non-existent grant root would be accepted by Node as an
+            // exact-path entry (no trailing wildcard), so the fact line's
+            // `read-root` claim would quietly narrow. The read root is the
+            // host process's cwd or the pinned workspace root — it exists
+            // when the host is running — so this is a loud impossibility,
+            // not a branch the model can steer into.
+            tracing::warn!(
+                path = %dir.display(),
+                "run_code: read root missing at spawn; fs-read grant skipped"
+            );
+        }
+    }
+    // The scratch dir twice: the absolute spelling (absolute-path writes)
+    // and the cwd-relative `.` spelling — the permission model resolves a
+    // *relative* write against cwd and checks it against the allowlist
+    // entries as given, so `.` is what makes `writeFileSync("x")` land in
+    // the scratch dir instead of being denied outright.
+    cmd.arg(format!("--allow-fs-write={}", scratch.display()));
+    cmd.arg("--allow-fs-write=.");
     cmd.arg(format!("--max-old-space-size={}", limits.heap_limit_mib));
     cmd.arg("-e");
     cmd.arg(BOOTSTRAP_SOURCE);
+    cmd.current_dir(&scratch);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -296,9 +686,28 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
     // that spawned its own children is ended as a tree, not just at the root.
     crate::process::attach_group(&mut cmd);
 
+    // Goal 416: bound the address space in the forked child (before exec), so
+    // out-of-heap allocations (Buffers / native) hit a kernel-level ceiling
+    // too. On a kernel that enforces RLIMIT_AS a failed setrlimit fails the
+    // spawn — surfaced below as `sandbox-unavailable`, never silently dropped.
+    // The limit value carries generous startup headroom: Node's own startup
+    // reservations (V8 pointer-compression cage, glibc arenas) abort the
+    // process below ~875 MiB of address space with a 512 MiB heap on Linux,
+    // so the heap+headroom formula is the floor that keeps every supported
+    // heap budget startable, not a tightening of the heap cap (which stays
+    // `--max-old-space-size`).
+    #[cfg(unix)]
+    {
+        let hard_limit = address_space_limit_bytes(limits.heap_limit_mib);
+        unsafe {
+            cmd.pre_exec(move || address_space_guard(hard_limit)());
+        }
+    }
+
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
+            cleanup_scratch(&scratch);
             let detail = format!("failed to start runtime {}: {err}", node.display());
             return unavailable_report(sandbox, started, &detail);
         }
@@ -560,6 +969,11 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
         describe_failure(failure, &limits, &ctx)
     });
 
+    // Goal 416: the scratch dir dies with the run — success, timeout, abort,
+    // crash — every path funnels through here. A failed cleanup warns (see
+    // `cleanup_scratch`) instead of stranding files silently.
+    cleanup_scratch(&scratch);
+
     RunReport {
         failure,
         exit_code,
@@ -790,5 +1204,417 @@ mod tests {
         let described =
             describe_failure(RunCodeFailure::WorkerExit, &RunCodeLimits::default(), &ctx);
         assert!(described.contains("signal"), "{described}");
+    }
+
+    // ── Goal 416 — local-sandbox security baseline ─────────────────────────
+
+    /// Whether a real `node` runtime is reachable — same direct probe as the
+    /// tool-layer tests, so a resolution bug fails loudly instead of skipping.
+    fn node_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A POSIX-sh runtime shim: records every argv it is invoked with and
+    /// speaks just enough of the protocol to finish a run. When called with
+    /// only the probe invocation (flag + `-e` + `process.exit(0)`) it exits
+    /// 0 — the "supported runtime" side of the fixture. The argv file is
+    /// baked into the script (the run's env is cleared by design, so nothing
+    /// else could hand it over).
+    fn write_runtime_shim(
+        dir: &Path,
+        verdict: ShimVerdict,
+        argv_file: &Path,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let path = dir.join(format!(
+            "shim-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, shim_source(verdict, argv_file))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(path)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ShimVerdict {
+        /// Accepts `--permission` (probe exits 0), then runs the protocol.
+        Supported,
+        /// Rejects every permission flag — an old runtime without a model.
+        Unsupported,
+    }
+
+    fn shim_source(verdict: ShimVerdict, argv_file: &Path) -> String {
+        let probe_exit = match verdict {
+            ShimVerdict::Supported => 0,
+            ShimVerdict::Unsupported => 9,
+        };
+        let argv_file_display = argv_file.display();
+        format!(
+            r#"#!/bin/sh
+# Test fixture: a "runtime" whose only behavior is argv capture + a fixed
+# protocol reply. A probe invocation is exactly three args (permission flag,
+# `-e`, `process.exit(0)`) and exits {probe_exit} to encode the verdict; a
+# real spawn (bootstrap source as the `-e` payload) reads the program line
+# from stdin and answers one result line.
+is_probe=0
+if [ "$#" -eq 3 ]; then
+  last=""
+  for arg in "$@"; do last="$arg"; done
+  [ "$last" = "process.exit(0)" ] && is_probe=1
+fi
+ARGV_FILE="{argv_file_display}"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$ARGV_FILE"
+done
+printf -- '---\n' >> "$ARGV_FILE"
+[ "$is_probe" = 1 ] && exit {probe_exit}
+read -r line
+printf '%s\n' '{{"t":"result","value":"shim-ok"}}'
+exit 0
+"#
+        )
+    }
+
+    fn shim_request(node: &Path, read_root: PathBuf) -> RunProgramRequest {
+        RunProgramRequest {
+            source: "return 'ignored';".to_string(),
+            bindings: BindingTable::empty(),
+            invoker: Arc::new(NullInvoker),
+            limits: RunCodeLimits::default(),
+            node_bin: Some(node.to_path_buf()),
+            abort: None,
+            read_root: Some(read_root),
+            min_free_bytes: None,
+        }
+    }
+
+    /// A stand-in invoker for shim runs that never issue tool calls.
+    struct NullInvoker;
+
+    #[async_trait]
+    impl ToolInvoker for NullInvoker {
+        async fn invoke(&self, _tool: &str, _args: Value) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// Headline (#134 W1): a supported runtime is launched WITH the
+    /// permission flags — fs writes confined to the scratch dir, process
+    /// spawning and workers denied, reads limited to the read root. The shim
+    /// records its spawn argv; the assertion reads them back.
+    #[tokio::test]
+    async fn runtime_launches_with_permission_flags() {
+        let tmp = std::env::temp_dir().join(format!("ptc-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let argv_file = tmp.join("argv.txt");
+        let node = write_runtime_shim(&tmp, ShimVerdict::Supported, &argv_file).unwrap();
+
+        let read_root = tmp.clone();
+        let report = run_program(shim_request(&node, read_root)).await;
+
+        assert_eq!(report.failure, None, "{:?}", report.detail);
+        assert_eq!(report.value.as_deref(), Some("shim-ok"));
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        // Each shim invocation appends its argv then a `---` separator; the
+        // spawn is the LAST complete block.
+        let spawn_argv = argv
+            .split("---\n")
+            .filter(|block| !block.trim().is_empty())
+            .last()
+            .expect("the shim records its spawn argv");
+        assert!(
+            spawn_argv.contains("--permission\n"),
+            "spawn argv must carry the permission flag: {spawn_argv:?}"
+        );
+        assert!(
+            spawn_argv.contains("--allow-fs-write="),
+            "spawn argv must confine writes: {spawn_argv:?}"
+        );
+        assert!(
+            !spawn_argv.contains("--allow-child-process"),
+            "process spawning must stay denied: {spawn_argv:?}"
+        );
+        assert!(
+            !spawn_argv.contains("--allow-worker"),
+            "worker threads must stay denied: {spawn_argv:?}"
+        );
+        assert!(
+            spawn_argv.contains(&format!("--allow-fs-read={}", tmp.display())),
+            "reads must be scoped to the read root: {spawn_argv:?}"
+        );
+        // Linux adds the /proc grant so the child can observe its own
+        // address-space limit (the live regression reads
+        // /proc/self/limits); macOS stays without it.
+        assert_eq!(
+            spawn_argv.contains("--allow-fs-read=/proc\n"),
+            cfg!(target_os = "linux"),
+            "/proc read grant must match the platform: {spawn_argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Headline (#134 W1): a runtime without a permission model is rejected
+    /// loudly — `sandbox-unavailable`, with the probe's concrete reason in
+    /// the detail. Never a silent fall-back to an unsandboxed run.
+    #[tokio::test]
+    async fn unsupported_runtime_is_rejected_loudly() {
+        let tmp = std::env::temp_dir().join(format!("ptc-shim-unsup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let argv_file = tmp.join("argv.txt");
+        let node = write_runtime_shim(&tmp, ShimVerdict::Unsupported, &argv_file).unwrap();
+
+        let read_root = tmp.clone();
+        let report = run_program(shim_request(&node, read_root)).await;
+
+        assert_eq!(
+            report.failure,
+            Some(protocol::RunCodeFailure::SandboxUnavailable)
+        );
+        let detail = report
+            .detail
+            .clone()
+            .expect("the rejection names its reason");
+        assert!(
+            detail.contains("no usable permission model"),
+            "the reason must say the permission model is missing: {detail}"
+        );
+        assert!(
+            detail.contains("--permission"),
+            "the reason names the probed flag: {detail}"
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("status=sandbox-unavailable"),
+            "{rendered}"
+        );
+        // No run happened, so no scratch dir was minted for it.
+        assert!(report.sandbox.scratch_dir.is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Headline (#134 W1): the scratch dir is created for the run, is the
+    /// spawn cwd, and is gone after the run — success, timeout and abort all
+    /// funnel through the same cleanup.
+    #[tokio::test]
+    async fn scratch_dir_is_created_and_cleaned_up() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let report = run_program(RunProgramRequest {
+            source: r#"require('fs').writeFileSync('left-in-scratch.txt', 'x');
+return process.cwd();"#
+                .to_string(),
+            bindings: BindingTable::empty(),
+            invoker: Arc::new(NullInvoker),
+            limits: RunCodeLimits::default(),
+            node_bin: None,
+            abort: None,
+            read_root: None,
+            min_free_bytes: None,
+        })
+        .await;
+        assert_eq!(report.failure, None, "{:?}", report.detail);
+        let scratch = report
+            .sandbox
+            .scratch_dir
+            .clone()
+            .expect("a completed run reports its scratch dir");
+        // macOS hands back `/private/var/...` for the process cwd while the
+        // fact string keeps the caller's `/var/...` spelling — same dir. The
+        // scratch dir is already deleted (cleanup ran), so canonicalise via
+        // its existing parent and re-attach the final component.
+        let resolve = |p: &Path| -> PathBuf {
+            if let Ok(resolved) = std::fs::canonicalize(p) {
+                return resolved;
+            }
+            match (p.parent(), p.file_name()) {
+                (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                    .unwrap_or_else(|_| parent.to_path_buf())
+                    .join(name),
+                _ => p.to_path_buf(),
+            }
+        };
+        let reported_cwd = report.value.as_deref().map(Path::new).map(resolve);
+        let expected = resolve(Path::new(&scratch));
+        assert!(
+            reported_cwd.as_deref() == Some(expected.as_path()),
+            "the spawn cwd is the scratch dir: {reported_cwd:?} vs {expected:?}",
+        );
+        assert!(
+            !Path::new(&scratch).exists(),
+            "the scratch dir is cleaned up after the run: {scratch}"
+        );
+    }
+
+    /// The scratch cleanup must also run on the timeout path — a killed run
+    /// may not strand its scratch dir.
+    #[tokio::test]
+    async fn scratch_dir_is_cleaned_up_after_a_timeout() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let report = run_program(RunProgramRequest {
+            source: "await new Promise(() => {});".to_string(),
+            bindings: BindingTable::empty(),
+            invoker: Arc::new(NullInvoker),
+            limits: RunCodeLimits {
+                timeout: Duration::from_millis(300),
+                ..RunCodeLimits::default()
+            },
+            node_bin: None,
+            abort: None,
+            read_root: None,
+            min_free_bytes: None,
+        })
+        .await;
+        assert_eq!(report.failure, Some(protocol::RunCodeFailure::Timeout));
+        let scratch = report
+            .sandbox
+            .scratch_dir
+            .clone()
+            .expect("the run minted a scratch dir before spawn");
+        assert!(
+            !Path::new(&scratch).exists(),
+            "the killed run's scratch dir is cleaned up: {scratch}"
+        );
+    }
+
+    /// Headline (#134 W1): a scratch volume below the free-space floor is
+    /// rejected BEFORE spawn — `sandbox-unavailable` with the volume path and
+    /// the measured free space, and no runtime process is ever started.
+    #[tokio::test]
+    async fn low_disk_rejects_before_spawn() {
+        let node = match super::locate_node() {
+            Some(node) => node,
+            None => {
+                eprintln!("skipping: no `node` runtime found on PATH");
+                return;
+            }
+        };
+        let report = run_program(RunProgramRequest {
+            source: "return 1;".to_string(),
+            bindings: BindingTable::empty(),
+            invoker: Arc::new(NullInvoker),
+            limits: RunCodeLimits::default(),
+            node_bin: Some(node),
+            abort: None,
+            read_root: None,
+            // An impossible floor: everything short of ~16 EiB is "low disk".
+            min_free_bytes: Some(u64::MAX / 2),
+        })
+        .await;
+        assert_eq!(
+            report.failure,
+            Some(protocol::RunCodeFailure::SandboxUnavailable)
+        );
+        let detail = report
+            .detail
+            .clone()
+            .expect("the rejection explains itself");
+        assert!(
+            detail.contains("insufficient free space"),
+            "the reason names the disk: {detail}"
+        );
+        assert!(
+            detail.contains("bytes free"),
+            "the reason reports the measured free space: {detail}"
+        );
+        assert!(
+            report.calls == 0 && report.output.is_empty(),
+            "no runtime work happened: {report:?}"
+        );
+        // The rejected run's scratch dir was cleaned up on the way out.
+        if let Some(scratch) = &report.sandbox.scratch_dir {
+            assert!(
+                !Path::new(scratch).exists(),
+                "the rejected run leaves no scratch dir behind: {scratch}"
+            );
+        }
+    }
+
+    /// The scratch dir carries the run's identity and lives under the system
+    /// temp volume.
+    #[test]
+    fn create_scratch_dir_is_unique_and_inside_temp() {
+        let a = create_scratch_dir().unwrap();
+        let b = create_scratch_dir().unwrap();
+        assert_ne!(a, b, "two live runs never share a scratch dir");
+        assert!(a.starts_with(std::env::temp_dir()));
+        assert!(a.is_dir());
+        cleanup_scratch(&a);
+        cleanup_scratch(&b);
+        assert!(!a.exists() && !b.exists());
+    }
+
+    /// The address-space limit tracks the heap budget plus headroom, floored
+    /// so a small test budget cannot strand the runtime at startup.
+    #[test]
+    fn address_space_limit_tracks_the_heap_budget() {
+        let base = address_space_limit_bytes(512);
+        assert_eq!(base, (512 + RLIMIT_HEADROOM_MIB) as u64 * 1024 * 1024);
+        // A tiny heap budget still gets the floor.
+        let tiny = address_space_limit_bytes(8);
+        assert!(tiny >= 256 * 1024 * 1024, "the floor holds: {tiny}");
+        // The headroom exists: the limit is strictly above the in-heap cap.
+        assert!(base > 512 * 1024 * 1024);
+    }
+
+    /// The facts never claim an unenforced limit: Linux states enforcement,
+    /// kernels that refuse RLIMIT_AS state exactly that.
+    #[test]
+    fn resource_guard_fact_matches_the_enforcement_completeness() {
+        let fact = address_space_guard_fact(512);
+        if cfg!(target_os = "linux") {
+            assert!(fact.starts_with("rlimit_as=enforced("), "{fact}");
+            assert!(fact.contains("headroom"), "{fact}");
+        } else {
+            assert!(
+                fact.starts_with("rlimit_as=not-enforced-by-kernel"),
+                "no unenforced cap may be claimed: {fact}"
+            );
+            assert!(fact.contains("heap limit"), "{fact}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_cache_is_per_binary_path() {
+        let a = PathBuf::from("/definitely/not/a/runtime-a");
+        let b = PathBuf::from("/definitely/not/a/runtime-b");
+        {
+            let mut cache = probe_cache().lock().unwrap();
+            cache.insert(
+                a.clone(),
+                ProbeVerdict::Supported(PermissionProbe {
+                    flag: "--permission",
+                }),
+            );
+            cache.insert(b.clone(), ProbeVerdict::Unsupported("stubbed".to_string()));
+        }
+        assert!(matches!(
+            probe_permission_model(&a).await,
+            ProbeVerdict::Supported(PermissionProbe {
+                flag: "--permission"
+            })
+        ));
+        assert!(matches!(
+            probe_permission_model(&b).await,
+            ProbeVerdict::Unsupported(reason) if reason == "stubbed"
+        ));
+        probe_cache().lock().unwrap().remove(&a);
+        probe_cache().lock().unwrap().remove(&b);
     }
 }

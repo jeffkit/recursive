@@ -94,6 +94,10 @@ pub struct RunCode {
     tools: ToolRegistry,
     limits: RunCodeLimits,
     node_bin: Option<PathBuf>,
+    /// Goal 416: the directory the program may read under the runtime
+    /// permission model (the workspace root). `None` resolves to the host
+    /// process's current directory at spawn time.
+    read_root: Option<PathBuf>,
 }
 
 impl RunCode {
@@ -103,6 +107,7 @@ impl RunCode {
             tools,
             limits: RunCodeLimits::default(),
             node_bin: None,
+            read_root: None,
         }
     }
 
@@ -115,6 +120,15 @@ impl RunCode {
     /// Pin the runtime binary instead of locating `node` on `PATH`.
     pub fn with_node_bin(mut self, node: impl Into<PathBuf>) -> Self {
         self.node_bin = Some(node.into());
+        self
+    }
+
+    /// Pin the directory the program may read under the runtime permission
+    /// model (the workspace root). Unpinned, the runner falls back to the
+    /// host process's current directory — the same root the runtime process
+    /// inherited before the permission model existed.
+    pub fn with_read_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.read_root = Some(root.into());
         self
     }
 
@@ -199,6 +213,8 @@ impl Tool for RunCode {
             limits: self.limits,
             node_bin: self.node_bin.clone(),
             abort: None,
+            read_root: self.read_root.clone(),
+            min_free_bytes: None,
         })
         .await;
         Ok(report.render())
@@ -498,11 +514,19 @@ return await Slow();
         );
     }
 
-    /// Issue #134 review: the wall-clock budget stays authoritative when the
-    /// program leaves a detached process holding the inherited stdout/stderr
-    /// pipes. The stderr reader used to be awaited unbounded, so a 0.4s budget
-    /// produced a ~20s call after the runtime was killed (the leftover process
-    /// kept the pipe open).
+    /// Issue #134 review: the wall-clock budget stays authoritative even when
+    /// something could hold the inherited stdout/stderr pipes past the kill.
+    /// The stderr reader used to be awaited unbounded, so a 0.4s budget
+    /// produced a ~20s call after the runtime was killed.
+    ///
+    /// Goal 416 re-point: the runtime permission model now denies
+    /// `child_process` outright (that is the security baseline this goal
+    /// adds), so the detached-holder *scenario* is prevented at the source —
+    /// the program's spawn attempt throws. The host-side guarantee the test
+    /// pins is unchanged and still exercised end-to-end: the run hits its
+    /// wall-clock budget, the group kill fires, and the bounded stderr join
+    /// returns the call in bounded time. The program parks after the denial
+    /// so the timeout path (kill + bounded joins) is what actually runs.
     #[tokio::test]
     async fn a_detached_pipe_holder_cannot_outlast_the_budget() {
         if !node_available() {
@@ -514,17 +538,26 @@ return await Slow();
             ..RunCodeLimits::default()
         });
         let code = r#"
-const cp = await import('node:child_process');
-cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], {
-  detached: true,
-  stdio: ['ignore', 'inherit', 'inherit'],
-}).unref();
-return 'spawned';
+try {
+  const cp = await import('node:child_process');
+  cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], {
+    detached: true,
+    stdio: ['ignore', 'inherit', 'inherit'],
+  }).unref();
+  console.log("spawn unexpectedly allowed");
+} catch (err) {
+  console.log("spawn denied by the permission model");
+}
+await new Promise(() => {});
 "#;
         let started = std::time::Instant::now();
         let out = tool.execute(json!({ "code": code })).await.unwrap();
         let elapsed = started.elapsed();
         assert!(out.contains("status=timeout"), "{out}");
+        assert!(
+            out.contains("spawn denied by the permission model"),
+            "the permission model must deny the spawn: {out}"
+        );
         assert!(
             elapsed < Duration::from_secs(15),
             "a leftover pipe holder must not stretch the call past its budget: {elapsed:?}"
@@ -692,10 +725,175 @@ for (;;) ballast.push(new Array(100000).fill("xxxxxxxxxxxxxxxx"));
             limits: RunCodeLimits::default(),
             node_bin: None,
             abort: Some(token),
+            read_root: None,
+            min_free_bytes: None,
         })
         .await;
         assert!(canceller.await.is_ok());
         assert_eq!(report.failure, Some(protocol::RunCodeFailure::Abort));
         assert!(report.render().contains("status=abort"));
+    }
+
+    // ── Goal 416 — live-node security baseline ─────────────────────────────
+
+    /// Live-node (#134 W1): `child_process` is denied by the runtime
+    /// permission model — the mod.rs:458 detach-holder escape (spawning a
+    /// grandchild process) is dead, loudly, inside the program.
+    #[tokio::test]
+    async fn child_process_import_is_denied() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let tool = RunCode::new(registry_with(Arc::new(Double)));
+        let code = r#"
+const cp = await import('node:child_process');
+try {
+  cp.spawnSync('echo', ['pwned']);
+  console.log("SPAWN ALLOWED");
+} catch (err) {
+  console.log("spawn denied: " + err.message.slice(0, 40));
+}
+try {
+  cp.execSync('echo pwned');
+  console.log("EXEC ALLOWED");
+} catch (err) {
+  console.log("exec denied: " + err.message.slice(0, 40));
+}
+return "checked";
+"#;
+        let out = tool.execute(json!({ "code": code })).await.unwrap();
+        assert!(out.contains("status=ok"), "{out}");
+        assert!(out.contains("spawn denied:"), "{out}");
+        assert!(out.contains("exec denied:"), "{out}");
+        assert!(!out.contains("SPAWN ALLOWED"), "{out}");
+        assert!(!out.contains("EXEC ALLOWED"), "{out}");
+    }
+
+    /// Live-node (#134 W1): a direct workspace write outside the scratch dir
+    /// is denied by the permission model. The program's only writable
+    /// location is its per-run scratch dir; the read root stays read-only.
+    #[tokio::test]
+    async fn workspace_direct_write_outside_scratch_is_denied() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let ws = tempfile::TempDir::new().expect("workspace tempdir");
+        let tool = RunCode::new(registry_with(Arc::new(Double)))
+            .with_read_root(ws.path())
+            .with_node_bin(runner::locate_node().expect("node must be on PATH for this test"));
+        let ws_path = ws.path().display().to_string().replace('\\', "\\\\");
+        let code = format!(
+            r#"
+const fs = require('fs');
+try {{
+  fs.writeFileSync("{ws_path}/escalated.txt", "pwned");
+  console.log("WORKSPACE WRITE ALLOWED");
+}} catch (err) {{
+  console.log("workspace write denied: " + err.message.slice(0, 40));
+}}
+// The scratch dir (the spawn cwd) is writable.
+fs.writeFileSync("in-scratch.txt", "fine");
+return "checked";
+"#
+        );
+        let out = tool.execute(json!({ "code": code })).await.unwrap();
+        assert!(out.contains("status=ok"), "{out}");
+        assert!(out.contains("workspace write denied:"), "{out}");
+        assert!(!out.contains("WORKSPACE WRITE ALLOWED"), "{out}");
+        assert!(
+            !ws.path().join("escalated.txt").exists(),
+            "nothing may land in the read root: {}",
+            ws.path().display()
+        );
+    }
+
+    /// Live-node (#134 W1): the rendered fact is honest about what the
+    /// permission model is — a seat belt, not a malicious-code boundary.
+    /// `node:sqlite` is Node's own documented bypass ("does not guarantee
+    /// that users will not be able to access the file system through other
+    /// means"); verified live on node 26.10 (macOS and Linux):
+    /// `new DatabaseSync('<outside>')` + `exec('CREATE TABLE …')` writes a
+    /// file outside every fs grant while `fs.writeFileSync` to the same path
+    /// is denied. The fact string must say so — a model reading this
+    /// observation must never believe `scratch-only` means it cannot write
+    /// elsewhere, and the operator must never read it as hostile-code
+    /// containment (that is the container/microVM tier's job).
+    #[tokio::test]
+    async fn fs_policy_fact_names_the_node_sqlite_bypass() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let tool = RunCode::new(registry_with(Arc::new(Double)));
+        let out = tool
+            .execute(json!({ "code": "return 'probe';" }))
+            .await
+            .unwrap();
+        assert!(out.contains("status=ok"), "{out}");
+        assert!(
+            out.contains("fs-write=scratch-only"),
+            "the fact keeps its headline: {out}"
+        );
+        assert!(
+            out.contains("node:sqlite bypasses fs grants"),
+            "the fact must disclose the sqlite bypass, not claim hard confinement: {out}"
+        );
+        assert!(
+            out.contains("seat-belt"),
+            "the fact must carry the seat-belt qualifier: {out}"
+        );
+    }
+
+    /// Live-node (#134 W1): the address-space guard is what the sandbox facts
+    /// claim it is. On a Linux kernel (which enforces RLIMIT_AS) the child
+    /// sees the lowered limit — it reads `/proc/self/limits`, which the
+    /// runner grants explicitly (`--allow-fs-read=/proc`; verified: the
+    /// permission model has no /proc carve-out and denies the read with
+    /// `ERR_ACCESS_DENIED` otherwise). On a kernel that refuses to lower it
+    /// (macOS) the fact string must say `not-enforced-by-kernel` rather than
+    /// claim a cap that does not exist.
+    #[tokio::test]
+    async fn address_space_guard_fact_matches_the_child_view() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let tool = RunCode::new(registry_with(Arc::new(Double)));
+        // Read the limit the child inherited: glibc exposes getrlimit only
+        // natively, so go through /proc on Linux and assert the fact string
+        // elsewhere.
+        if cfg!(target_os = "linux") {
+            let code = r#"
+const text = require('fs').readFileSync('/proc/self/limits', 'utf8');
+const line = text.split('\n').find((l) => l.includes('Max address space'));
+console.log(line);
+return line;
+"#;
+            let out = tool.execute(json!({ "code": code })).await.unwrap();
+            assert!(
+                out.contains("status=ok"),
+                "the child must be able to read /proc/self/limits: {out}"
+            );
+            assert!(
+                out.contains("Max address space"),
+                "the child must report its own limit: {out}"
+            );
+            assert!(
+                out.contains("rlimit_as=enforced("),
+                "Linux facts must claim enforcement: {out}"
+            );
+        } else {
+            let out = tool
+                .execute(json!({ "code": "return 'probe';" }))
+                .await
+                .unwrap();
+            assert!(out.contains("status=ok"), "{out}");
+            assert!(
+                out.contains("rlimit_as=not-enforced-by-kernel"),
+                "a kernel that cannot lower RLIMIT_AS must be labeled, not lied about: {out}"
+            );
+        }
     }
 }

@@ -677,13 +677,17 @@ impl AgentTool {
         // would reach tools outside this worker's `allowed_tools`. Rebuild it
         // over the restricted registry (no-op when the worker was not given
         // `RunCode`; `binding_names` excludes `RunCode` itself, so a program
-        // can never recurse).
+        // can never recurse). The read root is pinned to the worker's
+        // workspace so the run's fs-read grant is deterministic rather than
+        // whatever directory the host process started in.
         if reg
             .find_by_name(crate::tools::run_code::RUN_CODE_TOOL_NAME)
             .is_some()
         {
             let restricted = reg.clone();
-            reg = reg.register(Arc::new(crate::tools::run_code::RunCode::new(restricted)));
+            reg = reg.register(Arc::new(
+                crate::tools::run_code::RunCode::new(restricted).with_read_root(&self.workspace),
+            ));
         }
         reg
     }

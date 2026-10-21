@@ -656,11 +656,26 @@ impl AgentRuntimeBuilder {
         if self.with_run_code && !kernel.tools().surface_filtered() {
             if kernel.tools().transport().executes_on_host() {
                 let invoker_registry = kernel.tools().clone();
-                kernel
-                    .tools_mut()
-                    .register_mut(Arc::new(crate::tools::run_code::RunCode::new(
-                        invoker_registry,
-                    )));
+                // Pin the run's fs-read root to the session's workspace —
+                // the same root the registry's fs tools are built on — so
+                // the grant is deterministic. Unpinned, the runner falls
+                // back to the host process's cwd at spawn time, which is
+                // whatever directory the host happened to start in. The
+                // deliverables ledger's workspace is that root (Goal #133
+                // builds it from the same workspace the tools get); the
+                // session-roots slot is the TUI `/add-dir` companion, whose
+                // first entry is not the workspace itself.
+                let read_root = kernel
+                    .tools()
+                    .deliverables()
+                    .map(|d| d.workspace().to_path_buf());
+                let run_code = match read_root {
+                    Some(root) => {
+                        crate::tools::run_code::RunCode::new(invoker_registry).with_read_root(root)
+                    }
+                    None => crate::tools::run_code::RunCode::new(invoker_registry),
+                };
+                kernel.tools_mut().register_mut(Arc::new(run_code));
             } else {
                 tracing::warn!(
                     "run_code: not registered — it executes model-authored code in a host \
@@ -1029,6 +1044,46 @@ mod tests {
         assert!(
             rt.kernel().tools().find_by_name("RunCode").is_none(),
             "an allow-list must not be widened by the preset"
+        );
+    }
+
+    /// Goal 416 review: the run's fs-read root is pinned to the session's
+    /// workspace (the deliverables ledger's workspace root, the same root
+    /// the fs tools are built on) rather than falling back to whatever
+    /// directory the host process started in. Proven behaviourally: the
+    /// program reads a file that only exists under the workspace — a run
+    /// rooted at the host process's cwd would have that read denied by the
+    /// permission model.
+    #[tokio::test]
+    async fn run_code_read_root_is_pinned_to_the_workspace() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let dir = tempfile::TempDir::new().expect("temp workspace");
+        let marker = dir.path().join("marker.txt");
+        std::fs::write(&marker, "pinned\n").expect("seed marker");
+
+        let tools = crate::tools::build_standard_tools(dir.path(), &[], 30);
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(tools)
+            .with_run_code(true)
+            .build()
+            .expect("build must succeed");
+        let code = format!(
+            "return require('fs').readFileSync({:?}, 'utf8').trim();",
+            marker.display().to_string().replace('\\', "\\\\")
+        );
+        let out = rt
+            .kernel()
+            .tools()
+            .invoke("RunCode", serde_json::json!({"code": code}))
+            .await
+            .expect("RunCode must succeed");
+        assert!(
+            out.contains("status=ok") && out.contains("--- value ---\npinned"),
+            "the workspace file must be readable (fs-read root = workspace): {out}"
         );
     }
 

@@ -164,6 +164,26 @@ pub struct SandboxFacts {
     pub heap_limit_mib: usize,
     pub output_limit_bytes: usize,
     pub timeout_secs: u64,
+    /// Goal 416: the filesystem policy enforced by the runtime's permission
+    /// model (`fs` writes = the run's scratch dir only, `child_process` /
+    /// `worker_threads` / `cluster` denied), or the reason the model is not
+    /// in force. Empty only when the sandbox was unavailable before these
+    /// facts were assembled. A seat-belt statement, not a confinement claim:
+    /// Node's permission model does not protect against malicious code, and
+    /// the fact string names the documented `node:sqlite` fs bypass.
+    pub fs_policy: String,
+    /// Goal 416: the permission flag the runtime was probed with
+    /// (`--permission` / `--experimental-permission`), or `None` when the
+    /// runtime has no permission model.
+    pub permission_flag: Option<String>,
+    /// Goal 416: the per-run scratch directory the program may write (its
+    /// spawn cwd), or `None` when no run reached the spawn stage.
+    pub scratch_dir: Option<String>,
+    /// Goal 416: resource guards with an honest enforcement statement —
+    /// e.g. `rlimit_as=enforced(768MiB)` on Linux, or the kernel's failure to
+    /// apply it spelled out (`rlimit_as=not-enforced-by-kernel; in-heap
+    /// bounded by the heap limit`) rather than a claimed-but-unenforced cap.
+    pub resource_guards: String,
 }
 
 /// The single value `run_code` renders for the model.
@@ -203,6 +223,21 @@ impl RunReport {
             self.sandbox.output_limit_bytes,
             self.sandbox.timeout_secs,
         ));
+        if !self.sandbox.fs_policy.is_empty() {
+            out.push_str(&format!("sandbox: fs={}\n", self.sandbox.fs_policy));
+        }
+        if let Some(flag) = &self.sandbox.permission_flag {
+            out.push_str(&format!("sandbox: permission_flag={flag}\n"));
+        }
+        if let Some(dir) = &self.sandbox.scratch_dir {
+            out.push_str(&format!("sandbox: scratch={dir}\n"));
+        }
+        if !self.sandbox.resource_guards.is_empty() {
+            out.push_str(&format!(
+                "sandbox: guards={}\n",
+                self.sandbox.resource_guards
+            ));
+        }
         if let Some(detail) = &self.detail {
             out.push_str(&format!("detail: {detail}\n"));
         }
@@ -395,6 +430,7 @@ mod tests {
                 heap_limit_mib: 512,
                 output_limit_bytes: 64,
                 timeout_secs: 120,
+                ..SandboxFacts::default()
             },
         };
         let rendered = report.render();
@@ -422,10 +458,51 @@ mod tests {
                 heap_limit_mib: 512,
                 output_limit_bytes: 64,
                 timeout_secs: 120,
+                ..SandboxFacts::default()
             },
         };
         let rendered = report.render();
         assert!(rendered.contains("status=ok"));
         assert!(rendered.contains("--- value ---\n{\"total\":3}"));
+    }
+
+    /// Goal 416: the security-baseline facts are additive render lines — a
+    /// report that never reached the permission stage omits them (old readers
+    /// keep parsing), and a report that did carries the policy, the probe
+    /// flag, the scratch dir and the enforcement statement.
+    #[test]
+    fn render_carries_the_security_baseline_facts() {
+        let report = RunReport {
+            failure: None,
+            exit_code: Some(0),
+            calls: 0,
+            duration_ms: 5,
+            output: String::new(),
+            output_bytes: 0,
+            output_truncated: false,
+            value: Some("1".into()),
+            detail: None,
+            sandbox: SandboxFacts {
+                runtime: Some("/usr/bin/node".into()),
+                env_policy: "cleared".into(),
+                heap_limit_mib: 512,
+                output_limit_bytes: 64,
+                timeout_secs: 120,
+                fs_policy: "fs-write=scratch-only (seat-belt, not a malicious-code \
+                            boundary: node:sqlite bypasses fs grants); \
+                            child_process=denied; worker_threads=denied; cluster=denied"
+                    .into(),
+                permission_flag: Some("--permission".into()),
+                scratch_dir: Some("/tmp/run-code-1".into()),
+                resource_guards: "rlimit_as=enforced(768MiB)".into(),
+            },
+        };
+        let rendered = report.render();
+        assert!(rendered.contains("sandbox: fs=fs-write=scratch-only"));
+        assert!(rendered.contains("node:sqlite bypasses fs grants"));
+        assert!(rendered.contains("child_process=denied"));
+        assert!(rendered.contains("sandbox: permission_flag=--permission"));
+        assert!(rendered.contains("sandbox: scratch=/tmp/run-code-1"));
+        assert!(rendered.contains("sandbox: guards=rlimit_as=enforced(768MiB)"));
     }
 }
