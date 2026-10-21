@@ -555,7 +555,19 @@ impl AgentRuntime {
         //
         // Pass the full TokenUsage so cache_hit_tokens / cache_miss_tokens
         // land on the CompactionBoundary event (g336).
-        let compact_usage = self.maybe_compact_cross_turn(&turn_outcome.usage).await?;
+        //
+        // Issue #162: the threshold decision must judge the *last* LLM call's
+        // prompt size, so `prompt_tokens` is overwritten with
+        // `last_prompt_tokens` before handing the usage over — passing the
+        // turn sum made every multi-step turn cross the token threshold no
+        // matter how small the actual context was. The cache fields stay
+        // turn-accumulated: their consumer here is the CompactionBoundary
+        // telemetry, not the trigger (`should_compact_usage` folds them via
+        // `input_tokens`, so a cache-splitting provider keeps its
+        // normalised reading).
+        let mut compact_input = turn_outcome.usage;
+        compact_input.prompt_tokens = turn_outcome.last_prompt_tokens;
+        let compact_usage = self.maybe_compact_cross_turn(&compact_input).await?;
         // Issue #115: cross-turn compaction re-sends the whole transcript —
         // fold its spend (plus any manual `/compact` spend parked since the
         // last turn) into this turn's usage so the cost tracker sees it.

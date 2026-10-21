@@ -2414,6 +2414,182 @@ async fn cross_turn_microcompact_disabled_when_none() {
     );
 }
 
+// ── Issue #162: the cross-turn trigger judges the last LLM call, not the turn sum ──
+
+/// TokenUsage for a scripted step: `prompt` in, cache split empty (a provider
+/// that reports no split is normalised by definition, so the trigger decides
+/// on `prompt_tokens` alone).
+fn step_usage(prompt: u32) -> crate::llm::TokenUsage {
+    crate::llm::TokenUsage {
+        prompt_tokens: prompt,
+        total_tokens: prompt,
+        ..Default::default()
+    }
+}
+
+fn tool_step_completion(step: usize, usage: crate::llm::TokenUsage) -> Completion {
+    Completion {
+        content: format!("step {step}"),
+        tool_calls: vec![crate::llm::ToolCall {
+            id: format!("c{step}"),
+            name: "add".into(),
+            arguments: json!({"a": step, "b": 1}),
+        }],
+        finish_reason: Some("tool_calls".into()),
+        usage: Some(usage),
+        reasoning_content: None,
+    }
+}
+
+fn summary_completion() -> Completion {
+    Completion {
+        content: "Summary of prior conversation.".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+/// Only a compaction that actually runs consumes this completion and splices
+/// its content into the transcript, so its presence is the observable for
+/// "the trigger fired".
+async fn transcript_contains_summary(rt: &AgentRuntime) -> bool {
+    rt.transcript()
+        .iter()
+        .any(|m| m.content.contains("Summary of prior conversation."))
+}
+
+/// Issue #162: a multi-step turn whose *accumulated* prompt_tokens cross the
+/// threshold while the last LLM call stays below it must NOT compact. 8 steps
+/// × 100K accumulate to 800K ≥ 784K; the buggy accumulated reading fired a
+/// paid summary on every such turn.
+#[tokio::test]
+async fn cross_turn_compaction_ignores_accumulated_prompt_tokens() {
+    const THRESHOLD: u32 = 784_000;
+    let mut completions: Vec<Completion> = (0..7)
+        .map(|i| tool_step_completion(i, step_usage(100_000)))
+        .collect();
+    completions.push(Completion {
+        content: "done".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: Some(step_usage(100_000)),
+        reasoning_content: None,
+    });
+    // Spare completion only the summariser would consume if the trigger
+    // (wrongly) fired on the accumulated sum.
+    completions.push(summary_completion());
+    let llm = Arc::new(MockProvider::new(completions));
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    let compactor = crate::Compactor::new(usize::MAX) // never by char estimate
+        .threshold_prompt_tokens(THRESHOLD);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .tools(ToolRegistry::local().register(Arc::new(Adder)))
+        .compactor(compactor)
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    // Pad the transcript so compaction *could* run if triggered.
+    let seed: Vec<Message> = (0..6)
+        .flat_map(|i| {
+            vec![
+                Message::user(format!("q{i}")),
+                Message::assistant(format!("a{i}")),
+            ]
+        })
+        .collect();
+    rt.set_transcript(seed);
+
+    while rx.try_recv().is_ok() {}
+    let out = rt.run("one more question").await.unwrap();
+    assert_eq!(out.steps, 8, "7 tool-use steps plus the closing stop");
+
+    while let Ok(ev) = rx.try_recv() {
+        assert!(
+            !matches!(ev, AgentEvent::CompactionBoundary { .. }),
+            "compaction must not fire on the accumulated turn sum"
+        );
+    }
+    assert!(
+        !transcript_contains_summary(&rt).await,
+        "transcript must be untouched — no summary was spliced in"
+    );
+}
+
+/// Reverse direction: when the last LLM call itself exceeds the threshold,
+/// cross-turn compaction still fires, and the (turn-accumulated) cache split
+/// reaches the CompactionBoundary telemetry (g336).
+#[tokio::test]
+async fn cross_turn_compaction_fires_on_last_prompt_tokens() {
+    const THRESHOLD: u32 = 784_000;
+    let mut completions: Vec<Completion> = (0..2)
+        .map(|i| tool_step_completion(i, step_usage(100_000)))
+        .collect();
+    // DeepSeek-shaped last call: prompt_tokens == hit + miss (normalised).
+    completions.push(Completion {
+        content: "done".into(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".into()),
+        usage: Some(crate::llm::TokenUsage {
+            prompt_tokens: 800_000,
+            total_tokens: 800_000,
+            cache_hit_tokens: 50_000,
+            cache_miss_tokens: 750_000,
+            ..Default::default()
+        }),
+        reasoning_content: None,
+    });
+    completions.push(summary_completion());
+    let llm = Arc::new(MockProvider::new(completions));
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    let compactor = crate::Compactor::new(usize::MAX) // never by char estimate
+        .threshold_prompt_tokens(THRESHOLD);
+    let mut rt = AgentRuntime::builder()
+        .llm(llm)
+        .tools(ToolRegistry::local().register(Arc::new(Adder)))
+        .compactor(compactor)
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    let seed: Vec<Message> = (0..6)
+        .flat_map(|i| {
+            vec![
+                Message::user(format!("q{i}")),
+                Message::assistant(format!("a{i}")),
+            ]
+        })
+        .collect();
+    rt.set_transcript(seed);
+
+    while rx.try_recv().is_ok() {}
+    rt.run("one more question").await.unwrap();
+
+    let mut boundary = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::CompactionBoundary {
+            cache_hit_tokens,
+            cache_miss_tokens,
+            ..
+        } = ev
+        {
+            boundary = Some((cache_hit_tokens, cache_miss_tokens));
+        }
+    }
+    let (hit, miss) =
+        boundary.expect("compaction must fire when the last call exceeds the threshold");
+    assert_eq!(hit, 50_000, "turn cache-hit total forwarded to telemetry");
+    assert_eq!(
+        miss, 750_000,
+        "turn cache-miss total forwarded to telemetry"
+    );
+    assert!(
+        transcript_contains_summary(&rt).await,
+        "compaction ran and spliced the summary in"
+    );
+}
+
 // ── compact_on_overflow ─────────────────────────────────────────────────
 
 #[tokio::test]
