@@ -431,10 +431,33 @@ fn validate_path_template(template: &str, name: &str) -> Result<()> {
         })
 }
 
+/// `true` when `value` is, or contains, a collapsing dot segment — the whole
+/// value or one `/`/`\`-delimited component made only of dots. Such a value
+/// is percent-encoded into a single URL segment, but an origin that decodes
+/// `%2F` before normalising its path would still walk out of the configured
+/// base.
+fn has_dot_segment(value: &str) -> bool {
+    value
+        .split(['/', '\\'])
+        .any(|seg| !seg.is_empty() && seg.chars().all(|c| c == '.'))
+}
+
 /// Percent-encode one path-segment value. Unreserved characters pass
 /// through; everything else (including `/`, `?`, `#`, `%`, spaces, UTF-8)
 /// is %-encoded byte-wise so a param value can never escape its segment.
-fn encode_segment(value: &str) -> String {
+/// Dot-segment values are rejected: `.` is unreserved, so leaving it raw
+/// would let [`url::Url::set_path`] collapse the path outside the
+/// operator-configured base.
+fn encode_segment(value: &str) -> Result<String> {
+    if has_dot_segment(value) {
+        return Err(Error::BadToolArgs {
+            name: HttpCall::NAME.to_string(),
+            message: format!(
+                "path segment `{value}` is not allowed: it is (or contains) \
+                 a dot segment"
+            ),
+        });
+    }
     let mut out = String::with_capacity(value.len());
     for b in value.as_bytes() {
         match b {
@@ -444,7 +467,7 @@ fn encode_segment(value: &str) -> String {
             other => out.push_str(&format!("%{other:02X}")),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Render a scalar param value the way it appears in a URL.
@@ -535,7 +558,7 @@ impl HttpCall {
         for name in &needed {
             match params.get(name).and_then(scalar_to_string) {
                 Some(v) => {
-                    segments.insert(name.clone(), encode_segment(&v));
+                    segments.insert(name.clone(), encode_segment(&v)?);
                 }
                 None => {
                     if params.contains_key(name) {
@@ -581,8 +604,37 @@ impl HttpCall {
             path = path.replace(&format!("{{{name}}}"), value);
         }
         let mut url = spec.base_url.clone();
-        let base_path = url.path().trim_end_matches('/');
-        url.set_path(&format!("{base_path}{path}"));
+        let base_path = url.path().trim_end_matches('/').to_string();
+        // Invariant: a placeholder (or a template mistake) must never
+        // retarget the request outside the path prefix the operator
+        // configured. `set_path` collapses `.`/`..` segments, so check both
+        // the assembled path (nothing to collapse) and the path the server
+        // will actually receive (still under the prefix).
+        let full_path = format!("{base_path}{path}");
+        url.set_path(&full_path);
+        let resolved = url.path();
+        let within_base = !has_dot_segment(&full_path)
+            && (base_path.is_empty()
+                || resolved == base_path
+                || resolved.starts_with(&format!("{base_path}/")));
+        if !within_base {
+            return Err(Error::BadToolArgs {
+                name: Self::NAME.to_string(),
+                message: if base_path.is_empty() {
+                    format!(
+                        "endpoint '{}': path `{full_path}` carries dot segments and \
+                         was rewritten to `{resolved}`",
+                        spec.name
+                    )
+                } else {
+                    format!(
+                        "endpoint '{}': path `{full_path}` resolves to `{resolved}`, \
+                         outside the configured base path `{base_path}`",
+                        spec.name
+                    )
+                },
+            });
+        }
         for (k, v) in &query {
             url.query_pairs_mut().append_pair(k, v);
         }
@@ -1248,6 +1300,110 @@ mod tests {
         );
     }
 
+    // ── placeholder path escape (issue #170) ────────────────────────────
+
+    fn templated_spec(base: &str, path: &str) -> EndpointSpec {
+        EndpointRegistry::from_json(
+            &json!({ "endpoints": { "ep": {
+                "method": "GET",
+                "base_url": base,
+                "path": path,
+                "allow_private": true
+            }}})
+            .to_string(),
+        )
+        .expect("registry")
+        .get("ep")
+        .expect("ep")
+        .clone()
+    }
+
+    fn string_params(pairs: &[(&str, &str)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn single_dot_placeholder_is_rejected() {
+        let spec = templated_spec("https://gw.internal/svc/orders", "/{id}");
+        let err = HttpCall::build_url(&spec, &string_params(&[("id", ".")])).unwrap_err();
+        assert!(err.to_string().contains("dot segment"), "{err}");
+    }
+
+    #[test]
+    fn dotdot_placeholder_is_rejected() {
+        let spec = templated_spec("https://gw.internal/svc/orders", "/{id}");
+        let err = HttpCall::build_url(&spec, &string_params(&[("id", "..")])).unwrap_err();
+        assert!(err.to_string().contains("dot segment"), "{err}");
+    }
+
+    #[test]
+    fn nested_path_placeholder_is_rejected() {
+        let spec = templated_spec("https://gw.internal/svc/orders", "/{id}");
+        for value in ["a/../..", "a\\..\\..", "..."] {
+            let err = HttpCall::build_url(&spec, &string_params(&[("id", value)])).unwrap_err();
+            assert!(err.to_string().contains("dot segment"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn normal_placeholder_stays_under_base() {
+        let spec = templated_spec("https://gw.internal/svc/orders", "/{id}");
+        let url = HttpCall::build_url(&spec, &string_params(&[("id", "42")])).expect("ok");
+        assert_eq!(url.as_str(), "https://gw.internal/svc/orders/42");
+        // Dot-bearing values that are not dot segments still pass through.
+        let url = HttpCall::build_url(&spec, &string_params(&[("id", "v1.2")])).expect("ok");
+        assert_eq!(url.path(), "/svc/orders/v1.2");
+    }
+
+    #[test]
+    fn template_dot_segment_escaping_base_is_rejected() {
+        // A literal `..` in the template collapses under `set_path`; the
+        // post-normalisation check must catch the retargeted path.
+        let spec = templated_spec("https://gw.internal/svc/orders", "/../admin");
+        let err = HttpCall::build_url(&spec, &BTreeMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured base path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sibling_prefix_is_not_mistaken_for_base() {
+        // `/svc/orders-evil` shares `starts_with("/svc/orders")` with the
+        // base, so the check must enforce a path boundary.
+        let spec = templated_spec("https://gw.internal/svc/orders", "/../../svc/orders-evil/x");
+        let err = HttpCall::build_url(&spec, &BTreeMap::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the configured base path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn root_base_rejects_collapsing_template() {
+        // With no base path, `starts_with("")` is vacuously true — the
+        // equivalent invariant is "nothing to collapse".
+        let spec = templated_spec("https://gw.internal", "/../admin");
+        let err = HttpCall::build_url(&spec, &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("dot segments"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dotdot_placeholder_fails_before_dispatch() {
+        let (addr, _handle) = spawn_mock("HTTP/1.1 200 OK".to_string(), "{}".to_string());
+        let tool = tool_at(addr);
+        let err = tool
+            .execute(json!({"endpoint": "get_order", "params": {"order_id": ".."}}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dot segment"), "{msg}");
+        assert!(!msg.contains("HTTP 200"), "request must not be sent: {msg}");
+    }
+
     #[tokio::test]
     async fn unknown_endpoint_error_has_no_url() {
         let (addr, _handle) = spawn_mock("HTTP/1.1 200 OK".to_string(), "{}".to_string());
@@ -1442,11 +1598,16 @@ mod tests {
 
     #[test]
     fn encode_segment_escapes_everything_unsafe() {
-        assert_eq!(encode_segment("A-z_9.~"), "A-z_9.~");
-        assert_eq!(encode_segment("a b"), "a%20b");
-        assert_eq!(encode_segment("/"), "%2F");
-        assert_eq!(encode_segment("好"), "%E5%A5%BD");
-        assert_eq!(encode_segment("%"), "%25");
+        assert_eq!(encode_segment("A-z_9.~").expect("ok"), "A-z_9.~");
+        assert_eq!(encode_segment("a b").expect("ok"), "a%20b");
+        assert_eq!(encode_segment("/").expect("ok"), "%2F");
+        assert_eq!(encode_segment("好").expect("ok"), "%E5%A5%BD");
+        assert_eq!(encode_segment("%").expect("ok"), "%25");
+        assert_eq!(encode_segment("v1.2").expect("ok"), "v1.2");
+        // Dot segments are unreserved and would be collapsed by `set_path`.
+        for value in [".", "..", "...", "a/../..", "a\\..\\..", "a/./b"] {
+            assert!(encode_segment(value).is_err(), "{value} must be rejected");
+        }
     }
 
     #[test]
