@@ -3832,29 +3832,35 @@ mod tests {
     /// configurable tool timeout — that is exactly how "the server never
     /// started" would take 5 minutes to surface.
     ///
-    /// Hermetic: the mock is a loopback listener that answers after 1.2s.
+    /// Hermetic: the mock is a loopback listener that answers after 3s.
+    /// The delay is far beyond both the 300ms read budget and the 2s
+    /// latency bound below, and the tool budget (10s) is far beyond the
+    /// delay, so a pass can only mean the read-budget tier held — any
+    /// regression to the tool budget or the client backstop returns `Ok`
+    /// at 3s and trips the first assert.
     #[tokio::test]
     async fn http_initialize_fails_fast_and_ignores_the_tool_budget() {
-        let url = spawn_delayed_streamable_mock(Duration::from_millis(1200), Duration::ZERO);
+        let url = spawn_delayed_streamable_mock(Duration::from_secs(3), Duration::ZERO);
         let server = server_with_url(&url, Some("http"));
 
         let started = std::time::Instant::now();
         let result = McpClient::spawn_with_timeout(&server, Duration::from_millis(300))
             .await
-            .map(|client| client.with_tool_timeout(Duration::from_secs(5)));
+            .map(|client| client.with_tool_timeout(Duration::from_secs(10)));
         let elapsed = started.elapsed();
 
         assert!(
             result.is_err(),
-            "a 1.2s initialize must fail under a 300ms budget, not wait for the tool budget"
+            "a 3s initialize must fail under a 300ms budget, not wait for the tool budget"
         );
-        // Observed on this machine: ~300-310ms (the 300ms budget plus
-        // scheduling). The pre-rework client-level 30s timeout made this
-        // line report ~30s; a `tool_timeout`-wide client timeout made it
-        // report the full server delay.
+        // The bound sits well above the 300ms budget so scheduler jitter
+        // under a fully loaded parallel test run cannot flake it (observed
+        // ~300-310ms idle, ~900ms under load) yet stays below the 3s mock
+        // delay and the 10s tool budget: an error this fast is only
+        // reachable via the read-budget tier.
         eprintln!("http initialize failed after {elapsed:?}");
         assert!(
-            elapsed < Duration::from_millis(900),
+            elapsed < Duration::from_secs(2),
             "initialize must fail promptly (read-timeout bound), took {elapsed:?} — \
              the per-request budget is not tiered"
         );
