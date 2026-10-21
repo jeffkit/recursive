@@ -20,7 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
@@ -274,6 +275,10 @@ pub struct McpPromptMessage {
 // Transport abstraction
 // ---------------------------------------------------------------------------
 
+/// Response slots shared between an HTTP+SSE client and its resident
+/// reader task, keyed by JSON-RPC request id (issue #178).
+type PendingResponses = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
 /// The underlying transport for an MCP client.
 #[allow(clippy::large_enum_variant)]
 enum McpTransport {
@@ -283,16 +288,29 @@ enum McpTransport {
         reader: BufReader<ChildStdout>,
         child: Option<Child>,
     },
-    /// HTTP+SSE transport.
+    /// Legacy HTTP+SSE transport (2024-11-05): a single long-lived `GET`
+    /// event stream carries every server→client message, while
+    /// client→server messages are `POST`ed to the endpoint the stream
+    /// announces (issue #178).
     HttpSse {
         client: reqwest::Client,
-        /// Base SSE endpoint URL (the one that returns the event stream).
+        /// The SSE endpoint URL (the long-lived `GET`).
         sse_url: String,
-        /// URL template for POST requests (from the `endpoint` event).
-        post_url: Option<String>,
-        /// Buffer for accumulating SSE data between reads.
-        buffer: String,
+        /// Messenger endpoint, resolved to an absolute URL from the
+        /// `endpoint` event's `data:` payload — a relative payload is
+        /// joined against [`sse_url`](Self::HttpSse::sse_url).
+        post_url: String,
+        /// Sending halves of the in-flight response slots, shared with the
+        /// reader task so it can wake the right waiter by id.
+        pending: PendingResponses,
+        /// Receiving halves of [`pending`](Self::HttpSse::pending), owned
+        /// by this client and consumed by `read_response`.
+        waiters: HashMap<u64, oneshot::Receiver<Result<Value>>>,
+        /// The resident stream reader. Bound to the client: aborted on
+        /// `Drop` so the session's stream is not left behind.
+        reader: JoinHandle<()>,
     },
+
     /// 2025-03-26 Streamable HTTP transport: a single endpoint that
     /// accepts JSON-RPC via `POST` and answers either with a JSON body or
     /// with an SSE stream in the POST response.
@@ -448,10 +466,17 @@ impl fmt::Debug for McpClient {
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        if let McpTransport::Stdio { ref mut child, .. } = &mut self.transport {
-            if let Some(mut child) = child.take() {
-                let _ = child.start_kill();
+        match &mut self.transport {
+            McpTransport::Stdio { child, .. } => {
+                if let Some(mut child) = child.take() {
+                    let _ = child.start_kill();
+                }
             }
+            // The reader owns the session's long-lived GET: aborting it
+            // closes the stream instead of leaving an orphan task and a
+            // socket behind (issue #178).
+            McpTransport::HttpSse { reader, .. } => reader.abort(),
+            McpTransport::StreamableHttp { .. } => {}
         }
     }
 }
@@ -532,6 +557,23 @@ impl McpClient {
     /// (issue #181 review, spec 陷阱 #1). The per-call budget is applied
     /// per request by [`McpClient::http_request_timeout`] instead.
     fn build_http_client(server: &McpServer) -> Result<reqwest::Client> {
+        Self::build_http_client_with_total_timeout(server, Some(HTTP_DEFAULT_REQUEST_TIMEOUT))
+    }
+
+    /// [`McpClient::build_http_client`] with an explicit transport-wide
+    /// timeout.
+    ///
+    /// The legacy SSE stream passes `None` (issue #178): reqwest's
+    /// client-level timeout covers *reading the body*, so the fixed 30s
+    /// budget would terminate a healthy long-lived event stream at 30s.
+    /// Every wait on that transport is still bounded elsewhere — the
+    /// handshake `GET` by a `tokio::time::timeout`, each `POST` by its
+    /// per-request `.timeout()`, and each response by
+    /// `read_response`'s budget.
+    fn build_http_client_with_total_timeout(
+        server: &McpServer,
+        total_timeout: Option<Duration>,
+    ) -> Result<reqwest::Client> {
         let mut default_headers = reqwest::header::HeaderMap::new();
         if let Some(extra) = &server.headers {
             for (key, value) in extra {
@@ -551,14 +593,14 @@ impl McpClient {
                 default_headers.insert(name, value);
             }
         }
-        reqwest::Client::builder()
-            .timeout(HTTP_DEFAULT_REQUEST_TIMEOUT)
-            .default_headers(default_headers)
-            .build()
-            .map_err(|e| Error::Mcp {
-                server: server.name.clone(),
-                message: format!("failed to build HTTP client: {e}"),
-            })
+        let mut builder = reqwest::Client::builder().default_headers(default_headers);
+        if let Some(total_timeout) = total_timeout {
+            builder = builder.timeout(total_timeout);
+        }
+        builder.build().map_err(|e| Error::Mcp {
+            server: server.name.clone(),
+            message: format!("failed to build HTTP client: {e}"),
+        })
     }
 
     /// Budget for a single HTTP request (issue #181 review).
@@ -663,26 +705,44 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Spawn via HTTP+SSE transport.
+    /// Spawn via the legacy HTTP+SSE transport (2024-11-05 revision).
+    ///
+    /// One long-lived `GET` stream serves the whole session (issue #178):
+    /// a resident reader task consumes it and dispatches every JSON-RPC
+    /// message by id, while requests go out as `POST`s to the endpoint the
+    /// stream announces. The previous implementation re-`GET` the stream
+    /// per response, which made the server open a *new* session each time —
+    /// replies for the original `sessionId` never arrived on the new
+    /// stream.
     async fn spawn_http_sse(
         server: &McpServer,
         url: &str,
         read_timeout: Duration,
         tool_timeout: Duration,
     ) -> Result<Self> {
-        let http_client = Self::build_http_client(server)?;
+        // No client-level timeout: the GET body is the session itself (see
+        // `build_http_client_with_total_timeout`).
+        let http_client = Self::build_http_client_with_total_timeout(server, None)?;
 
-        // Connect to the SSE endpoint and read the initial event to discover
-        // the message endpoint.
-        let response = http_client
-            .get(url)
-            .header("Accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(|e| Error::Mcp {
-                server: server.name.clone(),
-                message: format!("failed to connect to SSE endpoint `{url}`: {e}"),
-            })?;
+        // Connect to the SSE endpoint and read the initial event to
+        // discover the message endpoint. The header exchange is bounded by
+        // the short read budget, not by a 30s client timeout.
+        let response = timeout(
+            read_timeout,
+            http_client
+                .get(url)
+                .header("Accept", "text/event-stream")
+                .send(),
+        )
+        .await
+        .map_err(|_| Error::Mcp {
+            server: server.name.clone(),
+            message: format!("timeout connecting to SSE endpoint `{url}`"),
+        })?
+        .map_err(|e| Error::Mcp {
+            server: server.name.clone(),
+            message: format!("failed to connect to SSE endpoint `{url}`: {e}"),
+        })?;
 
         if !response.status().is_success() {
             return Err(Error::Mcp {
@@ -691,28 +751,44 @@ impl McpClient {
             });
         }
 
-        // Read the SSE stream to find the `endpoint` event (which tells us
-        // where to POST JSON-RPC messages). We buffer the stream for later use.
-        let mut stream = response.bytes_stream();
-        let mut sse_buffer = String::new();
-        let mut post_url: Option<String> = None;
-        let mut found_endpoint = false;
+        // A non-stream body cannot carry JSON-RPC replies; say so instead of
+        // silently waiting for events that will never arrive. The check is
+        // deliberately lenient about parameters (`text/event-stream;
+        // charset=utf-8`).
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !content_type.contains("text/event-stream") {
+            return Err(Error::Mcp {
+                server: server.name.clone(),
+                message: format!(
+                    "SSE endpoint `{url}` returned Content-Type `{content_type}`, \
+                     expected `text/event-stream`"
+                ),
+            });
+        }
 
-        // Read up to 64KB to find the endpoint event
-        let mut total_read = 0usize;
+        let mut stream = response.bytes_stream();
+        // Raw bytes: whatever the handshake consumes is replayed into the
+        // reader, so an event that shares a chunk with `endpoint` is not
+        // lost (and a multi-byte sequence split across chunks is not
+        // mangled by a per-chunk lossy conversion).
+        let mut handshake: Vec<u8> = Vec::new();
+        let mut found_endpoint: Option<String> = None;
+
+        // Read up to 64KB to find the endpoint event.
         let max_read = 65536;
 
-        while total_read < max_read {
-            match timeout(Duration::from_secs(10), stream.next()).await {
+        while handshake.len() < max_read {
+            match timeout(read_timeout, stream.next()).await {
                 Ok(Some(Ok(chunk))) => {
-                    let chunk_str = String::from_utf8_lossy(&chunk);
-                    total_read += chunk_str.len();
-                    sse_buffer.push_str(&chunk_str);
-
-                    // Parse SSE events from the buffer
-                    if let Some(endpoint) = parse_sse_endpoint(&sse_buffer) {
-                        post_url = Some(endpoint);
-                        found_endpoint = true;
+                    handshake.extend_from_slice(&chunk);
+                    if let Some(endpoint) = parse_sse_endpoint(&String::from_utf8_lossy(&handshake))
+                    {
+                        found_endpoint = Some(endpoint);
                         break;
                     }
                 }
@@ -732,22 +808,41 @@ impl McpClient {
             }
         }
 
-        if !found_endpoint {
+        let Some(raw_endpoint) = found_endpoint else {
+            let received = String::from_utf8_lossy(&handshake);
             return Err(Error::Mcp {
                 server: server.name.clone(),
                 message: format!(
                     "SSE endpoint `{url}` did not send an `endpoint` event. Received data: {}",
-                    &sse_buffer[..sse_buffer.len().min(200)]
+                    &received[..received.len().min(200)]
                 ),
             });
-        }
+        };
+
+        // The endpoint is usually a relative path (`/messages?sessionId=…`);
+        // POSTing it verbatim is an invalid URL (issue #178).
+        let post_url = resolve_sse_endpoint(url, &raw_endpoint, &server.name)?;
+
+        // Start the resident reader before the handshake POST: the
+        // `initialize` reply arrives on this stream, not in the POST body.
+        let pending: PendingResponses = Arc::default();
+        let reader = spawn_sse_reader(
+            stream,
+            &handshake,
+            pending.clone(),
+            http_client.clone(),
+            post_url.clone(),
+            server.name.clone(),
+        );
 
         let mut client = Self {
             transport: McpTransport::HttpSse {
                 client: http_client,
                 sse_url: url.to_string(),
                 post_url,
-                buffer: sse_buffer,
+                pending,
+                waiters: HashMap::new(),
+                reader,
             },
             next_id: 1,
             capabilities: ServerCapabilities::default(),
@@ -1175,34 +1270,65 @@ impl McpClient {
                 Ok(())
             }
             McpTransport::HttpSse {
-                client, post_url, ..
+                client,
+                post_url,
+                pending,
+                waiters,
+                ..
             } => {
-                let url = post_url.as_ref().ok_or_else(|| Error::Mcp {
-                    server: self.server_name.clone(),
-                    message: "HTTP transport: no POST endpoint available".into(),
-                })?;
                 let body = serde_json::to_string(value)?;
-                let response = client
-                    .post(url)
+                // Register the response slot *before* the POST: the reader
+                // task can see the reply while `send()` is still in flight
+                // (issue #178). Notifications (`no id`) expect no reply.
+                let request_id = value.get("id").and_then(|v| v.as_u64());
+                if let Some(id) = request_id {
+                    let (tx, rx) = oneshot::channel();
+                    pending.lock().await.insert(id, tx);
+                    waiters.insert(id, rx);
+                }
+
+                let mut outcome = Ok(());
+                match client
+                    .post(post_url.as_str())
                     .header("Content-Type", "application/json")
                     .timeout(http_timeout)
                     .body(body)
                     .send()
                     .await
-                    .map_err(|e| Error::Mcp {
-                        server: self.server_name.clone(),
-                        message: format!("HTTP POST error: {e}"),
-                    })?;
-                if !response.status().is_success() {
-                    return Err(Error::Mcp {
-                        server: self.server_name.clone(),
-                        message: format!(
-                            "HTTP POST to `{url}` returned HTTP {}",
-                            response.status()
-                        ),
-                    });
+                {
+                    Ok(response) if response.status().is_success() => {
+                        // The reply travels on the SSE stream; drain this
+                        // (usually empty `202`) body so the connection can
+                        // be reused. A body-read error is not a request
+                        // failure.
+                        let _ = response.bytes().await;
+                    }
+                    Ok(response) => {
+                        outcome = Err(Error::Mcp {
+                            server: self.server_name.clone(),
+                            message: format!(
+                                "HTTP POST to `{post_url}` returned HTTP {}",
+                                response.status()
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        outcome = Err(Error::Mcp {
+                            server: self.server_name.clone(),
+                            message: format!("HTTP POST error: {e}"),
+                        });
+                    }
                 }
-                Ok(())
+
+                if outcome.is_err() {
+                    // The request never reached the stream; drop its slot so
+                    // no later read can wait on a reply that cannot come.
+                    if let Some(id) = request_id {
+                        pending.lock().await.remove(&id);
+                        waiters.remove(&id);
+                    }
+                }
+                outcome
             }
             McpTransport::StreamableHttp {
                 client,
@@ -1276,37 +1402,52 @@ impl McpClient {
 
     /// Read a JSON-RPC response matching the given id from the active transport.
     async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
+        // Copied out of `self` so the transport arm below can borrow the
+        // transport mutably while these stay usable.
+        let read_timeout = self.read_timeout;
+        let server_name = self.server_name.clone();
         match &mut self.transport {
             McpTransport::Stdio { stdin, reader, .. } => {
-                Self::read_stdio_response(
-                    stdin,
-                    reader,
-                    expected_id,
-                    &self.server_name,
-                    self.read_timeout,
-                )
-                .await
+                Self::read_stdio_response(stdin, reader, expected_id, &server_name, read_timeout)
+                    .await
             }
             McpTransport::HttpSse {
-                client,
-                sse_url,
-                post_url,
-                buffer,
+                pending, waiters, ..
             } => {
-                Self::read_sse_response(
-                    client,
-                    sse_url,
-                    post_url,
-                    buffer,
-                    expected_id,
-                    &self.server_name,
-                )
-                .await
+                // The resident reader hands the reply over through the slot
+                // `write_line` registered before the POST (issue #178).
+                let Some(rx) = waiters.remove(&expected_id) else {
+                    return Err(Error::Mcp {
+                        server: server_name,
+                        message: format!("no pending HTTP+SSE request for id {expected_id}"),
+                    });
+                };
+                let pending = pending.clone();
+                match timeout(read_timeout, rx).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(Error::Mcp {
+                        server: server_name,
+                        message: format!(
+                            "SSE session ended before a response for id {expected_id} arrived"
+                        ),
+                    }),
+                    Err(_) => {
+                        // Stop the reader from dispatching into the dropped
+                        // slot when the late reply finally shows up.
+                        pending.lock().await.remove(&expected_id);
+                        Err(Error::Mcp {
+                            server: server_name,
+                            message: format!(
+                                "SSE timed out waiting for response for id {expected_id}"
+                            ),
+                        })
+                    }
+                }
             }
             McpTransport::StreamableHttp { pending, .. } => match pending.take() {
                 Some(result) => Ok(result),
                 None => Err(Error::Mcp {
-                    server: self.server_name.clone(),
+                    server: server_name,
                     message: format!("no buffered HTTP response for id {expected_id}"),
                 }),
             },
@@ -1466,76 +1607,205 @@ impl McpClient {
         stdin.write_all(&full).await?;
         stdin.flush().await
     }
+}
 
-    /// Read a JSON-RPC response from an SSE stream.
-    async fn read_sse_response(
-        client: &reqwest::Client,
-        sse_url: &str,
-        _post_url: &Option<String>,
-        buffer: &mut String,
-        expected_id: u64,
-        server_name: &str,
-    ) -> Result<Value> {
-        // If we have buffered data, try to parse a response from it first.
-        if !buffer.is_empty() {
-            if let Some(result) = parse_sse_response(buffer, expected_id, server_name) {
-                return result;
-            }
-        }
+// ---------------------------------------------------------------------------
+// Legacy HTTP+SSE session reader (issue #178)
+// ---------------------------------------------------------------------------
 
-        // Otherwise, reconnect to the SSE stream and read more events.
-        let response = client
-            .get(sse_url)
-            .header("Accept", "text/event-stream")
-            .send()
-            .await
-            .map_err(|e| Error::Mcp {
-                server: server_name.to_string(),
-                message: format!("failed to reconnect to SSE endpoint `{sse_url}`: {e}"),
-            })?;
+/// Resolve the `endpoint` event's payload to an absolute POST URL.
+///
+/// Official SDK servers announce a relative path (`/messages?sessionId=…`,
+/// sometimes with the query only), which must be joined against the SSE
+/// URL — POSTing the raw payload is an invalid-URL error.
+fn resolve_sse_endpoint(base: &str, endpoint: &str, server: &str) -> Result<String> {
+    let base_url = url::Url::parse(base).map_err(|e| Error::Mcp {
+        server: server.to_string(),
+        message: format!("invalid SSE endpoint URL `{base}`: {e}"),
+    })?;
+    base_url
+        .join(endpoint.trim())
+        .map(|url| url.to_string())
+        .map_err(|e| Error::Mcp {
+            server: server.to_string(),
+            message: format!("SSE `endpoint` event returned an unusable URL `{endpoint}`: {e}"),
+        })
+}
 
-        if !response.status().is_success() {
-            return Err(Error::Mcp {
-                server: server_name.to_string(),
-                message: format!(
-                    "SSE endpoint `{sse_url}` returned HTTP {}",
-                    response.status()
-                ),
-            });
-        }
-
-        let mut stream = response.bytes_stream();
-
+/// Spawn the resident reader for a legacy SSE stream.
+///
+/// The task owns the session's `GET` response for the client's lifetime
+/// (the client aborts it on `Drop`). It frames events incrementally, wakes
+/// the waiter of every JSON-RPC response by id, and answers
+/// server-initiated requests. On stream error or EOF it fails every
+/// pending waiter, so a dropped connection surfaces as an error instead of
+/// a hang.
+fn spawn_sse_reader<S, B>(
+    mut stream: S,
+    initial: &[u8],
+    pending: PendingResponses,
+    post: reqwest::Client,
+    post_url: String,
+    server_name: String,
+) -> JoinHandle<()>
+where
+    S: futures_util::Stream<Item = reqwest::Result<B>> + Unpin + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+{
+    let mut parser = SseParser::new(initial);
+    tokio::spawn(async move {
         loop {
-            match timeout(Duration::from_secs(10), stream.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    let chunk_str = String::from_utf8_lossy(&chunk);
-                    buffer.push_str(&chunk_str);
-
-                    if let Some(result) = parse_sse_response(buffer, expected_id, server_name) {
-                        return result;
-                    }
+            for event in parser.take() {
+                dispatch_sse_event(event, &pending, &post, &post_url, &server_name).await;
+            }
+            match stream.next().await {
+                Some(Ok(chunk)) => parser.push(chunk.as_ref()),
+                Some(Err(e)) => {
+                    fail_pending_sse(&pending, &server_name, format!("SSE stream error: {e}"))
+                        .await;
+                    return;
                 }
-                Ok(Some(Err(e))) => {
-                    return Err(Error::Mcp {
-                        server: server_name.to_string(),
-                        message: format!("error reading SSE stream from `{sse_url}`: {e}"),
-                    });
-                }
-                Ok(None) => {
-                    return Err(Error::Mcp {
-                        server: server_name.to_string(),
-                        message: format!("SSE stream ended without response for id {expected_id}"),
-                    });
-                }
-                Err(_) => {
-                    return Err(Error::Mcp {
-                        server: server_name.to_string(),
-                        message: format!("SSE timed out waiting for response for id {expected_id}"),
-                    });
+                None => {
+                    fail_pending_sse(
+                        &pending,
+                        &server_name,
+                        "SSE stream closed by the server".to_string(),
+                    )
+                    .await;
+                    return;
                 }
             }
         }
+    })
+}
+
+/// Route one SSE event: responses wake their waiter, requests are answered
+/// on the POST endpoint, anything else is logged and skipped.
+async fn dispatch_sse_event(
+    event: SseEvent,
+    pending: &PendingResponses,
+    post: &reqwest::Client,
+    post_url: &str,
+    server_name: &str,
+) {
+    if event.data.is_empty() {
+        return;
+    }
+    // Only meaningful during the handshake, which already consumed it.
+    if event.event.as_deref() == Some("endpoint") {
+        tracing::debug!(
+            target: "recursive::mcp",
+            server = %server_name,
+            "ignoring a repeated `endpoint` event on an established MCP SSE stream"
+        );
+        return;
+    }
+
+    let Ok(message) = serde_json::from_str::<Value>(event.data.trim()) else {
+        tracing::debug!(
+            target: "recursive::mcp",
+            server = %server_name,
+            data = %event.data,
+            "ignoring a non-JSON message on the MCP SSE stream"
+        );
+        return;
+    };
+
+    // A *request* from the server carries both `id` and `method`.
+    if let Some(method) = message.get("method").and_then(|v| v.as_str()) {
+        let request_id = message.get("id").cloned().unwrap_or(Value::Null);
+        answer_sse_server_request(post, post_url, server_name, request_id, method).await;
+        return;
+    }
+
+    let Some(id) = message.get("id").and_then(|v| v.as_u64()) else {
+        tracing::debug!(
+            target: "recursive::mcp",
+            server = %server_name,
+            "ignoring a server notification on the MCP SSE stream"
+        );
+        return;
+    };
+    let waiter = pending.lock().await.remove(&id);
+    let Some(waiter) = waiter else {
+        // Typically a reply that arrived after its caller timed out.
+        tracing::debug!(
+            target: "recursive::mcp",
+            server = %server_name,
+            id,
+            "dropping an MCP SSE response with no pending waiter"
+        );
+        return;
+    };
+    let _ = waiter.send(jsonrpc_outcome(&message, server_name));
+}
+
+/// Answer a server-initiated JSON-RPC request over the message endpoint,
+/// mirroring the stdio transport (issue #181): `ping` gets an empty
+/// result, anything else `-32601`. Staying silent would block the peer
+/// until its own timeout.
+async fn answer_sse_server_request(
+    post: &reqwest::Client,
+    post_url: &str,
+    server_name: &str,
+    request_id: Value,
+    method: &str,
+) {
+    // A null/missing id means a notification, not a request.
+    if request_id.is_null() {
+        return;
+    }
+    let reply = if method == "ping" {
+        serde_json::json!({ "jsonrpc": "2.0", "id": request_id, "result": {} })
+    } else {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": { "code": -32601, "message": format!("Method not found: {method}") },
+        })
+    };
+    // The SSE client has no client-level timeout (the GET is long-lived),
+    // so this POST must carry its own bounded budget.
+    let outcome = post
+        .post(post_url)
+        .header("Content-Type", "application/json")
+        .timeout(HTTP_DEFAULT_REQUEST_TIMEOUT)
+        .body(reply.to_string())
+        .send()
+        .await;
+    match outcome {
+        Ok(response) => {
+            let _ = response.bytes().await;
+        }
+        Err(e) => tracing::warn!(
+            target: "recursive::mcp",
+            server = %server_name,
+            method = %method,
+            error = %e,
+            "failed to answer a server-initiated MCP request on the SSE transport"
+        ),
+    }
+}
+
+/// Fail every in-flight request after the stream is lost, so callers get a
+/// prompt error rather than waiting out their own budget.
+async fn fail_pending_sse(pending: &PendingResponses, server_name: &str, message: String) {
+    let mut slots = pending.lock().await;
+    if slots.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        target: "recursive::mcp",
+        server = %server_name,
+        waiting = slots.len(),
+        reason = %message,
+        "MCP SSE stream lost; failing pending requests"
+    );
+    for (_, waiter) in slots.drain() {
+        let _ = waiter.send(Err(Error::Mcp {
+            server: server_name.to_string(),
+            message: message.clone(),
+        }));
     }
 }
 
@@ -1567,6 +1837,85 @@ fn parse_sse_endpoint(buffer: &str) -> Option<String> {
     None
 }
 
+/// One SSE event block, as framed by blank-line separators.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SseEvent {
+    /// The `event:` field, when the server supplied one.
+    event: Option<String>,
+    /// Concatenated `data:` lines. Multi-line data is joined without a
+    /// separator, matching [`parse_sse_response`] (a conforming server
+    /// never splits one JSON value across data lines).
+    data: String,
+}
+
+impl SseEvent {
+    fn is_empty(&self) -> bool {
+        self.event.is_none() && self.data.is_empty()
+    }
+}
+
+/// Incremental SSE frame parser for the legacy transport's resident reader
+/// (issue #178).
+///
+/// Bytes from a `bytes_stream` split anywhere — mid-field, mid-line, even
+/// mid-character — so only complete `\n`-terminated lines are consumed and
+/// the tail stays buffered. Working on bytes keeps a multi-byte UTF-8
+/// sequence intact across chunks; each *complete* line is decoded
+/// separately (a `\n` can never appear inside a multi-byte sequence).
+struct SseParser {
+    buf: Vec<u8>,
+    /// Fields accumulated for the event currently being framed.
+    current: SseEvent,
+}
+
+impl SseParser {
+    fn new(initial: &[u8]) -> Self {
+        Self {
+            buf: initial.to_vec(),
+            current: SseEvent::default(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Drain every event completed by the buffered bytes.
+    fn take(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        let mut consumed = 0usize;
+        while let Some(offset) = self.buf[consumed..].iter().position(|b| *b == b'\n') {
+            let end = consumed + offset;
+            let raw = String::from_utf8_lossy(&self.buf[consumed..end]);
+            let line = raw.trim_end_matches('\r');
+            consumed = end + 1;
+
+            if line.is_empty() {
+                // Blank line terminates the event.
+                if !self.current.is_empty() {
+                    events.push(std::mem::take(&mut self.current));
+                }
+                continue;
+            }
+            let Some((field, value)) = line.split_once(':') else {
+                // No colon → field with an empty value; nothing we read
+                // (`event`, `data`) is meaningful that way.
+                continue;
+            };
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => self.current.event = Some(value.to_string()),
+                "data" => self.current.data.push_str(value),
+                // `id:` / `retry:` carry nothing we use: the stream is
+                // bound to one session, so there is no resumption here.
+                _ => {}
+            }
+        }
+        self.buf.drain(..consumed);
+        events
+    }
+}
+
 /// Interpret one JSON-RPC message object, returning its `result` for the
 /// expected id, or an error describing why it does not match / is invalid.
 fn parse_jsonrpc_message(parsed: &Value, expected_id: u64, server_name: &str) -> Result<Value> {
@@ -1576,6 +1925,13 @@ fn parse_jsonrpc_message(parsed: &Value, expected_id: u64, server_name: &str) ->
             message: format!("response does not match request id {expected_id}"),
         });
     }
+    jsonrpc_outcome(parsed, server_name)
+}
+
+/// The `result` of a JSON-RPC response, or the server's error object as an
+/// [`Error::Mcp`]. Shared by the per-request readers and the legacy SSE
+/// reader, which does not know which request it is answering.
+fn jsonrpc_outcome(parsed: &Value, server_name: &str) -> Result<Value> {
     if let Some(err) = parsed.get("error") {
         let msg = err
             .get("message")
@@ -3562,6 +3918,371 @@ mod tests {
             elapsed < Duration::from_millis(2000),
             "the configured tool budget must bind (expected ~700ms), took {elapsed:?} — \
              the call fell back to the fixed client-level backstop"
+        );
+    }
+
+    // ── issue #178: legacy HTTP+SSE handshake and session reuse ──────────
+
+    /// State shared with the loopback legacy-SSE mock.
+    #[derive(Default)]
+    struct LegacySseState {
+        /// How many `GET`s opened the long-lived event stream.
+        get_count: std::sync::atomic::AtomicUsize,
+        /// Every POST target (path + query).
+        post_targets: std::sync::Mutex<Vec<String>>,
+        /// Every session id the server minted or was handed back on a POST.
+        session_ids: std::sync::Mutex<Vec<String>>,
+        /// Raw JSON bodies of every POST, for assertions.
+        post_bodies: std::sync::Mutex<Vec<String>>,
+        /// Queue feeding the live stream (installed by the GET handler).
+        stream: std::sync::Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        /// Close the stream instead of answering this JSON-RPC method.
+        close_stream_on: std::sync::Mutex<Option<String>>,
+    }
+
+    /// A loopback mock of the 2024-11-05 HTTP+SSE transport: one long-lived
+    /// `GET` stream announcing a **relative** `endpoint`, and a `POST`
+    /// endpoint that queues JSON-RPC replies onto that stream. Every
+    /// connection gets its own thread, so the stream blocks without
+    /// stalling POSTs.
+    fn spawn_legacy_sse_mock(state: Arc<LegacySseState>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let state = state.clone();
+                std::thread::spawn(move || handle_legacy_sse_conn(stream, state));
+            }
+        });
+        format!("http://{addr}/sse")
+    }
+
+    fn handle_legacy_sse_conn(mut stream: std::net::TcpStream, state: Arc<LegacySseState>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let Ok(clone) = stream.try_clone() else {
+            return;
+        };
+        let mut reader = BufReader::new(clone);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let body = String::from_utf8_lossy(&body).into_owned();
+
+        if request_line.starts_with("GET ") {
+            // The session's single long-lived event stream.
+            let n = state
+                .get_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let session = format!("session-{n}");
+            state.session_ids.lock().unwrap().push(session.clone());
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            *state.stream.lock().unwrap() = Some(tx);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Cache-Control: no-cache\r\n\r\n";
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            // Relative on purpose: the client must join this against the
+            // SSE URL instead of POSTing it verbatim (issue #178).
+            let endpoint = format!("event: endpoint\ndata: /messages?sessionId={session}\n\n");
+            if stream.write_all(endpoint.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            while let Ok(payload) = rx.recv() {
+                if write!(stream, "event: message\ndata: {payload}\n\n").is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+            }
+            return;
+        }
+
+        // POST /messages?sessionId=…
+        let target = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        state.post_targets.lock().unwrap().push(target.clone());
+        if let Some(session) = target.split("sessionId=").nth(1) {
+            state
+                .session_ids
+                .lock()
+                .unwrap()
+                .push(session.split('&').next().unwrap_or("").to_string());
+        }
+        state.post_bodies.lock().unwrap().push(body.clone());
+
+        let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let close_on = state.close_stream_on.lock().unwrap().clone();
+        if close_on.as_deref() == Some(method) {
+            // Simulate a dropped stream: drop the queue sender (the GET
+            // thread then returns and closes the socket) and answer the
+            // POST so the client is left waiting on the stream alone.
+            *state.stream.lock().unwrap() = None;
+            let _ = stream.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            return;
+        }
+
+        if !method.is_empty() {
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            if !id.is_null() {
+                let payload = match method {
+                    "initialize" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "legacy-mock", "version": "1"}
+                        }
+                    }),
+                    "tools/list" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"tools": [{
+                            "name": "echo",
+                            "description": "Echo",
+                            "inputSchema": {"type": "object"}
+                        }]}
+                    }),
+                    "tools/call" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"content": [{"type": "text", "text": "pong"}]}
+                    }),
+                    _ => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32601, "message": "unknown"}
+                    }),
+                };
+                let queued = state
+                    .stream
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|tx| tx.send(payload.to_string()).is_ok());
+                assert_eq!(queued, Some(true), "the live stream must accept replies");
+            }
+            // Server-initiated request: the client answers it over POST.
+            if method == "tools/list" {
+                let ping =
+                    serde_json::json!({"jsonrpc": "2.0", "id": "srv-ping-1", "method": "ping"});
+                let _ = state
+                    .stream
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|tx| tx.send(ping.to_string()));
+            }
+        }
+        let _ = stream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    }
+
+    #[test]
+    fn sse_parser_frames_events_split_across_chunks() {
+        let mut parser = SseParser::new(b"event: endpoint\ndata: /messages?sessionId=a\n\n");
+        let events = parser.take();
+        assert_eq!(
+            events.len(),
+            1,
+            "the handshake buffer must frame: {events:?}"
+        );
+        assert_eq!(events[0].event.as_deref(), Some("endpoint"));
+        assert_eq!(events[0].data, "/messages?sessionId=a");
+
+        // A chunk boundary in the middle of a field, a line, and an event.
+        parser.push(b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1");
+        assert!(
+            parser.take().is_empty(),
+            "a partial event must not be dispatched"
+        );
+        parser.push(",\"result\":{\"text\":\"你好\"}}\n\n".as_bytes());
+        let events = parser.take();
+        assert_eq!(
+            events[0].data, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"text\":\"你好\"}}",
+            "data must survive chunking byte-for-byte (UTF-8 safe)"
+        );
+
+        // CRLF framing and a comment line are handled.
+        parser.push(b": keep-alive\r\nevent: message\r\ndata: {}\r\n\r\n");
+        let events = parser.take();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].data, "{}");
+    }
+
+    #[test]
+    fn resolve_sse_endpoint_joins_relative_against_the_stream_url() {
+        assert_eq!(
+            resolve_sse_endpoint("http://h:1/sse", "/messages?sessionId=x", "s").unwrap(),
+            "http://h:1/messages?sessionId=x",
+            "a root-relative endpoint must resolve against the SSE origin"
+        );
+        assert_eq!(
+            resolve_sse_endpoint("http://h:1/sse", "messages?sessionId=x", "s").unwrap(),
+            "http://h:1/messages?sessionId=x"
+        );
+        assert_eq!(
+            resolve_sse_endpoint("http://h:1/sse", "http://other:2/m", "s").unwrap(),
+            "http://other:2/m",
+            "an absolute endpoint is used as-is"
+        );
+
+        let err = resolve_sse_endpoint("http://h:1/sse", "http://[::1", "s").unwrap_err();
+        assert!(err.to_string().contains("unusable URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_completes_the_handshake_and_reuses_one_session() {
+        let state = Arc::new(LegacySseState::default());
+        let url = spawn_legacy_sse_mock(state.clone());
+        let server = server_with_url(&url, Some("sse"));
+
+        // The handshake itself is the first regression: the old client
+        // either failed on the relative endpoint URL or timed out.
+        let mut client = McpClient::spawn(&server)
+            .await
+            .expect("legacy SSE initialize must complete");
+
+        let tools = client.list_tools().await.expect("tools/list over SSE");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        let out = client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .expect("tools/call over SSE");
+        assert_eq!(out, "pong");
+
+        // One stream for the whole session. The old client re-`GET` the SSE
+        // URL for every read, which opened a fresh server session each time.
+        let gets = state.get_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(gets, 1, "the session must reuse its single SSE stream");
+
+        let ids = state.session_ids.lock().unwrap().clone();
+        assert!(ids.len() >= 3, "expected GET + several POSTs, got {ids:?}");
+        assert!(
+            ids.iter().all(|id| id == &ids[0]),
+            "every request must stay on one sessionId, got {ids:?}"
+        );
+
+        let targets = state.post_targets.lock().unwrap().clone();
+        assert!(
+            !targets.is_empty()
+                && targets
+                    .iter()
+                    .all(|t| t == &format!("/messages?sessionId={}", ids[0])),
+            "the relative endpoint must be joined against the SSE URL: {targets:?}"
+        );
+
+        // The server-initiated `ping` shares the stream; the client must
+        // answer it over POST rather than leave the server waiting.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let bodies = state.post_bodies.lock().unwrap().clone();
+            if bodies.iter().any(|b| b.contains("\"srv-ping-1\"")) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server ping must be answered over POST; saw {bodies:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_stream_loss_fails_the_pending_request() {
+        let state = Arc::new(LegacySseState::default());
+        *state.close_stream_on.lock().unwrap() = Some("tools/call".into());
+        let url = spawn_legacy_sse_mock(state.clone());
+        let server = server_with_url(&url, Some("sse"));
+
+        // A 30s budget: the error below must come from the dropped stream,
+        // not from the caller's timeout.
+        let mut client = McpClient::spawn_with_timeout(&server, Duration::from_secs(30))
+            .await
+            .expect("initialize answers before the stream drops");
+
+        let started = std::time::Instant::now();
+        let err = client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .expect_err("a dropped stream must surface as an error, not hang");
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("SSE stream closed"),
+            "the loss itself must be reported: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the pending request must fail on stream loss, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_rejects_a_non_stream_response() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let Ok(clone) = stream.try_clone() else {
+                    return;
+                };
+                let mut reader = BufReader::new(clone);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line) {
+                    if n == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    line.clear();
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let server = server_with_url(&format!("http://{addr}/sse"), Some("sse"));
+        let err = McpClient::spawn(&server)
+            .await
+            .expect_err("a JSON body is not an SSE stream");
+        assert!(
+            err.to_string().contains("text/event-stream"),
+            "the Content-Type must be validated: {err}"
         );
     }
 }
