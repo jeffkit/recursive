@@ -911,13 +911,10 @@ async fn main() -> anyhow::Result<()> {
             // as the MCP registration above).
             let mut skills = cli::builder::discover_loaded_skills(&config);
             match cli::builder::skills_from_http_sources() {
-                Ok(mut src_skills) => {
-                    if !src_skills.is_empty() {
-                        eprintln!(
-                            "skills: loaded {} skill(s) via service-level SkillSource",
-                            src_skills.len()
-                        );
-                        skills.append(&mut src_skills);
+                Ok(src_skills) => {
+                    let merged = cli::builder::merge_remote_skills(&mut skills, src_skills);
+                    if merged > 0 {
+                        eprintln!("skills: loaded {merged} skill(s) via service-level SkillSource");
                     }
                 }
                 Err(e) => eprintln!("skills: WARN: {e}"),
@@ -926,13 +923,16 @@ async fn main() -> anyhow::Result<()> {
             // directory-discovered catalog only; align it with the merged
             // list so `Skill` can load a remote skill without any local
             // file. `register` replaces by tool name, so this is a swap,
-            // not a duplicate. Guards:
-            // - absent tool + non-empty allow-list → leave absent: the
-            //   allow-list already ran (issue #65) and must stay the last
-            //   word; re-adding here would resurrect a filtered tool.
-            if !skills.is_empty()
-                && (tools.find_by_name("Skill").is_some() || config.allow_tools.is_empty())
-            {
+            // not a duplicate. The guard's truth table (issue #65: the
+            // allow-list stays the last word; no empty tool for a
+            // zero-skill catalog) lives in
+            // `cli::builder::should_register_skill_tool` — inlined here it
+            // carried three P2 mutation survivors (#211).
+            if cli::builder::should_register_skill_tool(
+                skills.len(),
+                tools.find_by_name("Skill").is_some(),
+                config.allow_tools.is_empty(),
+            ) {
                 tools = tools.register(std::sync::Arc::new(
                     recursive::tools::load_skill::LoadSkill::new(skills.clone()),
                 ));
@@ -3988,6 +3988,76 @@ mod tests {
             web_search_jina_key: None,
             wall_timeout_secs: 0,
         }
+    }
+
+    // ── #211: `doctor --probe` LLM probe must run the real probe_llm ──────
+
+    /// The dead-endpoint arm goes through the REAL `probe_llm`: loopback
+    /// port 1 refuses the connection instantly, `retry_max: 0` (dummy_config)
+    /// is the explicit never-retry switch that also disables the network
+    /// budget window, so the `Err` surfaces without backoff. Body-replacement
+    /// mutants (`Ok("")` / `Ok("xyzzy")`) made the probe — the only check
+    /// that can see a revoked key or an unreachable gateway — report success
+    /// unconditionally, i.e. an exit-0 green in deployment scripts (#211
+    /// B-group); this test is red under any such mutant.
+    #[tokio::test]
+    async fn probe_llm_reports_a_dead_endpoint_as_err() {
+        let _env = EnvGuard::lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dead = dummy_config(tmp.path());
+        dead.api_base = "http://127.0.0.1:1/v1".to_string();
+        assert!(
+            probe_llm(&dead).await.is_err(),
+            "connection-refused endpoint must surface as a probe failure"
+        );
+    }
+
+    /// The live arm pins the detail contract end-to-end against a local
+    /// OpenAI-shaped listener (same raw-TCP mock as the provider tests):
+    /// model name, `answered in` wording and the completion char count all
+    /// come from the real probe path. The `Ok("xyzzy")` body-replacement
+    /// mutant fails every assertion here; `Ok("")` additionally fails the
+    /// dead-endpoint test above.
+    #[tokio::test]
+    async fn probe_llm_reports_a_live_endpoint_with_detail() {
+        let _env = EnvGuard::lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write mock completion");
+                let _ = stream.flush();
+            }
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = dummy_config(tmp.path());
+        cfg.api_base = format!("http://{addr}/v1");
+        let detail = probe_llm(&cfg)
+            .await
+            .expect("a live OpenAI-shaped endpoint must probe Ok");
+        assert!(
+            detail.contains("answered in"),
+            "detail must carry the probe wording: {detail}"
+        );
+        assert!(
+            detail.contains("test-model"),
+            "detail must name the configured model: {detail}"
+        );
+        assert!(
+            detail.contains("(4 chars)"),
+            "detail must count the completion content chars: {detail}"
+        );
     }
 
     // Regression for the streaming-SSE merge bug (commit 92d257e) where

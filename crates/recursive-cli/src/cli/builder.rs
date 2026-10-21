@@ -586,6 +586,44 @@ pub(crate) fn skills_from_http_sources() -> Result<Vec<Skill>, String> {
     Ok(skills)
 }
 
+/// Append the service-level (`RECURSIVE_SKILL_SOURCE_URL`) skills to the
+/// directory-discovered catalog and return how many were merged. Extracted
+/// from the `http` serve entry (issue #211): the merge used to sit behind an
+/// inline `if !src_skills.is_empty()` whose `!`-deletion mutant silently
+/// dropped every remote skill while the log line kept counting them — the
+/// count-and-append pair is now unit-pinned in both directions.
+pub(crate) fn merge_remote_skills(dst: &mut Vec<Skill>, src: Vec<Skill>) -> usize {
+    let merged = src.len();
+    dst.extend(src);
+    merged
+}
+
+/// Decide whether the `http` serve entry re-registers `LoadSkill` over the
+/// merged catalog. Extracted from `main.rs` (issue #211) so the guard is
+/// truth-table testable: the inlined form carried three P2 mutation
+/// survivors — deleting a `!` either silently dropped the re-registration or
+/// registered an empty tool for a zero-skill catalog, and `&&`→`||`
+/// resurrected a `Skill` that the operator allow-list had already filtered
+/// away (issue #65: the allow-list is the last word). Rows:
+/// - non-empty + `Skill` present + allow-list → register (explicitly allowed
+///   or unfiltered); non-empty + absent + empty allow-list → register (the
+///   Goal-312 remote-skills shape: `Skill` was never in the startup registry);
+/// - non-empty + absent + non-empty allow-list → stay absent (issue #65);
+/// - empty catalog → never register an empty `LoadSkill` (same contract as
+///   `build_tools`).
+///
+/// `skills_len` is `skills.len()` rather than a precomputed `bool` on
+/// purpose: a `!skills.is_empty()` argument at the (integration-untestable)
+/// call site would just re-create the `!`-deletion survivor this function
+/// exists to kill.
+pub(crate) fn should_register_skill_tool(
+    skills_len: usize,
+    skill_present: bool,
+    allow_tools_empty: bool,
+) -> bool {
+    skills_len > 0 && (skill_present || allow_tools_empty)
+}
+
 /// Parse `RECURSIVE_SKILL_SOURCE_HOSTS`; unset/blank disables the allowlist.
 fn skill_source_allowed_hosts() -> Option<Vec<String>> {
     let Ok(raw) = std::env::var("RECURSIVE_SKILL_SOURCE_HOSTS") else {
@@ -1023,6 +1061,113 @@ mod tests {
             err.contains("request failed") || err.contains("error"),
             "a dead endpoint must surface as a request error: {err}"
         );
+    }
+
+    // ── #211: http-serve skill registration guards ───────────────────────
+
+    /// Content-backed stand-in for a remote (`HttpSkillSource`) skill.
+    fn skill_named(name: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            path: PathBuf::from(format!("/virtual/skills/{name}/SKILL.md")),
+            mode: Default::default(),
+            triggers: Vec::new(),
+            hint: String::new(),
+            depends_on: Vec::new(),
+            refs: Vec::new(),
+            params: Vec::new(),
+            scripts: Vec::new(),
+            sections: Vec::new(),
+            globs: None,
+            body: Some(format!("---\nname: {name}\n---\n\nBody.\n")),
+        }
+    }
+
+    /// Full 2×2×2 truth table of the re-registration guard. Any logic mutant
+    /// of the body (`&&`→`||`, `||`→`&&`, constant true/false, `>`→`>=`) flips
+    /// at least one row. The load-bearing rows are commented in the helper's
+    /// contract: `(2,false,false)` is issue #65's allow-list-is-the-last-word,
+    /// `(2,false,true)` is the Goal-312 remote-skills shape, and every
+    /// `skills_len == 0` row keeps a zero-skill catalog from registering an
+    /// empty `LoadSkill`.
+    #[test]
+    fn should_register_skill_tool_truth_table() {
+        let table = [
+            (
+                2usize,
+                true,
+                false,
+                true,
+                "operator allow-list explicitly keeps Skill",
+            ),
+            (
+                2,
+                false,
+                false,
+                false,
+                "#65: allow-list filtered Skill — it stays filtered",
+            ),
+            (
+                2,
+                false,
+                true,
+                true,
+                "Goal-312: remote skills, no allow-list",
+            ),
+            (2, true, true, true, "directory skills, no allow-list"),
+            (0, true, true, false, "zero skills: no empty LoadSkill"),
+            (0, true, false, false, "zero skills + non-empty allow-list"),
+            (0, false, true, false, "zero skills, Skill absent"),
+            (
+                0,
+                false,
+                false,
+                false,
+                "zero skills, Skill absent, allow-list set",
+            ),
+        ];
+        for (skills_len, skill_present, allow_tools_empty, expected, scenario) in table {
+            assert_eq!(
+                should_register_skill_tool(skills_len, skill_present, allow_tools_empty),
+                expected,
+                "scenario: {scenario}"
+            );
+        }
+    }
+
+    /// The merge is unconditional on the remote side: non-empty remote
+    /// skills append after the directory catalog and the return value counts
+    /// them. The pre-#211 inline `if !src_skills.is_empty()` deletion-mutant
+    /// skipped the append while the log kept counting — length, order and
+    /// return value are pinned so both half-mutants (no append / wrong count)
+    /// are caught.
+    #[test]
+    fn merge_remote_skills_appends_remote_and_returns_the_count() {
+        let mut catalog = vec![skill_named("dir")];
+        let merged = merge_remote_skills(&mut catalog, vec![skill_named("r1"), skill_named("r2")]);
+        assert_eq!(
+            merged, 2,
+            "return value must count the merged remote skills"
+        );
+        let names: Vec<&str> = catalog.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["dir", "r1", "r2"],
+            "remote skills must append after the directory catalog"
+        );
+    }
+
+    /// Empty remote is a no-op: catalog untouched, count 0 (the caller logs
+    /// nothing) — the inverted-guard mutant logged `loaded 0 skill(s)` and
+    /// (worse) the deleted-`!` shape ran this path for every real load.
+    #[test]
+    fn merge_remote_skills_with_empty_remote_is_a_noop_returning_zero() {
+        let mut catalog = vec![skill_named("dir")];
+        let merged = merge_remote_skills(&mut catalog, Vec::new());
+        assert_eq!(merged, 0);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "dir");
     }
 
     fn test_config() -> Config {
