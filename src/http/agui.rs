@@ -625,6 +625,14 @@ fn load_thread_seed(session_dir: &Path) -> Vec<crate::message::Message> {
     let Ok(content) = std::fs::read_to_string(session_dir.join("transcript.jsonl")) else {
         return Vec::new();
     };
+    rebuild_thread_seed_from_content(&content)
+}
+
+/// The [`load_thread_seed`] framing over already-read transcript content —
+/// the one parser the thread reload AND the interrupt-resume seed (issue
+/// #160) go through, so a boundary cut cannot drift between the two paths
+/// and re-replay pre-compaction history on a resume.
+fn rebuild_thread_seed_from_content(content: &str) -> Vec<crate::message::Message> {
     let mut stored: Vec<crate::message::Message> = Vec::new();
     // First row after the last compact_boundary declaration seen so far.
     let mut after_boundary = None;
@@ -862,15 +870,18 @@ pub(crate) fn prepare_run(
         }
     }
 
-    // Load the transcript from the session. The AG-UI run persists one
-    // `Message` JSON per line (see the write side in the driver task).
+    // Load the transcript from the session through the same framing as the
+    // thread reload (issue #160): rows before the last persisted compaction
+    // boundary are superseded by the summary and must not re-enter the
+    // resume seed. The open interrupt's rows are always after that boundary
+    // (a thread with open interrupts admits no other run, so no later
+    // compaction can fold them). Only the read error keeps its own mapping;
+    // every framing decision lives in `rebuild_thread_seed_from_content`.
     let transcript_path = session_dir.join("transcript.jsonl");
-    let loaded_messages: Vec<crate::message::Message> = std::fs::read_to_string(&transcript_path)
-        .map_err(|e| PrepareAguiError::Internal(format!("failed to load session transcript: {e}")))?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    let content = std::fs::read_to_string(&transcript_path).map_err(|e| {
+        PrepareAguiError::Internal(format!("failed to load session transcript: {e}"))
+    })?;
+    let loaded_messages = rebuild_thread_seed_from_content(&content);
 
     // Build an index of resume items by interrupt_id.
     let resume_by_id: HashMap<&str, &ag::Resume> = resume_items
@@ -2193,6 +2204,138 @@ mod tests {
             load_open_interrupts(&dir).is_empty(),
             "open interrupts must be cleared after resume"
         );
+    }
+
+    /// A compacted AG-UI thread whose last run was interrupted on `tc-1`:
+    /// `[prompt, turn 1, answer 1, <boundary>, SUMMARY, turn 2, answer 2,
+    /// assistant(tc-1), tool(tc-1 denied)]`, with the interrupt left open.
+    fn write_compacted_interrupted_thread(dir: &Path) {
+        use crate::session::TranscriptEntry;
+        std::fs::create_dir_all(dir).unwrap();
+        write_interrupts(
+            dir,
+            &[OpenInterrupt {
+                interrupt_id: "i1".into(),
+                tool_call_id: "tc-1".into(),
+                reason: "tool_call".into(),
+                message: None,
+                created_at: "now".into(),
+            }],
+        );
+        let message = |m: &crate::message::Message| serde_json::to_string(m).unwrap();
+        let summary_entry = TranscriptEntry {
+            uuid: "summary-uuid".into(),
+            parent_uuid: None,
+            source_tool_assistant_uuid: None,
+            id: "summary-id".into(),
+            parent_id: None,
+            role: "system".into(),
+            content: "[compacted: turn 1]".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            usage: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            audit: None,
+            step: None,
+            is_compaction_summary: true,
+        };
+        let lines = [
+            message(&crate::message::Message::system("stored prompt")),
+            message(&user("turn 1")),
+            message(&crate::message::Message::assistant("answer 1")),
+            r#"{"type":"system","subtype":"compact_boundary","turn":1,"compacted_count":2,"timestamp":"2026-01-01T00:00:00Z"}"#.to_string(),
+            serde_json::to_string(&summary_entry).unwrap(),
+            message(&user("turn 2")),
+            message(&crate::message::Message::assistant("answer 2")),
+            message(&crate::message::Message::assistant_with_tool_calls(
+                "running it",
+                vec![crate::llm::ToolCall {
+                    id: "tc-1".into(),
+                    name: "Bash".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                }],
+            )),
+            message(&crate::message::Message::tool_result("tc-1", "denied")),
+        ];
+        std::fs::write(dir.join("transcript.jsonl"), lines.join("\n") + "\n").unwrap();
+    }
+
+    /// Issue #160: the interrupt-resume seed goes through the same boundary
+    /// framing as the thread reload — the rows a persisted summary already
+    /// stands for must not re-enter the prompt when the thread resumes, or
+    /// every resume after a compaction replays the whole history again.
+    #[test]
+    fn prepare_run_resume_seed_starts_at_compaction_summary() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-resume-compacted").unwrap();
+        write_compacted_interrupted_thread(&dir);
+
+        let resume = vec![agui_protocol::Resume {
+            interrupt_id: "i1".into(),
+            status: agui_protocol::ResumeStatus::Resolved,
+            payload: Some(serde_json::json!("suite passed")),
+        }];
+        let prepared = prepare_run(AguiRunInput {
+            workspace: ws,
+            input: &run_input("t-resume-compacted", Some(resume)),
+        })
+        .expect("resume prepares");
+        let seed = prepared.seed_transcript.expect("seed");
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "[compacted: turn 1]",
+                "turn 2",
+                "answer 2",
+                "running it",
+                "\"suite passed\"",
+            ],
+            "the resume seed is the post-compaction state plus the resolved \
+             result, not history + its summary"
+        );
+        assert!(
+            seed[0].is_compaction_summary,
+            "the summary must stay the seed head"
+        );
+    }
+
+    /// Issue #160, the second implementation: the resume branch and the
+    /// thread reload must produce the same sequence for the same thread —
+    /// only the resumed tool result's content differs — so the two paths
+    /// cannot drift apart again.
+    #[test]
+    fn prepare_run_resume_seed_matches_thread_reload() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-resume-matches-reload").unwrap();
+        write_compacted_interrupted_thread(&dir);
+        let reloaded = load_thread_seed(&dir);
+
+        let resume = vec![agui_protocol::Resume {
+            interrupt_id: "i1".into(),
+            status: agui_protocol::ResumeStatus::Cancelled,
+            payload: None,
+        }];
+        let prepared = prepare_run(AguiRunInput {
+            workspace: ws,
+            input: &run_input("t-resume-matches-reload", Some(resume)),
+        })
+        .expect("resume prepares");
+        let resumed = prepared.seed_transcript.expect("seed");
+
+        let (resumed_last, resumed_head) = resumed.split_last().expect("non-empty seed");
+        let (reloaded_last, reloaded_head) = reloaded.split_last().expect("non-empty seed");
+        assert_eq!(
+            resumed_head, reloaded_head,
+            "every row but the resumed result is identical to the thread reload"
+        );
+        assert_eq!(resumed_last.role, reloaded_last.role);
+        assert_eq!(resumed_last.tool_call_id, reloaded_last.tool_call_id);
+        assert_eq!(reloaded_last.content, "denied");
+        assert_eq!(resumed_last.content, "[interrupt cancelled by user]");
     }
 
     #[test]
