@@ -138,8 +138,11 @@ struct Cli {
     #[arg(short = 'n', long = "name")]
     name: Option<String>,
 
-    /// Reasoning effort level: low (no extended thinking), normal (default), high (max budget).
-    /// Currently effective for Anthropic models that support extended thinking.
+    /// Reasoning effort level: low (no extended thinking / effort "low"),
+    /// normal (default), high (max budget / effort "high"). Effective for
+    /// Anthropic models that support extended thinking (`thinking_budget`)
+    /// and OpenAI-compatible models (`reasoning_effort` request field,
+    /// issue #145).
     #[arg(long = "effort", value_parser = ["low", "normal", "high"])]
     effort: Option<String>,
 
@@ -669,9 +672,13 @@ async fn main() -> anyhow::Result<()> {
     if matches!(cli.permission_mode.as_deref(), Some("auto")) {
         config.headless = true;
     }
-    // --effort: map to thinking_budget (low=0 disables, normal=default, high=max).
+    // --effort: drive both thinking knobs (issue #145). low = disable
+    // extended thinking + effort "low"; high = 16K budget + effort "high";
+    // normal leaves both at their configured defaults. No
+    // budget↔effort cross-translation happens anywhere else.
     if let Some(effort) = &cli.effort {
         config.thinking_budget = effort_thinking_budget(effort);
+        config.reasoning_effort = effort_reasoning_effort(effort);
     }
     // --name: optional display name for the session.
     if let Some(name) = cli.name {
@@ -2276,6 +2283,18 @@ fn effort_thinking_budget(effort: &str) -> Option<u32> {
     match effort {
         "low" => Some(0),
         "high" => Some(16000),
+        _ => None, // "normal" → leave as default
+    }
+}
+
+/// `--effort` → `reasoning_effort` mapping for OpenAI-compatible providers
+/// (issue #145): `low`/`high` set the request field verbatim, anything else
+/// keeps the provider default. Deliberately mirrors
+/// [`effort_thinking_budget`] — one flag, two native knobs, no
+/// cross-translation between them.
+fn effort_reasoning_effort(effort: &str) -> Option<String> {
+    match effort {
+        "low" | "high" => Some(effort.to_string()),
         _ => None, // "normal" → leave as default
     }
 }
@@ -3949,6 +3968,7 @@ mod tests {
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
@@ -4329,11 +4349,18 @@ mod tests {
     }
 
     #[test]
-    fn effort_thinking_budget_maps_low_high_and_default() {
+    fn effort_flag_maps_thinking_budget_and_reasoning_effort() {
+        // low: disable extended thinking + effort "low" (issue #145).
         assert_eq!(effort_thinking_budget("low"), Some(0));
+        assert_eq!(effort_reasoning_effort("low"), Some("low".to_string()));
+        // high: max budget + effort "high".
         assert_eq!(effort_thinking_budget("high"), Some(16000));
+        assert_eq!(effort_reasoning_effort("high"), Some("high".to_string()));
+        // normal (and unknown values) keep both knobs at their defaults.
         assert_eq!(effort_thinking_budget("normal"), None);
+        assert_eq!(effort_reasoning_effort("normal"), None);
         assert_eq!(effort_thinking_budget(""), None);
+        assert_eq!(effort_reasoning_effort(""), None);
     }
 
     #[test]

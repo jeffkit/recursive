@@ -127,6 +127,14 @@ pub struct Config {
     /// `thinking = { type: "enabled", budget_tokens: n }`. Set via the
     /// `--effort` CLI flag or `RECURSIVE_THINKING_BUDGET` env var.
     pub thinking_budget: Option<u32>,
+    /// Reasoning-effort knob for OpenAI-compatible providers (issue #145),
+    /// forwarded verbatim as the `reasoning_effort` request field (e.g.
+    /// `low` / `high`). `None` = provider default — the request stays
+    /// byte-identical to a pre-#145 client (some gateways reject unknown
+    /// fields). Set by the `--effort` CLI flag alongside `thinking_budget`
+    /// (the Anthropic-side knob); the two are never cross-translated. No
+    /// env/config.toml knob yet (issue #145 follow-up).
+    pub reasoning_effort: Option<String>,
     /// Optional display name for the session, shown in the /resume picker.
     pub session_name: Option<String>,
     /// Maximum total API spend in USD **per turn**. When > 0 the step loop
@@ -231,6 +239,7 @@ impl std::fmt::Debug for Config {
             .field("headless", &self.headless)
             .field("memory_summary_limit", &self.memory_summary_limit)
             .field("thinking_budget", &self.thinking_budget)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("session_name", &self.session_name)
             .field("max_budget_usd", &self.max_budget_usd)
             .field("extra_dirs", &self.extra_dirs)
@@ -774,6 +783,8 @@ impl Config {
             headless,
             memory_summary_limit,
             thinking_budget,
+            // Issue #145: set by `--effort`; no env/config.toml knob yet.
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd,
             extra_dirs: file_extra_dirs,
@@ -1718,6 +1729,7 @@ max_tokens = 20000
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
@@ -2542,6 +2554,7 @@ preset = "totally-bogus-id"
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
@@ -2690,6 +2703,7 @@ api_key = "sk-from-file"
                 headless: false,
                 memory_summary_limit: 5,
                 thinking_budget: None,
+                reasoning_effort: None,
                 session_name: None,
                 max_budget_usd: None,
                 extra_dirs: Vec::new(),
@@ -2741,6 +2755,7 @@ api_key = "sk-from-file"
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
@@ -2830,6 +2845,7 @@ api_key = "sk-from-file"
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),

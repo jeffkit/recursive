@@ -62,6 +62,7 @@ fn test_config() -> Config {
         headless: false,
         memory_summary_limit: 5,
         thinking_budget: None,
+        reasoning_effort: None,
         session_name: None,
         max_budget_usd: None,
         extra_dirs: Vec::new(),

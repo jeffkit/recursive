@@ -27,8 +27,13 @@ use crate::llm::{ChatProvider, OpenAiProvider, RetryPolicy};
 /// its policy from the `config.retry_*` fields (unchanged behaviour).
 /// `max_search_rounds` preserves per-surface behaviour: agent surfaces pass
 /// `Some(config.max_search_rounds)`, servers that never used the knob pass
-/// `None`. `thinking_budget` is forwarded to the Anthropic arm (issue #94)
-/// and ignored by the OpenAI arm, which has no equivalent request field.
+/// `None`. `thinking_budget` is forwarded to the Anthropic arm (issue #94).
+/// `config.reasoning_effort` (issue #145, set by `--effort`) is forwarded
+/// by the OpenAI-compatible arm as the `reasoning_effort` request field;
+/// the Anthropic arm has no enum-level equivalent and no cross-translation
+/// is performed in either direction. `thinking_budget` stays an explicit
+/// parameter (rather than a `Config` read) because the HTTP per-request
+/// override (issue #94) injects it without touching `Config`.
 pub fn build_llm_provider(
     config: &Config,
     api_key: &str,
@@ -65,6 +70,7 @@ pub fn build_llm_provider(
                 .with_provider_name(config.provider_type.clone())
                 .with_temperature(config.temperature)
                 .with_max_tokens(config.max_tokens)
+                .with_reasoning_effort(config.reasoning_effort.clone())
                 .with_retry_policy(retry)
                 .with_retry_network_budget(network_budget);
             if let Some(rounds) = max_search_rounds {
@@ -117,6 +123,21 @@ mod tests {
         // The OpenAI-compatible arm never sets the Anthropic deferred-tool
         // beta, whatever the thinking budget says.
         assert!(!provider.supports_deferred_tools());
+    }
+
+    #[test]
+    fn builds_with_reasoning_effort_in_config() {
+        // Issue #145: the OpenAI-compatible arm reads the knob from
+        // `Config` (the payload emission itself is pinned by
+        // `request_body_carries_the_configured_reasoning_effort` in
+        // openai.rs); here we pin that a configured effort builds.
+        let config = Config {
+            provider_type: "openai".into(),
+            model: "deepseek-chat".into(),
+            reasoning_effort: Some("high".into()),
+            ..base_config()
+        };
+        assert!(build_llm_provider(&config, "sk-test", RetryPolicy::default(), None, None).is_ok());
     }
 
     #[cfg(feature = "anthropic")]

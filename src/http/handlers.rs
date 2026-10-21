@@ -460,10 +460,10 @@ pub(super) fn build_session_runtime(
         state.skills.clone(),
         HTTP_CHANNEL,
     )
-    // Issue #94: a per-request thinking budget needs its own provider
-    // (the budget is a request field in the Anthropic body); everything
-    // else reuses the server's shared provider.
-    .llm(provider_for_request(state, overrides.thinking_budget))
+    // Issue #94 + #145: per-request thinking overrides need their own
+    // provider (the knobs are request fields in the provider bodies);
+    // everything else reuses the server's shared provider.
+    .llm(provider_for_request(state, &overrides))
     // Issue #94: `max_budget_usd` used to be a stored-but-dead field —
     // the step loop now stops with `BudgetExceeded` once the turn's
     // spend reaches the ceiling.
@@ -513,22 +513,39 @@ pub(super) fn resolve_session_preset(
         .map_err(|e| ApiError::bad_request(e.to_string()))
 }
 
-/// Issue #94: resolve the provider for one request.
+/// Issue #94 (`thinking_budget`) + issue #145 (`reasoning_effort`): resolve
+/// the provider for one request.
 ///
-/// `thinking_budget` is a provider-level setting (Anthropic sends it as
-/// `thinking.budget_tokens`), so a value that differs from the server's
-/// default can only be honoured by building a provider for this request. The
-/// shared server provider is returned for every other case — no explicit
-/// budget, an unauthenticated `Config`, or a failed build — so behaviour is
-/// unchanged apart from a logged warning.
+/// Both knobs are provider-level settings (Anthropic sends
+/// `thinking.budget_tokens`, OpenAI-compatible gateways send
+/// `reasoning_effort`), so a value that differs from the server's default
+/// can only be honoured by building a provider for this request. The shared
+/// server provider is returned when neither override changes anything — no
+/// override at all, an unauthenticated `Config`, or a failed build — so
+/// behaviour is unchanged apart from a logged warning. `reasoning_effort`
+/// is injected through a cloned `Config` (the factory reads it from there,
+/// issue #145); `thinking_budget` keeps its explicit parameter and falls
+/// back to the server default, so an effort-only override rebuilds with the
+/// same budget the shared provider carries.
 fn provider_for_request(
     state: &AppState,
-    thinking_budget: Option<u32>,
+    overrides: &SessionOverrides,
 ) -> Arc<dyn crate::llm::ChatProvider> {
-    let Some(budget) = thinking_budget.filter(|b| Some(*b) != state.config.thinking_budget) else {
+    let budget = overrides
+        .thinking_budget
+        .filter(|b| Some(*b) != state.config.thinking_budget);
+    let effort = overrides
+        .reasoning_effort
+        .clone()
+        .filter(|e| state.config.reasoning_effort.as_deref() != Some(e.as_str()));
+    if budget.is_none() && effort.is_none() {
         return state.provider.clone();
-    };
+    }
     let Some(api_key) = state.config.api_key.as_deref().filter(|k| !k.is_empty()) else {
+        tracing::warn!(
+            "per-request thinking overrides cannot be honoured: the server has \
+             no api_key configured; falling back to the server provider"
+        );
         return state.provider.clone();
     };
     let retry = crate::llm::RetryPolicy {
@@ -536,12 +553,22 @@ fn provider_for_request(
         initial_backoff: Duration::from_secs(state.config.retry_initial_backoff_secs),
         max_backoff: Duration::from_secs(state.config.retry_max_backoff_secs),
     };
-    match crate::llm::build_llm_provider(&state.config, api_key, retry, None, Some(budget)) {
+    let mut config = state.config.clone();
+    if effort.is_some() {
+        config.reasoning_effort = effort;
+    }
+    match crate::llm::build_llm_provider(
+        &config,
+        api_key,
+        retry,
+        None,
+        budget.or(state.config.thinking_budget),
+    ) {
         Ok(provider) => provider,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "failed to build provider for per-request thinking_budget; \
+                "failed to build provider for per-request thinking overrides; \
                  falling back to the server provider"
             );
             state.provider.clone()
@@ -845,6 +872,7 @@ pub(super) async fn run_agent(
         SessionOverrides {
             max_budget_usd: body.max_budget_usd,
             thinking_budget: body.thinking_budget,
+            reasoning_effort: body.reasoning_effort.clone(),
         },
     )
     .build()
@@ -1126,6 +1154,7 @@ pub(super) async fn create_session(
         SessionOverrides {
             max_budget_usd: body.max_budget_usd,
             thinking_budget: body.thinking_budget,
+            reasoning_effort: body.reasoning_effort.clone(),
         },
     )
     // Issue #92: a session created here has a stable id for its whole life,
@@ -1166,6 +1195,7 @@ pub(super) async fn create_session(
             overrides: SessionOverrides {
                 max_budget_usd: body.max_budget_usd,
                 thinking_budget: body.thinking_budget,
+                reasoning_effort: body.reasoning_effort.clone(),
             },
             // Issue #85: ownership must survive a restart, otherwise a
             // cold-loaded session would fall back to admin-only and the
@@ -3597,6 +3627,7 @@ mod tests {
             session_name: None,
             max_steps: None,
             thinking_budget: None,
+            reasoning_effort: None,
             permission_mode: None,
             max_budget_usd: None,
             preset: preset.map(str::to_string),

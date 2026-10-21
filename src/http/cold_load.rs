@@ -384,7 +384,7 @@ async fn build_restored_runtime(
     )?;
     // Issue #94: restore the session's run overrides so a cold-loaded session
     // keeps the budget / thinking budget its creator asked for.
-    let overrides = meta.map(|m| m.overrides).unwrap_or_default();
+    let overrides = meta.map(|m| m.overrides.clone()).unwrap_or_default();
     let mut runtime = super::handlers::build_session_runtime(
         state,
         tool_registry,
@@ -576,6 +576,7 @@ mod tests {
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),

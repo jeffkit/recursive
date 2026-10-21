@@ -75,6 +75,10 @@ pub struct OpenAiProvider {
     /// Maximum number of ToolSearchTool round-trips per
     /// `complete_with_search` / `stream_with_search` call.
     max_search_rounds: usize,
+    /// Issue #145: OpenAI-compatible reasoning effort, forwarded verbatim
+    /// as the `reasoning_effort` request field when set. `None` keeps the
+    /// request byte-identical (some gateways reject unknown fields).
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -113,6 +117,7 @@ impl OpenAiProvider {
             stream_tx: None,
             search_engine: Arc::new(KeywordSearchEngine::new()),
             max_search_rounds: 3,
+            reasoning_effort: None,
         })
     }
 
@@ -229,6 +234,30 @@ impl OpenAiProvider {
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self
+    }
+
+    /// Issue #145: forward `reasoning_effort` on every request. `None`
+    /// keeps the provider default. No budget↔effort translation is
+    /// performed: the Anthropic-side `thinking_budget` knob is a token
+    /// count with no enum equivalent, so it is simply not set here.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Build the request body for this provider's configuration. Both the
+    /// streaming and non-streaming paths go through here so the reasoning
+    /// knob (issue #145) cannot apply to one and not the other.
+    fn request_body(&self, messages: &[Message], tools: &[ToolSpec]) -> Value {
+        let mut body = build_request(
+            &self.model,
+            self.temperature,
+            self.max_tokens,
+            messages,
+            tools,
+        );
+        apply_reasoning_effort(&mut body, self.reasoning_effort.as_deref());
+        body
     }
 
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
@@ -388,13 +417,7 @@ impl ChatProvider for OpenAiProvider {
         model = %self.model
     ))]
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
-        let body = build_request(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            messages,
-            tools,
-        );
+        let body = self.request_body(messages, tools);
         let url = format!("{}/chat/completions", self.base_url);
         let text = self.post_json_with_retry(&url, &body, "complete").await?;
         let parsed: ChatResponse = serde_json::from_str(&text)
@@ -408,13 +431,7 @@ impl ChatProvider for OpenAiProvider {
     }
 
     async fn complete_structured(&self, req: StructuredRequest) -> Result<StructuredCompletion> {
-        let mut body = build_request(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            &req.messages,
-            &[],
-        );
+        let mut body = self.request_body(&req.messages, &[]);
         body["response_format"] = serde_json::json!({
             "type": "json_schema",
             "json_schema": {
@@ -735,13 +752,7 @@ impl OpenAiProvider {
         stream_tx: Option<StreamSender>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<Completion> {
-        let mut body = build_request(
-            &self.model,
-            self.temperature,
-            self.max_tokens,
-            messages,
-            tools,
-        );
+        let mut body = self.request_body(messages, tools);
         body["stream"] = Value::Bool(true);
         // Ask providers that gate usage emission behind a flag (MiniMax,
         // OpenAI native) to include the final usage chunk. Providers that
@@ -1238,6 +1249,18 @@ impl OpenAiProvider {
             });
         }
         Ok(())
+    }
+}
+
+/// Issue #145: opt-in reasoning-effort knob for OpenAI-compatible
+/// gateways. `None` leaves the request untouched — several compatible
+/// gateways reject unknown fields, so the field is only present when the
+/// operator (or an HTTP request override) explicitly asked for it. The
+/// value is forwarded verbatim; no `thinking_budget`↔`reasoning_effort`
+/// translation is performed (token count vs. enum level, issue #145).
+fn apply_reasoning_effort(req: &mut Value, effort: Option<&str>) {
+    if let Some(effort) = effort {
+        req["reasoning_effort"] = Value::String(effort.to_string());
     }
 }
 
@@ -2023,6 +2046,33 @@ mod tests {
     fn builds_request_includes_max_tokens() {
         let req = build_request("m", 0.2, 1024, &[Message::user("hi")], &[]);
         assert_eq!(req["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn request_body_carries_the_configured_reasoning_effort() {
+        // The same builder chain `build_llm_provider`'s OpenAI arm drives
+        // from `Config::reasoning_effort` (issue #145).
+        let provider = OpenAiProvider::new("http://127.0.0.1:9", "sk-test", "m")
+            .unwrap()
+            .with_reasoning_effort(Some("high".to_string()));
+        let body = provider.request_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn request_body_omits_reasoning_effort_by_default() {
+        // Opt-in: with no knob set the request must stay byte-identical to
+        // a pre-#145 client (some gateways reject unknown fields).
+        let provider = OpenAiProvider::new("http://127.0.0.1:9", "sk-test", "m").unwrap();
+        let body = provider.request_body(&[Message::user("hi")], &[]);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn apply_reasoning_effort_forwards_the_value_verbatim() {
+        let mut req = build_request("m", 0.2, 1024, &[Message::user("hi")], &[]);
+        apply_reasoning_effort(&mut req, Some("minimal"));
+        assert_eq!(req["reasoning_effort"], "minimal");
     }
 
     #[test]

@@ -661,7 +661,9 @@ fn apply_skill_injection(mut base: String, injected: &[(String, String)]) -> Str
 /// ACP/HTTP servers keep the provider default (`None`) as before this helper
 /// existed. `config.thinking_budget` (set by `--effort` /
 /// `RECURSIVE_THINKING_BUDGET`) is forwarded as the Anthropic
-/// `thinking.budget_tokens` value.
+/// `thinking.budget_tokens` value; `config.reasoning_effort` (issue #145)
+/// flows through `config` to the OpenAI-compatible arm's
+/// `reasoning_effort` request field.
 pub(crate) fn build_llm_provider(
     config: &Config,
     api_key: &str,
@@ -1043,6 +1045,7 @@ mod tests {
             headless: true,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),

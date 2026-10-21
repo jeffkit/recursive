@@ -387,7 +387,7 @@ pub struct SessionInfo {
 /// These are provider/kernel settings rather than server-wide ones, so they
 /// live on the session runtime the request creates instead of in
 /// [`AppState::config`]. `Default` = "inherit the server's `Config`".
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionOverrides {
     /// Per-turn USD ceiling. `None` falls back to `Config::max_budget_usd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -396,6 +396,11 @@ pub struct SessionOverrides {
     /// `Config::thinking_budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    /// OpenAI-compatible reasoning effort (issue #145), forwarded verbatim
+    /// as the `reasoning_effort` request field. `None` falls back to
+    /// `Config::reasoning_effort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl SessionOverrides {
@@ -423,6 +428,11 @@ pub struct CreateSessionRequest {
     /// *provider* setting, so setting it builds a provider for this session
     /// with `thinking.budget_tokens = n` instead of reusing the server's.
     pub thinking_budget: Option<u32>,
+    /// Reasoning effort for OpenAI-compatible models (issue #145), e.g.
+    /// `"low"` / `"high"`, forwarded verbatim as the `reasoning_effort`
+    /// request field. Like `thinking_budget`, a *provider* setting honoured
+    /// by building a provider for this session. `None` = server default.
+    pub reasoning_effort: Option<String>,
     /// Permission mode: `"default"`, `"strict"`, `"acceptEdits"`,
     /// `"dontAsk"`, `"plan"`, or `"bypass"` (the last only where the operator
     /// opted in with `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`). `"auto"` is
@@ -864,6 +874,7 @@ pub(crate) fn test_config_stub() -> crate::config::Config {
         headless: false,
         memory_summary_limit: 5,
         thinking_budget: None,
+        reasoning_effort: None,
         session_name: None,
         max_budget_usd: None,
         extra_dirs: Vec::new(),
@@ -899,6 +910,10 @@ pub struct RunRequest {
     /// building a provider for this run with
     /// `thinking = {type: "enabled", budget_tokens: n}`.
     pub thinking_budget: Option<u32>,
+    /// Reasoning effort for OpenAI-compatible models (issue #145), e.g.
+    /// `"low"` / `"high"`, forwarded verbatim as the `reasoning_effort`
+    /// request field. `None` = server default.
+    pub reasoning_effort: Option<String>,
     /// Permission mode: `"default"`, `"strict"`, `"acceptEdits"`,
     /// `"dontAsk"`, `"plan"`, or `"bypass"` (the last only where the operator
     /// opted in with `RECURSIVE_ALLOW_BYPASS_PERMISSIONS`). `"auto"` is
@@ -1864,6 +1879,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "system_prompt": { "type": "string", "nullable": true },
                         "append_system_prompt": { "type": "string", "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
+                        "reasoning_effort": { "type": "string", "nullable": true },
                         "permission_mode": {
                             "type": "string",
                             "enum": [
@@ -1947,6 +1963,7 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         "session_name": { "type": "string", "nullable": true },
                         "max_steps": { "type": "integer", "nullable": true },
                         "thinking_budget": { "type": "integer", "nullable": true },
+                        "reasoning_effort": { "type": "string", "nullable": true },
                         "permission_mode": {
                             "type": "string",
                             "enum": [
@@ -2699,6 +2716,7 @@ mod goal_396_persistence_tests {
             headless: false,
             memory_summary_limit: 5,
             thinking_budget: None,
+            reasoning_effort: None,
             session_name: None,
             max_budget_usd: None,
             extra_dirs: Vec::new(),
