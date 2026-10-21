@@ -251,24 +251,31 @@ async fn uncommitted_user_edits_are_not_absorbed_into_the_turn() {
 #[test]
 fn over_budget_paths_degrade_with_a_coarse_marker() {
     isolate_home();
-    let (_tmp, ws) = repo_workspace();
+    let (tmp, ws) = repo_workspace();
     let budgets = Budgets {
         max_files: 2,
         max_file_bytes: 8,
         ..Budgets::default()
     };
-    let ledger = Deliverables::new(
-        &ws,
-        std::env::temp_dir().join(format!(
-            "recursive-deliverables-budgeted-{}",
-            std::process::id()
-        )),
-        budgets,
-    )
-    .unwrap();
+    // Issue #222: the ledger root must be private to this run. A root
+    // shared across runs (e.g. keyed by pid under `temp_dir()`) hands a
+    // fresh run whatever shadow index or `index.lock` the last one left
+    // behind. A sibling of the workspace inside the test's own tempdir is
+    // unique, outside the repository, and reclaimed with it.
+    let ledger = Deliverables::new(&ws, tmp.path().join("ledger-root"), budgets).unwrap();
 
     ledger.begin_turn(1);
     ledger.ensure_baseline().unwrap();
+    // The baseline must already hold the committed README: if the shadow
+    // snapshot silently came back empty, README would surface as "added"
+    // and every count below would be off by one for no visible reason.
+    let at_baseline = ledger.changes().unwrap().expect("a baseline was captured");
+    assert_eq!(at_baseline.sources, ["shadow_index"], "{at_baseline:?}");
+    assert_eq!(
+        at_baseline.changed_count(),
+        0,
+        "nothing changed since the baseline yet: {at_baseline:?}"
+    );
     // Sorts first, so it keeps its own (capture-budget) reason instead of
     // being overwritten by the render budget the way later paths are.
     std::fs::write(ws.join("aa-big.txt"), "0123456789").unwrap();
@@ -277,7 +284,15 @@ fn over_budget_paths_degrade_with_a_coarse_marker() {
     }
     let changes = ledger.finalize_turn(1).unwrap();
 
-    assert_eq!(changes.changed_count(), 5);
+    let listed: Vec<(&str, ChangeStatus)> = changes
+        .all_changes()
+        .map(|c| (c.path.as_str(), c.status))
+        .collect();
+    assert_eq!(
+        changes.changed_count(),
+        5,
+        "unexpected change set: {listed:?}"
+    );
     assert!(changes.truncated, "the render budget must be reported");
     assert!(changes.coarse_count() >= 3, "{changes:?}");
     let oversized = changes

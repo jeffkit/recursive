@@ -320,6 +320,7 @@ pub(crate) fn cmd_session_clean_checkpoints(workspace: &Path, force: bool) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvGuard;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -329,6 +330,32 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok()
+    }
+
+    /// Issue #222: `ShadowRepo::open` resolves the shadow-git dir through
+    /// `RECURSIVE_HOME`, which sibling tests (`cli::resume`, `main.rs`) set
+    /// and restore under the crate-wide [`EnvGuard`]. A rewind test that
+    /// reads it unguarded can resolve one home while fabricating the
+    /// session and another when `cmd_session_rewind` reopens the repo —
+    /// the checkpoint sha then lands in a fresh bare repo ("checkpoint
+    /// '<sha>' not found"), or in a sibling's already-deleted tempdir. Pin
+    /// the home under the guard for the whole test; the guard also keeps
+    /// the shadow repo out of the real `~/.recursive`.
+    fn pinned_home() -> (TempDir, EnvGuard) {
+        let home = TempDir::new().unwrap();
+        let mut env = EnvGuard::lock();
+        env.set_var("RECURSIVE_HOME", home.path());
+        (home, env)
+    }
+
+    /// The fabricated session's shadow repo must live under the pinned
+    /// home — proof the pin took effect before the rewind reopens it.
+    fn assert_shadow_under(home: &TempDir) {
+        assert!(
+            home.path().join("workspaces").is_dir(),
+            "shadow repo must be created under the pinned RECURSIVE_HOME {}",
+            home.path().display()
+        );
     }
 
     /// A minimal two-turn transcript. `truncate_transcript_to_turn` only
@@ -414,8 +441,10 @@ mod tests {
         if !has_git() {
             return;
         }
+        let (home, _env) = pinned_home();
         let ws = TempDir::new().unwrap();
         let sess = fabricate_saved_session(&ws);
+        assert_shadow_under(&home);
         let transcript_before = read_bytes(&sess.join("transcript.jsonl"));
         let log_before = read_bytes(&sess.join("checkpoints.jsonl"));
 
@@ -459,8 +488,10 @@ mod tests {
         if !has_git() {
             return;
         }
+        let (home, _env) = pinned_home();
         let ws = TempDir::new().unwrap();
         let sess = fabricate_saved_session(&ws);
+        assert_shadow_under(&home);
 
         cmd_session_rewind(ws.path(), sess.to_str().unwrap(), 1, true, false).unwrap();
 
