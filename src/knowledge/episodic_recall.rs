@@ -118,7 +118,22 @@ impl Tool for EpisodicRecall {
         for session_dir in sessions {
             let entries = match SessionReader::load_transcript(session_dir) {
                 Ok(e) => e,
-                Err(_) => continue,
+                // No transcript yet (session created, nothing written): benign skip.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    // An unreadable transcript silently drops the session
+                    // from the recall surface — observable degradation.
+                    tracing::warn!(
+                        session = session_dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown"),
+                        path = %session_dir.join("transcript.jsonl").display(),
+                        error = %err,
+                        "episodic recall: transcript read failed; skipping session"
+                    );
+                    continue;
+                }
             };
 
             if entries.is_empty() {
@@ -258,7 +273,22 @@ pub fn episodic_recall_summary(workspace: &std::path::Path, limit: usize) -> Str
     for session_dir in recent {
         let meta = match SessionReader::load_meta(session_dir) {
             Ok(m) => m,
-            Err(_) => continue,
+            // Removed between list and read (race): benign skip.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                // Corrupt/unreadable meta silently drops the session from
+                // the recent-sessions block — observable degradation.
+                tracing::warn!(
+                    session = session_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown"),
+                    path = %session_dir.join(".meta.json").display(),
+                    error = %err,
+                    "episodic recall: session meta read failed; skipping session"
+                );
+                continue;
+            }
         };
         let session_name = session_dir
             .file_name()
@@ -310,6 +340,113 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    /// Same as [`setup_session_with_messages`] but returns the session
+    /// directory itself, so tests can sabotage files inside it (#217).
+    fn setup_session_dir(ws: &std::path::Path, goal: &str, messages: &[(&str, &str)]) -> PathBuf {
+        let mut writer = SessionWriter::create(ws, goal, "test-model", "test-provider").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+        for (role, content) in messages {
+            let msg = match *role {
+                "assistant" => Message::assistant(content.to_string()),
+                "system" => Message::system(content.to_string()),
+                _ => Message::user(content.to_string()),
+            };
+            writer.append(&msg, None, None).unwrap();
+        }
+        writer.finish(SessionStatus::Completed).unwrap();
+        session_dir
+    }
+
+    /// An unreadable transcript silently drops the session from the recall
+    /// surface; the drop must be announced and the readable sessions must
+    /// still be searched (#217).
+    #[tracing_test::traced_test]
+    #[test]
+    fn recall_skips_unreadable_transcript_with_warning() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        setup_session_with_messages(ws, "readable-goal", &[("user", "needle-readable")]);
+
+        // A directory standing in for transcript.jsonl reads back as a
+        // non-NotFound IO error.
+        let corrupt = setup_session_dir(ws, "corrupt-goal", &[("user", "needle-corrupt")]);
+        std::fs::remove_file(corrupt.join("transcript.jsonl")).unwrap();
+        std::fs::create_dir(corrupt.join("transcript.jsonl")).unwrap();
+
+        let tool = EpisodicRecall::new(ws);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "needle"})));
+        let output = result.expect("search must succeed");
+        assert!(
+            output.contains("needle-readable"),
+            "the readable session must still be searched: {output}"
+        );
+        assert!(
+            !output.contains("needle-corrupt"),
+            "the unreadable session is skipped (behavior unchanged)"
+        );
+        assert!(
+            logs_contain("transcript read failed"),
+            "the skip must be announced"
+        );
+        let corrupt_name = corrupt.file_name().unwrap().to_str().unwrap();
+        assert!(logs_contain(corrupt_name), "the warning names the session");
+    }
+
+    /// A listed session without a transcript (created, nothing written yet)
+    /// reads back NotFound: benign skip, no warning noise.
+    #[tracing_test::traced_test]
+    #[test]
+    fn recall_missing_transcript_is_skipped_silently() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let dir = setup_session_dir(ws, "bare-goal", &[]);
+        let _ = std::fs::remove_file(dir.join("transcript.jsonl"));
+
+        let tool = EpisodicRecall::new(ws);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "anything"})));
+        assert!(result.is_ok());
+        assert!(
+            !logs_contain("transcript read failed"),
+            "an absent transcript is benign — no warning noise"
+        );
+    }
+
+    /// A zero-byte `.meta.json` (crash mid-write) is listed but unparsable:
+    /// the session drops out of the recent-sessions block, and the drop
+    /// must be announced (#217).
+    #[tracing_test::traced_test]
+    #[test]
+    fn summary_skips_corrupt_meta_with_warning() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        setup_session_with_messages(ws, "healthy-goal-unique", &[("user", "hi")]);
+        let corrupt = setup_session_dir(ws, "corrupt-meta-goal-unique", &[("user", "hi")]);
+        std::fs::write(corrupt.join(".meta.json"), b"").unwrap();
+
+        let summary = episodic_recall_summary(ws, 10);
+        assert!(
+            summary.contains("healthy-goal-unique"),
+            "healthy sessions are still listed: {summary}"
+        );
+        assert!(
+            !summary.contains("corrupt-meta-goal-unique"),
+            "the corrupt-meta session is skipped (behavior unchanged)"
+        );
+        assert!(
+            logs_contain("session meta read failed"),
+            "the skip must be announced"
+        );
+        let corrupt_name = corrupt.file_name().unwrap().to_str().unwrap();
+        assert!(logs_contain(corrupt_name), "the warning names the session");
     }
 
     #[test]

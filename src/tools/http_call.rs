@@ -199,9 +199,9 @@ impl EndpointRegistry {
     /// `<workspace>/.recursive/endpoints.json`.
     ///
     /// Returns `None` (silently) when no file exists, and `None` with a
-    /// stderr warning when a file exists but is invalid — a malformed
-    /// endpoints file must not brick unrelated commands, matching how the
-    /// permissions config degrades.
+    /// `tracing` warning when a file exists but is unreadable or invalid —
+    /// a malformed endpoints file must not brick unrelated commands,
+    /// matching how the permissions config degrades.
     pub fn discover(workspace: &Path) -> Option<Self> {
         let path: PathBuf = match std::env::var("RECURSIVE_ENDPOINTS_FILE") {
             Ok(p) if !p.is_empty() => PathBuf::from(p),
@@ -209,13 +209,24 @@ impl EndpointRegistry {
         };
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => return None,
+            // Not configured: benign.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                // An unreadable-but-present config silently disables the
+                // whole tool — observable degradation.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "http_call: endpoints file unreadable; tool disabled"
+                );
+                return None;
+            }
         };
         match Self::from_json(&content) {
             Ok(r) if r.is_empty() => None,
             Ok(r) => Some(r),
             Err(e) => {
-                eprintln!("http_call: ignoring {}: {e}", path.display());
+                tracing::warn!("http_call: ignoring {}: {e}", path.display());
                 None
             }
         }
@@ -1100,6 +1111,52 @@ mod tests {
         let reg = EndpointRegistry::discover(tmp.path()).expect("registry");
         assert_eq!(reg.len(), 1);
         assert!(reg.get("get_order").is_some());
+    }
+
+    /// A present-but-unreadable config (here: a directory standing in for
+    /// the file) silently disables the whole tool — the disable must be
+    /// announced with the path (#217).
+    #[tracing_test::traced_test]
+    #[test]
+    fn discover_unreadable_file_is_none_and_warns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join(".recursive").join("endpoints.json");
+        std::fs::create_dir_all(&file).expect("mkdir");
+
+        assert!(EndpointRegistry::discover(tmp.path()).is_none());
+        assert!(
+            logs_contain("endpoints file unreadable"),
+            "an unreadable-but-present config must be announced"
+        );
+        assert!(logs_contain("endpoints.json"), "the warning names the path");
+    }
+
+    /// Invalid JSON keeps degrading to `None`, now on the tracing channel
+    /// instead of raw stderr (#217).
+    #[tracing_test::traced_test]
+    #[test]
+    fn discover_invalid_json_is_none_and_warns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".recursive");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("endpoints.json"), "{not json").expect("write");
+
+        assert!(EndpointRegistry::discover(tmp.path()).is_none());
+        assert!(logs_contain("ignoring"), "invalid JSON must be announced");
+        assert!(logs_contain("endpoints.json"));
+    }
+
+    /// An absent config is "not configured", not a degradation — silent.
+    #[tracing_test::traced_test]
+    #[test]
+    fn discover_missing_file_stays_silent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        assert!(EndpointRegistry::discover(tmp.path()).is_none());
+        assert!(
+            !logs_contain("endpoints file unreadable"),
+            "an absent config is benign — no warning noise"
+        );
     }
 
     // ── schema hygiene ──────────────────────────────────────────────────

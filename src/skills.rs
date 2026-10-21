@@ -1066,7 +1066,19 @@ pub fn skills_for_injection(skills: &[Skill], goal: &str) -> Vec<(String, String
                     Some(b) => extract_body(b).to_string(),
                     None => match fs::read_to_string(&skill.path) {
                         Ok(content) => extract_body(&content).to_string(),
-                        Err(_) => continue,
+                        // Absent file (deleted after discovery): benign skip.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            // Unreadable body silently drops the skill from
+                            // the injection surface — observable degradation.
+                            tracing::warn!(
+                                skill = %skill.name,
+                                path = %skill.path.display(),
+                                error = %e,
+                                "always-mode skill body unreadable; skipping injection"
+                            );
+                            continue;
+                        }
                     },
                 };
                 result.push((skill.name.clone(), body));
@@ -2029,6 +2041,59 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "always-skill");
         assert_eq!(result[0].1, "Always body content");
+    }
+
+    fn always_skill_with_body_path(path: std::path::PathBuf) -> Skill {
+        Skill {
+            name: "ghost-skill".into(),
+            description: "always injected".into(),
+            path,
+            mode: SkillMode::Always,
+            triggers: Vec::new(),
+            hint: String::new(),
+            depends_on: Vec::new(),
+            refs: Vec::new(),
+            params: Vec::new(),
+            scripts: Vec::new(),
+            sections: Vec::new(),
+            globs: None,
+            body: None,
+        }
+    }
+
+    /// An Always-mode skill whose SKILL.md is unreadable (here: a directory
+    /// standing in for the file) is dropped from the injection surface —
+    /// the drop must be announced with the skill name (#217).
+    #[tracing_test::traced_test]
+    #[test]
+    fn always_skill_body_unreadable_warns_and_still_skips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("ghost-skill");
+        std::fs::create_dir(&path).unwrap();
+
+        let result = skills_for_injection(&[always_skill_with_body_path(path)], "anything");
+        assert!(result.is_empty(), "unreadable body must be skipped");
+        assert!(
+            logs_contain("always-mode skill body unreadable"),
+            "the drop must be announced"
+        );
+        assert!(logs_contain("ghost-skill"), "the warning names the skill");
+    }
+
+    /// An absent body file (deleted after discovery) reads back NotFound:
+    /// benign skip, no warning noise.
+    #[tracing_test::traced_test]
+    #[test]
+    fn always_skill_body_missing_is_skipped_silently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("never-written").join("SKILL.md");
+
+        let result = skills_for_injection(&[always_skill_with_body_path(path)], "anything");
+        assert!(result.is_empty());
+        assert!(
+            !logs_contain("always-mode skill body unreadable"),
+            "an absent file is benign — no warning noise"
+        );
     }
 
     #[test]
