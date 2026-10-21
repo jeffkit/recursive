@@ -33,6 +33,12 @@ use url::Host;
 use crate::error::{Error, Result};
 
 /// Validate URL and block SSRF targets (private/loopback/link-local addresses).
+///
+/// Returns the **normalised** serialisation ([`url::Url::as_str`]), not the
+/// raw input: callers feed the result into request URLs and shell commands,
+/// so echoing the input would carry quotes, spaces and `;` straight through.
+/// Normalisation alone does not make a URL shell-safe — `'`, `|`, `;` and
+/// `$` survive in a path — see `a2a::is_shell_safe_url`.
 pub(crate) fn validate_url(url: &str) -> Result<String> {
     // Cheap prefix gate keeps today's error message for non-http(s) inputs
     // (web_fetch tests match on "http:// or https://"); `Url::parse` would
@@ -131,7 +137,7 @@ pub(crate) fn validate_url(url: &str) -> Result<String> {
         }
     }
 
-    Ok(url.to_string())
+    Ok(parsed.as_str().to_string())
 }
 
 /// Returns true for IP addresses that must not be reached via outbound HTTP
@@ -783,6 +789,24 @@ mod tests {
     fn validate_url_still_accepts_hostnames() {
         assert!(validate_url("http://example.com").is_ok());
         assert!(validate_url("http://example.com:8080/path").is_ok());
+    }
+
+    /// Issue #171: callers interpolate the result into request URLs and shell
+    /// commands, so `validate_url` must return the parsed/normalised form, not
+    /// echo the raw input.
+    #[test]
+    fn validate_url_returns_normalised_url() {
+        assert_eq!(
+            validate_url("http://Example.COM:80/a b?x=1").expect("ok"),
+            "http://example.com/a%20b?x=1"
+        );
+        // Normalisation is not shell-safety: in a path `'`, `|` and `;` are
+        // legal and survive verbatim, which is why a2a's async command adds
+        // its own whitelist.
+        assert_eq!(
+            validate_url("https://evil.example/a';x|y;'").expect("ok"),
+            "https://evil.example/a';x|y;'"
+        );
     }
 
     // ── Goal 377: RFC-vs-string parsing mismatch bypasses ───────────────
