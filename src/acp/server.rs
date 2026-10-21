@@ -70,7 +70,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::bridge::sha256_first_12;
@@ -167,16 +169,153 @@ fn build_error(id: &Value, code: i32, message: &str) -> Value {
     })
 }
 
-/// Write a JSON line to the writer (used in run_io loop).
-async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut W,
-    value: &Value,
-) -> Result<(), std::io::Error> {
-    let json = serde_json::to_string(value).unwrap_or_default();
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
+/// Shared plumbing for detached prompt turns (issue #179): the cancel
+/// registry plus the frame channel every turn task writes to. Cloned into
+/// each turn task, so the read loop never holds a per-turn borrow.
+#[derive(Clone)]
+struct TurnControl {
+    registry: Arc<std::sync::Mutex<TurnRegistry>>,
+    out: mpsc::Sender<Value>,
+}
+
+impl TurnControl {
+    fn new(out: mpsc::Sender<Value>) -> Self {
+        Self {
+            registry: Arc::new(std::sync::Mutex::new(TurnRegistry::default())),
+            out,
+        }
+    }
+
+    /// Register a freshly started turn for `sid`.
+    fn register(&self, sid: &str, token: Arc<tokio_util::sync::CancellationToken>) {
+        self.lock().register(sid, token);
+    }
+
+    /// Mark a turn finished (called by the turn task itself).
+    fn turn_finished(&self) {
+        self.lock().turn_finished();
+    }
+
+    /// Queue the turn's task for the shutdown drain.
+    fn track_task(&self, task: JoinHandle<()>) {
+        self.lock().tasks.push(task);
+    }
+
+    /// Fire the cancel token of `sid`'s current turn, if registered.
+    fn cancel_session(&self, sid: &str) -> bool {
+        self.lock().cancel_session(sid)
+    }
+
+    /// True when no turn task is still running.
+    fn is_idle(&self) -> bool {
+        self.lock().is_idle()
+    }
+
+    /// Take every spawned turn task for the shutdown drain (EOF, #179:
+    /// a turn in flight when stdin closes still delivers its response,
+    /// exactly as the old serial loop did).
+    fn take_tasks(&self) -> Vec<JoinHandle<()>> {
+        self.lock().take_tasks()
+    }
+
+    /// Write one JSON-RPC frame to the writer task. The writer only stops
+    /// draining when every sender is gone, so a send failure means the
+    /// whole server is shutting down anyway.
+    async fn send(&self, value: Value) {
+        let _ = self.out.send(value).await;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, TurnRegistry> {
+        self.registry.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Shared registry of in-flight prompt turns (issue #179).
+///
+/// The read loop fires a session's token when `session/cancel` arrives —
+/// even while that session's turn task is mid-run — and drains the tasks on
+/// shutdown. Tokens are registered by `handle_session_prompt` and stay
+/// until replaced by the session's next turn; cancel falls back to the
+/// session's own token between turns, so a cancel that arrives after a
+/// turn finished still reports success without touching a future turn.
+#[derive(Default)]
+struct TurnRegistry {
+    /// sessionId → the token of the session's most recently started turn.
+    tokens: HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+    /// Every spawned turn task, awaited on shutdown so a turn's response
+    /// and notifications are flushed before the writer closes.
+    tasks: Vec<JoinHandle<()>>,
+    /// Turns started but not yet finished; keeps the idle-timeout shutdown
+    /// (S1-C9) from firing under a legitimately long, silent turn.
+    active: usize,
+}
+
+impl TurnRegistry {
+    /// Register a freshly started turn for `sid`.
+    fn register(&mut self, sid: &str, token: Arc<tokio_util::sync::CancellationToken>) {
+        self.tokens.insert(sid.to_string(), token);
+        self.active += 1;
+    }
+
+    /// Mark a turn finished (called by the turn task itself).
+    fn turn_finished(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
+
+    /// Fire the cancel token of `sid`'s current turn, if one is registered.
+    fn cancel_session(&self, sid: &str) -> bool {
+        match self.tokens.get(sid) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True when no turn task is still running.
+    fn is_idle(&self) -> bool {
+        self.active == 0
+    }
+
+    /// Cancel nothing, but take ownership of every spawned turn task so the
+    /// shutdown path can await their final frames (EOF drain, issue #179:
+    /// a turn in flight when stdin closes still delivers its response,
+    /// exactly as the old serial loop did).
+    fn take_tasks(&mut self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut self.tasks)
+    }
+}
+
+/// Spawn the task that owns the transport's write end (issue #179).
+///
+/// Every response and notification — from the read loop *and* from prompt
+/// turn tasks — is funneled through one channel into this task, so frames
+/// are serialized into complete JSON lines and never interleave mid-line.
+/// On a write error (peer gone) it keeps draining the channel so senders
+/// never block; the frames are simply dropped.
+fn spawn_writer_task<W>(mut writer: W) -> (mpsc::Sender<Value>, JoinHandle<()>)
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel::<Value>(128);
+    let handle = tokio::spawn(async move {
+        let mut peer_gone = false;
+        while let Some(value) = rx.recv().await {
+            if peer_gone {
+                continue;
+            }
+            let json = serde_json::to_string(&value).unwrap_or_default();
+            if writer.write_all(json.as_bytes()).await.is_err()
+                || writer.write_all(b"\n").await.is_err()
+                || writer.flush().await.is_err()
+            {
+                tracing::debug!("ACP stdout write failed; dropping remaining frames");
+                peer_gone = true;
+            }
+        }
+    });
+    (tx, handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +354,7 @@ async fn dispatch_async(
     state: &mut ServerState,
     sessions: &mut AcpSessionManager,
     llm: Option<&Arc<dyn ChatProvider>>,
+    control: &TurnControl,
 ) -> (Option<Value>, Vec<Value>) {
     match method {
         // ── Sprint 2: session/new ────────────────────────────────
@@ -251,7 +391,7 @@ async fn dispatch_async(
                 vec![],
             ),
             ServerState::Initialized => match llm {
-                Some(_llm) => handle_session_prompt(id, params, sessions).await,
+                Some(_llm) => handle_session_prompt(id, params, sessions, control).await,
                 None => (
                     Some(build_error(
                         id,
@@ -273,7 +413,7 @@ async fn dispatch_async(
                 )),
                 vec![],
             ),
-            ServerState::Initialized => handle_session_cancel(id, params, sessions),
+            ServerState::Initialized => handle_session_cancel(id, params, sessions, control),
         },
 
         // ── ACP-S1-01: session/load ───────────────────────────────
@@ -595,7 +735,7 @@ async fn handle_session_new(
     // Store the session (note: we use the pre-generated id via insert_with_id)
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
     let session = AcpSession {
-        runtime,
+        runtime: Arc::new(Mutex::new(runtime)),
         cwd: cwd.clone(),
         turn: 0,
         session_id: session_id.clone(),
@@ -793,7 +933,7 @@ async fn handle_session_load(
     }
 
     let session = AcpSession {
-        runtime,
+        runtime: Arc::new(Mutex::new(runtime)),
         cwd: metadata.cwd.clone(),
         turn,
         session_id: sid.clone(),
@@ -1089,7 +1229,7 @@ async fn handle_session_resume(
     }
 
     let session = AcpSession {
-        runtime,
+        runtime: Arc::new(Mutex::new(runtime)),
         cwd: metadata.cwd.clone(),
         turn: metadata.turn,
         session_id: sid.clone(),
@@ -1125,6 +1265,7 @@ async fn handle_session_prompt(
     id: &Value,
     params: Option<&Value>,
     sessions: &mut AcpSessionManager,
+    control: &TurnControl,
 ) -> (Option<Value>, Vec<Value>) {
     let params = match params {
         Some(p) => p,
@@ -1274,16 +1415,25 @@ async fn handle_session_prompt(
 
     // Create a new bridge for this turn and swap it in.
     // Sprint 2: turn counter passed for turnId; tool_call notifications disabled.
+    //
+    // The turn counter is incremented at *spawn* time: the turn now runs in
+    // its own task (issue #179), so the read loop never waits for it, and
+    // the "most recently prompted" selection for empty-params cancel sees
+    // the in-flight session immediately.
     let turn = session.turn;
+    session.turn += 1;
     let (bridge, mut rx) =
         AcpBridge::new(sid.clone(), std::collections::HashMap::new(), turn, false);
-    session.runtime.replace_event_sink(bridge);
 
     // Sprint 4: refresh the cancel token for this turn.
     // This creates a fresh CancellationToken wired to the agent runtime
     // via set_interrupt_token, ensuring a cancel only affects the
     // currently in-flight turn.
-    let _ = session.refresh_cancel_token();
+    let token = {
+        session.runtime.lock().await.replace_event_sink(bridge);
+        session.refresh_cancel_token().await
+    };
+    control.register(&sid, token);
 
     // AC-2.6: Emit user_message_chunk before running the agent.
     let user_msg_id = sha256_first_12(&concatenated);
@@ -1297,53 +1447,66 @@ async fn handle_session_prompt(
                 "messageId": user_msg_id,
                 "content": {
                     "type": "text",
-                    "text": concatenated,
+                    "text": concatenated.clone(),
                 },
             }
         }
     });
 
-    // Run the agent
-    let outcome = match session.runtime.run(concatenated).await {
-        Ok(o) => o,
-        Err(e) => {
-            return (
-                Some(build_error(
-                    id,
-                    INVALID_PARAMS,
-                    &format!("Agent run failed: {e}"),
-                )),
-                vec![],
-            );
+    // Run the agent in its own task so the read loop keeps consuming stdin
+    // while the turn runs — that is what makes a mid-turn `session/cancel`
+    // deliverable at all (issue #179). Frames flow to the writer task; the
+    // response is sent first, then the collected notifications, preserving
+    // the serial loop's wire order.
+    let runtime = session.runtime.clone();
+    let response_id = id.clone();
+    let control_for_task = control.clone();
+    let turn_task = tokio::spawn(async move {
+        let outcome = {
+            let mut rt = runtime.lock().await;
+            rt.run(concatenated).await
+        };
+        control_for_task.turn_finished();
+
+        let mut notifications: Vec<Value> = vec![user_notif];
+        while let Ok(notif) = rx.try_recv() {
+            notifications.push(notif);
         }
-    };
 
-    // Increment turn counter
-    session.turn += 1;
-
-    // Drain all notifications from the bridge
-    let mut notifications: Vec<Value> = vec![user_notif];
-    while let Ok(notif) = rx.try_recv() {
-        notifications.push(notif);
-    }
-
-    // AC-2.5: Complete stopReason mapping per contract.
-    let stop_reason = match outcome.finish_reason {
-        FinishReason::NoMoreToolCalls => "end_turn",
-        FinishReason::Cancelled => "cancelled",
-        FinishReason::BudgetExceeded => "max_turns",
-        FinishReason::Stuck { .. }
-        | FinishReason::TranscriptLimit { .. }
-        | FinishReason::ProviderStop(_)
-        | FinishReason::PermissionDenialLimit
-        | FinishReason::WallClockExceeded { .. } => "error",
-    };
-
-    let result = serde_json::json!({
-        "stopReason": stop_reason,
+        let frame = match outcome {
+            Ok(outcome) => {
+                // AC-2.5: Complete stopReason mapping per contract.
+                let stop_reason = match outcome.finish_reason {
+                    FinishReason::NoMoreToolCalls => "end_turn",
+                    FinishReason::Cancelled => "cancelled",
+                    FinishReason::BudgetExceeded => "max_turns",
+                    FinishReason::Stuck { .. }
+                    | FinishReason::TranscriptLimit { .. }
+                    | FinishReason::ProviderStop(_)
+                    | FinishReason::PermissionDenialLimit
+                    | FinishReason::WallClockExceeded { .. } => "error",
+                };
+                build_success(
+                    &response_id,
+                    serde_json::json!({
+                        "stopReason": stop_reason,
+                    }),
+                )
+            }
+            Err(e) => build_error(
+                &response_id,
+                INVALID_PARAMS,
+                &format!("Agent run failed: {e}"),
+            ),
+        };
+        control_for_task.send(frame).await;
+        for notif in notifications {
+            control_for_task.send(notif).await;
+        }
     });
+    control.track_task(turn_task);
 
-    (Some(build_success(id, result)), notifications)
+    (None, vec![])
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,10 +1525,19 @@ async fn handle_session_prompt(
 /// When params is empty (`{}`), the handler cancels the first running
 /// session (the one most recently prompted). If no session exists or
 /// none is running, returns error -32000.
+///
+/// The token fired is the session's most recently *started turn's* token,
+/// taken from the [`TurnRegistry`]; between turns it falls back to the
+/// session's own (fresh) token. A registry hit fires immediately without
+/// touching the sessions lock, so a cancel is deliverable even while a
+/// turn task holds the runtime mutex mid-run (issue #179). A finished
+/// turn's registry entry stays cancelled, harmlessly: every new turn
+/// installs a fresh token via `refresh_cancel_token`.
 fn handle_session_cancel(
     id: &Value,
     params: Option<&Value>,
     sessions: &mut AcpSessionManager,
+    control: &TurnControl,
 ) -> (Option<Value>, Vec<Value>) {
     // Determine which session to cancel.
     let sid: Option<String> = params.and_then(|p| {
@@ -1375,7 +1547,15 @@ fn handle_session_cancel(
     });
 
     if let Some(sid) = sid {
-        // Target a specific session by ID.
+        // Target a specific session by ID: prefer the turn registry (the
+        // token wired to the runtime of the in-flight turn), falling back
+        // to the session's own token. A registry hit does not require the
+        // sessions lock at all, so cancel works while a turn task holds
+        // the runtime mutex mid-run (issue #179).
+        if control.cancel_session(&sid) {
+            return (Some(build_success(id, Value::Bool(true))), vec![]);
+        }
+
         let session = match sessions.get_mut(&sid) {
             Some(s) => s,
             None => {
@@ -1405,6 +1585,9 @@ fn handle_session_cancel(
 
         match active_sid {
             Some(sid) => {
+                if control.cancel_session(&sid) {
+                    return (Some(build_success(id, Value::Bool(true))), vec![]);
+                }
                 match sessions.get_mut(&sid) {
                     Some(session) => {
                         session.cancel_token.cancel();
@@ -1512,12 +1695,19 @@ impl AcpServer {
     }
 
     /// Run the server on real stdio with 60-second idle timeout.
-    async fn run_stdio<R, W>(reader: R, mut writer: W, llm: Option<Arc<dyn ChatProvider>>)
+    ///
+    /// Issue #179: prompt turns run in detached tasks, so the loop keeps
+    /// reading stdin while a turn is in flight. The idle timeout therefore
+    /// only shuts down when no turn is running — a long, silent turn holds
+    /// the server alive exactly as it did when the loop was serial.
+    async fn run_stdio<R, W>(reader: R, writer: W, llm: Option<Arc<dyn ChatProvider>>)
     where
-        R: tokio::io::AsyncBufRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let sync_table = build_sync_dispatch_table();
+        let (out, writer_task) = spawn_writer_task(writer);
+        let control = TurnControl::new(out);
         let mut lines = BufReader::new(reader).lines();
         let mut state = ServerState::Uninitialized;
         let mut sessions = AcpSessionManager::new();
@@ -1546,21 +1736,22 @@ impl AcpServer {
                     break;
                 }
                 Err(_elapsed) => {
-                    // S1-C9: only genuine 60s of silence shuts the server down.
-                    if last_input.elapsed() >= idle_timeout {
+                    // S1-C9: only genuine 60s of silence shuts the server down,
+                    // and never under an in-flight prompt turn (#179).
+                    if control.is_idle() && last_input.elapsed() >= idle_timeout {
                         tracing::info!("ACP server idle timeout (60s), shutting down");
                         eprintln!("ServerShutdown");
                         break;
                     }
-                    // Woken early (e.g. a paused/fast-forwarded test clock):
-                    // keep waiting instead of treating it as a real timeout.
+                    // Woken early (e.g. a paused/fast-forwarded test clock),
+                    // or a turn is still running: keep waiting.
                     continue;
                 }
             };
 
             Self::process_line(
                 &line,
-                &mut writer,
+                &control,
                 &mut state,
                 &mut sessions,
                 llm.as_ref(),
@@ -1569,17 +1760,30 @@ impl AcpServer {
             .await;
         }
 
-        // The transport is gone: no session can outlive its stdio pipe, so
-        // release their MCP children instead of orphaning them (#183).
+        // Drain in-flight prompt turns without cancelling them (#179): each
+        // one still delivers its response and notifications to the writer,
+        // matching the serial loop where EOF was only observed after the
+        // turn finished. Then release the sessions' MCP children (#183) and
+        // close the writer.
+        for task in control.take_tasks() {
+            let _ = task.await;
+        }
         sessions.kill_all_mcp_children().await;
+        drop(control);
+        let _ = writer_task.await;
         debug!("ACP stdin closed or idle, server shutting down");
     }
 
     /// Dispatch a single input line (single request/notification or batch).
     /// Shared by `run_stdio` and `run_io`.
-    async fn process_line<W: tokio::io::AsyncWrite + Unpin>(
+    ///
+    /// Responses and notifications travel to the writer task through `out`
+    /// (issue #179); the returned values are the frames this * synchronous
+    /// path produces. A `session/prompt` returns `(None, vec![])` here —
+    /// its response and notifications are sent by the spawned turn task.
+    async fn process_line(
         line: &str,
-        writer: &mut W,
+        control: &TurnControl,
         state: &mut ServerState,
         sessions: &mut AcpSessionManager,
         llm: Option<&Arc<dyn ChatProvider>>,
@@ -1595,7 +1799,7 @@ impl AcpServer {
             Ok(v) => v,
             Err(_) => {
                 let resp = build_error(&Value::Null, PARSE_ERROR, "Parse error: invalid JSON");
-                let _ = write_line(writer, &resp).await;
+                control.send(resp).await;
                 return;
             }
         };
@@ -1604,7 +1808,7 @@ impl AcpServer {
             // Batch
             if arr.is_empty() {
                 let resp = build_error(&Value::Null, INVALID_REQUEST, "Empty batch is not allowed");
-                let _ = write_line(writer, &resp).await;
+                control.send(resp).await;
                 return;
             }
 
@@ -1612,7 +1816,7 @@ impl AcpServer {
             let mut batch_notifications: Vec<Value> = Vec::new();
             for item in arr {
                 let (resp, notifs) =
-                    Self::dispatch_one(item, state, sessions, llm, sync_table).await;
+                    Self::dispatch_one(item, state, sessions, llm, sync_table, control).await;
                 if let Some(resp) = resp {
                     responses.push(resp);
                 }
@@ -1620,23 +1824,20 @@ impl AcpServer {
             }
 
             if !responses.is_empty() {
-                let json = serde_json::to_string(&responses).unwrap_or_default();
-                let _ = writer.write_all(json.as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
-                let _ = writer.flush().await;
+                control.send(Value::Array(responses)).await;
             }
-            for notif in &batch_notifications {
-                let _ = write_line(writer, notif).await;
+            for notif in batch_notifications {
+                control.send(notif).await;
             }
         } else {
             // Single request/notification
             let (resp, notifications) =
-                Self::dispatch_one(&value, state, sessions, llm, sync_table).await;
+                Self::dispatch_one(&value, state, sessions, llm, sync_table, control).await;
             if let Some(resp) = resp {
-                let _ = write_line(writer, &resp).await;
+                control.send(resp).await;
             }
-            for notif in &notifications {
-                let _ = write_line(writer, notif).await;
+            for notif in notifications {
+                control.send(notif).await;
             }
         }
     }
@@ -1649,6 +1850,7 @@ impl AcpServer {
         sessions: &mut AcpSessionManager,
         llm: Option<&Arc<dyn ChatProvider>>,
         sync_table: &HashMap<&'static str, SyncMethodHandler>,
+        control: &TurnControl,
     ) -> (Option<Value>, Vec<Value>) {
         // Try to parse as JsonRpcEnvelope; on failure, return parse error
         let env: JsonRpcEnvelope = match serde_json::from_value(item.clone()) {
@@ -1709,6 +1911,40 @@ impl AcpServer {
             }
         };
 
+        // `session/cancel` is dispatched BEFORE the missing-id early return
+        // below: the ACP spec sends it as a *notification*, and dropping
+        // notifications here is exactly what made a mid-turn Esc deadlock
+        // into "run to completion" (issue #179). The request form keeps its
+        // response; the notification form produces none but must still fire
+        // the token.
+        if method == "session/cancel" {
+            match *state {
+                ServerState::Uninitialized => {
+                    if let Some(id) = &env.id {
+                        return (
+                            Some(build_error(
+                                id,
+                                SERVER_NOT_INITIALIZED,
+                                "Server not initialized",
+                            )),
+                            vec![],
+                        );
+                    }
+                    return (None, vec![]);
+                }
+                ServerState::Initialized => {
+                    let id = env.id.clone().unwrap_or(Value::Null);
+                    let (resp, notifs) =
+                        handle_session_cancel(&id, env.params.as_ref(), sessions, control);
+                    if env.id.is_some() {
+                        return (resp, notifs);
+                    }
+                    // Notification form: no response, side effect applied.
+                    return (None, vec![]);
+                }
+            }
+        }
+
         // Notifications (no id): silently discard
         let id = match &env.id {
             Some(id) => id.clone(),
@@ -1765,16 +2001,31 @@ impl AcpServer {
         }
 
         // Fall through to async dispatch (session methods)
-        dispatch_async(method, &id, env.params.as_ref(), state, sessions, llm).await
+        dispatch_async(
+            method,
+            &id,
+            env.params.as_ref(),
+            state,
+            sessions,
+            llm,
+            control,
+        )
+        .await
     }
 
     /// Run the server on generic reader/writer (testable). Exits on EOF.
-    pub async fn run_io<R, W>(reader: R, mut writer: W, llm: Option<Arc<dyn ChatProvider>>)
+    ///
+    /// Issue #179: prompt turns are detached; on EOF the loop drains them
+    /// (without cancelling) so every started turn still delivers its
+    /// response before the writer task closes the transport.
+    pub async fn run_io<R, W>(reader: R, writer: W, llm: Option<Arc<dyn ChatProvider>>)
     where
-        R: tokio::io::AsyncBufRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let sync_table = build_sync_dispatch_table();
+        let (out, writer_task) = spawn_writer_task(writer);
+        let control = TurnControl::new(out);
         let mut lines = BufReader::new(reader).lines();
         let mut state = ServerState::Uninitialized;
         let mut sessions = AcpSessionManager::new();
@@ -1788,7 +2039,7 @@ impl AcpServer {
         } {
             Self::process_line(
                 &line,
-                &mut writer,
+                &control,
                 &mut state,
                 &mut sessions,
                 llm.as_ref(),
@@ -1797,6 +2048,11 @@ impl AcpServer {
             .await;
         }
 
+        for task in control.take_tasks() {
+            let _ = task.await;
+        }
+        drop(control);
+        let _ = writer_task.await;
         debug!("ACP stdin closed, server shutting down");
     }
 }
@@ -1844,11 +2100,36 @@ mod tests {
     }
 
     async fn run_server_with_llm(input: &str, llm: Option<Arc<dyn ChatProvider>>) -> Vec<String> {
-        let reader = std::io::Cursor::new(input.as_bytes().to_owned());
-        let mut output = Vec::<u8>::new();
-        AcpServer::run_io(reader, &mut output, llm).await;
-        let text = String::from_utf8(output).unwrap();
-        text.lines().map(|s| s.to_string()).collect()
+        run_io_collect(input, llm).await
+    }
+
+    /// Run the server on an in-memory duplex transport, return its output lines.
+    ///
+    /// The server runs as a task: the input is written, the write half is shut
+    /// down (EOF), and every frame the server emitted — including frames sent
+    /// by detached prompt turn tasks, which the EOF drain flushes before the
+    /// writer closes (#179) — is collected.
+    async fn run_io_collect(input: &str, llm: Option<Arc<dyn ChatProvider>>) -> Vec<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let (server_r, server_w) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move { AcpServer::run_io(server_r, server_w, llm).await });
+
+        client
+            .write_all(input.as_bytes())
+            .await
+            .expect("write input");
+        client.shutdown().await.expect("signal EOF");
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.expect("read output");
+        server.await.expect("server task");
+
+        String::from_utf8(buf)
+            .expect("output is UTF-8")
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Helper: parse stdout line at index as JSON Value.
@@ -2428,6 +2709,8 @@ mod tests {
         let mut lines = BufReader::new(reader).lines();
         let mut state = ServerState::Uninitialized;
         let mut output = Vec::<u8>::new();
+        let (out, _out_rx) = mpsc::channel::<Value>(128);
+        let control = TurnControl::new(out);
 
         while let Some(line) = lines.next_line().await.unwrap() {
             let line = line.trim().to_string();
@@ -2444,6 +2727,7 @@ mod tests {
                 &mut sessions,
                 Some(&multi_llm),
                 &sync_table,
+                &control,
             )
             .await;
             if let Some(resp) = resp {
@@ -2465,6 +2749,435 @@ mod tests {
             !session.cancel_token.is_cancelled(),
             "token after turn should be fresh (not cancelled)"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // issue #179: mid-turn session/cancel (notification + request form)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Provider whose LLM call parks until the turn's cancel token fires —
+    /// the "long streaming answer" of the issue. When disarmed, later calls
+    /// answer normally so the next turn can be asserted unaffected.
+    struct BlockingOnCancelProvider {
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockingOnCancelProvider {
+        fn armed() -> Arc<Self> {
+            Arc::new(Self {
+                armed: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+
+        fn disarm(&self) {
+            self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn is_armed(&self) -> bool {
+            self.armed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn plain_completion() -> crate::llm::Completion {
+            crate::llm::Completion {
+                content: "done".into(),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for BlockingOnCancelProvider {
+        async fn complete(
+            &self,
+            _messages: &[crate::message::Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> crate::error::Result<crate::llm::Completion> {
+            // The kernel wraps non-streaming calls in a select against the
+            // shutdown token (`run_core::complete_with_budget`), so parking
+            // here is enough: a fired token surfaces as `Error::Cancelled`
+            // mid-call instead of at the next step boundary.
+            if !self.is_armed() {
+                return Ok(Self::plain_completion());
+            }
+            std::future::pending::<()>().await;
+            unreachable!("parked LLM call must be cancelled, never completed");
+        }
+
+        async fn stream(
+            &self,
+            _messages: &[crate::message::Message],
+            _tools: &[crate::llm::ToolSpec],
+            stream_tx: Option<crate::llm::StreamSender>,
+            cancel_token: Option<tokio_util::sync::CancellationToken>,
+        ) -> crate::error::Result<crate::llm::Completion> {
+            if !self.is_armed() {
+                let completion = Self::plain_completion();
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(crate::llm::StreamChunk::Text(completion.content.clone()));
+                }
+                return Ok(completion);
+            }
+            // Mirror the real providers: select the SSE read against the
+            // cancel token so an in-flight stream aborts immediately.
+            if let Some(token) = cancel_token {
+                token.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            Err(crate::error::Error::Cancelled)
+        }
+    }
+
+    /// An interactive client half wired to a spawned `run_io` server: send
+    /// requests while previous turns are still running, read frames back.
+    struct InteractiveServer {
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    }
+
+    impl InteractiveServer {
+        /// Spawn `run_io` on a duplex pair and return the client half.
+        fn spawn(llm: Option<Arc<dyn ChatProvider>>) -> Self {
+            let (client, server_io) = tokio::io::duplex(64 * 1024);
+            let (server_r, server_w) = tokio::io::split(server_io);
+            tokio::spawn(async move {
+                AcpServer::run_io(server_r, server_w, llm).await;
+            });
+            let (reader, writer) = tokio::io::split(client);
+            Self {
+                writer,
+                lines: BufReader::new(reader).lines(),
+            }
+        }
+
+        async fn send(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            self.writer
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write request");
+            self.writer.flush().await.expect("flush request");
+        }
+
+        /// Next server frame, failing the test after 10s instead of hanging.
+        async fn next_frame(&mut self) -> Value {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.lines.next_line())
+                    .await
+                    .expect("frame within 10s")
+                    .expect("frame read")
+                    .expect("stream open");
+            serde_json::from_str(line.as_str())
+                .unwrap_or_else(|e| panic!("frame is complete JSON: {line:?} ({e})"))
+        }
+
+        /// Next response (a frame with the given id and no method).
+        async fn next_response_for(&mut self, id: u64) -> Value {
+            loop {
+                let frame = self.next_frame().await;
+                if frame.get("method").is_none() && frame.get("id") == Some(&Value::from(id)) {
+                    return frame;
+                }
+            }
+        }
+    }
+
+    /// Handshake helper shared by the #179 tests: initialize + session/new,
+    /// returning the session id.
+    async fn handshake(client: &mut InteractiveServer) -> String {
+        client
+            .send(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#,
+            )
+            .await;
+        let init = client.next_response_for(1).await;
+        assert!(init.get("result").is_some(), "initialize: {init}");
+        let new_session = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
+            json_path(std::path::Path::new("/tmp"))
+        );
+        client.send(&new_session).await;
+        let new = client.next_response_for(2).await;
+        new["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string()
+    }
+
+    /// Acceptance (issue #179): the spec's notification-form
+    /// `session/cancel` — no id — must interrupt a turn blocked in the LLM
+    /// stream, ending it with `stopReason: "cancelled"`. Before the fix the
+    /// notification was silently discarded and the turn ran to completion.
+    #[tokio::test]
+    async fn notification_cancel_interrupts_running_turn() {
+        let llm = BlockingOnCancelProvider::armed();
+        let mut client = InteractiveServer::spawn(Some(llm.clone() as Arc<dyn ChatProvider>));
+        let sid = handshake(&mut client).await;
+
+        // Start a turn that parks in the provider, then cancel it by
+        // notification — no id, per the ACP spec.
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{sid}","prompt":[{{"type":"text","text":"long answer please"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":"{sid}"}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+
+        let resp = client.next_response_for(3).await;
+        assert_eq!(
+            resp["result"]["stopReason"], "cancelled",
+            "a notification-form cancel must interrupt the in-flight turn: {resp}"
+        );
+    }
+
+    /// The request form (with id) keeps working and still interrupts.
+    #[tokio::test]
+    async fn request_form_cancel_still_works() {
+        let llm = BlockingOnCancelProvider::armed();
+        let mut client = InteractiveServer::spawn(Some(llm.clone() as Arc<dyn ChatProvider>));
+        let sid = handshake(&mut client).await;
+
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{sid}","prompt":[{{"type":"text","text":"long answer please"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":4,"method":"session/cancel","params":{{"sessionId":"{sid}"}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+
+        let cancel_resp = client.next_response_for(4).await;
+        assert_eq!(cancel_resp["result"], Value::Bool(true), "{cancel_resp}");
+        let resp = client.next_response_for(3).await;
+        assert_eq!(
+            resp["result"]["stopReason"], "cancelled",
+            "the request-form cancel must interrupt the turn: {resp}"
+        );
+    }
+
+    /// A cancel that lands between turns must not poison the next turn:
+    /// its token is fresh, so the follow-up prompt completes normally.
+    #[tokio::test]
+    async fn cancel_does_not_affect_next_turn() {
+        let llm = BlockingOnCancelProvider::armed();
+        let mut client = InteractiveServer::spawn(Some(llm.clone() as Arc<dyn ChatProvider>));
+        let sid = handshake(&mut client).await;
+
+        // Turn 1: interrupted by a notification cancel.
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{sid}","prompt":[{{"type":"text","text":"long answer please"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":"{sid}"}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        let resp = client.next_response_for(3).await;
+        assert_eq!(resp["result"]["stopReason"], "cancelled", "{resp}");
+
+        // A late stray cancel arrives after the turn has ended; then the
+        // provider is disarmed and turn 2 must run to normal completion.
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":"{sid}"}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        llm.disarm();
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{{"sessionId":"{sid}","prompt":[{{"type":"text","text":"short one"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        let resp = client.next_response_for(5).await;
+        assert_eq!(
+            resp["result"]["stopReason"], "end_turn",
+            "a stale cancel must not affect the next turn: {resp}"
+        );
+    }
+
+    /// Cancelling session B leaves session A's in-flight turn untouched.
+    #[tokio::test]
+    async fn cancel_for_other_session_is_noop() {
+        let llm = BlockingOnCancelProvider::armed();
+        let mut client = InteractiveServer::spawn(Some(llm.clone() as Arc<dyn ChatProvider>));
+        let sid_a = handshake(&mut client).await;
+        let new_b = format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"session/new","params":{{"cwd":{}}}}}"#,
+            json_path(std::path::Path::new("/tmp"))
+        );
+        client.send(&new_b).await;
+        let new_b_resp = client.next_response_for(20).await;
+        let sid_b = new_b_resp["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        // Start A's turn, then cancel B — a different session entirely.
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":21,"method":"session/prompt","params":{{"sessionId":"{sid_a}","prompt":[{{"type":"text","text":"long answer please"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":22,"method":"session/cancel","params":{{"sessionId":"{sid_b}"}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        let cancel_b = client.next_response_for(22).await;
+        assert_eq!(cancel_b["result"], Value::Bool(true), "{cancel_b}");
+
+        // A's turn must still be running: no response for it arrives.
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                let frame = client.next_frame().await;
+                if frame.get("method").is_none() && frame.get("id") == Some(&Value::from(21)) {
+                    return frame;
+                }
+            }
+        })
+        .await;
+        assert!(
+            leaked.is_err(),
+            "cancelling session B must not end session A's turn: {:?}",
+            leaked
+        );
+
+        // Positive control: cancelling A itself does end it.
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":23,"method":"session/cancel","params":{{"sessionId":"{sid_a}"}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        let resp = client.next_response_for(21).await;
+        assert_eq!(resp["result"]["stopReason"], "cancelled", "{resp}");
+    }
+
+    /// Two turns producing concurrently: the writer task serializes every
+    /// frame into a complete JSON line (the wire never interleaves).
+    #[tokio::test]
+    async fn concurrent_prompts_do_not_interleave_writer_frames() {
+        /// Provider whose first two calls wait for a gate before answering,
+        /// so the test can hold two turns in flight simultaneously.
+        struct GatedProvider {
+            gates: std::sync::Mutex<Vec<tokio::sync::oneshot::Receiver<()>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ChatProvider for GatedProvider {
+            async fn complete(
+                &self,
+                _messages: &[crate::message::Message],
+                _tools: &[crate::llm::ToolSpec],
+            ) -> crate::error::Result<crate::llm::Completion> {
+                let gate = self.gates.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                Ok(crate::llm::Completion {
+                    content: "gated answer".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let (gate_tx, gate_rx): (Vec<_>, Vec<_>) = (0..2)
+            .map(|_| tokio::sync::oneshot::channel::<()>())
+            .unzip();
+        let llm = Arc::new(GatedProvider {
+            gates: std::sync::Mutex::new(gate_rx),
+        });
+
+        let mut client = InteractiveServer::spawn(Some(llm.clone() as Arc<dyn ChatProvider>));
+        let sid_a = handshake(&mut client).await;
+        let new_b = format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"session/new","params":{{"cwd":{}}}}}"#,
+            json_path(std::path::Path::new("/tmp"))
+        );
+        client.send(&new_b).await;
+        let new_b_resp = client.next_response_for(20).await;
+        let sid_b = new_b_resp["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        // Two prompts in flight at once — possible only because the read
+        // loop no longer awaits the whole turn (#179).
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":30,"method":"session/prompt","params":{{"sessionId":"{sid_a}","prompt":[{{"type":"text","text":"a"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+        client
+            .send(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":31,"method":"session/prompt","params":{{"sessionId":"{sid_b}","prompt":[{{"type":"text","text":"b"}}]}}}}"#
+                )
+                .as_str(),
+            )
+            .await;
+
+        // Release both gates and read until both responses are seen; every
+        // frame must be a complete JSON value.
+        drop(gate_tx);
+        let mut seen = std::collections::HashSet::new();
+        while !seen.contains(&30) || !seen.contains(&31) {
+            let frame = client.next_frame().await;
+            if frame.get("method").is_none() {
+                if let Some(id) = frame.get("id").and_then(|v| v.as_u64()) {
+                    if id == 30 || id == 31 {
+                        assert!(seen.insert(id), "duplicate response for id {id}");
+                        assert_eq!(
+                            frame["result"]["stopReason"], "end_turn",
+                            "both turns must complete normally: {frame}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -2616,17 +3329,23 @@ mod tests {
     async fn idle_timeout_shuts_down_server_after_60s() {
         tokio::time::pause();
 
-        // Create a duplex pair. Keep the writer alive so the reader
-        // doesn't see EOF — it will block waiting for a line that
-        // never arrives. This simulates stdin with no input.
+        // Create a duplex pair for stdin. Keep the peer alive so the reader
+        // doesn't see EOF — it will block waiting for a line that never
+        // arrives. This simulates stdin with no input. The stdout side is a
+        // second duplex, drained by a task (issue #179: the writer task owns
+        // the transport's write end).
         let (reader, _writer) = tokio::io::duplex(64);
         let reader = tokio::io::BufReader::new(reader);
-        let mut output = Vec::<u8>::new();
-
-        let handle = tokio::spawn(async move {
-            AcpServer::run_stdio(reader, &mut output, None).await;
-            output
+        let (mut out_peer, out_server) = tokio::io::duplex(64 * 1024);
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = out_peer.read_to_end(&mut buf).await;
+            buf
         });
+
+        let handle =
+            tokio::spawn(async move { AcpServer::run_stdio(reader, out_server, None).await });
 
         // Let the spawned task start so it reaches the timeout call.
         tokio::task::yield_now().await;
@@ -2637,7 +3356,11 @@ mod tests {
         // The server task must complete within 500ms of real time.
         let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
         match result {
-            Ok(Ok(output)) => {
+            Ok(Ok(())) => {
+                let output = tokio::time::timeout(std::time::Duration::from_millis(500), drain)
+                    .await
+                    .expect("drain finishes once the writer closes")
+                    .expect("drain task");
                 assert!(
                     output.is_empty(),
                     "no output should be produced on idle timeout"
@@ -2660,12 +3383,10 @@ mod tests {
 
         let (reader, _writer) = tokio::io::duplex(64);
         let reader = tokio::io::BufReader::new(reader);
-        let mut output = Vec::<u8>::new();
+        let (_out_peer, out_server) = tokio::io::duplex(64 * 1024);
 
-        let handle = tokio::spawn(async move {
-            AcpServer::run_stdio(reader, &mut output, None).await;
-            output
-        });
+        let handle =
+            tokio::spawn(async move { AcpServer::run_stdio(reader, out_server, None).await });
 
         tokio::task::yield_now().await;
 
@@ -2694,22 +3415,32 @@ mod tests {
     async fn eof_shuts_down_server() {
         let (reader, writer) = tokio::io::duplex(64);
         let reader = tokio::io::BufReader::new(reader);
-        let mut output = Vec::<u8>::new();
-
-        let handle = tokio::spawn(async move {
-            AcpServer::run_stdio(reader, &mut output, None).await;
-            output
+        let (mut out_peer, out_server) = tokio::io::duplex(64 * 1024);
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = out_peer.read_to_end(&mut buf).await;
+            buf
         });
+
+        let handle =
+            tokio::spawn(async move { AcpServer::run_stdio(reader, out_server, None).await });
 
         // Close the write end → the server's `next_line()` sees EOF.
         drop(writer);
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
         match result {
-            Ok(Ok(output)) => assert!(
-                output.is_empty(),
-                "EOF is not a request, so no stdout output is expected"
-            ),
+            Ok(Ok(())) => {
+                let output = tokio::time::timeout(std::time::Duration::from_millis(500), drain)
+                    .await
+                    .expect("drain finishes once the writer closes")
+                    .expect("drain task");
+                assert!(
+                    output.is_empty(),
+                    "EOF is not a request, so no stdout output is expected"
+                );
+            }
             Ok(Err(join_err)) => panic!("server task panicked: {join_err}"),
             Err(_) => panic!("run_stdio must return after stdin EOF (#183)"),
         }
@@ -2726,12 +3457,10 @@ mod tests {
 
         let (reader, mut writer) = tokio::io::duplex(512);
         let reader = tokio::io::BufReader::new(reader);
-        let mut output = Vec::<u8>::new();
+        let (_out_peer, out_server) = tokio::io::duplex(64 * 1024);
 
-        let handle = tokio::spawn(async move {
-            AcpServer::run_stdio(reader, &mut output, None).await;
-            output
-        });
+        let handle =
+            tokio::spawn(async move { AcpServer::run_stdio(reader, out_server, None).await });
 
         tokio::task::yield_now().await;
 
@@ -2846,14 +3575,7 @@ mod tests {
 {{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
             cwd
         );
-        let reader1 = std::io::Cursor::new(phase1_input.as_bytes().to_owned());
-        let mut output1 = Vec::<u8>::new();
-        AcpServer::run_io(reader1, &mut output1, Some(mock_llm())).await;
-        let lines1: Vec<String> = String::from_utf8(output1)
-            .unwrap()
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
+        let lines1 = run_io_collect(&phase1_input, Some(mock_llm())).await;
         let sn_resp: Value = serde_json::from_str(&lines1[2]).unwrap();
         let sid = sn_resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -2864,14 +3586,7 @@ mod tests {
 {{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"hello"}}]}}}}"#,
             cwd, sid
         );
-        let reader2 = std::io::Cursor::new(phase2_input.as_bytes().to_owned());
-        let mut output2 = Vec::<u8>::new();
-        AcpServer::run_io(reader2, &mut output2, Some(mock_llm())).await;
-        let lines2: Vec<String> = String::from_utf8(output2)
-            .unwrap()
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
+        let lines2 = run_io_collect(&phase2_input, Some(mock_llm())).await;
 
         assert!(
             lines2.len() >= 4,
@@ -2927,10 +3642,7 @@ mod tests {
             cwd
         );
 
-        let reader = std::io::Cursor::new(input.as_bytes().to_owned());
-        let mut output = Vec::<u8>::new();
-        AcpServer::run_io(reader, &mut output, Some(echo_llm)).await;
-        let text = String::from_utf8(output).unwrap();
+        let text = run_io_collect(&input, Some(echo_llm)).await.join("\n");
         assert!(!text.is_empty());
     }
 
@@ -2946,10 +3658,7 @@ mod tests {
             cwd
         );
 
-        let reader = std::io::Cursor::new(input.as_bytes().to_owned());
-        let mut output = Vec::<u8>::new();
-        AcpServer::run_io(reader, &mut output, Some(mock_llm())).await;
-        let text = String::from_utf8(output).unwrap();
+        let text = run_io_collect(&input, Some(mock_llm())).await.join("\n");
         assert!(!text.is_empty());
         assert!(
             text.contains("Unsupported"),
@@ -3000,18 +3709,11 @@ mod tests {
 {{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
             cwd
         );
-        let reader1 = std::io::Cursor::new(phase1_input.as_bytes().to_owned());
-        let mut output1 = Vec::<u8>::new();
         let llm1 = mock_llm_multi(vec![crate::llm::Completion {
             content: "Nice to meet you, Alice!".into(),
             ..Default::default()
         }]);
-        AcpServer::run_io(reader1, &mut output1, Some(llm1)).await;
-        let lines1: Vec<String> = String::from_utf8(output1)
-            .unwrap()
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
+        let lines1: Vec<String> = run_io_collect(&phase1_input, Some(llm1)).await;
         let sn_resp: Value = serde_json::from_str(&lines1[2]).unwrap();
         let sid = sn_resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -3023,10 +3725,9 @@ mod tests {
 {{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{}","prompt":[{{"type":"text","text":"what is my name?"}}]}}}}"#,
             cwd, sid, sid
         );
-        let reader2 = std::io::Cursor::new(phase2_input.as_bytes().to_owned());
-        let mut output2 = Vec::<u8>::new();
-        AcpServer::run_io(reader2, &mut output2, Some(multi_llm)).await;
-        let text = String::from_utf8(output2).unwrap();
+        let text = run_io_collect(&phase2_input, Some(multi_llm))
+            .await
+            .join("\n");
         assert!(
             text.contains("Alice"),
             "second turn should retain context about Alice, got:\n{text}"

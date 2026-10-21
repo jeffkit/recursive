@@ -121,7 +121,11 @@ pub struct SummarizedContext {
 /// State for one active ACP session.
 pub struct AcpSession {
     /// The agent runtime that processes `session/prompt` requests.
-    pub runtime: AgentRuntime,
+    ///
+    /// Shared behind a Mutex so a prompt turn can run in its own task
+    /// (issue #179) while the read loop keeps consuming stdin; the same
+    /// shape as the HTTP server's `SessionState::runtime`.
+    pub runtime: Arc<tokio::sync::Mutex<AgentRuntime>>,
     /// The sandbox root for filesystem tools.
     pub cwd: PathBuf,
     /// Monotonically-increasing turn counter.
@@ -158,10 +162,13 @@ impl AcpSession {
     /// clone of the new token for the caller to hold.
     ///
     /// Must be called exactly once per turn, before `runtime.run()`.
-    pub fn refresh_cancel_token(&mut self) -> Arc<tokio_util::sync::CancellationToken> {
+    pub async fn refresh_cancel_token(&mut self) -> Arc<tokio_util::sync::CancellationToken> {
         let token = Arc::new(tokio_util::sync::CancellationToken::new());
         // CancellationToken is internally Arc-based and cheap to clone.
-        self.runtime.set_interrupt_token((*token).clone());
+        self.runtime
+            .lock()
+            .await
+            .set_interrupt_token((*token).clone());
         self.cancel_token = token.clone();
         token
     }
@@ -979,7 +986,7 @@ mod tests {
 
         {
             let _session = AcpSession {
-                runtime,
+                runtime: Arc::new(Mutex::new(runtime)),
                 cwd: PathBuf::from("/tmp"),
                 turn: 0,
                 session_id: "test".to_string(),
@@ -1017,7 +1024,7 @@ mod tests {
                 .build()
                 .expect("build runtime");
             let session = AcpSession {
-                runtime,
+                runtime: Arc::new(Mutex::new(runtime)),
                 cwd: PathBuf::from("/tmp"),
                 turn: 0,
                 session_id: sid.to_string(),
