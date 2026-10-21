@@ -74,7 +74,33 @@ impl SentinelInfo {
         let mut lines = text.lines();
         let pid: u32 = lines.next()?.trim().parse().ok()?;
         let hostname = lines.next()?.trim().to_string();
-        let started_at_unix: u64 = lines.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        // Issue #219 — a missing or non-numeric started_at silently dates
+        // the lock holder to the epoch, skewing every staleness judgement
+        // that reads this sentinel. Keep the 0 default (behaviour
+        // unchanged), but the degenerate value must be attributable.
+        let started_at_unix: u64 = match lines.next() {
+            Some(line) => match line.trim().parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        pid,
+                        hostname = %hostname,
+                        value = %line.trim(),
+                        error = %e,
+                        "sentinel started_at is not numeric; treating as 0"
+                    );
+                    0
+                }
+            },
+            None => {
+                tracing::warn!(
+                    pid,
+                    hostname = %hostname,
+                    "sentinel started_at line missing; treating as 0"
+                );
+                0
+            }
+        };
         Some(Self {
             pid,
             hostname,
@@ -447,6 +473,50 @@ mod tests {
         assert_eq!(restored.pid, 99);
         assert_eq!(restored.hostname, "box01");
         assert_eq!(restored.started_at_unix, 42);
+    }
+
+    // Issue #219 — the started_at fallback (0) stays, but a missing or
+    // non-numeric third line must be attributable from the log.
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn sentinel_missing_started_at_warns_but_keeps_zero() {
+        let text = "12345\nmyhostname\n";
+        let rec = SentinelInfo::parse(text).expect("pid+hostname must parse");
+        assert_eq!(rec.started_at_unix, 0, "behaviour unchanged: 0 fallback");
+        assert!(
+            logs_contain("sentinel started_at line missing"),
+            "the omission must be announced"
+        );
+        assert!(logs_contain("12345"), "the warning names the holder pid");
+        assert!(
+            logs_contain("myhostname"),
+            "the warning names the holder host"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn sentinel_non_numeric_started_at_warns_with_raw_value() {
+        let text = "12345\nmyhostname\nnot-a-number\n";
+        let rec = SentinelInfo::parse(text).expect("pid+hostname must parse");
+        assert_eq!(rec.started_at_unix, 0, "behaviour unchanged: 0 fallback");
+        assert!(logs_contain("started_at is not numeric"));
+        assert!(
+            logs_contain("not-a-number"),
+            "the warning carries the raw value"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn sentinel_valid_started_at_does_not_warn() {
+        let rec = SentinelInfo::parse("1\nh\n1700000000\n").expect("must parse");
+        assert_eq!(rec.started_at_unix, 1_700_000_000);
+        assert!(
+            !logs_contain("started_at"),
+            "a well-formed sentinel is silent"
+        );
     }
 
     #[test]

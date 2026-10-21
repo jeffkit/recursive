@@ -305,6 +305,16 @@ impl ShadowRepo {
             .map_err(git_err)?;
 
         if !log_out.status.success() {
+            // Issue #219 — a broken shadow repo used to be indistinguishable
+            // from "this session never checkpointed". Keep the empty-list
+            // fallback (behaviour unchanged), but the history loss must be
+            // attributable from the log.
+            tracing::warn!(
+                session_id,
+                status = %log_out.status,
+                stderr = %String::from_utf8_lossy(&log_out.stderr).trim(),
+                "checkpoint list: git log failed; returning empty history"
+            );
             return Ok(vec![]);
         }
         let stdout = String::from_utf8_lossy(&log_out.stdout);
@@ -317,7 +327,7 @@ impl ShadowRepo {
                 continue;
             }
             let full_sha = parts[0].to_string();
-            let timestamp: i64 = parts[1].parse().unwrap_or(0);
+            let timestamp = log_timestamp(session_id, &full_sha, parts[1]);
             let msg = parts[2].to_string();
 
             let files_changed = if i + 1 < lines.len() {
@@ -730,6 +740,26 @@ const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 #[cfg_attr(test, mutants::skip)]
 fn log_line_incomplete(field_count: usize) -> bool {
     field_count < 3
+}
+
+/// Issue #219 — `%ct` is git-generated, so a non-numeric timestamp means a
+/// corrupted/wrongly-written ref chain rather than a benign default. Keep
+/// the 0 fallback (list ordering stays deterministic), but the raw value
+/// must be recoverable from the log. Free fn so tests can drive both arms.
+fn log_timestamp(session_id: &str, full_sha: &str, raw: &str) -> i64 {
+    match raw.trim().parse::<i64>() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                session_id,
+                sha = %full_sha,
+                value = %raw,
+                error = %e,
+                "checkpoint commit timestamp is not numeric; treating as 0"
+            );
+            0
+        }
+    }
 }
 
 /// Match git's "path missing from tree" stderr phrases.
@@ -1345,6 +1375,90 @@ mod tests {
             list[1].timestamp
         );
         let _ = (c1, c2); // suppress unused warnings
+    }
+
+    // Issue #219 — the 0 / empty fallbacks stay (behaviour unchanged), but
+    // a corrupted history must be attributable from the log.
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_timestamp_non_numeric_warns_with_raw_value() {
+        assert_eq!(
+            log_timestamp("sess", "abc123def4567890", "not-a-number"),
+            0,
+            "behaviour unchanged: 0 fallback"
+        );
+        assert!(
+            logs_contain("timestamp is not numeric"),
+            "the corruption must be announced"
+        );
+        assert!(
+            logs_contain("not-a-number"),
+            "the warning carries the raw value"
+        );
+        assert!(
+            logs_contain("abc123def4567890"),
+            "the warning names the commit"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_timestamp_valid_does_not_warn() {
+        assert_eq!(
+            log_timestamp("sess", "abc123def4567890", "1770000000"),
+            1_770_000_000
+        );
+        assert!(
+            !logs_contain("timestamp is not numeric"),
+            "a well-formed timestamp is silent"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn list_for_session_git_log_failure_warns_and_returns_empty() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+
+        fs::write(w.path().join("f.txt"), "v1").unwrap();
+        let c1 = r.snapshot_for_session("sess", "turn-0").unwrap();
+        fs::write(w.path().join("f.txt"), "v2").unwrap();
+        let _c2 = r.snapshot_for_session("sess", "turn-1").unwrap();
+
+        // Corrupt the shadow repo: delete the root commit's loose object so
+        // the session head still verifies but `git log` cannot walk history.
+        let out = git_cmd()
+            .env("GIT_DIR", w.shadow_dir())
+            .args(["rev-parse", &format!("{}^{{commit}}", c1.0)])
+            .output()
+            .expect("rev-parse runs");
+        assert!(
+            out.status.success(),
+            "parent commit resolves before corruption"
+        );
+        let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let obj = w
+            .shadow_dir()
+            .join("objects")
+            .join(&full[..2])
+            .join(&full[2..]);
+        assert!(obj.exists(), "root commit must be a loose object");
+        fs::remove_file(&obj).unwrap();
+
+        let list = r.list_for_session("sess").unwrap();
+        assert!(
+            list.is_empty(),
+            "history loss degrades to empty (behaviour unchanged)"
+        );
+        assert!(
+            logs_contain("git log failed"),
+            "the history loss must be announced"
+        );
+        assert!(logs_contain("sess"), "the warning names the session");
     }
 
     #[test]

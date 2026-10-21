@@ -504,10 +504,26 @@ impl SessionIndex {
             let session_id: String = row.get(0)?;
             let index: String = row.get(1)?;
             let content: String = row.get(6)?;
+            // Issue #219 — a non-numeric entry_index silently sorts as 0 and
+            // falls inside every `from..=to` window. Keep the 0 (behaviour
+            // unchanged), but the corrupted row must be identifiable from
+            // the log.
+            let index_num = match index.parse::<usize>() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        entry_index = %index,
+                        error = %e,
+                        "index entry_index is not numeric; treating as 0"
+                    );
+                    0
+                }
+            };
             Ok(EventHit {
                 active: false,
                 session_id,
-                index: index.parse().unwrap_or(0),
+                index: index_num,
                 entry_id: row.get(2)?,
                 role: row.get(3)?,
                 tool_name: row.get(4)?,
@@ -628,8 +644,22 @@ impl SessionIndex {
             rusqlite::params![session_id, from as i64, to as i64],
             |row| {
                 let index: String = row.get(0)?;
+                // Issue #219 — same corrupted-row announcement as `search`:
+                // 0 would silently re-enter any read window.
+                let index_num = match index.parse::<usize>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id,
+                            entry_index = %index,
+                            error = %e,
+                            "index entry_index is not numeric; treating as 0"
+                        );
+                        0
+                    }
+                };
                 Ok(StoredEvent {
-                    index: index.parse().unwrap_or(0),
+                    index: index_num,
                     entry_id: row.get(1)?,
                     role: row.get(2)?,
                     tool_name: row.get(3)?,
@@ -897,6 +927,56 @@ mod tests {
 
     fn open_index(ws: &Path) -> SessionIndex {
         SessionIndex::open(ws).expect("index opens")
+    }
+
+    /// Seed an FTS row whose `entry_index` is not numeric (issue #219's
+    /// corrupted-row shape; production rows always carry a digit string).
+    fn insert_corrupt_index_row(conn: &Connection, session_id: &str, content: &str) {
+        conn.execute(
+            "INSERT INTO events(session_id, entry_index, entry_id, role, tool_name, timestamp, content)
+             VALUES (?1, 'oops', 'entry-1', 'user', NULL, '2026-01-01T00:00:00Z', ?2)",
+            rusqlite::params![session_id, content],
+        )
+        .expect("corrupt row seeds");
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn read_events_corrupt_entry_index_warns_but_keeps_row() {
+        let env = IsolatedWorkspace::new();
+        let index = open_index(env.path());
+        insert_corrupt_index_row(&index.conn, "sess-corrupt", "corrupt-read-body");
+
+        let events = index.read_events("sess-corrupt", 0, 10).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the row stays in the window (behaviour unchanged)"
+        );
+        assert_eq!(events[0].index, 0, "0 fallback preserved");
+        assert!(
+            logs_contain("entry_index is not numeric"),
+            "the corruption must be announced"
+        );
+        assert!(logs_contain("oops"), "the warning carries the raw value");
+        assert!(
+            logs_contain("sess-corrupt"),
+            "the warning names the session"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn search_corrupt_entry_index_warns_but_keeps_hit() {
+        let env = IsolatedWorkspace::new();
+        let index = open_index(env.path());
+        insert_corrupt_index_row(&index.conn, "sess-corrupt", "corrupt-search-body");
+
+        let hits = index.search_events("corrupt", 10, None).unwrap();
+        assert_eq!(hits.len(), 1, "the hit stays (behaviour unchanged)");
+        assert_eq!(hits[0].index, 0, "0 fallback preserved");
+        assert!(logs_contain("entry_index is not numeric"));
+        assert!(logs_contain("oops"));
     }
 
     #[test]

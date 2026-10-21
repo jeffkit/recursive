@@ -721,6 +721,28 @@ impl AnthropicProvider {
     fn build_completion(acc: SseAccum, finish_reason: Option<String>) -> Completion {
         // Build final TokenUsage from accumulated fields
         let usage = if acc.input_tokens.is_some() || acc.output_tokens.is_some() {
+            // Issue #219 — a usage object with a token field missing means
+            // the 0 fallback below silently undercounts tokens and cost.
+            // Field-absence inside an otherwise-present usage is malformed
+            // for this API (message_start always carries input_tokens,
+            // message_delta always carries output_tokens); the cache fields
+            // stay exempt — they are legitimately absent without caching.
+            if acc.input_tokens.is_none() {
+                tracing::warn!(
+                    target: "recursive::llm",
+                    field = "input_tokens",
+                    frame = "message_start",
+                    "anthropic usage field missing; counting 0"
+                );
+            }
+            if acc.output_tokens.is_none() {
+                tracing::warn!(
+                    target: "recursive::llm",
+                    field = "output_tokens",
+                    frame = "message_delta",
+                    "anthropic usage field missing; counting 0"
+                );
+            }
             let prompt = acc.input_tokens.unwrap_or(0);
             let completion = acc.output_tokens.unwrap_or(0);
             Some(TokenUsage {
@@ -1423,6 +1445,26 @@ struct AnthropicUsage {
 
 impl AnthropicUsage {
     fn to_token_usage(&self) -> TokenUsage {
+        // Issue #219 — the non-streaming message shape makes both token
+        // fields mandatory, so a `usage` object without one is malformed
+        // and would silently undercount. Keep the 0 fallback (billing
+        // behaviour untouched; normalization is issue #193's), but make
+        // the omission observable. An entirely absent `usage` object
+        // stays silent — that is the legal-default case.
+        if self.input_tokens.is_none() {
+            tracing::warn!(
+                target: "recursive::llm",
+                field = "input_tokens",
+                "anthropic usage field missing in non-streaming response; counting 0"
+            );
+        }
+        if self.output_tokens.is_none() {
+            tracing::warn!(
+                target: "recursive::llm",
+                field = "output_tokens",
+                "anthropic usage field missing in non-streaming response; counting 0"
+            );
+        }
         let prompt = self.input_tokens.unwrap_or(0);
         TokenUsage {
             reasoning_tokens: 0,
@@ -1763,6 +1805,174 @@ mod tests {
         assert_eq!(content["type"], "tool_result");
         assert_eq!(content["tool_use_id"], "call_123");
         assert_eq!(content["content"], "result content");
+    }
+
+    // Issue #219 — a usage object with a token field missing assembles 0s
+    // (billing behaviour untouched; normalization is issue #193's) but the
+    // omission must be observable. Legal absence — no usage object at all,
+    // or present 0 values — stays silent.
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn nonstreaming_usage_missing_fields_warn_but_keep_zero_fallback() {
+        let raw = r#"{
+            "type": "message",
+            "content": [{"type": "text", "text": "Hello"}],
+            "stop_reason": "end_turn",
+            "usage": {}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed);
+        let u = c.usage.expect("usage object present → usage assembled");
+        assert_eq!(u.prompt_tokens, 0, "behaviour unchanged: 0 fallback");
+        assert_eq!(u.completion_tokens, 0);
+        assert!(logs_contain("anthropic usage field missing"));
+        assert!(logs_contain("input_tokens"));
+        assert!(logs_contain("output_tokens"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn nonstreaming_usage_present_zero_values_do_not_warn() {
+        let raw = r#"{
+            "type": "message",
+            "content": [{"type": "text", "text": "Hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed);
+        let u = c.usage.unwrap();
+        assert_eq!(u.prompt_tokens, 0);
+        assert_eq!(u.completion_tokens, 0);
+        assert!(
+            !logs_contain("anthropic usage field missing"),
+            "present 0 values are legal — no warning noise"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn nonstreaming_usage_entirely_absent_stays_silent() {
+        let raw = r#"{
+            "type": "message",
+            "content": [{"type": "text", "text": "Hello"}],
+            "stop_reason": "end_turn"
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(raw).unwrap();
+        let c = parse_completion(parsed);
+        assert!(c.usage.is_none(), "no usage object → no usage (unchanged)");
+        assert!(
+            !logs_contain("anthropic usage field missing"),
+            "an absent usage object is the legal-default case"
+        );
+    }
+
+    /// Drive `process_sse_line` with a usage-bearing frame sequence.
+    fn stream_usage_frames(start_usage: &str, delta_usage: Option<&str>) -> Completion {
+        let provider = AnthropicProvider::new("http://127.0.0.1:9", "key", "claude-3").unwrap();
+        let mut acc = SseAccum::default();
+        provider
+            .process_sse_line("event: message_start", &mut acc, &None)
+            .unwrap();
+        provider
+            .process_sse_line(
+                &format!(
+                    r#"data: {{"type":"message_start","message":{{"id":"m","usage":{start_usage}}}}}"#
+                ),
+                &mut acc,
+                &None,
+            )
+            .unwrap();
+        if let Some(u) = delta_usage {
+            provider
+                .process_sse_line("event: message_delta", &mut acc, &None)
+                .unwrap();
+            provider
+                .process_sse_line(
+                    &format!(
+                        r#"data: {{"type":"message_delta","delta":{{"stop_reason":"end_turn"}},"usage":{u}}}"#
+                    ),
+                    &mut acc,
+                    &None,
+                )
+                .unwrap();
+        }
+        AnthropicProvider::build_completion(acc, Some("end_turn".to_string()))
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn streaming_missing_input_tokens_warns_with_frame_hint() {
+        // message_start's usage object omits input_tokens entirely (cache
+        // fields are legitimately optional and stay warning-free).
+        let c = stream_usage_frames(
+            r#"{"cache_read_input_tokens":3}"#,
+            Some(r#"{"output_tokens":5}"#),
+        );
+        let u = c.usage.expect("output_tokens present → usage assembled");
+        assert_eq!(u.prompt_tokens, 0, "behaviour unchanged: 0 fallback");
+        assert_eq!(u.completion_tokens, 5);
+        assert_eq!(u.cache_hit_tokens, 3, "cache fields stay warning-free");
+        assert!(logs_contain("anthropic usage field missing"));
+        assert!(logs_contain("input_tokens"));
+        assert!(logs_contain("message_start"));
+        assert!(
+            !logs_contain("output_tokens"),
+            "output_tokens was reported — only input_tokens warns"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn streaming_missing_output_tokens_warns_with_frame_hint() {
+        // No message_delta usage frame at all: output_tokens never arrives.
+        let c = stream_usage_frames(r#"{"input_tokens":10}"#, None);
+        let u = c.usage.expect("input_tokens present → usage assembled");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 0, "behaviour unchanged: 0 fallback");
+        assert!(logs_contain("anthropic usage field missing"));
+        assert!(logs_contain("output_tokens"));
+        assert!(logs_contain("message_delta"));
+        assert!(
+            !logs_contain("input_tokens"),
+            "input_tokens was reported — only output_tokens warns"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn streaming_legal_zero_input_tokens_does_not_warn() {
+        // GLM-compatible surfaces report input_tokens=0 in message_start
+        // and re-report the real input in message_delta. Both fields are
+        // *present* — no warning noise on this path.
+        let c = stream_usage_frames(
+            r#"{"input_tokens":0}"#,
+            Some(r#"{"output_tokens":5,"input_tokens":42}"#),
+        );
+        let u = c.usage.unwrap();
+        assert_eq!(
+            u.prompt_tokens, 42,
+            "delta override wins (existing behaviour)"
+        );
+        assert_eq!(u.completion_tokens, 5);
+        assert!(
+            !logs_contain("anthropic usage field missing"),
+            "present fields never warn"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn streaming_usage_entirely_absent_stays_silent() {
+        // No token field ever arrives → usage stays None (unchanged), and
+        // nothing is assembled so there is nothing to warn about.
+        let c = stream_usage_frames(r#"{"cache_read_input_tokens":1}"#, None);
+        assert!(c.usage.is_none(), "no token field → no usage (unchanged)");
+        assert!(
+            !logs_contain("anthropic usage field missing"),
+            "an absent usage is the legal-default case"
+        );
     }
 
     #[test]
