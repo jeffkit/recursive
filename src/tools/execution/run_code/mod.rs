@@ -261,6 +261,30 @@ mod tests {
         }
     }
 
+    /// A binding that stays pending long enough for the runtime to exit
+    /// mid-call — the issue #218 regression harness.
+    struct Slow(Duration);
+
+    #[async_trait]
+    impl Tool for Slow {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "Slow".into(),
+                description: "Resolve after a fixed delay".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(&self, _arguments: Value) -> Result<String> {
+            tokio::time::sleep(self.0).await;
+            Ok("slow".into())
+        }
+
+        fn side_effect_class(&self) -> ToolSideEffect {
+            ToolSideEffect::ReadOnly
+        }
+    }
+
     fn registry_with(tool: Arc<dyn Tool>) -> ToolRegistry {
         ToolRegistry::local().register(tool)
     }
@@ -421,6 +445,32 @@ return "recovered";
         assert!(out.contains("status=ok"), "{out}");
         assert!(out.contains("caught:"), "{out}");
         assert!(out.contains("recovered"), "{out}");
+    }
+
+    /// Issue #218: a runtime that exits while a call-result is still being
+    /// written back must not swallow the failure — the write error is
+    /// classified `protocol` and names the call, instead of surfacing as a
+    /// bare `worker-exit` while the program side waits for a result that can
+    /// never arrive.
+    #[tokio::test]
+    async fn a_lost_call_result_write_is_reported_as_protocol_error() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let tool = RunCode::new(registry_with(Arc::new(Slow(Duration::from_millis(400)))));
+        // The runtime issues the call, then exits before the result can be
+        // written back: the host's write lands on a dead pipe.
+        let code = r#"
+setTimeout(() => process.exit(7), 30);
+return await Slow();
+"#;
+        let out = tool.execute(json!({ "code": code })).await.unwrap();
+        assert!(out.contains("status=protocol"), "{out}");
+        assert!(
+            out.contains("writing call-result 1 to runtime stdin failed"),
+            "{out}"
+        );
     }
 
     /// Acceptance (#134): the wall-clock budget trips and is classified

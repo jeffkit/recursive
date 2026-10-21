@@ -224,6 +224,17 @@ async fn wait_abort(token: Option<CancellationToken>) {
     }
 }
 
+/// A lost call-result must stay observable (issue #218): every write failure
+/// warns, and the first one is kept in `slot` so the run can be classified
+/// `protocol` with the call id in its detail once the write tasks are joined.
+async fn record_stdin_write_failure(slot: &Mutex<Option<String>>, message: String) {
+    tracing::warn!("{message}");
+    let mut guard = slot.lock().await;
+    if guard.is_none() {
+        *guard = Some(message);
+    }
+}
+
 fn unavailable_report(sandbox: SandboxFacts, started: Instant, detail: &str) -> RunReport {
     RunReport {
         failure: Some(RunCodeFailure::SandboxUnavailable),
@@ -309,6 +320,8 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
     let mut aborted = false;
 
     let stdin = Arc::new(Mutex::new(child.stdin.take()));
+    let stdin_write_error = Arc::new(Mutex::new(None::<String>));
+    let mut result_write_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     {
         let mut guard = stdin.lock().await;
         if let Some(handle) = guard.as_mut() {
@@ -383,7 +396,8 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
                                     calls += 1;
                                     let invoker = invoker.clone();
                                     let stdin = stdin.clone();
-                                    tokio::spawn(async move {
+                                    let stdin_write_error = stdin_write_error.clone();
+                                    result_write_tasks.push(tokio::spawn(async move {
                                         let message = match invoker.invoke(&tool, args).await {
                                             Ok(value) => json!({
                                                 "t": "call-result", "id": id, "ok": true, "value": value
@@ -395,11 +409,42 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
                                         };
                                         let line = format!("{message}\n");
                                         let mut guard = stdin.lock().await;
-                                        if let Some(handle) = guard.as_mut() {
-                                            let _ = handle.write_all(line.as_bytes()).await;
-                                            let _ = handle.flush().await;
+                                        match guard.as_mut() {
+                                            Some(handle) => {
+                                                if let Err(err) =
+                                                    handle.write_all(line.as_bytes()).await
+                                                {
+                                                    record_stdin_write_failure(
+                                                        &stdin_write_error,
+                                                        format!(
+                                                            "writing call-result {id} to \
+                                                             runtime stdin failed: {err}"
+                                                        ),
+                                                    )
+                                                    .await;
+                                                } else if let Err(err) = handle.flush().await {
+                                                    record_stdin_write_failure(
+                                                        &stdin_write_error,
+                                                        format!(
+                                                            "flushing call-result {id} to \
+                                                             runtime stdin failed: {err}"
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            None => {
+                                                record_stdin_write_failure(
+                                                    &stdin_write_error,
+                                                    format!(
+                                                        "runtime stdin was not available for \
+                                                         call-result {id}"
+                                                    ),
+                                                )
+                                                .await;
+                                            }
                                         }
-                                    });
+                                    }));
                                 }
                                 Err(err) => {
                                     protocol_error = Some(format!(
@@ -450,6 +495,24 @@ pub async fn run_program(req: RunProgramRequest) -> RunReport {
         },
         None => String::new(),
     };
+
+    // Issue #218: the runtime is reaped by now, so outstanding call-result
+    // writes fail fast; the shared grace only bounds an `invoke` still in
+    // flight. A recorded write failure then reclassifies the run as
+    // `protocol` — unless a stdout-side protocol error already explains it.
+    let write_grace = tokio::time::sleep(REAP_GRACE);
+    tokio::pin!(write_grace);
+    for mut task in result_write_tasks {
+        tokio::select! {
+            _ = &mut task => {}
+            _ = &mut write_grace => task.abort(),
+        }
+    }
+    if protocol_error.is_none() {
+        if let Some(message) = stdin_write_error.lock().await.take() {
+            protocol_error = Some(message);
+        }
+    }
 
     // The completion value shares the run's output budget with the log lines:
     // `render` prints both, so letting the value through unbounded (or even at
