@@ -1789,6 +1789,15 @@ mod tests {
         );
     }
 
+    // windows（#224）：夹具以普通文件冒充 session 目录，remove_file("<file>/.interrupts.json")
+    // 在 unix 报 ENOTDIR（非 NotFound → Err），windows 报 ERROR_PATH_NOT_FOUND → 映射为
+    // io::ErrorKind::NotFound，正落进 clear_open_interrupts「文件不存在=良性 no-op」分支返
+    // Ok——注入的失败在 windows 与「未持久化」不可区分。同夹具的 save_* 姐妹测试 windows
+    // 绿，因 save 无 NotFound 折叠。产品 NotFound 折叠是平台语义差异，本单不改。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: a file standing in for the session dir yields ERROR_PATH_NOT_FOUND -> io::ErrorKind::NotFound on windows (unix: ENOTDIR), which clear_open_interrupts treats as the benign absent-file no-op"
+    )]
     #[tracing_test::traced_test]
     #[test]
     fn clear_open_interrupts_failure_is_announced_with_path_and_error() {

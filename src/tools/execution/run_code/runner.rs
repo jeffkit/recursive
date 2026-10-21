@@ -1317,6 +1317,13 @@ exit 0
     /// permission flags — fs writes confined to the scratch dir, process
     /// spawning and workers denied, reads limited to the read root. The shim
     /// records its spawn argv; the assertion reads them back.
+    // windows（#224）：夹具 runtime shim 是 #!/bin/sh 脚本，CreateProcess 不认 shebang
+    //（os error 193 "%1 is not a valid Win32 application"），权限探针在 exec 即失败 →
+    // SandboxUnavailable 而非 None。sh 在 windows 无等价；解除条件：shim 改为 .cmd/.exe。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: the sh-script runtime shim is not a Win32 executable (os error 193); the permission probe fails at exec, not at the flag"
+    )]
     #[tokio::test]
     async fn runtime_launches_with_permission_flags() {
         let tmp = std::env::temp_dir().join(format!("ptc-shim-{}", std::process::id()));
@@ -1372,6 +1379,13 @@ exit 0
     /// Headline (#134 W1): a runtime without a permission model is rejected
     /// loudly — `sandbox-unavailable`, with the probe's concrete reason in
     /// the detail. Never a silent fall-back to an unsandboxed run.
+    // windows（#224）：同上 sh shim 不可执行——探针在 exec 失败（os error 193）而非被 shim
+    // 拒绝，detail 点名最后尝试的 --experimental-permission 而非 --permission，子串断言红；
+    // SandboxUnavailable 分类本身在 windows 仍成立。解除条件：shim 改为 .cmd/.exe。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: the sh-script runtime shim is not a Win32 executable (os error 193); the detail names the exec failure, not the rejected --permission flag"
+    )]
     #[tokio::test]
     async fn unsupported_runtime_is_rejected_loudly() {
         let tmp = std::env::temp_dir().join(format!("ptc-shim-unsup-{}", std::process::id()));
@@ -1501,6 +1515,13 @@ return process.cwd();"#
     /// Headline (#134 W1): a scratch volume below the free-space floor is
     /// rejected BEFORE spawn — `sandbox-unavailable` with the volume path and
     /// the measured free space, and no runtime process is ever started.
+    // windows（#224）：scratch_volume_free_bytes 是 cfg(unix) libc::statfs，cfg(not(unix))
+    // 版本返 None（WARN "could not be probed; proceeding without a disk check"）——低磁盘
+    // 拒绝在 windows 不可能触发（failure=None）。statfs 无等价接入是设计，事实串如实标注。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: no statfs free-space probe on windows (cfg(not(unix)) returns None), so the low-disk rejection cannot trigger"
+    )]
     #[tokio::test]
     async fn low_disk_rejects_before_spawn() {
         let node = match super::locate_node() {
@@ -1580,6 +1601,13 @@ return process.cwd();"#
 
     /// The facts never claim an unenforced limit: Linux states enforcement,
     /// kernels that refuse RLIMIT_AS state exactly that.
+    // windows（#224）：address_space_guard_fact 的 cfg(not(unix)) 版本返
+    // "rlimit_as=not-probed(platform)"；本测试 else 分支编码的是 unix 非 linux（macOS）的
+    // "not-enforced-by-kernel"。windows 无 setrlimit/RLIMIT_AS 等价。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: windows has no RLIMIT_AS; the cfg(not(unix)) fact is 'not-probed(platform)', not the unix 'not-enforced-by-kernel' this test's else branch encodes"
+    )]
     #[test]
     fn resource_guard_fact_matches_the_enforcement_completeness() {
         let fact = address_space_guard_fact(512);
