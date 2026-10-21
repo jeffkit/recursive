@@ -159,7 +159,22 @@ impl SqliteVecStore {
     }
 
     fn row_to_entry(id: String, text: String, tags_json: String, ts: String) -> MemoryEntry {
-        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let tags: Vec<String> = match serde_json::from_str(&tags_json) {
+            Ok(tags) => tags,
+            Err(e) => {
+                // Issue #216: a corrupt tags column must not silently drop
+                // the entry from tag-filtered recall — degrade to no tags,
+                // loudly.
+                tracing::warn!(
+                    entry_id = %id,
+                    raw = %crate::truncate_str(&tags_json, 80),
+                    error = %e,
+                    "memory row has corrupt tags JSON; tag-filtered recall \
+                     will miss this entry"
+                );
+                Vec::new()
+            }
+        };
         MemoryEntry { id, text, tags, ts }
     }
 }
@@ -432,6 +447,76 @@ mod tests {
             "2026-01-01T00:00:00Z".into(),
         );
         assert_eq!(entry.tags, vec!["alpha", "beta"]);
+    }
+
+    /// Issue #216: the empty-tags fallback for a corrupt tags column must
+    /// stay observable — the WARN carries the entry id, the raw value prefix
+    /// and the parse error.
+    #[tracing_test::traced_test]
+    #[test]
+    fn row_to_entry_warns_when_tags_json_is_corrupt() {
+        let entry = SqliteVecStore::row_to_entry(
+            "E9".into(),
+            "text".into(),
+            "not valid json ][".into(),
+            "2026-01-01T00:00:00Z".into(),
+        );
+        assert!(entry.tags.is_empty(), "behaviour unchanged: empty tags");
+
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("corrupt tags JSON") && l.contains("E9"))
+                .ok_or_else(|| "expected a WARN naming the corrupt entry".to_string())?;
+            if !line.contains("WARN") {
+                return Err(format!("the degrade must be logged at WARN, got: {line}"));
+            }
+            if !line.contains("not valid json") {
+                return Err(format!("the WARN must carry the raw value, got: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// End-to-end: a row whose tags column is corrupt still comes back from a
+    /// keyword search (text recall is not lost, tags degrade to empty) — only
+    /// tag-filtered recall misses it.
+    #[tokio::test]
+    async fn sqlite_store_returns_a_row_with_a_corrupt_tags_column() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteVecStore::open(dir.path().join("test.db")).unwrap();
+        store
+            .with_conn(|conn| {
+                // Direct SQL insert bypassing upsert: simulate a tags column
+                // corrupted outside this process.
+                conn.execute(
+                    "INSERT INTO memory_entries (id, text, tags, ts, embedding)
+                     VALUES (?1, ?2, ?3, ?4, NULL)",
+                    rusqlite::params![
+                        "E-corrupt",
+                        "recoverable note",
+                        "{not json",
+                        "2026-01-01T00:00:00Z"
+                    ],
+                )
+                .map_err(|e| storage_err(e.to_string()))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let results = store.search(vec![], "recoverable", None, 5).await.unwrap();
+        assert_eq!(results.len(), 1, "text recall must survive corrupt tags");
+        assert!(
+            results[0].tags.is_empty(),
+            "corrupt tags degrade to empty: {:?}",
+            results[0].tags
+        );
+        // The documented degradation: tag-filtered recall misses the entry.
+        let tagged = store
+            .search(vec![], "recoverable", Some("work"), 5)
+            .await
+            .unwrap();
+        assert!(tagged.is_empty());
     }
 
     /// Entries stored with a different embedding dimension than the query vector

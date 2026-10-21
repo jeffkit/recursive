@@ -536,13 +536,32 @@ pub fn load_facts(workspace: &std::path::Path, scope: &str) -> Result<FactStore>
     FactStore::load(&path)
 }
 
+/// Load a facts scope for prompt injection. A missing file is a legal empty
+/// ([`FactStore::load`] folds it into an empty store), but a read or parse
+/// failure must not silently masquerade as one — the prompt would lose every
+/// persisted fact with no trace (issue #216). Degrade to empty, loudly.
+fn load_facts_for_prompt(workspace: &std::path::Path, scope: &str) -> FactStore {
+    match load_facts(workspace, scope) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(
+                path = %facts_path(workspace, scope).display(),
+                error = %e,
+                "facts store unreadable; the prompt facts block degrades to empty"
+            );
+            FactStore::default()
+        }
+    }
+}
+
 /// Build a facts summary string for injection into the system prompt.
 /// Merges workspace-scoped and global-scoped facts, then returns the top N
 /// most recently accessed facts as a formatted block.
 pub fn facts_summary(workspace: &std::path::Path, limit: usize) -> String {
-    // Load both scopes; silently ignore missing files.
-    let workspace_store = load_facts(workspace, "workspace").unwrap_or_default();
-    let global_store = load_facts(workspace, "global").unwrap_or_default();
+    // Load both scopes; missing files are a legal empty, other failures
+    // degrade loudly (issue #216).
+    let workspace_store = load_facts_for_prompt(workspace, "workspace");
+    let global_store = load_facts_for_prompt(workspace, "global");
 
     // Merge active facts from both scopes; global facts come first so that
     // user-identity facts survive even when workspace has many project facts.
@@ -1457,6 +1476,40 @@ mod tests {
         let _pin = crate::test_util::PinnedHome::new(&fake_home);
         let summary = facts_summary(&ws, 5);
         assert_eq!(summary, "");
+    }
+
+    /// Issue #216: a facts.jsonl that cannot be parsed must not silently
+    /// empty the prompt facts block — the degrade is logged at WARN with the
+    /// store path, while the summary itself stays empty (behaviour unchanged).
+    #[tracing_test::traced_test]
+    #[test]
+    fn facts_summary_degrades_loudly_when_the_store_is_corrupt() {
+        let (tmp, ws) = tmp_workspace();
+        // Pin HOME so the real machine's global facts can't leak in.
+        let fake_home = tmp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _pin = crate::test_util::PinnedHome::new(&fake_home);
+        let path = facts_path(&ws, "workspace");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"id\":\"F1\"\n").unwrap(); // malformed line
+
+        let summary = facts_summary(&ws, 5);
+        assert_eq!(summary, "", "a corrupt store degrades to no facts block");
+
+        let expected_path = path.display().to_string();
+        logs_assert(move |lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("facts store unreadable"))
+                .ok_or_else(|| "expected a WARN for the unreadable facts store".to_string())?;
+            if !line.contains("WARN") {
+                return Err(format!("the degrade must be logged at WARN, got: {line}"));
+            }
+            if !line.contains(&expected_path) {
+                return Err(format!("the WARN must carry the store path, got: {line}"));
+            }
+            Ok(())
+        });
     }
 
     #[test]

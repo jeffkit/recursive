@@ -160,36 +160,83 @@ pub(super) async fn persist_session_meta(state: &AppState, id: &str, meta: &Sess
     }
 }
 
-/// Best-effort load of the persisted metadata. A read or parse failure
-/// degrades to `None` (server defaults) — a corrupt blob must not make a
-/// restorable session 500.
-pub(super) async fn load_session_meta(state: &AppState, id: &str) -> Option<SessionMeta> {
+/// Outcome of reading the persisted metadata (issue #216). `Absent` is a
+/// legal empty — no blob was ever written. `Unreadable` means data exists
+/// but could not be read or parsed. [`load_session_meta`] collapses both
+/// into `None` (its callers treat `None` as server defaults); rewriters of
+/// the blob must distinguish them, because persisting over `Unreadable`
+/// would replace real data with defaults.
+enum LoadedSessionMeta {
+    Found(Box<SessionMeta>),
+    Absent,
+    Unreadable,
+}
+
+async fn load_session_meta_detailed(state: &AppState, id: &str) -> LoadedSessionMeta {
     match state.storage.load_memory(&session_meta_key(id)).await {
         Ok(Some(json)) => match serde_json::from_str(&json) {
-            Ok(meta) => Some(meta),
+            Ok(meta) => LoadedSessionMeta::Found(Box::new(meta)),
             Err(e) => {
                 tracing::warn!(
                     session_id = %id,
                     error = %e,
                     "ignoring unparsable session metadata"
                 );
-                None
+                LoadedSessionMeta::Unreadable
             }
         },
-        Ok(None) => None,
+        Ok(None) => LoadedSessionMeta::Absent,
         Err(e) => {
             tracing::warn!(session_id = %id, error = %e, "failed to load session metadata");
-            None
+            LoadedSessionMeta::Unreadable
         }
+    }
+}
+
+/// Best-effort load of the persisted metadata. A read or parse failure
+/// degrades to `None` (server defaults) — a corrupt blob must not make a
+/// restorable session 500.
+pub(super) async fn load_session_meta(state: &AppState, id: &str) -> Option<SessionMeta> {
+    match load_session_meta_detailed(state, id).await {
+        LoadedSessionMeta::Found(meta) => Some(*meta),
+        LoadedSessionMeta::Absent | LoadedSessionMeta::Unreadable => None,
     }
 }
 
 /// Mirror a new title into the persisted metadata, preserving every other
 /// field. Used by `PATCH /sessions/:id`.
+///
+/// Issue #216: only a successfully loaded blob may be rewritten. When the
+/// blob is unreadable (read or parse failure) the mirror is skipped with a
+/// WARN — persisting a title-only default here would wipe the stored
+/// system prompt / mode / preset / owner fields behind it. A blob that was
+/// simply never written (a transcript from an older build) keeps creating
+/// the title-only blob: it overwrites nothing.
 pub(super) async fn update_persisted_title(state: &AppState, id: &str, title: Option<String>) {
-    let mut meta = load_session_meta(state, id).await.unwrap_or_default();
-    meta.title = title;
-    persist_session_meta(state, id, &meta).await;
+    match load_session_meta_detailed(state, id).await {
+        LoadedSessionMeta::Found(mut meta) => {
+            meta.title = title;
+            persist_session_meta(state, id, &meta).await;
+        }
+        LoadedSessionMeta::Absent => {
+            persist_session_meta(
+                state,
+                id,
+                &SessionMeta {
+                    title,
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        LoadedSessionMeta::Unreadable => {
+            tracing::warn!(
+                session_id = %id,
+                "skipping title mirror: persisted session metadata is unreadable, \
+                 refusing to overwrite it with a default blob"
+            );
+        }
+    }
 }
 
 pub(super) async fn get_or_load_session(
@@ -784,6 +831,69 @@ mod tests {
             Some("alice"),
             "a title rename must not drop the session's owner"
         );
+    }
+
+    /// Issue #216: when the persisted blob is unreadable (corrupt or storage
+    /// read failure), the title mirror must NOT replace it with a title-only
+    /// default blob — the stored bytes stay untouched and the skip is logged.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn update_persisted_title_does_not_overwrite_an_unreadable_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        let corrupt = r#"{"system_prompt":"keep me""#; // truncated JSON
+        state
+            .storage
+            .save_memory(&session_meta_key("s1"), corrupt)
+            .await
+            .unwrap();
+
+        update_persisted_title(&state, "s1", Some("renamed".into())).await;
+
+        let stored = state
+            .storage
+            .load_memory(&session_meta_key("s1"))
+            .await
+            .expect("blob still present");
+        assert_eq!(
+            stored.as_deref(),
+            Some(corrupt),
+            "an unreadable blob must not be rewritten (byte-identical)"
+        );
+        assert!(
+            load_session_meta(&state, "s1").await.is_none(),
+            "load semantics unchanged: unreadable → None"
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("skipping title mirror") && l.contains("s1"))
+                .ok_or_else(|| "expected a WARN for the skipped title mirror".to_string())?;
+            if !line.contains("WARN") {
+                return Err(format!("the skip must be logged at WARN, got: {line}"));
+            }
+            Ok(())
+        });
+    }
+
+    /// NotFound stays as-is: a session with no meta blob at all (a transcript
+    /// from an older build) still gets a title-only blob written on PATCH —
+    /// overwriting nothing, so the title survives the next cold load.
+    #[tokio::test]
+    async fn update_persisted_title_absent_blob_still_creates_title_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+
+        update_persisted_title(&state, "s1", Some("renamed".into())).await;
+
+        let loaded = load_session_meta(&state, "s1")
+            .await
+            .expect("a title-only blob is created");
+        assert_eq!(loaded.title.as_deref(), Some("renamed"));
+        assert!(loaded.system_prompt.is_none());
+        assert!(loaded.permission_mode.is_none());
+        assert!(loaded.owner.is_none());
     }
 
     /// Issue #98 acceptance: a session created with a custom `system_prompt`
