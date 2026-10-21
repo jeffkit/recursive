@@ -84,6 +84,30 @@ fn stderr_of(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+// ─── binary startup (#207) ───────────────────────────────────────────────────
+
+/// Issue #207: on Windows the OS main thread gets a 1 MiB stack, and once
+/// Goal 412 grew the shared startup path every subcommand overflowed it before
+/// writing a byte (`STATUS_STACK_OVERFLOW`, exit `0xC00000FD`, empty stdout).
+/// `main` now runs the async entry point on an 8 MiB thread. This is the one
+/// assertion a startup crash cannot satisfy — a clean exit *and* bytes on
+/// stdout; the content-only tests below read a crash as "nothing printed".
+#[test]
+fn binary_starts_prints_and_exits_zero() {
+    let cli = Cli::new();
+    let out = cli.run(&["providers", "list"]);
+    assert!(
+        out.status.success(),
+        "startup crashed: status={:?} stderr={:?}",
+        out.status,
+        stderr_of(&out)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "startup produced no stdout: {out:?}"
+    );
+}
+
 // ─── doctor ──────────────────────────────────────────────────────────────────
 
 /// `cmd_doctor -> Ok(())`: the replacement body returns immediately, printing
@@ -681,6 +705,14 @@ fn serve_notification_with_id_gets_no_response() {
     let out = run_serve(
         &cli,
         &[r#"{"jsonrpc":"2.0","id":5,"method":"notifications/initialized"}"#],
+    );
+    // #207: a server that crashed on startup prints nothing too — require the
+    // clean EOF exit so empty stdout can't pass as "not answered".
+    assert!(
+        out.status.success(),
+        "serve should exit cleanly on EOF: status={:?} stderr={:?}",
+        out.status,
+        stderr_of(&out)
     );
     assert!(
         stdout_of(&out).trim().is_empty(),

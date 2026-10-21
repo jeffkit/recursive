@@ -576,8 +576,39 @@ enum McpCmd {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Stack reserved for the thread that runs [`async_main`] (issue #207).
+///
+/// `#[tokio::main]` would `block_on` the async-main state machine on the OS
+/// main thread, whose stack Windows caps at the 1 MiB linker default (unix
+/// mains get 8 MiB from the rlimit). Goal 412 grew the shared startup path
+/// past that cap, so every subcommand died with `STATUS_STACK_OVERFLOW`
+/// before writing a byte. Running the state machine on an explicit thread
+/// sizes the stack the same on every platform; the OS main thread only
+/// parks in `join`.
+const MAIN_THREAD_STACK_BYTES: usize = 8 << 20;
+
+fn main() -> anyhow::Result<()> {
+    let main_thread = std::thread::Builder::new()
+        .name("recursive-main".to_string())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(|| {
+            // Same runtime `#[tokio::main]` builds, minus its `expect`.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")?
+                .block_on(async_main())
+        })
+        .context("spawning recursive-main thread")?;
+    match main_thread.join() {
+        Ok(result) => result,
+        // The default hook already reported the panic on `recursive-main`;
+        // re-raise without a second report so `main` still exits 101.
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Issue #150: hide this process's `/proc/<pid>/environ` from same-uid
     // children before any execution surface (tool transport, run_background,
     // HTTP server) can spawn a shell. Must happen before `Cli::parse()` /
@@ -778,13 +809,13 @@ async fn main() -> anyhow::Result<()> {
     match effective_cmd {
         #[cfg(feature = "weixin")]
         Cmd::WeixinDaemon => {
-            return run_weixin_headless_daemon(
+            run_weixin_headless_daemon(
                 config,
                 cli.mcp_config,
                 cli.weixin_base_url,
                 cli.weixin_cred_path,
             )
-            .await;
+            .await
         }
 
         Cmd::Tools => {
