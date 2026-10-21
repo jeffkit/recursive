@@ -826,12 +826,12 @@ impl<'a> RunCore<'a> {
     }
 
     /// Finalise a step whose LLM completion carried no tool calls. Pushes
-    /// the assistant message + reasoning onto the transcript, classifies
-    /// the finish reason (`ProviderStop` for non-`stop`/`end_turn`
-    /// provider reasons, else `NoMoreToolCalls`), emits `TurnFinished`,
-    /// and returns `Some(finish)` so the caller routes through
-    /// [`make_outcome`]. Returns `None` when the caller should continue
-    /// with tool dispatch.
+    /// the assistant message + reasoning onto the transcript (unless it
+    /// carries neither — issue #196), classifies the finish reason
+    /// (`ProviderStop` for non-`stop`/`end_turn` provider reasons, else
+    /// `NoMoreToolCalls`), emits `TurnFinished`, and returns `Some(finish)`
+    /// so the caller routes through [`make_outcome`]. Returns `None` when
+    /// the caller should continue with tool dispatch.
     fn handle_no_tool_calls(
         &mut self,
         completion: &Completion,
@@ -844,7 +844,24 @@ impl<'a> RunCore<'a> {
         // `MessageAppended` event (and transcript row) carries it.
         let mut msg = Message::assistant(completion.content.clone());
         msg.reasoning_content = completion.reasoning_content.clone();
-        self.push_message(step, msg);
+        // Issue #196 — sibling channel of #168: a *normal* stop can also
+        // carry neither text nor reasoning (an empty reply — a filtered or
+        // blocked response, or a provider quirk). Pushing it writes
+        // `{"role":"assistant","content":""}` to transcript.jsonl — the same
+        // poisoned row #168 drops on the interrupt path — and the session
+        // writer has no filter of its own, so this is the only place the row
+        // can be prevented. Same predicate as `finish_interrupted`, so a
+        // reasoning-only reply still keeps its row; the classification and
+        // `TurnFinished` below are untouched.
+        if crate::message::has_persistable_interrupt(&msg) {
+            self.push_message(step, msg);
+        } else {
+            tracing::warn!(
+                target: "recursive::agent",
+                "no-tool-calls completion carried no text and no reasoning; \
+                 skipping the empty assistant message"
+            );
+        }
         let finish = match completion.finish_reason.as_deref() {
             Some(r) if r != "stop" && r != "end_turn" => FinishReason::ProviderStop(r.to_string()),
             _ => FinishReason::NoMoreToolCalls,
@@ -3526,6 +3543,193 @@ mod tests {
             Some("thinking hard"),
         );
     }
+
+    /// Issue #196 — the sibling channel of #168. A completion that ends the
+    /// turn *normally* (`finish_reason = stop`) with no content, no reasoning
+    /// and no tool calls must not reach the transcript: `push_message` is what
+    /// feeds `SessionPersistenceSink`, and the writer has no empty-row filter
+    /// of its own. Dropping the row must not disturb the finish classification
+    /// or `TurnFinished`.
+    #[tokio::test]
+    async fn stop_completion_without_content_persists_no_empty_assistant() {
+        use crate::agent::FinishReason;
+        use crate::event::AgentEvent;
+        use crate::llm::Completion;
+        use crate::message::Role;
+        use tokio::sync::mpsc;
+
+        // "" is the plain empty reply; the whitespace-only variant pins the
+        // `.trim()` inside the shared predicate (whitespace is equally empty
+        // on the wire).
+        for content in ["", "  \n\t "] {
+            let hooks = crate::hooks::HookRegistry::new();
+            let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+                content: content.to_string(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+                reasoning_content: None,
+            }]));
+            let messages = vec![Message::user("hello".to_string())];
+            let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+            let mut core = make_run_core_for_inner(messages, &hooks, provider, 3);
+            core.events = Some(tx);
+
+            let outcome = core.run_inner().await.expect("run_inner must not error");
+            let events: Vec<AgentEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+            assert!(
+                matches!(outcome.finish_reason, FinishReason::NoMoreToolCalls),
+                "the finish classification must not change ({content:?}): {:?}",
+                outcome.finish_reason,
+            );
+            assert_eq!(
+                outcome
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::Assistant)
+                    .count(),
+                0,
+                "an empty stop completion has nothing to persist ({content:?}): {:?}",
+                outcome.messages,
+            );
+            assert!(
+                !events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::MessageAppended { message, .. }
+                        if message.role == Role::Assistant
+                )),
+                "no assistant row may be announced to the persistence sink \
+                 ({content:?}): {events:?}",
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::TurnFinished { .. })),
+                "TurnFinished must still be emitted ({content:?}): {events:?}",
+            );
+        }
+    }
+
+    /// Issue #196 negative control — the ordinary text path is untouched: the
+    /// assistant row is still pushed exactly once, with its content.
+    #[tokio::test]
+    async fn stop_completion_with_text_is_still_pushed() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: "all done".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(matches!(
+            outcome.finish_reason,
+            FinishReason::NoMoreToolCalls
+        ));
+        let assistant: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(assistant.len(), 1, "the reply must still be persisted");
+        assert_eq!(assistant[0].content, "all done");
+    }
+
+    /// Issue #196 shares #168's predicate (`has_persistable_interrupt`), not
+    /// `is_empty_assistant`: a reasoning-only stop is real model output and
+    /// keeps its row. Like a reasoning-only interrupt it is filtered from
+    /// requests by the serializers, so the row is recorded but never sent.
+    #[tokio::test]
+    async fn stop_completion_with_reasoning_only_is_still_pushed() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: Some("thinking hard".to_string()),
+        }]));
+        let messages = vec![Message::user("hi".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(matches!(
+            outcome.finish_reason,
+            FinishReason::NoMoreToolCalls
+        ));
+        let assistant: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant.len(),
+            1,
+            "a reasoning-only stop must not be dropped (issue #196 uses the \
+             #168 predicate): {:?}",
+            outcome.messages,
+        );
+        assert_eq!(assistant[0].content, "", "no text arrived");
+        assert_eq!(
+            assistant[0].reasoning_content.as_deref(),
+            Some("thinking hard"),
+        );
+    }
+
+    /// Issue #196 must not touch the finish classification: an empty
+    /// completion with a non-`stop` provider reason is still `ProviderStop`,
+    /// even though its row is dropped.
+    #[tokio::test]
+    async fn empty_stop_completion_keeps_provider_stop_finish_reason() {
+        use crate::agent::FinishReason;
+        use crate::llm::Completion;
+        use crate::message::Role;
+
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(crate::llm::MockProvider::new(vec![Completion {
+            content: String::new(),
+            tool_calls: vec![],
+            finish_reason: Some("length".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]));
+        let messages = vec![Message::user("hello".to_string())];
+        let core = make_run_core_for_inner(messages, &hooks, provider, 3);
+
+        let outcome = core.run_inner().await.expect("run_inner must not error");
+        assert!(
+            matches!(
+                &outcome.finish_reason,
+                FinishReason::ProviderStop(r) if r == "length"
+            ),
+            "expected ProviderStop(\"length\"), got {:?}",
+            outcome.finish_reason,
+        );
+        assert_eq!(
+            outcome
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::Assistant)
+                .count(),
+            0,
+            "the empty row is dropped regardless of the provider reason: {:?}",
+            outcome.messages,
+        );
+    }
+
     /// Goal 353 — regression guard for the PRE-EXISTING path.
     ///
     /// When the shutdown token is ALREADY cancelled at loop top (before any

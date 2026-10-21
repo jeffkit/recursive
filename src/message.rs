@@ -169,12 +169,15 @@ pub fn is_empty_assistant(m: &Message) -> bool {
     m.role == Role::Assistant && m.content.trim().is_empty() && m.tool_calls.is_empty()
 }
 
-/// Issue #168 — is this interrupted assistant message worth persisting?
+/// Issue #168 — is this assistant message worth persisting?
 ///
 /// [`is_empty_assistant`] is the right predicate for the *serializers* and the
 /// *load filter*: those drop the poisoned row and nothing else. It is
-/// deliberately **not** the right predicate for `run_core::finish_interrupted`,
-/// which decides whether to write a new row at all.
+/// deliberately **not** the right predicate for the two sites that decide
+/// whether to write a new row at all — `run_core::finish_interrupted` and, for
+/// a normal stop, `run_core::handle_no_tool_calls` (issue #196). Both terminal
+/// paths answer the same question, so they share this predicate rather than
+/// growing a second one that could drift.
 ///
 /// The issue's 「不做」 clause pins that: "不改 reasoning-only 中断的处理（那是
 /// 另一种形态）". A reasoning-only reply (`content == ""`,
