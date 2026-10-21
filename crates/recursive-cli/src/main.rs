@@ -4340,6 +4340,273 @@ mod tests {
         assert!(next_weixin_request(&mut rx, &stopped).await.is_none());
     }
 
+    // ── #210: weixin session switching is the daemon's only cross-user wall ──
+    //
+    // `recursive weixin-daemon` serves every WeChat user from ONE runtime;
+    // `switch_weixin_session` / `start_fresh_weixin_session` are the sole
+    // switch that moves that runtime onto the sender's own conversation
+    // (transcript + session id + persistence sink). A whole-body replacement
+    // (`None` / `Some(String::new())` / `Some("xyzzy")`) leaves the runtime
+    // parked on the previous user's session while still "succeeding", so user
+    // B's message would be enqueued into — and the reply persisted to — user
+    // A's transcript. These tests observe the switch through all of its
+    // effects (returned id, on-disk session + binding, runtime transcript,
+    // session lock held by the runtime's sink), so each such mutant is red.
+
+    /// An isolated per-user data root plus a built headless runtime to switch.
+    ///
+    /// `RECURSIVE_HOME` is pinned to a tempdir and the `RECURSIVE_SESSIONS_DIR`
+    /// hard override cleared, so the sessions and the `weixin_sessions.json`
+    /// binding map the switch writes land under this test's own tree.
+    #[cfg(feature = "weixin")]
+    struct WeixinSwitchFixture {
+        // Declaration order is drop order: the runtime (whose sink holds the
+        // bound session's writer and lock) must go before the tempdirs it
+        // writes into, and the env guard last so no path resolves against a
+        // restored environment.
+        rt: recursive::AgentRuntime,
+        cfg: Config,
+        ws: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        _env: EnvGuard,
+    }
+
+    #[cfg(feature = "weixin")]
+    async fn weixin_switch_fixture() -> WeixinSwitchFixture {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        let env = EnvGuard::set(&[
+            (
+                "RECURSIVE_HOME",
+                Some(home.path().to_str().expect("utf-8 tempdir path")),
+            ),
+            ("RECURSIVE_SESSIONS_DIR", None),
+        ]);
+        let cfg = dummy_config(ws.path());
+        let rt = build_runtime(
+            &cfg,
+            None,
+            Vec::new(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("build the headless runtime");
+        WeixinSwitchFixture {
+            rt,
+            cfg,
+            ws,
+            _home: home,
+            _env: env,
+        }
+    }
+
+    #[cfg(feature = "weixin")]
+    fn weixin_binding_of(ws: &std::path::Path, user_id: &str) -> Option<String> {
+        recursive::weixin::WeixinSessionMap::for_workspace(ws)
+            .session_of(user_id)
+            .expect("read the weixin binding map")
+    }
+
+    #[cfg(feature = "weixin")]
+    fn transcript_contents(rt: &recursive::AgentRuntime) -> Vec<String> {
+        rt.transcript().iter().map(|m| m.content.clone()).collect()
+    }
+
+    /// Resolve the session `id` reports, asserting it is on disk and that the
+    /// runtime's sink holds its writer (hence its lock): that lock is what
+    /// makes the next turn persist into *this* session rather than the
+    /// previous user's.
+    #[cfg(feature = "weixin")]
+    fn assert_runtime_is_on_session(ws: &std::path::Path, id: &str) -> PathBuf {
+        let dir = recursive::weixin::session_map::find_session_dir(ws, id)
+            .unwrap_or_else(|| panic!("reported session {id:?} must exist on disk"));
+        assert!(
+            recursive::session::locked_by_live_process(&dir),
+            "the runtime's sink must hold session {id}'s writer so its turns persist there"
+        );
+        dir
+    }
+
+    /// `start_fresh_weixin_session` (an unbound user's first message, every
+    /// `/r`): the runtime must leave the previous user's conversation and
+    /// land on a NEW, bound, on-disk session it now holds.
+    #[cfg(feature = "weixin")]
+    #[tokio::test]
+    async fn weixin_fresh_session_moves_the_runtime_off_the_previous_users_conversation() {
+        use recursive::message::Message;
+        let mut f = weixin_switch_fixture().await;
+        let ws = f.ws.path().to_path_buf();
+        // The runtime is parked on user-a's conversation.
+        f.rt.set_transcript(vec![Message::user("user-a: my private question")]);
+
+        let id = start_fresh_weixin_session(&mut f.rt, &f.cfg, &ws, "user-b", "hello from user-b")
+            .expect("the switch must report the session the runtime is now on");
+
+        assert_runtime_is_on_session(&ws, &id);
+        assert_eq!(
+            weixin_binding_of(&ws, "user-b").as_deref(),
+            Some(id.as_str()),
+            "user-b must be bound to the session created for them"
+        );
+        assert!(
+            f.rt.transcript().is_empty(),
+            "user-a's turns must not leak into user-b's fresh conversation: {:?}",
+            transcript_contents(&f.rt)
+        );
+    }
+
+    /// `switch_weixin_session` onto a binding that exists on disk (`/c N`, or
+    /// any message from a user whose binding differs from the one the runtime
+    /// is cached on): the runtime must load THAT user's history and drop the
+    /// previous user's turns — the cross-user wall of the single-runtime
+    /// daemon.
+    #[cfg(feature = "weixin")]
+    #[tokio::test]
+    async fn weixin_switch_loads_the_bound_session_and_drops_the_previous_users_turns() {
+        use recursive::message::Message;
+        let mut f = weixin_switch_fixture().await;
+        let ws = f.ws.path().to_path_buf();
+        // user-b already owns a session with history on disk.
+        let mut writer = recursive::weixin::WeixinSessionMap::create_bound_session(
+            &ws,
+            "user-b",
+            "user-b: first message",
+            &f.cfg.model,
+            &f.cfg.provider_type,
+            None,
+        )
+        .expect("create user-b's session");
+        let b_id = writer.session_id().to_string();
+        writer
+            .append(&Message::user("user-b: earlier question"), None, None)
+            .expect("append user-b's history");
+        // Release the session lock so the switch can append to it.
+        drop(writer);
+        // The runtime is parked on user-a's conversation (prompt included).
+        let mut parked = f.rt.transcript().to_vec();
+        parked.push(Message::user("user-a: my private question"));
+        f.rt.set_transcript(parked);
+
+        let bound = switch_weixin_session(
+            &mut f.rt,
+            &f.cfg,
+            &ws,
+            "user-b",
+            Some(&b_id),
+            "user-b: next message",
+        );
+
+        assert_eq!(
+            bound.as_deref(),
+            Some(b_id.as_str()),
+            "the switch must report the session the runtime is now on"
+        );
+        assert_runtime_is_on_session(&ws, &b_id);
+        let contents = transcript_contents(&f.rt);
+        assert!(
+            contents.iter().any(|c| c == "user-b: earlier question"),
+            "the runtime must now hold user-b's history: {contents:?}"
+        );
+        assert!(
+            !contents.iter().any(|c| c.starts_with("user-a:")),
+            "user-a's turn must not leak into user-b's session: {contents:?}"
+        );
+        assert_eq!(
+            weixin_binding_of(&ws, "user-b").as_deref(),
+            Some(b_id.as_str()),
+            "resuming an existing binding must not rebind the user"
+        );
+    }
+
+    /// `switch_weixin_session` onto a binding whose session is gone from disk:
+    /// the only safe landing is a NEW session — never the previous user's —
+    /// and the user must be rebound to the session actually created.
+    #[cfg(feature = "weixin")]
+    #[tokio::test]
+    async fn weixin_switch_to_a_missing_session_lands_on_a_fresh_one() {
+        use recursive::message::Message;
+        let mut f = weixin_switch_fixture().await;
+        let ws = f.ws.path().to_path_buf();
+        f.rt.set_transcript(vec![Message::user("user-a: my private question")]);
+
+        let bound = switch_weixin_session(
+            &mut f.rt,
+            &f.cfg,
+            &ws,
+            "user-b",
+            Some("no-such-session"),
+            "hello from user-b",
+        )
+        .expect("a missing session must fall back to a fresh one");
+
+        assert_ne!(
+            bound, "no-such-session",
+            "the reported id must be the session actually created"
+        );
+        assert_runtime_is_on_session(&ws, &bound);
+        assert_eq!(
+            weixin_binding_of(&ws, "user-b").as_deref(),
+            Some(bound.as_str()),
+            "user-b must be rebound to the fallback session"
+        );
+        assert!(
+            f.rt.transcript().is_empty(),
+            "user-a's turns must not leak into the fallback session: {:?}",
+            transcript_contents(&f.rt)
+        );
+    }
+
+    /// `/r` (`wanted = None`) must start a NEW session every time, release the
+    /// one being reset, and carry none of its turns over.
+    #[cfg(feature = "weixin")]
+    #[tokio::test]
+    async fn weixin_reset_starts_a_new_session_every_time() {
+        use recursive::message::Message;
+        let mut f = weixin_switch_fixture().await;
+        let ws = f.ws.path().to_path_buf();
+        f.rt.set_transcript(vec![Message::user("user-a: before the first /r")]);
+        let first = switch_weixin_session(&mut f.rt, &f.cfg, &ws, "user-a", None, "first")
+            .expect("first fresh session");
+        let first_dir = assert_runtime_is_on_session(&ws, &first);
+        assert!(f.rt.transcript().is_empty());
+        assert_eq!(
+            weixin_binding_of(&ws, "user-a").as_deref(),
+            Some(first.as_str())
+        );
+
+        // A turn lands in that session, then the user sends `/r` again.
+        f.rt.set_transcript(vec![Message::user("user-a: turn that /r must discard")]);
+        let second = switch_weixin_session(&mut f.rt, &f.cfg, &ws, "user-a", None, "second")
+            .expect("second fresh session");
+
+        assert_ne!(
+            first, second,
+            "/r must create a new session, not reuse the one being reset"
+        );
+        assert_runtime_is_on_session(&ws, &second);
+        assert!(
+            !recursive::session::locked_by_live_process(&first_dir),
+            "the runtime must have released the session that was reset"
+        );
+        assert!(
+            f.rt.transcript().is_empty(),
+            "the reset conversation must not survive into the new session: {:?}",
+            transcript_contents(&f.rt)
+        );
+        assert_eq!(
+            weixin_binding_of(&ws, "user-a").as_deref(),
+            Some(second.as_str()),
+            "the binding must follow the newest session"
+        );
+    }
+
     #[test]
     fn hook_timing_flag_accepted() {
         // Issue #185: this test reads env-derived state
