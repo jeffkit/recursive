@@ -263,6 +263,18 @@ pub(crate) fn warn_provider_giving_up(label: &str, status: Option<u16>, request_
     );
 }
 
+/// Proxy variable spellings reported by [`proxy_env_summary`], in report order.
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
 /// Presence-only summary of proxy-related environment variables, for
 /// network-error WARN logs (issue #203).
 ///
@@ -271,27 +283,51 @@ pub(crate) fn warn_provider_giving_up(label: &str, status: Option<u16>, request_
 /// which form". `direct` means no proxy variable was present. `NO_PROXY` is
 /// reported separately because it changes whether the configured proxy is
 /// bypassed for the failing endpoint.
+///
+/// Each *variable* is listed once. On Windows environment names are
+/// case-insensitive (and case-preserving), so `https_proxy` and `HTTPS_PROXY`
+/// probe the same entry; reporting both would claim a second proxy is
+/// configured when it is not (#207).
 pub(crate) fn proxy_env_summary() -> String {
-    const KEYS: [&str; 8] = [
-        "http_proxy",
-        "HTTP_PROXY",
-        "https_proxy",
-        "HTTPS_PROXY",
-        "all_proxy",
-        "ALL_PROXY",
-        "no_proxy",
-        "NO_PROXY",
-    ];
-    let set: Vec<&str> = KEYS
-        .iter()
-        .copied()
-        .filter(|key| std::env::var_os(key).is_some())
-        .collect();
+    let set = resolve_proxy_names(&PROXY_ENV_KEYS, lookup_proxy_env_name);
     if set.is_empty() {
         "direct".to_string()
     } else {
         set.join(",")
     }
+}
+
+/// Resolve the proxy variable names to report, one entry per variable.
+///
+/// `lookup` maps a probed spelling to the name the platform actually stores.
+/// Where lookups are exact (Unix) distinct spellings stay distinct, so the
+/// report is byte-identical to the pre-#207 behaviour. Where lookups are
+/// case-insensitive (Windows) both probes resolve to the stored name and it
+/// is listed once.
+fn resolve_proxy_names(keys: &[&str], lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for key in keys {
+        let Some(name) = lookup(key) else {
+            continue;
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+#[cfg(not(windows))]
+fn lookup_proxy_env_name(key: &str) -> Option<String> {
+    std::env::var_os(key).map(|_| key.to_string())
+}
+
+#[cfg(windows)]
+fn lookup_proxy_env_name(key: &str) -> Option<String> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
+        .find(|name| name.to_string_lossy().eq_ignore_ascii_case(key))
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// WARN once when network-class retries are exhausted (issue #203), including
@@ -765,19 +801,20 @@ mod tests {
     #[test]
     fn proxy_env_summary_reports_presence_without_values() {
         let _env_lock = crate::test_util::env_lock();
-        const KEYS: [&str; 8] = [
-            "http_proxy",
-            "HTTP_PROXY",
-            "https_proxy",
-            "HTTPS_PROXY",
-            "all_proxy",
-            "ALL_PROXY",
-            "no_proxy",
-            "NO_PROXY",
-        ];
-        let originals: Vec<Option<String>> = KEYS.iter().map(|k| std::env::var(k).ok()).collect();
-        for key in KEYS {
-            std::env::remove_var(key);
+        // Snapshot every variable that can reach the summary, matched
+        // case-insensitively: Windows may hold a spelling outside
+        // `PROXY_ENV_KEYS`, and removing only the listed spellings would leave
+        // it visible to the summary (which reports the stored name).
+        let matches_key = |name: &std::ffi::OsStr| {
+            PROXY_ENV_KEYS
+                .iter()
+                .any(|key| name.to_string_lossy().eq_ignore_ascii_case(key))
+        };
+        let originals: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(name, _)| matches_key(name))
+            .collect();
+        for (name, _) in &originals {
+            std::env::remove_var(name);
         }
 
         assert_eq!(proxy_env_summary(), "direct");
@@ -789,11 +826,35 @@ mod tests {
             "proxy values must not be logged"
         );
 
-        for (key, original) in KEYS.iter().zip(originals) {
-            match original {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
+        for (name, value) in originals {
+            std::env::set_var(name, value);
         }
+    }
+
+    /// Issue #207: Windows looks up environment names case-insensitively, so
+    /// probing `https_proxy` and `HTTPS_PROXY` hits the same stored variable.
+    /// The summary must list it once, under the casing the OS holds.
+    #[test]
+    fn proxy_env_names_collapse_case_variants_when_lookup_is_case_insensitive() {
+        let stored = ["HTTPS_PROXY"];
+        let names = resolve_proxy_names(&PROXY_ENV_KEYS, |key| {
+            stored
+                .iter()
+                .copied()
+                .find(|name| name.eq_ignore_ascii_case(key))
+                .map(str::to_string)
+        });
+        assert_eq!(names, ["HTTPS_PROXY"]);
+    }
+
+    /// The Unix contract is unchanged: distinct spellings are distinct
+    /// variables and both stay in the report, in probe order.
+    #[test]
+    fn proxy_env_names_keep_distinct_spellings_when_lookup_is_exact() {
+        let present = ["http_proxy", "HTTP_PROXY"];
+        let names = resolve_proxy_names(&PROXY_ENV_KEYS, |key| {
+            present.contains(&key).then_some(key.to_string())
+        });
+        assert_eq!(names, present);
     }
 }
