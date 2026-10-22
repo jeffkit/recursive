@@ -1585,9 +1585,7 @@ exit 0
 
         drop(held);
         let _ = std::fs::remove_dir_all(&tmp);
-        let err = verdict
-            .err()
-            .expect("a busy executable must surface its error");
+        let err = verdict.expect_err("a busy executable must surface its error");
         assert_eq!(
             err.raw_os_error(),
             Some(26),
