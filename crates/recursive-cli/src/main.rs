@@ -944,8 +944,8 @@ async fn async_main() -> anyhow::Result<()> {
             match cli::builder::skills_from_http_sources() {
                 Ok(src_skills) => {
                     let merged = cli::builder::merge_remote_skills(&mut skills, src_skills);
-                    if merged > 0 {
-                        eprintln!("skills: loaded {merged} skill(s) via service-level SkillSource");
+                    if let Some(line) = skill_source_log_line(merged) {
+                        eprintln!("{line}");
                     }
                 }
                 Err(e) => eprintln!("skills: WARN: {e}"),
@@ -2464,6 +2464,16 @@ fn session_entry_to_json(
             "removed": removed,
         }),
     })
+}
+
+/// Startup log line for service-level skills (issue #74 拆单 3/3): `Some` only
+/// when at least one skill came in via `RECURSIVE_SKILL_SOURCE_URL`. Extracted
+/// from the `http` serve entry (issue #223) so the `merged > 0` decision is
+/// truth-table testable — inlined, the comparison carried three mutation
+/// survivors: `<`/`==` silenced the operator's only confirmation that remote
+/// skills loaded, `>=` spammed "loaded 0" on every plain startup.
+fn skill_source_log_line(merged: usize) -> Option<String> {
+    (merged > 0).then(|| format!("skills: loaded {merged} skill(s) via service-level SkillSource"))
 }
 
 /// Apply `sessions show --tail`: keep only the last N entries. `None` (or a
@@ -4899,6 +4909,18 @@ mod tests {
             Some(300),
             "blank counts as unset"
         );
+
+        env.set_var(var, "   ");
+        assert_eq!(
+            plan_approval_timeout_secs(),
+            Some(300),
+            "whitespace-only counts as unset too"
+        );
+        // Issue #223: the `!raw.trim().is_empty()` → `true` guard mutant is
+        // equivalent and deliberately unasserted-by-distinction — a blank value
+        // that slips past the guard fails `parse::<u64>()` and lands on the
+        // same `Some(DEFAULT_SECS)` this fallback arm returns, so every input
+        // maps to the same output under both guards.
     }
 
     #[test]
@@ -5009,6 +5031,25 @@ mod tests {
     }
 
     #[test]
+    fn skill_source_log_line_reports_only_nonzero_merges() {
+        assert_eq!(
+            skill_source_log_line(0),
+            None,
+            "a plain startup must not log 'loaded 0' (issue #223: `>=` mutant)"
+        );
+        assert_eq!(
+            skill_source_log_line(1).as_deref(),
+            Some("skills: loaded 1 skill(s) via service-level SkillSource"),
+            "the operator's only confirmation that remote skills loaded"
+        );
+        assert_eq!(
+            skill_source_log_line(3).as_deref(),
+            Some("skills: loaded 3 skill(s) via service-level SkillSource"),
+            "the count itself is part of the message (`==` mutant would print only 0)"
+        );
+    }
+
+    #[test]
     fn tail_entries_keeps_only_the_last_n() {
         let make = |n: usize| (0..n).map(boundary).collect::<Vec<_>>();
         assert_eq!(tail_entries(make(3), None).len(), 3);
@@ -5022,6 +5063,14 @@ mod tests {
             }
             other => panic!("expected a boundary, got {other:?}"),
         }
+        // Issue #223: the exact-boundary rows. `tail == len` keeps everything
+        // and `tail == 0` yields the empty window. These rows also document why
+        // the `n < len` → `n <= len` guard mutant is equivalent and therefore
+        // unkillable: at `n == len` the slice arm computes `start == 0` and
+        // returns the same full vector the fallback arm returns, so both
+        // comparisons are extensionally equal over all inputs.
+        assert_eq!(tail_entries(make(3), Some(3)).len(), 3);
+        assert_eq!(tail_entries(make(3), Some(0)).len(), 0);
     }
 
     #[test]
@@ -5034,6 +5083,11 @@ mod tests {
         let tailed = tail_messages(&msgs, Some(3));
         assert_eq!(tailed.len(), 3);
         assert_eq!(tailed[0].content, "m2");
+        // Same boundary rows as tail_entries (#223): `tail == len` is the full
+        // slice, `tail == 0` the empty one — and at `n == len` the `<` → `<=`
+        // mutant slices from 0, which equals the fallback arm.
+        assert_eq!(tail_messages(&msgs, Some(5)).len(), 5);
+        assert_eq!(tail_messages(&msgs, Some(0)).len(), 0);
     }
 
     #[test]

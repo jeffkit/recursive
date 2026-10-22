@@ -537,4 +537,135 @@ mod tests {
         assert_eq!(last["content"], "post-rewind turn");
         assert_no_tmp_residue(&sess);
     }
+
+    /// Issue #223: the nested-directory scan used to carry a `delete !`
+    /// mutant on `if !slug_dir.is_dir()` that inverted the filter — real
+    /// session dirs got skipped, and JSONL sessions became unaddressable
+    /// by ID while every test stayed green. Pin both stored layouts plus
+    /// the miss and ambiguity branches.
+    #[test]
+    fn resolve_session_path_finds_flat_files_and_nested_session_dirs() {
+        let (home, mut env) = pinned_home();
+        // `RECURSIVE_SESSIONS_DIR` hard-overrides the user dir this function
+        // searches; clear any ambient value so both writers agree on the root.
+        env.remove_var("RECURSIVE_SESSIONS_DIR");
+        let ws = TempDir::new().unwrap();
+        let sessions = recursive::user_sessions_dir(ws.path()).unwrap();
+        let flat = sessions.join("20260101-legacy-goal.json");
+        let nested = sessions.join("proj-x").join("sess-alpha-01");
+        let ambiguous = sessions.join("proj-y").join("sess-alpha-02");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&ambiguous).unwrap();
+        fs::write(&flat, "{}").unwrap();
+        // A plain file between the slug dirs: the slug scan must skip it via
+        // the `!is_dir` guard, not descend into it.
+        fs::write(sessions.join("notes.txt"), "not a session").unwrap();
+
+        assert_eq!(
+            resolve_session_path(ws.path(), "legacy-goal").unwrap(),
+            flat,
+            "flat single-file sessions match by file stem"
+        );
+        assert_eq!(
+            resolve_session_path(ws.path(), "alpha-01").unwrap(),
+            nested,
+            "JSONL session dirs match by directory name"
+        );
+        assert_eq!(
+            resolve_session_path(ws.path(), "ALPHA-01").unwrap(),
+            nested,
+            "matching is case-insensitive"
+        );
+        let miss = resolve_session_path(ws.path(), "no-such-session")
+            .expect_err("an unknown id must be an error");
+        assert!(
+            format!("{miss:#}").contains("Session not found"),
+            "miss must say so; got: {miss:#}"
+        );
+        let ambiguous_err = resolve_session_path(ws.path(), "alpha-0")
+            .expect_err("two substring hits must refuse to guess");
+        assert!(
+            format!("{ambiguous_err:#}").contains("Ambiguous session identifier"),
+            "ambiguity must refuse to guess; got: {ambiguous_err:#}"
+        );
+        assert_shadow_under(&home);
+    }
+
+    /// Issue #223: `sessions migrate-legacy` had zero coverage — the body
+    /// could return `Ok(())` without creating anything, or refuse existing
+    /// files (inverted `!path.exists()`), with no test noticing. Pin the
+    /// full round trip: replayed transcript, carried-over tool registry
+    /// hash, and the missing-file refusal.
+    #[test]
+    fn migrate_legacy_replays_transcript_and_carries_the_registry_hash() {
+        let (home, mut env) = pinned_home();
+        env.remove_var("RECURSIVE_SESSIONS_DIR");
+        let ws = TempDir::new().unwrap();
+        let legacy_path = ws.path().join("legacy-session.json");
+        let legacy = recursive::session::SessionFile {
+            schema_version: 1,
+            goal: "migrate me".into(),
+            model: "test-model".into(),
+            provider: "test-provider".into(),
+            tool_registry_hash: "hash-legacy".into(),
+            steps_consumed: 3,
+            transcript: vec![
+                recursive::Message::user("hello"),
+                recursive::Message::assistant("hi"),
+            ],
+            preset: None,
+        };
+        legacy.write_to(&legacy_path).unwrap();
+
+        cmd_session_migrate_legacy(ws.path(), &legacy_path).unwrap();
+
+        // Exactly one JSONL session dir appeared under the user sessions root.
+        let sessions = recursive::user_sessions_dir(ws.path()).unwrap();
+        let created: Vec<PathBuf> = fs::read_dir(&sessions)
+            .unwrap()
+            .flatten()
+            .map(|slug| slug.path())
+            .filter(|p| p.is_dir())
+            .flat_map(|slug| {
+                fs::read_dir(&slug)
+                    .unwrap()
+                    .flatten()
+                    .map(|s| s.path())
+                    .filter(|p| p.is_dir())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|p| p.join(".meta.json").exists())
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "migrate must create exactly one session dir under {sessions:?}: {created:?}"
+        );
+        let sess = &created[0];
+        // The transcript was replayed line for line.
+        let transcript = fs::read_to_string(sess.join("transcript.jsonl")).unwrap();
+        let lines: Vec<&str> = transcript.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "both legacy messages must be replayed: {transcript}"
+        );
+        // The legacy tool_registry_hash survived the migration (.meta.json).
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(sess.join(".meta.json")).unwrap()).unwrap();
+        assert_eq!(
+            meta["tool_registry_hash"], "hash-legacy",
+            "the carried-over hash is the point of the migration: {meta}"
+        );
+
+        // A missing legacy file is refused before anything is created.
+        let absent = ws.path().join("absent.json");
+        let err = cmd_session_migrate_legacy(ws.path(), &absent)
+            .expect_err("a nonexistent legacy file must be refused");
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "refusal must name the problem; got: {err:#}"
+        );
+        assert_shadow_under(&home);
+    }
 }

@@ -713,3 +713,215 @@ fn run_finalizes_a_json_mode_session_as_crashed_when_the_provider_fails() {
 
     assert_session_crashed_with_error(&rig);
 }
+
+// ── migrate / gc-checkpoints / clean-checkpoints (issue #223) ───────────────
+// These three commands had zero mutation coverage: `cmd_migrate` could return
+// `Ok(())` moving nothing and both report-section guards (`!moved.is_empty()`
+// / `!skipped.is_empty()`) could invert unnoticed, `gc-checkpoints` could skip
+// the repo entirely, and `clean-checkpoints` could delete without consent.
+// Drive the real binary so the printed sections and on-disk effects are both
+// pinned. `user_workspace_dir`/`user_shadow_git_dir` are exported by the
+// `recursive` crate the binary itself uses, so the tests verify the same
+// locations the command writes.
+
+fn git_on_path() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Where the *child binary* puts the shadow repo: under the Rig's pinned home,
+/// keyed by the workspace hash. Computed in-process from paths, never from
+/// `user_shadow_git_dir` — that helper reads this process's env, and the test
+/// process must not depend on (or set) `RECURSIVE_HOME` while sibling
+/// integration tests run in parallel.
+fn child_shadow_dir(rig: &Rig) -> std::path::PathBuf {
+    rig.home
+        .path()
+        .join("workspaces")
+        .join(recursive::workspace_hash(rig.workspace.path()))
+        .join("shadow-git")
+}
+
+#[test]
+fn migrate_moves_legacy_state_and_prints_the_moved_section() {
+    let rig = Rig::new();
+    let legacy = rig.workspace.path().join(".recursive").join("sessions");
+    std::fs::create_dir_all(&legacy).expect("mkdir legacy sessions");
+    std::fs::write(legacy.join("old.json"), "{}").expect("write legacy session");
+
+    let out = rig.run(&["migrate"]);
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "migrate failed: {stderr}");
+    assert!(
+        stdout.contains("Moved:") && stdout.contains(".recursive/sessions"),
+        "the moved section must list what moved, got:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("warning:"),
+        "nothing was skipped, so no warning was due, got:\n{stderr}"
+    );
+    assert!(
+        !rig.workspace.path().join(".recursive").exists(),
+        "the emptied legacy root must be removed"
+    );
+    // The whole legacy `sessions` dir relocates under the child's pinned home.
+    let dest = rig
+        .home
+        .path()
+        .join("workspaces")
+        .join(recursive::workspace_hash(rig.workspace.path()))
+        .join("sessions");
+    assert!(
+        dest.join("old.json").exists(),
+        "the session must now live under {}",
+        dest.display()
+    );
+}
+
+#[test]
+fn migrate_reports_skips_when_destination_already_has_data() {
+    let rig = Rig::new();
+    // First run moves the legacy state under the user dir…
+    let legacy_root = rig.workspace.path().join(".recursive");
+    let legacy = legacy_root.join("sessions");
+    std::fs::create_dir_all(&legacy).expect("mkdir legacy sessions");
+    std::fs::write(legacy.join("old.json"), "{}").expect("write legacy session");
+    let first = rig.run(&["migrate"]);
+    assert!(
+        first.status.success(),
+        "first migrate failed: {:?}",
+        stderr_of(&first)
+    );
+
+    // …then the same legacy path reappears and collides with the moved copy.
+    std::fs::create_dir_all(&legacy).expect("re-mkdir legacy sessions");
+    std::fs::write(legacy.join("old.json"), "{}").expect("re-write legacy session");
+    let out = rig.run(&["migrate"]);
+    let stdout = stdout_of(&out);
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "second migrate failed: {stderr}");
+    assert!(
+        stdout.contains("Skipped (destination already exists):")
+            && stdout.contains(".recursive/sessions"),
+        "the skipped section must name the collision, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Moved:"),
+        "nothing moved on the colliding run, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("warning:"),
+        "a skipped item must raise the manual-merge warning, got:\n{stderr}"
+    );
+    assert!(
+        legacy.join("old.json").exists(),
+        "a skipped item stays put — migrate must not touch it"
+    );
+}
+
+#[test]
+fn gc_checkpoints_opens_and_prunes_the_shadow_repo() {
+    if !git_on_path() {
+        return;
+    }
+    let rig = Rig::new();
+    let shadow = child_shadow_dir(&rig);
+    assert!(!shadow.exists(), "a fresh workspace has no shadow repo yet");
+
+    let out = rig.run(&["sessions", "gc-checkpoints"]);
+    let stdout = stdout_of(&out);
+    assert!(
+        out.status.success(),
+        "gc-checkpoints failed: {:?}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout.contains("Running git gc on shadow repo")
+            && stdout.contains("Done. Shadow repo pruned."),
+        "gc must announce start and completion, got:\n{stdout}"
+    );
+    assert!(
+        shadow.exists(),
+        "gc (via ShadowRepo::open) must leave the repo in place at {}",
+        shadow.display()
+    );
+}
+
+#[test]
+fn clean_checkpoints_aborts_on_other_answers_deletes_on_yes_and_force() {
+    if !git_on_path() {
+        return;
+    }
+    let rig = Rig::new();
+    let shadow = || child_shadow_dir(&rig);
+    // Seed the repo: ShadowRepo::open creates the bare repo on demand.
+    let seeded = rig.run(&["sessions", "gc-checkpoints"]);
+    assert!(
+        seeded.status.success(),
+        "seeding gc failed: {:?}",
+        stderr_of(&seeded)
+    );
+    assert!(
+        shadow().exists(),
+        "seed failed: no shadow repo at {}",
+        shadow().display()
+    );
+
+    // Anything other than "y" aborts and keeps the repo.
+    let out_n = rig.run_with_stdin(&["sessions", "clean-checkpoints"], "n\n");
+    let stdout_n = stdout_of(&out_n);
+    assert!(
+        out_n.status.success(),
+        "clean (n) failed: {:?}",
+        stderr_of(&out_n)
+    );
+    assert!(
+        stdout_n.contains("Aborted."),
+        "a non-yes answer must abort, got:\n{stdout_n}"
+    );
+    assert!(
+        shadow().exists(),
+        "an aborted clean must not delete the repo"
+    );
+
+    // "y" consents — the repo is gone afterwards.
+    let out_y = rig.run_with_stdin(&["sessions", "clean-checkpoints"], "y\n");
+    let stdout_y = stdout_of(&out_y);
+    assert!(
+        out_y.status.success(),
+        "clean (y) failed: {:?}",
+        stderr_of(&out_y)
+    );
+    assert!(
+        stdout_y.contains("Shadow-git repo deleted."),
+        "a consenting clean must delete and say so, got:\n{stdout_y}"
+    );
+    assert!(
+        !shadow().exists(),
+        "a consenting clean must remove the repo"
+    );
+
+    // --force skips the prompt entirely (stdin is /dev/null here): the
+    // deleted confirmation line proves the prompt was bypassed, not answered.
+    let reseeded = rig.run(&["sessions", "gc-checkpoints"]);
+    assert!(
+        reseeded.status.success(),
+        "reseed gc failed: {:?}",
+        stderr_of(&reseeded)
+    );
+    let out_f = rig.run(&["sessions", "clean-checkpoints", "--force"]);
+    let stdout_f = stdout_of(&out_f);
+    assert!(
+        out_f.status.success(),
+        "clean --force failed: {:?}",
+        stderr_of(&out_f)
+    );
+    assert!(
+        stdout_f.contains("Shadow-git repo deleted."),
+        "--force must delete without a prompt, got:\n{stdout_f}"
+    );
+    assert!(!shadow().exists(), "--force must remove the repo");
+}
