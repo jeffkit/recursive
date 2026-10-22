@@ -53,6 +53,7 @@ use crate::tools::Tool;
 use crate::tools::ToolRegistry;
 
 use bindings::BindingTable;
+use protocol::SandboxFacts;
 use runner::{RunCodeLimits, RunProgramRequest, ToolInvoker};
 
 /// Primary tool name (PascalCase, like every other built-in tool).
@@ -98,6 +99,16 @@ pub struct RunCode {
     /// permission model (the workspace root). `None` resolves to the host
     /// process's current directory at spawn time.
     read_root: Option<PathBuf>,
+    /// Issue #134 W2: the session's event sink, held **weakly** (the
+    /// [`WorkerEventSink`](crate::event::WorkerEventSink) precedent, issue
+    /// #119). A strong handle would pin the run-scoped sink — and with it a
+    /// `ChannelSink` sender — for as long as the registry clone lives,
+    /// keeping every consumer that drains until the channel closes (the
+    /// CLI printer) from ever finishing. The parent runtime publishes its
+    /// sink through the telemetry-style slot below; once it drops the
+    /// sink, the tool's events are discarded (the run that would have
+    /// consumed them is over).
+    sink_slot: std::sync::Mutex<Option<std::sync::Weak<dyn crate::event::EventSink>>>,
 }
 
 impl RunCode {
@@ -108,6 +119,36 @@ impl RunCode {
             limits: RunCodeLimits::default(),
             node_bin: None,
             read_root: None,
+            sink_slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Publish the session's event sink (issue #134 W2): each program run
+    /// emits one [`AgentEvent::ProgrammaticRunStarted`] /
+    /// [`AgentEvent::ProgrammaticRunFinished`] pair through it. Held weakly
+    /// — a dead parent sink simply drops the events.
+    pub fn with_event_sink(self, sink: std::sync::Arc<dyn crate::event::EventSink>) -> Self {
+        *self
+            .sink_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::downgrade(&sink));
+        self
+    }
+
+    /// Emit one PTC lifecycle event through the published sink, when it is
+    /// still alive. Awaited inline (`execute` is already async): the sinks
+    /// in use are non-blocking sends, and inline delivery keeps the
+    /// started→finished ordering trivially monotonic.
+    async fn emit(&self, event: crate::event::AgentEvent) {
+        let sink = self
+            .sink_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(sink) = sink {
+            sink.emit(event).await;
         }
     }
 
@@ -152,6 +193,34 @@ impl RunCode {
             .filter(|name| bindings::validate_binding_name(name).is_ok())
             .collect()
     }
+}
+
+/// Issue #134 W2: the sandbox facts as the `key=value` line a consumer
+/// (SSE / collector) can render without re-deriving them from the model's
+/// observation. Mirrors [`protocol::RunReport::render`]'s sandbox block,
+/// minus the program output.
+pub fn sandbox_summary(facts: &SandboxFacts) -> String {
+    let mut out = format!(
+        "runtime={} env={} heap_limit_mib={} output_limit_bytes={} timeout_secs={}",
+        facts.runtime.as_deref().unwrap_or("unavailable"),
+        facts.env_policy,
+        facts.heap_limit_mib,
+        facts.output_limit_bytes,
+        facts.timeout_secs,
+    );
+    if !facts.fs_policy.is_empty() {
+        out.push_str(&format!(" fs={}", facts.fs_policy));
+    }
+    if let Some(flag) = &facts.permission_flag {
+        out.push_str(&format!(" permission_flag={flag}"));
+    }
+    if let Some(dir) = &facts.scratch_dir {
+        out.push_str(&format!(" scratch={dir}"));
+    }
+    if !facts.resource_guards.is_empty() {
+        out.push_str(&format!(" guards={}", facts.resource_guards));
+    }
+    out
 }
 
 #[async_trait]
@@ -206,6 +275,15 @@ impl Tool for RunCode {
             }
         })?;
 
+        // Issue #134 W2: one started/finished pair per run — the visible
+        // surface of a black-box step. No per-inner-call events (that would
+        // dilute the batching into ToolCall noise).
+        self.emit(crate::event::AgentEvent::ProgrammaticRunStarted {
+            step: 0,
+            program_chars: code.len(),
+        })
+        .await;
+        let started = std::time::Instant::now();
         let report = runner::run_program(RunProgramRequest {
             source: code.to_string(),
             bindings,
@@ -215,6 +293,20 @@ impl Tool for RunCode {
             abort: None,
             read_root: self.read_root.clone(),
             min_free_bytes: None,
+        })
+        .await;
+        let status = report
+            .failure
+            .map(|f| f.as_str().to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let sandbox_summary = crate::tools::run_code::sandbox_summary(&report.sandbox);
+        self.emit(crate::event::AgentEvent::ProgrammaticRunFinished {
+            step: 0,
+            success: report.failure.is_none(),
+            status,
+            calls: report.calls,
+            duration_ms: started.elapsed().as_millis() as u64,
+            sandbox_summary,
         })
         .await;
         Ok(report.render())
@@ -325,6 +417,152 @@ mod tests {
         assert!(spec.description.contains("Double"));
         assert_eq!(tool.binding_names(), vec!["Double".to_string()]);
         assert_eq!(tool.kind(), ToolKind::Execute);
+    }
+
+    /// Issue #134 W2: a run with a published (live) sink emits exactly one
+    /// started/finished pair carrying the aggregate (`calls`, duration,
+    /// status, sandbox summary) — and never one event per inner tool call.
+    #[tokio::test]
+    async fn a_run_emits_started_and_finished_events() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        // Hold the sink Arc for the whole test: the tool takes the sink
+        // **weakly** (the runtime owns the strong handle in production), so
+        // a temporary Arc would die here and the weak upgrade would
+        // legitimately drop every event.
+        let sink = std::sync::Arc::new(sink);
+        let tool = RunCode::new(registry_with(Arc::new(Double))).with_event_sink(sink.clone());
+        let out = tool
+            .execute(json!({
+                "code": "let t = 0; for (const n of [1,2,3]) t += Number(await Double({n})); return t;"
+            }))
+            .await
+            .unwrap();
+        assert!(out.contains("status=ok"), "{out}");
+        assert!(out.contains("calls=3"), "{out}");
+
+        let mut started = None;
+        let mut finished = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                crate::event::AgentEvent::ProgrammaticRunStarted { .. } => {
+                    assert!(started.is_none(), "at most one started per run");
+                    started = Some(());
+                }
+                crate::event::AgentEvent::ProgrammaticRunFinished {
+                    success,
+                    status,
+                    calls,
+                    duration_ms,
+                    sandbox_summary,
+                    ..
+                } => {
+                    assert!(finished.is_none(), "at most one finished per run");
+                    assert!(success);
+                    assert_eq!(status, "ok");
+                    assert_eq!(calls, 3, "the aggregate counts the inner calls");
+                    assert!(duration_ms > 0);
+                    assert!(
+                        sandbox_summary.contains("runtime="),
+                        "the summary must carry the sandbox facts: {sandbox_summary}"
+                    );
+                    finished = Some(());
+                }
+                // A tool call inside the program must NOT surface as a
+                // ToolCall event — no per-inner-call dilution.
+                other => panic!("unexpected event from a run: {other:?}"),
+            }
+        }
+        assert!(started.is_some(), "a started event must be emitted");
+        assert!(finished.is_some(), "a finished event must be emitted");
+    }
+
+    /// Issue #134 W2: the failing classes are reported with their taxonomy
+    /// string, exactly as the model's own observation reads.
+    #[tokio::test]
+    async fn a_failed_run_reports_its_taxonomy_status() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let (sink, mut rx) = crate::event::ChannelSink::new();
+        // Held for the whole test — the tool's handle is weak (see the
+        // emit test above).
+        let sink = std::sync::Arc::new(sink);
+        let tool = RunCode::new(registry_with(Arc::new(Double)))
+            .with_event_sink(sink.clone())
+            .with_limits(RunCodeLimits {
+                timeout: Duration::from_millis(300),
+                ..RunCodeLimits::default()
+            });
+        let out = tool
+            .execute(json!({ "code": "await new Promise(() => {});" }))
+            .await
+            .unwrap();
+        assert!(out.contains("status=timeout"), "{out}");
+        let mut saw_finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::event::AgentEvent::ProgrammaticRunFinished {
+                success, status, ..
+            } = ev
+            {
+                saw_finished = true;
+                assert!(!success, "a timeout is not a success");
+                assert_eq!(status, "timeout", "the taxonomy string must match");
+            }
+        }
+        assert!(
+            saw_finished,
+            "the finish event must actually reach the sink"
+        );
+    }
+
+    /// Issue #134 W2 (negative control): no published sink (or a dropped
+    /// parent) means no events and no failure — the tool result is unchanged.
+    #[tokio::test]
+    async fn a_run_without_a_sink_still_runs() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let tool = RunCode::new(registry_with(Arc::new(Double)));
+        let out = tool.execute(json!({"code": "return 1;"})).await.unwrap();
+        assert!(out.contains("status=ok"), "{out}");
+    }
+
+    /// The sandbox summary mirrors the model's own observation block so a
+    /// consumer never re-derives facts from rendered text.
+    #[test]
+    fn sandbox_summary_mirrors_the_rendered_facts() {
+        let facts = SandboxFacts {
+            runtime: Some("/usr/bin/node".into()),
+            env_policy: "cleared".into(),
+            heap_limit_mib: 512,
+            output_limit_bytes: 2 * 1024 * 1024,
+            timeout_secs: 120,
+            fs_policy: "fs-write=scratch-only".into(),
+            permission_flag: Some("--permission".into()),
+            scratch_dir: Some("/tmp/scratch".into()),
+            resource_guards: "rlimit_as=enforced(1024MiB)".into(),
+        };
+        let summary = sandbox_summary(&facts);
+        assert!(summary.contains("runtime=/usr/bin/node"), "{summary}");
+        assert!(summary.contains("env=cleared"), "{summary}");
+        assert!(summary.contains("heap_limit_mib=512"), "{summary}");
+        assert!(summary.contains("fs=fs-write=scratch-only"), "{summary}");
+        assert!(
+            summary.contains("permission_flag=--permission"),
+            "{summary}"
+        );
+        assert!(summary.contains("scratch=/tmp/scratch"), "{summary}");
+        assert!(summary.contains("guards=rlimit_as=enforced"), "{summary}");
+
+        // Unavailable sandbox: the facts stay honest.
+        let summary = sandbox_summary(&SandboxFacts::default());
+        assert!(summary.contains("runtime=unavailable"), "{summary}");
     }
 
     /// Issue #134 review: a registry entry that cannot be a portable binding

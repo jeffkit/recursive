@@ -52,7 +52,13 @@ impl StaticBreakdownCache {
             }
         }
         Self {
-            system_prompt: estimate_tokens(&segments.system_prompt),
+            // Issue #134 W2: the run_code pointer is appended to the joined
+            // prompt after assembly, so it can never sit in an assembly-time
+            // bucket — count it here, inside `system_prompt`, where the
+            // prompt's static cost lives. Empty for every session without
+            // run_code (zero-cost no-op).
+            system_prompt: estimate_tokens(&segments.system_prompt)
+                .saturating_add(estimate_tokens(&segments.run_code_pointer)),
             rules: estimate_tokens(&segments.rules),
             skills: estimate_tokens(&segments.skills),
             subagents: estimate_tokens(&segments.subagents),

@@ -377,6 +377,49 @@ pub enum AgentEvent {
         /// The event the worker's own runtime emitted.
         event: Box<AgentEvent>,
     },
+
+    // ── Issue #134 W2: programmatic tool calling (run_code) ───────────────
+    /// A `run_code` (programmatic tool calling) run started. Emitted once,
+    /// right before the runtime subprocess is spawned, so a consumer can
+    /// open a "program running…" span and measure the wall-clock gap to
+    /// [`Self::ProgrammaticRunFinished`]. The program's *inner* tool calls
+    /// deliberately have no per-call events — a batch of N calls would
+    /// otherwise dilute into N `ToolCall` frames and hide the very
+    /// batching value PTC exists for; the aggregate arrives with the
+    /// finish event.
+    ProgrammaticRunStarted {
+        /// The 1-based ReAct step whose assistant message issued the run.
+        step: usize,
+        /// Size of the program source in bytes.
+        program_chars: usize,
+    },
+    /// A `run_code` run finished. Emitted exactly once per run, after the
+    /// report is rendered — the terminal bookend of
+    /// [`Self::ProgrammaticRunStarted`]. `status` is the failure-taxonomy
+    /// string the model itself sees in the rendered observation
+    /// (`"ok"`, `"timeout"`, `"output-limit"`, `"heap-limit"`,
+    /// `"protocol"`, `"sandbox-unavailable"`, …), so a consumer never has
+    /// to re-derive it from the output text. `calls` counts the program's
+    /// inner tool calls — the batching win (one step instead of N
+    /// round-trips) is `calls` against one `ProgrammaticRunStarted`.
+    ProgrammaticRunFinished {
+        /// The 1-based ReAct step whose assistant message issued the run.
+        step: usize,
+        /// `true` when the program completed without hitting its budgets
+        /// (`status == "ok"`).
+        success: bool,
+        /// The failure-taxonomy status string (`"ok"`, `"timeout"`, …).
+        status: String,
+        /// How many inner tool calls the program made.
+        calls: usize,
+        /// Wall-clock duration of the whole run, in ms.
+        duration_ms: u64,
+        /// The sandbox facts the run reported, rendered as the same
+        /// `key=value` lines the model's observation carries (runtime,
+        /// env policy, budgets, fs policy, guards). Redacted form is the
+        /// caller's business — these lines contain no program output.
+        sandbox_summary: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,6 +1122,18 @@ mod tests {
                     cache_miss_tokens: 4,
                     step: 2,
                 }),
+            },
+            AgentEvent::ProgrammaticRunStarted {
+                step: 3,
+                program_chars: 512,
+            },
+            AgentEvent::ProgrammaticRunFinished {
+                step: 3,
+                success: true,
+                status: "ok".into(),
+                calls: 5,
+                duration_ms: 1_234,
+                sandbox_summary: "runtime=/usr/bin/node env=cleared".into(),
             },
         ];
 

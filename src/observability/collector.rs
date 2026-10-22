@@ -235,6 +235,12 @@ pub struct RunCollector {
     retries: u32,
     retry_classes: RetryClasses,
     compactions: u32,
+    /// Issue #134 W2: how many `run_code` program runs started under this
+    /// run — the batching story (`AgentEvent::ProgrammaticRunStarted`).
+    programmatic_runs: u32,
+    /// Issue #134 W2: inner tool calls the programs made in total — the
+    /// round-trips one program step replaced.
+    programmatic_calls: u32,
     finish_reason: Option<String>,
     error: Option<String>,
 }
@@ -256,6 +262,8 @@ impl RunCollector {
             retries: 0,
             retry_classes: RetryClasses::default(),
             compactions: 0,
+            programmatic_runs: 0,
+            programmatic_calls: 0,
             finish_reason: None,
             error: None,
         }
@@ -391,6 +399,14 @@ impl RunCollector {
             | AgentEvent::CompactionSkipped { .. } => {
                 self.compactions = self.compactions.saturating_add(1);
             }
+            // Issue #134 W2: PTC lifecycle is counted, not rendered — the
+            // trace metadata carries the batching story (runs, inner calls).
+            AgentEvent::ProgrammaticRunStarted { .. } => {
+                self.programmatic_runs = self.programmatic_runs.saturating_add(1);
+            }
+            AgentEvent::ProgrammaticRunFinished { calls, .. } => {
+                self.programmatic_calls = self.programmatic_calls.saturating_add(*calls as u32);
+            }
             AgentEvent::TurnFinished { reason, .. } => {
                 self.finish_reason = Some(reason.clone());
                 self.turn = self.turn.saturating_add(1);
@@ -489,6 +505,14 @@ impl RunCollector {
             (
                 format!("{TRACE_METADATA_PREFIX}compactions"),
                 AttrValue::Int(i64::from(self.compactions)),
+            ),
+            (
+                format!("{TRACE_METADATA_PREFIX}run_code_runs"),
+                AttrValue::Int(i64::from(self.programmatic_runs)),
+            ),
+            (
+                format!("{TRACE_METADATA_PREFIX}run_code_calls"),
+                AttrValue::Int(i64::from(self.programmatic_calls)),
             ),
             (
                 ATTR_OBSERVATION_TYPE.to_string(),
@@ -1163,6 +1187,40 @@ mod tests {
         assert_eq!(
             attr(root, &format!("{TRACE_METADATA_PREFIX}compactions")),
             Some(&AttrValue::Int(2))
+        );
+    }
+
+    /// Issue #134 W2: PTC lifecycle is counted, not rendered — the trace
+    /// metadata carries the batching story (runs started, inner calls).
+    #[test]
+    fn run_code_lifecycle_is_counted_on_the_root() {
+        let mut c = collector();
+        c.ingest(
+            &AgentEvent::ProgrammaticRunStarted {
+                step: 2,
+                program_chars: 512,
+            },
+            at(1),
+        );
+        c.ingest(
+            &AgentEvent::ProgrammaticRunFinished {
+                step: 2,
+                success: true,
+                status: "ok".into(),
+                calls: 5,
+                duration_ms: 1_234,
+                sandbox_summary: "runtime=node".into(),
+            },
+            at(2),
+        );
+        let root = &c.records()[0];
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}run_code_runs")),
+            Some(&AttrValue::Int(1))
+        );
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}run_code_calls")),
+            Some(&AttrValue::Int(5))
         );
     }
 

@@ -213,6 +213,7 @@ mod tests {
             last_prompt: Some("working".into()),
             cost: None,
             preset: None,
+            run_code: None,
             name: None,
             derived_from: None,
             finish_reason: None,

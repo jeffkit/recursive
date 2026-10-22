@@ -2558,9 +2558,10 @@ fn gap_event(resume_id: Option<String>) -> Event {
     Event::default().event("gap").data(data)
 }
 
-/// Render one [`SseFrame`] as an SSE [`Event`], typed by its payload variant.
-fn sse_frame_event(SseFrame { id, event }: SseFrame) -> Result<Event, Infallible> {
-    let event_type = match &event {
+/// The SSE `event:` name for one [`SseEvent`] payload variant. Split out of
+/// [`sse_frame_event`] so tests can pin the wire names.
+fn sse_event_type(event: &SseEvent) -> &'static str {
+    match event {
         SseEvent::Message { .. } => "message",
         SseEvent::PartialMessage { .. } => "partial_message",
         SseEvent::ToolCall { .. } => "tool_call",
@@ -2573,7 +2574,14 @@ fn sse_frame_event(SseFrame { id, event }: SseFrame) -> Result<Event, Infallible
         SseEvent::GoalAchieved { .. } => "goal_achieved",
         SseEvent::ToolProgress { .. } => "tool_progress",
         SseEvent::Usage { .. } => "usage",
-    };
+        SseEvent::ProgrammaticRunStarted { .. } => "programmatic_run_started",
+        SseEvent::ProgrammaticRunFinished { .. } => "programmatic_run_finished",
+    }
+}
+
+/// Render one [`SseFrame`] as an SSE [`Event`], typed by its payload variant.
+fn sse_frame_event(SseFrame { id, event }: SseFrame) -> Result<Event, Infallible> {
+    let event_type = sse_event_type(&event);
     let data = serde_json::to_string(&event).unwrap_or_default();
     // Issue #117: the frame carries its timeline id so clients can
     // order/dedupe across turns and know where they left off.
@@ -2657,6 +2665,31 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<SseEvent> {
             cache_hit_tokens: *cache_hit_tokens,
             cache_miss_tokens: *cache_miss_tokens,
             step: *step,
+        }),
+        // Issue #134 W2: the run_code lifecycle bookends surface as typed
+        // SSE events — a streaming client sees the batching win (N inner
+        // tool calls behind one step) instead of a black-box tool result.
+        AgentEvent::ProgrammaticRunStarted {
+            step,
+            program_chars,
+        } => Some(SseEvent::ProgrammaticRunStarted {
+            step: *step,
+            program_chars: *program_chars,
+        }),
+        AgentEvent::ProgrammaticRunFinished {
+            step,
+            success,
+            status,
+            calls,
+            duration_ms,
+            sandbox_summary,
+        } => Some(SseEvent::ProgrammaticRunFinished {
+            step: *step,
+            success: *success,
+            status: status.clone(),
+            calls: *calls,
+            duration_ms: *duration_ms,
+            sandbox_summary: sandbox_summary.clone(),
         }),
         // AssistantText, Latency, Compacted, PlanConfirmed, PlanRejected
         // don't have SSE equivalents (AssistantText is intentionally
@@ -6363,6 +6396,70 @@ mod tests {
             }
             other => panic!("expected GoalAchieved, got {other:?}"),
         }
+    }
+
+    /// Issue #134 W2: the run_code lifecycle bookends surface as typed SSE
+    /// frames (named `programmatic_run_*` on the wire) — kills
+    /// delete-match-arm on the two PTC mappings.
+    #[test]
+    fn map_agent_event_forwards_programmatic_run_events() {
+        match map_agent_event(&AgentEvent::ProgrammaticRunStarted {
+            step: 3,
+            program_chars: 512,
+        }) {
+            Some(SseEvent::ProgrammaticRunStarted {
+                step,
+                program_chars,
+            }) => {
+                assert_eq!(step, 3);
+                assert_eq!(program_chars, 512);
+            }
+            other => panic!("expected ProgrammaticRunStarted, got {other:?}"),
+        }
+        match map_agent_event(&AgentEvent::ProgrammaticRunFinished {
+            step: 3,
+            success: true,
+            status: "ok".into(),
+            calls: 5,
+            duration_ms: 1_234,
+            sandbox_summary: "runtime=/usr/bin/node env=cleared".into(),
+        }) {
+            Some(SseEvent::ProgrammaticRunFinished {
+                step,
+                success,
+                status,
+                calls,
+                duration_ms,
+                sandbox_summary,
+            }) => {
+                assert_eq!(step, 3);
+                assert!(success);
+                assert_eq!(status, "ok");
+                assert_eq!(calls, 5);
+                assert_eq!(duration_ms, 1_234);
+                assert!(sandbox_summary.contains("runtime="));
+            }
+            other => panic!("expected ProgrammaticRunFinished, got {other:?}"),
+        }
+        // And the frames carry their wire event names for the SSE stream.
+        assert_eq!(
+            sse_event_type(&SseEvent::ProgrammaticRunStarted {
+                step: 3,
+                program_chars: 512
+            }),
+            "programmatic_run_started"
+        );
+        assert_eq!(
+            sse_event_type(&SseEvent::ProgrammaticRunFinished {
+                step: 3,
+                success: false,
+                status: "timeout".into(),
+                calls: 1,
+                duration_ms: 5,
+                sandbox_summary: String::new(),
+            }),
+            "programmatic_run_finished"
+        );
     }
 
     #[test]

@@ -169,6 +169,7 @@ impl SessionWriter {
             last_prompt: None,
             cost: None,
             preset: preset.map(|s| s.to_string()),
+            run_code: None,
             name: None,
             derived_from: None,
             finish_reason: None,
@@ -248,6 +249,7 @@ impl SessionWriter {
             last_prompt: None,
             cost: None,
             preset: preset.map(|s| s.to_string()),
+            run_code: None,
             name: None,
             derived_from: None,
             finish_reason: None,
@@ -670,7 +672,6 @@ impl SessionWriter {
     }
 
     /// Record the identity that owns this session (issue #152).
-    ///
     /// Called once, when a caller-addressed session (an AG-UI thread) is
     /// first created. Like [`SessionWriter::set_derived_from`] this is a
     /// read-modify-write on `.meta.json` rather than a value held until
@@ -692,6 +693,31 @@ impl SessionWriter {
         };
         meta.owner = Some(owner.to_string());
         meta.tenant = tenant.map(|t| t.to_string());
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
+        }
+    }
+
+    /// Stamp the session's effective `run_code` state (issue #134 W2).
+    ///
+    /// Called by resume-style entries right after `open_existing`, so the
+    /// creation-time capability bit survives on disk: a later resume (or
+    /// another reader such as `sessions list`) can tell whether the session
+    /// runs with programmatic tool calling without re-deriving it from an
+    /// env that may no longer be set. Read-modify-write on `.meta.json`,
+    /// best-effort like [`Self::set_derived_from`].
+    pub fn set_run_code(&mut self, enabled: bool) {
+        let meta_path = self.session_dir.join(".meta.json");
+        let Ok(bytes) = std::fs::read(&meta_path) else {
+            return;
+        };
+        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
+            return;
+        };
+        if meta.run_code == Some(enabled) {
+            return;
+        }
+        meta.run_code = Some(enabled);
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
         }
@@ -971,6 +997,36 @@ mod tests {
         assert_eq!(meta.preset.as_deref(), Some("deepseek"));
         // Session content untouched by the identity rewrite.
         assert_eq!(meta.message_count, 1);
+    }
+
+    /// Issue #134 W2: `set_run_code` persists the sticky capability bit to
+    /// `.meta.json`, so a later resume can honour the creation-time contract.
+    #[test]
+    fn set_run_code_persists_the_sticky_bit() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-run-code");
+
+        let meta_after = |writer: SessionWriter| {
+            drop(writer);
+            SessionReader::load_meta(&dir).unwrap().run_code
+        };
+
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        writer.set_run_code(true);
+        writer.finish(SessionStatus::Active).unwrap();
+        assert_eq!(meta_after(writer), Some(true), "the bit must reach disk");
+
+        // Re-stamping the same value is a no-op (still true).
+        let mut writer2 = SessionWriter::open_existing(&dir).unwrap();
+        writer2.set_run_code(true);
+        writer2.finish(SessionStatus::Active).unwrap();
+        assert_eq!(meta_after(writer2), Some(true));
+
+        // Flipping to false is recorded — a *recorded* off, not an absence.
+        let mut writer3 = SessionWriter::open_existing(&dir).unwrap();
+        writer3.set_run_code(false);
+        writer3.finish(SessionStatus::Active).unwrap();
+        assert_eq!(meta_after(writer3), Some(false));
     }
 
     #[test]

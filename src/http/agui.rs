@@ -286,6 +286,44 @@ impl AguiConverter {
                     base: ag::BaseEvent::default(),
                 }));
             }
+            // Issue #134 W2: run_code lifecycle bookends ride AG-UI's Custom
+            // channel (the protocol's extension point) so an AG-UI client can
+            // show the batching win — N inner tool calls behind one step —
+            // without us inventing protocol variants.
+            AgentEvent::ProgrammaticRunStarted {
+                step,
+                program_chars,
+            } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/run_code_started".into(),
+                    value: serde_json::json!({
+                        "step": step,
+                        "programChars": program_chars,
+                    }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
+            AgentEvent::ProgrammaticRunFinished {
+                step,
+                success,
+                status,
+                calls,
+                duration_ms,
+                sandbox_summary,
+            } => {
+                out.push(ag::Event::Custom(ag::Custom {
+                    name: "agui-tui/run_code_finished".into(),
+                    value: serde_json::json!({
+                        "step": step,
+                        "success": success,
+                        "status": status,
+                        "calls": calls,
+                        "durationMs": duration_ms,
+                        "sandboxSummary": sandbox_summary,
+                    }),
+                    base: ag::BaseEvent::default(),
+                }));
+            }
             // checkpoint_post is emitted directly by the driver task (not via
             // AguiConverter) after RunFinished so it lands last.
             // heartbeat is emitted as an SSE comment at the HTTP layer.
@@ -1921,6 +1959,49 @@ mod tests {
         assert!(matches!(tail[1], ag::Event::TextMessageStart(_)));
         assert!(matches!(&tail[2], ag::Event::TextMessageContent(c) if c.delta == "xyz"));
         assert!(matches!(tail[3], ag::Event::TextMessageEnd(_)));
+    }
+
+    /// Issue #134 W2: the run_code lifecycle rides AG-UI's Custom channel —
+    /// the client sees the batching win without new protocol variants.
+    /// Kills delete-match-arm on the two PTC converter arms.
+    #[test]
+    fn run_code_lifecycle_piggybacks_on_custom_events() {
+        use agui_protocol as ag;
+
+        let mut conv = AguiConverter::new();
+        let started = conv.convert(&AgentEvent::ProgrammaticRunStarted {
+            step: 2,
+            program_chars: 256,
+        });
+        assert_eq!(started.len(), 1, "{started:?}");
+        match &started[0] {
+            ag::Event::Custom(c) => {
+                assert_eq!(c.name, "agui-tui/run_code_started");
+                assert_eq!(c.value["step"], 2);
+                assert_eq!(c.value["programChars"], 256);
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+
+        let finished = conv.convert(&AgentEvent::ProgrammaticRunFinished {
+            step: 2,
+            success: true,
+            status: "ok".into(),
+            calls: 5,
+            duration_ms: 1_234,
+            sandbox_summary: "runtime=/usr/bin/node".into(),
+        });
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        match &finished[0] {
+            ag::Event::Custom(c) => {
+                assert_eq!(c.name, "agui-tui/run_code_finished");
+                assert_eq!(c.value["status"], "ok");
+                assert_eq!(c.value["calls"], 5);
+                assert_eq!(c.value["durationMs"], 1_234);
+                assert_eq!(c.value["success"], true);
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
     }
 
     // ── thread-id mapping properties (live blake3 mapping) ───────────────

@@ -663,6 +663,34 @@ pub enum SseEvent {
         cache_miss_tokens: u32,
         step: usize,
     },
+    /// Issue #134 W2: a `run_code` (programmatic tool calling) program
+    /// started. The bookend of [`SseEvent::ProgrammaticRunFinished`] — one
+    /// pair per program run, never one frame per inner tool call.
+    ProgrammaticRunStarted {
+        /// The 1-based ReAct step whose assistant message issued the run.
+        step: usize,
+        /// Size of the program source in bytes.
+        program_chars: usize,
+    },
+    /// Issue #134 W2: a `run_code` program finished. `status` is the
+    /// failure-taxonomy string the model itself sees (`"ok"`, `"timeout"`,
+    /// …); `calls` counts the program's inner tool calls — the batching
+    /// win is `calls` against one `ProgrammaticRunStarted`.
+    ProgrammaticRunFinished {
+        step: usize,
+        /// `true` when the program completed without hitting its budgets.
+        success: bool,
+        /// The failure-taxonomy status string (`"ok"`, `"timeout"`, …).
+        status: String,
+        /// How many inner tool calls the program made.
+        calls: usize,
+        /// Wall-clock duration of the whole run, in ms.
+        duration_ms: u64,
+        /// The sandbox facts the run reported, as `key=value` lines
+        /// (runtime, env policy, budgets, fs policy, guards) — no program
+        /// output, nothing to redact.
+        sandbox_summary: String,
+    },
 }
 
 /// One SSE frame: an [`SseEvent`] plus the `id:` that pins it to the session
@@ -888,6 +916,7 @@ pub(crate) fn test_config_stub() -> crate::config::Config {
         stuck_window: 10,
         stuck_error_rate: 0.8,
         max_concurrent_runs: 8,
+        session_run_code: None,
         goal_eval_transcript_tail: 12,
         web_search_provider: None,
         web_search_api_key: None,
@@ -2748,6 +2777,7 @@ mod goal_396_persistence_tests {
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,

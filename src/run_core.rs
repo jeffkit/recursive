@@ -4822,6 +4822,7 @@ mod tests {
             skills: String::new(),
             subagents: String::new(),
             environment: String::new(),
+            run_code_pointer: String::new(),
         });
 
         let outcome = core.run_inner().await.expect("run_inner must not error");
@@ -4897,6 +4898,7 @@ mod tests {
             skills: "abcde".into(),             // 5 chars → 2 tokens (5/4=1.25, ceil=2)
             subagents: "abcdefgh".into(),       // 8 chars → 2 tokens (8/4=2.0, ceil=2)
             environment: String::new(),
+            run_code_pointer: String::new(),
         };
         let registry = crate::tools::ToolRegistry::default();
         let cache = StaticBreakdownCache::build(&segments, &[], &registry);
@@ -4904,6 +4906,29 @@ mod tests {
         assert_eq!(cache.system_prompt, 3, "10 chars / 4 = 2.5 → ceil = 3");
         assert_eq!(cache.skills, 2, "5 chars / 4 = 1.25 → ceil = 2");
         assert_eq!(cache.subagents, 2, "8 chars / 4 = 2.0 → ceil = 2");
+    }
+
+    /// Issue #134 W2: the run_code pointer is appended to the prompt after
+    /// assembly, so it rides in its own PromptSegments bucket — and the
+    /// estimator folds it into `system_prompt`, where the prompt's static
+    /// cost lives (Goal-328 contract: nothing in `full` escapes the
+    /// breakdown estimate).
+    #[test]
+    fn run_code_pointer_counts_into_the_system_prompt_bucket() {
+        let segments = crate::system_prompt::PromptSegments {
+            system_prompt: "1234567890".into(), // 10 chars → 3 tokens
+            run_code_pointer: crate::system_prompt::RUN_CODE_POINTER_SEGMENT.into(),
+            ..Default::default()
+        };
+        let registry = crate::tools::ToolRegistry::default();
+        let cache = StaticBreakdownCache::build(&segments, &[], &registry);
+        let pointer = crate::llm::estimate_tokens(crate::system_prompt::RUN_CODE_POINTER_SEGMENT);
+        assert!(pointer > 0, "the pointer segment must be non-empty");
+        assert_eq!(
+            cache.system_prompt,
+            3 + pointer,
+            "pointer bytes must land in the system_prompt bucket"
+        );
     }
 
     #[test]

@@ -229,6 +229,13 @@ pub(crate) async fn cmd_resume(
     // longer exists still refuses below.
     let meta = recursive::session::SessionReader::load_meta(&session_dir)
         .with_context(|| format!("reading .meta.json for session {}", session_dir.display()))?;
+    // Issue #134 W2: the session's recorded `run_code` bit feeds the sticky
+    // reconciliation in `build_runtime` — a resume without
+    // `RECURSIVE_RUN_CODE` must keep the creation-time state, and an
+    // explicit env this process overrides it (both paths WARN on
+    // divergence). `None` (pre-W2 session) changes nothing.
+    let mut config = config;
+    config.session_run_code = meta.run_code;
     let (tools, _) = build_tools(&config, None).await;
     let specs = tools.specs();
     let current_hash = recursive::session::hash_tool_specs(&specs);
@@ -628,6 +635,15 @@ fn resume_banner_enabled(json_mode: bool) -> bool {
     !json_mode
 }
 
+/// Whether a run's effective `run_code` state is knowable before the runtime
+/// is built — the library helper overlays the sticky session bit on the
+/// resolved preset (issue #134 W2). `None` is not produced here — the
+/// caller only writes the bit when the resolve succeeds, mirroring
+/// `build_runtime`'s hard-fail on an unknown preset.
+fn effective_run_code(config: &recursive::config::Config) -> Option<bool> {
+    recursive::preset::effective_run_code(config)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_resumed(
     config: recursive::config::Config,
@@ -652,6 +668,10 @@ pub(crate) async fn run_resumed(
 ) -> anyhow::Result<()> {
     let seed_len = seed.len();
 
+    // Issue #134 W2: the legacy `--resume-from <file>` path creates a FRESH
+    // session — write the run's effective run_code state so the new meta
+    // carries the same sticky bit a `resume`-created session has. (`cmd_resume`
+    // appends to an existing session, whose bit is already on disk.)
     let session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>> =
         if let Some(w) = existing_writer {
             let display_path = w
@@ -671,7 +691,10 @@ pub(crate) async fn run_resumed(
                 &[],
                 config.preset.as_deref(),
             ) {
-                Ok(writer) => {
+                Ok(mut writer) => {
+                    if let Some(effective) = effective_run_code(&config) {
+                        writer.set_run_code(effective);
+                    }
                     eprintln!("session: recording to {}", writer.session_dir().display());
                     Some(Arc::new(std::sync::Mutex::new(writer)))
                 }
@@ -1269,6 +1292,7 @@ mod tests {
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,

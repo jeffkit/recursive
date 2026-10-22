@@ -2702,6 +2702,12 @@ async fn run_loop(
                 if let Some(ref name) = config.session_name {
                     writer.set_name(name.as_str());
                 }
+                // Issue #134 W2: stamp the run's effective run_code state so
+                // the session meta carries the sticky bit a later resume
+                // honours.
+                if let Some(effective) = recursive::preset::effective_run_code(&config) {
+                    writer.set_run_code(effective);
+                }
                 if !json_mode {
                     eprintln!("session: recording to {}", writer.session_dir().display());
                 }
@@ -2985,6 +2991,12 @@ async fn run_once(
             Ok(mut writer) => {
                 if let Some(ref name) = config.session_name {
                     writer.set_name(name.as_str());
+                }
+                // Issue #134 W2: stamp the run's effective run_code state so
+                // the session meta carries the sticky bit a later resume
+                // honours.
+                if let Some(effective) = recursive::preset::effective_run_code(&config) {
+                    writer.set_run_code(effective);
                 }
                 if !json_mode {
                     eprintln!("session: recording to {}", writer.session_dir().display());
@@ -3933,7 +3945,14 @@ fn start_fresh_weixin_session(
         &config.provider_type,
         config.preset.as_deref(),
     ) {
-        Ok(w) => w,
+        Ok(mut w) => {
+            // Issue #134 W2: stamp the sticky run_code bit on every created
+            // session so a later resume honours the creation-time contract.
+            if let Some(effective) = recursive::preset::effective_run_code(config) {
+                w.set_run_code(effective);
+            }
+            w
+        }
         Err(e) => {
             tracing::warn!("WeChat: could not create a session: {e}");
             return None;
@@ -4027,6 +4046,7 @@ mod tests {
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,

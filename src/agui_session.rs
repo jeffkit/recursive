@@ -446,6 +446,7 @@ fn synthesize_meta_if_missing(dir: &Path, thread_id: &str) {
         last_prompt: None,
         cost: None,
         preset: None,
+        run_code: None,
         name,
         derived_from: None,
         finish_reason: None,

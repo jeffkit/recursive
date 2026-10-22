@@ -1008,6 +1008,7 @@ mod tests {
             last_prompt: Some("hi".into()),
             cost: None,
             preset: None,
+            run_code: None,
             name: Some("focused".into()),
             derived_from: None,
             finish_reason: None,

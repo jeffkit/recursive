@@ -230,6 +230,9 @@ fn build_meta(input: &MirrorInput<'_>) -> SessionMeta {
         last_prompt,
         cost: input.cost.clone(),
         preset: input.preset.map(|s| s.to_string()),
+        // The mirror mirrors the session's creation-time capability bit; the
+        // live session row (issue #98 blob) owns the authoritative value.
+        run_code: None,
         name: input.name.map(|s| s.to_string()),
         derived_from: None,
         finish_reason: None,

@@ -591,6 +591,16 @@ pub struct SessionMeta {
     /// session files round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// Issue #134 W2: whether the session was created with the `run_code`
+    /// tool (programmatic tool calling) effectively enabled. `Some(true)` /
+    /// `Some(false)` is written at creation from the resolved tool profile;
+    /// resume honours it (sticky) instead of re-deriving from the ambient
+    /// env — an env-less resume must not silently drop run_code (owner
+    /// ruling: any degradation is observable). `None` for sessions written
+    /// before the field existed. Deliberately NOT named `preset` — this is
+    /// a per-session capability bit, not a preset id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_code: Option<bool>,
     /// Optional human-readable display name for this session, set via `--name`.
     /// Shown in the /resume picker and `sessions list` output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1516,6 +1526,7 @@ mod tests {
             last_prompt: None,
             cost: None,
             preset: None,
+            run_code: None,
             name: None,
             derived_from: None,
             finish_reason: None,
@@ -1536,6 +1547,48 @@ mod tests {
         assert_eq!(restored.schema_version, 1);
         assert_eq!(restored.session_id, original.session_id);
         assert_eq!(restored.goal, original.goal);
+    }
+
+    /// Issue #134 W2: the `run_code` capability bit is optional on disk —
+    /// absent on pre-W2 files, skipped when `None`, and round-trips when
+    /// set. An absent field must never read back as `Some(false)`.
+    #[test]
+    fn session_meta_run_code_field_is_optional_and_round_trips() {
+        // Absent (pre-W2 file): deserialises to None.
+        let legacy = serde_json::json!({
+            "session_id": "s1",
+            "goal": "g",
+            "model": "m",
+            "provider": "p",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "message_count": 0,
+            "status": "active"
+        });
+        let restored: SessionMeta = serde_json::from_value(legacy).expect("legacy meta must load");
+        assert_eq!(restored.run_code, None, "no key must read back as None");
+
+        // None serialises the key away (keeps pre-W2 readers clean).
+        let meta = meta_for_test(SUPPORTED_SESSION_SCHEMA_VERSION);
+        let json = serde_json::to_string(&meta).expect("serialize");
+        assert!(
+            !json.contains("run_code"),
+            "None must be skipped on serialize: {json}"
+        );
+
+        // Some(true) round-trips.
+        let mut on = meta_for_test(SUPPORTED_SESSION_SCHEMA_VERSION);
+        on.run_code = Some(true);
+        let json = serde_json::to_string(&on).expect("serialize");
+        let back: SessionMeta = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.run_code, Some(true));
+
+        // Some(false) is preserved — it is a *recorded* off, not an absence.
+        let mut off = meta_for_test(SUPPORTED_SESSION_SCHEMA_VERSION);
+        off.run_code = Some(false);
+        let json = serde_json::to_string(&off).expect("serialize");
+        let back: SessionMeta = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.run_code, Some(false));
     }
 
     #[test]

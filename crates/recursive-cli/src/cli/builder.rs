@@ -766,13 +766,21 @@ pub(crate) async fn build_runtime(
     // it: an explicit id would come from the channel, otherwise
     // `RECURSIVE_AGENT_PRESET` decides, otherwise `standard`. An unknown id is
     // a hard error — the preset decides how the session runs.
-    let preset = recursive::preset::resolve_session(
+    let mut preset = recursive::preset::resolve_session(
         None,
         config,
         &recursive::preset::PresetEnv::from_process(),
     )?;
-    // MCP + touched-files + coordinator pruning all live in one shared tail
-    // (issues #70 / #65) so channels cannot drift apart.
+    // Issue #134 W2: reconcile the session's sticky `run_code` bit before the
+    // resolved profile reaches the assembly. A resume without the env keeps
+    // the creation-time state; an explicit RECURSIVE_RUN_CODE this process
+    // overrides it — every divergence WARNs with both values (owner ruling:
+    // no silent drift).
+    recursive::preset::reconcile_session_run_code(
+        &mut preset,
+        config.session_run_code,
+        &recursive::preset::PresetEnv::from_process(),
+    );
     let elicitation = recursive::mcp::new_elicitation_slot();
     let mut tools = finish_tool_surface(tools, config, mcp_config, Some(elicitation)).await;
 
@@ -847,12 +855,23 @@ pub(crate) async fn build_runtime(
     // post-compaction re-injection and the plan-mode tool gate. Resolved once,
     // here: an explicit id would come from the channel, otherwise
     // `RECURSIVE_AGENT_PRESET` decides, otherwise `standard`. An unknown id is
-    // a hard error — the preset decides how the session runs.
-    let preset = recursive::preset::resolve_session(
+    // a hard error — the preset decides how the session runs. The re-resolve
+    // after prompt assembly is the same declaration again (the first one fed
+    // the prompt profile); the sticky `run_code` reconcile below applies to
+    // whichever instance feeds `preset::apply`.
+    let mut preset = recursive::preset::resolve_session(
         None,
         config,
         &recursive::preset::PresetEnv::from_process(),
     )?;
+    // Issue #134 W2: the tool-profile half must see the same sticky
+    // reconciliation as the prompt half above, or the run_code gate drifts
+    // from the pointer line.
+    recursive::preset::reconcile_session_run_code(
+        &mut preset,
+        config.session_run_code,
+        &recursive::preset::PresetEnv::from_process(),
+    );
 
     let mut builder = AgentRuntimeBuilder::new()
         .llm(provider)
@@ -1204,6 +1223,7 @@ mod tests {
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,

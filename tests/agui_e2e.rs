@@ -127,6 +127,7 @@ fn mock_config(workspace: PathBuf) -> Config {
         stuck_error_rate: 0.8,
 
         max_concurrent_runs: 8,
+        session_run_code: None,
         goal_eval_transcript_tail: 12,
         web_search_provider: None,
         web_search_api_key: None,

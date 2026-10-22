@@ -710,9 +710,140 @@ pub static MINIMAL: AgentPreset = AgentPreset {
     capabilities: MINIMAL_CAPABILITIES,
 };
 
+/// Capability inventory of the `standard-ptc` preset — STANDARD's rows with
+/// the PTC row flipped on. Declared separately (not derived) so the
+/// inventory stays a flat, greppable list like every other preset's.
+static STANDARD_PTC_CAPABILITIES: &[Capability] = &[
+    Capability {
+        name: "cross-turn-compaction",
+        default: CapabilityDefault::Enabled,
+        toggle: COMPACT_THRESHOLD_ENV,
+        note: "LLM-summary compaction when the transcript outgrows the model's window; \
+               the threshold auto-derives from the model unless the env var pins it.",
+    },
+    Capability {
+        name: "proactive-tool-result-pruning",
+        default: CapabilityDefault::Disabled,
+        toggle: MICROCOMPACT_TRIGGER_ENV,
+        note: "no-LLM microcompaction; opt-in because the old default fired at ~5% of a \
+               1M-token window.",
+    },
+    Capability {
+        name: "transcript-char-cap",
+        default: CapabilityDefault::Disabled,
+        toggle: MAX_TRANSCRIPT_CHARS_ENV,
+        note: "pre-turn hard trim of the transcript; unset means unlimited.",
+    },
+    Capability {
+        name: "recently-read-file-reinjection",
+        default: CapabilityDefault::Enabled,
+        toggle: REINJECT_FILES_ENV,
+        note: "re-attach the last N read files as System messages after compaction, so \
+               the model does not pay to re-read them.",
+    },
+    Capability {
+        name: "invoked-skill-reinjection",
+        default: CapabilityDefault::Enabled,
+        toggle: REINJECT_SKILLS_ENV,
+        note: "re-attach invoked skill bodies after compaction, so the model keeps \
+               following them.",
+    },
+    Capability {
+        name: "plan-mode-tools",
+        default: CapabilityDefault::Enabled,
+        toggle: "",
+        note: "enter_plan_mode / exit_plan_mode / request_plan_mode; also requires an \
+               interactive channel to answer the approval prompt.",
+    },
+    Capability {
+        name: "programmatic-tool-calling",
+        default: CapabilityDefault::Enabled,
+        toggle: RUN_CODE_ENV,
+        note: "`run_code`: the model writes a program that calls tools as async functions, \
+               so a batch of ≥5 calls plus its aggregation costs one step instead of many. \
+               ON here — it executes model-authored code in a subprocess (the operator's \
+               explicit opt-in is choosing this preset); `RECURSIVE_RUN_CODE=off` still \
+               forces it off.",
+    },
+    Capability {
+        name: "goal-based-skill-injection",
+        default: CapabilityDefault::Enabled,
+        toggle: "",
+        note: "auto-load skill bodies matching the session goal; requires a goal at \
+               prompt-build time (CLI run, not HTTP sessions).",
+    },
+    Capability {
+        name: "subagent-delegation",
+        default: CapabilityDefault::Disabled,
+        toggle: "RECURSIVE_SUBAGENT_ENABLED",
+        note: "the `agent` tool plus the coordinator prompt; channel-agnostic, switched \
+               on when the operator enables it.",
+    },
+    Capability {
+        name: "self-scheduling-wakeup",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "ScheduleWakeup for loop / TUI sessions; registered by channels that own a \
+               wakeup slot.",
+    },
+    Capability {
+        name: "skill-install-tool",
+        default: CapabilityDefault::Disabled,
+        toggle: "",
+        note: "InstallSkill; TUI-only because it prompts through the UI channel.",
+    },
+    Capability {
+        name: "mcp-tools",
+        default: CapabilityDefault::Disabled,
+        toggle: "RECURSIVE_MCP_CONFIG",
+        note: "mcp__* tools; added to the process-wide registry at startup.",
+    },
+];
+
+/// The built-in `standard-ptc` preset (issue #134 W2): the `standard`
+/// session with programmatic tool calling on. Everything else — prompt
+/// profile, context management, plan-mode gate — is byte-for-byte the
+/// `standard` declaration; this preset exists so the operator has a
+/// one-name opt-in instead of remembering `RECURSIVE_RUN_CODE`.
+pub static STANDARD_PTC: AgentPreset = AgentPreset {
+    id: "standard-ptc",
+    description: "General coding session with programmatic tool calling: the `standard` \
+                  preset plus the RunCode tool — the model may run a JavaScript program \
+                  that batches many tool calls into one step. The program executes on the \
+                  host in a fresh Node subprocess (empty env, time / output / heap \
+                  budgets, Node permission model seat belt) — that host-execution cost \
+                  is what opting in buys.",
+    prompt: PromptProfile {
+        complete: None,
+        persona_suffix: None,
+        auto_skill_injection: true,
+        skill_catalog: true,
+    },
+    tools: ToolProfile {
+        plan_mode_tools: true,
+        allow: None,
+        run_code: true,
+    },
+    context: ContextProfile {
+        compaction: Some(CompactionMode::Auto),
+        microcompaction: None,
+        max_transcript_chars: None,
+        reinject_recent_files: Some(FileReinjectSpec {
+            max_files: DEFAULT_REINJECT_FILES,
+            token_budget: DEFAULT_REINJECT_FILE_BUDGET,
+            per_file_budget: DEFAULT_PER_FILE_BUDGET,
+        }),
+        reinject_invoked_skills: Some(SkillReinjectSpec {
+            token_budget: DEFAULT_REINJECT_SKILL_BUDGET,
+            per_skill_budget: DEFAULT_PER_SKILL_BUDGET,
+        }),
+    },
+    capabilities: STANDARD_PTC_CAPABILITIES,
+};
+
 /// Every built-in preset. Adding one is a declaration plus a line here — no
 /// builder branch anywhere (issue #127 acceptance 3).
-static BUILTIN: [&AgentPreset; 2] = [&STANDARD, &MINIMAL];
+static BUILTIN: [&AgentPreset; 3] = [&STANDARD, &STANDARD_PTC, &MINIMAL];
 
 /// Every built-in preset.
 pub fn builtin() -> &'static [&'static AgentPreset] {
@@ -753,6 +884,79 @@ pub fn resolve_session(
     env: &PresetEnv,
 ) -> Result<ResolvedPreset, UnknownPreset> {
     Ok(select(explicit, env)?.resolve(config, env))
+}
+
+/// Reconcile a session's recorded `run_code` bit (issue #134 W2) into a
+/// freshly resolved preset, with the owner-ruling observability contract:
+///
+/// * env unset → the session field wins (sticky): a resume without
+///   `RECURSIVE_RUN_CODE` must not silently drop (or silently gain) the
+///   tool the session was created with. Any divergence from what the
+///   declaration alone resolves to is `tracing::warn`ed with both values
+///   before converging.
+/// * env set → the explicit process env overrides the session field; when
+///   the two disagree the WARN carries both (`session=…`, `env=…`, and what
+///   the run will use).
+/// * field absent (`None`, pre-W2 session) → nothing to reconcile.
+///
+/// Applied by every resume-style entry (CLI `resume`, rebuild paths) right
+/// after `resolve_session`, so the effective state a run starts with is
+/// always the session's creation-time contract — unless the operator
+/// explicitly moved it this process, loudly.
+pub fn reconcile_session_run_code(
+    preset: &mut ResolvedPreset,
+    session_run_code: Option<bool>,
+    env: &PresetEnv,
+) {
+    let Some(session_value) = session_run_code else {
+        return;
+    };
+    let env_raw = env.run_code.as_deref().map(str::trim);
+    let env_set = env_raw.is_some();
+    let env_resolved = match env_raw {
+        None => false,
+        Some("") | Some("0") | Some("off") | Some("false") => false,
+        Some(_) => true,
+    };
+    if !env_set {
+        if preset.tools.run_code != session_value {
+            tracing::warn!(
+                target: "recursive::preset",
+                session_run_code = session_value,
+                declaration_resolves_to = preset.tools.run_code,
+                "run_code: session records a different state than the current \
+                 preset+env would resolve to; honouring the session's \
+                 creation-time contract (sticky, issue #134)"
+            );
+            preset.tools.run_code = session_value;
+        }
+        return;
+    }
+    if env_resolved != session_value {
+        tracing::warn!(
+            target: "recursive::preset",
+            session_run_code = session_value,
+            env_run_code = env_resolved,
+            effective = env_resolved,
+            "run_code: RECURSIVE_RUN_CODE is set this process and overrides the \
+             session's recorded state (issue #134)"
+        );
+    }
+    preset.tools.run_code = env_resolved;
+}
+
+/// The effective `run_code` state a session created right now would run
+/// with: resolve the preset (declaration + env) and overlay the sticky
+/// session bit (issue #134 W2). Creation paths stamp this onto the session
+/// meta; resume paths feed the recorded value back through
+/// [`reconcile_session_run_code`]. `None` only when the preset itself
+/// cannot resolve (unknown `RECURSIVE_AGENT_PRESET`) — those callers hard-
+/// fail anyway.
+pub fn effective_run_code(config: &Config) -> Option<bool> {
+    let env = PresetEnv::from_process();
+    let mut resolved = resolve_session(None, config, &env).ok()?;
+    reconcile_session_run_code(&mut resolved, config.session_run_code, &env);
+    Some(resolved.tools.run_code)
 }
 
 // ── assembly ──────────────────────────────────────────────────────────────
@@ -1221,7 +1425,7 @@ mod tests {
     fn an_unknown_preset_id_is_an_error_listing_the_known_ids() {
         let err = select(Some("nope"), &PresetEnv::default()).expect_err("must reject");
         assert_eq!(err.id, "nope");
-        assert_eq!(err.known, vec!["standard", "minimal"]);
+        assert_eq!(err.known, vec!["standard", "standard-ptc", "minimal"]);
         assert!(err.to_string().contains("standard"));
         assert!(err.to_string().contains("minimal"));
 
@@ -1775,5 +1979,159 @@ mod tests {
                 "{off:?} must disable run_code"
             );
         }
+    }
+
+    /// Issue #134 W2: `standard-ptc` is the one-click PTC shape — run_code on,
+    /// everything else equal to `standard`. Pins the preset id, the selection
+    /// path, the env-off escape hatch, and the "no collateral drift" contract.
+    #[test]
+    fn standard_ptc_preset_enables_run_code_and_matches_standard_elsewhere() {
+        let config = config_for("preset-test-model");
+
+        assert_eq!(STANDARD_PTC.id, "standard-ptc");
+        assert!(find("standard-ptc").is_some(), "must be selectable by id");
+        assert_eq!(
+            builtin_ids(),
+            vec!["standard", "standard-ptc", "minimal"],
+            "the builtin list carries the new declaration"
+        );
+
+        // run_code on...
+        assert!(
+            STANDARD_PTC
+                .resolve(&config, &PresetEnv::default())
+                .tools
+                .run_code,
+            "the preset's whole point: run_code resolves on with no env"
+        );
+        // ...but the env-off escape hatch still wins (env > declaration).
+        for off in ["0", "off", "false", ""] {
+            let env = PresetEnv {
+                run_code: Some(off.to_string()),
+                ..PresetEnv::default()
+            };
+            assert!(
+                !STANDARD_PTC.resolve(&config, &env).tools.run_code,
+                "RECURSIVE_RUN_CODE={off:?} must override the declaration"
+            );
+        }
+
+        // No collateral drift: every other resolved field equals `standard`'s.
+        let plain = STANDARD.resolve(&config, &PresetEnv::default());
+        let ptc = STANDARD_PTC.resolve(&config, &PresetEnv::default());
+        assert_eq!(plain.prompt, ptc.prompt, "prompt profile must not drift");
+        assert_eq!(plain.context, ptc.context, "context profile must not drift");
+        assert_eq!(
+            plain.tools.plan_mode_tools, ptc.tools.plan_mode_tools,
+            "plan-mode gate must not drift"
+        );
+        assert_eq!(
+            plain.tools.allow, ptc.tools.allow,
+            "tool allow must not drift"
+        );
+
+        // The capability inventory carries the flip explicitly (discoverability
+        // contract), and every toggle names a resolver-read env var.
+        let ptc_row = STANDARD_PTC
+            .capabilities
+            .iter()
+            .find(|c| c.name == "programmatic-tool-calling")
+            .expect("PTC row must exist");
+        assert_eq!(ptc_row.default, CapabilityDefault::Enabled);
+        assert_eq!(ptc_row.toggle, RUN_CODE_ENV);
+        let toggled: Vec<&str> = STANDARD_PTC
+            .capabilities
+            .iter()
+            .map(|c| c.toggle)
+            .filter(|t| !t.is_empty())
+            .collect();
+        for env_name in [
+            COMPACT_THRESHOLD_ENV,
+            MICROCOMPACT_TRIGGER_ENV,
+            MAX_TRANSCRIPT_CHARS_ENV,
+            REINJECT_FILES_ENV,
+            REINJECT_SKILLS_ENV,
+            RUN_CODE_ENV,
+        ] {
+            assert!(
+                toggled.contains(&env_name),
+                "{env_name} must appear in a row"
+            );
+        }
+
+        // `select` honours it through the env path too.
+        let env = PresetEnv {
+            agent_preset: Some("standard-ptc".to_string()),
+            ..PresetEnv::default()
+        };
+        assert_eq!(
+            select(None, &env).expect("select by env").id,
+            "standard-ptc"
+        );
+    }
+
+    /// Issue #134 W2: the session's recorded `run_code` bit is sticky —
+    /// no-env resume keeps the creation-time contract; an explicit env
+    /// this process overrides it, loudly; a matching state stays silent.
+    #[test]
+    fn session_run_code_field_reconciles_observably() {
+        let config = config_for("preset-test-model");
+
+        // A `standard` session created with run_code ON (e.g. via
+        // RECURSIVE_RUN_CODE at creation time) resumes without the env: the
+        // bit must stick. The divergence from the plain declaration is the
+        // case the WARN exists for.
+        let mut resolved = STANDARD.resolve(&config, &PresetEnv::default());
+        assert!(!resolved.tools.run_code, "fixture: standard resolves off");
+        reconcile_session_run_code(&mut resolved, Some(true), &PresetEnv::default());
+        assert!(
+            resolved.tools.run_code,
+            "an env-less resume must honour the session's recorded state"
+        );
+
+        // The inverse: a `standard-ptc` session resumes in a process that
+        // has since lost its env — run_code stays on regardless.
+        let mut resolved = STANDARD_PTC.resolve(&config, &PresetEnv::default());
+        reconcile_session_run_code(&mut resolved, Some(true), &PresetEnv::default());
+        assert!(resolved.tools.run_code, "matching state is a no-op");
+
+        // Explicit env ON overrides a session recorded OFF (the operator
+        // moved it this process; the WARN records both values).
+        let mut resolved = STANDARD.resolve(&config, &PresetEnv::default());
+        let env = PresetEnv {
+            run_code: Some("1".to_string()),
+            ..PresetEnv::default()
+        };
+        reconcile_session_run_code(&mut resolved, Some(false), &env);
+        assert!(resolved.tools.run_code, "explicit env wins over the bit");
+
+        // Explicit env OFF overrides a session recorded ON (the documented
+        // `RECURSIVE_RUN_CODE=off` escape hatch, still observable).
+        let mut resolved = STANDARD_PTC.resolve(&config, &PresetEnv::default());
+        let env = PresetEnv {
+            run_code: Some("off".to_string()),
+            ..PresetEnv::default()
+        };
+        reconcile_session_run_code(&mut resolved, Some(true), &env);
+        assert!(!resolved.tools.run_code, "explicit env-off still wins");
+
+        // A set-but-empty env value is OFF (same tolerance as resolve_tools),
+        // so it overrides a session recorded ON.
+        let mut resolved = STANDARD_PTC.resolve(&config, &PresetEnv::default());
+        let env = PresetEnv {
+            run_code: Some(" ".to_string()),
+            ..PresetEnv::default()
+        };
+        reconcile_session_run_code(&mut resolved, Some(true), &env);
+        assert!(!resolved.tools.run_code);
+
+        // Pre-W2 sessions carry `None`: nothing is reconciled, the
+        // declaration + env decide exactly as before this field existed.
+        let mut resolved = STANDARD.resolve(&config, &PresetEnv::default());
+        reconcile_session_run_code(&mut resolved, None, &PresetEnv::default());
+        assert!(!resolved.tools.run_code, "no field → declaration rules");
+        let mut resolved = STANDARD_PTC.resolve(&config, &PresetEnv::default());
+        reconcile_session_run_code(&mut resolved, None, &PresetEnv::default());
+        assert!(resolved.tools.run_code, "no field → declaration rules");
     }
 }

@@ -514,7 +514,7 @@ impl AgentRuntimeBuilder {
     /// Build the [`AgentRuntime`].
     ///
     /// Returns an error if the LLM provider is missing.
-    pub fn build(self) -> Result<AgentRuntime> {
+    pub fn build(mut self) -> Result<AgentRuntime> {
         let kernel_builder = self.kernel_builder.skills(self.skills);
         let mut kernel = kernel_builder.build()?;
 
@@ -525,8 +525,27 @@ impl AgentRuntimeBuilder {
             kernel.tools_mut().retain_tools(allow);
         }
 
+        // Issue #134 W2: one decision, two consumers — the pointer line in
+        // the system prompt below and the registration branch further down
+        // must agree on exactly when `RunCode` exists ("tool registered but
+        // pointer absent", or the reverse, would be a drift between the
+        // model-facing prompt and the actual tool surface).
+        let run_code_registered = self.with_run_code
+            && !kernel.tools().surface_filtered()
+            && kernel.tools().transport().executes_on_host();
+
         let mut transcript = Vec::new();
-        if let Some(sys) = self.system_prompt {
+        if let Some(mut sys) = self.system_prompt {
+            if run_code_registered {
+                // Same branch as the registration below: pointer lives iff
+                // the tool does. Recorded in its PromptSegments bucket so
+                // the context-breakdown estimate sees the extra bytes.
+                if let Some(segments) = &mut self.prompt_segments {
+                    segments.run_code_pointer =
+                        crate::system_prompt::RUN_CODE_POINTER_SEGMENT.to_string();
+                }
+                sys.push_str(crate::system_prompt::RUN_CODE_POINTER_SEGMENT);
+            }
             transcript.push(Message::system(sys));
         }
         transcript.extend(self.seed);
@@ -654,7 +673,9 @@ impl AgentRuntimeBuilder {
         //   permission-hook slot), so a program's `Read` satisfies the
         //   session's `Edit` and its files land in the session's turn ledger.
         if self.with_run_code && !kernel.tools().surface_filtered() {
-            if kernel.tools().transport().executes_on_host() {
+            // `run_code_registered` (computed above, same expression this
+            // branch mirrors) already folds in the host-transport gate.
+            if run_code_registered {
                 let invoker_registry = kernel.tools().clone();
                 // Pin the run's fs-read root to the session's workspace —
                 // the same root the registry's fs tools are built on — so
@@ -675,6 +696,11 @@ impl AgentRuntimeBuilder {
                     }
                     None => crate::tools::run_code::RunCode::new(invoker_registry),
                 };
+                // Issue #134 W2: the PTC lifecycle events flow through the
+                // same sink this runtime was built with — wired in the same
+                // branch that registers the tool, so "tool present but
+                // events dropped" cannot drift from the registration gate.
+                let run_code = run_code.with_event_sink(event_sink.clone());
                 kernel.tools_mut().register_mut(Arc::new(run_code));
             } else {
                 tracing::warn!(
@@ -1045,6 +1071,53 @@ mod tests {
             rt.kernel().tools().find_by_name("RunCode").is_none(),
             "an allow-list must not be widened by the preset"
         );
+    }
+
+    /// Issue #134 W2: the system prompt gains the PTC pointer line iff the
+    /// `RunCode` tool registers — and stays byte-identical when it doesn't
+    /// (prefix-cache stability on every un-enabled path).
+    #[test]
+    fn system_prompt_gains_pointer_line_iff_run_code_enabled() {
+        let pointer = crate::system_prompt::RUN_CODE_POINTER_SEGMENT;
+        let segments = || crate::system_prompt::PromptSegments {
+            system_prompt: "BASE".into(),
+            ..Default::default()
+        };
+
+        // Off: byte-identical — no pointer may leak into a run_code-less
+        // session.
+        let off = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(crate::tools::ToolRegistry::local())
+            .system_prompt("BASE")
+            .prompt_segments(segments())
+            .build()
+            .expect("off build must succeed");
+        assert_eq!(off.transcript()[0].content, "BASE");
+
+        // On: the pointer rides the prompt.
+        let on = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(crate::tools::ToolRegistry::local())
+            .with_run_code(true)
+            .system_prompt("BASE")
+            .prompt_segments(segments())
+            .build()
+            .expect("on build must succeed");
+        assert_eq!(on.transcript()[0].content, format!("BASE{pointer}"));
+
+        // Sandboxed transport: the tool never registers, so the pointer
+        // must never appear either — one decision feeds both sides.
+        let gated = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(crate::tools::ToolRegistry::new(Arc::new(SandboxTransport(
+                LocalTransport,
+            ))))
+            .with_run_code(true)
+            .system_prompt("BASE")
+            .build()
+            .expect("sandboxed build must succeed");
+        assert_eq!(gated.transcript()[0].content, "BASE");
     }
 
     /// Goal 416 review: the run's fs-read root is pinned to the session's

@@ -445,6 +445,13 @@ impl EventSink for AcpBridge {
                 let _ = self.tx.send(result_notif);
             }
 
+            // Issue #134 W2: run_code lifecycle bookends have no ACP
+            // session/update shape — the ACP client sees only the tool_use
+            // blocks the model itself emits. Deliberate drop, pinned here so
+            // the decision is visible rather than folded into the catch-all.
+            AgentEvent::ProgrammaticRunStarted { .. }
+            | AgentEvent::ProgrammaticRunFinished { .. } => {}
+
             // Silence other events: Latency, Usage, PlanMode*, etc.
             _ => {}
         }

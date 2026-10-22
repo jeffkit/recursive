@@ -87,7 +87,25 @@ pub struct PromptSegments {
     /// `capabilities()` (issue #31 §2), or `""` for the local tier — the
     /// joined prompt must stay byte-identical when this is empty.
     pub environment: String,
+    /// Issue #134 W2: the `## Programmatic tool calling` pointer the runtime
+    /// builder appends when it registers the `RunCode` tool (same branch —
+    /// tool present ⟺ pointer present). Empty for every session without
+    /// run_code, which keeps their system prompt byte-identical to the
+    /// pre-W2 form. Counted into the breakdown's `system_prompt` bucket —
+    /// the pointer is appended after `full` was assembled, so it can never
+    /// be part of the assembly-time buckets.
+    pub run_code_pointer: String,
 }
+
+/// Issue #134 W2: the run_code pointer text the runtime builder plants when
+/// the `RunCode` tool registers. Mirrors the sub-agents pointer above: one
+/// paragraph naming the capability and deferring the how-to to the tool's
+/// own description (usage lives with the tool, not in the prompt).
+pub const RUN_CODE_POINTER_SEGMENT: &str = "\n\n---\n\n## Programmatic tool calling\n\n\
+     The `RunCode` tool is registered. When a task needs many tool calls, consider \
+     writing one program that issues them as async calls and aggregates the \
+     results — see the `RunCode` tool description for when that beats \
+     round-tripping each call, and for the sandbox it runs in.";
 
 /// Assemble the final system prompt for an agent run.
 ///
@@ -152,6 +170,11 @@ pub fn assemble_system_prompt_with_environment(
             String::new()
         },
         environment: environment.unwrap_or("").to_string(),
+        // Assembly never plants the run_code pointer — the runtime builder
+        // appends [`RUN_CODE_POINTER_SEGMENT`] to `full` in the same branch
+        // that registers the `RunCode` tool, and records it here. Keeps
+        // run_code-less prompts byte-identical to the pre-W2 assembly.
+        run_code_pointer: String::new(),
     };
 
     // ── Joined full prompt ───────────────────────────────────────────────

@@ -197,6 +197,13 @@ pub struct Config {
     /// `0` means unlimited. Defaults to 8.
     /// Set via `RECURSIVE_MAX_CONCURRENT_RUNS` env var.
     pub max_concurrent_runs: usize,
+    /// Issue #134 W2: sticky `run_code` state a resume path passes in from
+    /// the session meta. `None` = no session field (creation / pre-W2
+    /// session): the preset declaration + `RECURSIVE_RUN_CODE` decide
+    /// exactly as before. `Some(b)` = the session was created with that
+    /// effective run_code state; the builder reconciles it (sticky, with a
+    /// WARN on divergence) instead of silently re-deriving from env.
+    pub session_run_code: Option<bool>,
     /// Number of most-recent transcript messages passed to the goal
     /// evaluator judge on each turn. Smaller values reduce judge cost;
     /// larger values give the judge more context for long sessions.
@@ -253,6 +260,7 @@ impl std::fmt::Debug for Config {
             .field("stuck_window", &self.stuck_window)
             .field("stuck_error_rate", &self.stuck_error_rate)
             .field("max_concurrent_runs", &self.max_concurrent_runs)
+            .field("session_run_code", &self.session_run_code)
             .field("goal_eval_transcript_tail", &self.goal_eval_transcript_tail)
             .field("web_search_provider", &self.web_search_provider)
             .field(
@@ -798,6 +806,9 @@ impl Config {
             stuck_window,
             stuck_error_rate,
             max_concurrent_runs,
+            // Issue #134 W2: populated by resume paths from the session meta;
+            // creation (from_env) has no session to be sticky to.
+            session_run_code: None,
             goal_eval_transcript_tail,
             web_search_provider,
             web_search_api_key,
@@ -1743,6 +1754,7 @@ max_tokens = 20000
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,
@@ -2568,6 +2580,7 @@ preset = "totally-bogus-id"
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: Some("sk-secret".into()),
@@ -2717,6 +2730,7 @@ api_key = "sk-from-file"
                 stuck_window: 10,
                 stuck_error_rate: 0.8,
                 max_concurrent_runs: 8,
+                session_run_code: None,
                 goal_eval_transcript_tail: 12,
                 web_search_provider: None,
                 web_search_api_key: None,
@@ -2768,6 +2782,7 @@ api_key = "sk-from-file"
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,
@@ -2859,6 +2874,7 @@ api_key = "sk-from-file"
             stuck_window: 10,
             stuck_error_rate: 0.8,
             max_concurrent_runs: 8,
+            session_run_code: None,
             goal_eval_transcript_tail: 12,
             web_search_provider: None,
             web_search_api_key: None,

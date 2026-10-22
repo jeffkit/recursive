@@ -562,6 +562,85 @@ mod tests {
         assert!(!entries[0].timestamp.is_empty());
     }
 
+    /// Issue #134 W2: a `run_code` turn is an ordinary assistant/tool pair
+    /// in the transcript (the PTC lifecycle events deliberately never
+    /// persist), so the reader must rebuild the resume seed with the pairing
+    /// intact — a regression nail against any future transcript/event change
+    /// silently swallowing the run_code step (invariant #8).
+    #[test]
+    fn run_code_turns_survive_resume_without_swallowing() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "run_code turn", "gpt-4o", "openai").unwrap();
+        writer
+            .append(&Message::system("You are a bot."), None, None)
+            .unwrap();
+        writer
+            .append(&Message::user("sum the doubles"), None, None)
+            .unwrap();
+        // The run_code step: one assistant tool_call, one protocol-shaped
+        // result — exactly what the tool result looks like on disk.
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "Running the batch.",
+                    vec![crate::message::ToolCall {
+                        id: "call_ptc_1".into(),
+                        name: "RunCode".into(),
+                        arguments: serde_json::json!({"code": "return 1;"}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(
+                &Message::tool_result(
+                    "call_ptc_1",
+                    "status=ok calls=3 duration_ms=12\nsandbox: runtime=/usr/bin/node",
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(&Message::assistant("The total is 6."), None, None)
+            .unwrap();
+        // A later turn after the run_code step — nothing after it may be
+        // swallowed either.
+        writer.append(&Message::user("thanks"), None, None).unwrap();
+
+        let session_dir = writer.session_dir().to_path_buf();
+        writer.finish(SessionStatus::Completed).unwrap();
+
+        let messages = SessionReader::load_messages(&session_dir).unwrap();
+        // The stored system prompt is dropped (builder reassembles it);
+        // every message of the run_code turn and everything after survives.
+        let roles: Vec<Role> = messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Assistant,
+                Role::User,
+            ],
+            "the run_code turn and the turns after it must survive the seed rebuild"
+        );
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].name, "RunCode");
+        assert_eq!(
+            messages[2].tool_call_id.as_deref(),
+            Some("call_ptc_1"),
+            "the protocol result stays glued to its call"
+        );
+        assert!(messages[2].content.starts_with("status=ok"));
+        assert_pairing(&messages);
+    }
+
     /// Invariant #8 checker for the splice tests: every `Role::Tool` message
     /// must be preceded by an assistant whose `tool_calls` contains its id,
     /// and every tool call in that assistant must be answered.
