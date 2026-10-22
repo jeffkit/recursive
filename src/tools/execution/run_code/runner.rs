@@ -336,10 +336,72 @@ enum ProbeVerdict {
     Unsupported(String),
 }
 
+/// Extra exec attempts after `ExecutableFileBusy` (ETXTBSY), and the wait
+/// between them. A runtime binary can be written to disk and exec'd right
+/// away (test shims, staged runtimes); while a write handle on the image is
+/// still open, the kernel refuses the exec with ETXTBSY — a specific,
+/// self-healing condition, so a short bounded retry absorbs the race. Retry
+/// budget spent → the error propagates unchanged: fail-closed untouched.
+const PROBE_ETXTBSY_EXTRA_ATTEMPTS: usize = 2;
+const PROBE_ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// ETXTBSY is raw errno 26 on the unix targets we ship. The
+/// `ErrorKind::ExecutableFileBusy` spelling needs Rust 1.83, past this
+/// crate's declared MSRV (1.75); platforms without the errno never retry.
+fn is_etxtbsy(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(26)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Run `attempt`, retrying only `ExecutableFileBusy` (ETXTBSY) failures a
+/// bounded number of times. Any other error — and ETXTBSY once the budget is
+/// spent — returns immediately, so the caller's fail-closed handling is
+/// unchanged. Every retry warns: a diverted exec is observable (降级可观测).
+async fn retry_on_etxtbsy<T, F, Fut>(context: &str, mut attempt: F) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut retries = 0usize;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if !is_etxtbsy(&err) || retries >= PROBE_ETXTBSY_EXTRA_ATTEMPTS {
+                    return Err(err);
+                }
+                retries += 1;
+                tracing::warn!(
+                    context = %context,
+                    retry = retries,
+                    error = %err,
+                    "executable was still busy (ETXTBSY); retrying the probe after a short delay"
+                );
+                tokio::time::sleep(PROBE_ETXTBSY_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
 /// Whether `flag` is accepted by `node`. A runtime that does not know the
 /// flag exits non-zero ("bad option") without side effects; a supported one
 /// runs the trivial `-e` program and exits 0.
 async fn flag_accepted(node: &Path, flag: &str) -> std::io::Result<bool> {
+    retry_on_etxtbsy(&format!("permission probe for {flag}"), || {
+        probe_flag_once(node, flag)
+    })
+    .await
+}
+
+/// One un-retried probe invocation.
+async fn probe_flag_once(node: &Path, flag: &str) -> std::io::Result<bool> {
     let probe = Command::new(node)
         .arg(flag)
         .arg("-e")
@@ -1421,6 +1483,144 @@ exit 0
         // No run happened, so no scratch dir was minted for it.
         assert!(report.sandbox.scratch_dir.is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── probe ETXTBSY retry (Goal 416 CI follow-up) ────────────────────────
+    // The runtime image is written to disk and exec'd right away; on Linux
+    // the first exec can land while a write handle on the image is still
+    // open (observed on CI: both probe candidates failed with os error 26),
+    // which fail-closed the whole run. The retry policy below absorbs the
+    // race; these tests pin its three edges.
+
+    /// A synthetic busy-executable error, injected through the errno the
+    /// kernel itself reports (ETXTBSY = 26 on the unix targets). unix-only:
+    /// platforms without the errno cannot construct it.
+    #[cfg(unix)]
+    fn fake_etxtbsy() -> std::io::Error {
+        std::io::Error::from_raw_os_error(26)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_retry_absorbs_a_transient_busy_executable() {
+        let mut calls = 0usize;
+        let verdict: std::io::Result<bool> = retry_on_etxtbsy("test probe", || {
+            calls += 1;
+            let call = calls;
+            async move {
+                if call == 1 {
+                    Err(fake_etxtbsy())
+                } else {
+                    Ok(true)
+                }
+            }
+        })
+        .await;
+        assert!(matches!(verdict, Ok(true)), "{verdict:?}");
+        assert_eq!(calls, 2, "exactly one retry after the busy-exec error");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_retry_exhaustion_stays_fail_closed() {
+        let mut calls = 0usize;
+        let verdict: std::io::Result<bool> = retry_on_etxtbsy("test probe", || {
+            calls += 1;
+            let call = calls;
+            async move {
+                if call <= 1 + PROBE_ETXTBSY_EXTRA_ATTEMPTS {
+                    Err(fake_etxtbsy())
+                } else {
+                    Ok(true)
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(verdict, Err(ref err) if is_etxtbsy(err)),
+            "a persistently busy executable must surface its own error: {verdict:?}"
+        );
+        assert_eq!(
+            calls,
+            1 + PROBE_ETXTBSY_EXTRA_ATTEMPTS,
+            "initial attempt plus the bounded retries — no more"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_retry_spares_other_errors() {
+        let mut calls = 0usize;
+        let verdict: std::io::Result<()> = retry_on_etxtbsy("test probe", || {
+            calls += 1;
+            async { Err(std::io::Error::other("not a busy executable")) }
+        })
+        .await;
+        assert!(
+            matches!(verdict, Err(ref err) if err.to_string().contains("not a busy executable")),
+            "a non-ETXTBSY error must surface unchanged: {verdict:?}"
+        );
+        assert_eq!(calls, 1, "only ETXTBSY is retried");
+    }
+
+    /// The real race, reproduced with the kernel's own ETXTBSY: a write
+    /// handle held on the runtime image makes every probe exec fail. After
+    /// the bounded retries the error surfaces unchanged — fail-closed, never
+    /// a mislabelled "unsupported" verdict and never a run.
+    // Linux-only by kernel semantics, not by porting convenience: Linux
+    // denies write access to the image at exec, macOS does not (a held
+    // open-for-write handle lets exec succeed, verified empirically) — so
+    // there is nothing to reproduce on macOS; the synthetic-kind unit tests
+    // above pin the retry policy everywhere.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn probe_surfaces_real_etxtbsy_after_retries_exhausted() {
+        let tmp = std::env::temp_dir().join(format!("ptc-probe-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let argv_file = tmp.join("argv.txt");
+        let node = write_runtime_shim(&tmp, ShimVerdict::Supported, &argv_file).unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&node).unwrap();
+
+        let verdict = flag_accepted(&node, "--permission").await;
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let err = verdict
+            .err()
+            .expect("a busy executable must surface its error");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(26),
+            "the kernel's ETXTBSY must reach the caller unchanged: {err}"
+        );
+    }
+
+    /// The retry absorbing the real race: the write handle is released inside
+    /// the retry window and a later attempt succeeds, so a transiently busy
+    /// image cannot fail a run that passes one exec later. Linux-only for the
+    /// same kernel-semantics reason as the exhaust test above.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn probe_recovers_when_the_busy_window_closes() {
+        let tmp = std::env::temp_dir().join(format!("ptc-probe-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let argv_file = tmp.join("argv.txt");
+        let node = write_runtime_shim(&tmp, ShimVerdict::Supported, &argv_file).unwrap();
+        let held = std::fs::OpenOptions::new().write(true).open(&node).unwrap();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+
+        let verdict = flag_accepted(&node, "--permission").await;
+
+        releaser.await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            matches!(verdict, Ok(true)),
+            "the probe must recover once the image is no longer busy: {verdict:?}"
+        );
     }
 
     /// Headline (#134 W1): the scratch dir is created for the run, is the
