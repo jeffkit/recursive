@@ -182,6 +182,20 @@ fn resolve_resume_message(message: Option<String>) -> String {
     }
 }
 
+/// Seed the sticky `run_code` bit (issue #134 W2) from session meta into
+/// the config so `build_runtime`'s reconciliation
+/// (`recursive::preset::reconcile_session_run_code`) acts on the
+/// creation-time contract: an env-less resume keeps the recorded state, an
+/// explicit `RECURSIVE_RUN_CODE` this process overrides it — every
+/// divergence WARNs with both values. `None` (a pre-W2 session without the
+/// field) changes nothing.
+fn seed_session_run_code(
+    config: &mut recursive::config::Config,
+    meta: &recursive::session::SessionMeta,
+) {
+    config.session_run_code = meta.run_code;
+}
+
 /// `recursive resume` command: dispatches based on which of
 /// (positional `session`, `--from-file`, neither) was provided,
 /// validates the tool-registry hash, then opens the existing
@@ -235,7 +249,7 @@ pub(crate) async fn cmd_resume(
     // explicit env this process overrides it (both paths WARN on
     // divergence). `None` (pre-W2 session) changes nothing.
     let mut config = config;
-    config.session_run_code = meta.run_code;
+    seed_session_run_code(&mut config, &meta);
     let (tools, _) = build_tools(&config, None).await;
     let specs = tools.specs();
     let current_hash = recursive::session::hash_tool_specs(&specs);
@@ -1063,8 +1077,8 @@ mod tests {
     use super::{
         classify_orphan_answer, cmd_resume, legacy_resume_error, prepare_replay_seed,
         prompt_orphan_choice_with, redo_orphan, replay_orphan_policy, resolve_resume_message,
-        resolve_resume_target, resume_banner_enabled, run_resumed, OrphanPolicy,
-        ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
+        resolve_resume_target, resume_banner_enabled, run_resumed, seed_session_run_code,
+        OrphanPolicy, ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
     };
     use crate::cli::session::resolve_session_path;
     // Issue #185: one crate-wide env guard for the whole binary — this module
@@ -1318,6 +1332,96 @@ mod tests {
             "tool_registry_hash": hash,
         });
         std::fs::write(dir.join(".meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    // ── sticky run_code: create → persist → resume honours it (#134 W2) ─────
+
+    /// Goal 418 headline: the sticky bit travels the resume seam. Creation
+    /// stamps the effective state onto `.meta.json`; the resume path reads
+    /// it back into the config (the exact seam `cmd_resume` feeds
+    /// `build_runtime` through); the reconciliation honours it — an
+    /// env-less rebuild keeps ON, an explicit `RECURSIVE_RUN_CODE=off` this
+    /// process overrides. Reverting the read-back to a no-op turns the
+    /// sticky and override halves red.
+    #[test]
+    fn session_persists_run_code_and_resume_honors_it() {
+        // `effective_run_code` re-reads `PresetEnv::from_process()`: hold the
+        // crate-wide guard for the whole body (#185/#222) and pin the two
+        // variables that decide the declaration, so the test is deterministic
+        // regardless of the developer/CI environment.
+        let mut env = EnvGuard::lock();
+        env.remove_var(recursive::preset::RUN_CODE_ENV);
+        env.remove_var("RECURSIVE_AGENT_PRESET");
+
+        let ws = tempfile::tempdir().unwrap();
+
+        // ① Creation writes the effective state (ON) onto disk.
+        let dir = ws.path().join("sticky-on");
+        let mut writer = recursive::session::SessionWriter::open_or_create(
+            &dir, "goal", "model", "openai", None,
+        )
+        .unwrap();
+        writer.set_run_code(true);
+        writer
+            .finish(recursive::session::SessionStatus::Active)
+            .unwrap();
+        drop(writer);
+
+        // ② Resume reads it back through the same seam cmd_resume uses.
+        let meta = recursive::session::SessionReader::load_meta(&dir).unwrap();
+        let mut cfg = test_config(ws.path());
+        assert_eq!(
+            cfg.session_run_code, None,
+            "fixture: an env-less config starts with no recorded bit"
+        );
+        seed_session_run_code(&mut cfg, &meta);
+        assert_eq!(
+            cfg.session_run_code,
+            Some(true),
+            "the recorded bit must reach the config (the sticky seam)"
+        );
+
+        // ③ Env-less rebuild: the recorded ON sticks. The bare `standard`
+        // declaration resolves off — exactly the divergence the WARN exists
+        // for (branch pinned by
+        // `preset::session_run_code_field_reconciles_observably`).
+        assert_eq!(
+            recursive::preset::effective_run_code(&cfg),
+            Some(true),
+            "an env-less resume must keep the creation-time state"
+        );
+
+        // ④ Explicit env OFF this process overrides the recorded ON (the
+        // documented escape hatch; the divergence WARN is the
+        // `reconcile_session_run_code` env-set branch this drives).
+        env.set_var(recursive::preset::RUN_CODE_ENV, "off");
+        assert_eq!(
+            recursive::preset::effective_run_code(&cfg),
+            Some(false),
+            "an explicit RECURSIVE_RUN_CODE=off overrides the sticky bit"
+        );
+        env.remove_var(recursive::preset::RUN_CODE_ENV);
+
+        // ⑤ A pre-W2 session (field absent) seeds nothing: the declaration
+        // alone decides, exactly as before the field existed.
+        let bare_dir = ws.path().join("pre-w2");
+        let mut bare_writer = recursive::session::SessionWriter::open_or_create(
+            &bare_dir, "goal", "model", "openai", None,
+        )
+        .unwrap();
+        bare_writer
+            .finish(recursive::session::SessionStatus::Active)
+            .unwrap();
+        drop(bare_writer);
+        let bare = recursive::session::SessionReader::load_meta(&bare_dir).unwrap();
+        let mut cfg = test_config(ws.path());
+        seed_session_run_code(&mut cfg, &bare);
+        assert_eq!(cfg.session_run_code, None);
+        assert_eq!(
+            recursive::preset::effective_run_code(&cfg),
+            Some(false),
+            "no recorded field → the declaration alone decides"
+        );
     }
 
     #[tokio::test]
