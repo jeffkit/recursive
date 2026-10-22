@@ -745,6 +745,7 @@ fn child_shadow_dir(rig: &Rig) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "#224: migrate/Rig-spawn flow is unix-session-dir semantics; windows shadow-git fabricate differs (run 39700485676)")]
 fn migrate_moves_legacy_state_and_prints_the_moved_section() {
     let rig = Rig::new();
     let legacy = rig.workspace.path().join(".recursive").join("sessions");
@@ -782,6 +783,7 @@ fn migrate_moves_legacy_state_and_prints_the_moved_section() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "#224: migrate/Rig-spawn flow is unix-session-dir semantics; windows shadow-git fabricate differs (run 39700485676)")]
 fn migrate_reports_skips_when_destination_already_has_data() {
     let rig = Rig::new();
     // First run moves the legacy state under the user dir…
