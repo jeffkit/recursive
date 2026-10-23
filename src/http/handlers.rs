@@ -2485,21 +2485,14 @@ pub(super) async fn session_events(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Verify the session exists (and that the caller may see it), keeping a
     // handle on it — the stream resumes from its replay log, and a cursor the
-    // log cannot serve is healed from its transcript (goal 422 W1). Every
-    // field is an `Arc`, so the clone shares state with the table entry; the
-    // snapshot below therefore sits behind the very same `ensure_access` gate
-    // as the frames (issue #85 — no state leaks to a non-owner).
-    let session = {
-        let sessions_lock = state.host.sessions();
-        let sessions = sessions_lock.read().await;
-        match sessions.get(&id) {
-            Some(session) => {
-                ensure_access(&identity, session)?;
-                session.clone()
-            }
-            None => return Err(ApiError::not_found("session not found")),
-        }
-    };
+    // log cannot serve is healed from its transcript (goal 422 W1). The
+    // lookup goes through the cold loader (issue #227): a session evicted or
+    // lost to a restart is restored from storage instead of 404ing the
+    // subscribe, exactly like `GET /sessions/:id`. `get_or_load_session`
+    // asserts ownership before anything materializes, so the snapshot below
+    // sits behind the very same `ensure_access` gate as the frames (issue
+    // #85 — no state leaks to a non-owner).
+    let session = super::cold_load::get_or_load_session(&state, &id, &identity).await?;
     let event_log = session.event_log.clone();
 
     // `?since=` wins over the header when a client sends both.

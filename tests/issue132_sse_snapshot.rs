@@ -281,24 +281,25 @@ mod issue132_tests {
         assert!(watermark > 0, "the turn advanced the sequence");
 
         simulate_restart(&state, &id).await;
-        cold_load(&app, &id).await;
-        assert_eq!(
-            event_seq(&state, &id).await,
-            watermark,
-            "cold load must seed the sequence from the persisted watermark"
-        );
-        assert!(
-            ring_frames(&state, &id).await.is_empty(),
-            "the rebuilt ring holds nothing from before the restart"
-        );
 
-        // Reconnect with the pre-restart cursor.
+        // Reconnect with the pre-restart cursor — no warm-up REST call first
+        // (issue #227): the events endpoint itself cold-loads, so this
+        // subscribe is the session's first touch after the restart.
         let response = subscribe(
             &app,
             &format!("/sessions/{id}/events?since={stale_cursor}"),
             None,
         )
         .await;
+        assert_eq!(
+            event_seq(&state, &id).await,
+            watermark,
+            "the subscribe's cold load must seed the sequence from the persisted watermark"
+        );
+        assert!(
+            ring_frames(&state, &id).await.is_empty(),
+            "the rebuilt ring holds nothing from before the restart"
+        );
         // … and then the stream goes on: a live frame continuing the sequence
         // space must arrive on the same connection.
         publish(
