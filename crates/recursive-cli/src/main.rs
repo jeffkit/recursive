@@ -612,8 +612,9 @@ async fn async_main() -> anyhow::Result<()> {
     // Issue #150: hide this process's `/proc/<pid>/environ` from same-uid
     // children before any execution surface (tool transport, run_background,
     // HTTP server) can spawn a shell. Must happen before `Cli::parse()` /
-    // `Config::from_env()` read the environment.
-    recursive::hardening::harden_process();
+    // `Config::from_env()` read the environment. The outcome is reported
+    // below, once `init_logging` has a subscriber to receive it.
+    let hardening = recursive::hardening::harden_process();
     let cli = Cli::parse();
     // --sandbox flag (issue §3): wins over RECURSIVE_SANDBOX when given, by
     // exporting it before any tool-set construction reads the env.
@@ -639,6 +640,7 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let _logging_guard = init_logging(&early_log, &cli.log_format)?;
     tracing::trace!("recursive main starting");
+    hardening.report();
 
     if cli.session_out.is_some() {
         eprintln!(
@@ -783,6 +785,27 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
     };
+
+    // Issue #150 (defence in depth): `Config::from_env` has consumed this
+    // process's own credentials into `config`, so drop them from the live
+    // environment before anything can spawn a child. Two readers run later
+    // and are deferred: `recursive http` reads RECURSIVE_HTTP_AUTH_* when it
+    // builds the router (it scrubs them itself afterwards), and
+    // `recursive init` re-reads the preset key env by name to tell the
+    // operator whether it is already set — it builds no execution surface,
+    // so it keeps its environment.
+    if !matches!(effective_cmd, Cmd::Init { .. }) {
+        #[cfg(feature = "http")]
+        let keep_for_router: &[&str] = if matches!(effective_cmd, Cmd::Http { .. }) {
+            &[recursive::hardening::HTTP_AUTH_ENV_PREFIX]
+        } else {
+            &[]
+        };
+        #[cfg(not(feature = "http"))]
+        let keep_for_router: &[&str] = &[];
+        let scrub = recursive::hardening::scrub_process_env(keep_for_router);
+        hardening.warn_if_exposed(&scrub);
+    }
 
     // Warn about legacy in-tree state for commands that interact with
     // the workspace. The Migrate command itself shouldn't double-warn.
@@ -1087,6 +1110,13 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(warning) = disabled_auth_warning(auth_enabled) {
                 tracing::warn!("{warning}");
             }
+            // Issue #150: the router (auth_config_from_env) and the check
+            // above were the last readers of RECURSIVE_HTTP_AUTH_*; drop the
+            // inbound keys / JWT secret before the first request can spawn a
+            // tool child. RECURSIVE_HTTP_AUTH_INSECURE_OK is exempt inside
+            // the scrub — auth_middleware re-reads that switch per request.
+            let scrub = recursive::hardening::scrub_process_env(&[]);
+            hardening.warn_if_exposed(&scrub);
             recursive::http::serve_with_graceful_shutdown(listener, router, async move {
                 http_shutdown.cancelled().await
             })
@@ -4018,8 +4048,15 @@ mod tests {
     /// `tests/issue89_parent_environ.rs`.
     #[test]
     fn harden_process_is_idempotent() {
-        recursive::hardening::harden_process();
-        recursive::hardening::harden_process();
+        let first = recursive::hardening::harden_process();
+        let second = recursive::hardening::harden_process();
+        assert_eq!(
+            first, second,
+            "hardening outcome must be stable across calls"
+        );
+        // Linux is the only platform with a mechanism; everywhere else the
+        // helper must say so rather than claim success.
+        assert_eq!(first.is_applied(), cfg!(target_os = "linux"));
     }
 
     fn dummy_config(tmp: &std::path::Path) -> Config {

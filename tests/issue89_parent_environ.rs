@@ -72,7 +72,11 @@ async fn hardened_process_hides_its_environ_from_same_uid_children() {
     // ── The fix ─────────────────────────────────────────────────────────
     // Harden *this* process (the one `$PPID` resolves to), then run the
     // issue's command through the real `Bash` tool.
-    recursive::hardening::harden_process();
+    assert_eq!(
+        recursive::hardening::harden_process(),
+        recursive::hardening::HardenOutcome::Applied,
+        "on a non-root Linux host prctl(PR_SET_DUMPABLE, 0) must succeed"
+    );
     recursive::hardening::harden_process(); // idempotent
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
