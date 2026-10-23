@@ -904,9 +904,16 @@ mod tests {
     /// Nothing to protect (no credential variables captured) → no exec at
     /// all: the mechanism must not double-exec every credential-free CLI
     /// invocation. Same pure-decision property as the sentinel arm.
+    ///
+    /// Holds the crate-wide env lock even though it never mutates env
+    /// (#185/#222: read-only env tests lock too): `reexec_clean_env` reads
+    /// [`REEXEC_SENTINEL_VAR`], and without the lock that read can land
+    /// inside `reexec_skips_when_sentinel_present`'s transient set/restore
+    /// window, flipping this test onto the `AlreadyCleanEnv` branch.
     #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn reexec_skips_when_no_credentials_captured() {
+        let _lock = crate::test_util::env_lock();
         let outcome = reexec_clean_env(&CredentialHandoff::default());
         assert_eq!(outcome, ReExecOutcome::NotNeeded);
         assert!(outcome.is_applied());
@@ -914,9 +921,12 @@ mod tests {
 
     /// Linux: the kernel mechanism already covers the block, so the re-exec
     /// arm reports itself as covered (ubuntu CI exercises this directly).
+    /// Takes the env lock like its sibling arms: same entry function, and a
+    /// future env read in any compiled arm must not reintroduce the race.
     #[cfg(target_os = "linux")]
     #[test]
     fn reexec_is_covered_by_prctl_on_linux() {
+        let _lock = crate::test_util::env_lock();
         let outcome = reexec_clean_env(&CredentialHandoff::default());
         assert_eq!(outcome, ReExecOutcome::CoveredByKernelMechanism);
         assert!(outcome.is_applied());
@@ -946,9 +956,12 @@ mod tests {
 
     /// Windows: no execve semantics (#207) — a documented no-op that must
     /// NOT claim the exposure is closed (windows CI job compiles this).
+    /// Takes the env lock like its sibling arms: same entry function, and a
+    /// future env read in any compiled arm must not reintroduce the race.
     #[cfg(not(unix))]
     #[test]
     fn reexec_is_noop_without_execve_semantics() {
+        let _lock = crate::test_util::env_lock();
         let outcome = reexec_clean_env(&CredentialHandoff::default());
         assert_eq!(outcome, ReExecOutcome::NoExecveSemantics);
         assert!(!outcome.is_applied());
