@@ -18,6 +18,7 @@ mod rate_limit;
 mod session_mirror;
 pub mod triggers;
 mod usage;
+mod workspace_files;
 
 // Goal 395: the admission gate moved to the transport-agnostic
 // `session_host` module; re-exported here so front-end call sites and
@@ -53,6 +54,7 @@ use handlers::{
     session_plan_confirm, session_plan_reject, session_set_goal,
 };
 use rate_limit::{metrics_middleware, rate_limit_middleware};
+use workspace_files::session_workspace_files;
 
 use triggers::{
     create_trigger, delete_trigger, fire_webhook, get_trigger, list_triggers, patch_trigger,
@@ -192,6 +194,11 @@ pub struct Metrics {
     /// [`SessionEventLog::with_eviction_counter`]; a sustained rise is the
     /// signal to raise `RECURSIVE_SSE_REPLAY_CAPACITY`.
     pub event_log_evictions: Arc<AtomicU64>,
+    /// Goal 423 W2b (#132): read-only files-endpoint refusals by reason
+    /// (`escape` / `too_large` / `version_mismatch` / `symlink` / `range` /
+    /// `not_utf8`). Every refusal also WARNs; a rising family means clients
+    /// are asking for paths or pages the contract refuses.
+    pub workspace_file_rejections: CounterFamily,
     // ── Issue #113: histograms ─────────────────────────────────────────
     /// Per-`model` LLM latency of a completed run, fed from
     /// [`crate::runtime::RuntimeOutcome::llm_latency_ms`] — the runtime
@@ -257,6 +264,7 @@ impl Default for Metrics {
             event_stream_gaps: AtomicU64::new(0),
             event_stream_snapshots: AtomicU64::new(0),
             event_log_evictions: Arc::new(AtomicU64::new(0)),
+            workspace_file_rejections: CounterFamily::default(),
             llm_latency_ms: HistogramFamily::new(LLM_LATENCY_MS_BUCKETS),
             run_steps: HistogramFamily::new(RUN_STEPS_BUCKETS),
             admission_wait_ms: HistogramFamily::new(ADMISSION_WAIT_MS_BUCKETS),
@@ -966,6 +974,7 @@ pub(crate) fn test_config_stub() -> crate::config::Config {
         session_run_code: None,
         goal_eval_transcript_tail: 12,
         sse_replay_capacity: 512,
+        workspace_file_max_bytes: 256 * 1024,
         web_search_provider: None,
         web_search_api_key: None,
         web_search_jina_key: None,
@@ -1316,6 +1325,7 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}/messages", post(send_session_message))
         .route("/sessions/{id}/usage", get(get_session_usage))
         .route("/sessions/{id}/events", get(session_events))
+        .route("/sessions/{id}/files", get(session_workspace_files))
         .route("/sessions/{id}/plan/confirm", post(session_plan_confirm))
         .route("/sessions/{id}/plan/reject", post(session_plan_reject))
         .route("/sessions/{id}/goal", post(session_set_goal))
@@ -1729,6 +1739,96 @@ pub fn build_openapi_spec() -> serde_json::Value {
                     }
                 }
             },
+            "/sessions/{id}/files": {
+                "get": {
+                    "summary": "Read a workspace file (read-only)",
+                    "description": "Goal 423 W2b (issue #132): read-only access to the \
+                        session's workspace root, in three modes. `mode=lines` (default) \
+                        returns a 1-indexed inclusive `start_line`/`end_line` page of a \
+                        UTF-8 text file — the `Read` tool's convention (CRLF input is \
+                        LF-normalized); out-of-range pages are an explicit 422, never \
+                        clamped. `mode=bytes` returns an `offset`/`length` byte window as \
+                        base64 `data`; windows outside the file are an explicit 422. \
+                        `mode=list` returns a single-level directory listing \
+                        (`name`/`kind` `file|dir|symlink`/`size`); entries are never \
+                        followed through symlinks. Every response carries a `version` \
+                        token (`\"{mtime_ms}-{len}\"`); pass it back as `?version=` and a \
+                        changed file answers 412 instead of a silently mixed read. A file \
+                        above the configured ceiling (env \
+                        `RECURSIVE_WORKSPACE_FILE_MAX_BYTES`, default 256 KiB — the `Read` \
+                        tool's limit) is an explicit 413 in every mode: oversized reads \
+                        fail, they never truncate. Paths resolve with containment on the \
+                        resolved form and a terminal symlink is always rejected (inside \
+                        the root or not); error messages quote the client's relative \
+                        spelling only. Read-only: GET is the only method; reads have no \
+                        side effects. Refusals are counted on `/metrics` as \
+                        `recursive_workspace_file_rejections{reason=...}`.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string" }
+                    }, {
+                        "name": "path",
+                        "in": "query",
+                        "required": false,
+                        "description": "Path relative to the workspace root \
+                            (required except for `mode=list`, which may list the root).",
+                        "schema": { "type": "string" }
+                    }, {
+                        "name": "mode",
+                        "in": "query",
+                        "required": false,
+                        "schema": { "type": "string", "enum": ["lines", "bytes", "list"] }
+                    }, {
+                        "name": "start_line",
+                        "in": "query",
+                        "required": false,
+                        "description": "mode=lines: 1-indexed inclusive first line (default 1).",
+                        "schema": { "type": "integer" }
+                    }, {
+                        "name": "end_line",
+                        "in": "query",
+                        "required": false,
+                        "description": "mode=lines: 1-indexed inclusive last line (default: last line).",
+                        "schema": { "type": "integer" }
+                    }, {
+                        "name": "offset",
+                        "in": "query",
+                        "required": false,
+                        "description": "mode=bytes: first byte of the window (default 0).",
+                        "schema": { "type": "integer" }
+                    }, {
+                        "name": "length",
+                        "in": "query",
+                        "required": false,
+                        "description": "mode=bytes: window length (default: through end of file).",
+                        "schema": { "type": "integer" }
+                    }, {
+                        "name": "version",
+                        "in": "query",
+                        "required": false,
+                        "description": "Expected version token; a mismatch answers 412.",
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "File page, byte window or directory listing",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object" }
+                                }
+                            }
+                        },
+                        "400": { "description": "Rejected path (escape, symlink) or bad parameters" },
+                        "403": { "description": "Session belongs to another identity" },
+                        "404": { "description": "Session or entry not found" },
+                        "412": { "description": "Version mismatch: the file changed since the client last read it" },
+                        "413": { "description": "File exceeds the configured size ceiling; nothing is truncated" },
+                        "422": { "description": "Out-of-range page/window, or non-UTF-8 file in lines mode" }
+                    }
+                }
+            },
             "/agui": {
                 "post": {
                     "summary": "Run an AG-UI agent",
@@ -1801,6 +1901,10 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         Issue #132 adds `recursive_event_stream_gaps` / \
                         `recursive_event_stream_snapshots` (session event streams opened \
                         with an explicit gap / healed with a state snapshot). \
+                        Goal 423 W2b adds `recursive_workspace_file_rejections` \
+                        (`reason` = why the read-only files endpoint refused a path: \
+                        escape / too_large / version_mismatch / symlink / range / \
+                        not_utf8). \
                         Issue #113 adds the labelled series `recursive_requests_total` \
                         (`route` = matched route template, `status`), \
                         `recursive_agent_runs_finished_total` (`finish_reason`), \
@@ -2842,6 +2946,7 @@ mod goal_396_persistence_tests {
             session_run_code: None,
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
+            workspace_file_max_bytes: 256 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,

@@ -3499,6 +3499,11 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
         "Compactions skipped by reason (issue #113)",
         &["reason"],
     ));
+    out.push_str(&metrics.workspace_file_rejections.render(
+        "recursive_workspace_file_rejections",
+        "Read-only workspace files endpoint refusals by reason (Goal 423 W2b, issue #132)",
+        &["reason"],
+    ));
     out.push_str(&metrics.llm_latency_ms.render(
         "recursive_llm_latency_ms",
         "LLM latency of a completed run in milliseconds, by model (issue #113)",

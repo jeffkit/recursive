@@ -65,6 +65,15 @@ pub const DEFAULT_RETRY_NETWORK_BUDGET_SECS: u64 = 600;
 /// `--no-default-features` builds do not reach into the `http` feature.
 pub const DEFAULT_SSE_REPLAY_CAPACITY: usize = 512;
 
+/// Default byte ceiling for one workspace file served over HTTP (Goal 423
+/// W2b, issue #132) — the single literal behind
+/// `Config::workspace_file_max_bytes` and the `Read` tool's default
+/// `max_bytes`, so the agent surface and the read-only files endpoint reject
+/// at the same size. A larger file is an explicit error in every mode, never
+/// a truncation. Kept in `config` (always compiled) so `--no-default-features`
+/// builds do not reach into the `http` feature.
+pub const DEFAULT_WORKSPACE_FILE_MAX_BYTES: usize = 256 * 1024;
+
 #[derive(Clone)]
 pub struct Config {
     pub workspace: PathBuf,
@@ -225,6 +234,14 @@ pub struct Config {
     /// snapshot/gap path.
     /// Default 512. Set via `RECURSIVE_SSE_REPLAY_CAPACITY` env var.
     pub sse_replay_capacity: usize,
+    /// Goal 423 W2b (#132): byte ceiling for a single file served by the
+    /// read-only `GET /sessions/{id}/files` endpoint. A file above it is an
+    /// explicit 413 in **every** mode — page requests included — never a
+    /// truncation; the default is the shared
+    /// [`DEFAULT_WORKSPACE_FILE_MAX_BYTES`], which is also the `Read` tool's
+    /// default, so both read surfaces reject at the same size.
+    /// Default 262144. Set via `RECURSIVE_WORKSPACE_FILE_MAX_BYTES` env var.
+    pub workspace_file_max_bytes: usize,
     /// Web search provider name (brave, tavily, serper, bocha, bing).
     /// Set via `RECURSIVE_WEB_SEARCH_PROVIDER` env var or `[search]` config.
     pub web_search_provider: Option<String>,
@@ -721,6 +738,14 @@ impl Config {
         let sse_replay_capacity =
             parse_env("RECURSIVE_SSE_REPLAY_CAPACITY", DEFAULT_SSE_REPLAY_CAPACITY)?;
 
+        // Goal 423 W2b (#132): same env-only shape. The default is the shared
+        // constant so the HTTP files endpoint and the `Read` tool reject at
+        // the same size (single source of truth).
+        let workspace_file_max_bytes = parse_env(
+            "RECURSIVE_WORKSPACE_FILE_MAX_BYTES",
+            DEFAULT_WORKSPACE_FILE_MAX_BYTES,
+        )?;
+
         // Web search config: env var > file config > None
         let file_search = file_config.search.as_ref();
         let web_search_provider = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER")
@@ -832,6 +857,7 @@ impl Config {
             session_run_code: None,
             goal_eval_transcript_tail,
             sse_replay_capacity,
+            workspace_file_max_bytes,
             web_search_provider,
             web_search_api_key,
             web_search_jina_key,
@@ -1779,6 +1805,7 @@ max_tokens = 20000
             session_run_code: None,
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
+            workspace_file_max_bytes: 256 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
@@ -2606,6 +2633,7 @@ preset = "totally-bogus-id"
             session_run_code: None,
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
+            workspace_file_max_bytes: 256 * 1024,
             web_search_provider: None,
             web_search_api_key: Some("sk-secret".into()),
             web_search_jina_key: None,
@@ -2757,6 +2785,7 @@ api_key = "sk-from-file"
                 session_run_code: None,
                 goal_eval_transcript_tail: 12,
                 sse_replay_capacity: 512,
+                workspace_file_max_bytes: 256 * 1024,
                 web_search_provider: None,
                 web_search_api_key: None,
                 web_search_jina_key: None,
@@ -2810,6 +2839,7 @@ api_key = "sk-from-file"
             session_run_code: None,
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
+            workspace_file_max_bytes: 256 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
@@ -2896,6 +2926,50 @@ api_key = "sk-from-file"
         std::env::remove_var("RECURSIVE_API_KEY");
     }
 
+    /// Goal 423 W2b (#132): the files-endpoint ceiling defaults to the shared
+    /// constant (the `Read` tool's limit — one number, two surfaces), moves
+    /// with its env var, and rejects garbage at startup instead of silently
+    /// keeping the default.
+    #[test]
+    fn workspace_file_max_bytes_default_is_the_const_and_env_overrides_it() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let original = std::env::var("RECURSIVE_WORKSPACE_FILE_MAX_BYTES").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        std::env::remove_var("RECURSIVE_WORKSPACE_FILE_MAX_BYTES");
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.workspace_file_max_bytes,
+            DEFAULT_WORKSPACE_FILE_MAX_BYTES
+        );
+        assert_eq!(config.workspace_file_max_bytes, 256 * 1024);
+
+        std::env::set_var("RECURSIVE_WORKSPACE_FILE_MAX_BYTES", "16");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.workspace_file_max_bytes, 16);
+
+        std::env::set_var("RECURSIVE_WORKSPACE_FILE_MAX_BYTES", "huge");
+        let err = Config::from_env().expect_err("garbage must be rejected");
+        assert!(
+            err.to_string()
+                .contains("RECURSIVE_WORKSPACE_FILE_MAX_BYTES"),
+            "{err}"
+        );
+
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_WORKSPACE_FILE_MAX_BYTES", v);
+        } else {
+            std::env::remove_var("RECURSIVE_WORKSPACE_FILE_MAX_BYTES");
+        }
+
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
+    }
+
     // -----------------------------------------------------------------------
     // web_search empty-string filter tests
     // (kills delete-! mutants on lines 446/450/454)
@@ -2945,6 +3019,7 @@ api_key = "sk-from-file"
             session_run_code: None,
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
+            workspace_file_max_bytes: 256 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,

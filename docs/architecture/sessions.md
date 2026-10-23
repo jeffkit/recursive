@@ -158,6 +158,23 @@ family (`src/session/index.rs`, `src/session/relations.rs`,
   attachments. There is no CLI/HTTP entry point either — `export_session_tree`
   is the library entry point a channel can call.
 
+## Read-only workspace files over HTTP (Goal 423 W2b, issue #132)
+
+`GET /sessions/{id}/files` serves the session's workspace read-only: `mode=lines`
+(1-indexed inclusive line page, the `Read` tool's convention incl. CRLF→LF
+normalization), `mode=bytes` (base64 byte window) and `mode=list` (single-level
+listing that never follows symlinks). Contract: paths resolve with containment
+on the *resolved form* via `resolve_within_any` (#170 precedent) and a terminal
+symlink is always refused (inside the root or not); every response carries a
+`version` token (`"{mtime_ms}-{len}"`, `412` on a `?version=` mismatch); a file
+above `RECURSIVE_WORKSPACE_FILE_MAX_BYTES` (default 256 KiB — the same constant
+as the `Read` tool) is an explicit `413` in every mode — oversized reads fail,
+they never truncate; pagination out of range is an explicit `422`, never a
+clamp. Owner/admin gate as on every `/sessions/:id*` route (cold-loading
+included — a restart does not 404 the first read), GET-only, zero write
+surface, refusals counted as `recursive_workspace_file_rejections{reason}` on
+`/metrics`. Implementation: `src/http/workspace_files.rs`.
+
 ## Migration
 
 `src/migrate.rs` handles migration of legacy `.recursive/sessions/` and

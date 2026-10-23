@@ -207,7 +207,9 @@ impl ReadFile {
             root: root.into(),
             extra_roots: Vec::new(),
             session_roots: None,
-            max_bytes: 256 * 1024,
+            // Goal 423 W2b: the shared constant (also the HTTP files
+            // endpoint's ceiling) so both read surfaces reject at one size.
+            max_bytes: crate::config::DEFAULT_WORKSPACE_FILE_MAX_BYTES,
             read_state: None,
             transport: Arc::new(crate::tools::transport::LocalTransport),
         }
