@@ -155,10 +155,13 @@ mod issue132_workspace_files_tests {
     /// symlink is refused even when it points *inside* the root; and no
     /// error message ever echoes a server-side absolute path.
     #[tokio::test]
-    #[cfg_attr(
-        windows,
-        ignore = "symlink_dir needs Windows privileges (#224); lift when CI grants them"
-    )]
+    // Whole-test unix gate, not cfg_attr(windows, ignore): the body uses
+    // `std::os::unix::fs::symlink`, which does not exist on windows, so the
+    // test cannot even *compile* there — `ignore` only skips at runtime
+    // (E0433 x5 in the windows clippy job, run 40037188916). These are
+    // unix-semantics assertions (symlink refusal); lift the gate only by
+    // abstracting symlink creation behind a cfg-gated helper (#224).
+    #[cfg(unix)]
     async fn workspace_files_cannot_read_outside_root() {
         let (state, tmp) = workspace_state();
         let app = build_router(state.clone());
@@ -353,10 +356,10 @@ mod issue132_workspace_files_tests {
     /// type and never follows a symlink — a link to a file is listed as
     /// `symlink`, not resolved into the file it points at.
     #[tokio::test]
-    #[cfg_attr(
-        windows,
-        ignore = "symlink_file needs Windows privileges (#224); lift when CI grants them"
-    )]
+    // Whole-test unix gate: body uses `std::os::unix::fs::symlink`
+    // (compile error on windows; see the sibling test's comment above and
+    // run 40037188916). Unix-semantics listing assertions (#224).
+    #[cfg(unix)]
     async fn directory_listing_is_contained_and_does_not_follow_symlinks() {
         let (state, tmp) = workspace_state();
         let app = build_router(state.clone());
