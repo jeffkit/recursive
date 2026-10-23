@@ -3683,6 +3683,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "libc",
  "mutants",
  "opentelemetry",
  "opentelemetry-otlp",

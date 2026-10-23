@@ -57,6 +57,10 @@ otel = [
 
 [dev-dependencies]
 tempfile = "3"
+# `tests/issue226_reexec_env.rs` re-creates the parent half of the re-exec
+# handoff (a `pipe(2)` with an inheritable read end); `std` has no API that
+# clears `FD_CLOEXEC`. Already in the graph — the root lib depends on it.
+libc = "0.2"
 # Inert attribute crate recognized by cargo-mutants (`#[cfg_attr(test, mutants::skip)]`).
 # Tags structurally untestable / behaviour-equivalent mutants in this crate so the
 # `cli-mutants` gate stops counting them as missed. No production-build impact.

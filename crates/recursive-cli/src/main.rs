@@ -609,6 +609,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
+    // Issue #226: when this process is the clean-environment re-execution of
+    // itself, the parent passed its credential variables over an inherited
+    // fd (they are deliberately absent from the exec-time environment block,
+    // which KERN_PROCARGS2 exposes to same-uid readers on macOS). Restore
+    // them into the live environment before *anything* reads the
+    // environment — clap's injection, `Config::from_env`, the startup scrub
+    // — so this boot replays the parent's exactly. The outcome is reported
+    // below, once `init_logging` has a subscriber to receive it.
+    let reexec_restore = recursive::hardening::restore_reexec_env();
     // Issue #150: hide this process's `/proc/<pid>/environ` from same-uid
     // children before any execution surface (tool transport, run_background,
     // HTTP server) can spawn a shell. Must happen before `Cli::parse()` /
@@ -641,6 +650,7 @@ async fn async_main() -> anyhow::Result<()> {
     let _logging_guard = init_logging(&early_log, &cli.log_format)?;
     tracing::trace!("recursive main starting");
     hardening.report();
+    reexec_restore.report();
 
     if cli.session_out.is_some() {
         eprintln!(
@@ -794,6 +804,14 @@ async fn async_main() -> anyhow::Result<()> {
     // `recursive init` re-reads the preset key env by name to tell the
     // operator whether it is already set — it builds no execution surface,
     // so it keeps its environment.
+    //
+    // Issue #226 (macOS / non-Linux unix): this is also the re-exec seam.
+    // The handoff is captured *before* the scrub (which destroys the
+    // values), the scrub builds the whitelist, then `reexec_clean_env`
+    // replaces this image with a clean-environment copy of itself — same
+    // pid, credentials coming back over an inherited fd in the child. On
+    // Linux `prctl` already hides the block and on Windows there are no
+    // execve semantics; both report through the same outcome.
     if !matches!(effective_cmd, Cmd::Init { .. }) {
         #[cfg(feature = "http")]
         let keep_for_router: &[&str] = if matches!(effective_cmd, Cmd::Http { .. }) {
@@ -803,8 +821,27 @@ async fn async_main() -> anyhow::Result<()> {
         };
         #[cfg(not(feature = "http"))]
         let keep_for_router: &[&str] = &[];
+        let handoff = recursive::hardening::CredentialHandoff::capture();
         let scrub = recursive::hardening::scrub_process_env(keep_for_router);
-        hardening.warn_if_exposed(&scrub);
+        let reexec = recursive::hardening::reexec_clean_env(&handoff);
+        // Never returns on the success path — the exec'd child reports
+        // AlreadyCleanEnv here on its own boot.
+        reexec.report();
+        // The exec-time block is hidden when the kernel mechanism took
+        // (Linux `prctl`), when this is the clean-env re-exec, or when there
+        // was nothing credential-shaped to protect; only then does the
+        // standing #150 exposure WARN go quiet. Deliberately not
+        // `reexec.is_applied()`: that is also true for
+        // `CoveredByKernelMechanism`, which would mask a *failed* `prctl`.
+        let block_hidden = hardening.is_applied()
+            || matches!(
+                reexec,
+                recursive::hardening::ReExecOutcome::AlreadyCleanEnv
+                    | recursive::hardening::ReExecOutcome::NotNeeded
+            );
+        if !block_hidden {
+            hardening.warn_if_exposed(&scrub);
+        }
     }
 
     // Warn about legacy in-tree state for commands that interact with
