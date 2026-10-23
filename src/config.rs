@@ -59,6 +59,12 @@ pub const DEFAULT_RETRY_MAX_BACKOFF_SECS: u64 = 8;
 /// restores count-only retries.
 pub const DEFAULT_RETRY_NETWORK_BUDGET_SECS: u64 = 600;
 
+/// Default SSE replay ring capacity (frames) — the single literal behind
+/// `Config::sse_replay_capacity` and the http module's
+/// `SESSION_EVENT_LOG_CAPACITY`. Kept in `config` (always compiled) so
+/// `--no-default-features` builds do not reach into the `http` feature.
+pub const DEFAULT_SSE_REPLAY_CAPACITY: usize = 512;
+
 #[derive(Clone)]
 pub struct Config {
     pub workspace: PathBuf,
@@ -212,7 +218,8 @@ pub struct Config {
     pub goal_eval_transcript_tail: usize,
     /// Goal 422 W1 (#132): how many frames a session's SSE replay ring
     /// retains. The default matches the pre-config hard-coded value
-    /// ([`crate::http::SESSION_EVENT_LOG_CAPACITY`]) byte for byte — this
+    /// ([`DEFAULT_SSE_REPLAY_CAPACITY`], re-exported by the http module as
+    /// `SESSION_EVENT_LOG_CAPACITY`) byte for byte — this
     /// only widens or narrows the resume window, never changes frame
     /// semantics; cursors beyond it keep resolving to the explicit
     /// snapshot/gap path.
@@ -708,12 +715,11 @@ impl Config {
                 .unwrap_or(12usize),
         )?;
 
-        // Goal 422 W1 (#132): env only — no file-config knob yet; the default
-        // is the http module's constant so the two can never drift apart.
-        let sse_replay_capacity = parse_env(
-            "RECURSIVE_SSE_REPLAY_CAPACITY",
-            crate::http::SESSION_EVENT_LOG_CAPACITY,
-        )?;
+        // Goal 422 W1 (#132): env only — no file-config knob yet. The literal
+        // lives here (always compiled) and the http module aliases it, so the
+        // two can never drift apart and `--no-default-features` still builds.
+        let sse_replay_capacity =
+            parse_env("RECURSIVE_SSE_REPLAY_CAPACITY", DEFAULT_SSE_REPLAY_CAPACITY)?;
 
         // Web search config: env var > file config > None
         let file_search = file_config.search.as_ref();
@@ -2861,13 +2867,10 @@ api_key = "sk-from-file"
         std::env::set_var("RECURSIVE_MODEL", "test-model");
         std::env::set_var("RECURSIVE_API_KEY", "test-key");
 
-        // Default: env unset → the http constant (512).
+        // Default: env unset → the shared constant (512).
         std::env::remove_var("RECURSIVE_SSE_REPLAY_CAPACITY");
         let config = Config::from_env().unwrap();
-        assert_eq!(
-            config.sse_replay_capacity,
-            crate::http::SESSION_EVENT_LOG_CAPACITY
-        );
+        assert_eq!(config.sse_replay_capacity, DEFAULT_SSE_REPLAY_CAPACITY);
         assert_eq!(config.sse_replay_capacity, 512);
 
         // Override: env=4 → 4.

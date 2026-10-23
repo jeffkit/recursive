@@ -35,7 +35,7 @@ use super::SseFrame;
 /// `RECURSIVE_SSE_REPLAY_CAPACITY` ([`crate::config::Config::sse_replay_capacity`]);
 /// this constant is that setting's default and the value every pre-config
 /// build used.
-pub const SESSION_EVENT_LOG_CAPACITY: usize = 512;
+pub const SESSION_EVENT_LOG_CAPACITY: usize = crate::config::DEFAULT_SSE_REPLAY_CAPACITY;
 
 /// What a subscriber must receive to (re)join the stream at a cursor, plus
 /// the position its live pump resumes from.
