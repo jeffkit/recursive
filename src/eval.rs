@@ -1776,20 +1776,25 @@ mod tests {
 
     #[test]
     fn task_set_covers_every_category_and_stays_in_the_first_version_window() {
+        // Through the public accessor, not the static: `tasks()` is what the
+        // report and the CLI consume, so a body swapped for an empty slice
+        // must fail here. (Every check reading `TASKS` directly is why the
+        // `Vec::leak(Vec::new())` mutant survived #223's run 39854090906.)
+        let all = tasks();
         assert!(
-            (8..=15).contains(&TASKS.len()),
+            (8..=15).contains(&all.len()),
             "the first task set is 8-15 tasks, got {}",
-            TASKS.len()
+            all.len()
         );
         for category in TaskCategory::all() {
-            let count = TASKS.iter().filter(|t| t.category == category).count();
+            let count = all.iter().filter(|t| t.category == category).count();
             assert!(
                 (2..=3).contains(&count),
                 "category {} has {count} tasks, expected 2-3",
                 category.as_str()
             );
         }
-        let mut ids: Vec<&str> = TASKS.iter().map(|t| t.id).collect();
+        let mut ids: Vec<&str> = all.iter().map(|t| t.id).collect();
         let before = ids.len();
         ids.sort();
         ids.dedup();
@@ -2446,6 +2451,432 @@ mod tests {
         assert!(
             !render_markdown(std::slice::from_ref(&plain)).contains("## Mechanism pairs"),
             "a report without the batch pair must not gain the section"
+        );
+    }
+
+    /// Issue #223 (run 39854090906): a seeder body swapped for `Ok(())`
+    /// survived — the generic seeder test only checks it does not crash and
+    /// is idempotent, never what it leaves on disk. These four seeders are
+    /// the ones the run flagged; each is pinned by its exact bytes.
+    #[test]
+    fn seeders_place_their_exact_files_on_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path();
+
+        seed_data_csv(ws).expect("seed data.csv");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data.csv")).expect("data.csv"),
+            "1,alice,90\n2,bob,85\n"
+        );
+
+        seed_marker_files(ws).expect("seed marker files");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).expect("a.txt"),
+            "alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("b.txt")).expect("b.txt"),
+            "MARKER lives here\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("c.txt")).expect("c.txt"),
+            "gamma\n"
+        );
+
+        seed_line_files(ws).expect("seed line files");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("x.txt")).expect("x.txt"),
+            "one\ntwo\nthree\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("y.txt")).expect("y.txt"),
+            "four\nfive\n"
+        );
+
+        seed_input_txt(ws).expect("seed input.txt");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("input.txt")).expect("input.txt"),
+            "abc\n"
+        );
+    }
+
+    /// Issue #223: `Mode::as_str` swapped for a constant (`""` / `"xyzzy"`)
+    /// survived — the string lands in `Sample.mode` and drives the report's
+    /// mode list and the replay-disclaimer gate, but no test spelled it out.
+    #[test]
+    fn mode_strings_are_the_report_and_flag_contract() {
+        assert_eq!(Mode::Replay.as_str(), "replay");
+        assert_eq!(Mode::Live.as_str(), "live");
+    }
+
+    /// Issue #223: `preset_carries_run_code` swapped for `false` survived —
+    /// the only call site is the skip gate in `run_task_across_presets`, and
+    /// every existing assertion exercised the skip direction (a pinned task
+    /// *may* skip), which stays true when nothing can ever carry the tool.
+    /// The truth table pins the carry direction itself, plus both refusals.
+    #[test]
+    fn preset_carries_run_code_truth_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = config_for(tmp.path());
+        let pinned = task("batch-run-code").expect("pinned task");
+        let plain = task("single-append-row").expect("plain task");
+        let standard = preset::find("standard").expect("standard");
+        let minimal = preset::find("minimal").expect("minimal");
+
+        // No allow-list: the explicit pin resolves RunCode on, so a capable
+        // preset must carry the arm — the direction the mutant erased.
+        assert!(
+            preset_carries_run_code(&config, standard, pinned),
+            "standard carries the pinned arm: no allow-list, env pinned on"
+        );
+        // minimal's allow-list can never gain RunCode, pin or no pin.
+        assert!(!preset_carries_run_code(&config, minimal, pinned));
+        // Without the pin, standard's own declaration (off) holds.
+        assert!(!preset_carries_run_code(&config, standard, plain));
+    }
+
+    /// Issue #223: `estimate_messages_tokens` swapped for `1` survived — no
+    /// test called it. Pin the arithmetic (content + tool-call name + args,
+    /// the harness's bytes/4 estimate) and the empty baseline.
+    #[test]
+    fn message_token_estimate_sums_content_and_tool_calls() {
+        let args = serde_json::json!({ "path": "a.txt" });
+        let expected = estimate_tokens("abcd")
+            + estimate_tokens("hello!")
+            + estimate_tokens("Read")
+            + estimate_tokens(&args.to_string());
+        assert_eq!(expected, 8, "bytes/4 ceil: 1 + 2 + 1 + 4");
+
+        let messages = vec![
+            Message::user("abcd"),
+            Message::assistant_with_tool_calls(
+                "hello!",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "Read".into(),
+                    arguments: args,
+                }],
+            ),
+        ];
+        assert_eq!(estimate_messages_tokens(&messages), expected);
+        assert_eq!(estimate_messages_tokens(&[]), 0);
+    }
+
+    /// Issue #223: `estimate_output_tokens` swapped for `0`/`1` and its
+    /// assistant filter flipped (`==`→`!=`) all survived. Pin the exact sum
+    /// over assistant messages only — the non-assistant rows sum to 3, the
+    /// assistant rows to 7, so the flipped filter cannot pass either.
+    #[test]
+    fn output_token_estimate_counts_only_assistant_rows() {
+        let args = serde_json::json!({ "cmd": "ls" });
+        let expected = estimate_tokens("assist text")
+            + estimate_tokens("Bash")
+            + estimate_tokens(&args.to_string());
+        assert_eq!(expected, 7, "bytes/4 ceil: 3 + 1 + 3");
+
+        let transcript = vec![
+            Message::system("sys"),
+            Message::user("usr"),
+            Message::assistant("assist text"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "Bash".into(),
+                    arguments: args,
+                }],
+            ),
+            Message::tool_result("call-1", "res"),
+        ];
+        assert_eq!(estimate_output_tokens(&transcript), expected);
+    }
+
+    /// Issue #223: the `+=` on cache_read_tokens/turns/tool_calls in
+    /// `summarize` swapped for `-=`/`*=` survived — the existing aggregation
+    /// test feeds cache 0, turns 1, tools 0, values on which every operator
+    /// is extensionally equal. Non-trivial values pin the real sums.
+    #[test]
+    fn summarize_sums_every_counter_over_trivial_free_values() {
+        let mk = |cache: u32, wall: u64, turns: usize, tools: usize| Sample {
+            task_id: "t".into(),
+            category: "single-file".into(),
+            preset: "minimal".into(),
+            system_prompt_tokens: 100,
+            mode: "replay".into(),
+            success: true,
+            finish_reason: "no_more_tool_calls".into(),
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_read_tokens: cache,
+            wall_ms: wall,
+            turns,
+            tool_calls: tools,
+            failure: None,
+            provider: None,
+            model: None,
+        };
+        let samples = vec![mk(7, 5, 2, 4), {
+            let mut second = mk(9, 7, 3, 6);
+            second.system_prompt_tokens = 120;
+            second
+        }];
+        let stats = summarize(&samples);
+        assert_eq!(stats.len(), 1);
+        let s = &stats[0];
+        assert_eq!(s.cache_read_tokens, 16, "7 + 9, not 7 - 9 or 7 * 9");
+        assert_eq!(s.turns, 5, "2 + 3, not 2 * 3");
+        assert_eq!(s.tool_calls, 10, "4 + 6, not 4 * 6");
+        assert_eq!(s.input_tokens, 20);
+        assert_eq!(s.output_tokens, 6);
+        assert_eq!(s.wall_ms, 12);
+        assert_eq!(s.system_prompt_tokens, 120, "max, not sum");
+    }
+
+    /// Issue #223: `summarize_by_category` survived an empty-vec body, the
+    /// dedup-guard `!` deletion, and all three filter mutations on
+    /// `category == … && preset == …` — no test called it directly. One test
+    /// pins row identity (unique, sorted), row count, and per-row numbers
+    /// that differ in both axes so `!=`/`||` subsets cannot coincide.
+    #[test]
+    fn summarize_by_category_rows_are_unique_sorted_and_exact() {
+        let mk = |category: &str, preset: &str, input: u32| Sample {
+            task_id: "t".into(),
+            category: category.into(),
+            preset: preset.into(),
+            system_prompt_tokens: 1,
+            mode: "replay".into(),
+            success: true,
+            finish_reason: "no_more_tool_calls".into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            wall_ms: 1,
+            turns: 1,
+            tool_calls: 0,
+            failure: None,
+            provider: None,
+            model: None,
+        };
+        let samples = vec![
+            mk("single-file", "minimal", 10),
+            mk("multi-step", "standard", 70),
+            mk("single-file", "minimal", 20),
+            mk("single-file", "standard", 100),
+            mk("multi-step", "minimal", 7),
+        ];
+
+        let rows = summarize_by_category(&samples);
+        let keys: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(category, s)| (category.as_str(), s.preset.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("multi-step", "minimal"),
+                ("multi-step", "standard"),
+                ("single-file", "minimal"),
+                ("single-file", "standard"),
+            ],
+            "unique (category, preset) rows in sorted order — a duplicated key \
+             or an empty body fails here"
+        );
+
+        let cell = |category: &str, preset: &str| {
+            rows.iter()
+                .find(|(c, s)| c == category && s.preset == preset)
+                .map(|(_, s)| (s.runs, s.input_tokens))
+                .expect("row exists")
+        };
+        assert_eq!(cell("multi-step", "minimal"), (1, 7));
+        assert_eq!(cell("multi-step", "standard"), (1, 70));
+        assert_eq!(cell("single-file", "minimal"), (2, 30));
+        assert_eq!(cell("single-file", "standard"), (1, 100));
+    }
+
+    /// Issue #223: both `&&`s in `mechanism_pairs`' skip probe flipped to
+    /// `||` survived — the skip flag was only asserted where it is true, so
+    /// a probe that lights up for the wrong preset passed unnoticed. Pin the
+    /// full table: skip marks only its own preset, arms carry exact means,
+    /// and a preset with one arm has no skip and no phantom stats.
+    #[test]
+    fn mechanism_pairs_mark_only_their_own_preset_skip() {
+        let mk = |task_id: &str, preset: &str, finish: &str, input: u32| Sample {
+            task_id: task_id.into(),
+            category: "batch-aggregate".into(),
+            preset: preset.into(),
+            system_prompt_tokens: 893,
+            mode: "replay".into(),
+            success: finish != "skipped",
+            finish_reason: finish.into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            wall_ms: 10,
+            turns: 2,
+            tool_calls: 1,
+            failure: None,
+            provider: None,
+            model: None,
+        };
+        let samples = vec![
+            mk("batch-run-code", "minimal", "skipped", 0),
+            mk("batch-roundtrip", "standard", "no_more_tool_calls", 3000),
+            mk("batch-roundtrip", "standard", "no_more_tool_calls", 3004),
+            mk("batch-run-code", "standard", "no_more_tool_calls", 1500),
+            mk("batch-run-code", "standard", "no_more_tool_calls", 1508),
+            mk("batch-roundtrip", "solo", "no_more_tool_calls", 500),
+            // Not a batch task: contributes no pair of its own, no stats.
+            mk("t1", "standard", "no_more_tool_calls", 99),
+        ];
+
+        let pairs = mechanism_pairs(&samples);
+        assert_eq!(
+            pairs.iter().map(|p| p.preset.as_str()).collect::<Vec<_>>(),
+            vec!["minimal", "solo", "standard"],
+            "presets appear only through batch rows, in sorted order"
+        );
+
+        let standard = pairs.iter().find(|p| p.preset == "standard").expect("std");
+        assert!(
+            !standard.run_code_skipped,
+            "standard ran the arm — another preset's skip row must not bleed in"
+        );
+        let roundtrip = standard.roundtrip.as_ref().expect("roundtrip arm");
+        assert_eq!(roundtrip.runs, 2);
+        assert_eq!(roundtrip.successes, 2);
+        assert_eq!(roundtrip.input_tokens, 3002.0);
+        let run_code = standard.run_code.as_ref().expect("run-code arm");
+        assert_eq!(run_code.runs, 2);
+        assert_eq!(run_code.input_tokens, 1504.0);
+
+        let minimal = pairs
+            .iter()
+            .find(|p| p.preset == "minimal")
+            .expect("minimal");
+        assert!(minimal.run_code_skipped, "the loud skip is marked");
+        assert!(
+            minimal.roundtrip.is_none() && minimal.run_code.is_none(),
+            "a skipped arm carries no mechanism numbers"
+        );
+
+        let solo = pairs.iter().find(|p| p.preset == "solo").expect("solo");
+        assert!(solo.roundtrip.is_some());
+        assert!(solo.run_code.is_none());
+        assert!(
+            !solo.run_code_skipped,
+            "solo never had a skip row — the flag must stay false"
+        );
+    }
+
+    /// Issue #223: deleting the `(Some(p), Some(m))` provenance arm or the
+    /// `!` on `!provenance.is_empty()` in `render_markdown` both survived —
+    /// the provider/model line was never asserted. Pin the joined spelling
+    /// (model present → `p/m`, model absent → `p`, duplicates collapse) and
+    /// its absence for replay-only reports.
+    #[test]
+    fn provenance_line_names_provider_model_only_when_present() {
+        let mk = |provider: Option<&str>, model: Option<&str>| Sample {
+            task_id: "t".into(),
+            category: "single-file".into(),
+            preset: "minimal".into(),
+            system_prompt_tokens: 1,
+            mode: "replay".into(),
+            success: true,
+            finish_reason: "no_more_tool_calls".into(),
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            wall_ms: 1,
+            turns: 1,
+            tool_calls: 0,
+            failure: None,
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+        };
+        let live = vec![
+            mk(Some("zhipu"), Some("glm-5")),
+            mk(Some("zhipu"), None),
+            mk(Some("zhipu"), Some("glm-5")),
+        ];
+        let report = render_markdown(&live);
+        assert!(
+            report.contains("Provider/model: zhipu, zhipu/glm-5."),
+            "sorted, deduped, `p/m` when the model is known:\n{report}"
+        );
+
+        let replay_only = vec![mk(None, None)];
+        let replay_report = render_markdown(&replay_only);
+        assert!(
+            !replay_report.contains("Provider/model:"),
+            "replay rows have no provenance to name:\n{replay_report}"
+        );
+    }
+
+    /// Issue #223: flipping the replay-disclaimer gate (`==`→`!=`) survived —
+    /// no test asserted the disclaimer's presence *or* absence.
+    #[test]
+    fn replay_disclaimer_appears_exactly_when_replay_rows_exist() {
+        let mk = |mode: &str| Sample {
+            task_id: "t".into(),
+            category: "single-file".into(),
+            preset: "minimal".into(),
+            system_prompt_tokens: 1,
+            mode: mode.into(),
+            success: true,
+            finish_reason: "no_more_tool_calls".into(),
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            wall_ms: 1,
+            turns: 1,
+            tool_calls: 0,
+            failure: None,
+            provider: None,
+            model: None,
+        };
+        assert!(
+            render_markdown(&[mk("replay")]).contains("deterministic scripted provider"),
+            "replay rows must carry the disclaimer"
+        );
+        assert!(
+            !render_markdown(&[mk("live")]).contains("deterministic scripted provider"),
+            "a live-only report must not carry it"
+        );
+    }
+
+    /// Issue #223: `>` → `>=` on the mechanism delta's zero-guard survived.
+    /// A free roundtrip arm (mean input 0.0) must render the documented
+    /// `ratio` fallback (0.00×), not divide by zero into `inf`.
+    #[test]
+    fn mechanism_delta_ratio_falls_back_to_zero_when_roundtrip_is_free() {
+        let mk = |task_id: &str, input: u32| Sample {
+            task_id: task_id.into(),
+            category: "batch-aggregate".into(),
+            preset: "standard".into(),
+            system_prompt_tokens: 893,
+            mode: "replay".into(),
+            success: true,
+            finish_reason: "no_more_tool_calls".into(),
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            wall_ms: 10,
+            turns: 2,
+            tool_calls: 1,
+            failure: None,
+            provider: None,
+            model: None,
+        };
+        let samples = vec![mk("batch-roundtrip", 0), mk("batch-run-code", 100)];
+        let report = render_markdown(&samples);
+        assert!(
+            report.contains("(0.00×)"),
+            "a zero-mean denominator renders the 0.00× fallback:\n{report}"
+        );
+        assert!(
+            !report.contains("inf"),
+            "no division by zero may leak into the report:\n{report}"
         );
     }
 }
