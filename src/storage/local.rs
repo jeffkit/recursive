@@ -60,6 +60,10 @@ impl LocalStorageBackend {
     /// Delete every persisted transcript whose mtime is older than `cutoff`,
     /// except for the ids in `keep` (sessions still live in memory).
     ///
+    /// Storage keys containing `/` (`trigger-run/<uuid>`) persist one level
+    /// down, in a subdirectory of `sessions/`; the sweep reaches into those
+    /// and keys each record by its slash-joined relative path (issue #147).
+    ///
     /// A session's tombstone (`memory/session-deleted/<id>`) goes with its
     /// transcript — leaving it behind would grow the memory dir without
     /// bound and keep the id on disk after the transcript itself is gone. The
@@ -87,52 +91,10 @@ impl LocalStorageBackend {
     ) -> Result<crate::storage::ReclaimReport> {
         let dir = self.sessions_dir();
         let mut report = crate::storage::ReclaimReport::default();
-        match tokio::fs::read_dir(&dir).await {
-            Ok(mut entries) => {
-                while let Some(entry) = entries.next_entry().await.map_err(|e| Error::Storage {
-                    message: format!("read sessions dir {dir:?}: {e}"),
-                })? {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some(TRANSCRIPT_EXTENSION) {
-                        continue;
-                    }
-                    let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    if keep.contains(id) {
-                        continue;
-                    }
-                    let mtime = entry.metadata().await.ok().and_then(|m| m.modified().ok());
-                    if !is_expired(mtime, cutoff) {
-                        continue;
-                    }
-                    remove_ignoring_missing(&path).await?;
-                    // The tombstone and the per-session metadata/usage blobs
-                    // name the same id and hold plaintext session data. Nothing
-                    // enumerates `memory/`, so a sweep that left them behind
-                    // would retain the session's title, custom system prompt and
-                    // ledger past its retention window indefinitely.
-                    let mut session_failed = false;
-                    for key in std::iter::once(crate::storage::deleted_marker_key(id))
-                        .chain(crate::storage::session_payload_keys(id))
-                    {
-                        if let Err(err) = remove_ignoring_missing(&self.memory_path(&key)).await {
-                            session_failed = true;
-                            tracing::warn!(
-                                session_id = id,
-                                key = %key,
-                                error = %err,
-                                "retention: failed to delete a session's key/value record; \
-                                 plaintext session data is still on disk"
-                            );
-                        }
-                    }
-                    if session_failed {
-                        report.failed += 1;
-                    } else {
-                        report.removed += 1;
-                    }
-                }
+        match tokio::fs::metadata(&dir).await {
+            Ok(_) => {
+                self.purge_transcripts_in(&dir, "", 0, cutoff, keep, &mut report)
+                    .await?;
             }
             // A missing sessions dir means nothing to reap here — but a
             // tombstone may still be stranded, so fall through to the sweep.
@@ -145,6 +107,105 @@ impl LocalStorageBackend {
         }
         report.removed += self.purge_orphan_tombstones(cutoff).await;
         Ok(report)
+    }
+
+    /// Sweep every `*.jsonl` transcript directly inside `dir`, deriving each
+    /// storage key as `<prefix><file stem>`.
+    ///
+    /// `prefix` is empty for the top-level sessions dir and `<name>/` for a
+    /// namespaced subdirectory: the tombstone and key/value records are
+    /// derived from the key the writer used (`trigger-run/<uuid>`), so the
+    /// namespace must be part of the id or the sweep would look for records
+    /// that were never written (issue #147). `depth` gates the descent —
+    /// writers namespace exactly one level, so only the top level recurses.
+    async fn purge_transcripts_in(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        depth: usize,
+        cutoff: SystemTime,
+        keep: &HashSet<String>,
+        report: &mut crate::storage::ReclaimReport,
+    ) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(dir).await.map_err(|e| Error::Storage {
+            message: format!("read sessions dir {dir:?}: {e}"),
+        })?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| Error::Storage {
+            message: format!("read sessions dir {dir:?}: {e}"),
+        })? {
+            let path = entry.path();
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                if depth == 0 {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        let prefix = format!("{prefix}{name}/");
+                        Box::pin(self.purge_transcripts_in(
+                            &path,
+                            &prefix,
+                            depth + 1,
+                            cutoff,
+                            keep,
+                            report,
+                        ))
+                        .await?;
+                    }
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some(TRANSCRIPT_EXTENSION) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let id = format!("{prefix}{stem}");
+            let mtime = entry.metadata().await.ok().and_then(|m| m.modified().ok());
+            self.purge_transcript_file(&id, &path, mtime, cutoff, keep, report)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Purge one expired, unkept transcript file together with the tombstone
+    /// and key/value records that name the same storage key.
+    async fn purge_transcript_file(
+        &self,
+        id: &str,
+        path: &Path,
+        mtime: Option<SystemTime>,
+        cutoff: SystemTime,
+        keep: &HashSet<String>,
+        report: &mut crate::storage::ReclaimReport,
+    ) -> Result<()> {
+        if keep.contains(id) || !is_expired(mtime, cutoff) {
+            return Ok(());
+        }
+        remove_ignoring_missing(path).await?;
+        // The tombstone and the per-session metadata/usage blobs name the same
+        // id and hold plaintext session data. Nothing enumerates `memory/`, so
+        // a sweep that left them behind would retain the session's title,
+        // custom system prompt and ledger past its retention window
+        // indefinitely.
+        let mut session_failed = false;
+        for key in std::iter::once(crate::storage::deleted_marker_key(id))
+            .chain(crate::storage::session_payload_keys(id))
+        {
+            if let Err(err) = remove_ignoring_missing(&self.memory_path(&key)).await {
+                session_failed = true;
+                tracing::warn!(
+                    session_id = id,
+                    key = %key,
+                    error = %err,
+                    "retention: failed to delete a session's key/value record; \
+                     plaintext session data is still on disk"
+                );
+            }
+        }
+        if session_failed {
+            report.failed += 1;
+        } else {
+            report.removed += 1;
+        }
+        Ok(())
     }
 
     /// Delete tombstones that are older than `cutoff` and whose transcript is
@@ -655,6 +716,70 @@ mod tests {
                 "a fresh session keeps its `{key}` record"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn purge_removes_expired_trigger_run_subdirectory_keys() {
+        use std::time::{Duration, SystemTime};
+
+        let (b, _dir) = backend();
+        // `spawn_trigger_run` persists under `trigger-run/<uuid>` (issue
+        // #147); the slash lands the transcript in a subdirectory of
+        // `sessions/`, which the retention sweep must still reach.
+        let expired = "trigger-run/0198f0c1-9d3b-7c4a-8e2f-0123456789ab";
+        let fresh = "trigger-run/0198f0c1-9d3b-7c4a-8e2f-0123456789ac";
+        let kept = "trigger-run/0198f0c1-9d3b-7c4a-8e2f-0123456789ad";
+        for key in [expired, fresh, kept] {
+            b.save_transcript(key, &make_messages()).await.unwrap();
+            b.save_memory(&crate::storage::deleted_marker_key(key), "1")
+                .await
+                .unwrap();
+            for payload in crate::storage::session_payload_keys(key) {
+                b.save_memory(&payload, "{}").await.unwrap();
+            }
+        }
+
+        // Backdate only the expired run's transcript — its age alone drives
+        // the expiry; the tombstone and payload records go with it.
+        let old_mtime = SystemTime::now() - Duration::from_secs(90 * 86_400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(b.transcript_path(expired))
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+            .unwrap();
+
+        let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        let mut keep = HashSet::new();
+        keep.insert(kept.to_string());
+        let report = b.purge_sessions_older_than(cutoff, &keep).await.unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.failed, 0);
+
+        assert!(
+            !b.transcript_path(expired).exists(),
+            "expired trigger-run transcript must be reaped"
+        );
+        assert!(
+            b.load_transcript(expired).await.unwrap().is_empty(),
+            "the reaped key must no longer load any transcript"
+        );
+        for key in std::iter::once(crate::storage::deleted_marker_key(expired))
+            .chain(crate::storage::session_payload_keys(expired))
+        {
+            assert!(
+                b.load_memory(&key).await.unwrap().is_none(),
+                "the expired run's `{key}` record must go with its transcript"
+            );
+        }
+        assert!(
+            b.transcript_path(fresh).exists(),
+            "an unexpired trigger-run transcript survives"
+        );
+        assert!(
+            b.transcript_path(kept).exists(),
+            "a trigger-run key listed in `keep` survives"
+        );
     }
 
     #[tokio::test]
