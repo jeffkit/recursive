@@ -91,3 +91,18 @@ landed in 14bac15a.
   The native `transcript.jsonl` rows are a natural data source for #132's
   snapshot semantics, but nothing here pre-builds that interface;
   `http/event_log.rs`'s in-memory ring + explicit `gap` frame is unchanged.
+  **W1 (goal 422) now closes the cross-process half of that contract**: the
+  per-session event watermark (`SessionMeta.event_watermark.next_seq`, one
+  write per turn via `cold_load::persist_event_watermark`) seeds the
+  cold-loaded ring, so a pre-restart cursor resolves to one of three explicit
+  states — `snapshot` (state rebuilt by the same `compact::rebuild_seed` a
+  cold load uses, current up to `up_to_seq`), `gap` (when no snapshot can be
+  derived), or the issue-#97 in-ring replay — never a silent resume from now;
+  garbage cursors keep their non-gap semantics. The replay window is
+  configurable (`RECURSIVE_SSE_REPLAY_CAPACITY`, default = the
+  `SESSION_EVENT_LOG_CAPACITY` constant) and the loss side is observable:
+  `recursive_event_stream_gaps` / `recursive_event_stream_snapshots` /
+  `recursive_event_log_evictions` on `/metrics`, WARN on the seeding and
+  fallback paths. This section only *reads* transcripts and metadata — the
+  write paths stay the ones mapped above (#147 boundary intact); W2 (bounded
+  upstream contract + read-only file API) is a separate goal.
