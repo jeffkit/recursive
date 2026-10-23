@@ -4976,7 +4976,9 @@ mod tests {
         // equivalent and deliberately unasserted-by-distinction — a blank value
         // that slips past the guard fails `parse::<u64>()` and lands on the
         // same `Some(DEFAULT_SECS)` this fallback arm returns, so every input
-        // maps to the same output under both guards.
+        // maps to the same output under both guards. The gate excludes that
+        // one mutant by name (`.cargo/mutants.toml` exclude_re); the blank /
+        // whitespace rows above stay as behaviour pins for the fallback arm.
     }
 
     #[test]
@@ -5086,6 +5088,18 @@ mod tests {
         }
     }
 
+    /// The `removed` counters of a boundary run, so tests can pin the exact
+    /// window contents (LoadedEntry has no PartialEq on purpose).
+    fn boundary_removed(entries: &[recursive::session::LoadedEntry]) -> Vec<usize> {
+        entries
+            .iter()
+            .map(|e| match e {
+                recursive::session::LoadedEntry::CompactBoundary { removed, .. } => *removed,
+                other => panic!("expected a boundary, got {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn skill_source_log_line_reports_only_nonzero_merges() {
         assert_eq!(
@@ -5124,8 +5138,11 @@ mod tests {
         // the `n < len` → `n <= len` guard mutant is equivalent and therefore
         // unkillable: at `n == len` the slice arm computes `start == 0` and
         // returns the same full vector the fallback arm returns, so both
-        // comparisons are extensionally equal over all inputs.
+        // comparisons are extensionally equal over all inputs. The gate
+        // excludes that one mutant by name (`.cargo/mutants.toml` exclude_re);
+        // the tail == len row pins the full window content, not just a count.
         assert_eq!(tail_entries(make(3), Some(3)).len(), 3);
+        assert_eq!(boundary_removed(&tail_entries(make(3), Some(3))), [0, 1, 2]);
         assert_eq!(tail_entries(make(3), Some(0)).len(), 0);
     }
 
@@ -5141,8 +5158,11 @@ mod tests {
         assert_eq!(tailed[0].content, "m2");
         // Same boundary rows as tail_entries (#223): `tail == len` is the full
         // slice, `tail == 0` the empty one — and at `n == len` the `<` → `<=`
-        // mutant slices from 0, which equals the fallback arm.
+        // mutant slices from 0, which equals the fallback arm. The gate
+        // excludes that one mutant by name (`.cargo/mutants.toml` exclude_re);
+        // the tail == len row pins full content equality, not just a count.
         assert_eq!(tail_messages(&msgs, Some(5)).len(), 5);
+        assert_eq!(tail_messages(&msgs, Some(5)), msgs);
         assert_eq!(tail_messages(&msgs, Some(0)).len(), 0);
     }
 

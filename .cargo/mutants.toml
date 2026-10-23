@@ -21,4 +21,16 @@ exclude_re = [
     # content_h, both `>` and `>=` produce pad=0 and identical output, so the
     # `>`→`>=` mutant is equivalent and unobservable from rendered output.
     "replace > with >= in render_empty_state",
+    # Issue #223 batch 3 (CI run 39943859391), true-equivalence mutants per the
+    # render_empty_state precedent: at `n == len` the `<=` mutant slices from 0
+    # and returns the same full vector the `_` arm returns, so `<` vs `<=` are
+    # extensionally equal over all inputs. Boundary rows (tail == len / tail
+    # == 0, full content pinned) live in the tail_entries / tail_messages tests;
+    # two CI runs reported MISSED with those rows in place.
+    "replace < with <= in tail_entries",
+    "replace < with <= in tail_messages",
+    # Same batch: a blank env value that slips past the mutated guard fails
+    # `parse::<u64>()` and lands on the same `Some(DEFAULT_SECS)` the `_` arm
+    # returns — every input maps to the same output under both guards.
+    "with true in plan_approval_timeout_secs",
 ]
