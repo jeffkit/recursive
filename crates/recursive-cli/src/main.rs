@@ -1850,11 +1850,12 @@ async fn cmd_doctor(
 /// `probe_llm` (issue #212) so the single-shot contract has a unit-pinned
 /// seam: the deletion mutant on `retry_max: 0` inherited the operator's
 /// retry count (default 8, 600 s network budget) and turned the liveness
-/// probe into a minutes-long stall on a dead gateway. Only `retry_max` is
-/// asserted by tests — the backoff fields are unread once `retry_max == 0`
-/// (`RetryPolicy::backoff_for_budgeted` returns before consulting them), so
-/// their mutants are equivalent and deliberately unasserted (#195 triage
-/// 1782/1783).
+/// probe into a minutes-long stall on a dead gateway. All four overrides
+/// are asserted on the derived `Config` (#203 config surface; #223 run
+/// 39922642466): the probe owns the values it ships, so a deleted field
+/// must not silently fall back to the operator's tuning — even the backoff
+/// fields, which `RetryPolicy::backoff_for_budgeted` happens not to read
+/// once `retry_max == 0` (#195 triage 1782/1783).
 fn probe_config(config: &Config) -> Config {
     Config {
         retry_max: 0,
@@ -4176,20 +4177,35 @@ mod tests {
     /// Issue #212: the probe forces a single request. Deleting the
     /// `retry_max: 0` override made `doctor --probe` inherit the operator's
     /// retry count (default 8 + 600 s network budget) and stall health
-    /// checks for minutes on a dead gateway. Only `retry_max` is pinned:
-    /// the backoff fields are unread once `retry_max == 0`
-    /// (`RetryPolicy::backoff_for_budgeted` returns before consulting them),
-    /// so mutants there are equivalent and deliberately unasserted (#195
-    /// triage 1782/1783).
+    /// checks for minutes on a dead gateway. All four overrides are pinned
+    /// with sentinel base values (#203 config surface; #223 run
+    /// 39922642466): a "delete field from struct expression" mutant falls
+    /// back to the operator's base value, so every field needs its own
+    /// assertion against the constant `probe_config` ships.
     #[test]
     fn probe_config_forces_single_shot() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = dummy_config(tmp.path());
         cfg.retry_max = 8;
+        cfg.retry_initial_backoff_secs = 9;
+        cfg.retry_max_backoff_secs = 90;
+        cfg.retry_network_budget_secs = 900;
         let probed = probe_config(&cfg);
         assert_eq!(
             probed.retry_max, 0,
             "probe must zero the operator retry count"
+        );
+        assert_eq!(
+            probed.retry_initial_backoff_secs, 1,
+            "probe must ship its own initial backoff, not the operator's"
+        );
+        assert_eq!(
+            probed.retry_max_backoff_secs, 1,
+            "probe must ship its own backoff cap, not the operator's"
+        );
+        assert_eq!(
+            probed.retry_network_budget_secs, 600,
+            "probe must ship its own network budget, not the operator's"
         );
     }
 

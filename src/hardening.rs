@@ -354,8 +354,8 @@ mod tests {
         assert!(!HardenOutcome::Unsupported.is_applied());
     }
 
-    /// `report` / `warn_if_exposed` must not panic for any arm; the WARN
-    /// text itself is exercised by eye in the CLI, not asserted here.
+    /// `report` / `warn_if_exposed` must not panic for any arm (totality).
+    /// What each arm *emits* is asserted by the capture tests below.
     #[test]
     fn outcome_reporting_is_total() {
         let empty = ScrubReport::default();
@@ -429,10 +429,14 @@ mod tests {
 
         // `RECURSIVE_WEB_SEARCH_API_KEY` is never deferred by any feature, so
         // it is the "always scrubbed" probe; `RECURSIVE_API_KEY` is deferred
-        // only when `vector-memory` is compiled in.
+        // only when `vector-memory` is compiled in; `RECURSIVE_E2B_API_KEY`
+        // only when `e2b-sandbox` is (its `is_deferred_consumer` arm compiles
+        // out under the mutants gate's default features — the assert below is
+        // what kills that arm in a feature-enabled run, #223 run 39922642466).
         let probes = [
             "RECURSIVE_WEB_SEARCH_API_KEY",
             "RECURSIVE_API_KEY",
+            "RECURSIVE_E2B_API_KEY",
             "RECURSIVE_HTTP_AUTH_KEYS",
             "RECURSIVE_HTTP_AUTH_JWT_SECRET",
             "RECURSIVE_HTTP_AUTH_INSECURE_OK",
@@ -477,6 +481,21 @@ mod tests {
             );
             assert!(std::env::var_os("RECURSIVE_API_KEY").is_none());
         }
+        if cfg!(feature = "e2b-sandbox") {
+            assert!(
+                first
+                    .retained
+                    .contains(&"RECURSIVE_E2B_API_KEY".to_string()),
+                "e2b-sandbox re-reads RECURSIVE_E2B_API_KEY; it must be retained: {first:?}"
+            );
+            assert!(std::env::var_os("RECURSIVE_E2B_API_KEY").is_some());
+        } else {
+            assert!(
+                first.removed.contains(&"RECURSIVE_E2B_API_KEY".to_string()),
+                "without e2b-sandbox RECURSIVE_E2B_API_KEY has no later reader: {first:?}"
+            );
+            assert!(std::env::var_os("RECURSIVE_E2B_API_KEY").is_none());
+        }
         // Never touched: knobs, the per-request switch, unrelated names.
         for untouched in [
             "RECURSIVE_MAX_TOKENS",
@@ -513,6 +532,220 @@ mod tests {
         assert!(third.removed.is_empty(), "{third:?}");
 
         // SAFETY: restoring under the same lock.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    // ── tracing capture harness (#223, CI run 39922642466) ─────────────────
+    // The owner ruling "any degradation must be observable" makes the emitted
+    // WARN itself the behaviour of `report` / `warn_if_exposed`, so the tests
+    // below assert the events and their structured fields, not just that
+    // nothing panics. `tracing::subscriber::with_default` scopes a
+    // DEBUG-level fmt subscriber to the calling thread only: parallel-safe,
+    // and it never touches any process-global subscriber.
+
+    /// Append-only shared sink the capture subscriber formats into.
+    #[derive(Clone)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local DEBUG-level tracing subscriber and return
+    /// everything it formatted (ANSI off, one event per line). The closure's
+    /// own return value is discarded.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> String {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let _ignored = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        String::from_utf8(out).expect("tracing output is utf-8")
+    }
+
+    /// The `Failed` arm's WARN **is** the fix's observable behaviour (owner
+    /// ruling: any degradation must be observable). It must name the
+    /// mechanism and the kernel's `errno`, both as the message and as
+    /// structured fields, so a deployment can tell a seccomp refusal from an
+    /// exotic kernel gap instead of silently accepting the gap.
+    #[test]
+    fn report_failed_emits_warn_naming_mechanism_and_errno() {
+        let logs = capture_logs(|| HardenOutcome::Failed { errno: 1 }.report());
+        assert!(logs.contains("WARN"), "expected a WARN event, got: {logs}");
+        assert!(
+            logs.contains("hardening: prctl(PR_SET_DUMPABLE, 0) failed"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("mechanism=\"prctl(PR_SET_DUMPABLE, 0)\""),
+            "the structured mechanism field, not just the message: {logs}"
+        );
+        assert!(
+            logs.contains("errno=1"),
+            "the structured errno field: {logs}"
+        );
+    }
+
+    /// The non-failed arms stay DEBUG (they are not degradations) but still
+    /// say what ran and on which OS — `Unsupported` is the arm macOS and
+    /// Windows production runs take, so the `os` field is what makes those
+    /// logs greppable.
+    #[test]
+    fn report_applied_and_unsupported_emit_debug_with_os() {
+        let applied = capture_logs(|| HardenOutcome::Applied.report());
+        assert!(applied.contains("DEBUG"), "{applied}");
+        assert!(
+            applied.contains("prctl(PR_SET_DUMPABLE, 0) applied"),
+            "{applied}"
+        );
+
+        let unsupported = capture_logs(|| HardenOutcome::Unsupported.report());
+        assert!(unsupported.contains("DEBUG"), "{unsupported}");
+        assert!(unsupported.contains("no kernel mechanism"), "{unsupported}");
+        assert!(
+            unsupported.contains(&format!("os={:?}", std::env::consts::OS)),
+            "{unsupported}"
+        );
+    }
+
+    /// `warn_if_exposed` on an exposed, unhid environment: one WARN carrying
+    /// the *sum* count (`removed + retained` — the `+` → `-` mutant would
+    /// underflow, or report 0 and go quiet) and the exposed variable *names*.
+    #[test]
+    fn warn_if_exposed_emits_one_warn_with_sum_count_and_names() {
+        let scrub = ScrubReport {
+            removed: vec!["RECURSIVE_API_KEY".into()],
+            retained: vec![
+                "RECURSIVE_HTTP_AUTH_KEYS".into(),
+                "RECURSIVE_HTTP_AUTH_JWT_SECRET".into(),
+            ],
+        };
+        let logs = capture_logs(|| HardenOutcome::Unsupported.warn_if_exposed(&scrub));
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("count=3"),
+            "count is removed(1) + retained(2): {logs}"
+        );
+        assert!(
+            logs.contains(
+                "variables=[\"RECURSIVE_API_KEY\", \"RECURSIVE_HTTP_AUTH_KEYS\", \
+                 \"RECURSIVE_HTTP_AUTH_JWT_SECRET\"]"
+            ),
+            "the WARN names every exposed variable: {logs}"
+        );
+        assert!(
+            logs.contains(&format!("os={:?}", std::env::consts::OS)),
+            "{logs}"
+        );
+    }
+
+    /// Quiet by design in both clean directions: `Applied` means the exec-time
+    /// copy is hidden (no degradation), and an empty scrub means there is
+    /// nothing to leak. The empty-scrub row is what kills the `exposed == 0`
+    /// → `!=` mutant, which would warn precisely when there is nothing to
+    /// warn about and stay silent when there is.
+    #[test]
+    fn warn_if_exposed_is_quiet_when_applied_or_nothing_matched() {
+        let some = ScrubReport {
+            removed: vec!["RECURSIVE_API_KEY".into()],
+            retained: vec![],
+        };
+        let applied = capture_logs(|| HardenOutcome::Applied.warn_if_exposed(&some));
+        assert!(
+            applied.is_empty(),
+            "a hardened process has nothing to warn about: {applied:?}"
+        );
+        let nothing =
+            capture_logs(|| HardenOutcome::Unsupported.warn_if_exposed(&ScrubReport::default()));
+        assert!(
+            nothing.is_empty(),
+            "no credential variables, no exposure, no WARN: {nothing:?}"
+        );
+    }
+
+    /// The two `scrub_process_env` DEBUG lines are the audit trail of what
+    /// the startup scrub touched; each must fire exactly when its list is
+    /// non-empty — the `delete !` mutants invert them into logging the empty
+    /// scrub and going quiet on the real one. Env-mutating, so it runs under
+    /// the shared env lock like every env test.
+    #[test]
+    fn scrub_debug_lines_fire_exactly_when_their_list_is_non_empty() {
+        let _lock = crate::test_util::env_lock();
+        const REMOVED: &str = "RECURSIVE_SCRUBLOG_REMOVED_KEY";
+        const RETAINED: &str = "RECURSIVE_SCRUBLOG_KEEP_AUTH_KEYS";
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [REMOVED, RETAINED]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REMOVED, "issue223-value") };
+        unsafe { std::env::set_var(RETAINED, "issue223-value") };
+        // The scrub removes every matching variable it is not told to keep —
+        // including any the developer's shell exported. Snapshot those so the
+        // restore below leaves the process environment exactly as it was.
+        let foreign: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(k, _)| {
+                let k = k.to_string_lossy();
+                is_process_credential_env(&k) && k != REMOVED && k != RETAINED
+            })
+            .collect();
+
+        // Pass 1: one removal + one keep-prefix retention — both lines fire
+        // and both carry the probe name.
+        let first = capture_logs(|| scrub_process_env(&["RECURSIVE_SCRUBLOG_KEEP_"]));
+        assert!(first.contains("DEBUG"), "{first}");
+        assert!(
+            first.contains("dropped consumed credential variables") && first.contains(REMOVED),
+            "the removed line names the scrubbed probe: {first}"
+        );
+        assert!(
+            first.contains("kept for a reader that has not run yet") && first.contains(RETAINED),
+            "the retained line names the kept probe: {first}"
+        );
+
+        // Pass 2: retention dropped — the removed line fires again, the kept
+        // line must not.
+        let second = capture_logs(|| scrub_process_env(&[]));
+        assert!(
+            second.contains("dropped consumed credential variables"),
+            "{second}"
+        );
+        assert!(
+            !second.contains("kept for a reader that has not run yet"),
+            "nothing was kept on the second pass: {second}"
+        );
+
+        // Pass 3: nothing matching left — neither line fires.
+        let third = capture_logs(|| scrub_process_env(&[]));
+        assert!(
+            !third.contains("dropped consumed credential variables")
+                && !third.contains("kept for a reader that has not run yet"),
+            "a clean scrub must stay silent: {third}"
+        );
+
+        // SAFETY: restoring under the same lock; credentials of the outer
+        // environment that the scrub removed go back too.
+        for (k, v) in foreign {
+            unsafe { std::env::set_var(&k, &v) };
+        }
         for (k, v) in saved {
             match v {
                 Some(v) => unsafe { std::env::set_var(k, v) },
