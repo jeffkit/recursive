@@ -210,6 +210,14 @@ pub struct Config {
     /// Default 12. Set via `RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL` env var.
     /// Goal-291.
     pub goal_eval_transcript_tail: usize,
+    /// Goal 422 W1 (#132): how many frames a session's SSE replay ring
+    /// retains. The default matches the pre-config hard-coded value
+    /// ([`crate::http::SESSION_EVENT_LOG_CAPACITY`]) byte for byte — this
+    /// only widens or narrows the resume window, never changes frame
+    /// semantics; cursors beyond it keep resolving to the explicit
+    /// snapshot/gap path.
+    /// Default 512. Set via `RECURSIVE_SSE_REPLAY_CAPACITY` env var.
+    pub sse_replay_capacity: usize,
     /// Web search provider name (brave, tavily, serper, bocha, bing).
     /// Set via `RECURSIVE_WEB_SEARCH_PROVIDER` env var or `[search]` config.
     pub web_search_provider: Option<String>,
@@ -700,6 +708,13 @@ impl Config {
                 .unwrap_or(12usize),
         )?;
 
+        // Goal 422 W1 (#132): env only — no file-config knob yet; the default
+        // is the http module's constant so the two can never drift apart.
+        let sse_replay_capacity = parse_env(
+            "RECURSIVE_SSE_REPLAY_CAPACITY",
+            crate::http::SESSION_EVENT_LOG_CAPACITY,
+        )?;
+
         // Web search config: env var > file config > None
         let file_search = file_config.search.as_ref();
         let web_search_provider = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER")
@@ -810,6 +825,7 @@ impl Config {
             // creation (from_env) has no session to be sticky to.
             session_run_code: None,
             goal_eval_transcript_tail,
+            sse_replay_capacity,
             web_search_provider,
             web_search_api_key,
             web_search_jina_key,
@@ -1756,6 +1772,7 @@ max_tokens = 20000
             max_concurrent_runs: 8,
             session_run_code: None,
             goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
@@ -2582,6 +2599,7 @@ preset = "totally-bogus-id"
             max_concurrent_runs: 8,
             session_run_code: None,
             goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
             web_search_provider: None,
             web_search_api_key: Some("sk-secret".into()),
             web_search_jina_key: None,
@@ -2732,6 +2750,7 @@ api_key = "sk-from-file"
                 max_concurrent_runs: 8,
                 session_run_code: None,
                 goal_eval_transcript_tail: 12,
+                sse_replay_capacity: 512,
                 web_search_provider: None,
                 web_search_api_key: None,
                 web_search_jina_key: None,
@@ -2784,6 +2803,7 @@ api_key = "sk-from-file"
             max_concurrent_runs: 8,
             session_run_code: None,
             goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
@@ -2822,6 +2842,51 @@ api_key = "sk-from-file"
             std::env::set_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL", v);
         } else {
             std::env::remove_var("RECURSIVE_GOAL_EVAL_TRANSCRIPT_TAIL");
+        }
+
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
+    }
+
+    /// Goal 422 W1 (#132): the replay-ring capacity is configurable, and its
+    /// default is the very constant every pre-config build used — so a server
+    /// that never sets the variable behaves byte-for-byte as before.
+    #[test]
+    fn sse_replay_capacity_default_is_the_const_and_env_overrides_it() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let original = std::env::var("RECURSIVE_SSE_REPLAY_CAPACITY").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        // Default: env unset → the http constant (512).
+        std::env::remove_var("RECURSIVE_SSE_REPLAY_CAPACITY");
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.sse_replay_capacity,
+            crate::http::SESSION_EVENT_LOG_CAPACITY
+        );
+        assert_eq!(config.sse_replay_capacity, 512);
+
+        // Override: env=4 → 4.
+        std::env::set_var("RECURSIVE_SSE_REPLAY_CAPACITY", "4");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.sse_replay_capacity, 4);
+
+        // A value that is not a count is a startup error, not a silent default.
+        std::env::set_var("RECURSIVE_SSE_REPLAY_CAPACITY", "many");
+        let err = Config::from_env().expect_err("garbage must be rejected");
+        assert!(
+            err.to_string().contains("RECURSIVE_SSE_REPLAY_CAPACITY"),
+            "{err}"
+        );
+
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_SSE_REPLAY_CAPACITY", v);
+        } else {
+            std::env::remove_var("RECURSIVE_SSE_REPLAY_CAPACITY");
         }
 
         std::env::remove_var("RECURSIVE_MODEL");
@@ -2876,6 +2941,7 @@ api_key = "sk-from-file"
             max_concurrent_runs: 8,
             session_run_code: None,
             goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,

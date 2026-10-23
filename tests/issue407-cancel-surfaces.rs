@@ -157,6 +157,7 @@ fn test_config(workspace: PathBuf) -> Config {
         max_concurrent_runs: 8,
         session_run_code: None,
         goal_eval_transcript_tail: 12,
+        sse_replay_capacity: 512,
         web_search_provider: None,
         web_search_api_key: None,
         web_search_jina_key: None,

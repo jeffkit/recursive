@@ -611,6 +611,223 @@ mod issue132_tests {
         assert!(after.contains("# TYPE recursive_event_stream_gaps counter\n"));
     }
 
+    // ── headline: capacity is configurable, default unchanged ───────────
+
+    /// A state whose replay rings hold `capacity` frames.
+    fn state_with_capacity(text: &str, turns: usize, capacity: usize) -> AppState {
+        let mut state = state_answering(text, turns);
+        state.config.sse_replay_capacity = capacity;
+        state
+    }
+
+    /// The ring is sized from `Config::sse_replay_capacity` (env
+    /// `RECURSIVE_SSE_REPLAY_CAPACITY`; the `from_env` default is pinned to the
+    /// constant in `config.rs`). A server on the default retains exactly what
+    /// the pre-config constant retained; a custom value is honoured by every
+    /// session — fresh or cold-loaded — and the frames it drops are counted.
+    #[tokio::test]
+    async fn event_log_capacity_is_configurable_with_512_default() {
+        // Default: the fixture config carries the constant, and a ring built
+        // from it behaves exactly like the hard-coded one did — one frame
+        // past the constant evicts exactly one.
+        let state = state_answering("unused", 0);
+        assert_eq!(state.config.sse_replay_capacity, SESSION_EVENT_LOG_CAPACITY);
+        assert_eq!(SESSION_EVENT_LOG_CAPACITY, 512);
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+        let frames: Vec<SseFrame> = (0..=SESSION_EVENT_LOG_CAPACITY)
+            .map(|i| partial(&format!("1-0-{i}"), "x", i))
+            .collect();
+        seed(&state, &id, frames).await;
+        let retained = ring_frames(&state, &id).await;
+        assert_eq!(retained.len(), SESSION_EVENT_LOG_CAPACITY);
+        assert_eq!(
+            retained[0].id, "1-0-1",
+            "exactly the oldest frame was evicted"
+        );
+        assert!(metrics_text(&app)
+            .await
+            .contains("recursive_event_log_evictions 1\n"));
+
+        // Custom: a 4-frame ring keeps the last 4 of 6 and reports 2 evicted.
+        let state = state_with_capacity("all done", 1, 4);
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+        let frames: Vec<SseFrame> = (0..6)
+            .map(|i| partial(&format!("1-0-{i}"), "x", i))
+            .collect();
+        seed(&state, &id, frames).await;
+        let retained = ring_frames(&state, &id).await;
+        assert_eq!(
+            retained.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["1-0-2", "1-0-3", "1-0-4", "1-0-5"],
+            "the configured capacity, not the constant, bounds the ring"
+        );
+        let metrics = metrics_text(&app).await;
+        assert!(
+            metrics.contains("recursive_event_log_evictions 2\n"),
+            "{metrics}"
+        );
+        assert!(metrics.contains("# TYPE recursive_event_log_evictions counter\n"));
+
+        // … and a cold-loaded session is sized the same way.
+        run_turn(&app, &id, "hi").await;
+        simulate_restart(&state, &id).await;
+        cold_load(&app, &id).await;
+        let frames: Vec<SseFrame> = (0..6)
+            .map(|i| partial(&format!("9-0-{}", 100 + i), "y", i))
+            .collect();
+        seed(&state, &id, frames).await;
+        assert_eq!(
+            ring_frames(&state, &id).await.len(),
+            4,
+            "a restored ring honours the configured capacity too"
+        );
+    }
+
+    // ── headline: reconnect after eviction, state restored, no gaps ─────
+
+    /// Read from an open SSE body until it goes quiet, keeping it open.
+    async fn read_quiet(chunks: &mut axum::body::BodyDataStream) -> String {
+        let mut text = String::new();
+        while let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(Duration::from_millis(300), chunks.next()).await
+        {
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        text
+    }
+
+    /// Acceptance #1 of issue #132 as a controlled comparison: subscriber A
+    /// stays connected across several turns and records every frame live;
+    /// the ring is too small to keep them all, so A's first frame is evicted;
+    /// subscriber B then resumes from that evicted cursor. B must end up with
+    /// A's state — delivered as a snapshot — with no gap frame and none of
+    /// A's frames repeated.
+    ///
+    /// A reads between turns (the turn endpoint returns only after every
+    /// frame is in the ring), so with a ring at least one turn deep A is never
+    /// a slow consumer — the eviction is the *history's* length, not A's lag.
+    #[tokio::test]
+    async fn reconnect_after_eviction_restores_state_without_gaps() {
+        let capacity = 16;
+        let max_turns = 8;
+        let state = state_with_capacity("all done", max_turns, capacity);
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+
+        // A subscribes before the first turn.
+        let a = subscribe(&app, &format!("/sessions/{id}/events"), None).await;
+        let mut a_chunks = a.into_body().into_data_stream();
+        let mut a_body = String::new();
+
+        // Turns run until the ring has dropped A's first frame.
+        let mut turns = 0;
+        let a_first = loop {
+            turns += 1;
+            assert!(
+                turns <= max_turns,
+                "the ring never overflowed after {max_turns} turns — frames per turn \
+                 shrank below what this test assumes"
+            );
+            run_turn(&app, &id, "hi").await;
+            a_body.push_str(&read_quiet(&mut a_chunks).await);
+            let a_ids = frame_ids(&a_body);
+            let first = a_ids.first().expect("A saw the first turn").clone();
+            let retained = ring_frames(&state, &id).await;
+            assert!(
+                a_ids.len() / turns <= capacity,
+                "precondition: one turn must fit the ring, or A itself would lag: {a_ids:?}"
+            );
+            if retained.iter().all(|f| f.id != first) {
+                break first;
+            }
+        };
+        drop(a_chunks);
+        let a_ids = frame_ids(&a_body);
+        assert!(
+            a_ids.len() > capacity,
+            "the history must overflow the ring for the comparison to mean anything: {a_ids:?}"
+        );
+        assert!(
+            !a_body.contains("event: gap"),
+            "A was live throughout and must never have lagged: {a_body}"
+        );
+        assert_eq!(ring_frames(&state, &id).await.len(), capacity);
+
+        // A's state after the turns, as the REST surface reports it (system
+        // prompt excluded — the snapshot is the cold-load seed).
+        let response = app
+            .clone()
+            .oneshot(json_request("GET", &format!("/sessions/{id}"), ""))
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let a_state: Vec<serde_json::Value> = detail["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|m| m["role"] != "system")
+            .cloned()
+            .collect();
+        assert_eq!(a_state.len(), 2 * turns, "{a_state:?}");
+
+        // B resumes from A's evicted cursor.
+        let b_body = read_sse(
+            &app,
+            &format!("/sessions/{id}/events?since={a_first}"),
+            None,
+        )
+        .await;
+
+        assert!(
+            !b_body.contains("event: gap"),
+            "no hole: the snapshot heals the evicted cursor: {b_body}"
+        );
+        let snapshot = snapshot_payload(&b_body);
+        assert_eq!(
+            snapshot["messages"].as_array().expect("messages"),
+            &a_state,
+            "B's rebuilt state must equal A's"
+        );
+        assert_eq!(
+            snapshot["up_to_seq"],
+            event_seq(&state, &id).await,
+            "the snapshot is current up to the turn's last event"
+        );
+        let b_ids = frame_ids(&b_body);
+        assert!(
+            b_ids.iter().all(|id| !a_ids.contains(id)),
+            "no duplicate: nothing A already saw is re-sent to B: {b_ids:?}"
+        );
+        assert!(
+            b_ids.is_empty(),
+            "every frame of the turn is folded into the snapshot: {b_ids:?}"
+        );
+
+        // And the loss that made the snapshot necessary is on /metrics.
+        let metrics = metrics_text(&app).await;
+        assert!(
+            metrics.contains("recursive_event_stream_snapshots 1\n"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("recursive_event_stream_gaps 0\n"),
+            "{metrics}"
+        );
+        let evicted: u64 = metrics
+            .lines()
+            .find_map(|l| l.strip_prefix("recursive_event_log_evictions "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("eviction counter line");
+        assert_eq!(
+            evicted as usize,
+            a_ids.len() - capacity,
+            "every frame the ring dropped is counted"
+        );
+    }
+
     // ── owner gate (issue #85) ──────────────────────────────────────────
 
     fn api_request(method: &str, uri: &str, key: &str, body: &str) -> axum::http::Request<Body> {

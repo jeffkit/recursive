@@ -19,16 +19,22 @@
 //! handler emits an explicit `gap` frame — a gap is never silent.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::SseFrame;
 
-/// How many frames a session retains for replay.
+/// How many frames a session retains for replay by default.
 ///
 /// A streaming turn emits one frame per token delta, so this is a
 /// replay-window bound, not a whole-turn guarantee: it comfortably covers a
 /// reconnect after seconds of disconnection (the case the issue reports) and
 /// degrades to an explicit `gap` notice beyond that.
+///
+/// Goal 422 W1 (#132): the operator can override it per server through
+/// `RECURSIVE_SSE_REPLAY_CAPACITY` ([`crate::config::Config::sse_replay_capacity`]);
+/// this constant is that setting's default and the value every pre-config
+/// build used.
 pub const SESSION_EVENT_LOG_CAPACITY: usize = 512;
 
 /// What a subscriber must receive to (re)join the stream at a cursor, plus
@@ -58,6 +64,11 @@ struct StoredFrame {
 pub struct SessionEventLog {
     capacity: usize,
     inner: Mutex<LogInner>,
+    /// Goal 422 W1 (#132): frames this ring evicted, shared with
+    /// `Metrics::event_log_evictions` so every session's replay-history loss
+    /// lands on one `/metrics` series. `None` for rings built without a
+    /// metrics registry (tests).
+    evicted: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug)]
@@ -85,6 +96,7 @@ impl SessionEventLog {
                 frames: VecDeque::new(),
                 history_floor: None,
             }),
+            evicted: None,
         }
     }
 
@@ -110,7 +122,15 @@ impl SessionEventLog {
                 frames: VecDeque::new(),
                 history_floor,
             }),
+            evicted: None,
         }
+    }
+
+    /// Goal 422 W1 (#132): count every frame this ring evicts on `counter`
+    /// (the server-wide `Metrics::event_log_evictions`).
+    pub fn with_eviction_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.evicted = Some(counter);
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, LogInner> {
@@ -125,6 +145,9 @@ impl SessionEventLog {
         inner.frames.push_back(StoredFrame { pos, frame });
         while inner.frames.len() > self.capacity {
             inner.frames.pop_front();
+            if let Some(evicted) = &self.evicted {
+                evicted.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 

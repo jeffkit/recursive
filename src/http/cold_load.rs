@@ -418,10 +418,10 @@ pub(super) async fn get_or_load_session(
         last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(super::now_session_ms())),
         usage: restored_usage,
         event_seq: Arc::new(std::sync::atomic::AtomicU64::new(watermark.unwrap_or(0))),
-        event_log: Arc::new(crate::http::SessionEventLog::restored(
-            crate::http::SESSION_EVENT_LOG_CAPACITY,
-            watermark,
-        )),
+        event_log: Arc::new(
+            crate::http::SessionEventLog::restored(state.config.sse_replay_capacity, watermark)
+                .with_eviction_counter(state.metrics.event_log_evictions.clone()),
+        ),
     };
     // All mutable state lives in Arc fields, so this handle shares everything
     // that matters with the table value.
@@ -729,6 +729,7 @@ mod tests {
             max_concurrent_runs: 8,
             session_run_code: None,
             goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,

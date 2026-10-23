@@ -1228,9 +1228,10 @@ pub(super) async fn create_session(
         // snapshot is persisted after every turn.
         usage: Arc::new(super::SessionUsage::new(state.config.model.clone())),
         event_seq: Arc::new(AtomicU64::new(0)),
-        event_log: Arc::new(crate::http::SessionEventLog::new(
-            crate::http::SESSION_EVENT_LOG_CAPACITY,
-        )),
+        event_log: Arc::new(
+            crate::http::SessionEventLog::new(state.config.sse_replay_capacity)
+                .with_eviction_counter(state.metrics.event_log_evictions.clone()),
+        ),
     };
 
     state
@@ -1821,9 +1822,10 @@ pub(super) async fn fork_session(
         // transcript is history, not usage this session incurred.
         usage: Arc::new(super::SessionUsage::new(state.config.model.clone())),
         event_seq: Arc::new(AtomicU64::new(0)),
-        event_log: Arc::new(crate::http::SessionEventLog::new(
-            crate::http::SESSION_EVENT_LOG_CAPACITY,
-        )),
+        event_log: Arc::new(
+            crate::http::SessionEventLog::new(state.config.sse_replay_capacity)
+                .with_eviction_counter(state.metrics.event_log_evictions.clone()),
+        ),
     };
 
     state
@@ -3390,6 +3392,7 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     // healed in-stream.
     let event_stream_gaps = metrics.event_stream_gaps.load(Ordering::Relaxed);
     let event_stream_snapshots = metrics.event_stream_snapshots.load(Ordering::Relaxed);
+    let event_log_evictions = metrics.event_log_evictions.load(Ordering::Relaxed);
     let last_llm_success_ms = metrics.last_llm_success_ms.load(Ordering::Relaxed);
     let llm_failures_consecutive = metrics.llm_failures_consecutive.load(Ordering::Relaxed);
 
@@ -3454,6 +3457,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_event_stream_snapshots Session event streams opened with a state snapshot: resume cursor beyond the replay window healed in-stream (issue #132)\n\
          # TYPE recursive_event_stream_snapshots counter\n\
          recursive_event_stream_snapshots {event_stream_snapshots}\n\
+         # HELP recursive_event_log_evictions Frames evicted from session SSE replay rings; a sustained rise means resumable history is being dropped — raise RECURSIVE_SSE_REPLAY_CAPACITY (issue #132)\n\
+         # TYPE recursive_event_log_evictions counter\n\
+         recursive_event_log_evictions {event_log_evictions}\n\
          # HELP recursive_llm_last_success_ms Milliseconds since server epoch of the last successful run (0 = never; issue #123)\n\
          # TYPE recursive_llm_last_success_ms gauge\n\
          recursive_llm_last_success_ms {last_llm_success_ms}\n\

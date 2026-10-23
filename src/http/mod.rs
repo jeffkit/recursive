@@ -186,6 +186,12 @@ pub struct Metrics {
     /// delivering the cold-load-derived session state in-stream. The
     /// snapshot-at-cursor counterpart of [`Self::event_stream_gaps`].
     pub event_stream_snapshots: AtomicU64,
+    /// Goal 422 W1 (#132): frames evicted from session replay rings — the
+    /// rate at which resumable history is being dropped. Shared (`Arc`, like
+    /// [`Self::runs_waiting`]) with every ring built through
+    /// [`SessionEventLog::with_eviction_counter`]; a sustained rise is the
+    /// signal to raise `RECURSIVE_SSE_REPLAY_CAPACITY`.
+    pub event_log_evictions: Arc<AtomicU64>,
     // ── Issue #113: histograms ─────────────────────────────────────────
     /// Per-`model` LLM latency of a completed run, fed from
     /// [`crate::runtime::RuntimeOutcome::llm_latency_ms`] — the runtime
@@ -250,6 +256,7 @@ impl Default for Metrics {
             sessions_evicted: AtomicU64::new(0),
             event_stream_gaps: AtomicU64::new(0),
             event_stream_snapshots: AtomicU64::new(0),
+            event_log_evictions: Arc::new(AtomicU64::new(0)),
             llm_latency_ms: HistogramFamily::new(LLM_LATENCY_MS_BUCKETS),
             run_steps: HistogramFamily::new(RUN_STEPS_BUCKETS),
             admission_wait_ms: HistogramFamily::new(ADMISSION_WAIT_MS_BUCKETS),
@@ -958,6 +965,7 @@ pub(crate) fn test_config_stub() -> crate::config::Config {
         max_concurrent_runs: 8,
         session_run_code: None,
         goal_eval_transcript_tail: 12,
+        sse_replay_capacity: 512,
         web_search_provider: None,
         web_search_api_key: None,
         web_search_jina_key: None,
@@ -2833,6 +2841,7 @@ mod goal_396_persistence_tests {
             max_concurrent_runs: 8,
             session_run_code: None,
             goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
