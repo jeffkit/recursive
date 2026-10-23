@@ -40,7 +40,7 @@ CRATE="recursive-agent"
 # cargo-mutants still generates mutants there (it walks the AST, not the build
 # graph) but every mutation is a no-op and is reported MISSED, failing the gate
 # on any change to the observability module.
-FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,acp,coordinator-mode,otel"
+FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,acp,coordinator-mode,otel,vector-memory,e2b-sandbox"
 
 # Default: parallel copy mode. --jobs N runs N cargo build/test jobs
 # concurrently; JOBS>1 drops --in-place (parallel in-place mutation would

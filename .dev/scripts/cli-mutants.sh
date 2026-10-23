@@ -19,7 +19,7 @@ set -euo pipefail
 
 CRATE="recursive-cli"
 # No special features beyond defaults for this crate.
-FEATURES=""
+FEATURES="weixin"
 # Default: parallel copy mode (--jobs = CPU count) — real source never
 # mutated, uncommitted changes safe, and total time ~time/cores vs
 # ~60s/mutant single-threaded (2026-08-03 gate-timeout incident).
