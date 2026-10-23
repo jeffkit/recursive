@@ -132,6 +132,31 @@ pub(super) struct SessionMeta {
     /// Issue #85: the owner's tenant, part of the ownership key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Goal 422 W1 (#132): the session's event-stream watermark, written at
+    /// the end of every turn. Its *presence* in a loaded blob is the "history
+    /// below this point is not in this process" marker: cold load seeds the
+    /// session's `event_seq` from it (so new frame ids never reuse a
+    /// pre-restart sequence) and hands it to the replay ring as the floor
+    /// that tells a real pre-restart cursor apart from garbage. `None` (older
+    /// build, or a session that never finished a turn) restores as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_watermark: Option<EventWatermark>,
+}
+
+/// Goal 422 W1 (#132): per-session event-stream watermark, persisted inside
+/// [`SessionMeta`].
+///
+/// Only a turn-boundary granularity is recorded (one write per turn, not per
+/// frame). The window between the last persisted watermark and a mid-turn
+/// crash is therefore *not* lossless — but it is never silent: the restored
+/// ring is seeded so an unresolved cursor in that window still opens with an
+/// explicit snapshot or gap (see [`crate::http::SessionEventLog::restored`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct EventWatermark {
+    /// Sequence number the session's *next* event will be stamped with —
+    /// i.e. how many events it has enveloped so far. Every frame id ending
+    /// in a sequence below this value was emitted before the watermark.
+    pub next_seq: u64,
 }
 
 /// Storage key for the per-session metadata blob (issue #98).
@@ -239,6 +264,49 @@ pub(super) async fn update_persisted_title(state: &AppState, id: &str, title: Op
     }
 }
 
+/// Goal 422 W1 (#132): record the session's event-stream watermark — called
+/// at the end of every turn with the session's `event_seq`. Preserves every
+/// other persisted field; same three-way policy as [`update_persisted_title`]
+/// (issue #216): an unreadable blob is left alone with a WARN rather than
+/// overwritten with defaults. Idempotent: an unchanged watermark is not
+/// rewritten.
+///
+/// Best-effort like the rest of the metadata: a failed write only costs the
+/// next cold load its floor, and the restored ring stays explicit about that
+/// (an unresolved cursor is a gap, not a silent resume) — see
+/// [`crate::http::SessionEventLog::restored`].
+pub(super) async fn persist_event_watermark(state: &AppState, id: &str, next_seq: u64) {
+    let watermark = EventWatermark { next_seq };
+    match load_session_meta_detailed(state, id).await {
+        LoadedSessionMeta::Found(mut meta) => {
+            if meta.event_watermark.as_ref() == Some(&watermark) {
+                return;
+            }
+            meta.event_watermark = Some(watermark);
+            persist_session_meta(state, id, &meta).await;
+        }
+        LoadedSessionMeta::Absent => {
+            persist_session_meta(
+                state,
+                id,
+                &SessionMeta {
+                    event_watermark: Some(watermark),
+                    ..Default::default()
+                },
+            )
+            .await;
+        }
+        LoadedSessionMeta::Unreadable => {
+            tracing::warn!(
+                session_id = %id,
+                next_seq,
+                "skipping event watermark persist: persisted session metadata is \
+                 unreadable, refusing to overwrite it with a default blob"
+            );
+        }
+    }
+}
+
 pub(super) async fn get_or_load_session(
     state: &Arc<AppState>,
     id: &str,
@@ -314,6 +382,27 @@ pub(super) async fn get_or_load_session(
     if let Some(existing) = sessions.get(id) {
         return Ok(Arc::new(existing.clone()));
     }
+    // Goal 422 W1 (#132): seed the event-stream cursor system from the
+    // persisted watermark. Restoring `event_seq` keeps new frame ids from
+    // reusing a pre-restart sequence (a bare `?since=<seq>` must never match
+    // a post-restart frame), and the ring's floor is what tells a *real*
+    // pre-restart cursor — resolved to a snapshot or an explicit gap — apart
+    // from garbage, which keeps the issue-#97 non-gap semantics. Without a
+    // watermark (older blob, or a session that never finished a turn) the
+    // session restores exactly as before, except the ring still reports that
+    // it replaced one, so nothing resumes silently.
+    let watermark = meta
+        .as_ref()
+        .and_then(|m| m.event_watermark.as_ref())
+        .map(|w| w.next_seq);
+    if let Some(floor) = watermark {
+        tracing::warn!(
+            session_id = %id,
+            watermark = floor,
+            "event log rebuilt from storage: cursors below the watermark \
+             resolve to a snapshot or an explicit gap, not a silent resume"
+        );
+    }
     let session = SessionState {
         id: id.to_string(),
         // `created_at` stays synthesized: it is presentation metadata, not a
@@ -328,9 +417,10 @@ pub(super) async fn get_or_load_session(
         non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(non_system_count)),
         last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(super::now_session_ms())),
         usage: restored_usage,
-        event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        event_log: Arc::new(crate::http::SessionEventLog::new(
+        event_seq: Arc::new(std::sync::atomic::AtomicU64::new(watermark.unwrap_or(0))),
+        event_log: Arc::new(crate::http::SessionEventLog::restored(
             crate::http::SESSION_EVENT_LOG_CAPACITY,
+            watermark,
         )),
     };
     // All mutable state lives in Arc fields, so this handle shares everything
@@ -782,6 +872,7 @@ mod tests {
             overrides: Default::default(),
             owner: Some("alice".into()),
             tenant: Some("acme".into()),
+            event_watermark: None,
         };
         persist_session_meta(&state, "s1", &meta).await;
         let loaded = load_session_meta(&state, "s1")
@@ -818,6 +909,7 @@ mod tests {
                 overrides: Default::default(),
                 owner: Some("alice".into()),
                 tenant: None,
+                event_watermark: None,
             },
         )
         .await;
@@ -831,6 +923,147 @@ mod tests {
             loaded.owner.as_deref(),
             Some("alice"),
             "a title rename must not drop the session's owner"
+        );
+    }
+
+    // ── Goal 422 W1 (#132): event-stream watermark ──────────────────────
+
+    fn restorable_transcript() -> Vec<Message> {
+        vec![system("stored prompt"), user("ping"), assistant("pong")]
+    }
+
+    #[tokio::test]
+    async fn cold_load_seeds_event_seq_and_ring_floor_from_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        seed(dir.path(), "wm-1", restorable_transcript()).await;
+        persist_session_meta(
+            &state,
+            "wm-1",
+            &SessionMeta {
+                event_watermark: Some(EventWatermark { next_seq: 7 }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let session = get_or_load_session(&state, "wm-1", &AuthIdentity::local())
+            .await
+            .expect("cold load");
+        assert_eq!(
+            session.event_seq.load(Ordering::Relaxed),
+            7,
+            "new frames must continue the persisted sequence space, never reuse it"
+        );
+        // A real pre-restart cursor is a gap to be made explicit, not a
+        // silent resume from now.
+        assert!(
+            session.event_log.replay(Some("1-0-3")).truncated,
+            "a cursor below the watermark must be flagged"
+        );
+        // The un-persisted window (cursor above the floor but unknown to the
+        // rebuilt ring) is explicit too.
+        assert!(session.event_log.replay(Some("1-0-9")).truncated);
+        // No cursor still means "from now".
+        assert!(!session.event_log.replay(None).truncated);
+    }
+
+    #[tokio::test]
+    async fn cold_load_without_a_watermark_restores_as_before_but_not_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        seed(dir.path(), "wm-old", restorable_transcript()).await;
+        // An older blob: every field absent.
+        persist_session_meta(&state, "wm-old", &SessionMeta::default()).await;
+
+        let session = get_or_load_session(&state, "wm-old", &AuthIdentity::local())
+            .await
+            .expect("cold load");
+        assert_eq!(session.event_seq.load(Ordering::Relaxed), 0);
+        // The ring still knows it replaced one: a cursor it cannot resolve is
+        // reported, exactly the memory loss #132 says must not be silent.
+        assert!(session.event_log.replay(Some("1-0-3")).truncated);
+    }
+
+    #[tokio::test]
+    async fn persist_event_watermark_round_trips_and_keeps_the_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        persist_session_meta(
+            &state,
+            "wm-rt",
+            &SessionMeta {
+                owner: Some("alice".into()),
+                preset: Some("standard".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        persist_event_watermark(&state, "wm-rt", 5).await;
+        let loaded = load_session_meta(&state, "wm-rt").await.expect("meta");
+        assert_eq!(loaded.event_watermark, Some(EventWatermark { next_seq: 5 }));
+        assert_eq!(loaded.owner.as_deref(), Some("alice"));
+        assert_eq!(loaded.preset.as_deref(), Some("standard"));
+
+        // The watermark only ever moves forward with the turns.
+        persist_event_watermark(&state, "wm-rt", 12).await;
+        let loaded = load_session_meta(&state, "wm-rt").await.expect("meta");
+        assert_eq!(
+            loaded.event_watermark,
+            Some(EventWatermark { next_seq: 12 })
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_event_watermark_creates_the_blob_when_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        assert!(load_session_meta(&state, "wm-new").await.is_none());
+
+        persist_event_watermark(&state, "wm-new", 3).await;
+        let loaded = load_session_meta(&state, "wm-new").await.expect("meta");
+        assert_eq!(loaded.event_watermark, Some(EventWatermark { next_seq: 3 }));
+    }
+
+    #[tokio::test]
+    async fn persist_event_watermark_leaves_an_unreadable_blob_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), vec![]);
+        let key = session_meta_key("wm-bad");
+        state
+            .storage
+            .save_memory(&key, "{ this is not json")
+            .await
+            .unwrap();
+
+        persist_event_watermark(&state, "wm-bad", 4).await;
+        let raw = state.storage.load_memory(&key).await.unwrap();
+        assert_eq!(
+            raw.as_deref(),
+            Some("{ this is not json"),
+            "an unreadable blob must not be replaced by a watermark-only default"
+        );
+    }
+
+    #[test]
+    fn session_meta_watermark_is_optional_on_the_wire() {
+        // A blob written before the field existed still parses …
+        let old: SessionMeta =
+            serde_json::from_str(r#"{"owner":"alice","title":"t"}"#).expect("old blob");
+        assert_eq!(old.event_watermark, None);
+        // … and a blob without a watermark serializes without the key, so the
+        // bytes an older reader sees are unchanged.
+        let json = serde_json::to_string(&SessionMeta::default()).unwrap();
+        assert!(!json.contains("event_watermark"), "{json}");
+        let json = serde_json::to_string(&SessionMeta {
+            event_watermark: Some(EventWatermark { next_seq: 2 }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""event_watermark":{"next_seq":2}"#),
+            "{json}"
         );
     }
 
@@ -948,6 +1181,7 @@ mod tests {
                 overrides: Default::default(),
                 owner: None,
                 tenant: None,
+                event_watermark: None,
             },
         )
         .await;
@@ -1027,6 +1261,7 @@ mod tests {
                 overrides: Default::default(),
                 owner: None,
                 tenant: None,
+                event_watermark: None,
             },
         )
         .await;
@@ -1093,6 +1328,7 @@ mod tests {
                     overrides: Default::default(),
                     owner: None,
                     tenant: None,
+                    event_watermark: None,
                 },
             )
             .await;

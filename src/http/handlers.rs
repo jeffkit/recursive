@@ -1202,6 +1202,9 @@ pub(super) async fn create_session(
             // original caller would lose access to its own session.
             owner: Some(identity.subject.clone()),
             tenant: identity.tenant.clone(),
+            // Goal 422 W1 (#132): no turn has run yet; the watermark is
+            // written at the end of each one.
+            event_watermark: None,
         },
     )
     .await;
@@ -2340,6 +2343,19 @@ pub(super) async fn send_session_message(
     // Disconnect the sink so the forwarder drains and exits.
     runtime.set_event_sink(Arc::new(NullSink));
     let _ = forward_handle.await;
+
+    // Goal 422 W1 (#132): every frame of this turn is now in the replay ring
+    // and `event_seq` is final for the turn — persist it as the session's
+    // watermark. A later cold load seeds the cursor system from it, so a
+    // client resuming across a restart gets a snapshot or an explicit gap
+    // instead of a silent empty stream. Written before the outcome is mapped
+    // so a failed turn's frames are covered too.
+    super::cold_load::persist_event_watermark(
+        &state,
+        &id,
+        session.event_seq.load(Ordering::Relaxed),
+    )
+    .await;
 
     if let Err(e) = &run_result {
         // Issue #124: mark the Langfuse trace failed on provider/transport errors.

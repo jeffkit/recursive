@@ -66,6 +66,14 @@ struct LogInner {
     /// position `< next_pos`, which makes gaps detectable by arithmetic.
     next_pos: u64,
     frames: VecDeque<StoredFrame>,
+    /// Goal 422 W1 (#132): set on a ring rebuilt from storage (cold load).
+    /// Every event sequence number below the floor was emitted before this
+    /// ring existed — by a previous process or a previous instance of the
+    /// session — so a cursor below it can never resolve here, and the frames
+    /// it names are *really* gone rather than garbage. `None` on a ring born
+    /// in this process, where an unresolved cursor means exactly what issue
+    /// #97 said: nothing was ever evicted, or the cursor never named a frame.
+    history_floor: Option<u64>,
 }
 
 impl SessionEventLog {
@@ -75,6 +83,32 @@ impl SessionEventLog {
             inner: Mutex::new(LogInner {
                 next_pos: 0,
                 frames: VecDeque::new(),
+                history_floor: None,
+            }),
+        }
+    }
+
+    /// Ring for a session restored from storage (goal 422 W1, issue #132).
+    ///
+    /// Two things differ from a fresh ring, both driven by the persisted
+    /// event watermark:
+    ///
+    /// - `history_floor` (the watermark's `next_seq`) classifies cursors: a
+    ///   reconnecting client whose cursor names a sequence below the floor is
+    ///   holding a *real* pre-restart cursor, so [`Self::replay`] resolves it
+    ///   to the snapshot-or-gap path instead of a silent empty resume.
+    /// - `next_pos` starts at 1, not 0: this ring replaced an earlier one, so
+    ///   from birth it must report `anything_evicted` — a cursor that
+    ///   unresolvedly names the un-persisted window between watermarks (a
+    ///   crash mid-turn) still gets the explicit gap/snapshot path, never a
+    ///   silent one.
+    pub fn restored(capacity: usize, history_floor: Option<u64>) -> Self {
+        Self {
+            capacity,
+            inner: Mutex::new(LogInner {
+                next_pos: 1,
+                frames: VecDeque::new(),
+                history_floor,
             }),
         }
     }
@@ -109,6 +143,25 @@ impl SessionEventLog {
         };
         // A resolved cursor has been delivered, so the subscriber's next frame
         // is the one after it; an unresolved one falls back to the whole ring.
+        //
+        // Goal 422 W1 (#132): but first distinguish a *real* pre-restart
+        // cursor from garbage. A cursor whose sequence sits below the
+        // persisted watermark named frames this ring can never hold — the
+        // history it asks for is genuinely elsewhere (the transcript), so the
+        // caller must open with a snapshot or an explicit gap. A cursor at or
+        // above the floor keeps the issue-#97 unresolved semantics: on a
+        // restored ring that yields the whole ring + `truncated` (the
+        // un-persisted window is real), on a never-evicted ring it stays a
+        // non-gap unknown.
+        if let (Some(floor), Some(seq)) = (inner.history_floor, frame_seq(cursor)) {
+            if seq < floor {
+                return SessionReplay {
+                    frames: inner.all_frames(),
+                    next_pos: inner.next_pos,
+                    truncated: true,
+                };
+            }
+        }
         let (frames, truncated) = match inner.position_of(cursor) {
             Some(pos) => (inner.frames_from(pos.saturating_add(1)), false),
             None => (inner.all_frames(), inner.anything_evicted()),
@@ -187,7 +240,11 @@ impl LogInner {
 /// Ids are `<ts_ms>-<turn>-<seq>`, with a `:progress` suffix on frames derived
 /// from the same event ([`crate::event::EventMeta::id`]); all of them end in
 /// the event's sequence number.
-fn frame_seq(id: &str) -> Option<u64> {
+///
+/// Goal 422 W1 (#132): also the unit the snapshot path dedupes on — a
+/// snapshot carries the sequence it is current up to, and frames below it are
+/// already folded in.
+pub(crate) fn frame_seq(id: &str) -> Option<u64> {
     id.strip_suffix(":progress")
         .unwrap_or(id)
         .rsplit('-')
@@ -316,5 +373,113 @@ mod tests {
         let replay = log.replay(Some("not-a-frame-id"));
         assert_eq!(ids(&replay), vec!["1-0-0", "1-0-1"]);
         assert!(!replay.truncated);
+    }
+
+    // ── Goal 422 W1 (#132): rings rebuilt from storage ──────────────────
+
+    #[test]
+    fn restored_ring_resolves_a_pre_watermark_cursor_to_an_explicit_gap() {
+        // Watermark 10: sequences 0..10 were emitted before this ring existed.
+        let log = SessionEventLog::restored(4, Some(10));
+
+        // The real pre-restart cursor cannot resolve here, and the frames it
+        // asks for are genuinely gone — that must be said, not skipped.
+        let replay = log.replay(Some("1-0-3"));
+        assert!(
+            replay.truncated,
+            "a cursor below the watermark is a real gap, not a silent resume"
+        );
+        assert!(replay.frames.is_empty(), "nothing was pushed yet");
+        assert_eq!(replay.next_pos, 1, "a restored ring is seeded past 0");
+    }
+
+    #[test]
+    fn restored_ring_hands_a_pre_watermark_cursor_everything_pushed_since() {
+        let log = SessionEventLog::restored(4, Some(10));
+        // The restored session's own frames continue the sequence space.
+        log.push(frame("2-1-10"));
+        log.push(frame("2-1-11"));
+
+        let replay = log.replay(Some("1-0-5"));
+        assert!(replay.truncated);
+        assert_eq!(
+            ids(&replay),
+            vec!["2-1-10", "2-1-11"],
+            "post-restore frames were never seen by the client and must follow"
+        );
+        assert_eq!(replay.next_pos, 3);
+    }
+
+    #[test]
+    fn restored_ring_resolves_its_own_frames_normally() {
+        let log = SessionEventLog::restored(4, Some(10));
+        log.push(frame("2-1-10"));
+        log.push(frame("2-1-11"));
+        log.push(frame("2-1-12"));
+
+        // A cursor naming a frame this ring holds resumes strictly after it,
+        // exactly as on a fresh ring — the floor only classifies the past.
+        let replay = log.replay(Some("2-1-10"));
+        assert_eq!(ids(&replay), vec!["2-1-11", "2-1-12"]);
+        assert!(!replay.truncated);
+        // A bare sequence works the same way.
+        assert_eq!(ids(&log.replay(Some("11"))), vec!["2-1-12"]);
+    }
+
+    #[test]
+    fn restored_ring_treats_the_unpersisted_window_as_a_gap_not_silence() {
+        // Watermark persisted at 10, but the process crashed mid-turn after
+        // emitting up to 14: a client holding `…-12` is above the floor yet
+        // names nothing this ring has. Issue #97's "unresolved → whole ring"
+        // rule applies, and the seeded position makes it `truncated`.
+        let log = SessionEventLog::restored(4, Some(10));
+        let replay = log.replay(Some("1-0-12"));
+        assert!(
+            replay.truncated,
+            "an unresolved cursor on a rebuilt ring must be explicit"
+        );
+        assert!(replay.frames.is_empty());
+    }
+
+    #[test]
+    fn restored_ring_without_a_watermark_is_still_explicit_about_lost_history() {
+        // Older metadata blobs carry no watermark: the floor is unknown, but
+        // the ring still replaced one — an unresolved cursor is a gap here.
+        let log = SessionEventLog::restored(4, None);
+        log.push(frame("2-0-0"));
+        let replay = log.replay(Some("1-0-7"));
+        assert!(replay.truncated);
+        assert_eq!(ids(&replay), vec!["2-0-0"]);
+    }
+
+    #[test]
+    fn restored_ring_without_a_cursor_starts_from_now_like_a_fresh_one() {
+        let log = SessionEventLog::restored(4, Some(10));
+        log.push(frame("2-1-10"));
+        let replay = log.replay(None);
+        assert!(replay.frames.is_empty());
+        assert!(!replay.truncated);
+        assert_eq!(replay.next_pos, 2);
+    }
+
+    #[test]
+    fn restored_ring_live_pump_arithmetic_is_unaffected_by_the_seed() {
+        let log = SessionEventLog::restored(2, Some(10));
+        // A pump that subscribed at the seeded write position sees exactly
+        // what is pushed afterwards, and nothing is flagged until eviction.
+        let next = log.replay(None).next_pos;
+        log.push(frame("2-1-10"));
+        let drained = log.drain_from(next);
+        assert_eq!(ids(&drained), vec!["2-1-10"]);
+        assert!(!drained.truncated);
+
+        log.push(frame("2-1-11"));
+        log.push(frame("2-1-12"));
+        let lagged = log.drain_from(drained.next_pos.saturating_sub(1));
+        assert_eq!(ids(&lagged), vec!["2-1-11", "2-1-12"]);
+        assert!(
+            lagged.truncated,
+            "the frame at the pump's position was evicted"
+        );
     }
 }
