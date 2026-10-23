@@ -3838,17 +3838,29 @@ mod tests {
         format!("http://{addr}/mcp")
     }
 
+    /// Wall-clock bound shared by the fails-fast `initialize` test and its
+    /// negative control (#209). A jitter absorber, not a contract: the
+    /// invariant under test is "initialize fails orders of magnitude
+    /// faster than the tool budget and never consumes it", so the bound
+    /// only has to sit above the worst scheduling delay a fully loaded
+    /// parallel suite inflicts on the 300ms timer (observed 2.745s there,
+    /// ~300-310ms idle — 2s went false-red) and far below the 10s tool
+    /// budget the handshake must never follow.
+    const INITIALIZE_FAILS_FAST_BOUND: Duration = Duration::from_secs(3);
+
     /// Review rework: the HTTP `initialize` handshake must stay bounded by
     /// the read timeout. Its budget must NOT follow the (much larger)
     /// configurable tool timeout — that is exactly how "the server never
     /// started" would take 5 minutes to surface.
     ///
     /// Hermetic: the mock is a loopback listener that answers after 3s.
-    /// The delay is far beyond both the 300ms read budget and the 2s
-    /// latency bound below, and the tool budget (10s) is far beyond the
-    /// delay, so a pass can only mean the read-budget tier held — any
-    /// regression to the tool budget or the client backstop returns `Ok`
-    /// at 3s and trips the first assert.
+    /// The delay is far beyond the 300ms read budget and far below the
+    /// tool budget (10s), so a pass can only mean the read-budget tier
+    /// held — any regression to the tool budget or the client backstop
+    /// waits for the response, returns `Ok` at 3s and trips the first
+    /// assert. The delay coincides with [`INITIALIZE_FAILS_FAST_BOUND`]
+    /// on purpose: an error inside the bound lands before the mock's only
+    /// answer, so it can come from nothing but the read-budget tier.
     #[tokio::test]
     async fn http_initialize_fails_fast_and_ignores_the_tool_budget() {
         let url = spawn_delayed_streamable_mock(Duration::from_secs(3), Duration::ZERO);
@@ -3864,16 +3876,46 @@ mod tests {
             result.is_err(),
             "a 3s initialize must fail under a 300ms budget, not wait for the tool budget"
         );
-        // The bound sits well above the 300ms budget so scheduler jitter
-        // under a fully loaded parallel test run cannot flake it (observed
-        // ~300-310ms idle, ~900ms under load) yet stays below the 3s mock
-        // delay and the 10s tool budget: an error this fast is only
-        // reachable via the read-budget tier.
+        // #209: the bound absorbs full-suite scheduling jitter (the timer
+        // fired at 2.745s under that load) while staying far below the
+        // 10s tool budget — an error this fast is only reachable via the
+        // read-budget tier. The negative control below keeps it honest.
         eprintln!("http initialize failed after {elapsed:?}");
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < INITIALIZE_FAILS_FAST_BOUND,
             "initialize must fail promptly (read-timeout bound), took {elapsed:?} — \
              the per-request budget is not tiered"
+        );
+    }
+
+    /// Negative control for #209: [`INITIALIZE_FAILS_FAST_BOUND`] must not
+    /// be decorative. The mock stalls `initialize` for 8s — well past the
+    /// bound — and the read budget is deliberately inflated to 4s, i.e. a
+    /// client that no longer fails fast. A timeout never fires early, so
+    /// the error cannot land before ~4s and sits beyond the bound: exactly
+    /// the run the timing assert of
+    /// `http_initialize_fails_fast_and_ignores_the_tool_budget` rejects.
+    /// Finishing inside the bound here would mean the mock stopped
+    /// delaying `initialize` or the read budget stopped binding — and the
+    /// sibling's bound would be measuring nothing.
+    #[tokio::test]
+    async fn http_initialize_slower_than_the_fails_fast_bound_is_flagged() {
+        let url = spawn_delayed_streamable_mock(Duration::from_secs(8), Duration::ZERO);
+        let server = server_with_url(&url, Some("http"));
+
+        let started = std::time::Instant::now();
+        let result = McpClient::spawn_with_timeout(&server, Duration::from_secs(4)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "an 8s initialize must still be cut off by a 4s read budget"
+        );
+        eprintln!("slow http initialize rejected after {elapsed:?}");
+        assert!(
+            elapsed >= INITIALIZE_FAILS_FAST_BOUND,
+            "a genuinely slow initialize must land beyond the fails-fast bound \
+             (took {elapsed:?}) — otherwise that bound is measuring nothing"
         );
     }
 
