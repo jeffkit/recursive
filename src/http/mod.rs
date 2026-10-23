@@ -17,6 +17,7 @@ mod metrics;
 mod rate_limit;
 mod session_mirror;
 pub mod triggers;
+mod uplink;
 mod usage;
 mod workspace_files;
 
@@ -68,11 +69,11 @@ use axum::{
     Json, Router,
 };
 
-/// Maximum accepted request body size (1 MiB).
-///
-/// Prevents OOM via maliciously large JSON payloads on POST /run and
-/// POST /sessions/:id/messages, both of which accept unbounded user strings.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+// Goal 423 W2a (#132): one literal for the global body cap and the
+// messages endpoint's default uplink budget — they can never drift. Still
+// the OOM guard for every unbounded user string (POST /run, /sessions/:id/
+// messages, …).
+use crate::config::DEFAULT_UPLINK_MAX_BYTES as MAX_BODY_BYTES;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -199,6 +200,11 @@ pub struct Metrics {
     /// `not_utf8`). Every refusal also WARNs; a rising family means clients
     /// are asking for paths or pages the contract refuses.
     pub workspace_file_rejections: CounterFamily,
+    /// Goal 423 W2a (#132): uplink request bodies rejected for exceeding
+    /// `Config::uplink_max_bytes` — the typed-413 contract path. A rising
+    /// counter means a client (or an operator-set budget) is fighting the
+    /// configured limit; each rejection also WARNs with the observed size.
+    pub uplink_overflows: AtomicU64,
     // ── Issue #113: histograms ─────────────────────────────────────────
     /// Per-`model` LLM latency of a completed run, fed from
     /// [`crate::runtime::RuntimeOutcome::llm_latency_ms`] — the runtime
@@ -265,6 +271,7 @@ impl Default for Metrics {
             event_stream_snapshots: AtomicU64::new(0),
             event_log_evictions: Arc::new(AtomicU64::new(0)),
             workspace_file_rejections: CounterFamily::default(),
+            uplink_overflows: AtomicU64::new(0),
             llm_latency_ms: HistogramFamily::new(LLM_LATENCY_MS_BUCKETS),
             run_steps: HistogramFamily::new(RUN_STEPS_BUCKETS),
             admission_wait_ms: HistogramFamily::new(ADMISSION_WAIT_MS_BUCKETS),
@@ -975,6 +982,7 @@ pub(crate) fn test_config_stub() -> crate::config::Config {
         goal_eval_transcript_tail: 12,
         sse_replay_capacity: 512,
         workspace_file_max_bytes: 256 * 1024,
+        uplink_max_bytes: 1024 * 1024,
         web_search_provider: None,
         web_search_api_key: None,
         web_search_jina_key: None,
@@ -1322,7 +1330,17 @@ pub fn build_router_with_auth_and_rate_limit(
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}", axum::routing::delete(delete_session))
         .route("/sessions/{id}", axum::routing::patch(patch_session))
-        .route("/sessions/{id}/messages", post(send_session_message))
+        .route(
+            "/sessions/{id}/messages",
+            // Goal 423 W2a (#132): the uplink budget for this route is
+            // `Config::uplink_max_bytes`, enforced by `uplink::read_bounded`
+            // inside the handler (typed 413 + metric + WARN). The global
+            // `DefaultBodyLimit` below is disabled *for this route only*, so
+            // a raised budget genuinely applies instead of being silently
+            // double-capped at 1 MiB. Every other POST stays under the
+            // global layer.
+            post(send_session_message).layer(DefaultBodyLimit::disable()),
+        )
         .route("/sessions/{id}/usage", get(get_session_usage))
         .route("/sessions/{id}/events", get(session_events))
         .route("/sessions/{id}/files", get(session_workspace_files))
@@ -1610,7 +1628,14 @@ pub fn build_openapi_spec() -> serde_json::Value {
             "/sessions/{id}/messages": {
                 "post": {
                     "summary": "Send a message",
-                    "description": "Send a user message in a session and get the assistant response.",
+                    "description": "Send a user message in a session and get the assistant response. \
+                        Goal 423 W2a (issue #132): the request body is bounded by the \
+                        uplink contract — a body above the configured limit (env \
+                        `RECURSIVE_UPLINK_MAX_BYTES`, default 1 MiB) answers a typed \
+                        413 envelope naming `limit_bytes`, is counted as \
+                        `recursive_uplink_overflows` on `/metrics`, and fails this \
+                        request alone (the session and any live SSE subscription are \
+                        unaffected).",
                     "parameters": [{
                         "name": "id",
                         "in": "path",
@@ -1644,6 +1669,14 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         },
                         "409": {
                             "description": "A run is already active for this session",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "413": {
+                            "description": "Body exceeds the uplink limit (RECURSIVE_UPLINK_MAX_BYTES)",
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/ErrorResponse" }
@@ -1904,7 +1937,9 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         Goal 423 W2b adds `recursive_workspace_file_rejections` \
                         (`reason` = why the read-only files endpoint refused a path: \
                         escape / too_large / version_mismatch / symlink / range / \
-                        not_utf8). \
+                        not_utf8). Goal 423 W2a adds `recursive_uplink_overflows` \
+                        (request bodies rejected by the bounded-uplink contract on \
+                        `POST /sessions/{id}/messages`). \
                         Issue #113 adds the labelled series `recursive_requests_total` \
                         (`route` = matched route template, `status`), \
                         `recursive_agent_runs_finished_total` (`finish_reason`), \
@@ -2947,6 +2982,7 @@ mod goal_396_persistence_tests {
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
             workspace_file_max_bytes: 256 * 1024,
+            uplink_max_bytes: 1024 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,

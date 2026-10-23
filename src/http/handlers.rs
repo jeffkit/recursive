@@ -2153,12 +2153,21 @@ fn prior_turn_index(transcript: &[crate::message::Message]) -> u32 {
 ///
 /// Issue #85: only the session's owner (or an admin) may run a turn in it —
 /// `get_or_load_session` asserts ownership before the session is materialized.
+///
+/// Goal 423 W2a (#132): the body is read through the bounded-uplink
+/// contract (`Config::uplink_max_bytes`) — an oversized body is a typed 413
+/// envelope with `limit_bytes` (+ `/metrics` counter + WARN) instead of
+/// axum's plain-text rejection, and fails this request alone.
 pub(super) async fn send_session_message(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AuthIdentity>,
     Path(id): Path<String>,
-    Json(body): Json<SessionMessageRequest>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
 ) -> Result<Json<SessionMessageResponse>, ApiError> {
+    let raw = super::uplink::read_bounded(&state, &id, &headers, body).await?;
+    let body: SessionMessageRequest = serde_json::from_slice(&raw)
+        .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
     if body.content.trim().is_empty() {
         return Err(ApiError::bad_request("missing or empty 'content' field"));
     }
@@ -3386,6 +3395,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
     let event_stream_gaps = metrics.event_stream_gaps.load(Ordering::Relaxed);
     let event_stream_snapshots = metrics.event_stream_snapshots.load(Ordering::Relaxed);
     let event_log_evictions = metrics.event_log_evictions.load(Ordering::Relaxed);
+    // Goal 423 W2a (#132): uplink bodies rejected by the bounded-uplink
+    // contract (typed 413 instead of axum's default rejection).
+    let uplink_overflows = metrics.uplink_overflows.load(Ordering::Relaxed);
     let last_llm_success_ms = metrics.last_llm_success_ms.load(Ordering::Relaxed);
     let llm_failures_consecutive = metrics.llm_failures_consecutive.load(Ordering::Relaxed);
 
@@ -3453,6 +3465,9 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_event_log_evictions Frames evicted from session SSE replay rings; a sustained rise means resumable history is being dropped — raise RECURSIVE_SSE_REPLAY_CAPACITY (issue #132)\n\
          # TYPE recursive_event_log_evictions counter\n\
          recursive_event_log_evictions {event_log_evictions}\n\
+         # HELP recursive_uplink_overflows Uplink request bodies rejected for exceeding RECURSIVE_UPLINK_MAX_BYTES (Goal 423 W2a, issue #132)\n\
+         # TYPE recursive_uplink_overflows counter\n\
+         recursive_uplink_overflows {uplink_overflows}\n\
          # HELP recursive_llm_last_success_ms Milliseconds since server epoch of the last successful run (0 = never; issue #123)\n\
          # TYPE recursive_llm_last_success_ms gauge\n\
          recursive_llm_last_success_ms {last_llm_success_ms}\n\
@@ -4714,10 +4729,8 @@ mod tests {
             State(state.clone()),
             Extension(AuthIdentity::local()),
             Path(sid.to_string()),
-            Json(SessionMessageRequest {
-                content: "retry the same prompt".into(),
-                notify: None,
-            }),
+            axum::http::HeaderMap::new(),
+            axum::body::Body::from(r#"{"content":"retry the same prompt"}"#),
         )
         .await
         .into_response();
@@ -4757,10 +4770,8 @@ mod tests {
             State(state.clone()),
             Extension(AuthIdentity::local()),
             Path(sid.to_string()),
-            Json(SessionMessageRequest {
-                content: "hello".into(),
-                notify: None,
-            }),
+            axum::http::HeaderMap::new(),
+            axum::body::Body::from(r#"{"content":"hello"}"#),
         )
         .await;
 

@@ -74,6 +74,13 @@ pub const DEFAULT_SSE_REPLAY_CAPACITY: usize = 512;
 /// builds do not reach into the `http` feature.
 pub const DEFAULT_WORKSPACE_FILE_MAX_BYTES: usize = 256 * 1024;
 
+/// Maximum accepted HTTP request body, in bytes (1 MiB) — the single literal
+/// behind the http router's global `DefaultBodyLimit` layer and the default
+/// of `Config::uplink_max_bytes` (Goal 423 W2a, issue #132). Kept in
+/// `config` (always compiled) so `--no-default-features` builds do not reach
+/// into the `http` feature.
+pub const DEFAULT_UPLINK_MAX_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Config {
     pub workspace: PathBuf,
@@ -242,6 +249,18 @@ pub struct Config {
     /// default, so both read surfaces reject at the same size.
     /// Default 262144. Set via `RECURSIVE_WORKSPACE_FILE_MAX_BYTES` env var.
     pub workspace_file_max_bytes: usize,
+    /// Goal 423 W2a (#132): byte budget of one uplink request body — today
+    /// that is one `POST /sessions/{id}/messages` (the only Client→Host
+    /// uplink; a future WS mux budgets each logical stream with the same
+    /// knob). The default is [`DEFAULT_UPLINK_MAX_BYTES`], the exact literal
+    /// the router's global `DefaultBodyLimit` enforces, so the default
+    /// changes nothing byte for byte — the messages endpoint merely reports
+    /// an overflow as a typed 413 + `/metrics` counter + WARN instead of
+    /// axum's plain-text rejection. Raising it above 1 MiB genuinely applies:
+    /// that endpoint opts out of the global layer and this budget is its
+    /// only gate.
+    /// Default 1048576. Set via `RECURSIVE_UPLINK_MAX_BYTES` env var.
+    pub uplink_max_bytes: usize,
     /// Web search provider name (brave, tavily, serper, bocha, bing).
     /// Set via `RECURSIVE_WEB_SEARCH_PROVIDER` env var or `[search]` config.
     pub web_search_provider: Option<String>,
@@ -746,6 +765,10 @@ impl Config {
             DEFAULT_WORKSPACE_FILE_MAX_BYTES,
         )?;
 
+        // Goal 423 W2a (#132): env only — no file-config knob yet. The
+        // default is the global body-limit constant, byte for byte.
+        let uplink_max_bytes = parse_env("RECURSIVE_UPLINK_MAX_BYTES", DEFAULT_UPLINK_MAX_BYTES)?;
+
         // Web search config: env var > file config > None
         let file_search = file_config.search.as_ref();
         let web_search_provider = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER")
@@ -858,6 +881,7 @@ impl Config {
             goal_eval_transcript_tail,
             sse_replay_capacity,
             workspace_file_max_bytes,
+            uplink_max_bytes,
             web_search_provider,
             web_search_api_key,
             web_search_jina_key,
@@ -1806,6 +1830,7 @@ max_tokens = 20000
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
             workspace_file_max_bytes: 256 * 1024,
+            uplink_max_bytes: 1024 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
@@ -2634,6 +2659,7 @@ preset = "totally-bogus-id"
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
             workspace_file_max_bytes: 256 * 1024,
+            uplink_max_bytes: 1024 * 1024,
             web_search_provider: None,
             web_search_api_key: Some("sk-secret".into()),
             web_search_jina_key: None,
@@ -2786,6 +2812,7 @@ api_key = "sk-from-file"
                 goal_eval_transcript_tail: 12,
                 sse_replay_capacity: 512,
                 workspace_file_max_bytes: 256 * 1024,
+                uplink_max_bytes: 1024 * 1024,
                 web_search_provider: None,
                 web_search_api_key: None,
                 web_search_jina_key: None,
@@ -2840,6 +2867,7 @@ api_key = "sk-from-file"
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
             workspace_file_max_bytes: 256 * 1024,
+            uplink_max_bytes: 1024 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,
@@ -2970,6 +2998,46 @@ api_key = "sk-from-file"
         std::env::remove_var("RECURSIVE_API_KEY");
     }
 
+    /// Goal 423 W2a (#132): the uplink budget defaults to the exact literal
+    /// the router's global body limit enforces (byte for byte — the default
+    /// changes nothing), moves with its env var, and rejects garbage at
+    /// startup instead of silently keeping the default.
+    #[test]
+    fn uplink_max_bytes_default_is_the_const_and_env_overrides_it() {
+        let _env_lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_env_lock);
+
+        let original = std::env::var("RECURSIVE_UPLINK_MAX_BYTES").ok();
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+
+        std::env::remove_var("RECURSIVE_UPLINK_MAX_BYTES");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.uplink_max_bytes, DEFAULT_UPLINK_MAX_BYTES);
+        assert_eq!(config.uplink_max_bytes, 1024 * 1024);
+
+        std::env::set_var("RECURSIVE_UPLINK_MAX_BYTES", "65536");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.uplink_max_bytes, 65536);
+
+        std::env::set_var("RECURSIVE_UPLINK_MAX_BYTES", "plenty");
+        let err = Config::from_env().expect_err("garbage must be rejected");
+        assert!(
+            err.to_string().contains("RECURSIVE_UPLINK_MAX_BYTES"),
+            "{err}"
+        );
+
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_UPLINK_MAX_BYTES", v);
+        } else {
+            std::env::remove_var("RECURSIVE_UPLINK_MAX_BYTES");
+        }
+
+        std::env::remove_var("RECURSIVE_MODEL");
+        std::env::remove_var("RECURSIVE_API_KEY");
+    }
+
     // -----------------------------------------------------------------------
     // web_search empty-string filter tests
     // (kills delete-! mutants on lines 446/450/454)
@@ -3020,6 +3088,7 @@ api_key = "sk-from-file"
             goal_eval_transcript_tail: 12,
             sse_replay_capacity: 512,
             workspace_file_max_bytes: 256 * 1024,
+            uplink_max_bytes: 1024 * 1024,
             web_search_provider: None,
             web_search_api_key: None,
             web_search_jina_key: None,

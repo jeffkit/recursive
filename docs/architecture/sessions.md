@@ -175,6 +175,20 @@ included — a restart does not 404 the first read), GET-only, zero write
 surface, refusals counted as `recursive_workspace_file_rejections{reason}` on
 `/metrics`. Implementation: `src/http/workspace_files.rs`.
 
+## Bounded uplink contract (Goal 423 W2a, issue #132)
+
+The one Client→Host uplink today is `POST /sessions/{id}/messages`; its body
+is read within an explicit byte budget (`RECURSIVE_UPLINK_MAX_BYTES`, default
+1 MiB — byte-for-byte the router's global `DefaultBodyLimit`, which stays in
+place for every other POST). An overflow is a **typed 413 `ApiError` envelope
+naming `limit_bytes`**, counted as `recursive_uplink_overflows` on `/metrics`
+and WARNed with the session id, limit and observed size — never axum's
+plain-text rejection, never a silent clamp. The refusal fails that one
+request only: session state, runtime and live SSE subscribers are untouched.
+The budget is per *logical stream*; when a WS mux arrives, each logical
+stream reuses the same primitive (`src/http/uplink.rs`) and the same error
+shape.
+
 ## Migration
 
 `src/migrate.rs` handles migration of legacy `.recursive/sessions/` and
