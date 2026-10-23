@@ -29,6 +29,7 @@ pub use auth::{
     ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS,
 };
 // Issue #97: the bounded per-session replay ring behind SSE resume.
+pub(crate) use event_log::frame_seq;
 pub use event_log::{SessionEventLog, SessionReplay, SESSION_EVENT_LOG_CAPACITY};
 pub use handlers::map_agent_event;
 // Issue #113: labelled counter / histogram families, the bounded finish-reason
@@ -174,6 +175,17 @@ pub struct Metrics {
     pub persist_failures: AtomicU64,
     /// Issue #123: sessions removed by the idle reaper (counter).
     pub sessions_evicted: AtomicU64,
+    /// Goal 422 W1 (#132): `gap` frames opened on session event streams — a
+    /// resume cursor the session can no longer serve and for which no
+    /// snapshot could be derived. Counts the explicit-notification paths
+    /// (initial replay and mid-stream pump alike); a rising value means
+    /// clients are losing replayable history.
+    pub event_stream_gaps: AtomicU64,
+    /// Goal 422 W1 (#132): `snapshot` frames opened on session event streams —
+    /// a resume cursor below the retained/watermarked history healed by
+    /// delivering the cold-load-derived session state in-stream. The
+    /// snapshot-at-cursor counterpart of [`Self::event_stream_gaps`].
+    pub event_stream_snapshots: AtomicU64,
     // ── Issue #113: histograms ─────────────────────────────────────────
     /// Per-`model` LLM latency of a completed run, fed from
     /// [`crate::runtime::RuntimeOutcome::llm_latency_ms`] — the runtime
@@ -236,6 +248,8 @@ impl Default for Metrics {
             readyz_storage_ok: AtomicBool::new(false),
             persist_failures: AtomicU64::new(0),
             sessions_evicted: AtomicU64::new(0),
+            event_stream_gaps: AtomicU64::new(0),
+            event_stream_snapshots: AtomicU64::new(0),
             llm_latency_ms: HistogramFamily::new(LLM_LATENCY_MS_BUCKETS),
             run_steps: HistogramFamily::new(RUN_STEPS_BUCKETS),
             admission_wait_ms: HistogramFamily::new(ADMISSION_WAIT_MS_BUCKETS),
@@ -631,6 +645,32 @@ pub enum SseEvent {
         /// `id:` of the oldest frame still available, or `null` when the
         /// replay buffer holds nothing.
         resume_id: Option<String>,
+    },
+    /// Goal 422 W1 (#132): connection-level state snapshot opening a stream
+    /// whose resume cursor predates what the session can replay — either the
+    /// cursor was evicted from the ring, or the ring was rebuilt from storage
+    /// (restart / cold load) and the cursor sits below the persisted
+    /// watermark. The payload is the session state exactly as a cold load
+    /// would rebuild it (`compact::rebuild_seed` over the authoritative
+    /// transcript, same JSON message shape as `GET /sessions/:id`), so the
+    /// client reconstructs and then follows the live increments gap-free.
+    ///
+    /// Like [`SseEvent::Gap`] this is a per-connection notice, not a frame on
+    /// the session timeline: it is never pushed into the replay ring, never
+    /// assigned an `id:`, and never broadcast to other subscribers. A
+    /// snapshot is offered instead of a `gap` whenever the state can be
+    /// derived; the `gap` frame is reserved for when it cannot (runtime busy
+    /// with a turn, nothing restorable in the transcript).
+    Snapshot {
+        /// Session messages at the moment the snapshot was taken, in the same
+        /// JSON shape `GET /sessions/:id` reports (`messages`).
+        messages: Vec<serde_json::Value>,
+        /// Every event with a sequence number below this value is already
+        /// reflected in `messages` — both sides drop stream frames below it
+        /// (the snapshot superseded them), and frames at or above it apply on
+        /// top of the rebuilt state. Equal to the session's `event_seq` when
+        /// the snapshot was derived under the runtime lock.
+        up_to_seq: u64,
     },
     /// Agent proposed a plan and is waiting for human review.
     PlanProposed { plan: String },
@@ -1640,9 +1680,20 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         Resumable (issue #97): pass the `id:` of the last frame received \
                         via the `Last-Event-ID` header or the `since` query parameter and \
                         the stream first replays everything logged after it. When the \
-                        cursor is older than the retained replay window a `gap` frame is \
-                        emitted first, and the client should reconcile via \
-                        `GET /sessions/{id}`.",
+                        cursor is older than the retained replay window — evicted, or below \
+                        the persisted watermark after a server restart — the stream opens \
+                        with a `snapshot` frame (issue #132: the session state as a cold \
+                        load rebuilds it, `messages` in the `GET /sessions/{id}` shape plus \
+                        `up_to_seq`; frames with a sequence below it are already folded in \
+                        and are not re-sent), then continues live. Only when no snapshot can \
+                        be derived (runtime busy, nothing restorable) is a `gap` frame \
+                        emitted instead, and the client should reconcile via \
+                        `GET /sessions/{id}`. `snapshot` and `gap` are per-connection \
+                        notices: no `id:`, never replayed. Frame event names: `message`, \
+                        `partial_message`, `tool_call`, `tool_result`, `tool_progress`, \
+                        `usage`, `done`, `error`, `plan_proposed`, `goal_continuing`, \
+                        `goal_achieved`, `programmatic_run_started`, \
+                        `programmatic_run_finished`, plus the notices `snapshot` and `gap`.",
                     "parameters": [{
                         "name": "id",
                         "in": "path",
@@ -1739,6 +1790,9 @@ pub fn build_openapi_spec() -> serde_json::Value {
                         `recursive_agui_runs`, `recursive_persist_failures`, \
                         `recursive_sessions_evicted`, `recursive_llm_last_success_ms` and \
                         `recursive_llm_failures_consecutive`. \
+                        Issue #132 adds `recursive_event_stream_gaps` / \
+                        `recursive_event_stream_snapshots` (session event streams opened \
+                        with an explicit gap / healed with a state snapshot). \
                         Issue #113 adds the labelled series `recursive_requests_total` \
                         (`route` = matched route template, `status`), \
                         `recursive_agent_runs_finished_total` (`finish_reason`), \

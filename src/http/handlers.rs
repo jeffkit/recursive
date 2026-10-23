@@ -2464,9 +2464,16 @@ pub(super) struct SessionEventsQuery {
 /// Issue #97: the stream is resumable. A client that reconnects with
 /// `Last-Event-ID` (or `?since=`) set to the last frame `id:` it saw is
 /// replayed everything logged after it before going live, and a subscriber
-/// that merely fell behind the broadcast channel recovers the same way. Only
-/// when the cursor predates the retained replay window does the stream open
-/// with an explicit [`SseEvent::Gap`] instead of silently skipping frames.
+/// that merely fell behind the broadcast channel recovers the same way.
+///
+/// Goal 422 W1 (#132): when the cursor predates the retained replay window —
+/// evicted from the ring, or below the persisted watermark after a restart /
+/// cold load — the stream opens with an explicit [`SseEvent::Snapshot`] of
+/// the session state (derived like a cold load) and only frames newer than
+/// it follow, so the client rebuilds and continues gap-free. When no snapshot
+/// can be derived (runtime busy, nothing restorable) the stream opens with
+/// the explicit [`SseEvent::Gap`] instead. Both are counted on `/metrics`;
+/// neither path ever silently restarts "from now".
 pub(super) async fn session_events(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2475,18 +2482,23 @@ pub(super) async fn session_events(
     headers: axum::http::HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Verify the session exists (and that the caller may see it), keeping a
-    // handle on its replay log — the stream resumes from there.
-    let event_log = {
+    // handle on it — the stream resumes from its replay log, and a cursor the
+    // log cannot serve is healed from its transcript (goal 422 W1). Every
+    // field is an `Arc`, so the clone shares state with the table entry; the
+    // snapshot below therefore sits behind the very same `ensure_access` gate
+    // as the frames (issue #85 — no state leaks to a non-owner).
+    let session = {
         let sessions_lock = state.host.sessions();
         let sessions = sessions_lock.read().await;
         match sessions.get(&id) {
             Some(session) => {
                 ensure_access(&identity, session)?;
-                session.event_log.clone()
+                session.clone()
             }
             None => return Err(ApiError::not_found("session not found")),
         }
     };
+    let event_log = session.event_log.clone();
 
     // `?since=` wins over the header when a client sends both.
     let cursor = query
@@ -2508,10 +2520,60 @@ pub(super) async fn session_events(
     // Everything the client missed while it was away, oldest first.
     let replay = event_log.replay(cursor.as_deref());
     let mut initial: Vec<Result<Event, Infallible>> = Vec::with_capacity(replay.frames.len() + 1);
-    if replay.truncated {
-        initial.push(Ok(gap_event(replay.frames.first().map(|f| f.id.clone()))));
-    }
-    initial.extend(replay.frames.into_iter().map(sse_frame_event));
+    // Goal 422 W1 (#132): a cursor the ring cannot serve — evicted from it,
+    // or below the watermark of a ring rebuilt by a restart — must open the
+    // stream with something explicit. Preferred: a snapshot of the session
+    // state (what a cold load would rebuild), so the client reconstructs and
+    // then follows the live increments gap-free. When no snapshot can be
+    // derived the issue-#97 `gap` frame stays. Both paths are counted and
+    // logged — a resume is never silently dropped back to "from now".
+    let snapshot_floor = if replay.truncated {
+        match snapshot_at_cursor(&session) {
+            Ok((messages, up_to_seq)) => {
+                state
+                    .metrics
+                    .event_stream_snapshots
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %id,
+                    cursor = cursor.as_deref().unwrap_or(""),
+                    up_to_seq,
+                    "resume cursor predates the replay window; opening the stream \
+                     with a state snapshot"
+                );
+                initial.push(Ok(snapshot_event(messages, up_to_seq)));
+                Some(up_to_seq)
+            }
+            Err(reason) => {
+                state
+                    .metrics
+                    .event_stream_gaps
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session_id = %id,
+                    cursor = cursor.as_deref().unwrap_or(""),
+                    reason,
+                    "resume cursor predates the replay window and no snapshot could \
+                     be derived; opening the stream with a gap"
+                );
+                initial.push(Ok(gap_event(replay.frames.first().map(|f| f.id.clone()))));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Frames the snapshot already folded in (sequence below `up_to_seq`) are
+    // dropped — replaying them on top of the rebuilt state would duplicate
+    // their effects; everything newer follows. Without a snapshot, every
+    // retained frame is replayed exactly as issue #97 specified.
+    initial.extend(
+        replay
+            .frames
+            .into_iter()
+            .filter(|frame| newer_than_snapshot(snapshot_floor, &frame.id))
+            .map(sse_frame_event),
+    );
 
     // The log — not the broadcast payload — decides what to send: the channel
     // only wakes the pump. That is what turns a *lagged* receiver from a silent
@@ -2522,6 +2584,7 @@ pub(super) async fn session_events(
     // subscriber must receive (everything below it has just been replayed).
     let pump_next = Arc::new(AtomicU64::new(replay.next_pos));
     let pump_log = event_log;
+    let pump_metrics = state.metrics.clone();
     // `futures_util::StreamExt` is invoked through UFCS on purpose: this file
     // already imports `tokio_stream::StreamExt` (which has no `flat_map`), and
     // importing a second `StreamExt` would make `map` / `filter_map` / `merge`
@@ -2531,9 +2594,22 @@ pub(super) async fn session_events(
         pump_next.store(replay.next_pos, Ordering::Relaxed);
         let mut frames: Vec<Result<Event, Infallible>> = Vec::new();
         if replay.truncated {
+            // A slow consumer out-waited the ring: frames newer than any
+            // snapshot are really lost, so this stays the explicit gap.
+            pump_metrics
+                .event_stream_gaps
+                .fetch_add(1, Ordering::Relaxed);
             frames.push(Ok(gap_event(replay.frames.first().map(|f| f.id.clone()))));
         }
-        frames.extend(replay.frames.into_iter().map(sse_frame_event));
+        // A frame the forwarder pushed late but that the snapshot already
+        // covers is dropped the same way as during the initial replay.
+        frames.extend(
+            replay
+                .frames
+                .into_iter()
+                .filter(|frame| newer_than_snapshot(snapshot_floor, &frame.id))
+                .map(sse_frame_event),
+        );
         futures_util::stream::iter(frames)
     });
 
@@ -2574,6 +2650,64 @@ fn gap_event(resume_id: Option<String>) -> Event {
     Event::default().event("gap").data(data)
 }
 
+/// The `snapshot` frame (goal 422 W1, issue #132): the session state for a
+/// client whose cursor the replay window no longer covers, so it can rebuild
+/// and follow gap-free instead of reconciling by hand. Like [`gap_event`] it
+/// deliberately carries no `id:` — a per-connection notice, not a frame on
+/// the session timeline — and it never enters the replay ring.
+fn snapshot_event(messages: Vec<serde_json::Value>, up_to_seq: u64) -> Event {
+    let event = SseEvent::Snapshot {
+        messages,
+        up_to_seq,
+    };
+    let data = serde_json::to_string(&event).unwrap_or_default();
+    Event::default().event("snapshot").data(data)
+}
+
+/// Goal 422 W1 (#132): the session state a resuming subscriber rebuilds from
+/// when its cursor predates the replay ring, plus the sequence it is current
+/// up to.
+///
+/// Derived exactly like a cold load — [`crate::compact::rebuild_seed`] over
+/// the authoritative transcript, messages in the `GET /sessions/:id` JSON
+/// shape — so there is one notion of "the session's state", not a second one
+/// for the stream. The runtime lock is only *tried*: a turn holds it for its
+/// whole duration (`enqueue(&mut self)`), and a reconnect must never stall
+/// behind a running turn (same policy as `get_session`). Holding it also
+/// makes `up_to_seq` exact: no event is being emitted meanwhile, and every
+/// event emitted so far already has its message in the transcript
+/// (`emit_turn_messages` extends it before the lock is released).
+///
+/// `Err` names why no snapshot could be produced; the caller falls back to
+/// the issue-#97 `gap` frame so the degradation stays explicit.
+fn snapshot_at_cursor(
+    session: &SessionState,
+) -> Result<(Vec<serde_json::Value>, u64), &'static str> {
+    let runtime = session
+        .runtime
+        .try_lock()
+        .map_err(|_| "runtime busy with a turn")?;
+    let up_to_seq = session.event_seq.load(Ordering::Relaxed);
+    let seed = crate::compact::rebuild_seed(runtime.transcript())
+        .ok_or("nothing restorable in the transcript")?;
+    let messages = seed
+        .seed
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+    Ok((messages, up_to_seq))
+}
+
+/// Goal 422 W1 (#132): whether a frame still has to be delivered after a
+/// snapshot current up to `floor` (`None` = no snapshot: everything is). A
+/// frame whose id carries no sequence cannot be classified and is kept.
+fn newer_than_snapshot(floor: Option<u64>, frame_id: &str) -> bool {
+    match (floor, super::frame_seq(frame_id)) {
+        (Some(floor), Some(seq)) => seq >= floor,
+        _ => true,
+    }
+}
+
 /// The SSE `event:` name for one [`SseEvent`] payload variant. Split out of
 /// [`sse_frame_event`] so tests can pin the wire names.
 fn sse_event_type(event: &SseEvent) -> &'static str {
@@ -2585,6 +2719,7 @@ fn sse_event_type(event: &SseEvent) -> &'static str {
         SseEvent::Done { .. } => "done",
         SseEvent::Error { .. } => "error",
         SseEvent::Gap { .. } => "gap",
+        SseEvent::Snapshot { .. } => "snapshot",
         SseEvent::PlanProposed { .. } => "plan_proposed",
         SseEvent::GoalContinuing { .. } => "goal_continuing",
         SseEvent::GoalAchieved { .. } => "goal_achieved",
@@ -3250,6 +3385,11 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
         .len() as u64;
     let persist_failures = metrics.persist_failures.load(Ordering::Relaxed);
     let sessions_evicted = metrics.sessions_evicted.load(Ordering::Relaxed);
+    // Goal 422 W1 (#132): the two explicit resume outcomes of the session
+    // event stream — a gap is history the client lost, a snapshot is history
+    // healed in-stream.
+    let event_stream_gaps = metrics.event_stream_gaps.load(Ordering::Relaxed);
+    let event_stream_snapshots = metrics.event_stream_snapshots.load(Ordering::Relaxed);
     let last_llm_success_ms = metrics.last_llm_success_ms.load(Ordering::Relaxed);
     let llm_failures_consecutive = metrics.llm_failures_consecutive.load(Ordering::Relaxed);
 
@@ -3308,6 +3448,12 @@ pub(super) async fn metrics_handler(State(state): State<Arc<AppState>>) -> Strin
          # HELP recursive_sessions_evicted Total sessions removed by the idle reaper (issue #123)\n\
          # TYPE recursive_sessions_evicted counter\n\
          recursive_sessions_evicted {sessions_evicted}\n\
+         # HELP recursive_event_stream_gaps Session event streams opened with an explicit gap frame: resume cursor beyond the replay window and no snapshot derivable (issue #132)\n\
+         # TYPE recursive_event_stream_gaps counter\n\
+         recursive_event_stream_gaps {event_stream_gaps}\n\
+         # HELP recursive_event_stream_snapshots Session event streams opened with a state snapshot: resume cursor beyond the replay window healed in-stream (issue #132)\n\
+         # TYPE recursive_event_stream_snapshots counter\n\
+         recursive_event_stream_snapshots {event_stream_snapshots}\n\
          # HELP recursive_llm_last_success_ms Milliseconds since server epoch of the last successful run (0 = never; issue #123)\n\
          # TYPE recursive_llm_last_success_ms gauge\n\
          recursive_llm_last_success_ms {last_llm_success_ms}\n\
