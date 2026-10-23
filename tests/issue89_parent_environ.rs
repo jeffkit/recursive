@@ -77,7 +77,7 @@ async fn hardened_process_hides_its_environ_from_same_uid_children() {
         recursive::hardening::HardenOutcome::Applied,
         "on a non-root Linux host prctl(PR_SET_DUMPABLE, 0) must succeed"
     );
-    recursive::hardening::harden_process(); // idempotent
+    let _ = recursive::hardening::harden_process(); // idempotent (return already asserted above)
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let observation = RunShell::new(tmp.path())
