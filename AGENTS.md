@@ -31,6 +31,7 @@ before editing `src/`.**
   `--override "原因 / ack 人"`，原样留痕）. Policy-touching commits carry
   `[policy]` + `Policy-ack:` trailer. Convention:
   `docs/landing-and-acceptance.md`（镜像自 plaita，owner 拍板 2026-10-18）.
+  变异判死证明 → `docs/proofs/`（模板见其 README；#201）.
 
 ## Owner architecture rulings (2026-10-18)
 

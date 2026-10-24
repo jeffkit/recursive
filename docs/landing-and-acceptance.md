@@ -32,6 +32,7 @@
 
 - 修复声称「变异全杀死 / 定向全绿」的，证明文件必须随修复提交进仓：
   `docs/proofs/<issue>-<slug>.md`；gist 只是传输通道，不是台账。
+  模板、最小字段与既有台账见 `docs/proofs/README.md`（#201）。
 - 幸存者必须独立进程 recheck 复核（#195 教训：main 上的「全绿」可能是幸存者）。
 
 ## 4. 验收锚点 = origin/main
