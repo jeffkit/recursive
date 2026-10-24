@@ -42,18 +42,74 @@ exclude_re = [
     # out of any in-process test's reach). Guard test:
     # hardening::tests::std_env_yields_one_entry_per_name_the_dedup_precondition.
     "replace == with != in CredentialHandoff::capture",
-    # `blob.len() - written` → `+` in reexec_clean_env: the handoff pipe has
-    # no reader until exec, so a write round beyond the first is reachable
-    # only once the pipe is full — and there both expressions produce the
-    # identical EAGAIN failure (`Failed { stage: "handoff-write" }`). Round
-    # one adds zero, so every fitting blob is written identically. Both
-    # behaviours (fitting blob execs / oversize blob fails open) are pinned
-    # by hardening::tests::reexec_exec_boundary_self_exec_end_to_end.
-    "replace - with + in reexec_clean_env",
-    # `Instant::now() + Duration::from_secs(2)` → `*` in restore_reexec_env
-    # is type-invalid (`Instant: Mul<Duration>` does not exist) — unviable on
-    # every target that compiles the line; ubuntu's mutation gate reported it
-    # MISSED only because the whole arm is compiled out there (cfg blindness,
-    # the same run lists other never-compiled-line mutants).
-    "replace + with * in restore_reexec_env",
+    # ── Issue #228 batch 2 (CI run 40114354611: 71 mutants → 31 MISSED) ────
+    # The re-exec handoff family below lives in
+    # `#[cfg(all(unix, not(target_os = "linux")))]` arms: the ubuntu mutation
+    # gate never compiles those lines, so every mutant there builds
+    # byte-identical to the baseline and reports MISSED no matter what the
+    # tests assert (that run scored even the type-invalid `Instant *
+    # Duration` mutant MISSED — proof the lines are compiled out, not merely
+    # untested). Every mutant excluded here is pinned where the code actually
+    # compiles by the named guard tests; each pin was re-verified by hand on
+    # macOS for this batch (mutation applied → suite red; the two equivalence
+    # entries → suite green). The exclusions only stop ubuntu from
+    # re-reporting that local kill evidence as noise. If a guard test is ever
+    # deleted, delete its exclusion with it.
+    #
+    # REGEX WARNING: entries are regexes matched against the printed mutant
+    # name — metacharacters in operator names (`+`, `*`) MUST be escaped or
+    # the entry silently never matches. Batch 1's `replace - with +` and
+    # `replace + with *` entries were inert for exactly that reason, which is
+    # why run 40114354611 still listed those survivors. `cargo mutants
+    # --list` is the checker: excluded names must disappear from it.
+    #
+    # capture body → Default::default() (385): ubuntu compiles capture() as
+    # `Self::default()` anyway (the linux arm), so the mutant is invisible
+    # there; on macOS handoff_capture_takes_predicate_matches_only and
+    # handoff_capture_boundary_payloads_round_trip_the_real_pipe_field_by_field
+    # both go red under the applied mutation.
+    "replace CredentialHandoff::capture -> Self with Default::default()",
+    # reexec_clean_env write/exec loop (607 pipe guard, 626/636 write-loop
+    # bounds, 633 `/` division, 640 `+=` mutations): pinned by the two-phase
+    # self-exec fixture reexec_exec_boundary_self_exec_end_to_end — phase 1
+    # (oversize blob → Failed{handoff-write}) kills `n < 0 → ==`, phase 2
+    # (real exec; child asserts sentinel=1, knob riding, Restored{count:1},
+    # byte-exact credential) kills the pipe guard, both bounds, the division
+    # and both `+=` mutations; `written < len → <=` degenerates into a
+    # zero-byte-write hang that the gate's timeout counts as caught.
+    "replace != with == in reexec_clean_env",
+    "replace < with (==|>|<=) in reexec_clean_env",
+    "replace - with / in reexec_clean_env",
+    "replace \\+= with (-|\\*)= in reexec_clean_env",
+    # `blob.len() - written → +` is extensionally equivalent — verified by
+    # hand for this batch: plain suite green AND the solo self-exec fixture
+    # green under the applied mutation. Round one adds zero; later rounds are
+    # reachable only once the pipe is full, where both expressions produce
+    # the identical EAGAIN → Failed{handoff-write}.
+    "replace - with \\+ in reexec_clean_env",
+    # reexec_child_envs whitelist (704 body replacements, 707 delete !,
+    # 708/709 `&&`/`!=` inversions): killed on macOS by
+    # reexec_child_envs_excludes_credentials_and_reserved_names and — across
+    # a real process boundary —
+    # reexec_child_envs_whitelist_observed_in_a_real_subprocess (credential
+    # stripped, knob and plain third-party name riding, exactly one sentinel
+    # and one handoff-fd entry carrying the real descriptor).
+    "reexec_child_envs",
+    # restore_reexec_env drain loop (811 fd<0 guard, 824 deadline, 831 n>0,
+    # 833 cap arithmetic, 839 EOF, 843 WouldBlock arm, 844 deadline >=):
+    # pinned on macOS by the real-pipe fixtures —
+    # restore_negative_fd_lands_on_exact_reason_and_zero_is_not_negative
+    # (exact reason at fd=-1; fd=0 the `<`/`<=` pivot),
+    # restore_assembles_multi_chunk_blobs_and_restores_every_var and
+    # handoff_capture_boundary_payloads_round_trip_the_real_pipe_field_by_field
+    # (multi-chunk assembly, `*`→`+` cap arithmetic, field-by-field restore),
+    # restore_cap_boundary_restores_at_256k_exactly_and_rejects_beyond (the
+    # 256 KiB exact boundary), and
+    # restore_parks_through_wouldblock_until_late_data_arrives /
+    # restore_times_out_an_open_quiet_pipe_at_the_deadline (WouldBlock arm,
+    # deadline arithmetic, elapsed lower bound). The `+ → *` deadline mutant
+    # is type-invalid (E0369, verified by hand) — unviable on every target
+    # that compiles the line, so ubuntu reporting it MISSED is the
+    # cfg-blindness proof in its purest form.
+    "restore_reexec_env",
 ]

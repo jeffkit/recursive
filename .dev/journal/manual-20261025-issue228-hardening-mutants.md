@@ -1,5 +1,13 @@
 # 2026-10-25 — #228 批次:hardening.rs 34 条变异幸存逐条钉死(re-exec 家族测试补强)
 
+**[03:53] 交付行(wt-b1 席,批次 2)**:2 测试新增(边界载荷真管道全径 T9 +
+704 子进程白名单 T10)+ mutants.toml 修复批次 1 两条**死正则豁免**(`+`/`*`
+未转义,391 生效而 633/824 从未生效——run 40114354611 仍列它们的直接原因)+
+按族补全 31 条 MISSED 全量豁免(每条带守卫指针,6 条负控实证手工验红/验绿)。
+产品逻辑零改动(diff 全在 `mod tests` + mutants.toml)。三门全绿
+(workspace 5278/0,clippy 0,fmt 0),`--list` 实证 31 条全部消失、零误伤。
+等主控验收;预期本 push 触发的 hardening.rs scope Mutation run 零 MISSED。
+
 **[00:41] 交付行(wt-b1 席)**:8 测试新增(7 常规 + 1 双相自 exec 端到端夹具),
 mutants.toml 三条真等价/不可活豁免(#223 批 3 同款 doctrine),产品逻辑零改动
 (diff 全在 `mod tests` + mutants.toml 注释)。三门全绿,等主控验收。
@@ -121,3 +129,91 @@ keeper 会持续再建档;本批交付只解决「测试钉死」(macOS 可验�
   --all-features -- -D warnings` EXIT=0 / `cargo fmt --all -- --check` EXIT=0
   (退出码直取无管道;本地 cargo-mutants 未跑,协议 §2b)。
 - 未 push,未动 main;commit 落 wt-b1。
+
+---
+
+## 批次 2(2026-10-25,CI run 40114354611:71 mutants → 31 MISSED)
+
+### 断根因:批次 1 的两条豁免是死正则
+
+`cargo mutants --list` 实证(27.1.0,本地):批次 1 加的三条 exclude_re 中
+391(`replace == with != in CredentialHandoff::capture`,无元字符)**生效**
+(不在 run 40114354611 的 MISSED 里),而 633(`replace - with + ...`)与
+824(`replace + with * ...`)**从未生效**——`exclude_re` 是正则匹配,模式里的
+`+`/`*` 是量词(`with +` = "一个以上空格"),永远匹配不上字面 mutant 名。
+这就是批次 1 之后 run 仍列 633/824 的直接原因。修复:全部转义,并在 toml 里
+留下 REGEX WARNING + `cargo mutants --list` 自查口径。
+
+### 批次 2 全账(31 条 → 全部处置)
+
+结构事实不变(批次 1 已断):31 条全部位于 `#[cfg(all(unix,
+not(target_os = "linux")))]` 的 macOS 专属臂,ubuntu CI 根本不编译——
+**任何 ubuntu 测试都结构上不可杀**(run 把 E0369 类型不合法的 824 `+`→`*`
+报成 MISSED 是铁证)。因此 CI 门收敛的唯一 test-only 通道是 exclude_re;
+测试的作用是提供「代码编译处已被钉死」的负控证据。逐族处置:
+
+| 族 | 条目 | macOS 杀手(负控实证) | CI 处置 |
+|---|---|---|---|
+| capture | 385 body→Default | **T9** + 批 0 capture 测试(手工施加→双红) | exclude(ubuntu 臂本就是 Self::default()) |
+| reexec_clean_env 写/exec 环 | 607/626×3/633÷/636×2/640×2 | **T8**(批次 1 已建;640 `*=` 手工验红:普通绿、solo 红) | exclude(T8 守卫指针) |
+| reexec_clean_env | 633 `-`→`+` | **手工验绿:普通套件绿 + solo T8(真 exec)绿** → 真等价实证 | exclude(等价论证保留) |
+| reexec_child_envs | 704×2/707/708×2/709×2 | 批 0 ④ + **T10**(704 vec![] 手工施加→双红) | exclude(整族) |
+| restore_reexec_env | 811×3/824×2/831×2/833×5/839/843/844 | T3-T7(批次 1)+ **T9**;833 `*`→`/` 手工验红×5;824 `+`→`*` 验 E0369 | exclude(整族) |
+
+### Tests added(2)
+
+1. **T9** `handoff_capture_boundary_payloads_round_trip_the_real_pipe_field_by_field`
+   (macOS 臂):capture→encode→**真管道**→parse→restore 全径,边界尺寸载荷——
+   A 帧恰好 4096(读 chunk 边界)、B 值 8191(奇数跨块)、C 双设(setenv
+   replace 语义,dedup 前后)、总 blob 22407(>16KiB macOS 管道容量,读写
+   背压交错),writer 不均分片(1000/5000/5001/12000/16383/20000,分界落在
+   name/value 内部),restore 后**逐字段字节精确断言**。普通套件即可杀 385,
+   不依赖 solo 自 exec 夹具。
+2. **T10** `reexec_child_envs_whitelist_observed_in_a_real_subprocess`
+   (macOS 臂):`env_clear().envs(reexec_child_envs(fd))` 起**真子进程**
+   (/usr/bin/env),断言子进程观测面——凭证被剥、knob 与普通第三方名随行、
+   sentinel/fd 恰一条且 fd 为真描述符号。704 函数体替换在子进程层面的
+   直接证据。
+
+### 负控实证台账(手工施加 mutant → cargo test → 还原,6 条)
+
+1. 385 capture→Default:`handoff_capture_*` 2 测试红 ✓
+2. 633 `-`→`+`:普通 27 绿 + `cargo test --lib reexec_exec_boundary` 两轮
+   "running 1 test"(真 exec 发生)ok 绿 ✓ → 真等价
+3. 824 `+`→`*`:E0369 cannot multiply `Instant` by `Duration`(类型不可活)✓
+4. 704 body→vec![]:④ + T10 双红 ✓
+5. 640 `+=`→`*=`:普通 27 绿(循环未被驱动)→ solo T8 红(panic: came back
+   with ...)✓(证实该算符唯一杀手是 T8)
+6. 833 `*`→`/`(cap 变 0):T4/T5/T6/T-restore/T9 五红 ✓
+
+### mutants.toml 变更
+
+- 修复死正则两条(转义 `\+`/`\*`,语义并入族注释);
+- 按族新增:capture fn 替换 1 条、reexec_clean_env 5 条(含等价 1 条)、
+  `reexec_child_envs` 整族 1 条、`restore_reexec_env` 整族 1 条;
+- 每条带守卫测试指针与负控结论;toml 头部加 REGEX WARNING(元字符必须
+  转义,`--list` 是自查器)与「删守卫测试必须同步删豁免」的约束声明;
+- `--list` 复核:hardening.rs 31 条 MISSED 名全部消失;误伤为零(仅 794
+  fn→Default 随族豁免,本就 unviable);ubuntu 可见面(is_empty 402、
+  encode/decode、predicate/scrub/reporting)未动,仍由跨平台测试杀。
+
+### ubuntu-only 可见性自查(批次 2 交付说明)
+
+- 新增 2 测试均为 macOS 臂门控,ubuntu 门**不可见**;本批新增 ubuntu 可见杀
+  为 **0**(与批次 1 结论一致:ubuntu 可见面早已被 T1 与跨平台 blob/谓词/
+  scrub 测试杀净);
+- CI 门零 MISSED 的达成路径**只有** exclude_re(结构上 ubuntu 不编译这些
+  行,任何测试不可杀);测试与负控提供的是「代码编译处已被钉死」的证据链;
+- 预期:本 push 触发的 mutants.yml main-push(hardening.rs scope)报告
+  0 MISSED → 按 #228 关单判据代行关单。
+
+### 三门与协议
+
+- `cargo test --workspace`:**5278 passed / 0 failed**(基线 5276+2);
+- `cargo clippy --all-targets --all-features -- -D warnings`:0;
+- `cargo fmt --all` + `--check`:0;
+- 本地 cargo-mutants **未跑**(协议 §2b;仅用 `--list` 干跑做豁免复核,
+  不执行任何变异测试);负控为手工施加+定向测试,非门跑;
+- #222:全部 env 测试持 `crate::test_util::env_lock()`;#224:新增全为
+  macOS 臂门控,windows 口径不触发;禁区未触碰;产品逻辑零改动
+  (diff = src/hardening.rs `mod tests` + .cargo/mutants.toml + 本 journal)。

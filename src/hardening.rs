@@ -1558,6 +1558,239 @@ mod tests {
         }
     }
 
+    // ── #228 batch 2 (CI run 40114354611, 31 MISSED in this file) ──────────
+    // Batch 1 pinned this family where it compiles (macOS arm) and documented
+    // that the ubuntu gate can never see those kills (cfg blindness — the
+    // same run scored a type-invalid mutant MISSED). Batch 2 adds the two
+    // direct-drive fixtures the master's dispatch names: boundary-sized
+    // payloads through the capture → encode → real-pipe → parse → restore
+    // path with field-by-field assertions, and the child-env whitelist
+    // observed across a real subprocess boundary.
+
+    /// The capture → encode → pipe transport → parse → restore path driven
+    /// end-to-end over a **real pipe** with boundary-sized payloads, every
+    /// restored field asserted byte-exactly. The fixtures make the loop
+    /// arithmetic distinguishable: variable A's frame ends exactly at the
+    /// 4096-byte read-chunk boundary, B's value is odd-sized and spans
+    /// several chunks, C is set twice (setenv replaces — capture must yield
+    /// one entry carrying the final value), and the whole blob exceeds the
+    /// 16 KiB macOS pipe capacity so writer and reader genuinely interleave
+    /// through backpressure. The writer emits in uneven chunks whose
+    /// boundaries land mid-name and mid-value. Kills the
+    /// `capture → Default::default()` survivor (385) in the plain suite —
+    /// no solo self-exec needed — and re-kills the restore read-loop family
+    /// (811–844) at these boundary sizes.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn handoff_capture_boundary_payloads_round_trip_the_real_pipe_field_by_field() {
+        let _lock = crate::test_util::env_lock();
+        const A: &str = "RECURSIVE_ISSUE228B99_KEY_A";
+        const B: &str = "RECURSIVE_ISSUE228B99_KEY_B";
+        const C: &str = "RECURSIVE_ISSUE228B99_KEY_C";
+        const D: &str = "RECURSIVE_ISSUE228B99_KEY_D";
+        const KNOB: &str = "RECURSIVE_ISSUE228B9_MAX_TOKENS";
+        let (val_a, val_b, val_c, val_d) = (
+            "a".repeat(4067), // A's frame: 27 + 1 + 4067 + 1 == 4096 exactly
+            "b".repeat(8191), // odd size, spans several read chunks
+            "c".repeat(33),
+            "d".repeat(10_000), // pushes the blob past the pipe capacity
+        );
+        // Snapshot everything the test touches, and strip the process's real
+        // credential variables so capture() sees exactly the fixtures (same
+        // hygiene as the self-exec fixture above).
+        let names = [A, B, C, D, KNOB, REEXEC_HANDOFF_FD_VAR];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            names.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let foreign: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(k, _)| is_process_credential_env(&k.to_string_lossy()))
+            .collect();
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        for (k, _) in &foreign {
+            unsafe { std::env::remove_var(k) };
+        }
+        for k in [A, B, C, D, KNOB] {
+            unsafe { std::env::remove_var(k) };
+        }
+        // SAFETY: as above.
+        unsafe { std::env::set_var(A, &val_a) };
+        unsafe { std::env::set_var(B, &val_b) };
+        unsafe { std::env::set_var(C, "stale-first-value") };
+        unsafe { std::env::set_var(C, &val_c) };
+        unsafe { std::env::set_var(D, &val_d) };
+        unsafe { std::env::set_var(KNOB, "4096") };
+
+        let handoff = CredentialHandoff::capture();
+        assert_eq!(
+            handoff.vars,
+            vec![
+                (
+                    std::ffi::OsString::from(A),
+                    std::ffi::OsString::from(&val_a)
+                ),
+                (
+                    std::ffi::OsString::from(B),
+                    std::ffi::OsString::from(&val_b)
+                ),
+                (
+                    std::ffi::OsString::from(C),
+                    std::ffi::OsString::from(&val_c)
+                ),
+                (
+                    std::ffi::OsString::from(D),
+                    std::ffi::OsString::from(&val_d)
+                ),
+            ],
+            "sorted, final value for the twice-set name, knob excluded"
+        );
+        let blob = handoff.encode();
+        assert_eq!(
+            blob.len(),
+            22_407,
+            "frame arithmetic 4096 + 8220 + 62 + 10029: A ends on the read-chunk \
+             boundary, the blob rides past the 16 KiB pipe capacity"
+        );
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let writer = std::thread::spawn(move || {
+            // Uneven chunk boundaries, each landing inside some name or
+            // value: the transport is a byte stream, and the parse side must
+            // reassemble fields across every split point.
+            let mut prev = 0usize;
+            for end in [1000usize, 5000, 5001, 12_000, 16_383, 20_000] {
+                write_all_fd(write_fd, &blob[prev..end]);
+                prev = end;
+            }
+            write_all_fd(write_fd, &blob[prev..]);
+            // SAFETY: close on the pipe write end this thread owns.
+            unsafe { libc::close(write_fd) };
+        });
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, read_fd.to_string()) };
+
+        let outcome = restore_reexec_env();
+
+        writer.join().expect("writer thread");
+        assert_eq!(outcome, RestoreOutcome::Restored { count: 4 });
+        assert_eq!(std::env::var(A).unwrap(), val_a, "field A byte-exact");
+        assert_eq!(std::env::var(B).unwrap(), val_b, "field B byte-exact");
+        assert_eq!(std::env::var(C).unwrap(), val_c, "field C byte-exact");
+        assert_eq!(std::env::var(D).unwrap(), val_d, "field D byte-exact");
+        assert!(
+            std::env::var_os(REEXEC_HANDOFF_FD_VAR).is_none(),
+            "handoff fd variable consumed"
+        );
+
+        // SAFETY: restoring under the same lock.
+        for (k, v) in &foreign {
+            unsafe { std::env::set_var(k, v) };
+        }
+        // SAFETY: as above.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    /// The child-environment whitelist must survive the process boundary: a
+    /// real subprocess launched with **exactly** [`reexec_child_envs`] as
+    /// its environment shows the credential stripped, the knob and a plain
+    /// third-party name riding along, and exactly one sentinel and one
+    /// handoff-fd entry — the same observations the re-executed child itself
+    /// makes at exec time. Kills the `reexec_child_envs` body replacements
+    /// (`vec![]` / `vec![(Default, Default)]`, 704) and the filter operator
+    /// survivors (707/708/709) at subprocess level, complementing the
+    /// in-process Vec assertions above.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn reexec_child_envs_whitelist_observed_in_a_real_subprocess() {
+        let _lock = crate::test_util::env_lock();
+        const CRED: &str = "RECURSIVE_ISSUE228SUB_API_KEY";
+        const KNOB: &str = "RECURSIVE_ISSUE228SUB_MAX_TOKENS";
+        const PLAIN: &str = "ISSUE228SUB_PLAIN";
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            CRED,
+            KNOB,
+            PLAIN,
+            REEXEC_SENTINEL_VAR,
+            REEXEC_HANDOFF_FD_VAR,
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(CRED, "secret-value") };
+        unsafe { std::env::set_var(KNOB, "4096") };
+        unsafe { std::env::set_var(PLAIN, "plain-value") };
+        unsafe { std::env::set_var(REEXEC_SENTINEL_VAR, "preset-by-operator") };
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, "999") };
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let envs = reexec_child_envs(read_fd);
+        let out = std::process::Command::new("/usr/bin/env")
+            .env_clear()
+            .envs(envs)
+            .output()
+            .expect("spawn /usr/bin/env");
+        // SAFETY: fds this test owns; the child is done with them.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+
+        // SAFETY: restoring under the same lock.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        assert!(out.status.success(), "env exited {:#?}", out.status);
+        let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let count = |name: &str| {
+            lines
+                .iter()
+                .filter(|l| l.starts_with(&format!("{name}=")))
+                .count()
+        };
+        assert_eq!(
+            count(CRED),
+            0,
+            "the credential must never cross the process boundary"
+        );
+        assert_eq!(count(KNOB), 1, "the knob rides along, exactly once");
+        assert_eq!(
+            count(PLAIN),
+            1,
+            "a plain third-party name rides along, exactly once"
+        );
+        assert_eq!(count(REEXEC_SENTINEL_VAR), 1, "exactly one sentinel entry");
+        assert!(
+            lines.contains(&format!("{REEXEC_SENTINEL_VAR}=1")),
+            "the sentinel is normalised to \"1\", not the preset value"
+        );
+        assert_eq!(
+            count(REEXEC_HANDOFF_FD_VAR),
+            1,
+            "exactly one handoff-fd entry"
+        );
+        assert!(
+            lines.contains(&format!("{REEXEC_HANDOFF_FD_VAR}={read_fd}")),
+            "the fd entry carries the real descriptor number, not the preset 999"
+        );
+    }
+
     /// End-to-end re-exec boundary: the parent stage has a real credential
     /// to protect and calls [`reexec_clean_env`] for real — on success that
     /// **replaces this very test binary's process image** and the re-executed
