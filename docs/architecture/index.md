@@ -57,3 +57,4 @@ drill into what you need.
 - [persistence.md](persistence.md) — transcript/会话持久化:通道×粒度矩阵、retention 与 #147 收口边界(补注册)
 * [AG-UI](agui.md) - frontend protocol layer: protocol/client crates, transport-free server session layer, thin HTTP adapter
 * [Invariants](invariants.md) - the ten invariants every change must respect
+* [Degradation Registry](degradation-registry.md) - owner ruling「任何降级必须可观测」的全仓登记面:已知可观测站点(预载)、首版扫描违例 #229-#241(只登记+立单)、非降级排除口径与维护约定 (issue #201)
