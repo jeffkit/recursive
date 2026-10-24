@@ -76,7 +76,7 @@ Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md)
 >
 > Regression test: `compaction_keeps_tool_calls_paired_with_results`
 
-Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md)
+Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md), [Context Compaction](compaction.md) (the transcript-mutation contracts: single write path, canonical rebuild)
 
 ## Invariant #9 — New Tool → New File
 

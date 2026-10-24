@@ -44,7 +44,9 @@ through `compact::rebuild_declared_seed` (the canonical rebuild, Goal 413 —
 truncation after the boundary, legacy-marker backfill, killed-run orphan
 tool-call skip-answer), and the REST flat side resyncs via
 `is_stored_prefix` / full rewrite with the watermark marked
-(`runtime.rs`). The AG-UI `messages` contract (threadId is the session;
+(`runtime.rs`). The four compaction contracts behind these paths — single
+ownership, canonical rebuild, token accounting, observable degradation — are
+specified in [compaction.md](compaction.md). The AG-UI `messages` contract (threadId is the session;
 request `messages` is this turn's prompt, not the history) lives in
 [agui.md](agui.md) — including its documented cost: a client-side history
 rewrite does not take effect.

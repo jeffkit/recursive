@@ -139,5 +139,7 @@ written down before the run — is driven end to end in `tests/agui_e2e.rs`.
 - `docs/INTERNALS.md` — HTTP server overview and admission gate.
 - `docs/architecture/sessions.md` — transcript/session storage shared with
   the AG-UI session layer.
+- `docs/architecture/compaction.md` — the canonical rebuild (Goal 413) that
+  thread-seed loading and resume go through.
 - `docs/architecture/invariants.md` — Invariant #8 (tool-call pairing),
   which the seed mapping exists to preserve.

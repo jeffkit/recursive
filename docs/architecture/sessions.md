@@ -199,4 +199,5 @@ structure.
 
 - [Agent Loop](agent-loop.md) — how transcripts grow per turn
 - [Layer 3 — Episodic](memory/layer3-episodic.md) — searching past sessions
+- [Context Compaction](compaction.md) — the four compaction contracts over this transcript (ownership, canonical rebuild, token accounting, observability)
 - [Invariants](invariants.md) — Invariant #7 (transcript always saved), Invariant #8 (tool-call pairing)
