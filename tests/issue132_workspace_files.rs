@@ -116,6 +116,10 @@ mod issue132_workspace_files_tests {
         state.event_channels.write().await.remove(id);
     }
 
+    // Only called from the unix-gated symlink tests; on windows this
+    // helper would be dead code and clippy -D warnings would fail
+    // (run 40037188916 follow-up).
+    #[cfg(unix)]
     async fn metrics_text(app: &axum::Router) -> String {
         let response = app
             .clone()
