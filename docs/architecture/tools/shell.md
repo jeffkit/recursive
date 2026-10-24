@@ -35,6 +35,9 @@ For stricter isolation, two sandbox backends are available:
 
 Default configured via `shell_timeout_secs` in `build_standard_tools`. The
 self-improve loop sets this from `RECURSIVE_SHELL_TIMEOUT` env var.
+A timeout ends the **whole process group**, not just the shell
+(`terminate_group`, `src/process.rs`) — see
+[Cancellation & Process Ownership](../cancellation.md).
 
 ## Critical Warning
 

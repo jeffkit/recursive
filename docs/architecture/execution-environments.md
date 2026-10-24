@@ -94,6 +94,10 @@ was never written in this session returns `NotFound`. Whole-tree
 pre-upload is out of scope for this milestone (see non-goals).
 | `destroy` | no-op | container remove (idempotent) | `DELETE /sandboxes/{id}` (idempotent; 404 = already gone) |
 
+Teardown is **liquidation, not a table reset**: before `destroy()` runs, every
+companion background job is cancelled and its process group reaped
+(`AgentRuntime::destroy_environment`) — see [cancellation.md](cancellation.md).
+
 In the microvm tier the host-exec tools (`run_background` /
 `check_background` / `watch_file` / `stop_loop`) are **dropped** from the
 registry — they spawn via the host `/bin/sh` and would bypass the VM (same
