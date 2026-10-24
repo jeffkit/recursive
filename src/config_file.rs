@@ -521,15 +521,46 @@ pub fn load_layered_permissions(workspace: &Path) -> LayeredPermissionsConfig {
 
 /// Load a single permission layer from a TOML file, if it exists.
 ///
-/// Returns `None` if the file doesn't exist or can't be parsed.
+/// Returns `None` if the file doesn't exist (normal — no layer configured),
+/// or if it exists but can't be read/parsed. The latter two cases used to
+/// skip the layer **silently**: one malformed TOML line made the whole
+/// User/Project rule layer vanish with no trace — a fail-open degradation
+/// on the rule surface, which violates the owner ruling that any
+/// degradation must be observable (issue #199 S3(b), 拍板随单带). Both now
+/// emit a WARNING naming the path, the layer source, and the error before
+/// the skip.
 fn load_permission_layer(path: &Path, source: RuleSource) -> Option<PermissionLayer> {
     if !path.exists() {
         return None;
     }
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::warn!(
+                target: "recursive::permissions",
+                path = %path.display(),
+                ?source,
+                %error,
+                "permission layer unreadable; layer skipped (fail-open degradation)"
+            );
+            return None;
+        }
+    };
     // Parse as FileConfig first so we only extract the [permissions] section.
     // This avoids picking up unrelated sections (e.g. [provider]) as empty defaults.
-    let file_config: FileConfig = toml::from_str(&content).ok()?;
+    let file_config: FileConfig = match toml::from_str(&content) {
+        Ok(file_config) => file_config,
+        Err(error) => {
+            tracing::warn!(
+                target: "recursive::permissions",
+                path = %path.display(),
+                ?source,
+                %error,
+                "permission layer TOML parse failed; layer skipped (fail-open degradation)"
+            );
+            return None;
+        }
+    };
     let section = file_config.permissions?;
     Some(PermissionLayer {
         source,
@@ -821,6 +852,120 @@ interactive = ["delete_file"]
         // Project layer has allow/interactive
         assert_eq!(config.layers[1].allow, vec!["Write"]);
         assert_eq!(config.layers[1].interactive, vec!["delete_file"]);
+    }
+
+    // ---- Issue #199 S3(b): a broken permission layer must be observable ----
+    //
+    // `load_permission_layer` used to swallow read/parse failures with
+    // `ok()?`, so one malformed TOML line silently dropped the whole
+    // User/Project rule layer — fail-open with zero trace. The WARN is the
+    // fix's observable behaviour (owner ruling), so the tests below assert
+    // it the same way `hardening.rs`'s #223 capture harness does:
+    // `tracing::subscriber::with_default` scopes a DEBUG-level fmt
+    // subscriber to the calling thread only (parallel-safe, no
+    // process-global subscriber touched). No env vars are involved (the
+    // path is passed explicitly), so no env lock is needed.
+
+    /// Append-only shared sink the capture subscriber formats into.
+    #[derive(Clone)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local DEBUG-level tracing subscriber and
+    /// return `(f's result, everything it formatted)` (ANSI off, one
+    /// event per line).
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        let logs = String::from_utf8(out).expect("tracing output is utf-8");
+        (value, logs)
+    }
+
+    /// A file with a TOML syntax error must skip the layer AND warn with
+    /// the path and the failure kind. Kills a re-mutation back to
+    /// `toml::from_str(..).ok()?`.
+    #[test]
+    fn load_permission_layer_bad_toml_warns_and_skips_layer() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[permissions\nallow = [\"Read\"\n").unwrap();
+
+        let (layer, logs) = capture_logs(|| load_permission_layer(&path, RuleSource::User));
+        assert!(
+            layer.is_none(),
+            "a TOML-broken layer must be skipped, not half-loaded"
+        );
+        assert!(
+            logs.contains("WARN"),
+            "parse failure must emit a WARN, got: {logs}"
+        );
+        assert!(
+            logs.contains("TOML parse failed"),
+            "WARN must name the failure kind, got: {logs}"
+        );
+        assert!(
+            logs.contains(&path.display().to_string()),
+            "WARN must carry the offending path, got: {logs}"
+        );
+        assert!(
+            logs.contains("User"),
+            "WARN must carry the layer source, got: {logs}"
+        );
+    }
+
+    /// A file that exists but cannot be read (here: a directory at the
+    /// config path) must warn with the same observable shape. Kills a
+    /// re-mutation back to `std::fs::read_to_string(..).ok()?`.
+    #[test]
+    fn load_permission_layer_unreadable_file_warns_and_skips_layer() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = tmp.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let (layer, logs) = capture_logs(|| load_permission_layer(&path, RuleSource::Project));
+        assert!(layer.is_none(), "an unreadable layer must be skipped");
+        assert!(
+            logs.contains("WARN") && logs.contains("unreadable"),
+            "read failure must emit the unreadable-WARN, got: {logs}"
+        );
+        assert!(
+            logs.contains(&path.display().to_string()),
+            "WARN must carry the offending path, got: {logs}"
+        );
+    }
+
+    /// Negative control for the WARN surface itself: a missing file is the
+    /// normal "no layer configured" case and must stay SILENT (no WARN) —
+    /// the warning is for degradation, not for absence.
+    #[test]
+    fn load_permission_layer_missing_file_stays_silent() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = tmp.path().join("nonexistent.toml");
+        let (layer, logs) = capture_logs(|| load_permission_layer(&path, RuleSource::User));
+        assert!(layer.is_none());
+        assert!(
+            !logs.contains("WARN"),
+            "missing file is not a degradation and must not warn, got: {logs}"
+        );
     }
 
     // ---- L1: provider.api_key must NEVER land in ~/.recursive/config.toml ----
