@@ -133,44 +133,72 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Run mutants (per crate, files scope)
+        id: mutants
         env:
           AGENT_FILES: ${{ steps.scope.outputs.agent }}
           CLI_FILES: ${{ steps.scope.outputs.cli }}
           TUI_FILES: ${{ steps.scope.outputs.tui }}
         run: |
-          failed=""
+          survivors=""; baseline_failed=""
+          # 分诊口径（#201/#195，2026-10-25）：脚本退出码语义见 *-mutants.sh —
+          #   0 = 过；1 = cargo-mutants 基线/测试失败**原样透传**（非幸存者，
+          #       #195 三次假信号教训：基线失败曾被记成「变异幸存」开单）；
+          #   2 = 有 MISSED（真幸存者，gate FAIL）；其余非零 = 前置拒绝
+          #       （脏树 exit 3 / 未安装 exit 2），按幸存者路径处理（保守红）。
+          run_crate() {  # run_crate <crate-name> <script> <files...>
+            local crate="$1"; local script="$2"; shift 2
+            local rc=0
+            echo "::group::${crate}-mutants ($# files)"
+            bash "$script" "$@" || rc=$?
+            echo "::endgroup::"
+            echo "exit codes: ${crate}=${rc}" | tee -a /tmp/mutants-exit-codes.txt
+            if [[ "$rc" -eq 0 ]]; then return 0; fi
+            if [[ "$rc" -eq 1 ]]; then
+              baseline_failed="${baseline_failed:+$baseline_failed }${crate}"
+              echo "::error::baseline failed in ${crate} (exit 1 — baseline/test failure, NOT survivors; see #195)"
+            else
+              survivors="${survivors:+$survivors }${crate}"
+            fi
+          }
           if [[ -n "$AGENT_FILES$CLI_FILES$TUI_FILES" ]]; then
+            rm -f /tmp/mutants-exit-codes.txt
             if [[ -n "$AGENT_FILES" ]]; then
               read -ra F <<< "$AGENT_FILES"
-              echo "::group::agent-mutants (${#F[@]} files)"
-              bash .dev/scripts/agent-mutants.sh "${F[@]}" || failed="$failed agent"
-              echo "::endgroup::"
+              run_crate agent .dev/scripts/agent-mutants.sh "${F[@]}"
             fi
             if [[ -n "$CLI_FILES" ]]; then
               read -ra F <<< "$CLI_FILES"
-              echo "::group::cli-mutants (${#F[@]} files)"
-              bash .dev/scripts/cli-mutants.sh "${F[@]}" || failed="$failed cli"
-              echo "::endgroup::"
+              run_crate cli .dev/scripts/cli-mutants.sh "${F[@]}"
             fi
             if [[ -n "$TUI_FILES" ]]; then
               read -ra F <<< "$TUI_FILES"
-              echo "::group::tui-mutants (${#F[@]} files)"
-              bash .dev/scripts/tui-mutants.sh "${F[@]}" || failed="$failed tui"
-              echo "::endgroup::"
+              run_crate tui .dev/scripts/tui-mutants.sh "${F[@]}"
             fi
           else
             echo "no crate sources changed in this push — nothing to mutate"
             exit 0
           fi
-          if [[ -n "$failed" ]]; then
-            echo "mutants survivors in:$failed"
+          {
+            echo "survivors=${survivors}"
+            echo "baseline_failed=${baseline_failed}"
+          } >> "$GITHUB_OUTPUT"
+          if [[ -n "$baseline_failed" ]]; then
+            echo "mutants BASELINE FAILED in:$baseline_failed — not filing a survivor issue (#195 lesson)"
+          fi
+          if [[ -n "$survivors" ]]; then
+            echo "mutants survivors in:$survivors"
+          fi
+          if [[ -n "$baseline_failed$survivors" ]]; then
             exit 1
           fi
 
       # 幸存者 → 自动建档（P2）给 keeper 派发修复 goal；查重：已有同前缀 open
       # 单只回评，不重复开单（ISSUE_FILING_GUIDE 禁止重复提报）。
+      # 基线失败（exit 1）**不得**进本步——那不是幸存者，开「变异幸存」单是
+      # #195 实证三次的假信号；基线失败只留 ::error:: 日志（上游 Run 步）。
+      # survivors 输出为空也拦住「更早步骤失败」误入本步的旧假信号类。
       - name: File keeper issue on survivors
-        if: failure()
+        if: failure() && steps.mutants.outputs.survivors != ''
         env:
           GH_TOKEN: ${{ github.token }}
           SHA_SHORT: ${{ github.sha }}

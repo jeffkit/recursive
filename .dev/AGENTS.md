@@ -291,6 +291,14 @@ as this list. Update both together — or the test together with them.
    clippy-dirty code (very rare; document the reason in the journal
    entry).
 
+   **Bug-fix commits must strengthen the weak assertions that let the bug
+   through** (review convention ratified 2026-10-25, #194/#201): 修 bug
+   的提交须同时把放过该 bug 的弱断言改强，commit 说明指出改强的测试名。
+   Cautionary examples — the five weak assertions catalogued in #194
+   (`kernel/tests.rs:215`, `compact/mod.rs:717`, `compact/mod.rs:1322`,
+   `handlers.rs:5771`, and #184's own base-ref check) each let a real bug
+   slip past a green suite.
+
    **E2E smoke is a hard gate by the self-improve flow** (restored after
    being silently skipped on g262): the flow runs the `e2e` project gate
    declared in `.flowcast/gates.json` →
