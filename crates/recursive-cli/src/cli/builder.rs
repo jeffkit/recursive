@@ -351,17 +351,53 @@ pub(crate) fn apply_operator_allow_list(tools: &mut ToolRegistry, config: &Confi
 ///   2. `~/.recursive/config.toml`'s `[permissions]` section.
 ///   3. None — every tool allowed (back-compat default).
 ///
-/// Errors during file read or TOML parse are logged to stderr and
-/// treated as "no permissions config" — a malformed file should not
-/// brick the CLI for unrelated commands.
+/// Errors during file read or TOML parse are logged to stderr (source 1 in
+/// [`permissions_from_env_path`], source 2 in [`file_config_or_report`]) and
+/// treated as "no permissions config" — a malformed file should not brick
+/// the CLI for unrelated commands, but falling through to tier 3 is a
+/// fail-open on the rule surface, so it must never happen silently.
 fn resolve_tool_permissions() -> Option<recursive::permissions::PermissionsConfig> {
     if let Ok(path) = std::env::var("RECURSIVE_TOOL_PERMISSIONS_FILE") {
         if let Some(perms) = permissions_from_env_path(&path) {
             return Some(perms);
         }
     }
-    let file_config = recursive::config_file::FileConfig::load().ok().flatten()?;
+    let file_config = file_config_or_report(&mut |line| eprintln!("{line}"))?;
     Some(permissions_from_section(file_config.permissions?))
+}
+
+/// `FileConfig::load()` for the `~/.recursive/config.toml` permission source,
+/// with the `Err` arm reported through `report` instead of dropped.
+///
+/// Until issue #231 this was `.ok().flatten()`: a config.toml that existed
+/// but failed to read or parse was indistinguishable from an absent one, so
+/// one TOML typo in `[permissions]` silently granted every tool. The line
+/// mirrors [`permissions_from_env_path`] (`permissions: failed to <read|parse>
+/// <path>: <error>`) and goes to stderr like that sibling branch: stderr is
+/// not subject to `--log` / `RUST_LOG` filtering, so a rule-surface fail-open
+/// stays visible even under `--log error`. `Ok(None)` (no file) stays silent —
+/// tier 3 by absence is the documented default, not a degradation. The sink
+/// is a parameter so the regression test can assert the line without
+/// capturing process stderr.
+fn file_config_or_report(
+    report: &mut dyn FnMut(String),
+) -> Option<recursive::config_file::FileConfig> {
+    match recursive::config_file::FileConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            let path = recursive::config_file::config_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.recursive/config.toml".to_string());
+            report(match error {
+                recursive::Error::Io(io) => format!("permissions: failed to read {path}: {io}"),
+                // `FileConfig::load_from` already phrases this as
+                // "failed to parse config file <path>: <toml error>".
+                recursive::Error::Config { message } => format!("permissions: {message}"),
+                other => format!("permissions: failed to load {path}: {other}"),
+            });
+            None
+        }
+    }
 }
 
 /// Parse a `RECURSIVE_TOOL_PERMISSIONS_FILE` value into a permissions config.
@@ -1410,6 +1446,122 @@ mod tests {
         assert!(
             permissions_from_env_path("").is_none(),
             "an empty path is 'no env override', not an error"
+        );
+    }
+
+    // ── file_config_or_report (issue #231) ────────────────────────────────
+
+    /// Runs `file_config_or_report` against a `RECURSIVE_HOME` whose
+    /// `.recursive/config.toml` has the given body (`None` = no file), and
+    /// returns the result, every line the report sink received, and the
+    /// config path the function should have named.
+    fn load_file_config_under(
+        config_toml: Option<&str>,
+    ) -> (
+        Option<recursive::config_file::FileConfig>,
+        Vec<String>,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        if let Some(body) = config_toml {
+            std::fs::create_dir_all(config_path.parent().expect("parent dir")).expect("mkdir");
+            std::fs::write(&config_path, body).expect("write config.toml");
+        }
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_HOME",
+            Some(tmp.path().to_str().expect("utf8 tempdir")),
+        )]);
+        let mut lines = Vec::new();
+        let result = file_config_or_report(&mut |line| lines.push(line));
+        (result, lines, config_path.display().to_string())
+    }
+
+    /// Issue #231 regression: a `~/.recursive/config.toml` that exists but is
+    /// not valid TOML used to be `.ok()`-swallowed into "no permissions
+    /// config" (tier 3, every tool allowed) with no trace. The fall-through
+    /// stays — a typo must not brick unrelated commands — but it must be
+    /// reported, naming the file and the parse failure, in the same
+    /// `permissions: failed to …` shape as the env-file branch.
+    #[test]
+    fn file_config_or_report_names_a_malformed_config_toml_instead_of_silently_allowing_all() {
+        let (result, lines, path) =
+            load_file_config_under(Some("[permissions]\nallow = [\"Read\"\n"));
+        assert!(
+            result.is_none(),
+            "a malformed config.toml must still fall through to tier 3"
+        );
+        assert_eq!(lines.len(), 1, "exactly one report line, got {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.starts_with("permissions: failed to parse "),
+            "must use the env-branch wording for a parse failure, got {line:?}"
+        );
+        assert!(
+            line.contains(&path),
+            "must name the offending file, got {line:?}"
+        );
+    }
+
+    /// The other `Err` shape: the path exists but cannot be read (here it is a
+    /// directory, as in `load_permission_layer_unreadable_file_warns_and_skips_layer`).
+    /// `Error::Io` alone does not carry the path, so the report must add it.
+    #[test]
+    fn file_config_or_report_names_an_unreadable_config_toml_with_its_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join(".recursive").join("config.toml");
+        std::fs::create_dir_all(&config_path).expect("config.toml as a directory");
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_HOME",
+            Some(tmp.path().to_str().expect("utf8 tempdir")),
+        )]);
+        let mut lines = Vec::new();
+        let result = file_config_or_report(&mut |line| lines.push(line));
+        assert!(result.is_none(), "an unreadable config.toml falls through");
+        assert_eq!(lines.len(), 1, "exactly one report line, got {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.starts_with("permissions: failed to read "),
+            "must use the env-branch wording for a read failure, got {line:?}"
+        );
+        assert!(
+            line.contains(&config_path.display().to_string()),
+            "must name the offending file, got {line:?}"
+        );
+    }
+
+    /// Positive control for the new report: a valid config.toml (with or
+    /// without a `[permissions]` section) and an absent one must produce
+    /// **zero** report lines — the fix must not add a warning to every normal
+    /// startup; absence and "no section" are tier 3 by design, not degradation.
+    #[test]
+    fn file_config_or_report_is_silent_for_valid_and_absent_config_toml() {
+        let (result, lines, _) = load_file_config_under(Some("[permissions]\ndeny = [\"Bash\"]\n"));
+        let section = result
+            .expect("a valid config.toml must load")
+            .permissions
+            .expect("[permissions] section present");
+        assert_eq!(section.deny, vec!["Bash".to_string()]);
+        assert!(
+            lines.is_empty(),
+            "a valid config must not be reported, got {lines:?}"
+        );
+
+        let (result, lines, _) = load_file_config_under(Some("# no sections at all\n"));
+        assert!(result
+            .expect("a valid config.toml without sections must load")
+            .permissions
+            .is_none());
+        assert!(
+            lines.is_empty(),
+            "a config without [permissions] is tier 3 by design, got {lines:?}"
+        );
+
+        let (result, lines, _) = load_file_config_under(None);
+        assert!(result.is_none(), "no file is tier 3 by absence");
+        assert!(
+            lines.is_empty(),
+            "an absent config.toml is the documented default, not a degradation; got {lines:?}"
         );
     }
 

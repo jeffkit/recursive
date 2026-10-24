@@ -53,13 +53,13 @@ timestamp: 2026-10-25T00:00:00Z
 | `docs/architecture/cancellation.md` | 取消/回收降级面成文（reclaim WARN 口径） | 契约成文 | — | Goal 425 / e6b0fd56 | 📄 成文 |
 | `docs/architecture/channels.md` | 六通道降级面成文（auth 503 / admission 503+Retry-After / 实验级降 SLA 不降门） | 契约成文 | — | Goal 427 / 4cce895b | 📄 成文 |
 
-## B. 首版扫描新发现违例（2026-10-25，只登记+立单，未修）
+## B. 首版扫描新发现违例（2026-10-25，只登记+立单，未修；逐单修复后就地翻转状态列）
 
 | 站点 | 降级形态 | 观测方式 | 回归钉 | 来源 | 状态 |
 |---|---|---|---|---|---|
 | `src/checkpoint.rs:648`（write_workspace_tree） | checkpoint diff 的 `git add -A` 进临时 index，`.output()` 结果整丢——staging 失败后 write-tree 对空/部分 index 成功，diff 静默错账（「全删除」/「无变更」）；sibling `snapshot_for_session` 有检查 | 无 | 无 | S4 扫描 | ❌ [#229](https://github.com/jeffkit/recursive/issues/229) |
 | `src/session/index.rs:873`/`:883` | 私密会话索引/库 0700/0600 chmod `let _ =` 吞——失败留 umask 默认权限（安全邻接），doc 宣称契约但失败无痕 | 无 | 无 | S4 扫描 | ❌ [#230](https://github.com/jeffkit/recursive/issues/230) |
-| `crates/recursive-cli/src/cli/builder.rs:363` | `~/.recursive/config.toml` 读失败/坏 TOML → `.ok().flatten()` 静默落 tier3 allow-all；doc 宣称「logged to stderr」而代码不打（doc/code 不符）；同函数 env 路径有 eprintln，此路独缺 | 无 | 无 | S4 扫描 | ❌ [#231](https://github.com/jeffkit/recursive/issues/231) |
+| `crates/recursive-cli/src/cli/builder.rs:382`（`file_config_or_report`，原 :363） | `~/.recursive/config.toml` 读失败/坏 TOML 原 `.ok().flatten()` 静默落 tier3 allow-all（规则面 fail-open；doc 宣称「logged to stderr」而代码不打）→ Err 臂 `eprintln!`「permissions: failed to read/parse <path>: <error>」对齐同函数 env 分支；缺文件 / 无 `[permissions]` 节仍静默 = 合法 tier3 非降级 | `eprintln!`（stderr，不受 `--log`/`RUST_LOG` 过滤） | `file_config_or_report_names_a_malformed_config_toml_instead_of_silently_allowing_all` / `…_names_an_unreadable_config_toml_with_its_path` / `…_is_silent_for_valid_and_absent_config_toml`（正控）（同文件 :1487/:1510/:1538；sink 层钉观测本体——负控 Err 臂还原静默即两钉红；`eprintln!` 接线一行不在进程内可测面） | S4 扫描 → #231 | ✅ 有钉 [#231](https://github.com/jeffkit/recursive/issues/231) |
 | `src/http/session_mirror.rs:153-154`（唯一调用方 mod.rs:2414 同静默） | AGUI teardown 镜像 transcript/meta 双 atomic_write 吞——镜像缺失/陈旧无痕（活路径 #147 有 ?，本站是镜像面） | 无 | 无 | S4 扫描 | ❌ [#232](https://github.com/jeffkit/recursive/issues/232) |
 | `src/acp/session.rs:327-328`（insert_with_id） | ACP 建档初始 metadata 持久化吞——重启 resume 静默丢会话 | 无 | 无 | S4 扫描 | ❌ [#233](https://github.com/jeffkit/recursive/issues/233) |
 | `crates/recursive-cli/src/cli/session.rs:175` + `crates/recursive-tui/src/backend.rs:888` | transcript `finish()` 定稿吞（迁移路径 `.ok()` 继续+报成功话术 / TUI shutdown `let _ =`）——SessionStatus 静默失真 | 无 | 无 | S4 扫描 | ❌ [#234](https://github.com/jeffkit/recursive/issues/234) |
