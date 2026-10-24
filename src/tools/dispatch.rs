@@ -32,22 +32,18 @@ fn record_touched(name: &str, args: &Value, slot: &Mutex<TouchedFiles>) {
     let Ok(mut t) = slot.lock() else {
         return;
     };
-    match name {
-        "Write" => {
-            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                t.paths.insert(p.to_string());
-            }
+    // Issue #199: the path-argument position comes from the single identity
+    // table (this used to be a third parallel copy of the Write/Edit set).
+    // Keyed on the raw dispatch name, preserving pre-refactor behavior
+    // (alias calls record nothing) — canonicalization is the pipeline's job.
+    let shape = crate::tools::tool_identity::builtin_safety_shape(name);
+    if shape.is_write() {
+        if let Some(p) = shape.extract_path(args) {
+            t.paths.insert(p);
         }
-        "Edit" => {
-            // Edit (str_replace) stores the path in file_path.
-            if let Some(p) = args.get("file_path").and_then(|v| v.as_str()) {
-                t.paths.insert(p.to_string());
-            }
-        }
-        "Bash" => {
-            t.saw_shell = true;
-        }
-        _ => {}
+    }
+    if name == "Bash" {
+        t.saw_shell = true;
     }
 }
 
@@ -101,7 +97,11 @@ impl ToolRegistry {
                     audit: AuditMeta {
                         step_id: uuid::Uuid::now_v7().hyphenated().to_string(),
                         tool_name: Some(name.to_string()),
-                        canonical_name: Some(self.canonical_name(name).unwrap_or(name).to_string()),
+                        canonical_name: Some(
+                            self.identity_for(name)
+                                .map(|i| i.canonical_name)
+                                .unwrap_or_else(|| name.to_string()),
+                        ),
                         started_at: now,
                         finished_at: now,
                         args_hash: String::new(),
@@ -210,7 +210,11 @@ impl ToolRegistry {
             audit: AuditMeta {
                 step_id,
                 tool_name: Some(name.to_string()),
-                canonical_name: Some(self.canonical_name(name).unwrap_or(name).to_string()),
+                canonical_name: Some(
+                    self.identity_for(name)
+                        .map(|i| i.canonical_name)
+                        .unwrap_or_else(|| name.to_string()),
+                ),
                 started_at,
                 finished_at,
                 args_hash,

@@ -95,16 +95,27 @@ impl<'a> PermissionPipeline<'a> {
     /// decision, so an alias such as `write_file` cannot bypass a check
     /// written for `Write`.
     pub async fn check(&self, tool_name: &str, mut arguments: Value) -> CheckOutcome {
-        // Aliases only affect lookup (issue #153): normalize to the
-        // canonical (primary) tool name *before* any policy decision, so an
-        // alias like `write_file` cannot dodge a rule written for `Write`.
-        // Every phase below — safety content, static rules, hooks, L1 policy
-        // — must see the canonical name; `tool_name` (the raw, possibly
-        // aliased name) is kept only for user-facing error text.
-        let canonical = self.registry.canonical_name(tool_name).unwrap_or(tool_name);
+        // Aliases only affect lookup (issue #153): the structured identity
+        // (issue #199) is derived ONCE at the entry — canonical name + safety
+        // shape — and every phase below consumes it. `tool_name` (the raw,
+        // possibly aliased name) is kept only for user-facing error text and
+        // for the dual-hit rule matching (`check_static_aliased`).
+        let identity = self.registry.identity_for(tool_name);
+        let canonical: &str = identity
+            .as_ref()
+            .map(|i| i.canonical_name.as_str())
+            .unwrap_or(tool_name);
+        // Unknown names keep the pre-refactor name-keyed semantics: the
+        // single table still answers for FS tool names that are not (or no
+        // longer) registered, so e.g. a filtered-out `Write` keeps its
+        // protected-path check if something calls check() with it.
+        let shape = identity
+            .as_ref()
+            .map(|i| i.shape)
+            .unwrap_or_else(|| crate::tools::tool_identity::builtin_safety_shape(canonical));
 
         // Phase 1: safety content (file-path content for protected-path check).
-        let safety_content = safety_content_for_tool(canonical, &arguments);
+        let safety_content = shape.extract_path(&arguments);
 
         // NEW-PERM-2 (Goal H2): safety check for protected paths must
         // run independently of whether `permissions` is configured.
@@ -116,11 +127,9 @@ impl<'a> PermissionPipeline<'a> {
         // `check_static` (which does its own safety check) but the
         // second call is idempotent — both Deny with the same path.
         let is_readonly = self.registry.is_readonly(canonical);
-        if let Some(path) = crate::permissions::check_protected_path(
-            canonical,
-            is_readonly,
-            safety_content.as_deref(),
-        ) {
+        if let Some(path) =
+            crate::permissions::check_protected_path(shape, is_readonly, safety_content.as_deref())
+        {
             return CheckOutcome::Deny {
                 error: Error::PermissionDenied {
                     name: tool_name.into(),
@@ -381,9 +390,11 @@ impl<'a> PermissionPipeline<'a> {
     /// - If no L1 policy is configured on the registry, returns `Ok(())`.
     /// - If `arguments["command"]` is a string, runs `policy.check_shell(cmd)`.
     /// - If `arguments["path"]` or `arguments["file_path"]` is a string,
-    ///   runs `policy.check_fs_path(path, is_write)`. `is_write` is
-    ///   `true` for the canonical `Write` / `Edit` / `StrReplace`, `false`
-    ///   otherwise (aliases are resolved first, issue #153).
+    ///   runs `policy.check_fs_path(path, is_write)`. The write
+    ///   classification comes from the single identity table (issue #199 —
+    ///   this used to be a hardcoded `matches!` name set): `true` for the
+    ///   canonical `Write` / `Edit` / `StrReplace`, `false` otherwise,
+    ///   with aliases resolved first (issue #153).
     ///
     /// Returns the first policy error encountered. Callers must propagate
     /// the error and stop dispatch.
@@ -391,13 +402,19 @@ impl<'a> PermissionPipeline<'a> {
         let Some(policy): Option<&PolicyConfig> = self.registry.policy.as_ref() else {
             return Ok(());
         };
-        // Issue #153: classify on the canonical name so an alias such as
-        // `write_file` is still treated as a write for `fs.write_allow`.
-        let canonical = self.registry.canonical_name(tool_name).unwrap_or(tool_name);
         if let Some(cmd) = arguments.get("command").and_then(|v| v.as_str()) {
             policy.check_shell(cmd)?;
         }
-        let is_write = matches!(canonical, "Write" | "Edit" | "StrReplace");
+        // Issue #153/#199: classify through the single identity derivation so
+        // an alias such as `write_file` is still treated as a write for
+        // `fs.write_allow`. The name-keyed fallback preserves the pre-refactor
+        // string-set semantics for names that are not registered.
+        let shape = self
+            .registry
+            .identity_for(tool_name)
+            .map(|i| i.shape)
+            .unwrap_or_else(|| crate::tools::tool_identity::builtin_safety_shape(tool_name));
+        let is_write = shape.is_write();
         let path_arg = arguments
             .get("path")
             .or_else(|| arguments.get("file_path"))
@@ -411,20 +428,10 @@ impl<'a> PermissionPipeline<'a> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/// Extract the file-path "content" from tool arguments for the safety
-/// check in `check_static`. Returns `None` for tools that don't operate
-/// on a file path.
-///
-/// - `Write` / `Read`: extract `args["path"]`
-/// - `Edit`: extract `args["file_path"]`
-/// - All other tools: `None`
-fn safety_content_for_tool(name: &str, args: &serde_json::Value) -> Option<String> {
-    match name {
-        "Write" | "Read" => args["path"].as_str().map(String::from),
-        "Edit" => args["file_path"].as_str().map(String::from),
-        _ => None,
-    }
-}
+// Issue #199: the former `safety_content_for_tool` helper (a hardcoded
+// `"Write"|"Read"` / `"Edit"` name set) is gone — the safety content is
+// extracted through the identity's `SafetyShape::extract_path`, sourced
+// from the single table in `crate::tools::tool_identity`.
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
@@ -888,40 +895,44 @@ mod tests {
         );
     }
 
-    // ── safety_content_for_tool targeted tests ────────────────────────────────
+    // ── safety content extraction targeted tests (issue #199: single table) ──
+    // The former `safety_content_for_tool` unit tests, re-aimed at the
+    // single-table path that replaced it. Same mutation-kill intent: each
+    // table entry removal or path-field swap turns the matching test red.
 
     #[test]
     fn safety_content_read_extracts_path_field() {
-        // kills mutations that swap "path" with "file_path" for Read/Write
+        // kills mutations that swap "path" with "file_path" for Read
         let args = serde_json::json!({"path": "/tmp/file.txt"});
-        let result = safety_content_for_tool("Read", &args);
+        let result = crate::tools::tool_identity::builtin_safety_shape("Read").extract_path(&args);
         assert_eq!(result.as_deref(), Some("/tmp/file.txt"));
     }
 
     #[test]
     fn safety_content_write_extracts_path_field() {
-        // kills removal of "Write" from the match arm
+        // kills removal of "Write" from the single table
         let args = serde_json::json!({"path": "/tmp/out.txt"});
-        let result = safety_content_for_tool("Write", &args);
+        let result = crate::tools::tool_identity::builtin_safety_shape("Write").extract_path(&args);
         assert_eq!(result.as_deref(), Some("/tmp/out.txt"));
     }
 
     #[test]
     fn safety_content_edit_extracts_file_path_field() {
-        // kills mutations swapping "file_path" with "path" in the Edit arm
+        // kills mutations swapping "file_path" with "path" in the Edit entry
         let args = serde_json::json!({"file_path": "/src/main.rs"});
-        let result = safety_content_for_tool("Edit", &args);
+        let result = crate::tools::tool_identity::builtin_safety_shape("Edit").extract_path(&args);
         assert_eq!(result.as_deref(), Some("/src/main.rs"));
     }
 
     #[test]
     fn safety_content_other_tool_returns_none() {
-        // kills `_ => Some(...)` mutations and function-level replacements
+        // kills table-entry additions for non-FS tools and identity-level
+        // replacements that fabricate safety content
         let args = serde_json::json!({"path": "/tmp/x", "command": "ls"});
-        let result = safety_content_for_tool("Bash", &args);
+        let result = crate::tools::tool_identity::builtin_safety_shape("Bash").extract_path(&args);
         assert!(
             result.is_none(),
-            "non-file tools must return None from safety_content_for_tool"
+            "non-file tools must return no safety content"
         );
     }
 

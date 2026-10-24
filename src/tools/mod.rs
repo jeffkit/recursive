@@ -23,6 +23,7 @@ pub mod present;
 pub mod registry;
 pub mod send_message;
 pub mod todo;
+pub mod tool_identity;
 pub mod tool_kind;
 pub mod tool_search;
 #[cfg(feature = "web_fetch")]

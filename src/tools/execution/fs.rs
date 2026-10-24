@@ -572,11 +572,16 @@ impl Tool for WriteFile {
         // protected paths before dispatch, but the safety surface must hold
         // on its own (see `permission_pipeline.rs` Phase 1) — a direct
         // `Tool::execute` call must not write `.git/hooks/*` either.
+        // Issue #199: the classification is read from the single identity
+        // table (this literal used to bypass every derivation evolution);
+        // the name is this tool's own canonical registration name.
         {
             let abs_str = abs.to_string_lossy();
-            if let Some(protected) =
-                crate::permissions::check_protected_path("Write", false, Some(abs_str.as_ref()))
-            {
+            if let Some(protected) = crate::permissions::check_protected_path(
+                crate::tools::tool_identity::builtin_safety_shape("Write"),
+                false,
+                Some(abs_str.as_ref()),
+            ) {
                 return Err(Error::PermissionDenied {
                     name: "Write".into(),
                     reason: crate::permissions::DecisionReason::SafetyCheck { path: protected },

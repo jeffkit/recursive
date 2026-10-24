@@ -17,6 +17,7 @@ use crate::permissions::auto_classifier::AutoClassifier;
 use crate::permissions::SharedPermissions;
 use crate::permissions::{PermissionMode, PermissionsConfig};
 use crate::tools::fs::ReadFileState;
+use crate::tools::tool_identity::{builtin_safety_shape, ToolIdentity, ToolOrigin};
 use crate::tools::tool_kind::ToolKind;
 
 use super::audit::TouchedFiles;
@@ -196,6 +197,12 @@ pub struct ToolRegistry {
     /// Alias → primary name mapping for `find_by_name`.
     /// Populated by `register`; never mutated by `invoke`.
     aliases: BTreeMap<String, String>,
+    /// Primary name → registration origin (issue #199 owner ruling ①: the
+    /// source of a tool is explicit registry state, stamped at insert time
+    /// by [`Self::insert_tool`], instead of being encoded in the
+    /// `mcp__<server>__<tool>` naming convention). Not tenant identity —
+    /// see `tool_identity::ToolOrigin`.
+    origins: BTreeMap<String, ToolOrigin>,
     transport: Arc<dyn super::transport::ToolTransport>,
     /// Goal-197: thread-safe shared permissions for runtime rule updates.
     /// When `Some`, `invoke_with_audit` reads through the lock at call time,
@@ -273,6 +280,7 @@ impl ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            origins: BTreeMap::new(),
             transport,
             permissions: None,
             auto_classifier: None,
@@ -318,6 +326,7 @@ impl ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            origins: BTreeMap::new(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
             auto_classifier: self.auto_classifier.clone(),
@@ -439,6 +448,9 @@ impl ToolRegistry {
         Self {
             tools,
             aliases: self.aliases.clone(),
+            // Same tools under the same names — the origin stamps travel
+            // with the registration, not with the session state.
+            origins: self.origins.clone(),
             transport: self.transport.clone(),
             permissions: self.permissions.clone(),
             permission_mode: self.permission_mode.clone(),
@@ -792,9 +804,28 @@ impl ToolRegistry {
         self.elicitation.clone()
     }
 
+    /// Insert `tool` under `name`, stamping its registration origin
+    /// (issue #199). The stamp is read from the tool object itself
+    /// ([`Tool::mcp_server_name`]), so every registration path — builtin
+    /// `register` / `register_when`, MCP `register_mut`, deferred-tool
+    /// finalization — goes through one site and the explicit origin can
+    /// never drift from what was actually registered. Sandbox
+    /// replacements re-register under the same primary name and re-stamp
+    /// the same origin.
+    fn insert_tool(&mut self, name: &str, tool: Arc<dyn Tool>) {
+        let origin = match tool.mcp_server_name() {
+            Some(server) => ToolOrigin::Mcp {
+                server: server.to_string(),
+            },
+            None => ToolOrigin::Builtin,
+        };
+        self.origins.insert(name.to_string(), origin);
+        self.tools.insert(name.to_string(), tool);
+    }
+
     pub fn register(mut self, tool: Arc<dyn Tool>) -> Self {
         let name = tool.spec().name;
-        self.tools.insert(name, tool);
+        self.insert_tool(&name, tool);
         self
     }
 
@@ -808,14 +839,14 @@ impl ToolRegistry {
         for &alias in aliases {
             self.aliases.insert(alias.to_string(), name.clone());
         }
-        self.tools.insert(name, tool);
+        self.insert_tool(&name, tool);
         self
     }
 
     /// Register a tool via mutable reference (for use with shared registries).
     pub fn register_mut(&mut self, tool: Arc<dyn Tool>) {
         let name = tool.spec().name;
-        self.tools.insert(name, tool);
+        self.insert_tool(&name, tool);
     }
 
     /// Register a tool with aliases via mutable reference.
@@ -824,7 +855,7 @@ impl ToolRegistry {
         for &alias in aliases {
             self.aliases.insert(alias.to_string(), name.clone());
         }
-        self.tools.insert(name, tool);
+        self.insert_tool(&name, tool);
     }
 
     /// Builder-style conditional registration: registers every tool produced
@@ -834,7 +865,7 @@ impl ToolRegistry {
         if cond {
             for tool in make() {
                 let name = tool.spec().name;
-                self.tools.insert(name, tool);
+                self.insert_tool(&name, tool);
             }
         }
         self
@@ -855,6 +886,41 @@ impl ToolRegistry {
             return None;
         }
         self.aliases.get(name).map(String::as_str)
+    }
+
+    /// THE single tool-identity derivation function (issue #199 owner
+    /// ruling ①). Resolves `name` (alias → primary, unknown → passthrough)
+    /// and composes the [`ToolIdentity`] every permission decision is made
+    /// against: canonical name, registration origin, and the safety shape
+    /// from the single table.
+    ///
+    /// Returns `None` only for names that are neither a registered tool nor
+    /// an alias — consumers keep their pre-refactor passthrough semantics
+    /// for those (e.g. the pipeline still surfaces the raw name in errors,
+    /// `is_readonly` stays `false`, and the name-keyed shape fallback keeps
+    /// the protected-path check alive for filtered-out FS tool names).
+    ///
+    /// After this function, no other site in the crate may derive identity
+    /// data (canonical name / origin / safety classification) from a tool
+    /// name string — `tests/tool_identity_contract.rs` statically asserts
+    /// that.
+    pub fn identity_for(&self, name: &str) -> Option<ToolIdentity> {
+        let canonical = self.canonical_name(name).unwrap_or(name);
+        if !self.tools.contains_key(canonical) {
+            return None;
+        }
+        // Every insert site stamps the origin (`insert_tool`); the fallback
+        // is unreachable coherence insurance, not a silent downgrade path.
+        let origin = self
+            .origins
+            .get(canonical)
+            .cloned()
+            .unwrap_or(ToolOrigin::Builtin);
+        Some(ToolIdentity {
+            canonical_name: canonical.to_string(),
+            origin,
+            shape: builtin_safety_shape(canonical),
+        })
     }
 
     /// Find a registered tool by its primary name or any alias.
@@ -915,6 +981,8 @@ impl ToolRegistry {
             .retain(|name, _| !drop_set.contains(name.as_str()));
         self.aliases
             .retain(|_, primary| self.tools.contains_key(primary));
+        self.origins
+            .retain(|name, _| !drop_set.contains(name.as_str()));
     }
 
     /// Restrict the registry to only the named tools, removing all others.
@@ -932,6 +1000,8 @@ impl ToolRegistry {
             .retain(|name, _| allowed.contains(&name.to_lowercase()));
         self.aliases
             .retain(|_, primary| self.tools.contains_key(primary));
+        self.origins
+            .retain(|name, _| allowed.contains(&name.to_lowercase()));
         self.surface_filtered = true;
     }
 
@@ -999,8 +1069,7 @@ impl ToolRegistry {
         let catalog: super::tool_search::DeferredCatalog =
             Arc::new(std::sync::RwLock::new(deferred_specs));
         let tool = Arc::new(super::tool_search::ToolSearchTool::new(catalog));
-        self.tools
-            .insert(super::tool_search::TOOL_SEARCH_TOOL_NAME.to_string(), tool);
+        self.insert_tool(super::tool_search::TOOL_SEARCH_TOOL_NAME, tool);
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -1015,11 +1084,15 @@ impl ToolRegistry {
     ///
     /// Resolves aliases first: `is_readonly("read_file")` and
     /// `is_readonly("Read")` must agree, or a permission check keyed on the
-    /// canonical name would misclassify an alias call as a write.
+    /// canonical name would misclassify an alias call as a write. The
+    /// canonical resolution goes through [`Self::identity_for`] (issue #199)
+    /// instead of a private re-derivation.
     pub fn is_readonly(&self, name: &str) -> bool {
-        let canonical = self.canonical_name(name).unwrap_or(name);
+        let Some(identity) = self.identity_for(name) else {
+            return false;
+        };
         self.tools
-            .get(canonical)
+            .get(&identity.canonical_name)
             .map(|t| t.is_readonly())
             .unwrap_or(false)
     }
@@ -1036,12 +1109,14 @@ impl ToolRegistry {
 
     /// Like `is_readonly` but passes call-time arguments to the tool so it can
     /// make an argument-specific decision (e.g. `sub_agent` checking
-    /// `subagent_type: "explore"`). Aliases are resolved first, like
-    /// [`Self::is_readonly`].
+    /// `subagent_type: "explore"`). Aliases are resolved first via
+    /// [`Self::identity_for`], like [`Self::is_readonly`].
     pub fn is_readonly_for_call(&self, name: &str, args: &Value) -> bool {
-        let canonical = self.canonical_name(name).unwrap_or(name);
+        let Some(identity) = self.identity_for(name) else {
+            return false;
+        };
         self.tools
-            .get(canonical)
+            .get(&identity.canonical_name)
             .map(|t| t.is_readonly_for_args(args))
             .unwrap_or(false)
     }

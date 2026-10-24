@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::tools::tool_identity::{builtin_safety_shape, SafetyShape};
+
 /// The reason why a permission decision was made.
 ///
 /// Carries structured information about which rule, mode, hook, or
@@ -458,8 +460,13 @@ impl LayeredPermissionsConfig {
     ) -> Permission {
         // 0. Safety check (Goal 196): protected paths cannot be written
         // to, even under BypassPermissions. Read-only tools are exempt.
+        // Issue #199: the FS-content classification comes from the single
+        // identity table — this site used to keep its own name match
+        // (former set B, a second parallel copy of the same concept).
         if !is_readonly {
-            if let Some(path) = extract_file_path_from_content(tool_name, content) {
+            if let Some(path) =
+                extract_file_path_from_content(builtin_safety_shape(tool_name), content)
+            {
                 for protected in PROTECTED_PATHS {
                     if path_contains_protected(&path, protected) {
                         return Permission::Denied(
@@ -769,20 +776,21 @@ const PROTECTED_PATHS: &[&str] = &[
     ".env",
 ];
 
-/// Extract a file path from `content` for tools that operate on a file.
+/// Extract a file path from `content` for FS-content tools (issue #199).
 ///
-/// - For `Write` and `Read`, `content` *is* the file path
-///   (the caller is expected to have passed `args["path"]` as `content`).
-/// - For `Edit`, `content` is the file path
-///   (the caller is expected to have passed `args["file_path"]` as `content`).
-/// - All other tools return `None`.
-fn extract_file_path_from_content(tool_name: &str, content: Option<&str>) -> Option<String> {
+/// The tool→FS classification is the caller-supplied [`SafetyShape`],
+/// sourced from the single identity table (`builtin_safety_shape` /
+/// `ToolRegistry::identity_for`) — this function no longer keeps its own
+/// name match (that was former set B, the second parallel copy of the
+/// pipeline's safety-content set).
+///
+/// - `content` is the file path the caller already extracted from the
+///   call arguments (via `SafetyShape::extract_path`).
+/// - Returns `Some(content)` for shapes that declare a path argument
+///   (`Write`, `Read`, `Edit`), `None` otherwise.
+fn extract_file_path_from_content(shape: SafetyShape, content: Option<&str>) -> Option<String> {
     let content = content?;
-    match tool_name {
-        "Write" | "Read" => Some(content.to_string()),
-        "Edit" => Some(content.to_string()),
-        _ => None,
-    }
+    shape.path_arg().map(|_| content.to_string())
 }
 
 /// Returns `true` if any component of `path` is exactly `protected`.
@@ -805,16 +813,21 @@ fn path_contains_protected(path: &str, protected: &str) -> bool {
 /// writes to `.git/hooks/`, `.env`, etc. Returns the offending
 /// protected path component if matched, `None` otherwise.
 ///
-/// `is_readonly` exempts `Read` and `Grep` from the check.
+/// Issue #199: the tool enters as its structured [`SafetyShape`] (from
+/// `ToolRegistry::identity_for`, or `builtin_safety_shape` for
+/// registry-less deep-defense callers) instead of a raw name string.
+///
+/// `is_readonly` exempts read-only tools (e.g. `Read`, `Grep`) from the
+/// check.
 pub fn check_protected_path(
-    tool_name: &str,
+    shape: SafetyShape,
     is_readonly: bool,
     content: Option<&str>,
 ) -> Option<String> {
     if is_readonly {
         return None;
     }
-    let path = extract_file_path_from_content(tool_name, content)?;
+    let path = extract_file_path_from_content(shape, content)?;
     for protected in PROTECTED_PATHS {
         if path_contains_protected(&path, protected) {
             return Some(path);
