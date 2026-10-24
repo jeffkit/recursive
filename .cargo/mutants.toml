@@ -33,4 +33,27 @@ exclude_re = [
     # `parse::<u64>()` and lands on the same `Some(DEFAULT_SECS)` the `_` arm
     # returns — every input maps to the same output under both guards.
     "with true in plan_approval_timeout_secs",
+    # Issue #228 (CI run 40037188940), hardening.rs re-exec family — true
+    # equivalences per the #223 batch-3 doctrine (guard test + argument):
+    # `dedup_by(|a, b| a.0 == b.0)` in CredentialHandoff::capture only ever
+    # matters if the environment held two entries under one name, and
+    # setenv(3) replaces — duplicates are not constructible through the std
+    # API (hostile hand-crafted execve environ is the only channel and is
+    # out of any in-process test's reach). Guard test:
+    # hardening::tests::std_env_yields_one_entry_per_name_the_dedup_precondition.
+    "replace == with != in CredentialHandoff::capture",
+    # `blob.len() - written` → `+` in reexec_clean_env: the handoff pipe has
+    # no reader until exec, so a write round beyond the first is reachable
+    # only once the pipe is full — and there both expressions produce the
+    # identical EAGAIN failure (`Failed { stage: "handoff-write" }`). Round
+    # one adds zero, so every fitting blob is written identically. Both
+    # behaviours (fitting blob execs / oversize blob fails open) are pinned
+    # by hardening::tests::reexec_exec_boundary_self_exec_end_to_end.
+    "replace - with + in reexec_clean_env",
+    # `Instant::now() + Duration::from_secs(2)` → `*` in restore_reexec_env
+    # is type-invalid (`Instant: Mul<Duration>` does not exist) — unviable on
+    # every target that compiles the line; ubuntu's mutation gate reported it
+    # MISSED only because the whole arm is compiled out there (cfg blindness,
+    # the same run lists other never-compiled-line mutants).
+    "replace + with * in restore_reexec_env",
 ]

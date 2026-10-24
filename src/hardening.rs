@@ -1180,6 +1180,527 @@ mod tests {
         }
     }
 
+    // ── #228 batch (CI run 40037188940, 34 MISSED in this file) ────────────
+    // Platform visibility is part of the pinning here: everything inside an
+    // `all(unix, not(target_os = "linux"))` arm is compiled out on the
+    // ubuntu mutation gate, so those survivors can only ever be killed where
+    // the code actually compiles. The per-survivor mapping lives in the
+    // commit message and .dev/journal/manual-20261025-issue228-*.md.
+
+    /// Cross-platform kill for the one ubuntu-visible survivor of the batch
+    /// (`is_empty -> true`): a handoff that captured vars is not empty, and
+    /// the default (nothing captured) is. No cfg — the struct and the method
+    /// compile everywhere, so this runs (and kills) on the ubuntu gate too.
+    #[test]
+    fn handoff_is_empty_tracks_captured_vars() {
+        assert!(CredentialHandoff::default().is_empty());
+        let full = CredentialHandoff {
+            vars: vec![(
+                std::ffi::OsString::from("RECURSIVE_ISSUE228EMPTY_KEY"),
+                std::ffi::OsString::from("v"),
+            )],
+        };
+        assert!(!full.is_empty());
+    }
+
+    /// Negative-control guard for the `dedup_by` equality mutant (`==` →
+    /// `!=` in `capture`, #228). The dedup only matters if the environment
+    /// could hold two entries under one name — and `set_var` cannot
+    /// construct that: a second set replaces, never appends. Green under
+    /// the mutant *by construction* today; it goes red the moment the
+    /// precondition becomes constructible (a std behaviour change), which
+    /// is exactly when the mutant stops being equivalent. Same doctrine as
+    /// the #223 batch-3 equivalence exclusions: guard test + documented
+    /// exclusion in .cargo/mutants.toml.
+    #[test]
+    fn std_env_yields_one_entry_per_name_the_dedup_precondition() {
+        let _lock = crate::test_util::env_lock();
+        const PROBE: &str = "RECURSIVE_ISSUE228DUP_KEY";
+        let saved = std::env::var_os(PROBE);
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(PROBE, "first") };
+        unsafe { std::env::set_var(PROBE, "second") };
+        let entries: Vec<_> = std::env::vars_os().filter(|(k, _)| k == PROBE).collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "setenv replaces: duplicate names are not constructible via the std API"
+        );
+        assert_eq!(entries[0].1, "second");
+        // SAFETY: restoring under the same lock.
+        match saved {
+            Some(v) => unsafe { std::env::set_var(PROBE, v) },
+            None => unsafe { std::env::remove_var(PROBE) },
+        }
+    }
+
+    /// Write a whole buffer to a pipe fd, looping over short writes
+    /// (blocking mode may return partial counts). macOS-gated like its only
+    /// callers — compiled out on linux so it is not dead code there.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn write_all_fd(fd: libc::c_int, mut data: &[u8]) {
+        while !data.is_empty() {
+            // SAFETY: write(2) on a pipe fd this test owns; the slice
+            // outlives the call.
+            let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+            assert!(
+                n >= 0,
+                "pipe write failed: {}",
+                std::io::Error::last_os_error()
+            );
+            data = &data[n as usize..];
+        }
+    }
+
+    /// The negative-fd guard is exact: `-1` parses fine and must land on the
+    /// dedicated `handoff fd is negative` reason, not fall through to a raw
+    /// read error — kills the `fd < 0` → `==` and `→ >` survivors (CI run
+    /// 40037188940), which both let `-1` reach the EBADF path. `0` is the
+    /// only input separating `<` from `<=` (the third survivor): it takes
+    /// the real drain path and must never be called negative. Stdin is
+    /// redirected to /dev/null for the fd-0 case so the read is a
+    /// deterministic EOF, and put back afterwards — restore closes the
+    /// descriptor it drained.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn restore_negative_fd_lands_on_exact_reason_and_zero_is_not_negative() {
+        let _lock = crate::test_util::env_lock();
+        let saved = std::env::var_os(REEXEC_HANDOFF_FD_VAR);
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, "-1") };
+        assert_eq!(
+            restore_reexec_env(),
+            RestoreOutcome::Failed {
+                reason: "handoff fd is negative"
+            }
+        );
+
+        let saved_stdin = unsafe { libc::dup(0) };
+        if saved_stdin >= 0 {
+            let devnull = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDWR) };
+            assert!(
+                devnull >= 0,
+                "open /dev/null: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: fd-table surgery on descriptors this test owns; 0 is
+            // replaced (its old copy is saved above), devnull closed after.
+            unsafe { libc::dup2(devnull, 0) };
+            unsafe { libc::close(devnull) };
+        }
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, "0") };
+        let outcome = restore_reexec_env();
+        if saved_stdin >= 0 {
+            // SAFETY: restore closed fd 0 after draining it; put the saved
+            // stdin back.
+            unsafe { libc::dup2(saved_stdin, 0) };
+            unsafe { libc::close(saved_stdin) };
+            assert_eq!(outcome, RestoreOutcome::Restored { count: 0 });
+        } else {
+            // Stdin was already closed at entry: the drain fails with EBADF.
+            // Either way the negative-fd guard must not have fired.
+            assert!(
+                !matches!(outcome, RestoreOutcome::Failed { reason } if reason == "handoff fd is negative"),
+                "{outcome:?}"
+            );
+        }
+        // SAFETY: restoring under the same lock.
+        match saved {
+            Some(v) => unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, v) },
+            None => unsafe { std::env::remove_var(REEXEC_HANDOFF_FD_VAR) },
+        }
+    }
+
+    /// A blob larger than one read chunk (4096 bytes) must be assembled
+    /// from multiple reads and restore every var. Pins the `n > 0` extend
+    /// path, the EOF break and the 256 KiB cap arithmetic: an 8 KiB blob
+    /// clears the original cap but trips the `*` → `+` mutant's 256+1024,
+    /// and EOF (`n == 0`) must break, not extend — killing the `>` → `==`/`<`,
+    /// `*` → `+` and `==` → `!=` survivors (CI run 40037188940). The
+    /// `>` → `>=` survivor dies cleanly on the at-cap boundary test below.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn restore_assembles_multi_chunk_blobs_and_restores_every_var() {
+        let _lock = crate::test_util::env_lock();
+        const NAME1: &str = "RECURSIVE_ISSUE228CHUNK_KEY";
+        const NAME2: &str = "RECURSIVE_ISSUE228CHUNK_TOKEN";
+        let handoff = CredentialHandoff {
+            vars: vec![
+                (
+                    std::ffi::OsString::from(NAME1),
+                    std::ffi::OsString::from("a".repeat(4000)),
+                ),
+                (
+                    std::ffi::OsString::from(NAME2),
+                    std::ffi::OsString::from("b".repeat(4100)),
+                ),
+            ],
+        };
+        let blob = handoff.encode();
+        assert!(
+            blob.len() > 4096 && blob.len() < 256 * 1024,
+            "fixture must span several reads but stay under the cap: {}",
+            blob.len()
+        );
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [NAME1, NAME2, REEXEC_HANDOFF_FD_VAR]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(NAME1, "stale") };
+        unsafe { std::env::set_var(NAME2, "stale") };
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let writer = std::thread::spawn(move || {
+            write_all_fd(write_fd, &blob);
+            // SAFETY: close on the pipe write end this thread owns.
+            unsafe { libc::close(write_fd) };
+        });
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, read_fd.to_string()) };
+
+        let outcome = restore_reexec_env();
+
+        writer.join().expect("writer thread");
+        assert_eq!(outcome, RestoreOutcome::Restored { count: 2 });
+        assert_eq!(std::env::var(NAME1).unwrap().len(), 4000);
+        assert_eq!(std::env::var(NAME2).unwrap().len(), 4100);
+        // SAFETY: restoring under the same lock.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    /// The 256 KiB cap is exact at `256 * 1024`: a blob of exactly the cap
+    /// drains and restores, one step beyond fails with the exact reason —
+    /// killing the `>` → `==` and `→ >=` survivors (CI run 40037188940),
+    /// which both reject the at-cap blob. The over-cap half pins the
+    /// boundary semantics themselves (the `==` mutant also trips there, so
+    /// the at-cap half is what discriminates).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn restore_cap_boundary_restores_at_256k_exactly_and_rejects_beyond() {
+        let _lock = crate::test_util::env_lock();
+        const NAME: &str = "RECURSIVE_ISSUE228CAP_KEY";
+        // name(25) + NUL + value + NUL == 262144 exactly; reads are 4096
+        // bytes, so the running length passes through the cap exactly.
+        let value_len = 256 * 1024 - NAME.len() - 2;
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [NAME, REEXEC_HANDOFF_FD_VAR]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let blob = {
+            let handoff = CredentialHandoff {
+                vars: vec![(
+                    std::ffi::OsString::from(NAME),
+                    std::ffi::OsString::from("c".repeat(value_len)),
+                )],
+            };
+            handoff.encode()
+        };
+        assert_eq!(blob.len(), 256 * 1024);
+        let writer = std::thread::spawn(move || {
+            write_all_fd(write_fd, &blob);
+            // SAFETY: close on the pipe write end this thread owns.
+            unsafe { libc::close(write_fd) };
+        });
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, read_fd.to_string()) };
+        let outcome = restore_reexec_env();
+        writer.join().expect("writer thread");
+        assert_eq!(outcome, RestoreOutcome::Restored { count: 1 });
+        assert_eq!(std::env::var(NAME).unwrap().len(), value_len);
+
+        // Beyond the cap: drained read fails before decode, exact reason.
+        let over = {
+            let handoff = CredentialHandoff {
+                vars: vec![(
+                    std::ffi::OsString::from(NAME),
+                    std::ffi::OsString::from("d".repeat(value_len + 16)),
+                )],
+            };
+            handoff.encode()
+        };
+        assert_eq!(over.len(), 256 * 1024 + 16);
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let writer = std::thread::spawn(move || {
+            write_all_fd(write_fd, &over);
+            // SAFETY: close on the pipe write end this thread owns.
+            unsafe { libc::close(write_fd) };
+        });
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, read_fd.to_string()) };
+        let outcome = restore_reexec_env();
+        writer.join().expect("writer thread");
+        assert_eq!(
+            outcome,
+            RestoreOutcome::Failed {
+                reason: "handoff blob exceeds 256 KiB"
+            }
+        );
+
+        // SAFETY: restoring under the same lock.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    /// While the parent's write end is alive but quiet, a WouldBlock read
+    /// must park and retry: data arriving well inside the deadline is
+    /// restored, not failed. Kills the `+` → `-` deadline mutant (deadline
+    /// in the past fails on the first WouldBlock), the deleted WouldBlock
+    /// match arm (EAGAIN becomes "handoff read failed") and the `>=` → `<`
+    /// inversion (times out on the first WouldBlock) — CI run 40037188940.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn restore_parks_through_wouldblock_until_late_data_arrives() {
+        let _lock = crate::test_util::env_lock();
+        const NAME: &str = "RECURSIVE_ISSUE228LATE_KEY";
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [NAME, REEXEC_HANDOFF_FD_VAR]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        let blob = {
+            let handoff = CredentialHandoff {
+                vars: vec![(
+                    std::ffi::OsString::from(NAME),
+                    std::ffi::OsString::from("late-value"),
+                )],
+            };
+            handoff.encode()
+        };
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            write_all_fd(write_fd, &blob);
+            // SAFETY: close on the pipe write end this thread owns.
+            unsafe { libc::close(write_fd) };
+        });
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, read_fd.to_string()) };
+
+        let outcome = restore_reexec_env();
+
+        writer.join().expect("writer thread");
+        assert_eq!(outcome, RestoreOutcome::Restored { count: 1 });
+        assert_eq!(std::env::var(NAME).unwrap(), "late-value");
+        // SAFETY: restoring under the same lock.
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    /// A handoff fd that never reaches EOF (write end open, nothing
+    /// written) fails loudly **at** the deadline with the exact reason — and
+    /// only after actually waiting. That wait is the behaviour under test
+    /// (issue #226: a bogus fd must not hang startup, nor fail fast): the
+    /// `+` → `-` deadline mutant and the `>=` → `<` inversion both fire
+    /// immediately and die on the elapsed bound, the deleted WouldBlock arm
+    /// dies on the reason. ~2s by design; macOS-only code, so the ubuntu
+    /// gate never pays it.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn restore_times_out_an_open_quiet_pipe_at_the_deadline() {
+        let _lock = crate::test_util::env_lock();
+        let saved = std::env::var_os(REEXEC_HANDOFF_FD_VAR);
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) on a local array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, read_fd.to_string()) };
+
+        let start = std::time::Instant::now();
+        let outcome = restore_reexec_env();
+        let elapsed = start.elapsed();
+
+        // SAFETY: the write end is ours and unread; the read end was closed
+        // by restore.
+        unsafe { libc::close(write_fd) };
+        assert_eq!(
+            outcome,
+            RestoreOutcome::Failed {
+                reason: "handoff pipe did not reach EOF within 2s"
+            }
+        );
+        assert!(
+            elapsed.as_millis() >= 1900,
+            "the deadline must actually be waited out, took {elapsed:?}"
+        );
+        // SAFETY: restoring under the same lock.
+        match saved {
+            Some(v) => unsafe { std::env::set_var(REEXEC_HANDOFF_FD_VAR, v) },
+            None => unsafe { std::env::remove_var(REEXEC_HANDOFF_FD_VAR) },
+        }
+    }
+
+    /// End-to-end re-exec boundary: the parent stage has a real credential
+    /// to protect and calls [`reexec_clean_env`] for real — on success that
+    /// **replaces this very test binary's process image** and the re-executed
+    /// child (same binary, same argv, stage marker set) resumes as stage 2,
+    /// verifies the clean exec-time environment and drains the handoff.
+    ///
+    /// This is the only way the pipe/write/exec arithmetic past the
+    /// sentinel/empty decision gates (lines ~600-680, CI run 40037188940's
+    /// `reexec_clean_env` survivors) becomes observable at all. Two phases:
+    ///
+    /// Phase 1 (in-process, no exec): a credential blob **larger than the
+    /// pipe capacity** must fail open at `handoff-write` — the write end is
+    /// CLOEXEC with no reader until exec, so an over-capacity blob can
+    /// never drain (that is the documented design, see the O_NONBLOCK
+    /// comment in `reexec_clean_env`). Kills the `n < 0` → `==` survivor,
+    /// which only misbehaves on the second write round this phase reaches
+    /// (its `written += (-1 as usize)` overflows).
+    ///
+    /// Phase 2 (exec): an 8 KiB blob fits the pipe and is written in one
+    /// round, so the original execs. Kills the `pipe != 0` → `==` guard,
+    /// the `written < len` → `==`/`>` bounds (they skip the write and the
+    /// child asserts on the *restored* credential), `len - written` → `/`
+    /// (division by zero), `n < 0` → `>` (a successful write treated as a
+    /// failure) and `written += n` → `-=`/`*=` (underflow panic / the pipe
+    /// fills and the function fails); `written < len` → `<=` hangs writing
+    /// zero bytes, which the mutation gate counts via its timeout.
+    ///
+    /// (`len - written` → `+` is extensionally equivalent — round one adds
+    /// zero, and later rounds are reachable only once the pipe is full,
+    /// where both guards produce the identical EAGAIN failure; excluded in
+    /// .cargo/mutants.toml with this argument.)
+    ///
+    /// Two guards make it safe to sit in the default suite: it only runs
+    /// when this test is the explicitly selected filter (the string in the
+    /// name appears in libtest's argv — a plain `cargo test` never
+    /// matches), and stage 2 is keyed on the stage marker, which doubles as
+    /// the sentinel-bounded "at most one exec" guarantee. Exercise it with:
+    /// `cargo test reexec_exec_boundary -- --nocapture`
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn reexec_exec_boundary_self_exec_end_to_end() {
+        const STAGE: &str = "RECURSIVE_ISSUE228E2E_STAGE";
+        const CRED: &str = "RECURSIVE_ISSUE228E2E_KEY";
+        const KNOB: &str = "RECURSIVE_ISSUE228E2E_KNOB";
+        // macOS pipe capacity is 16 KiB: 8 KiB rides it in a single
+        // O_NONBLOCK write round, 70 KiB cannot drain at all.
+        fn fitting_value() -> String {
+            "x".repeat(8_192)
+        }
+        fn oversize_value() -> String {
+            "x".repeat(70_000)
+        }
+
+        if std::env::var_os(STAGE).is_some() {
+            // Stage 2: we are the re-executed child. The exec-time block was
+            // scrubbed; the whitelist kept the knob and the stage marker,
+            // added the sentinel, and the handoff fd carried the credential.
+            let _lock = crate::test_util::env_lock();
+            assert_eq!(
+                std::env::var(REEXEC_SENTINEL_VAR).unwrap(),
+                "1",
+                "child must boot with the sentinel set"
+            );
+            assert_eq!(
+                std::env::var(KNOB).unwrap(),
+                "4096",
+                "non-credential knobs must ride the whitelist"
+            );
+            let outcome = restore_reexec_env();
+            assert_eq!(
+                outcome,
+                RestoreOutcome::Restored { count: 1 },
+                "exactly the test credential travels the handoff"
+            );
+            assert_eq!(std::env::var(CRED).unwrap(), fitting_value());
+            assert!(
+                std::env::var_os(REEXEC_HANDOFF_FD_VAR).is_none(),
+                "handoff fd variable must be consumed"
+            );
+            return;
+        }
+        let selected_solo = std::env::args_os()
+            .skip(1)
+            .any(|a| a.to_string_lossy().contains("reexec_exec_boundary"));
+        if !selected_solo {
+            // Part of the plain suite: the exec below would replace the whole
+            // parallel test process, so it only runs when this test was
+            // deliberately selected by name.
+            return;
+        }
+
+        let _lock = crate::test_util::env_lock();
+        // SAFETY: process-global env mutation, serialised by `env_lock`. The
+        // sentinel must be absent or the mechanism would (by design) refuse
+        // to exec; the stage marker must be absent so this process does not
+        // mistake itself for the child. Every credential-shaped variable is
+        // stripped so the handoff blob is exactly the test's own — this
+        // process is about to be replaced, so nothing needs restoring here
+        // (on the panic paths the solo process exits and takes the
+        // mutations with it).
+        unsafe { std::env::remove_var(REEXEC_SENTINEL_VAR) };
+        unsafe { std::env::remove_var(STAGE) };
+        let foreign: Vec<std::ffi::OsString> = std::env::vars_os()
+            .filter(|(k, _)| is_process_credential_env(&k.to_string_lossy()))
+            .map(|(k, _)| k)
+            .collect();
+        for k in &foreign {
+            unsafe { std::env::remove_var(k) };
+        }
+        unsafe { std::env::set_var(KNOB, "4096") };
+        unsafe { std::env::set_var(STAGE, "2") };
+
+        // Phase 1: over-capacity blob fails open at handoff-write.
+        unsafe { std::env::set_var(CRED, oversize_value()) };
+        let handoff = CredentialHandoff::capture();
+        assert_eq!(
+            handoff.vars.len(),
+            1,
+            "only the stripped-down test credential"
+        );
+        let outcome = reexec_clean_env(&handoff);
+        assert!(
+            matches!(
+                outcome,
+                ReExecOutcome::Failed {
+                    stage: "handoff-write",
+                    ..
+                }
+            ),
+            "a blob larger than the pipe capacity must fail open at handoff-write, got {outcome:?}"
+        );
+
+        // Phase 2: fitting blob — on success this never returns; the
+        // process image is replaced and the child runs the stage-2 branch
+        // above. Any surviving return is a failed re-exec and names the
+        // stage it failed at.
+        unsafe { std::env::set_var(CRED, fitting_value()) };
+        let handoff = CredentialHandoff::capture();
+        assert_eq!(handoff.vars.len(), 1);
+        let outcome = reexec_clean_env(&handoff);
+        panic!("re-exec must replace the process image; came back with {outcome:?}");
+    }
+
     /// Both reports are total (no panic on any arm) and the
     /// degradation-relevant arms emit at the right level: the child's
     /// already-clean line is the INFO a deployment greps for, a failed
