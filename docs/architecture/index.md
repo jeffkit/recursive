@@ -19,6 +19,7 @@ drill into what you need.
 * [Layer 0 Injection](layer0-injection.md) - how the system prompt is assembled from memory sources
 * [Execution Environments](execution-environments.md) - sandbox tiers (none/policy/container/microvm), capability matrix, tier selection
 * [Cancellation & Process Ownership](cancellation.md) - process groups + killpg, the cancel task table, destroy = liquidation, observable cancellation (issue #198)
+* [Channel Tiering](channels.md) - production / secondary-production / experimental tiers across the six channels, per-channel promises and downgrade surfaces, MCP client vs server (issue #200)
 
 ## Memory System
 

@@ -224,9 +224,11 @@ speculative wiring** (2026-10-24; the rejected option (b) was a minimal
   individual tool call is bounded by `tool_timeout` (#181). There is no
   per-call task-table registration: the `CancelKind::McpServer` variant is
   declared (`src/process.rs:65`) but has **zero construction sites**
-  repo-wide. It is parked against #200 — wire it when a consumer needs
-  functional MCP-server cancellation, or delete the variant; do not wire it
-  speculatively.
+  repo-wide. Disposed by #200 / Goal 427 (ratified option (a)): the variant
+  is **kept as an experimental-reserved, deliberately unwired arm** — a
+  recorded status quo, not a gap; wire it (`spawn_keyed`, keyed by server
+  name) only when an MCP-host consumer appears — see
+  [channels.md](channels.md) §10.
 
 ### 4.2 ACP cancel is cooperative at the step boundary — read this before consuming it
 

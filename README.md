@@ -4,6 +4,10 @@ A Rust coding-agent platform: a small ReAct kernel plus the surrounding
 HTTP API, MCP, multi-agent orchestration, and TUI that turn it into a
 full development tool.
 
+> Channel tiers (issue #200): CLI/kernel = production, HTTP/AG-UI =
+> secondary-production, ACP/MCP-server/TUI = experimental — see
+> [docs/architecture/channels.md](docs/architecture/channels.md).
+
 [![CI](https://github.com/jeffkit/recursive/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffkit/recursive/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/recursive-agent.svg)](https://crates.io/crates/recursive-agent)
 [![Docs.rs](https://docs.rs/recursive-agent/badge.svg)](https://docs.rs/recursive-agent)
@@ -24,9 +28,14 @@ Around that kernel the platform adds opt-in surfaces:
 - **HTTP API** — axum-based REST + SSE server with sessions, rate-limiting,
   JWT/API-key auth, OpenAPI spec (feature `http`)
 - **MCP** — both as a client (consume external MCP servers) and a server
-  (expose Recursive's tools to other MCP-aware agents) (feature `mcp`)
+  (`recursive serve`, *experimental*) (feature `mcp`); the client side is a
+  shared tool-integration surface, not a tiered channel — see
+  [docs/architecture/channels.md](docs/architecture/channels.md)
 - **TUI** — ratatui-based interactive client with streaming tool indicators,
-  plan mode, and command palette (`crates/recursive-tui`)
+  plan mode, and command palette (`crates/recursive-tui`, *experimental*)
+- **ACP** — Agent Client Protocol server over stdio (`recursive acp`,
+  feature `acp`); *experimental*, no external-client promise yet — see
+  [docs/architecture/channels.md](docs/architecture/channels.md)
 - **Multi-agent** — agent pool, shared memory, messaging bus, plan-mode
   coordination (feature `coordinator-mode`)
 - **Cloud runtime** — S3 transcript storage (wired into `recursive http`),
@@ -153,7 +162,7 @@ recursive loop "monitor src/ for changes and report"
 # HTTP API server
 recursive http --addr 127.0.0.1:3000
 
-# Terminal UI (connects to HTTP server)
+# Terminal UI (in-process backend; experimental — the HTTP-facing TUI is agui-tui)
 cargo run -p recursive-tui
 
 # inspect what tools are registered (no API key needed)
@@ -284,6 +293,10 @@ without waiting for the TTL to expire.
 catalog management — see `--help` for the available sub-commands.
 
 ## Docker / Cloud Deployment
+
+> **Maturity**: the HTTP surface is *secondary-production* (issue #200
+> tiering) — the deployment recipes below carry no production-SLA promise;
+> see [docs/architecture/channels.md](docs/architecture/channels.md).
 
 ### Single-container (local mode)
 
@@ -478,6 +491,8 @@ cargo test --workspace
 
 ## Python SDK
 
+> SDK promises track the HTTP surface (*secondary-production*, issue #200).
+
 ```bash
 cd sdk/python && pip install -e .
 ```
@@ -498,6 +513,9 @@ comparison against fake-cc (Claude Code-style baseline), see
 [docs/tui-fake-cc-gap.md](docs/tui-fake-cc-gap.md).
 
 ## AG-UI (frontend protocol)
+
+> Maturity: *secondary-production*, tracking the HTTP surface (issue #200);
+> today's consumers are in-repo (e2e + `agui-tui`).
 
 `POST /agui` exposes agent runs to frontend clients (CopilotKit, `@ag-ui/client`)
 over the AG-UI protocol: request a run with a `RunAgentInput` JSON body, consume
