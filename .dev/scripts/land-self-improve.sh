@@ -183,6 +183,18 @@ fi
 
 # ---- Step 5: quality gates ---------------------------------------------------
 
+# Step 5a: landing gate（#201 S1；docs/landing-and-acceptance.md §1/§2）。
+# 它是 §1 硬闸，与 cargo 门性质不同：SKIP_GATES 不豁免；main 恰红要落地走
+# LANDING_GATE_OVERRIDE="原因 / ack 人"（--override 留痕），不静默放行。
+echo ""
+echo ">> landing gate: main CI + policy trailers..."
+if [[ -n "${LANDING_GATE_OVERRIDE:-}" ]]; then
+  python3 scripts/landing_gate.py ci --override "$LANDING_GATE_OVERRIDE"
+else
+  python3 scripts/landing_gate.py ci
+fi
+python3 scripts/landing_gate.py trailers "origin/main..${BRANCH}"
+
 if [[ "${SKIP_GATES:-}" == "1" ]]; then
   echo "!! SKIP_GATES=1; skipping cargo test/clippy/fmt" >&2
 else

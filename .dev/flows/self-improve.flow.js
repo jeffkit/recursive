@@ -755,6 +755,9 @@ async function runAttemptWithGoal({ sysPromptFile, transcriptOut, baseline, work
     if (mainHead !== baseline) {
       throw new Error(`main checkout moved since baseline (baseline=${baseline.slice(0, 8)} HEAD=${mainHead.slice(0, 8)}); refusing to cherry-pick. Worktree commit: ${wtSha.slice(0, 8)}`)
     }
+  // [fallback-only] v1 flowcast 引擎已退役（2026-10-01 拍板 v2 单轨），落地门不接此路径——
+  // 生产守卫在 self_improve_flow_v2.py 的 land_push/land_push2（#201 S1）；如复活本引擎，
+  // 落地前必须先跑 scripts/landing_gate.py ci（fail-closed）+ trailers 核验。
     try { git(['cherry-pick', '--no-commit', wtSha], repo) } catch (err) {
       try { git(['cherry-pick', '--abort'], repo) } catch { /* */ }
       throw new Error(`cherry-pick conflict landing ${wtSha.slice(0, 8)}: ${err.message}`)
@@ -1145,7 +1148,12 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
     // 快路径：main 仍在 baseline，cherry-pick 即落地（落下的 == 被门验过的 B0+ours）。
     await cp.step('commit.land', () => {
       try {
-        git(['cherry-pick', '--no-commit', wtSha], repo)
+    // [fallback-only] v1 flowcast 引擎已退役（2026-10-01 拍板 v2 单轨），落地门不接此路径——
+    // 生产守卫在 self_improve_flow_v2.py 的 land_push/land_push2（#201 S1）；如复活本引擎，
+    // 落地前必须先跑 scripts/landing_gate.py ci（fail-closed）+ trailers 核验。
+  // 生产守卫在 self_improve_flow_v2.py 的 land_push/land_push2（#201 S1）；如复活本引擎，
+  // 落地前必须先跑 scripts/landing_gate.py ci（fail-closed）+ trailers 核验。
+      git(['cherry-pick', '--no-commit', wtSha], repo)
       } catch (err) {
         try { git(['cherry-pick', '--abort'], repo) } catch { /* 未进入 cherry-pick 状态 */ }
         throw new Error(`cherry-pick conflict landing ${wtSha.slice(0, 8)}: ${err.message}`)
@@ -1194,6 +1202,9 @@ async function runAttempt({ sysPromptFile, transcriptOut, baseline, worktreeDir 
   // ⑤d rebase+regate 全绿 → cherry-pick rebased wtSha（其父即 mainHead，故无冲突）落地。
   await cp.step('commit.land', () => {
     try {
+  // [fallback-only] v1 flowcast 引擎已退役（2026-10-01 拍板 v2 单轨），落地门不接此路径——
+  // 生产守卫在 self_improve_flow_v2.py 的 land_push/land_push2（#201 S1）；如复活本引擎，
+  // 落地前必须先跑 scripts/landing_gate.py ci（fail-closed）+ trailers 核验。
       git(['cherry-pick', '--no-commit', wtSha], repo)
     } catch (err) {
       try { git(['cherry-pick', '--abort'], repo) } catch { /* 未进入 cherry-pick 状态 */ }

@@ -1036,6 +1036,63 @@ def goal_subject(goal: str) -> str:
     return re.sub(r"^(#+\s*|Goal:\s*)", "", first, flags=re.I).strip()[:60]
 
 
+def goal_policy(goal: str) -> tuple[bool, str, str]:
+    """#201 S1(c)：goal front-matter 声明 `policy: true` + `policy-ack` 的解析。
+
+    返回 (policy, ack, body)；body = 去掉 front-matter 后的正文。声明 policy
+    却缺 ack 返回 (True, "", body)——由调用方按 §2 拒落。
+    """
+    policy, ack, body = False, "", goal
+    m = re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*\n?", goal, re.S)
+    if m:
+        body = goal[m.end():].lstrip("\n")
+        for ln in m.group(1).splitlines():
+            k, _, v = ln.partition(":")
+            k, v = k.strip().lower(), v.strip().strip("\"'")
+            if k == "policy":
+                policy = v.lower() in ("true", "yes", "1")
+            elif k in ("policy-ack", "policy_ack"):
+                ack = v
+    return policy, ack, body
+
+
+def run_landing_gate(st: Engine, cwd: str) -> None:
+    """#201 S1(a)：落地前调 scripts/landing_gate.py ci —— fail-closed。
+
+    rc 0=绿；1=红/gh 失败；2=无结论。非 0 一律 SystemExit 中止落地（不自动
+    override）。结论（rc/时间戳）写 st.state["landingGate"] 并 st.log，门
+    「跑过且结论为何」必须可查（owner ruling：任何降级必须可观测）。
+    LANDING_GATE_CMD 是测试缝（shlex 切分后执行），缺省用仓内脚本。
+    """
+    import shlex
+    cmd_env = os.environ.get("LANDING_GATE_CMD")
+    cmd = shlex.split(cmd_env) if cmd_env else ["python3", "scripts/landing_gate.py", "ci"]
+    t0 = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        p = sh(cmd, cwd=cwd, check=False)
+        rc, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError as e:
+        rc, out = 1, f"landing gate cmd not found: {e}"
+    st.state["landingGate"] = {"rc": rc, "at": t0, "cmd": " ".join(cmd), "out": out[-1500:]}
+    st.save()
+    st.log(f"  [landing-gate] rc={rc} at={t0}")
+    if rc != 0:
+        raise SystemExit(f"landing gate red/inconclusive (rc={rc}): {out[-400:]}")
+
+
+def check_policy_trailer(st: Engine, message: str) -> None:
+    """#201 S1(a)：cherry-pick 后、commit 前对拟落 message 做 trailers 等价核验。
+
+    与 scripts/landing_gate.py trailers 同判据：message 含 [policy] 则必须带
+    Policy-ack trailer；不含则原样放行（§2 只约束 policy 提交）。
+    """
+    if "[policy]" not in message.lower():
+        return
+    if not re.search(r"^Policy-ack:\s*\S+", message, re.MULTILINE | re.IGNORECASE):
+        raise SystemExit("landing gate trailers: [policy] commit missing Policy-ack trailer "
+                         "(docs/landing-and-acceptance.md §2)")
+
+
 def step_run(st: Engine) -> None:
     """run.recursive + BudgetExceeded/超时自动 resume 一次（runAttempt ①② 段合并为一个可续单元）。"""
     worktree = st.state["worktreeDir"]
@@ -1157,6 +1214,16 @@ def step_commit_land(st: Engine) -> None:
     wt_sha = st.p("wtSha") or (st.state.get("commitPrep") or {}).get("wtSha")
     goal = st.p("goal")
     subject = goal_subject(goal)
+    # #201 S1(a)：熔断在 cherry-pick 之前——main 红/无结论即中止，不动 main。
+    run_landing_gate(st, cwd=st.repo)
+    # #201 S1(c)：goal front-matter 的 policy 声明 → 落地 message（§2）。
+    policy, ack, body = goal_policy(goal)
+    if policy and not ack:
+        raise SystemExit("goal declares policy: true without policy-ack "
+                         "(docs/landing-and-acceptance.md §2)")
+    tag, trailer = ("[policy] ", f"\n\nPolicy-ack: {ack}") if policy else ("", "")
+    message = f"self-improve: {tag}{body}{trailer}"
+    check_policy_trailer(st, message)
     try:
         sh(["git", "cherry-pick", "--no-commit", wt_sha], cwd=st.repo)
     except subprocess.CalledProcessError as e:
@@ -1165,7 +1232,7 @@ def step_commit_land(st: Engine) -> None:
         except Exception:
             pass
         raise SystemExit(f"cherry-pick conflict landing {wt_sha[:8]}: {(e.stderr or '')[-400:]}")
-    sh(["git", "commit", "-m", f"self-improve: {subject}"], cwd=st.repo)
+    sh(["git", "commit", "-m", message], cwd=st.repo)
     st.finish({"verdict": "committed", "landed": git(["rev-parse", "--short", "HEAD"], st.repo)})
 
 

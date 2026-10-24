@@ -403,6 +403,41 @@ def self_improve_v2(INPUT):
     # 选命令——调用方注入则用之，缺省回退 cargo 三段（**recursive 自身路径
     # 逐字节不变**，零回归）。DSL 限制（表达式无条件赋值/无列表字面量/
     # 变量名即节点 id 不可重赋）使此逻辑必须落在 code 节点内。
+    # ── #201 S1(c)：goal front-matter 的 policy 声明 → 落地 message（§2）──
+    pm = CODE(id="policy_meta", lang="python", input={"goal": goal}, code=(
+        "import re\n"
+        "\n"
+        "\n"
+        "def run(input):\n"
+        "    # #201 S1(c): goal front-matter -> landing commit message. `policy: true`\n"
+        "    # + `policy-ack: \"<who> <date>\"` become \"[policy]\" in the title and a\n"
+        "    # \"Policy-ack:\" trailer (docs/landing-and-acceptance.md §2); without the\n"
+        "    # declaration the message is unchanged. Declaring policy without an ack\n"
+        "    # is a goal-authoring error and fails the run before any agent work.\n"
+        "    goal = str(input.get(\"goal\") or \"\")\n"
+        "    policy, ack, body = False, \"\", goal\n"
+        "    m = re.match(r\"\\A---[ \\t]*\\n(.*?)\\n---[ \\t]*\\n?\", goal, re.S)\n"
+        "    if m:\n"
+        "        body = goal[m.end():].lstrip(\"\\n\")\n"
+        "        for ln in m.group(1).splitlines():\n"
+        "            k, _, v = ln.partition(\":\")\n"
+        "            k, v = k.strip().lower(), v.strip().strip(\"\\\"'\")\n"
+        "            if k == \"policy\":\n"
+        "                policy = v.lower() in (\"true\", \"yes\", \"1\")\n"
+        "            elif k in (\"policy-ack\", \"policy_ack\"):\n"
+        "                ack = v\n"
+        "    res = {\"ok\": True, \"policy\": policy, \"policy_str\": \"true\" if policy else \"false\",\n"
+        "           \"ack\": ack, \"body\": body, \"title_tag\": \"[policy] \" if policy else \"\",\n"
+        "           \"trailer\": (\"\\n\\nPolicy-ack: \" + ack) if (policy and ack) else \"\", \"why\": \"\"}\n"
+        "    if policy and not ack:\n"
+        "        res.update(ok=False, why=\"goal declares policy: true without policy-ack \"\n"
+        "                                  \"(docs/landing-and-acceptance.md §2)\")\n"
+        "    return res\n"))
+    if pm.ok == False:
+        wpm = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
+                        content=F.concat("policy front-matter: ", pm.why))
+        return {"verdict": "failed-preserved", "stage": "policy", "why": pm.why}
+
     gates = CODE(id="gate_select", lang="python",
                  input={"gates": INPUT.gates if INPUT.gates else None,
                         "spec": INPUT.gates_spec or "",
@@ -594,7 +629,7 @@ def self_improve_v2(INPUT):
     # review_prompt 的 F.concat 直接炸 node。主流程顶层 F 可用（preflight 失败
     # 分支同款已实证），故线性展开到顶层：首评 → NEEDS_FIX 修一轮 → 复评定论；
     # UNAVAILABLE / 修后仍不过均 failed-preserved 并落盘评审原文。
-    review_prompt = (
+    review_prompt = F.concat(
         "You are an independent reviewer (different provider). In the current "
         "workspace, run `git diff $(git merge-base origin/main HEAD)` to see the full "
         "change (relative to the branch point: covers both uncommitted edits and "
@@ -603,7 +638,13 @@ def self_improve_v2(INPUT):
         "show those as inverted deletions and waste your attention), and Read any "
         "source files you need to cross-check claims.\n"
         "Review for correctness, regressions and contract violations.\n"
-        'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".')
+        'Respond with the last line exactly "VERDICT:PASS" or "VERDICT:NEEDS_FIX".\n',
+        # #201 S1(c)：未声明 policy 而 diff 命中 §2 定义 → reviewer 拦下转人工
+        "Policy gate (docs/landing-and-acceptance.md §2, #201): this goal's front-matter "
+        "declares policy=", pm.policy_str, ". If the diff is policy-touching - it changes "
+        "a behaviour constant or default, error semantics, a fail-open/fail-closed "
+        "orientation, or narrows a contract - but policy=false, respond VERDICT:NEEDS_FIX "
+        "and name the hunk; a human must re-file the goal with `policy: true` + `policy-ack`.")
     # 节点 id 按赋值名派生且全局唯一（跨分支也算重复，64dfd7d/61294d0 两次实证）——
     # 评审段赋值名一律带序号：rev1/rev2/wfr/wfr2。
     rev1 = AGENTRUN(agent=reviewer, prompt=review_prompt, repo=pre.worktree,
@@ -704,12 +745,12 @@ def self_improve_v2(INPUT):
     # ff 校验）。旧路径在本地 clone 里 `merge --ff-only` 再推，并行会话持续推动
     # 本地 main 时必炸（plaita#27/#35 needs-human 根因），故废弃该载体。
     pub = GIT_PUBLISH(worktree_dir=pre.worktree, branch_name=pre.branch,
-                      commit_message=F.concat("self-improve: ", goal),
+                      commit_message=F.concat("self-improve: ", pm.title_tag, pm.body, pm.trailer),
                       merge_mode="none", main_clone=repo, base_branch="main")
     land_push = CODE(id="land_push", lang="python",
               input={"wt": pre.worktree, "branch": pre.branch,
                      "land_base": pre.land_base, "repo": repo}, code=(
-        "import subprocess\n"
+        "import os, shlex, subprocess\n"
         "\n"
         "\n"
         "def run(input):\n"
@@ -717,10 +758,54 @@ def self_improve_v2(INPUT):
         "    land_base = input.get(\"land_base\") or \"HEAD\"\n"
         "    base_branch = land_base.split(\"/\", 1)[1] if \"/\" in land_base else \"main\"\n"
         "    repo = input.get(\"repo\") or wt\n"
+        "    gate = {\"rc\": -1, \"stage\": \"not-run\", \"log\": \"\"}\n"
         "\n"
         "    def git(*a):\n"
         "        return subprocess.run([\"git\", \"-C\", wt] + list(a),\n"
         "                              capture_output=True, text=True)\n"
+        "\n"
+        "    def out(ok, refuse, note, why):\n"
+        "        return {\"ok\": ok, \"refuse\": refuse, \"note\": note, \"why\": why,\n"
+        "                \"gate_rc\": gate[\"rc\"], \"gate_stage\": gate[\"stage\"],\n"
+        "                \"gate_log\": gate[\"log\"]}\n"
+        "\n"
+        "    def landing_gate():\n"
+        "        # #201 S1 — docs/landing-and-acceptance.md §1 (main CI red = freeze)\n"
+        "        # + §2 ([policy] commits need Policy-ack), run BEFORE anything is\n"
+        "        # pushed. Fail-closed: rc 1 (red / gh failure) and rc 2 (no\n"
+        "        # conclusion) both refuse; no automatic override. LANDING_GATE_CMD /\n"
+        "        # LANDING_GATE_TRAILERS_CMD are the test seams (shlex-split); the\n"
+        "        # default is the target repo's own scripts/landing_gate.py. A repo\n"
+        "        # without that script has not adopted the convention: recorded as\n"
+        "        # stage=absent in the node output + landing-gate.log (observable,\n"
+        "        # never silent) and the push proceeds.\n"
+        "        ci_env = os.environ.get(\"LANDING_GATE_CMD\")\n"
+        "        tr_env = os.environ.get(\"LANDING_GATE_TRAILERS_CMD\")\n"
+        "        script = os.path.join(wt, \"scripts\", \"landing_gate.py\")\n"
+        "        if not ci_env and not os.path.isfile(script):\n"
+        "            gate.update(rc=0, stage=\"absent\",\n"
+        "                        log=\"landing gate: scripts/landing_gate.py absent in worktree \"\n"
+        "                            \"(repo has not adopted the convention) - skipped, observable\")\n"
+        "            return True\n"
+        "        ci = shlex.split(ci_env) if ci_env else [\"python3\", \"scripts/landing_gate.py\", \"ci\"]\n"
+        "        g = subprocess.run(ci, cwd=wt, capture_output=True, text=True)\n"
+        "        txt = ((g.stdout or \"\") + (g.stderr or \"\"))[-1500:]\n"
+        "        if g.returncode != 0:\n"
+        "            gate.update(rc=g.returncode, stage=\"ci\",\n"
+        "                        log=\"landing gate ci rc=%d (fail-closed)\\n%s\" % (g.returncode, txt))\n"
+        "            return False\n"
+        "        tr = (shlex.split(tr_env) if tr_env else\n"
+        "              [\"python3\", \"scripts/landing_gate.py\", \"trailers\",\n"
+        "               \"origin/\" + base_branch + \"..HEAD\"])\n"
+        "        t = subprocess.run(tr, cwd=wt, capture_output=True, text=True)\n"
+        "        ttxt = ((t.stdout or \"\") + (t.stderr or \"\"))[-1500:]\n"
+        "        if t.returncode != 0:\n"
+        "            gate.update(rc=t.returncode, stage=\"trailers\",\n"
+        "                        log=\"landing gate trailers rc=%d (fail-closed)\\n%s\\n%s\"\n"
+        "                            % (t.returncode, txt, ttxt))\n"
+        "            return False\n"
+        "        gate.update(rc=0, stage=\"pass\", log=\"landing gate pass\\n%s\\n%s\" % (txt, ttxt))\n"
+        "        return True\n"
         "\n"
         "    git(\"fetch\", \"origin\")\n"
         "    # 护栏（绝不代推他人提交）：本地 clone 的 <base> 领先 origin 的提交若\n"
@@ -733,27 +818,26 @@ def self_improve_v2(INPUT):
         "        to_land = set(git(\"rev-list\", land_base + \"..HEAD\").stdout.split())\n"
         "        bundled = [c for c in loc if c in to_land]\n"
         "        if bundled:\n"
-        "            return {\"ok\": False, \"refuse\": True, \"note\": \"\",\n"
-        "                    \"why\": \"分支捆绑本地未推提交 %d 条，已拒推（交人工）：%s\" % (\n"
-        "                        len(bundled), \" \".join(bundled[:8]))}\n"
+        "            return out(False, True, \"\", \"分支捆绑本地未推提交 %d 条，已拒推（交人工）：%s\" % (\n"
+        "                len(bundled), \" \".join(bundled[:8])))\n"
+        "    if not landing_gate():\n"
+        "        return out(False, True, \"\", \"landing gate refused (stage=%s rc=%d) - see landing-gate.log\"\n"
+        "                   % (gate[\"stage\"], gate[\"rc\"]))\n"
         "    # 推分支（先删远端同名旧分支：rebase 后续推会分叉被拒，best-effort）\n"
         "    git(\"push\", \"origin\", \"--delete\", branch)\n"
         "    r1 = git(\"push\", \"-u\", \"origin\", branch)\n"
         "    if r1.returncode != 0:\n"
-        "        return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
-        "                \"why\": (\"push branch: \" + (r1.stderr or r1.stdout))[-400:]}\n"
+        "        return out(False, False, \"\", (\"push branch: \" + (r1.stderr or r1.stdout))[-400:])\n"
         "    # 直推基线：服务端 ff 校验；非 ff（基支已前进）→ ok=False 走 rebase 重试\n"
         "    r2 = git(\"push\", \"origin\", \"HEAD:\" + base_branch)\n"
         "    if r2.returncode == 0:\n"
-        "        return {\"ok\": True, \"refuse\": False,\n"
-        "                \"note\": \"已直推 \" + base_branch + \"（分支 \" + branch + \"）\",\n"
-        "                \"why\": \"\"}\n"
-        "    return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
-        "            \"why\": (\"push \" + base_branch + \": \" + (r2.stderr or r2.stdout))[-400:]}\n"))
+        "        return out(True, False, \"已直推 \" + base_branch + \"（分支 \" + branch + \"）\", \"\")\n"
+        "    return out(False, False, \"\", (\"push \" + base_branch + \": \" + (r2.stderr or r2.stdout))[-400:])\n"))
+    wgate1 = WRITEFILE(path=F.concat(run_dir, "/landing-gate.log"), content=land_push.gate_log)
     if land_push.refuse == True:
-        # 捆绑护栏命中：不 rebase 不重试（重试仍会撞同一护栏），直接人工
+        # 捆绑护栏或 landing gate 命中：不 rebase 不重试（重试仍会撞同一结论），直接人工
         w_land_push0 = WRITEFILE(path=F.concat(run_dir, "/land-failure.log"),
-                         content=F.concat("bundled local commits: ", land_push.why))
+                         content=F.concat("land refused: ", land_push.why))
         return {"verdict": "failed-preserved", "stage": "land", "why": land_push.why}
     if land_push.ok == True:
         return {"verdict": "committed", "via": "direct-push",
@@ -960,7 +1044,7 @@ def self_improve_v2(INPUT):
     land_push2 = CODE(id="land_push2", lang="python",
                input={"wt": pre.worktree, "branch": pre.branch,
                       "land_base": pre.land_base, "repo": repo}, code=(
-        "import subprocess\n"
+        "import os, shlex, subprocess\n"
         "\n"
         "\n"
         "def run(input):\n"
@@ -968,12 +1052,59 @@ def self_improve_v2(INPUT):
         "    land_base = input.get(\"land_base\") or \"HEAD\"\n"
         "    base_branch = land_base.split(\"/\", 1)[1] if \"/\" in land_base else \"main\"\n"
         "    repo = input.get(\"repo\") or wt\n"
+        "    gate = {\"rc\": -1, \"stage\": \"not-run\", \"log\": \"\"}\n"
         "\n"
         "    def git(*a):\n"
         "        return subprocess.run([\"git\", \"-C\", wt] + list(a),\n"
         "                              capture_output=True, text=True)\n"
         "\n"
+        "    def out(ok, refuse, note, why):\n"
+        "        return {\"ok\": ok, \"refuse\": refuse, \"note\": note, \"why\": why,\n"
+        "                \"gate_rc\": gate[\"rc\"], \"gate_stage\": gate[\"stage\"],\n"
+        "                \"gate_log\": gate[\"log\"]}\n"
+        "\n"
+        "    def landing_gate():\n"
+        "        # #201 S1 — docs/landing-and-acceptance.md §1 (main CI red = freeze)\n"
+        "        # + §2 ([policy] commits need Policy-ack), run BEFORE anything is\n"
+        "        # pushed. Fail-closed: rc 1 (red / gh failure) and rc 2 (no\n"
+        "        # conclusion) both refuse; no automatic override. LANDING_GATE_CMD /\n"
+        "        # LANDING_GATE_TRAILERS_CMD are the test seams (shlex-split); the\n"
+        "        # default is the target repo's own scripts/landing_gate.py. A repo\n"
+        "        # without that script has not adopted the convention: recorded as\n"
+        "        # stage=absent in the node output + landing-gate.log (observable,\n"
+        "        # never silent) and the push proceeds.\n"
+        "        ci_env = os.environ.get(\"LANDING_GATE_CMD\")\n"
+        "        tr_env = os.environ.get(\"LANDING_GATE_TRAILERS_CMD\")\n"
+        "        script = os.path.join(wt, \"scripts\", \"landing_gate.py\")\n"
+        "        if not ci_env and not os.path.isfile(script):\n"
+        "            gate.update(rc=0, stage=\"absent\",\n"
+        "                        log=\"landing gate: scripts/landing_gate.py absent in worktree \"\n"
+        "                            \"(repo has not adopted the convention) - skipped, observable\")\n"
+        "            return True\n"
+        "        ci = shlex.split(ci_env) if ci_env else [\"python3\", \"scripts/landing_gate.py\", \"ci\"]\n"
+        "        g = subprocess.run(ci, cwd=wt, capture_output=True, text=True)\n"
+        "        txt = ((g.stdout or \"\") + (g.stderr or \"\"))[-1500:]\n"
+        "        if g.returncode != 0:\n"
+        "            gate.update(rc=g.returncode, stage=\"ci\",\n"
+        "                        log=\"landing gate ci rc=%d (fail-closed)\\n%s\" % (g.returncode, txt))\n"
+        "            return False\n"
+        "        tr = (shlex.split(tr_env) if tr_env else\n"
+        "              [\"python3\", \"scripts/landing_gate.py\", \"trailers\",\n"
+        "               \"origin/\" + base_branch + \"..HEAD\"])\n"
+        "        t = subprocess.run(tr, cwd=wt, capture_output=True, text=True)\n"
+        "        ttxt = ((t.stdout or \"\") + (t.stderr or \"\"))[-1500:]\n"
+        "        if t.returncode != 0:\n"
+        "            gate.update(rc=t.returncode, stage=\"trailers\",\n"
+        "                        log=\"landing gate trailers rc=%d (fail-closed)\\n%s\\n%s\"\n"
+        "                            % (t.returncode, txt, ttxt))\n"
+        "            return False\n"
+        "        gate.update(rc=0, stage=\"pass\", log=\"landing gate pass\\n%s\\n%s\" % (txt, ttxt))\n"
+        "        return True\n"
+        "\n"
         "    git(\"fetch\", \"origin\")\n"
+        "    # 护栏（绝不代推他人提交）：本地 clone 的 <base> 领先 origin 的提交若\n"
+        "    # 出现在待落地集合里，说明本分支捆绑了本地未推工作 → 拒推交人工。\n"
+        "    # 本地与 origin 持平时护栏自然放行（自愈，无需人工改分支）。\n"
         "    if land_base != \"HEAD\":\n"
         "        loc = subprocess.run([\"git\", \"-C\", repo, \"rev-list\",\n"
         "                              \"origin/\" + base_branch + \"..\" + base_branch],\n"
@@ -981,21 +1112,22 @@ def self_improve_v2(INPUT):
         "        to_land = set(git(\"rev-list\", land_base + \"..HEAD\").stdout.split())\n"
         "        bundled = [c for c in loc if c in to_land]\n"
         "        if bundled:\n"
-        "            return {\"ok\": False, \"refuse\": True, \"note\": \"\",\n"
-        "                    \"why\": \"分支捆绑本地未推提交 %d 条，已拒推（交人工）：%s\" % (\n"
-        "                        len(bundled), \" \".join(bundled[:8]))}\n"
+        "            return out(False, True, \"\", \"分支捆绑本地未推提交 %d 条，已拒推（交人工）：%s\" % (\n"
+        "                len(bundled), \" \".join(bundled[:8])))\n"
+        "    if not landing_gate():\n"
+        "        return out(False, True, \"\", \"landing gate refused (stage=%s rc=%d) - see landing-gate.log\"\n"
+        "                   % (gate[\"stage\"], gate[\"rc\"]))\n"
+        "    # 推分支（先删远端同名旧分支：rebase 后续推会分叉被拒，best-effort）\n"
         "    git(\"push\", \"origin\", \"--delete\", branch)\n"
         "    r1 = git(\"push\", \"-u\", \"origin\", branch)\n"
         "    if r1.returncode != 0:\n"
-        "        return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
-        "                \"why\": (\"push branch: \" + (r1.stderr or r1.stdout))[-400:]}\n"
+        "        return out(False, False, \"\", (\"push branch: \" + (r1.stderr or r1.stdout))[-400:])\n"
+        "    # 直推基线：服务端 ff 校验；非 ff（基支已前进）→ ok=False 走 rebase 重试\n"
         "    r2 = git(\"push\", \"origin\", \"HEAD:\" + base_branch)\n"
         "    if r2.returncode == 0:\n"
-        "        return {\"ok\": True, \"refuse\": False,\n"
-        "                \"note\": \"已直推 \" + base_branch + \"（分支 \" + branch + \"）\",\n"
-        "                \"why\": \"\"}\n"
-        "    return {\"ok\": False, \"refuse\": False, \"note\": \"\",\n"
-        "            \"why\": (\"push \" + base_branch + \": \" + (r2.stderr or r2.stdout))[-400:]}\n"))
+        "        return out(True, False, \"已直推 \" + base_branch + \"（分支 \" + branch + \"）\", \"\")\n"
+        "    return out(False, False, \"\", (\"push \" + base_branch + \": \" + (r2.stderr or r2.stdout))[-400:])\n"))
+    wgate2 = WRITEFILE(path=F.concat(run_dir, "/landing-gate.log"), content=land_push2.gate_log)
     if land_push2.ok == True:
         return {"verdict": "committed", "via": "direct-push-retry",
                 "note": land_push2.note}
