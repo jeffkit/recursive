@@ -7,9 +7,18 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0387",
 ]
 # 0367/0368/0369 = zip 4.6.1 的 ZipArchive::extract 符号链接外逃 / SUID 位保留族。
 # 暴露面：src/tools/install_skill.rs（远程技能 zip 解压，不可信输入；#103 已做路径
 # 穿越与完整性校验，extract 符号链接面需单独复核）+ src/session/export.rs（本地
 # 导出，低暴露）。zip 无 patched 版本可锁（镜像与上游均未发）；解禁条件 = zip
 # patched 版本发布即 cargo update -p zip 并删除本清单。
+# 0387 = crypto-bigint 0.5.5「本应常数时间的运算存在多处时序可变性」族
+# (RustCrypto/crypto-bigint#1365)。无范围内补丁(公告解法=升 >=0.7.6,跨大版本;
+# 钉死方:aws-sigv4 1.5.1 与 elliptic-curve 0.13.8 均 pin ^0.5)。
+# 暴露面:纯传递依赖,recursive 零直接调用 crypto-bigint API;消费形态是
+# AWS SigV4 签名与 P-256 椭圆曲线运算(均在成熟库内部),无自建常数时间面,
+# 时序侧信道在本仓使用形态下不可达性高。
+# 解禁条件 = aws-sigv4 或 elliptic-curve 发布支持 crypto-bigint >=0.7 的版本,
+# cargo update 通过后删除本条(届时同步复核 0.7 breaking changes)。
