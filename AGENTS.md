@@ -122,7 +122,7 @@ by the lighter manual-edit policy.
   `NoMoreToolCalls`) are **data, not errors** — transcript is always saved.
 - **Tool-call pairing** (invariant #8): each `Role::Tool` MUST stay immediately
   after the `Role::Assistant` whose `tool_calls` lists its `id`. Orphans →
-  HTTP 400. Regression test: `compaction_keeps_tool_calls_paired_with_results`.
+  HTTP 400. Regression test: `compaction_preserves_tool_call_pairing`.
 
 ## Worktree workflow
 

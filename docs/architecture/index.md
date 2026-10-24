@@ -52,5 +52,6 @@ drill into what you need.
 * [Skills System](skills.md) - skill discovery, injection modes, SKILL.md format
 * [Sessions](sessions.md) - session persistence, transcript JSONL, lifecycle
 * [Context Compaction](compaction.md) - the four compaction contracts: single ownership, canonical rebuild, token accounting, observable degradation
+- [persistence.md](persistence.md) — transcript/会话持久化:通道×粒度矩阵、retention 与 #147 收口边界(补注册)
 * [AG-UI](agui.md) - frontend protocol layer: protocol/client crates, transport-free server session layer, thin HTTP adapter
 * [Invariants](invariants.md) - the ten invariants every change must respect

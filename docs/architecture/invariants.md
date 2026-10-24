@@ -74,7 +74,7 @@ Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md)
 >
 > Orphaned tool results cause HTTP 400 from OpenAI / DeepSeek / Anthropic.
 >
-> Regression test: `compaction_keeps_tool_calls_paired_with_results`
+> Regression test: `compaction_preserves_tool_call_pairing` (tests/invariants/tool_call_pairing.rs; extends the former `compaction_keeps_tool_calls_paired_with_results`)
 
 Impact: [Agent Loop](agent-loop.md), [Sessions](sessions.md), [Context Compaction](compaction.md) (the transcript-mutation contracts: single write path, canonical rebuild)
 
