@@ -535,6 +535,15 @@ impl RunCollector {
                 AttrValue::Str(cost_details_json(self.total_cost_usd)),
             ),
         ];
+        // Goal 430 (#244): host-edge labels ride along verbatim under the
+        // `label.` sub-prefix, so they can never collide with the built-in
+        // keys above and no key is ever inspected here.
+        for (key, value) in &self.meta.labels {
+            attrs.push((
+                format!("{TRACE_METADATA_PREFIX}label.{key}"),
+                AttrValue::Str(value.clone()),
+            ));
+        }
         if !self.meta.session_id.is_empty() {
             attrs.push((
                 ATTR_TRACE_SESSION_ID.to_string(),
@@ -883,6 +892,72 @@ mod tests {
             attr(root, &format!("{TRACE_METADATA_PREFIX}finish_reason")),
             Some(AttrValue::Str(r)) if r == "no_more_tool_calls"
         ));
+    }
+
+    /// Goal 430 (#244 W1, end-to-end half 2): host-edge labels reach the
+    /// root span verbatim — key untouched under the `label.` sub-prefix,
+    /// value byte-for-byte, in `BTreeMap` order — and an empty map adds no
+    /// `label.` attribute at all, so existing traces are untouched.
+    #[test]
+    fn labels_are_forwarded_verbatim_under_the_label_subprefix() {
+        let label_prefix = format!("{TRACE_METADATA_PREFIX}label.");
+        let labelled = RunCollector::new(
+            RunMeta::new("sess-1", "m", "p").with_labels([
+                ("tenant".to_string(), "acme".to_string()),
+                ("cost_center".to_string(), "x-7".to_string()),
+            ]),
+            true,
+            t0(),
+        );
+        let root = &labelled.records()[0];
+        assert_eq!(
+            attr(root, &format!("{label_prefix}tenant")),
+            Some(&AttrValue::Str("acme".into()))
+        );
+        assert_eq!(
+            attr(root, &format!("{label_prefix}cost_center")),
+            Some(&AttrValue::Str("x-7".into()))
+        );
+        let label_keys: Vec<&str> = root
+            .attrs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| k.starts_with(&label_prefix))
+            .collect();
+        assert_eq!(
+            label_keys,
+            [
+                "langfuse.trace.metadata.label.cost_center",
+                "langfuse.trace.metadata.label.tenant",
+            ],
+            "labels are emitted once each, in sorted key order"
+        );
+        // The built-in `turn` key is unaffected by a label of the same name.
+        let shadowing = RunCollector::new(
+            RunMeta::new("sess-1", "m", "p")
+                .with_turn(4)
+                .with_labels([("turn".to_string(), "mine".to_string())]),
+            true,
+            t0(),
+        );
+        let root = &shadowing.records()[0];
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}turn")),
+            Some(&AttrValue::Int(4))
+        );
+        assert_eq!(
+            attr(root, &format!("{label_prefix}turn")),
+            Some(&AttrValue::Str("mine".into()))
+        );
+
+        let unlabelled = collector();
+        assert!(
+            unlabelled.records()[0]
+                .attrs
+                .iter()
+                .all(|(k, _)| !k.starts_with(&label_prefix)),
+            "no labels → no `label.` attributes"
+        );
     }
 
     #[test]

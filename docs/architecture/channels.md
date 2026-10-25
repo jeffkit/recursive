@@ -97,8 +97,22 @@ TUI 的双形态锚点以上表两个二进制为准。
   approval_hooks=<N> auth=<configured|insecure-debug|unconfigured>` +
   四档沙箱单租户 WARN（镜像 microvm 先例）——部署事实启动即说，
   「文档知道的事运行时不说」的缺口收口。
+- **trace labels（Goal 430 / #244 W1，owner 2026-10-25 裁决的执行载体）**：
+  每个 HTTP turn 的 Langfuse trace 带 `langfuse.trace.metadata.label.<key>`
+  属性；W1 默认集只有 `tenant`，来源=**会话 owner 的 tenant**
+  （`SessionState.tenant`，非当前请求方；`subject` 不入默认，PII），派生/
+  校验/模板展开全在边缘模块 `src/http/labels.rs`（键
+  `^[a-z][a-z0-9_]{0,63}$`、值 ≤256B 无控制字符、≤16 键；越界 → WARN
+  「trace labels dropped (degradation)」命名键+规则不记值，turn 照跑）。
+  **内核零感知**：labels 只住 `RunMeta`（observability 层），collector
+  `for (k, v)` 原样透传零键名字面量；`TurnContext` / runtime / tool
+  registry 一字不动——由 `tests/identity_opacity_contract.rs` 静态守卫
+  钉死（红区 18 文件 + `src/agent/` 生产半区 `tenant|subject` 严格零命中
+  + `TurnContext` 13 字段快照）。W2（技能源 URL / 外呼 headers 按 labels
+  在 handler 层预展开）见 Goal 431，`expand_template` 已在边缘层就位。
 - **不支持清单**：次生产 ≠ 生产 SLA 承诺（宣称面已按本页对齐）；C 端
-  身份装配未落（#146 / 属主 #152，P3 缓行——只指路，此处不展开不代做）；
+  身份装配：W1 透传地基已落（上条），技能分区/外呼携带（#244 W2 →
+  Goal 431）未落，#146 P3 缓行、属主 #152——只指路，此处不展开不代做；
   Redis session hot-state 不接入 `recursive http`（#92 方向已关）。
 
 ## 5. AG-UI — 次生产（随 HTTP）

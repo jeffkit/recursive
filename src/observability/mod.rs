@@ -25,6 +25,8 @@
 //! `collector` submodule) so traces produced here and by the plaita
 //! orchestration stack land in the same Langfuse project and are comparable.
 
+use std::collections::BTreeMap;
+
 use crate::event::EventSink;
 
 #[cfg(feature = "otel")]
@@ -54,6 +56,11 @@ pub struct RunMeta {
     pub trace_name: String,
     /// `langfuse.trace.tags` applied to the trace.
     pub tags: Vec<String>,
+    /// Opaque labels supplied by the host edge (Goal 430 / #244), forwarded
+    /// verbatim as `langfuse.trace.metadata.label.<key>`. This layer never
+    /// reads a key: whatever a label means is decided where it was derived
+    /// (`http::labels`). Sorted so the attribute order is stable.
+    pub labels: BTreeMap<String, String>,
 }
 
 impl RunMeta {
@@ -70,6 +77,7 @@ impl RunMeta {
             provider: provider.into(),
             trace_name: "recursive.run".to_string(),
             tags: Vec::new(),
+            labels: BTreeMap::new(),
         }
     }
 
@@ -86,6 +94,13 @@ impl RunMeta {
     /// Set the turn index within the session (0 for a one-shot run).
     pub fn with_turn(mut self, turn: u32) -> Self {
         self.turn = turn;
+        self
+    }
+
+    /// Replace the opaque labels forwarded on the trace (see
+    /// [`RunMeta::labels`]).
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.labels = labels.into_iter().collect();
         self
     }
 
@@ -265,6 +280,25 @@ mod tests {
         assert_eq!(meta.turn, 0);
         assert_eq!(meta.trace_name, "recursive.run");
         assert!(meta.tags.is_empty());
+        assert!(meta.labels.is_empty());
+    }
+
+    /// Goal 430: `with_labels` replaces the whole map and keeps it sorted,
+    /// whatever order the host supplied the pairs in.
+    #[test]
+    fn run_meta_with_labels_replaces_and_sorts() {
+        let meta = RunMeta::new("s", "m", "p")
+            .with_labels([("zeta".to_string(), "1".to_string())])
+            .with_labels([
+                ("zeta".to_string(), "2".to_string()),
+                ("alpha".to_string(), "3".to_string()),
+            ]);
+        let pairs: Vec<(&str, &str)> = meta
+            .labels
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(pairs, [("alpha", "3"), ("zeta", "2")]);
     }
 
     #[test]

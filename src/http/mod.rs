@@ -13,6 +13,7 @@ mod cold_load;
 mod environment_binding_tests;
 mod event_log;
 mod handlers;
+mod labels;
 mod metrics;
 mod rate_limit;
 mod session_mirror;
@@ -34,6 +35,11 @@ pub use auth::{
 pub(crate) use event_log::frame_seq;
 pub use event_log::{SessionEventLog, SessionReplay, SESSION_EVENT_LOG_CAPACITY};
 pub use handlers::map_agent_event;
+// Goal 430 (#244 W1): opaque trace labels — derived, validated and (for the
+// W2 consumers) expanded at this edge only; the kernel never sees them.
+pub use labels::{
+    expand_template, from_session_owner, LabelsError, LabelsReason, MissingLabel, OpaqueLabels,
+};
 // Issue #113: labelled counter / histogram families, the bounded finish-reason
 // labels and the run-event metrics sink.
 pub use metrics::{

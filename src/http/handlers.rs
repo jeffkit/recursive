@@ -2149,6 +2149,40 @@ fn prior_turn_index(transcript: &[crate::message::Message]) -> u32 {
     transcript.iter().filter(|m| m.role == Role::User).count() as u32
 }
 
+/// Goal 430 (#244 W1): the Langfuse run metadata for one HTTP turn, labels
+/// included. The labels derive from the session *owner's* tenant (not the
+/// caller's — an admin reaching across tenants must not re-label the work;
+/// the request-side identity is already audited by #101), and reach the
+/// trace as opaque `langfuse.trace.metadata.label.<key>` attributes.
+///
+/// Labelling is a side channel: a tenant value out of bounds must never
+/// fail the user's turn, but dropping the label silently would be a
+/// fail-silent degradation — so the drop is announced (key + rule, never
+/// the value) and the turn proceeds unlabelled.
+fn turn_run_meta(
+    session_id: &str,
+    tenant: Option<&str>,
+    model: &str,
+    provider: &str,
+    turn: u32,
+) -> crate::observability::RunMeta {
+    let labels = match super::labels::from_session_owner(tenant) {
+        Ok(labels) => labels,
+        Err(err) => {
+            tracing::warn!(
+                target: "recursive::http",
+                key = %err.key,
+                reason = %err.reason,
+                "trace labels dropped (degradation)"
+            );
+            super::labels::OpaqueLabels::default()
+        }
+    };
+    crate::observability::RunMeta::new(session_id, model, provider)
+        .with_turn(turn)
+        .with_labels(labels)
+}
+
 /// POST /sessions/:id/messages — send a message in a session.
 ///
 /// Issue #85: only the session's owner (or an admin) may run a turn in it —
@@ -2247,14 +2281,13 @@ pub(super) async fn send_session_message(
     // so without this a goal-loop's frames cannot be stitched to one timeline.
     let (sink, mut event_rx) =
         EnvelopeSink::with_correlation(Some(id.clone()), turn, session.event_seq.clone());
-    let langfuse_run = crate::observability::LangfuseRun::try_new(
-        crate::observability::RunMeta::new(
-            id.clone(),
-            state.config.model.clone(),
-            state.config.provider_type.clone(),
-        )
-        .with_turn(turn),
-    );
+    let langfuse_run = crate::observability::LangfuseRun::try_new(turn_run_meta(
+        &id,
+        session.tenant.as_deref(),
+        &state.config.model,
+        &state.config.provider_type,
+        turn,
+    ));
     let mut event_sinks: Vec<Box<dyn crate::event::EventSink>> = vec![Box::new(sink)];
     // Issue #113: fold tool errors / retries / compactions into `/metrics`
     // alongside the SSE and Langfuse sinks — never instead of them.
@@ -4795,6 +4828,55 @@ mod tests {
         ];
         assert_eq!(prior_turn_index(&transcript), 2);
         assert_eq!(prior_turn_index(&[]), 0);
+    }
+
+    /// Goal 430 (#244 W1, end-to-end half 1): the per-turn run metadata
+    /// carries the session owner's tenant as the opaque `tenant` label and
+    /// nothing else; an untenanted session is simply unlabelled. The
+    /// collector half (`labels_are_forwarded_verbatim_under_the_label_subprefix`)
+    /// pins the attribute shape, so together they cover "HTTP request →
+    /// trace attribute, key and value verbatim" without a Langfuse backend.
+    #[test]
+    fn turn_run_meta_labels_the_trace_with_the_owner_tenant() {
+        let meta = turn_run_meta("sess-9", Some("acme"), "gpt-x", "openai", 3);
+        assert_eq!(meta.session_id, "sess-9");
+        assert_eq!(meta.model, "gpt-x");
+        assert_eq!(meta.provider, "openai");
+        assert_eq!(meta.turn, 3);
+        let labels: Vec<(&str, &str)> = meta
+            .labels
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(labels, [("tenant", "acme")]);
+
+        let untenanted = turn_run_meta("sess-9", None, "gpt-x", "openai", 0);
+        assert!(untenanted.labels.is_empty());
+        assert_eq!(untenanted.turn, 0);
+    }
+
+    /// Goal 430: a tenant value the label rules reject must not fail the
+    /// turn — but the dropped label is announced (key + rule, never the
+    /// value) rather than vanishing silently.
+    #[tracing_test::traced_test]
+    #[test]
+    fn turn_run_meta_announces_a_dropped_label_and_proceeds_unlabelled() {
+        let meta = turn_run_meta("sess-9", Some("bad\r\nvalue"), "gpt-x", "openai", 1);
+        assert!(meta.labels.is_empty(), "an out-of-bounds label is dropped");
+        assert_eq!(meta.turn, 1, "the run metadata is otherwise intact");
+        assert!(
+            logs_contain("trace labels dropped (degradation)"),
+            "the drop must be announced"
+        );
+        assert!(logs_contain("key=tenant"), "the warning names the key");
+        assert!(
+            logs_contain("control character"),
+            "the warning names the rule"
+        );
+        assert!(
+            !logs_contain("bad"),
+            "the warning must never carry the rejected value"
+        );
     }
 
     #[tokio::test]
