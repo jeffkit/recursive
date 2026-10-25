@@ -469,18 +469,28 @@ async fn build_restored_runtime(
     let base = meta
         .and_then(|m| m.system_prompt.clone())
         .unwrap_or_else(|| state.config.system_prompt.clone());
+    // Goal 431 (#244 W2a): a restored session is partitioned by its
+    // persisted owner's opaque labels — the same value `may_access_session`
+    // already reads, so the rebuilt catalog is the one its owner always had.
+    // A session with no persisted meta carries no labels and takes the
+    // startup (unpartitioned) catalog.
+    let labels = super::handlers::session_labels(meta.and_then(|m| m.tenant.as_deref()));
+    let skills = state
+        .session_skill_catalog(&labels)
+        .await
+        .map_err(ApiError::internal)?;
     // Same system-prompt assembly as every other channel (project context +
     // skill index + sub-agent note).
     let assembled = crate::assemble_system_prompt(
         &base,
         &state.config.workspace,
-        &state.skills,
+        &skills,
         state.config.subagent_enabled,
     );
     // Issue #31: a restored session gets its OWN environment (container
     // tier) like a fresh one, plus the environment prompt segment.
     let mut tool_registry = state
-        .session_tool_registry()
+        .session_tool_registry(&labels)
         .await
         .map_err(ApiError::internal)?;
     if let Some(mode_str) = meta.and_then(|m| m.permission_mode.as_deref()) {
@@ -525,6 +535,7 @@ async fn build_restored_runtime(
     let mut runtime = super::handlers::build_session_runtime(
         state,
         tool_registry,
+        skills,
         full,
         segments,
         max_steps,
@@ -760,6 +771,7 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(LocalStorageBackend::new(dir)),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_mirror_root: None,

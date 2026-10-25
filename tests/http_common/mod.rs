@@ -334,6 +334,7 @@ pub fn sample_state() -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        partitioning: Default::default(),
         storage: test_storage_dir(),
         agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         // Issue #121: no native session mirror for the shared fixtures.
@@ -364,6 +365,7 @@ pub fn sample_state_with_provider(provider: Arc<MockProvider>) -> AppState {
         )),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        partitioning: Default::default(),
         storage: test_storage_dir(),
         agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         // Issue #121: no native session mirror for the shared fixtures.
@@ -408,6 +410,7 @@ pub fn sample_state_with_storage(
         slash_commands: Arc::new(Vec::new()),
         rate_limiter: RateLimiter::new(10, 1.0),
         skills: vec![],
+        partitioning: Default::default(),
         storage,
         agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
         // Issue #121: no native session mirror for the shared fixtures.

@@ -442,9 +442,11 @@ pub(super) fn inject_environment_segment(
 ///
 /// `pub(super)` since issue #98: `http::cold_load` reuses this exact path for
 /// restored sessions so they cannot drift from freshly created ones.
+#[allow(clippy::too_many_arguments)] // the per-session asset bundle (state + registry + catalog + prompt)
 pub(super) fn build_session_runtime(
     state: &AppState,
     tool_registry: ToolRegistry,
+    skills: std::sync::Arc<Vec<crate::skills::Skill>>,
     system_prompt: String,
     prompt_segments: crate::system_prompt::PromptSegments,
     max_steps: usize,
@@ -457,7 +459,7 @@ pub(super) fn build_session_runtime(
         prompt_segments,
         max_steps,
         preset,
-        state.skills.clone(),
+        skills.as_ref().clone(),
         HTTP_CHANNEL,
     )
     // Issue #94 + #145: per-request thinking overrides need their own
@@ -809,6 +811,11 @@ pub(super) async fn list_presets(State(state): State<Arc<AppState>>) -> Json<Vec
 
 pub(super) async fn run_agent(
     State(state): State<Arc<AppState>>,
+    // Goal 431 (#244 W2a): auth off = single-user deployment = no labels
+    // (sessions on a templated skill-source deployment then fail closed at
+    // the first template needing a key — anonymous channels cannot pick a
+    // catalog).
+    identity: Option<Extension<AuthIdentity>>,
     Json(body): Json<RunRequest>,
 ) -> Result<Json<RunResponse>, ApiError> {
     // Validate: goal must not be empty
@@ -834,18 +841,30 @@ pub(super) async fn run_agent(
             p
         }
     };
+    // Goal 431 (#244 W2a): the run is partitioned by the caller's opaque
+    // labels — skill catalog and endpoint headers resolve per session before
+    // anything is assembled.
+    let labels = session_labels(
+        identity
+            .as_ref()
+            .and_then(|identity| identity.tenant.as_deref()),
+    );
+    let skills = state
+        .session_skill_catalog(&labels)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
     // + base + skill index + coordinator/sub_agent note (when enabled).
     let assembled_system_prompt = crate::assemble_system_prompt(
         &system_prompt,
         &state.config.workspace,
-        &state.skills,
+        &skills,
         state.config.subagent_enabled,
     );
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
     let mut tool_registry = state
-        .session_tool_registry()
+        .session_tool_registry(&labels)
         .await
         .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     // Issue #31 §2: inject the `<environment>` segment only when the
@@ -865,6 +884,7 @@ pub(super) async fn run_agent(
     let mut runtime = build_session_runtime(
         &state,
         tool_registry,
+        skills,
         system_prompt,
         prompt_segments,
         max_steps,
@@ -1111,12 +1131,21 @@ pub(super) async fn create_session(
     } else {
         None
     };
+    // Goal 431 (#244 W2a): the session is partitioned by its owner's (the
+    // caller's — issue #85 makes them the same here) opaque labels; a
+    // template needing a missing key fails creation closed (503 naming the
+    // template).
+    let labels = session_labels(identity.tenant.as_deref());
+    let skills = state
+        .session_skill_catalog(&labels)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     // Common system-prompt assembly: project context (AGENTS.md + CLAUDE.md)
     // + base + skill index + coordinator/sub_agent note (when enabled).
     let assembled_system_prompt = crate::assemble_system_prompt(
         &system_prompt,
         &state.config.workspace,
-        &state.skills,
+        &skills,
         state.config.subagent_enabled,
     );
     let system_prompt = assembled_system_prompt.full;
@@ -1126,7 +1155,7 @@ pub(super) async fn create_session(
         .map(|n| n as usize)
         .unwrap_or(state.config.max_steps);
     let mut tool_registry = state
-        .session_tool_registry()
+        .session_tool_registry(&labels)
         .await
         .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let (system_prompt, prompt_segments) =
@@ -1147,6 +1176,7 @@ pub(super) async fn create_session(
     let mut runtime = build_session_runtime(
         &state,
         tool_registry,
+        skills,
         system_prompt,
         prompt_segments,
         max_steps,
@@ -1735,19 +1765,26 @@ pub(super) async fn fork_session(
     let new_id = generate_session_id();
     let created_at = format_timestamp(SystemTime::now());
     let base_system_prompt = state.config.system_prompt.clone();
+    // Goal 431 (#244 W2a): a fork is owned by the caller (issue #85), so it
+    // is partitioned by the caller's opaque labels.
+    let labels = session_labels(identity.tenant.as_deref());
+    let skills = state
+        .session_skill_catalog(&labels)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     // Common system-prompt assembly so the forked session matches every
     // other channel (project context + skill index + sub-agent note).
     let assembled_system_prompt = crate::assemble_system_prompt(
         &base_system_prompt,
         &state.config.workspace,
-        &state.skills,
+        &skills,
         state.config.subagent_enabled,
     );
     let system_prompt = assembled_system_prompt.full;
     let prompt_segments = assembled_system_prompt.segments;
 
     let tool_registry = state
-        .session_tool_registry()
+        .session_tool_registry(&labels)
         .await
         .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let (system_prompt, prompt_segments) =
@@ -1757,6 +1794,7 @@ pub(super) async fn fork_session(
     let mut runtime = build_session_runtime(
         &state,
         tool_registry,
+        skills,
         system_prompt,
         prompt_segments,
         state.config.max_steps,
@@ -2181,6 +2219,29 @@ fn turn_run_meta(
     crate::observability::RunMeta::new(session_id, model, provider)
         .with_turn(turn)
         .with_labels(labels)
+}
+
+/// Goal 431 (#244 W2a/W2b): the opaque labels a session *build* is
+/// partitioned by — the same owner-tenant derivation as [`turn_run_meta`]
+/// (an out-of-bounds tenant value degrades to no labels with a WARN rather
+/// than failing the request on a side channel). Unlike the trace path these
+/// labels feed the per-session skill catalog and endpoint headers, so an
+/// empty set fails closed at the first operator template that needs a key
+/// (session creation 503s naming the template — 拍板点 4 posture, decided in
+/// `AppState::session_skill_catalog` / `session_tool_registry`).
+pub(super) fn session_labels(tenant: Option<&str>) -> super::labels::OpaqueLabels {
+    match super::labels::from_session_owner(tenant) {
+        Ok(labels) => labels,
+        Err(err) => {
+            tracing::warn!(
+                target: "recursive::http",
+                key = %err.key,
+                reason = %err.reason,
+                "session labels dropped (degradation)"
+            );
+            super::labels::OpaqueLabels::default()
+        }
+    }
 }
 
 /// POST /sessions/:id/messages — send a message in a session.
@@ -3096,16 +3157,32 @@ pub(super) async fn agui_run(
         }
     };
 
+    // Goal 431 (#244 W2a): AG-UI threads are partitioned by the caller's
+    // opaque labels (the identity that owns the thread per issue #152).
+    let labels = session_labels(
+        identity
+            .as_ref()
+            .and_then(|identity| identity.tenant.as_deref()),
+    );
+    let skills = state.session_skill_catalog(&labels).await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                status: "error".into(),
+                error: e,
+            }),
+        )
+    })?;
     // Common system-prompt assembly: project context + skill index +
     // coordinator/sub_agent note (when enabled).
     let assembled_system_prompt = crate::assemble_system_prompt(
         &base_prompt,
         &state.config.workspace,
-        &state.skills,
+        &skills,
         state.config.subagent_enabled,
     );
 
-    let tool_registry = state.session_tool_registry().await.map_err(|e| {
+    let tool_registry = state.session_tool_registry(&labels).await.map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -3166,7 +3243,7 @@ pub(super) async fn agui_run(
             preset,
             wall_timeout_secs: state.config.wall_timeout_secs,
             storage: state.storage.clone(),
-            skills: state.skills.clone(),
+            skills: skills.as_ref().clone(),
         },
     )
     .map_err(|e| {
@@ -3673,6 +3750,7 @@ mod tests {
             slash_commands: Arc::new(Vec::new()),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -3685,6 +3763,7 @@ mod tests {
         let builder = build_session_runtime(
             &state,
             ToolRegistry::default(),
+            std::sync::Arc::new(state.skills.clone()),
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
@@ -3739,6 +3818,7 @@ mod tests {
                 "---\nname: remote-skill\ndescription: from the wire\n---\n\nBody",
                 Vec::new(),
             )],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -3751,6 +3831,7 @@ mod tests {
         let builder = build_session_runtime(
             &state,
             ToolRegistry::default(),
+            std::sync::Arc::new(state.skills.clone()),
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
@@ -3791,6 +3872,7 @@ mod tests {
             slash_commands: Arc::new(Vec::new()),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
                 root.join("storage"),
             )),
@@ -3829,6 +3911,7 @@ mod tests {
         let builder = build_session_runtime(
             &state,
             crate::tools::build_standard_tools(tmp.path(), &[], 60),
+            std::sync::Arc::new(state.skills.clone()),
             "sys".to_string(),
             crate::system_prompt::PromptSegments::default(),
             16,
@@ -4011,6 +4094,7 @@ mod tests {
         let builder = build_session_runtime(
             &state,
             registry,
+            std::sync::Arc::new(state.skills.clone()),
             full,
             segments,
             16,
@@ -4163,6 +4247,7 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -4249,6 +4334,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_mirror_root: None,
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
@@ -4627,6 +4713,7 @@ mod tests {
             host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -4728,6 +4815,7 @@ mod tests {
             host,
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -5024,6 +5112,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -5079,6 +5168,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -5146,6 +5236,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_mirror_root: None,
@@ -5842,6 +5933,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-handlers-test-{}", std::process::id())),
@@ -6919,6 +7011,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: std::sync::Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir()
                     .join(format!("recursive-agui-seed-test-{}", std::process::id())),
@@ -7047,6 +7140,7 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-agui-cancel-{}", std::process::id())),
             )),
@@ -7153,6 +7247,7 @@ mod tests {
             )),
             rate_limiter: crate::http::RateLimiter::new(100, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(crate::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-agui-stream-{}", std::process::id())),
             )),
@@ -7252,6 +7347,7 @@ mod tests {
             slash_commands: Arc::new(vec![]),
             rate_limiter: crate::http::RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(crate::storage::LocalStorageBackend::new(dir.to_path_buf())),
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_mirror_root: None,

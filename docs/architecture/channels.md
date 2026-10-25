@@ -108,11 +108,27 @@ TUI 的双形态锚点以上表两个二进制为准。
   `for (k, v)` 原样透传零键名字面量；`TurnContext` / runtime / tool
   registry 一字不动——由 `tests/identity_opacity_contract.rs` 静态守卫
   钉死（红区 18 文件 + `src/agent/` 生产半区 `tenant|subject` 严格零命中
-  + `TurnContext` 13 字段快照）。W2（技能源 URL / 外呼 headers 按 labels
-  在 handler 层预展开）见 Goal 431，`expand_template` 已在边缘层就位。
+  + `TurnContext` 13 字段快照）。
+- **会话分区与外呼身份（Goal 431 / #244 W2）**：两个消费方在同一会话构建点
+  `AppState::session_tool_registry(&labels)` 消费 owner-tenant labels：
+  ①技能分区——`RECURSIVE_SKILL_SOURCE_URL` 支持 `{key}` 模板，按会话展开后
+  经既有 `HttpSkillSource` 校验拉取目录（缓存键=展开后的具体 URL，下层不见
+  标签键名），`LoadSkill` 与 runtime skill_index 都吃 per-session 目录；
+  无模板 URL 的部署零行为变化（启动期进程级目录即无 labels 时的回退形态，
+  文档于此写明）。②外呼身份——endpoints 文件新增可选 `headers` 键（对象，
+  值支持 `{key}` 模板；与 auth header 同名冲突 load 期拒绝），会话构建期经
+  `expand_template` 预展开成具体串替换 per-session `HttpCall`——工具只见
+  具体值，零键名语义（裁决②）。失败姿态均 fail-closed：模板缺键或拉取失败
+  → 会话创建 503，文案只含运算符模板与缺失键名、不含展开值（拍板点 4；
+  展开值属于会话自身的标签值，校验类拒绝只给摘要防 host 谕示）；非 serve
+  的 CLI 通道遇模板 headers → 启动 Err 命名端点+占位符（拍板点 5，
+  `cli::builder::ensure_endpoints_serve_ready`）；serve 启动对模板技能源/
+  模板端点各打一行 WARN 使语义可预见。a2a 不动（`auth` 参数层已合规，
+  身份值不走 prompt）；客户端请求体自定义 labels 不做（#146 约束 6：若做
+  须独立命名空间，另立单）。
 - **不支持清单**：次生产 ≠ 生产 SLA 承诺（宣称面已按本页对齐）；C 端
-  身份装配：W1 透传地基已落（上条），技能分区/外呼携带（#244 W2 →
-  Goal 431）未落，#146 P3 缓行、属主 #152——只指路，此处不展开不代做；
+  身份装配：透传地基/技能分区/外呼携带均已落（上两条，#146 §三 六条约束
+  全保留），#146 P3 缓行、属主 #152——只指路，此处不展开不代做；
   Redis session hot-state 不接入 `recursive http`（#92 方向已关）。
 
 ## 5. AG-UI — 次生产（随 HTTP）

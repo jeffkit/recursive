@@ -164,6 +164,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -226,6 +227,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -524,6 +526,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -606,6 +609,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -695,6 +699,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -913,6 +918,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -1281,6 +1287,7 @@ mod http_tests {
             slash_commands: Arc::new(Vec::new()),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: storage.clone(),
             agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             // Issue #121: no native session mirror for these fixtures.
@@ -5682,6 +5689,7 @@ mod http_tests {
             )),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("recursive-http-test-{}", std::process::id())),
             )),
@@ -6225,6 +6233,7 @@ pub(crate) mod trigger_endpoints {
             )),
             rate_limiter: RateLimiter::new(100, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage: Arc::new(recursive::storage::LocalStorageBackend::new(
                 std::env::temp_dir().join(format!("trig-test-{}", std::process::id())),
             )),

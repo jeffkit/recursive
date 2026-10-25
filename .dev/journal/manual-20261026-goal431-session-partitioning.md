@@ -1,0 +1,35 @@
+# 2026-10-26 — Goal 431 = #244 W2a+W2b 合发(技能租户分区 + 外呼携带身份)
+
+- **Date**: 2026-10-26(B2 修复席,主控 02:1x 轮值注入;基线 54892333 = 本席 W1)
+- **Goal**: 431(#244 W2a+W2b;#146 的两条消费诉求,落齐即 #146/#244 关单条件齐;规格 = ~/recovery-files/goal430.md「现状核查注记②③」「W2 插入点与签名」「拍板点 4/5」)
+- **Files touched**:
+  - `src/tools/http_call.rs` — W2b 工具层:`EndpointSpec.headers: Vec<(String,String)>`(新字段)+ `RawEndpoint.headers: Option<BTreeMap>`(serde 可选键,文档同步进模块头安全清单);`build_endpoint` load 期校验(空名/`HeaderValue` 非法字面值/与 auth_header 大小写不敏感冲突——reqwest `.header()` 追加不替换,双凭据必须 load 期拒);`expand_headers_with(expand: impl Fn(&str) -> Result<String,String>)` 闭包注入展开(工具层零键名知识;展开值再过 `HeaderValue` 校验=fail-closed 在 registry 构建期非线上);`has_template_placeholder` 语法检测(与 expand_template 文法同形:`{{`/`}}` 转义豁免、裸 `{`/`{}`/未闭合全算模板);`template_header_endpoints()` 供 CLI 启动 Err 与 serve WARN;`call()` 零语义循环逐个 `.header(k,v)`。
+  - `src/http/mod.rs` — W2a+W2b 边缘层:`SessionPartitioning`(Clone+Default:skill_sources/skills_base/catalog_cache/endpoints 四件套,AppState 单字段 `partitioning` 收拢——22 处 AppState 字面量每处一行);`SkillSourceTemplates{urls,allowed_hosts,pins}`(纯数据,env 解析留 CLI 侧);`session_tool_registry(&self, labels: &OpaqueLabels)`(规格写死签名落地):先 `session_skill_catalog`(缓存命中零网络)→ rebind(容器档吃 per-session 目录)→ endpoints 模板 headers 经 `expand_template` 预展开 `register_mut` 换装 HttpCall → per-session 目录 `register_mut` 换装 LoadSkill(register 按名替换=swap;catalog 空则 base 也不曾有 Skill 工具,无需 unregister)→ coordinator filter → allow-list 最后(#65 顺序不变);`session_skill_catalog`:urls 空=快路径回 `state.skills`(启动期进程级目录=无 labels 回退形态,文档写明),有模板则逐 URL 展开后 get-or-fetch(`HttpSkillSource` 既有校验链复用,缓存键=展开后具体 URL 下层不知键名);失败姿态拍板点 4:缺键 Err 命名模板+缺失键,fetch 失败 Disallowed 类只给摘要防 host 谕示(label 值进 host 时原文会回显,`Request` 类仍透传且全文把展开 URL 洗回模板),仅成功入缓存。
+  - `src/http/handlers.rs` — `session_labels`(W1 `turn_run_meta` 同款派生姿态:越界 WARN「session labels dropped (degradation)」后空 labels,消费端模板缺键自然 fail-closed);6 调用点接线:`run_agent`(签名加 `Option<Extension<AuthIdentity>>`,auth 关=单用户=无 labels)、`create_session`(identity=即将写入的 owner)、`fork_session`(fork owner=caller,#85)、`agui_run`(#152 线程属主=请求方 identity)、`build_session_runtime` 加 `skills: Arc<Vec<Skill>>` 参数(prompt 组装与 runtime catalog 都吃 per-session 目录);8 too_many_arguments allow(带理由注释,仓库先例)。
+  - `src/http/cold_load.rs` — 第 5 调用点(规格 4 点外新发现):labels 源=持久化 `meta.tenant`(owner 归属,与 may_access_session 同值),无 meta=空 labels=快路径。
+  - `src/http/triggers.rs` — 第 6 调用点:`fire_trigger`→`run_trigger_goal`→`one_shot_run` 传 `trigger.tenant`(工作归属=trigger owner;session 绑定路径复用建会话时的 runtime 不重建)。
+  - `crates/recursive-cli/src/cli/builder.rs` — `skill_source_templates()`(裸 env→纯数据零 I/O);`ensure_endpoints_serve_ready()`(拍板点 5:模板 headers 在非 serve 通道=启动 Err 命名端点+header+指路 `recursive http`);`build_runtime` 内接线(build_runtime 自调 build_tools,是所有 CLI 运行时通道的咽喉)。
+  - `crates/recursive-cli/src/main.rs` — serve 臂:capture `dir_skills`(merge 前目录目录=per-session 组成基)+ `skill_source_templates`/`endpoints` 进 AppState.partitioning;两条启动 WARN(模板技能源/模板端点,可预见性对齐 429 姿态);4 个非 serve 直建点(Tools/Run/run_loop/MCP stdio)各一行 ensure。
+  - `docs/architecture/channels.md` — §4 新增「会话分区与外呼身份(Goal 431/#244 W2)」条 + 不支持清单改「透传/技能分区/外呼携带均已落,#146 §三 六条全保留」。
+  - 测试字面量:`tests/http.rs`(9)/`tests/http_common/mod.rs`(3)/`tests/agui_e2e.rs`/`tests/v050_integration.rs` 各 AppState 字面量补 `partitioning: Default::default()`。
+- **Tests added**(+20:全仓 75 suites 5346→5366 passed,0 failed):
+  - http_call.rs 8 条:headers 可选默认空/排序+clone 保序/模板检测文法(转义豁免、`{}`与未闭合算模板)/auth 冲突 load 拒(含大小写)/控制字符 load 拒+空名拒/expand 替换+plain+转义保留+源 registry 不动/失败命名端点+header+缺键/展开值含控制字符拒且不含值/线上 verbatim(loopback mock 双 header 断言)。
+  - http/mod.rs 5 条:无模板源=启动目录快路径(labels 无关)/模板缺键 fail-closed 命名模板+`missing label \`tenant\``且零缓存写入/缓存键=展开 URL(acme 命中种子缓存组成 base+remote;other 键不同→allowlist 本地掐断→fail-closed,且错误不含 acme、不含展开 host)/registry 换装双断言(Skill+HttpCall 在场;无 labels 时 endpoint 扩展失败整场构建 Err 命名 endpoint+header+缺键)/plain headers 无 labels 直通。
+  - builder.rs 6 条:skill_source_templates 解析(EnvGuard #222)/未置空/ensure 拒模板命名端点+header+serve 指路/ensure 过 plain+缺文件良性/build_runtime 接线源码钉/main.rs 四直建点计数==4 且 serve 臂豁免源码钉。
+  - 负控实证 5 条(commit 前手涂→定向红→cp/cmp 逐字节还原,备份 /tmp/b2-backups/goal431/negctl/):
+    - NC-1 fetch fail-open(`unwrap_or_default`)=拍板点 4 被否姿态 → `session_catalog_cache_is_keyed...` 红 @3497;
+    - NC-2 缓存键换模板键 → 同测试红 @3503(acme 会话不再命中);
+    - NC-3 删 endpoints 换装块 → 两个 registry 测试双红(3556/3594);
+    - NC-4 删 build_runtime 接线行 → `build_runtime_wires_the_startup_template_check` 钉红(2386);
+    - NC-5 去 Disallowed 脱敏 → 红 @3515 且红文案自证泄漏形态:`skill source host 'other.skills-test.example' is not in the allowlist`(label 值在 host 里被原文回显——正是摘要要防的 host 谕示)。
+- **Notes**:
+  - 规格 4 调用点 → 实况 6(cold_load.rs:483、triggers.rs:618 是规格快照后的新增重建点,漏接=租户串号,全接)。
+  - **规格偏差①(收拢)**:AppState「新字段」落为单字段 `partitioning: SessionPartitioning`(四件套 Clone+Default)——22 处 AppState 字面量(生产 1+测试 21)每处一行,内含字段名与规格点名一一对应(skill_sources/skills_base/catalog_cache/endpoints)。
+  - **规格偏差②(加固)**:503 文案脱敏——拍板点 4「命名 URL 不记 tenant 值」:命名的是**运算符模板**(展开 URL 含标签值,绝不外流);HttpSkillSourceError::Disallowed 只给摘要(原文引 host=label 值进 host 时成租户名谕示),Request/Parse/Integrity 透传(构造上无 URL)且全文展开 URL→模板替换。NC-5 红文案存照。
+  - **规格偏差③(加固)**:非 serve 通道启动 Err 覆盖 `build_runtime` 内部(自调 build_tools 的咽喉,覆盖 Run/Repl/Loop/Resume/weixin)+ main.rs 四直建点;ACP 用 `ToolRegistry::local()` 不注册 HttpCall,模板到不了(核实)。工具执行期不加占位符扫描:`{{}}`→`{}` 合法字面值会误报,防线=构建期拒绝(启动 Err/serve 期会话构建 503)而非线上扫描。
+  - serve 期 startup registry 的 HttpCall 仍持 raw 模板=惰性(所有会话构建点走 session_tool_registry 换装,mod.rs 既有源码钉 + 本单 `(&labels)` 针更新共证);端点文件格式文档同步在 http_call.rs 模块头(仓库无独立 endpoints 操作文档,repo grep 实证)。
+  - **EnvGuard 自死锁复踩**(memory envlock-shadowing-self-deadlock 同型):`ensure_endpoints_serve_ready_passes_plain_headers_and_missing_files` 同线程连续两个 `EnvGuard::set`(第一个被遮蔽不提前 drop)→ 不可重入 crate 级 ENV_LOCK 自死锁,整测试进程挂起(采样实证:anthropic 既有测试阻塞在 `EnvGuard::lock`)。修复=第一把锁显式作用域;测试内已留注释。**测试挂死≠编译挂死:cargo test 卡住先 sample 测试进程找 ENV_LOCK,别杀 cargo 重试**。
+  - 红线自证:kernel.rs/runtime.rs/run_core.rs/agent/、tools/registry.rs/dispatch.rs/mod.rs/tool_identity.rs、a2a.rs(auth 参数层已合规不动)、load_skill.rs、skills.rs、observability/*、event.rs、mcp.rs(#209)、hardening.rs、agui_session.rs(#152)、.cargo/mutants.toml —— git diff 全空;改动仅 http_call.rs(规格点名)+ http 边缘三件 + CLI 装配。identity_opacity_contract 7/7 + tool_identity_contract 9/9(守卫自动抓红区)。
+  - #222:新测试触 env 全经 `EnvGuard`(builder.rs);mod.rs 会话测试零 env(skill_sources 结构体注入,缓存手动种子)。#224:零新增 `#[cfg(...)]`;两条源码钉 `include_str!` + `replace("\r\n","\n")` CRLF 中性。本地 mutants 未跑(§2b)。
+  - 三门无管道全绿:fmt --check EXIT=0 / clippy --workspace --all-targets --all-features -D warnings EXIT=0 / test --workspace EXIT=0(75 suites 5366 passed/0 failed)+ identity 7/7 + tool_identity 9/9。GitNexus 不可用 grep 代:session_tool_registry 全调用点 6(handlers 4+cold_load 1+triggers 1)+ mod.rs 测试 3;expand_headers_with/template_header_endpoints 调用点唯一(session_tool_registry/main.rs WARN/ensure);session_skill_catalog 调用点 6 处 handler+1 处 registry 内部。
+  - #244/#146 不关单不动标签(#152/#146 主控来);W2a/W2b 合发一 commit(共享 partitioning 管道,拆分省一次签名 churn 反而成真);未 push、未动 main,等主控验收。

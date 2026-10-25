@@ -28,7 +28,13 @@
 //!   the redirect hop that `url_guard`'s docs list as a known gap — a 3xx is
 //!   surfaced as an error instead of a second request to an unvalidated
 //!   host;
-//! - request/transport errors are reported without the request URL.
+//! - request/transport errors are reported without the request URL;
+//! - the optional per-endpoint `headers` map (Goal 431 / #244 W2b) sends
+//!   static operator headers on every call. Values may be `{key}` templates,
+//!   but expansion happens upstream at the HTTP edge, per session — on every
+//!   non-serve channel a template in the file is a startup error, and the
+//!   tool only ever transmits concrete values. A header colliding with the
+//!   endpoint's auth header is rejected at load time.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::header::HeaderValue;
 use reqwest::{Client, Method as HttpMethod};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -123,6 +130,15 @@ pub struct EndpointSpec {
     pub auth_env: Option<String>,
     pub auth_header: String,
     pub auth_prefix: String,
+    /// Goal 431 (#244 W2b): static operator headers, sent verbatim on every
+    /// call. Values may arrive as `{key}` templates from the endpoints file;
+    /// the embedding edge expands them **before** any registry reaches this
+    /// tool (`EndpointRegistry::expand_headers_with`), so what lands here is
+    /// always the concrete string — the tool carries names and values
+    /// without reading a single key. Load-time validation lives in
+    /// `EndpointRegistry::build_endpoint`; keys colliding with
+    /// `auth_header` are rejected there.
+    pub headers: Vec<(String, String)>,
     pub timeout: Duration,
     pub max_response_bytes: usize,
     /// Governs the single transport-failure retry.
@@ -145,6 +161,11 @@ struct RawEndpoint {
     auth_header: Option<String>,
     #[serde(default)]
     auth_prefix: Option<String>,
+    /// Optional static headers (`{"Name": "value or {key} template"}`).
+    /// Values are templates until the embedding edge expands them; see
+    /// [`EndpointSpec::headers`].
+    #[serde(default)]
+    headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -286,6 +307,11 @@ impl EndpointRegistry {
                 });
             }
         }
+        let auth_header = raw
+            .auth_header
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_AUTH_HEADER.to_string());
+        let headers = Self::validate_static_headers(name, raw.headers, &auth_header)?;
         Ok(EndpointSpec {
             name: name.to_string(),
             method,
@@ -293,14 +319,12 @@ impl EndpointRegistry {
             path_template: raw.path,
             description: raw.description,
             auth_env: raw.auth_env.filter(|s| !s.is_empty()),
-            auth_header: raw
-                .auth_header
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_AUTH_HEADER.to_string()),
+            auth_header,
             auth_prefix: raw
                 .auth_prefix
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| DEFAULT_AUTH_PREFIX.to_string()),
+            headers,
             timeout: Duration::from_millis(raw.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
             max_response_bytes: raw.max_response_bytes.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
             idempotent: raw
@@ -309,6 +333,123 @@ impl EndpointRegistry {
             allow_private: raw.allow_private,
         })
     }
+
+    /// Load-time validation for the optional `headers` map: names must be
+    /// non-empty and header-legal, values must be header-legal as written
+    /// (a literal CR/LF in the config is a config bug — templates are fine,
+    /// they expand to validated values later), and a header may not shadow
+    /// the endpoint's auth header (reqwest appends rather than replaces, so
+    /// a collision would send two credentials).
+    fn validate_static_headers(
+        name: &str,
+        headers: Option<BTreeMap<String, String>>,
+        auth_header: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let Some(headers) = headers else {
+            return Ok(Vec::new());
+        };
+        // BTreeMap iteration is sorted, so the wire order is deterministic.
+        let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
+        for (header_name, value) in headers {
+            if header_name.is_empty() {
+                return Err(Error::Config {
+                    message: format!("endpoint '{name}': header names must be non-empty"),
+                });
+            }
+            HeaderValue::from_str(&header_name).map_err(|e| Error::Config {
+                message: format!(
+                    "endpoint '{name}': header '{header_name}' is not a valid header name: {e}"
+                ),
+            })?;
+            HeaderValue::from_str(&value).map_err(|_| Error::Config {
+                message: format!(
+                    "endpoint '{name}': header '{header_name}' value contains characters \
+                     that are not allowed in an HTTP header (control characters are rejected; \
+                     escape literal braces as {{{{ and }}}})"
+                ),
+            })?;
+            if header_name.eq_ignore_ascii_case(auth_header) {
+                return Err(Error::Config {
+                    message: format!(
+                        "endpoint '{name}': header '{header_name}' collides with the auth header \
+                         ('{auth_header}'); remove one — reqwest would send both"
+                    ),
+                });
+            }
+            out.push((header_name, value));
+        }
+        Ok(out)
+    }
+
+    /// Goal 431 (#244 W2b): produce a registry whose static header values are
+    /// fully concrete. Every value goes through `expand` — the embedding edge
+    /// supplies the closure, so this layer never learns a single key name;
+    /// errors name the endpoint and the header, never a value. Expanded
+    /// values are re-validated as header values (fail-closed at registry
+    /// build time, not on the wire). Registries without headers pass through
+    /// unchanged.
+    pub fn expand_headers_with(
+        &self,
+        expand: impl Fn(&str) -> Result<String, String>,
+    ) -> Result<Self, String> {
+        let mut endpoints = self.endpoints.clone();
+        for (name, spec) in endpoints.iter_mut() {
+            if spec.headers.is_empty() {
+                continue;
+            }
+            let mut expanded = Vec::with_capacity(spec.headers.len());
+            for (header_name, template) in &spec.headers {
+                let value = expand(template)
+                    .map_err(|e| format!("endpoint '{name}': header '{header_name}': {e}"))?;
+                HeaderValue::from_str(&value).map_err(|_| {
+                    format!(
+                        "endpoint '{name}': header '{header_name}': expanded value is not a \
+                         valid header value"
+                    )
+                })?;
+                expanded.push((header_name.clone(), value));
+            }
+            spec.headers = expanded;
+        }
+        Ok(Self { endpoints })
+    }
+
+    /// Endpoints carrying unexpanded `{key}` header templates, as
+    /// `(endpoint, header)` pairs in registry order. The CLI startup path
+    /// turns the first pair into a hard error (a plain command has no
+    /// session labels to expand with); the HTTP serve path only warns,
+    /// because expansion happens per session there.
+    pub fn template_header_endpoints(&self) -> Vec<(String, String)> {
+        self.endpoints
+            .iter()
+            .flat_map(|(name, spec)| {
+                spec.headers
+                    .iter()
+                    .filter(|(_, value)| has_template_placeholder(value))
+                    .map(move |(header_name, _)| (name.clone(), header_name.clone()))
+            })
+            .collect()
+    }
+}
+
+/// Whether `value` contains anything `expand_template` would treat as a
+/// `{key}` placeholder: a `{` that opens a substitution (an escaped `{{` or a
+/// lone `}` is literal, mirroring the edge expander's own grammar — including
+/// its "unterminated `{…` is an error" rule).
+fn has_template_placeholder(value: &str) -> bool {
+    let mut rest = value;
+    while let Some(pos) = rest.find(['{', '}']) {
+        let tail = &rest[pos..];
+        if tail.starts_with("{{") || tail.starts_with("}}") {
+            rest = &tail[2..];
+            continue;
+        }
+        if tail.starts_with('{') {
+            return true;
+        }
+        rest = &tail[1..];
+    }
+    false
 }
 
 /// Load-time guard on an operator-configured base URL.
@@ -737,6 +878,12 @@ impl HttpCall {
         let url = Self::build_url(spec, &params)?;
 
         let mut builder = self.client.request(spec.method.http(), url);
+        // Static operator headers (Goal 431 / #244 W2b). The edge has already
+        // expanded any `{key}` templates (`expand_headers_with`), so this loop
+        // carries concrete names and values verbatim — no key is read here.
+        for (header_name, value) in &spec.headers {
+            builder = builder.header(header_name, value);
+        }
         if let Some(body) = args.get("body") {
             if !spec.method.accepts_body() {
                 return Err(Error::BadToolArgs {
@@ -1672,5 +1819,205 @@ mod tests {
         let names = placeholders("/api/orders/{order_id}/items/{sku}").expect("ok");
         assert_eq!(names, vec!["order_id", "sku"]);
         assert!(placeholders("/no/placeholders").expect("ok").is_empty());
+    }
+
+    // ── static headers (Goal 431 / #244 W2b) ────────────────────────────
+
+    fn registry_with_headers(headers: Value) -> Result<EndpointRegistry> {
+        EndpointRegistry::from_json(
+            &json!({ "endpoints": { "ep": {
+                "method": "GET",
+                "base_url": "http://127.0.0.1:8899",
+                "path": "/x",
+                "allow_private": true,
+                "headers": headers
+            }}})
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn headers_are_optional_and_default_to_empty() {
+        let reg = EndpointRegistry::from_json(&registry_json("http://127.0.0.1:8899", json!({})))
+            .expect("registry");
+        assert!(reg.get("get_order").expect("ep").headers.is_empty());
+        assert!(reg.template_header_endpoints().is_empty());
+    }
+
+    #[test]
+    fn headers_parse_sorted_and_survive_a_clone() {
+        let reg = registry_with_headers(json!({
+            "Zulu": "last", "Alpha": "first {k}", "Mike": "plain"
+        }))
+        .expect("headers are valid config");
+        let spec = reg.get("ep").expect("ep");
+        // BTreeMap → deterministic (sorted) wire order.
+        assert_eq!(
+            spec.headers,
+            vec![
+                ("Alpha".to_string(), "first {k}".to_string()),
+                ("Mike".to_string(), "plain".to_string()),
+                ("Zulu".to_string(), "last".to_string()),
+            ]
+        );
+        assert_eq!(
+            reg.template_header_endpoints(),
+            vec![("ep".to_string(), "Alpha".to_string())],
+            "only the value with a live placeholder is a template"
+        );
+    }
+
+    #[test]
+    fn header_template_detection_matches_the_edge_expander_grammar() {
+        // Escaped braces are literals and never flagged; a bare `{}` or an
+        // unterminated `{` IS flagged, because expand_template fails closed
+        // on both (this detector runs on raw operator config, before any
+        // expansion — literal brace output is produced from `{{`/`}}` input,
+        // which is not flagged).
+        let reg = registry_with_headers(json!({
+            "Literal": "a {{literal}} b {{}} tail",
+            "Plain": "no braces at all",
+            "Unterminated": "prefix {tenant",
+            "Empty": "{}",
+            "Real": "Bearer {token}"
+        }))
+        .expect("all values are header-legal");
+        assert_eq!(
+            reg.template_header_endpoints(),
+            vec![
+                ("ep".to_string(), "Empty".to_string()),
+                ("ep".to_string(), "Real".to_string()),
+                ("ep".to_string(), "Unterminated".to_string()),
+            ]
+        );
+        assert!(!has_template_placeholder(""));
+        assert!(!has_template_placeholder("}} stray close"));
+        assert!(!has_template_placeholder("a {{b}} c"));
+    }
+
+    #[test]
+    fn header_colliding_with_auth_header_is_rejected_at_load() {
+        for header in ["Authorization", "AUTHORIZATION", "authorization"] {
+            let err = registry_with_headers(json!({ header: "static" })).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("collides"), "{msg}");
+            assert!(msg.contains("'ep'"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn header_with_control_characters_is_rejected_at_load() {
+        let err = registry_with_headers(json!({ "X-A": "v1\r\nX-B: injected" })).unwrap_err();
+        assert!(
+            err.to_string().contains("not allowed in an HTTP header"),
+            "{err}"
+        );
+        // An empty header *name* is a config bug too.
+        let err = registry_with_headers(json!({ "": "v" })).unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err}");
+    }
+
+    #[test]
+    fn expand_headers_with_substitutes_and_keeps_plain_values() {
+        let reg = registry_with_headers(json!({
+            "X-Tenant": "acme-{k}",
+            "X-Static": "plain",
+            "X-Escaped": "{{kept}}"
+        }))
+        .expect("valid");
+        let expanded = reg
+            .expand_headers_with(|tpl| {
+                if tpl.contains("{k}") {
+                    Ok(tpl.replace("{k}", "7"))
+                } else {
+                    // Mimic the edge expander's escape rules for the literal.
+                    Ok(tpl.replace("{{", "{").replace("}}", "}"))
+                }
+            })
+            .expect("closure covers every placeholder");
+        assert_eq!(
+            expanded.get("ep").expect("ep").headers,
+            vec![
+                ("X-Escaped".to_string(), "{kept}".to_string()),
+                ("X-Static".to_string(), "plain".to_string()),
+                ("X-Tenant".to_string(), "acme-7".to_string()),
+            ]
+        );
+        // The source registry is untouched (expand takes &self); only the
+        // live placeholder is a template on the raw side.
+        assert_eq!(
+            reg.template_header_endpoints(),
+            vec![("ep".to_string(), "X-Tenant".to_string())],
+        );
+    }
+
+    #[test]
+    fn expand_headers_with_names_endpoint_and_header_on_failure() {
+        let reg = registry_with_headers(json!({ "X-A": "ok", "X-B": "needs-{k}" })).expect("valid");
+        let err = reg
+            .expand_headers_with(|tpl| {
+                if tpl.contains("{k}") {
+                    Err("template references missing label `k`".to_string())
+                } else {
+                    Ok(tpl.to_string())
+                }
+            })
+            .expect_err("missing key must fail closed");
+        assert!(err.contains("endpoint 'ep'"), "{err}");
+        assert!(err.contains("header 'X-B'"), "{err}");
+        assert!(err.contains("missing label `k`"), "{err}");
+    }
+
+    #[test]
+    fn expand_headers_with_rejects_a_value_that_expands_into_control_characters() {
+        let reg = registry_with_headers(json!({ "X-A": "v-{k}" })).expect("valid");
+        let err = reg
+            .expand_headers_with(|_| Ok("bad\r\ninjected".to_string()))
+            .expect_err("expanded injection must fail closed");
+        assert!(err.contains("not a valid header value"), "{err}");
+        assert!(err.contains("endpoint 'ep'"), "{err}");
+        assert!(!err.contains("bad\r\ninjected"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn static_headers_reach_the_wire_verbatim() {
+        let (addr, handle) =
+            spawn_mock("HTTP/1.1 200 OK".to_string(), r#"{"ok":true}"#.to_string());
+        let reg = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "get_order": {
+                "method": "GET",
+                "base_url": format!("http://{addr}"),
+                "path": "/api/orders/{order_id}",
+                "allow_private": true,
+                "headers": { "X-Trace-Id": "t-9", "X-Static-After-Expansion": "acme-7" }
+            }}})
+            .to_string(),
+        )
+        .expect("registry");
+        let expanded = reg
+            .expand_headers_with(|tpl| Ok(tpl.replace("{k}", "7")))
+            .expect("expand");
+        let tool = HttpCall::new(expanded).with_auth_resolver(|_| None);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"endpoint": "get_order", "params": {"order_id": "A"}})),
+        )
+        .await
+        .expect("no hang")
+        .expect("ok");
+        let captured = handle.join().expect("join");
+        assert!(
+            captured.headers.to_lowercase().contains("x-trace-id: t-9"),
+            "static header must reach the wire: {}",
+            captured.headers
+        );
+        assert!(
+            captured
+                .headers
+                .to_lowercase()
+                .contains("x-static-after-expansion: acme-7"),
+            "expanded header value must reach the wire: {}",
+            captured.headers
+        );
     }
 }

@@ -634,6 +634,44 @@ pub(crate) fn merge_remote_skills(dst: &mut Vec<Skill>, src: Vec<Skill>) -> usiz
     merged
 }
 
+/// Goal 431 (拍板点 5): endpoint header templates expand per session from
+/// opaque labels that only the HTTP serve channel has — a plain command has
+/// none, so an endpoints file carrying `{key}` header templates is unusable
+/// here and must fail at startup, naming the endpoint and the header
+/// (fail-closed, #146 constraint 5), never silently sending the raw
+/// template. Idempotent; a no-op when no endpoints file exists.
+pub(crate) fn ensure_endpoints_serve_ready(workspace: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(endpoints) = recursive::tools::EndpointRegistry::discover(workspace) {
+        if let Some((endpoint, header)) = endpoints.template_header_endpoints().into_iter().next() {
+            anyhow::bail!(
+                "endpoint '{endpoint}': header '{header}' contains a {{{{...}}}} template; \
+                 header templates are expanded per session and are only usable on the \
+                 HTTP serve channel ('recursive http') — this command has no session labels"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Goal 431 (#244 W2a): the raw skill-source configuration as written in the
+/// environment, before any expansion. The HTTP serve entry stores it on
+/// `AppState` so per-session catalogs can be expanded and fetched from the
+/// session's own labels; nothing here performs I/O.
+pub(crate) fn skill_source_templates() -> recursive::http::SkillSourceTemplates {
+    let raw = std::env::var("RECURSIVE_SKILL_SOURCE_URL").unwrap_or_default();
+    let urls: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .collect();
+    recursive::http::SkillSourceTemplates {
+        urls,
+        allowed_hosts: skill_source_allowed_hosts(),
+        pins: skill_source_sha256_pins(),
+    }
+}
+
 /// Decide whether the `http` serve entry re-registers `LoadSkill` over the
 /// merged catalog. Extracted from `main.rs` (issue #211) so the guard is
 /// truth-table testable: the inlined form carried three P2 mutation
@@ -795,6 +833,9 @@ pub(crate) async fn build_runtime(
     };
     let provider = build_llm_provider(config, api_key, retry, Some(config.max_search_rounds))?;
     let (tools, read_state) = build_tools(config, None).await;
+    // Goal 431 (拍板点 5): every CLI runtime channel fails closed on
+    // endpoint header templates (only `recursive http` can expand them).
+    ensure_endpoints_serve_ready(&config.workspace)?;
     // Issue #127: the session's agent preset is the single assembly point for
     // context management (compactor / microcompactor / transcript cap),
     // post-compaction re-injection and the plan-mode tool gate. It is resolved
@@ -2249,5 +2290,159 @@ done
             request_line.contains("/v1/messages"),
             "an anthropic config must POST to /v1/messages, got {request_line:?}"
         );
+    }
+    // ── Goal 431 (#244 W2a/W2b): startup template posture ────────────────
+
+    #[test]
+    fn skill_source_templates_parses_the_raw_environment_without_io() {
+        let _env = EnvGuard::set(&[
+            (
+                "RECURSIVE_SKILL_SOURCE_URL",
+                Some("https://skills.example/{tenant}/idx.json, https://static.example/x.json"),
+            ),
+            ("RECURSIVE_SKILL_SOURCE_HOSTS", Some("skills.example")),
+            ("RECURSIVE_SKILL_SOURCE_SHA256", Some("pin-a,pin-b")),
+        ]);
+        let templates = skill_source_templates();
+        assert_eq!(
+            templates.urls,
+            vec![
+                "https://skills.example/{tenant}/idx.json".to_string(),
+                "https://static.example/x.json".to_string(),
+            ]
+        );
+        assert!(templates.has_templates(), "the first URL is a template");
+        assert_eq!(
+            templates.allowed_hosts,
+            Some(vec!["skills.example".to_string()])
+        );
+        assert_eq!(
+            templates.pins,
+            vec!["pin-a".to_string(), "pin-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn skill_source_templates_is_empty_when_unset() {
+        let _env = EnvGuard::set(&[
+            ("RECURSIVE_SKILL_SOURCE_URL", None),
+            ("RECURSIVE_SKILL_SOURCE_HOSTS", None),
+            ("RECURSIVE_SKILL_SOURCE_SHA256", None),
+        ]);
+        let templates = skill_source_templates();
+        assert!(templates.urls.is_empty());
+        assert!(!templates.has_templates());
+        assert_eq!(templates.allowed_hosts, None);
+        assert!(templates.pins.is_empty());
+    }
+
+    fn write_endpoints_file(body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "recursive-431-endpoints-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("endpoints.json");
+        std::fs::write(&path, body).expect("write");
+        path
+    }
+
+    #[test]
+    fn ensure_endpoints_serve_ready_rejects_template_headers_naming_endpoint_and_header() {
+        let path = write_endpoints_file(
+            r#"{"endpoints": {"biz": {
+                "method": "GET",
+                "base_url": "https://biz.example.test",
+                "path": "/v1/x",
+                "headers": {"X-Session": "{tenant}", "X-Ok": "plain"}
+            }}}"#,
+        );
+        let _env = EnvGuard::set(&[(
+            "RECURSIVE_ENDPOINTS_FILE",
+            Some(path.to_str().expect("utf8")),
+        )]);
+        let err = ensure_endpoints_serve_ready(std::path::Path::new("."))
+            .expect_err("a plain command cannot expand header templates");
+        let msg = err.to_string();
+        assert!(msg.contains("endpoint 'biz'"), "{msg}");
+        assert!(msg.contains("header 'X-Session'"), "{msg}");
+        assert!(msg.contains("HTTP serve channel"), "{msg}");
+    }
+
+    /// The unit tests above call the helper directly; this one pins the
+    /// *wiring*: `build_runtime` self-builds tools, so the check must sit
+    /// inside it or every build_runtime-based channel silently regresses to
+    /// sending raw templates (Goal 429 source-pin precedent).
+    #[test]
+    fn build_runtime_wires_the_startup_template_check() {
+        let src = include_str!("builder.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub(crate) async fn build_runtime")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub(crate) ").next())
+            .expect("build_runtime must exist");
+        assert!(
+            body.contains("ensure_endpoints_serve_ready(&config.workspace)?"),
+            "build_runtime must fail closed on endpoint header templates \
+             (only `recursive http` can expand them per session)"
+        );
+    }
+
+    /// main.rs has four direct `build_tools` sites outside `build_runtime`
+    /// (Tools / Run / run_loop / MCP stdio): each must fail closed. The
+    /// serve arm must NOT — per-session expansion is the feature there.
+    #[test]
+    fn every_non_serve_build_tools_site_fails_closed_on_template_headers() {
+        let src = include_str!("../main.rs").replace("\r\n", "\n");
+        let sites = src
+            .matches("cli::builder::ensure_endpoints_serve_ready(&config.workspace)?;")
+            .count();
+        assert_eq!(
+            sites, 4,
+            "each non-serve build_tools site (Tools / Run / run_loop / MCP stdio) \
+             must fail closed on endpoint header templates"
+        );
+        let serve_arm = src
+            .split("Cmd::Http { addr } => {")
+            .nth(1)
+            .and_then(|rest| rest.split("Cmd::Run { goal } => {").next())
+            .expect("serve arm must exist");
+        assert!(
+            !serve_arm.contains("ensure_endpoints_serve_ready"),
+            "the serve arm must not reject template headers — it expands them \
+             per session instead (Goal 431 W2b)"
+        );
+    }
+
+    #[test]
+    fn ensure_endpoints_serve_ready_passes_plain_headers_and_missing_files() {
+        let path = write_endpoints_file(
+            r#"{"endpoints": {"biz": {
+                "method": "GET",
+                "base_url": "https://biz.example.test",
+                "path": "/v1/x",
+                "headers": {"X-Static": "concrete"}
+            }}}"#,
+        );
+        // Scope the first guard: EnvGuard wraps a plain (non-reentrant)
+        // Mutex, so a second guard must not be created while this one is
+        // alive — even shadowed, the binding only drops at scope end
+        // (issue #222 family: self-deadlock on the crate-wide env lock).
+        {
+            let _env = EnvGuard::set(&[(
+                "RECURSIVE_ENDPOINTS_FILE",
+                Some(path.to_str().expect("utf8")),
+            )]);
+            ensure_endpoints_serve_ready(std::path::Path::new("."))
+                .expect("concrete headers are usable on every channel");
+        }
+        // No file at all: benign.
+        let _env = EnvGuard::set(&[("RECURSIVE_ENDPOINTS_FILE", Some("/nonexistent/431/e.json"))]);
+        ensure_endpoints_serve_ready(std::path::Path::new("."))
+            .expect("a missing endpoints file is not a startup error");
     }
 }

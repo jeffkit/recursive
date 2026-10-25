@@ -484,8 +484,13 @@ async fn fire_trigger(
         }
     }
 
-    let (session_id, outcome_text, finish_reason) =
-        run_trigger_goal(state, trigger.session_id.as_deref(), &goal).await;
+    let (session_id, outcome_text, finish_reason) = run_trigger_goal(
+        state,
+        trigger.session_id.as_deref(),
+        trigger.tenant.as_deref(),
+        &goal,
+    )
+    .await;
 
     // Record + notify. Webhooks stamp last_result here too (they are not
     // scheduler-advanced) so GET /triggers shows delivery outcome.
@@ -556,8 +561,14 @@ fn stamp_result(s: TriggerStore, trigger: &Trigger, result: String) {
 async fn run_trigger_goal(
     state: &Arc<AppState>,
     session_id: Option<&str>,
+    tenant: Option<&str>,
     goal: &str,
 ) -> (String, Option<String>, String) {
+    // Goal 431 (#244 W2a): the work belongs to the trigger's owner, so the
+    // one-shot catalog is partitioned by the trigger's own labels. (The
+    // session-bound path reuses the session's runtime, which was already
+    // partitioned at creation.)
+    let labels = super::handlers::session_labels(tenant);
     match session_id {
         Some(id) => {
             match super::cold_load::get_or_load_session(state, id, &AuthIdentity::local()).await {
@@ -568,11 +579,11 @@ async fn run_trigger_goal(
                         error = %e.message,
                         "trigger: configured session unavailable; falling back to one-shot run"
                     );
-                    one_shot_run(state, goal).await
+                    one_shot_run(state, goal, &labels).await
                 }
             }
         }
-        None => one_shot_run(state, goal).await,
+        None => one_shot_run(state, goal, &labels).await,
     }
 }
 
@@ -604,18 +615,26 @@ async fn run_in_session(
 /// One-shot run for triggers without a session. The transcript is
 /// persisted under a deterministic `trigger-<id>-<timestamp>` key so
 /// post-hoc inspection works; the in-memory session is not registered.
-async fn one_shot_run(state: &Arc<AppState>, goal: &str) -> (String, Option<String>, String) {
+async fn one_shot_run(
+    state: &Arc<AppState>,
+    goal: &str,
+    labels: &super::labels::OpaqueLabels,
+) -> (String, Option<String>, String) {
     let _permit = match super::handlers::acquire_run_timed(state).await {
         Ok(p) => p,
         Err(e) => return (String::new(), None, format!("admission failed: {e:?}")),
     };
+    let skills = match state.session_skill_catalog(labels).await {
+        Ok(s) => s,
+        Err(e) => return (String::new(), None, format!("skill catalog failed: {e}")),
+    };
     let assembled = crate::assemble_system_prompt(
         &state.config.system_prompt,
         &state.config.workspace,
-        &state.skills,
+        &skills,
         state.config.subagent_enabled,
     );
-    let tool_registry = match state.session_tool_registry().await {
+    let tool_registry = match state.session_tool_registry(labels).await {
         Ok(r) => r,
         Err(e) => {
             return (String::new(), None, format!("registry build failed: {e}"));
@@ -640,7 +659,7 @@ async fn one_shot_run(state: &Arc<AppState>, goal: &str) -> (String, Option<Stri
         prompt_segments,
         state.config.max_steps,
         &preset,
-        state.skills.clone(),
+        skills.as_ref().clone(),
         super::handlers::HTTP_CHANNEL,
     )
     .llm(state.provider.clone())

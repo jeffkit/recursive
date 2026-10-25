@@ -810,7 +810,22 @@ pub struct AppState {
     pub rate_limiter: RateLimiter,
     /// Discovered skills for skill_index injection into the system prompt.
     /// Empty if no skills found. Goal-312.
+    ///
+    /// Goal 431 (#244 W2a): this is the **startup pose** — the merged
+    /// (directory + service-level) catalog captured when the server booted.
+    /// Session runtimes must NOT consume it directly: the per-session catalog
+    /// comes from [`AppState::session_skill_catalog`], which partitions the
+    /// service-level half by the session's opaque labels. Kept for startup
+    /// surfaces (`/skills`, prompt assembly for sessions on deployments with
+    /// no templated skill sources) and as the no-labels fallback form.
     pub skills: Vec<crate::skills::Skill>,
+    /// Goal 431 (#244 W2a/W2b): everything a session build resolves *per
+    /// session* from the owner's opaque labels — raw skill-source URL
+    /// templates, the directory-only catalog base, the expanded-URL catalog
+    /// cache and the raw endpoint registry. Default is the legacy posture:
+    /// no templated sources, no endpoint registry, sessions share the
+    /// startup catalog unchanged.
+    pub partitioning: SessionPartitioning,
     /// Goal 396: shared transcript persistence backend. Chosen once at HTTP
     /// startup by [`crate::storage::http_storage_backend`] — `S3StorageBackend`
     /// when `RECURSIVE_S3_BUCKET` is set and the `cloud-runtime` feature is
@@ -854,6 +869,71 @@ pub struct ToolInfo {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+/// Goal 431 (#244 W2a/W2b): the per-session resolution inputs behind
+/// [`AppState::partitioning`].
+///
+/// - `skill_sources`: raw, **unexpanded** skill-source configuration as
+///   captured from the environment at startup (`RECURSIVE_SKILL_SOURCE_URL`
+///   / `_HOSTS` / `_SHA256`). The URLs are operator templates (`{key}`
+///   placeholders allowed); expansion happens per session in
+///   [`AppState::session_skill_catalog`] and nowhere else. Held as plain
+///   data so the serving edge (which parses the env once, in the CLI
+///   builder) can hand it to [`AppState`] without the server re-reading a
+///   mutable environment later.
+/// - `skills_base`: the directory-discovered catalog **before** the startup
+///   service-level merge — the base every per-session catalog composes from
+///   (`base` + per-expanded-URL fetches).
+/// - `catalog_cache`: per-session skill catalogs keyed by the **expanded**
+///   concrete URL — the cache never sees a label key, only its resolved
+///   value, so lower layers stay identity-blind (owner ruling: not
+///   `(tenant, url)`, just the URL the session will fetch).
+/// - `endpoints`: the raw endpoint registry (headers may still carry
+///   `{key}` templates) for per-session expansion in
+///   [`AppState::session_tool_registry`]. `None` = no endpoints file. The
+///   startup registry's own `HttpCall` keeps the raw templates and is
+///   inert: every session build point swaps in the expanded instance before
+///   any tool can execute (pinned by the `session_tool_registry` source
+///   tests).
+#[derive(Clone, Default)]
+pub struct SessionPartitioning {
+    /// Raw skill-source URL templates, positionally paired with `pins`.
+    pub skill_sources: SkillSourceTemplates,
+    /// Directory-only skill catalog (pre service-level merge).
+    pub skills_base: Vec<crate::skills::Skill>,
+    /// Successful fetches keyed by the expanded concrete URL.
+    pub catalog_cache: Arc<std::sync::Mutex<HashMap<String, Arc<Vec<crate::skills::Skill>>>>>,
+    /// Raw endpoint registry for per-session header expansion.
+    pub endpoints: Option<crate::tools::EndpointRegistry>,
+}
+
+/// Goal 431 (#244 W2a): raw, **unexpanded** skill-source configuration as
+/// captured from the environment at startup. The URLs are operator templates
+/// (`{key}` placeholders allowed); expansion happens per session in
+/// [`AppState::session_skill_catalog`] and nowhere else. Held as plain data
+/// so the serving edge (which parses the env once, in the CLI builder) can
+/// hand it to [`AppState`] without the server re-reading a mutable
+/// environment later.
+#[derive(Debug, Clone, Default)]
+pub struct SkillSourceTemplates {
+    /// Raw URL templates, positionally paired with [`Self::pins`].
+    pub urls: Vec<String>,
+    /// Host allowlist (`RECURSIVE_SKILL_SOURCE_HOSTS`), applied to every
+    /// expanded URL by [`crate::skills::HttpSkillSource`].
+    pub allowed_hosts: Option<Vec<String>>,
+    /// Positional SHA-256 pins over the exact index body
+    /// (`RECURSIVE_SKILL_SOURCE_SHA256`).
+    pub pins: Vec<String>,
+}
+
+impl SkillSourceTemplates {
+    /// Whether any URL carries a `{key}` template. A deployment whose URLs
+    /// are all concrete keeps today's process-level catalog semantics
+    /// (sessions fetch through the same cache, keyed by the unchanged URL).
+    pub fn has_templates(&self) -> bool {
+        self.urls.iter().any(|u| u.contains('{'))
+    }
 }
 
 /// Goal 403 (issue §3): construct the container environment **per session**.
@@ -924,7 +1004,10 @@ impl AppState {
     /// path this is an idempotent re-filter. MCP tools survive the rebuild:
     /// `rebind_per_session_registry` re-attaches the process-wide MCP tools
     /// to the fresh container registry before the surface filters run.
-    pub async fn session_tool_registry(&self) -> Result<ToolRegistry, String> {
+    pub async fn session_tool_registry(
+        &self,
+        labels: &OpaqueLabels,
+    ) -> Result<ToolRegistry, String> {
         // Issue #134 review: each session gets its OWN permission-hook slot.
         // On the clone path the registry would otherwise share the
         // process-wide base's slot, so a request-scoped hook — AG-UI installs
@@ -933,15 +1016,118 @@ impl AppState {
         // in every later session. Views of THIS session (e.g. `run_code`'s
         // invoker registry) still share the slot, so a late install reaches
         // them.
-        let mut registry =
-            rebind_per_session_registry(&self.tool_registry, &self.config, &self.skills)
-                .await?
-                .isolate_permission_hook();
+        //
+        // Goal 431 (#244 W2a/W2b): the two identity-shaped consumers resolve
+        // here, at the serving edge, before the registry ever reaches a
+        // session — the tool layer only ever sees concrete values (the
+        // per-session skill catalog and endpoint headers already expanded
+        // from operator templates through `expand_template`). Expansion is
+        // fail-closed: a template whose label the session does not carry
+        // fails the whole session build (503 at the handler).
+        let skills = self.session_skill_catalog(labels).await?;
+        let mut registry = rebind_per_session_registry(&self.tool_registry, &self.config, &skills)
+            .await?
+            .isolate_permission_hook();
+        // W2b: swap the shared `HttpCall` (whose headers may still be
+        // operator templates) for this session's fully expanded instance.
+        // `register` replaces by tool name, so this is a swap, not a
+        // duplicate; the allow-list filter below stays the last word
+        // (issue #65).
+        if let Some(raw) = &self.partitioning.endpoints {
+            let expanded = raw
+                .expand_headers_with(|template| {
+                    expand_template(template, labels).map_err(|e| e.to_string())
+                })
+                .map_err(|e| format!("endpoint headers unavailable for this session: {e}"))?;
+            registry.register_mut(Arc::new(crate::tools::HttpCall::new(expanded)));
+        }
+        // W2a: replace the process-level `LoadSkill` with the per-session
+        // catalog. Same swap-by-name contract as the serve entry's startup
+        // re-registration; when the catalog is empty the base registry never
+        // carried a `Skill` tool for it either (both come from the same
+        // directory discovery), so there is nothing stale to remove.
+        if !skills.is_empty() {
+            registry.register_mut(Arc::new(crate::tools::load_skill::LoadSkill::new(
+                skills.as_ref().clone(),
+            )));
+        }
         crate::coordinator::filter_registry(&mut registry);
         if !self.config.allow_tools.is_empty() {
             registry.retain_tools(&self.config.allow_tools);
         }
         Ok(registry)
+    }
+
+    /// Goal 431 (#244 W2a): the skill catalog a NEW session should run with.
+    ///
+    /// Deployments without templated skill sources (the default) get the
+    /// startup catalog unchanged — this is the documented process-level
+    /// fallback form. With `skill_sources.urls` present, each template is
+    /// expanded through the session's opaque labels and the concrete URL is
+    /// fetched (once per process, cached by the expanded URL) via the same
+    /// [`crate::skills::HttpSkillSource`] validation the startup path uses.
+    /// Failure posture is fail-closed (owner 拍板点 4): a missing label or a
+    /// failed fetch is an `Err` naming the operator template — the 503 must
+    /// not carry the expanded URL, because it embeds the label values.
+    pub async fn session_skill_catalog(
+        &self,
+        labels: &OpaqueLabels,
+    ) -> Result<Arc<Vec<crate::skills::Skill>>, String> {
+        let sources = &self.partitioning.skill_sources;
+        if sources.urls.is_empty() {
+            return Ok(Arc::new(self.skills.clone()));
+        }
+        let mut catalog = self.partitioning.skills_base.clone();
+        for (i, template) in sources.urls.iter().enumerate() {
+            let expanded = expand_template(template, labels).map_err(|e| {
+                format!("skill source '{template}' cannot be resolved for this session: {e}")
+            })?;
+            let cached = self
+                .partitioning
+                .catalog_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&expanded)
+                .cloned();
+            let skills = match cached {
+                Some(skills) => skills,
+                None => {
+                    let mut source = crate::skills::HttpSkillSource::new(
+                        &expanded,
+                        sources.allowed_hosts.clone(),
+                    );
+                    if let Some(pin) = sources.pins.get(i) {
+                        source = source.with_pinned_sha256(pin.clone());
+                    }
+                    let fetched = Arc::new(source.load_skills().map_err(|e| {
+                        // The 503 may embed this text; label values live in
+                        // the expanded URL, so local-validation rejections
+                        // (which quote the expanded host) are summarized
+                        // instead of forwarded — an operator reproduces them
+                        // at startup, and the session keeps its tenant-name
+                        // oracle. Transport errors carry no URL by
+                        // construction; a stray expanded URL is still
+                        // scrubbed back to the template.
+                        let detail = match &e {
+                            crate::skills::HttpSkillSourceError::Disallowed(_) => {
+                                "rejected by local validation (https scheme / host allowlist)"
+                                    .to_string()
+                            }
+                            _ => e.to_string().replace(&expanded, template),
+                        };
+                        format!("skill source '{template}' failed: {detail}")
+                    })?);
+                    self.partitioning
+                        .catalog_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(expanded, fetched.clone());
+                    fetched
+                }
+            };
+            catalog.extend(skills.iter().cloned());
+        }
+        Ok(Arc::new(catalog))
     }
 }
 
@@ -3129,6 +3315,7 @@ mod goal_396_persistence_tests {
             slash_commands: Arc::new(Vec::new()),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_mirror_root,
@@ -3157,12 +3344,16 @@ mod goal_396_persistence_tests {
             slash_commands: Arc::new(Vec::new()),
             rate_limiter: RateLimiter::new(10, 1.0),
             skills: vec![],
+            partitioning: Default::default(),
             storage,
             agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_mirror_root: None,
         };
 
-        let registry = state.session_tool_registry().await.expect("registry");
+        let registry = state
+            .session_tool_registry(&OpaqueLabels::default())
+            .await
+            .expect("registry");
         assert!(
             registry.find_by_name("Read").is_some(),
             "allow-listed tools must survive"
@@ -3187,7 +3378,10 @@ mod goal_396_persistence_tests {
         let state = test_state(test_host(0), RecordingStorage::new(), None).await;
         let base = state.tool_registry.clone();
 
-        let mut first = state.session_tool_registry().await.expect("registry");
+        let mut first = state
+            .session_tool_registry(&OpaqueLabels::default())
+            .await
+            .expect("registry");
         first.set_permission_hook(Arc::new(crate::tools::registry::PermissionHookDisabled));
         assert!(first.permission_hook().is_some());
 
@@ -3195,7 +3389,10 @@ mod goal_396_persistence_tests {
             base.permission_hook().is_none(),
             "a request-scoped hook must not leak into the process-wide base"
         );
-        let second = state.session_tool_registry().await.expect("registry");
+        let second = state
+            .session_tool_registry(&OpaqueLabels::default())
+            .await
+            .expect("registry");
         assert!(
             second.permission_hook().is_none(),
             "a request-scoped hook must not leak into the next session"
@@ -3213,6 +3410,202 @@ mod goal_396_persistence_tests {
             first.permission_hook().is_none(),
             "the session and its views must share the slot"
         );
+    }
+
+    // ── Goal 431 (#244 W2a/W2b): per-session partitioning ────────────────
+    //
+    // No network in these tests: the cache is seeded with the *expanded*
+    // URL as key (which is the contract under test — the cache never sees
+    // a label key), and fetch attempts that would leave the process are
+    // cut off by the host allowlist, failing closed before any I/O.
+
+    fn partitioned_state() -> SkillSourceTemplates {
+        SkillSourceTemplates {
+            // The label value lands in the HOST, so a raw validation error
+            // would quote it — the fixtures below pin the scrub.
+            urls: vec!["https://{tenant}.skills-test.example/idx.json".to_string()],
+            // Does not cover the expanded hosts, so an un-cached expanded
+            // URL fails validation locally — no request is ever issued.
+            allowed_hosts: Some(vec!["mock.skills.test".to_string()]),
+            pins: vec![],
+        }
+    }
+
+    fn remote_skill_fixture(name: &str) -> crate::skills::Skill {
+        crate::skills::skill_from_content(
+            name,
+            &format!("---\nname: {name}\ndescription: per-session\n---\n\nBody"),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_catalog_without_templated_sources_is_the_startup_catalog() {
+        let state = test_state(test_host(0), RecordingStorage::new(), None).await;
+        let catalog = state
+            .session_skill_catalog(&OpaqueLabels::default())
+            .await
+            .expect("no sources = nothing to partition");
+        assert!(catalog.is_empty());
+        // The owner's labels are irrelevant on this deployment shape.
+        let labelled = OpaqueLabels::try_from_pairs([("tenant", "acme")]).expect("valid");
+        let again = state
+            .session_skill_catalog(&labelled)
+            .await
+            .expect("still the fast path");
+        assert_eq!(again.len(), state.skills.len());
+    }
+
+    #[tokio::test]
+    async fn session_catalog_fails_closed_when_a_template_needs_a_missing_label() {
+        let mut state = test_state(test_host(0), RecordingStorage::new(), None).await;
+        state.partitioning.skill_sources = partitioned_state();
+        // A session with no tenant cannot resolve the template — creation
+        // fails closed naming the operator template and the missing key,
+        // never a partially-populated catalog.
+        let err = state
+            .session_skill_catalog(&OpaqueLabels::default())
+            .await
+            .expect_err("missing key must fail closed");
+        assert!(
+            err.contains("https://{tenant}.skills-test.example/idx.json"),
+            "{err}"
+        );
+        assert!(err.contains("missing label `tenant`"), "{err}");
+        // Nothing was fetched, so nothing is cached.
+        assert!(state
+            .partitioning
+            .catalog_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_catalog_cache_is_keyed_by_the_expanded_url_not_the_label() {
+        let mut state = test_state(test_host(0), RecordingStorage::new(), None).await;
+        state.partitioning.skill_sources = partitioned_state();
+        state.partitioning.skills_base = vec![remote_skill_fixture("dir-skill")];
+        let acme_url = "https://acme.skills-test.example/idx.json";
+        state
+            .partitioning
+            .catalog_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                acme_url.to_string(),
+                Arc::new(vec![remote_skill_fixture("acme-only")]),
+            );
+
+        // Session carrying tenant=acme: the expansion hits the seeded cache
+        // (no network), and the catalog is base + the per-URL fetch.
+        let acme = OpaqueLabels::try_from_pairs([("tenant", "acme")]).expect("valid");
+        let catalog = state.session_skill_catalog(&acme).await.expect("cache hit");
+        let names: Vec<&str> = catalog.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["dir-skill", "acme-only"]);
+
+        // A different tenant expands to a different key → cache miss → the
+        // allowlist cuts the fetch off locally → fail-closed. acme's catalog
+        // must never serve another session.
+        let other = OpaqueLabels::try_from_pairs([("tenant", "other")]).expect("valid");
+        let err = state
+            .session_skill_catalog(&other)
+            .await
+            .expect_err("cross-tenant key must not hit acme's cache entry");
+        assert!(
+            !err.contains("acme"),
+            "the failure must not carry the other session's expanded URL: {err}"
+        );
+        // The label value itself rode into the expanded host; the
+        // local-validation summary must not echo it back.
+        assert!(
+            !err.contains("other.skills-test.example"),
+            "the failure must not quote the expanded host: {err}"
+        );
+        assert!(err.contains("rejected by local validation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn session_registry_swaps_in_the_per_session_skill_tool_and_expanded_httpcall() {
+        let mut state = test_state(test_host(0), RecordingStorage::new(), None).await;
+        state.partitioning.skill_sources = partitioned_state();
+        state.partitioning.skills_base = vec![remote_skill_fixture("dir-skill")];
+        state
+            .partitioning
+            .catalog_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "https://acme.skills-test.example/idx.json".to_string(),
+                Arc::new(vec![remote_skill_fixture("acme-only")]),
+            );
+        state.partitioning.endpoints = Some(
+            crate::tools::EndpointRegistry::from_json(
+                &serde_json::json!({ "endpoints": { "biz": {
+                    "method": "GET",
+                    "base_url": "https://biz.example.test",
+                    "path": "/v1/x",
+                    "headers": { "X-Static": "acme-7", "X-Session": "{tenant}" }
+                }}})
+                .to_string(),
+            )
+            .expect("endpoint registry"),
+        );
+
+        let acme = OpaqueLabels::try_from_pairs([("tenant", "acme")]).expect("valid");
+        let registry = state
+            .session_tool_registry(&acme)
+            .await
+            .expect("cache-seeded catalog + expandable headers");
+        assert!(
+            registry.find_by_name("Skill").is_some(),
+            "the per-session catalog must ride in as a Skill tool"
+        );
+        assert!(
+            registry.find_by_name("HttpCall").is_some(),
+            "the expanded HttpCall replaces the shared instance"
+        );
+
+        // No labels + a templated header → the endpoint expansion fails the
+        // whole session build, naming endpoint and header (never a value).
+        // (The templated skill sources are cleared so the catalog takes the
+        // fast path and the endpoint expansion is the failure under test.)
+        state.partitioning.skill_sources.urls = Vec::new();
+        let err = match state.session_tool_registry(&OpaqueLabels::default()).await {
+            Err(err) => err,
+            Ok(_) => panic!("missing label must fail the session build closed"),
+        };
+        assert!(err.contains("endpoint 'biz'"), "{err}");
+        assert!(err.contains("header 'X-Session'"), "{err}");
+        assert!(err.contains("missing label `tenant`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn session_registry_passes_plain_endpoint_headers_through_unlabelled() {
+        let mut state = test_state(test_host(0), RecordingStorage::new(), None).await;
+        state.partitioning.endpoints = Some(
+            crate::tools::EndpointRegistry::from_json(
+                &serde_json::json!({ "endpoints": { "biz": {
+                    "method": "GET",
+                    "base_url": "https://biz.example.test",
+                    "path": "/v1/x",
+                    "headers": { "X-Static": "concrete" }
+                }}})
+                .to_string(),
+            )
+            .expect("endpoint registry"),
+        );
+        let registry = state
+            .session_tool_registry(&OpaqueLabels::default())
+            .await
+            .expect("headers without templates need no labels");
+        assert!(registry.find_by_name("HttpCall").is_some());
+        // The startup catalog rides in unchanged on the fast path.
+        assert!(state
+            .session_skill_catalog(&OpaqueLabels::default())
+            .await
+            .expect("fast path")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3708,9 +4101,10 @@ mod goal_403_http_sandbox_entry {
              per session, issue §3)"
         );
         assert!(
-            src.contains("state\n        .session_tool_registry()\n        .await"),
-            "per-session runtimes must be built from session_tool_registry() \
-             (issue #31 made it async/Result-shaped)"
+            src.contains("state\n        .session_tool_registry(&labels)\n        .await"),
+            "per-session runtimes must be built from session_tool_registry(&labels) \
+             (issue #31 made it async/Result-shaped; Goal 431 added the opaque \
+             labels that partition skills and expand endpoint headers)"
         );
         // Issue #31: the Result-shaped registry build must NOT fall back to
         // the shared startup registry on failure — container-tier failures

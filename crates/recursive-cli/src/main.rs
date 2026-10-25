@@ -880,6 +880,7 @@ async fn async_main() -> anyhow::Result<()> {
 
         Cmd::Tools => {
             let (tools, _) = cli::builder::build_tools(&config, None).await;
+            cli::builder::ensure_endpoints_serve_ready(&config.workspace)?;
             let specs = tools.specs();
             println!("{}", serde_json::to_string_pretty(&specs)?);
             Ok(())
@@ -936,6 +937,38 @@ async fn async_main() -> anyhow::Result<()> {
             config.max_steps = http_max_steps;
             config.wall_timeout_secs = http_wall_timeout_secs;
             let (tools, _) = cli::builder::build_tools(&config, None).await;
+            // Goal 431 (#244 W2a/W2b): capture the per-session resolution
+            // inputs once — raw skill-source templates (expansion happens per
+            // session from the session's own labels) and the raw endpoint
+            // registry (header templates expand per session too). Template
+            // URLs cannot be fetched at startup (the raw `{...}` is not a
+            // URL), so the startup fetch degrading to a WARN is expected on
+            // templated deployments — say so instead of leaving it a mystery.
+            let skill_source_templates = cli::builder::skill_source_templates();
+            if skill_source_templates.has_templates() {
+                eprintln!(
+                    "WARN: RECURSIVE_SKILL_SOURCE_URL carries {{{{...}}}} templates — \
+                     skill catalogs are fetched per session (partitioned by the \
+                     session's labels); sessions without the required labels \
+                     cannot use the templated sources (fail-closed)"
+                );
+            }
+            let endpoints = recursive::tools::EndpointRegistry::discover(&config.workspace);
+            if let Some(endpoints) = &endpoints {
+                let templated: Vec<String> = endpoints
+                    .template_header_endpoints()
+                    .into_iter()
+                    .map(|(endpoint, header)| format!("{endpoint} → {header}"))
+                    .collect();
+                if !templated.is_empty() {
+                    eprintln!(
+                        "WARN: endpoint headers with {{{{...}}}} templates expand per \
+                         session: {} — sessions without the required labels cannot \
+                         call those endpoints (fail-closed)",
+                        templated.join(", ")
+                    );
+                }
+            }
             // Goal 429 S2 (#88): HTTP has no terminal and no stream-json
             // control channel — it is semantically headless regardless of the
             // global `--headless` flag. An `interactive`-classified tool now
@@ -1032,6 +1065,11 @@ async fn async_main() -> anyhow::Result<()> {
             // directory skills keep working (same log-and-degrade posture
             // as the MCP registration above).
             let mut skills = cli::builder::discover_loaded_skills(&config);
+            // Goal 431 (#244 W2a): the directory catalog BEFORE the
+            // service-level merge — per-session catalogs compose from this
+            // base plus per-expanded-URL fetches, so a templated deployment
+            // never leaks the startup fetch into another session's catalog.
+            let dir_skills = skills.clone();
             match cli::builder::skills_from_http_sources() {
                 Ok(src_skills) => {
                     let merged = cli::builder::merge_remote_skills(&mut skills, src_skills);
@@ -1123,6 +1161,15 @@ async fn async_main() -> anyhow::Result<()> {
                 slash_commands: std::sync::Arc::new(slash_commands),
                 rate_limiter: recursive::http::rate_limiter_from_env(),
                 skills,
+                // Goal 431 (#244 W2a/W2b): per-session resolution inputs —
+                // raw skill-source templates, the directory-only base, the
+                // expanded-URL cache and the raw endpoint registry.
+                partitioning: recursive::http::SessionPartitioning {
+                    skill_sources: skill_source_templates,
+                    skills_base: dir_skills,
+                    endpoints,
+                    ..Default::default()
+                },
                 storage,
                 // Issue #66: registry of cancellation tokens for in-flight
                 // /agui runs, keyed by thread id (SSE disconnect guard +
@@ -1289,6 +1336,7 @@ async fn async_main() -> anyhow::Result<()> {
                     // before a provider sees the transcript, or the run dies
                     // on "tool_use without tool_result" (HTTP 400).
                     let (tools, _) = cli::builder::build_tools(&config, None).await;
+                    cli::builder::ensure_endpoints_serve_ready(&config.workspace)?;
                     let policy = cli::resume::replay_orphan_policy(orphans.as_deref())?;
                     let seed =
                         cli::resume::prepare_replay_seed(seed.to_vec(), &tools, policy).await?;
@@ -2996,6 +3044,9 @@ async fn run_loop(
     // Build tools with ScheduleWakeup registered; must happen before build_runtime
     // so the slot is shared between the tool and the runtime loop.
     let (mut tools, _) = cli::builder::build_tools(&config, None).await;
+    // Goal 431 (拍板点 5): this channel has no session labels; endpoint
+    // header templates are unusable here — fail closed at startup.
+    cli::builder::ensure_endpoints_serve_ready(&config.workspace)?;
     let elicitation = recursive::mcp::new_elicitation_slot();
     tools = tools.with_elicitation_slot(elicitation.clone());
     cli::builder::register_mcp_tools(&mut tools, &config.workspace, mcp_config, Some(elicitation))
@@ -3831,6 +3882,7 @@ async fn run_mcp_server_stdio(config: Config, _mcp_config: Option<PathBuf>) -> a
     // Build the tool registry (local tools only — no MCP servers, since
     // we *are* the MCP server).
     let (tools, _) = cli::builder::build_tools(&config, None).await;
+    cli::builder::ensure_endpoints_serve_ready(&config.workspace)?;
 
     // We don't need an LLM provider or agent for the stdio server mode.
     // The tools are called directly via dispatch_request.
