@@ -159,10 +159,7 @@ impl WeixinDaemon {
         tokio::spawn(async move {
             bot_for_handler
                 .on_message(Box::new(move |msg| {
-                    let _ = raw_tx_handler.send(RawIncoming {
-                        user_id: msg.user_id.clone(),
-                        text: msg.text.clone(),
-                    });
+                    bridge_raw_incoming(&raw_tx_handler, &msg.user_id, &msg.text);
                 }))
                 .await;
         });
@@ -326,4 +323,76 @@ fn render_qr_terminal(url: &str) {
 struct RawIncoming {
     user_id: String,
     text: String,
+}
+
+/// Bridge one raw inbound WeChat message into the processor channel.
+///
+/// A failed send means the processor task is gone (its receiver was
+/// dropped) and this inbound user message is lost with no other record.
+/// Unlike outbound sends — where "the peer is gone" is benign — this is
+/// inbound business data, so the loss must stay observable (any
+/// degradation warns-or-louder). Best-effort by design: the polling
+/// closure must not panic or block on a dead processor.
+fn bridge_raw_incoming(tx: &mpsc::UnboundedSender<RawIncoming>, user_id: &str, text: &str) {
+    if let Err(error) = tx.send(RawIncoming {
+        user_id: user_id.to_string(),
+        text: text.to_string(),
+    }) {
+        warn!(
+            user_id = %user_id,
+            error = %error,
+            "inbound weixin message dropped (degradation)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Processor death (receiver dropped) must turn the inbound-message
+    /// loss into a WARN — this is user data, not a control-plane send.
+    /// Platform-neutral injection (channel only, no fs), hence no cfg
+    /// gate (#224 口径).
+    #[tracing_test::traced_test]
+    #[test]
+    fn bridge_send_failure_warns_with_user_id_and_error() {
+        let (tx, rx) = mpsc::unbounded_channel::<RawIncoming>();
+        drop(rx);
+
+        bridge_raw_incoming(&tx, "wx-user-1", "hello");
+
+        assert!(
+            logs_contain("inbound weixin message dropped (degradation)"),
+            "inbound weixin message loss must be reported as a degradation"
+        );
+        assert!(
+            logs_contain("user_id=wx-user-1"),
+            "WARN must carry the sender's user_id field"
+        );
+        assert!(
+            logs_contain("error=channel closed"),
+            "WARN must carry the send error field"
+        );
+    }
+
+    /// Positive control: a live processor receives the message intact and
+    /// the bridge stays off the warning channel.
+    #[tracing_test::traced_test]
+    #[test]
+    fn bridge_healthy_send_is_silent_and_delivers() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RawIncoming>();
+
+        bridge_raw_incoming(&tx, "wx-user-2", "ping");
+
+        let delivered = rx
+            .try_recv()
+            .expect("healthy bridge must deliver the message");
+        assert_eq!(delivered.user_id, "wx-user-2");
+        assert_eq!(delivered.text, "ping");
+        assert!(
+            !logs_contain("inbound weixin message dropped (degradation)"),
+            "healthy bridge must stay silent"
+        );
+    }
 }
