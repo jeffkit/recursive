@@ -471,7 +471,7 @@ impl SessionWriter {
             msg.role,
             crate::message::Role::User | crate::message::Role::Assistant
         ) {
-            let _ = self.bump_updated_at();
+            self.bump_updated_at();
         }
 
         Ok(new_uuid)
@@ -504,33 +504,70 @@ impl SessionWriter {
         self.writer.flush()
     }
 
-    /// Update `updated_at`, `message_count`, `first_prompt`, and `last_prompt`
-    /// in `.meta.json`, preserving everything else (goal, model, status, tool hash).
-    /// Best-effort: errors are returned but `append()` swallows them
-    /// so a transient meta-write failure does not abort the run.
-    fn bump_updated_at(&self) -> std::io::Result<()> {
+    /// Read-modify-write `.meta.json`, preserving every field `mutate`
+    /// leaves alone. `mutate` returns `false` when the on-disk value is
+    /// already current, in which case the write is skipped.
+    ///
+    /// The one seam shared by the best-effort meta updates
+    /// ([`Self::bump_updated_at`], [`Self::set_derived_from`],
+    /// [`Self::update_identity`], [`Self::set_owner`],
+    /// [`Self::set_run_code`]). `finish_with_details` keeps its own copy
+    /// because its failure is propagated to the caller, not logged.
+    fn rewrite_meta(&self, mutate: impl FnOnce(&mut SessionMeta) -> bool) -> std::io::Result<()> {
         let meta_path = self.session_dir.join(".meta.json");
         let bytes = std::fs::read(&meta_path)?;
         let mut meta: SessionMeta = serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        meta.updated_at = chrono_lite_now();
-        meta.message_count = self.message_count;
-        // g157: persist first/last prompt so session picker can show them
-        // without reading the full JSONL.
-        if self.first_prompt.is_some() {
-            meta.first_prompt = self.first_prompt.clone();
-        }
-        if self.last_prompt.is_some() {
-            meta.last_prompt = self.last_prompt.clone();
-        }
-        // Persist auto-generated or explicitly set display name on every bump
-        // so the session list shows the title as soon as the first message lands.
-        if self.name.is_some() && meta.name.is_none() {
-            meta.name = self.name.clone();
+        if !mutate(&mut meta) {
+            return Ok(());
         }
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         crate::atomic::atomic_write(&meta_path, json.as_bytes())
+    }
+
+    /// Best-effort [`Self::rewrite_meta`]: the caller is never aborted, but
+    /// a failure is no longer silent (issue #236; owner ruling
+    /// 「任何降级必须可观测」). `.meta.json` is the copy every reader
+    /// consults — `resume` picks the most recent session by `updated_at`,
+    /// cost pricing reads `model`, the AG-UI access check reads `owner` —
+    /// so a swallowed write hands them a stale answer with no trace.
+    /// `field` names the value left stale.
+    fn rewrite_meta_best_effort(&self, field: &str, mutate: impl FnOnce(&mut SessionMeta) -> bool) {
+        if let Err(error) = self.rewrite_meta(mutate) {
+            tracing::warn!(
+                session_id = %self.session_id,
+                path = %self.session_dir.join(".meta.json").display(),
+                field,
+                %error,
+                "session meta update failed; .meta.json keeps a stale value (degradation)"
+            );
+        }
+    }
+
+    /// Update `updated_at`, `message_count`, `first_prompt`, and `last_prompt`
+    /// in `.meta.json`, preserving everything else (goal, model, status, tool hash).
+    /// Best-effort: a failure is logged at WARN and the run goes on, so a
+    /// transient meta-write failure does not abort it.
+    fn bump_updated_at(&self) {
+        self.rewrite_meta_best_effort("updated_at", |meta| {
+            meta.updated_at = chrono_lite_now();
+            meta.message_count = self.message_count;
+            // g157: persist first/last prompt so session picker can show them
+            // without reading the full JSONL.
+            if self.first_prompt.is_some() {
+                meta.first_prompt = self.first_prompt.clone();
+            }
+            if self.last_prompt.is_some() {
+                meta.last_prompt = self.last_prompt.clone();
+            }
+            // Persist auto-generated or explicitly set display name on every bump
+            // so the session list shows the title as soon as the first message lands.
+            if self.name.is_some() && meta.name.is_none() {
+                meta.name = self.name.clone();
+            }
+            true
+        });
     }
 
     /// Finalise the session: flush the writer and update the meta file
@@ -618,20 +655,13 @@ impl SessionWriter {
     /// first `finish()` should still know where it came from.
     pub fn set_derived_from(&mut self, source: impl Into<String>) {
         let source = source.into();
-        let meta_path = self.session_dir.join(".meta.json");
-        let Ok(bytes) = std::fs::read(&meta_path) else {
-            return;
-        };
-        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
-            return;
-        };
-        if meta.derived_from.as_deref() == Some(source.as_str()) {
-            return;
-        }
-        meta.derived_from = Some(source);
-        if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
-        }
+        self.rewrite_meta_best_effort("derived_from", |meta| {
+            if meta.derived_from.as_deref() == Some(source.as_str()) {
+                return false;
+            }
+            meta.derived_from = Some(source);
+            true
+        });
     }
 
     /// Feed run-level token usage into the writer's cumulative total
@@ -653,22 +683,16 @@ impl SessionWriter {
     /// and `resume` read the model from meta, so it must track the
     /// most recent run rather than the one that created the session.
     pub fn update_identity(&mut self, model: &str, provider: &str, preset: Option<&str>) {
-        let meta_path = self.session_dir.join(".meta.json");
-        let Ok(bytes) = std::fs::read(&meta_path) else {
-            return;
-        };
-        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
-            return;
-        };
-        if meta.model == model && meta.provider == provider && meta.preset.as_deref() == preset {
-            return;
-        }
-        meta.model = model.to_string();
-        meta.provider = provider.to_string();
-        meta.preset = preset.map(|s| s.to_string());
-        if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
-        }
+        self.rewrite_meta_best_effort("model/provider/preset", |meta| {
+            if meta.model == model && meta.provider == provider && meta.preset.as_deref() == preset
+            {
+                return false;
+            }
+            meta.model = model.to_string();
+            meta.provider = provider.to_string();
+            meta.preset = preset.map(|s| s.to_string());
+            true
+        });
     }
 
     /// Record the identity that owns this session (issue #152).
@@ -684,18 +708,11 @@ impl SessionWriter {
         let Some(owner) = owner else {
             return;
         };
-        let meta_path = self.session_dir.join(".meta.json");
-        let Ok(bytes) = std::fs::read(&meta_path) else {
-            return;
-        };
-        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
-            return;
-        };
-        meta.owner = Some(owner.to_string());
-        meta.tenant = tenant.map(|t| t.to_string());
-        if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
-        }
+        self.rewrite_meta_best_effort("owner", |meta| {
+            meta.owner = Some(owner.to_string());
+            meta.tenant = tenant.map(|t| t.to_string());
+            true
+        });
     }
 
     /// Stamp the session's effective `run_code` state (issue #134 W2).
@@ -707,20 +724,13 @@ impl SessionWriter {
     /// env that may no longer be set. Read-modify-write on `.meta.json`,
     /// best-effort like [`Self::set_derived_from`].
     pub fn set_run_code(&mut self, enabled: bool) {
-        let meta_path = self.session_dir.join(".meta.json");
-        let Ok(bytes) = std::fs::read(&meta_path) else {
-            return;
-        };
-        let Ok(mut meta) = serde_json::from_slice::<SessionMeta>(&bytes) else {
-            return;
-        };
-        if meta.run_code == Some(enabled) {
-            return;
-        }
-        meta.run_code = Some(enabled);
-        if let Ok(json) = serde_json::to_string_pretty(&meta) {
-            let _ = crate::atomic::atomic_write(&meta_path, json.as_bytes());
-        }
+        self.rewrite_meta_best_effort("run_code", |meta| {
+            if meta.run_code == Some(enabled) {
+                return false;
+            }
+            meta.run_code = Some(enabled);
+            true
+        });
     }
 
     /// Return the session ID.
@@ -1303,6 +1313,140 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    /// #236: every best-effort `.meta.json` update (`bump_updated_at` via
+    /// `append`, `set_derived_from`, `update_identity`, `set_owner`,
+    /// `set_run_code`) must surface a failure as a WARNING carrying the
+    /// session id, the failing path and the field left stale — the update
+    /// stays best-effort (the caller is not aborted), but a stale meta can
+    /// no longer be traceless (owner ruling). Injection: `.meta.json` is
+    /// replaced by a directory, so the read-modify-write fails on read.
+    /// Platform-neutral (no POSIX-mode API involved), hence no cfg gate
+    /// (#224 口径).
+    #[tracing_test::traced_test]
+    #[test]
+    fn meta_update_failures_warn_with_session_id_path_and_field() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-meta-rmw");
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        let meta_path = dir.join(".meta.json");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+
+        writer.set_derived_from("parent");
+        writer.update_identity("m2", "p2", None);
+        writer.set_owner(Some("alice"), Some("acme"));
+        writer.set_run_code(true);
+        // The transcript write is not the degraded part — only the meta
+        // bump is — so `append` itself must still succeed.
+        writer.append(&Message::user("hi"), None, None).unwrap();
+
+        assert!(
+            logs_contain("session meta update failed"),
+            "a failed meta update must be reported as a degradation"
+        );
+        assert!(
+            logs_contain("session_id=agui-meta-rmw"),
+            "the warning must carry the session id"
+        );
+        assert!(
+            logs_contain("path=") && logs_contain(".meta.json"),
+            "the warning must name the failing path"
+        );
+        for field in [
+            "derived_from",
+            "model/provider/preset",
+            "owner",
+            "run_code",
+            "updated_at",
+        ] {
+            assert!(
+                logs_contain(&format!("field=\"{field}\"")),
+                "the warning must name the stale field {field}"
+            );
+        }
+    }
+
+    /// #236, write arm: a read that succeeds but an `atomic_write` that
+    /// fails (unwritable session dir) is the exact shape the old
+    /// `let _ = atomic_write(..)` swallowed. Also pins the idempotency
+    /// short-cut: re-declaring the on-disk value must not even attempt a
+    /// write — under 0555 an attempted write WARNs, so an unwanted write
+    /// is observable here. POSIX-mode injection, hence `cfg(unix)` (#224).
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn meta_update_write_failure_warns_and_idempotent_resets_stay_silent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-meta-ro");
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        writer.set_derived_from("parent");
+        writer.update_identity("m2", "p2", Some("x"));
+        writer.set_run_code(true);
+        assert!(!logs_contain("session meta update failed"));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Already current on disk: no write attempted, so nothing to warn about.
+        writer.set_derived_from("parent");
+        writer.update_identity("m2", "p2", Some("x"));
+        writer.set_run_code(true);
+        assert!(
+            !logs_contain("session meta update failed"),
+            "an idempotent re-set must not attempt (and fail) a write"
+        );
+
+        // Real changes: the write is attempted, fails, and must be reported.
+        writer.set_owner(Some("alice"), None);
+        writer.set_run_code(false);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            logs_contain("session meta update failed"),
+            "a failed meta write must be reported as a degradation"
+        );
+        assert!(logs_contain("field=\"owner\""));
+        assert!(logs_contain("field=\"run_code\""));
+        assert!(
+            logs_contain("ermission denied"),
+            "the warning must carry the underlying io error"
+        );
+        // The stale value the warning talks about is really what readers see.
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.owner, None);
+        assert_eq!(meta.run_code, Some(true));
+    }
+
+    /// Positive control for #236: healthy meta updates land on disk and
+    /// stay off the warning channel.
+    #[tracing_test::traced_test]
+    #[test]
+    fn meta_update_healthy_writes_stay_silent() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("agui-meta-ok");
+        let mut writer = SessionWriter::open_or_create(&dir, "goal", "m", "p", None).unwrap();
+        writer.set_derived_from("parent");
+        writer.update_identity("m2", "p2", Some("x"));
+        writer.set_owner(Some("alice"), Some("acme"));
+        writer.set_run_code(true);
+        writer.append(&Message::user("hi"), None, None).unwrap();
+
+        let meta = SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(meta.derived_from.as_deref(), Some("parent"));
+        assert_eq!(meta.model, "m2");
+        assert_eq!(meta.provider, "p2");
+        assert_eq!(meta.preset.as_deref(), Some("x"));
+        assert_eq!(meta.owner.as_deref(), Some("alice"));
+        assert_eq!(meta.tenant.as_deref(), Some("acme"));
+        assert_eq!(meta.run_code, Some(true));
+        assert_eq!(meta.message_count, 1);
+        assert!(
+            !logs_contain("session meta update failed"),
+            "healthy meta updates must not be reported as degraded"
+        );
     }
 
     fn make_isolated_writer() -> (
