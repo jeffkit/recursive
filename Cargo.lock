@@ -3699,6 +3699,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tracing-test",
  "uuid",
 ]
 
@@ -3720,6 +3721,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-test",
  "tui-pty-harness",
  "unicode-width 0.2.0",
 ]

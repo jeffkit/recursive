@@ -36,6 +36,9 @@ arboard = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# `#[tracing_test::traced_test]` in-process log capture for the issue #234
+# regression pin (the shutdown finish() swallow must warn).
+tracing-test = "0.2"
 # Inert attribute crate recognized by `cargo-mutants`. Used to tag
 # functions/expressions that are structurally untestable (infinite-loop
 # mutants, terminal-I/O side effects) so the mutant gate stops counting

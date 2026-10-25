@@ -57,6 +57,9 @@ otel = [
 
 [dev-dependencies]
 tempfile = "3"
+# `#[tracing_test::traced_test]` in-process log capture for the issue #234
+# regression pin (the legacy-migration finish() swallow must warn).
+tracing-test = "0.2"
 # `tests/issue226_reexec_env.rs` re-creates the parent half of the re-exec
 # handoff (a `pipe(2)` with an inheritable read end); `std` has no API that
 # clears `FD_CLOEXEC`. Already in the graph — the root lib depends on it.

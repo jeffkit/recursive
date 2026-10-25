@@ -172,7 +172,7 @@ pub(crate) fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyho
         writer.append(msg, None, None)?;
     }
     let session_dir = writer.session_dir().to_path_buf();
-    writer.finish(SessionStatus::Interrupted).ok();
+    finalize_migrated_session(&mut writer, &session_dir);
     drop(writer);
 
     // Patch `.meta.json` to carry over the legacy `tool_registry_hash`.
@@ -191,6 +191,22 @@ pub(crate) fn cmd_session_migrate_legacy(workspace: &Path, path: &Path) -> anyho
             .unwrap_or("<id>"),
     );
     Ok(())
+}
+
+/// Finalise the migrated session as `Interrupted` (the legacy single-file
+/// format carries no terminal status). The transcript rows are already on
+/// disk, so a failed finish is a degradation, not a hard error — but the
+/// session would then keep `active` with no final marker while the command
+/// prints its success lines, so the failure is warned (issue #234; owner
+/// ruling: every degradation must be observable).
+fn finalize_migrated_session(writer: &mut SessionWriter, session_dir: &Path) {
+    if let Err(e) = writer.finish(SessionStatus::Interrupted) {
+        tracing::warn!(
+            session_dir = %session_dir.display(),
+            error = %e,
+            "legacy session migration: finish failed; the migrated session keeps no final status marker (degradation)"
+        );
+    }
 }
 
 /// Implementation of `recursive sessions rewind`.
@@ -667,5 +683,59 @@ mod tests {
             "refusal must name the problem; got: {err:#}"
         );
         assert_shadow_under(&home);
+    }
+
+    /// #234: the migration's `finish()` used to be swallowed (`.ok()`), so
+    /// the migrated session kept `active` with no final marker while the
+    /// command printed its success lines. The failure must warn. Injection:
+    /// `.meta.json` is occupied by a directory, which defeats finish's
+    /// read-modify-write — platform-neutral, no cfg gate (#224 口径).
+    /// Positive control first: a healthy finish is silent and lands
+    /// `Interrupted`.
+    #[tracing_test::traced_test]
+    #[test]
+    fn migration_finish_failure_warns_and_healthy_finish_stays_silent() {
+        let (_home, mut env) = pinned_home();
+        env.remove_var("RECURSIVE_SESSIONS_DIR");
+        let ws = TempDir::new().unwrap();
+
+        let mut writer = SessionWriter::create(
+            ws.path(),
+            "migrate finish ok",
+            "test-model",
+            "test-provider",
+        )
+        .unwrap();
+        let dir = writer.session_dir().to_path_buf();
+        finalize_migrated_session(&mut writer, &dir);
+        drop(writer);
+        let meta = recursive::session::SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(
+            meta.status,
+            SessionStatus::Interrupted,
+            "the healthy path must still finalise the session"
+        );
+        assert!(
+            !logs_contain("legacy session migration: finish failed"),
+            "a healthy finish must not be reported as degraded"
+        );
+
+        let mut writer = SessionWriter::create(
+            ws.path(),
+            "migrate finish bad",
+            "test-model",
+            "test-provider",
+        )
+        .unwrap();
+        let dir = writer.session_dir().to_path_buf();
+        let meta_path = dir.join(".meta.json");
+        fs::remove_file(&meta_path).unwrap();
+        fs::create_dir(&meta_path).unwrap();
+        finalize_migrated_session(&mut writer, &dir);
+        drop(writer);
+        assert!(
+            logs_contain("legacy session migration: finish failed"),
+            "a failed finish must be reported as a degradation"
+        );
     }
 }

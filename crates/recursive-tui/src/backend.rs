@@ -609,6 +609,26 @@ async fn loop_arbiter(
     }
 }
 
+/// Retire the interactive session's writer at shutdown: take the slot, lock
+/// the writer, and persist `Completed`. The transcript rows are already on
+/// disk, so a failed finish is a degradation, not a crash — but the session
+/// would then stay `active` with no final marker for resume/audit, so the
+/// failure is warned (issue #234; owner ruling: every degradation must be
+/// observable).
+fn finalize_session_on_shutdown(session_writer: &mut Option<Arc<std::sync::Mutex<SessionWriter>>>) {
+    if let Some(sw_arc) = session_writer.take() {
+        if let Ok(mut sw) = sw_arc.lock() {
+            if let Err(e) = sw.finish(SessionStatus::Completed) {
+                tracing::warn!(
+                    session_dir = %sw.session_dir().display(),
+                    error = %e,
+                    "TUI session shutdown: finish failed; the transcript keeps no final status marker (degradation)"
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     mut state: RuntimeBuild,
@@ -883,11 +903,7 @@ async fn worker_loop(
             }
 
             UserAction::Shutdown => {
-                if let Some(sw_arc) = session_writer.take() {
-                    if let Ok(mut sw) = sw_arc.lock() {
-                        let _ = sw.finish(SessionStatus::Completed);
-                    }
-                }
+                finalize_session_on_shutdown(&mut session_writer);
                 break;
             }
 
@@ -3788,5 +3804,59 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    // ── #234: shutdown finalize observability ───────────────────────────────
+
+    /// A failed `finish()` at shutdown must warn — the transcript would
+    /// otherwise stay `active` with no final marker, silently. Injection: a
+    /// directory occupying `.meta.json` defeats finish's read-modify-write;
+    /// platform-neutral, hence no cfg gate (#224 口径).
+    #[tracing_test::traced_test]
+    #[test]
+    fn shutdown_finalize_warns_when_finish_fails() {
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
+        let mut sw = SessionWriter::create(ws.path(), "goal", "model", "tui").unwrap();
+        let meta_path = sw.session_dir().join(".meta.json");
+        std::fs::remove_file(&meta_path).unwrap();
+        std::fs::create_dir(&meta_path).unwrap();
+        let mut slot = Some(Arc::new(std::sync::Mutex::new(sw)));
+
+        finalize_session_on_shutdown(&mut slot);
+
+        assert!(slot.is_none(), "shutdown must still retire the writer slot");
+        assert!(
+            logs_contain("TUI session shutdown: finish failed"),
+            "a failed finish at shutdown must be reported as a degradation"
+        );
+    }
+
+    /// Positive control: a healthy shutdown finalises silently and the
+    /// status lands `Completed`.
+    #[tracing_test::traced_test]
+    #[test]
+    fn shutdown_finalize_healthy_finish_is_silent_and_completes() {
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
+        let sw = SessionWriter::create(ws.path(), "goal", "model", "tui").unwrap();
+        let dir = sw.session_dir().to_path_buf();
+        let mut slot = Some(Arc::new(std::sync::Mutex::new(sw)));
+
+        finalize_session_on_shutdown(&mut slot);
+
+        assert!(slot.is_none(), "shutdown must still retire the writer slot");
+        let meta = recursive::session::SessionReader::load_meta(&dir).unwrap();
+        assert_eq!(
+            meta.status,
+            SessionStatus::Completed,
+            "shutdown must finalise the session"
+        );
+        assert!(
+            !logs_contain("TUI session shutdown: finish failed"),
+            "a healthy shutdown must not be reported as degraded"
+        );
     }
 }
