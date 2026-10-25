@@ -5396,7 +5396,9 @@ mod tests {
     }
 
     /// A permissions config is summarized as rule count / mode / interactive
-    /// count — the fields an operator tunes.
+    /// count — the fields an operator tunes. The rule count sums all three
+    /// kinds (allow + deny + interactive): a deny rule is present so a count
+    /// that drops or subtracts one kind is visible in the total.
     #[test]
     fn http_security_posture_line_summarizes_permissions_rules_mode_and_interactive() {
         use recursive::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
@@ -5405,8 +5407,8 @@ mod tests {
             layers: vec![PermissionLayer {
                 source: RuleSource::User,
                 allow: vec!["Read".into()],
+                deny: vec!["Edit".into()],
                 interactive: vec!["Bash".into(), "Write".into()],
-                ..Default::default()
             }],
         };
         let registry = recursive::tools::ToolRegistry::local().with_permissions(perms);
@@ -5417,7 +5419,7 @@ mod tests {
             "configured",
         );
         for needle in [
-            "permissions=3 rules, mode=default, interactive=2",
+            "permissions=4 rules, mode=default, interactive=2",
             "sandbox=policy",
             "auth=configured",
         ] {
@@ -5549,6 +5551,29 @@ mod tests {
         );
     }
 
+    /// The production half of this file for source pins: everything before
+    /// the unit-test module. Split on the real module header — a string
+    /// literal inside a test spells its newlines as `\n` escapes and so can
+    /// never match it — rather than on the last `mod tests {` text, which a
+    /// later pin's own literal would move (and silently fold that pin's
+    /// needle into the "production" half: self-match, pin always green).
+    /// `\r` is stripped first so a CRLF checkout (Windows CI) sees the same
+    /// header.
+    fn production_source() -> String {
+        include_str!("main.rs")
+            .replace('\r', "")
+            .split_once("\n#[cfg(test)]\nmod tests {\n")
+            .expect("tests module header")
+            .0
+            .to_string()
+    }
+
+    /// Whitespace-normalised view so a pin survives rustfmt reflow but still
+    /// fixes every token.
+    fn squash_ws(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     /// The [policy] wiring itself: the HTTP arm must pin the registry's
     /// headless semantics. The behavioral pins for the underlying pipeline
     /// semantics live in `src/tools/mod.rs` (#154 family: empty-runner deny,
@@ -5556,15 +5581,40 @@ mod tests {
     /// silent revert of the one-line wiring (mutation, merge conflict).
     #[test]
     fn http_arm_fixes_headless_semantics() {
-        let src = include_str!("main.rs");
-        // Only the production half: the needle below would otherwise match
-        // this test's own source text (self-match trap — first negative
-        // control stayed green because of it).
-        let (production, _tests) = src.rsplit_once("mod tests {").expect("tests module marker");
         assert!(
-            production.contains("let tools = tools.with_headless(true);"),
+            production_source().contains("let tools = tools.with_headless(true);"),
             "the Cmd::Http arm must fix the registry's headless semantics \
              (Goal 429 S2 [policy]) — the line went missing"
+        );
+    }
+
+    // ── #150 / #226: standing credential-exposure WARN wiring ───────────────
+
+    /// The standing exposure WARN (`warn_if_exposed`, pinned behaviourally in
+    /// `src/hardening.rs`) is gated by `!block_hidden`, where the block is
+    /// hidden when the kernel mechanism took **or** this is the clean-env
+    /// re-exec / there was nothing to protect — deliberately not
+    /// `reexec.is_applied()`, which would also mask a *failed* `prctl`
+    /// (`CoveredByKernelMechanism`). The predicate is inline in `async_main`
+    /// (process entry; runs `exec`), so it cannot be executed from a unit
+    /// test: this source pin guards the two operators that invert it. An
+    /// `&&` demands both conditions; a dropped `!` mutes the WARN on exactly
+    /// the exposed paths (Windows, failed `prctl`, failed re-exec) — the
+    /// fail-silent degradation #150 made observable.
+    #[test]
+    fn exposure_warn_is_gated_by_block_hidden_or_of_kernel_and_reexec() {
+        let production = squash_ws(&production_source());
+        assert!(
+            production.contains(
+                "let block_hidden = hardening.is_applied() || matches!( reexec, \
+                 recursive::hardening::ReExecOutcome::AlreadyCleanEnv | \
+                 recursive::hardening::ReExecOutcome::NotNeeded );"
+            ),
+            "block_hidden must be `prctl applied OR (clean re-exec | nothing to protect)`"
+        );
+        assert!(
+            production.contains("if !block_hidden { hardening.warn_if_exposed(&scrub); }"),
+            "the exposure WARN must fire when the block is NOT hidden"
         );
     }
 
