@@ -1345,6 +1345,53 @@ mod tests {
         assert_eq!(meta.name.as_deref(), Some("my custom name"));
     }
 
+    /// `bump_updated_at` fills an empty on-disk name but never clobbers an
+    /// existing one: `set_name` is held in memory and lands via `finish()`
+    /// only (its doc contract). Mutant hardening for the #243 batch-2 run —
+    /// `&&` → `||` in the bump lets a pending explicit rename overwrite the
+    /// on-disk name mid-run (and a name-less writer wipe a disk name).
+    #[test]
+    fn bump_fills_an_empty_meta_name_but_never_clobbers_an_existing_one() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let mut writer = SessionWriter::create(ws, "name policy", "gpt-4o", "openai").unwrap();
+        let session_dir = writer.session_dir().to_path_buf();
+
+        // First user message: the auto-title is computed and reaches disk
+        // via the bump — the fill half of the guard.
+        writer
+            .append(&Message::user("first auto title"), None, None)
+            .unwrap();
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(
+            meta.name.as_deref(),
+            Some("first auto title"),
+            "the auto title must reach .meta.json on the first bump"
+        );
+
+        // Explicit rename, then another bump: the bump must leave the
+        // on-disk name alone; `finish()` is the rename's persistence channel.
+        writer.set_name("explicit rename");
+        writer
+            .append(&Message::user("second prompt"), None, None)
+            .unwrap();
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(
+            meta.name.as_deref(),
+            Some("first auto title"),
+            "a bump must never clobber a name already on disk"
+        );
+
+        writer.finish(SessionStatus::Completed).unwrap();
+        let meta = SessionReader::load_meta(&session_dir).unwrap();
+        assert_eq!(
+            meta.name.as_deref(),
+            Some("explicit rename"),
+            "finish() is the persistence channel for an explicit rename"
+        );
+    }
+
     /// Long prompts are truncated to 60 visible chars in the auto-filled name.
     #[test]
     fn autofill_name_truncates_long_prompt() {

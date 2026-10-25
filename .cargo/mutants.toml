@@ -138,4 +138,21 @@ exclude_re = [
     "replace > with < in SessionWriter::create_with_tools",
     "replace \\|\\| with && in SessionWriter::create_with_tools",
     "replace < with <= in SessionWriter::create_with_tools",
+    # Issue #243 batch 2: the same retry bound as guard-expression replacement
+    # (`attempt < 7` → `true`, :129:27). Two walls make the divergence
+    # unreachable from a deterministic test, hand-verified this batch
+    # (mutation applied → full writer suite 28/28 green → byte-exact
+    # restore): (1) attempts 1–7 unconditionally run
+    # `create_dir_all(&session_dir)?` first, so every filesystem-level denial
+    # (read-only parent, ENAMETOOLONG, ENOTDIR) surfaces through `?` —
+    # identically under both variants — and never reaches the match; (2) an
+    # attempt's Err arm therefore requires the freshly created writable
+    # directory to fail `SessionLock::acquire`, whose first action (exclusive
+    # create_new of the sentinel) succeeds on exactly such a directory;
+    # pre-placing a lock under the attempt's random 8-hex uuid suffix is the
+    # only remaining channel and is outside deterministic reach. The
+    # killable siblings of the same guard (`with false`, `<`→`==`, `<`→`>`,
+    # all killed by the stray-file retry test's attempt-0 acquire failure)
+    # stay in scope — the regex is name-specific on `with true`.
+    "replace match guard attempt < 7 with true in SessionWriter::create_with_tools",
 ]
