@@ -116,6 +116,15 @@ cleanup_mutants() {
       echo "warn: cargo-mutants left mutations in ${#dirty[@]} file(s); restoring via git checkout:" >&2
       printf '  %s\n' "${dirty[@]}" >&2
       git checkout -- "${dirty[@]}" 2>/dev/null || true
+      # Issue #241: the restore itself used to be swallowed — a failed
+      # checkout leaves mutant sources in the tree silently (next build
+      # runs mutated code). Verify and scream if restoration failed.
+      local still_dirty
+      still_dirty=$(git status --porcelain -- "${dirty[@]}" 2>/dev/null | wc -l | tr -d ' ')
+      if [[ "$still_dirty" -gt 0 ]]; then
+        echo "error: mutation restore FAILED — $still_dirty file(s) still mutated in tree (issue #241):" >&2
+        git status --porcelain -- "${dirty[@]}" >&2
+      fi
     fi
   fi
   exit "$rc"
