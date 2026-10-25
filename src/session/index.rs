@@ -865,22 +865,43 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Private session data: the index directory is 0700 and the database 0600.
+/// Private session data: the index directory is 0700.
+///
+/// The mode is a documented contract of `SessionIndex::open`, so a chmod
+/// failure (left with umask defaults, world-readable) is a degradation and
+/// must stay observable (owner ruling) — warn with the path and the error.
+/// Windows has no chmod equivalent (ACLs govern access; a readonly-bit
+/// fallback is not the same contract) — staying a no-op there is a known
+/// platform gap per the #224口径, not a silent swallow.
 fn restrict_dir(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "session index: failed to restrict directory permissions to 0700"
+            );
+        }
     }
     #[cfg(not(unix))]
     let _ = dir;
 }
 
+/// Private session data: the index database is 0600. Same contract and
+/// same observability ruling as [`restrict_dir`].
 fn restrict_file(file: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                path = %file.display(),
+                error = %e,
+                "session index: failed to restrict file permissions to 0600"
+            );
+        }
     }
     #[cfg(not(unix))]
     let _ = file;
@@ -1471,5 +1492,128 @@ mod tests {
         let terms = ["hello".to_string(), "a\"b".to_string()];
         let refs: Vec<&String> = terms.iter().collect();
         assert_eq!(match_expression(&refs), "\"hello\" \"a\"\"b\"");
+    }
+
+    // ---- Issue #230: the private-mode contract must fail observably ----
+    //
+    // `restrict_dir`/`restrict_file` used to `let _ =` the chmod result,
+    // so a failure left the index at umask defaults (world-readable)
+    // while the doc claimed "Private session data: 0700/0600". The WARN
+    // is the fix's observable behaviour (owner ruling), asserted the
+    // same way `config_file.rs`'s #199 S3(b) capture harness does:
+    // thread-scoped `with_default` subscriber — parallel-safe, no env
+    // mutation. Tests are `#[cfg(unix)]` wholesale per the #224口径:
+    // on Windows `restrict_*` is a documented no-op (ACLs govern; the
+    // 0700/0600 contract is not expressible), so there is nothing to
+    // pin there.
+
+    /// Append-only shared sink the capture subscriber formats into.
+    #[derive(Clone)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local DEBUG-level tracing subscriber and
+    /// return `(f's result, everything it formatted)` (ANSI off, one
+    /// event per line).
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        let logs = String::from_utf8(out).expect("tracing output is utf-8");
+        (value, logs)
+    }
+
+    fn private_mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A successful restrict must actually enforce the contracted mode
+    /// AND stay silent — the warning is for degradation, not for the
+    /// normal path. Kills widening 0o700 / 0o600.
+    #[cfg(unix)]
+    #[test]
+    fn restrict_sets_private_modes_and_stays_silent_on_success() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let dir = tmp.path().join("idx");
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("index.db");
+        std::fs::write(&file, b"").unwrap();
+
+        let ((), logs) = capture_logs(|| {
+            restrict_dir(&dir);
+            restrict_file(&file);
+        });
+        assert_eq!(private_mode_of(&dir), 0o700, "dir contract is 0700");
+        assert_eq!(private_mode_of(&file), 0o600, "file contract is 0600");
+        assert!(
+            !logs.contains("WARN"),
+            "successful restrict is not a degradation and must not warn, got: {logs}"
+        );
+    }
+
+    /// A chmod failure must emit a WARN naming the path, the expected
+    /// mode and the error. Kills a re-mutation back to
+    /// `let _ = set_permissions(...)`. Injection: a path that does not
+    /// exist reaches the same Err arm as every real chmod failure
+    /// (EACCES, EROFS, …) with no env games and no root dependence.
+    #[cfg(unix)]
+    #[test]
+    fn restrict_dir_failure_warns_with_path_and_expected_mode() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let missing = tmp.path().join("no-such-dir");
+
+        let ((), logs) = capture_logs(|| restrict_dir(&missing));
+        assert!(
+            logs.contains("WARN"),
+            "dir chmod failure must emit a WARN, got: {logs}"
+        );
+        assert!(
+            logs.contains("0700"),
+            "WARN must state the expected mode, got: {logs}"
+        );
+        assert!(
+            logs.contains(&missing.display().to_string()),
+            "WARN must carry the offending path, got: {logs}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_file_failure_warns_with_path_and_expected_mode() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let missing = tmp.path().join("no-such.db");
+
+        let ((), logs) = capture_logs(|| restrict_file(&missing));
+        assert!(
+            logs.contains("WARN"),
+            "file chmod failure must emit a WARN, got: {logs}"
+        );
+        assert!(
+            logs.contains("0600"),
+            "WARN must state the expected mode, got: {logs}"
+        );
+        assert!(
+            logs.contains(&missing.display().to_string()),
+            "WARN must carry the offending path, got: {logs}"
+        );
     }
 }
