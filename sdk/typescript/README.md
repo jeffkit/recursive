@@ -64,6 +64,11 @@ multi-turn `streamInput` work like the Claude Agent SDK.
 | `canUseTool` | control `can_use_tool` replies |
 | `hooks` | `initialize` + `hook_callback` |
 
+On the HTTP server channel, permission rules that classify a tool as
+`interactive` are headless: they need an approval hook
+(`PermissionRequest` under `~/.recursive/hooks` or
+`<workspace>/.recursive/hooks`) or the tool is denied (Goal 429 S2).
+
 ## Session-style API (also available)
 
 ```typescript

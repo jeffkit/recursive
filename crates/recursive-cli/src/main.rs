@@ -936,6 +936,19 @@ async fn async_main() -> anyhow::Result<()> {
             config.max_steps = http_max_steps;
             config.wall_timeout_secs = http_wall_timeout_secs;
             let (tools, _) = cli::builder::build_tools(&config, None).await;
+            // Goal 429 S2 (#88): HTTP has no terminal and no stream-json
+            // control channel — it is semantically headless regardless of the
+            // global `--headless` flag. An `interactive`-classified tool now
+            // takes pipeline Phase 6: an installed external approval hook
+            // decides (its `permissionDecision` is authoritative, #154), an
+            // empty hook set DENIES fail-closed — instead of Phase 5's silent
+            // allow. Session registries inherit the flag through
+            // `rebind_per_session_registry` (the clone path and the container
+            // rebuild both carry `base.headless`); the AG-UI client-tool /
+            // `interrupt_before` hooks sit in the per-session slot at the
+            // dispatch level, ahead of the pipeline, and are unaffected.
+            // Permission-surface behavior change: commit carries [policy].
+            let tools = tools.with_headless(true);
             // Issues #70 / #65: HTTP is an agent-loop channel like run/loop,
             // so it must go through the same cross-cutting surface wiring —
             // MCP registration, touched-files collector, coordinator pruning.
@@ -986,6 +999,11 @@ async fn async_main() -> anyhow::Result<()> {
             // assertable line at startup — the facts the architecture docs
             // state, the process says too. Purely descriptive: process-level
             // facts only (zero tenant identity — owner ruling).
+            // Goal 429 S2: make the fail-closed flip foreseeable — the WARN
+            // names the interactive tools that will now be denied.
+            if let Some(warn) = http_interactive_without_hooks_warning(&tools) {
+                eprintln!("WARN: {warn}");
+            }
             eprintln!(
                 "{}",
                 http_security_posture_line(
@@ -2651,6 +2669,30 @@ fn permission_mode_label(mode: &recursive::permissions::PermissionMode) -> &'sta
         PM::Auto => "auto",
         PM::Strict => "strict",
     }
+}
+
+/// Goal 429 S2: the foreseeability WARN for an HTTP deployment that wrote
+/// `interactive` rules but discovered no approval hook — under the headless
+/// semantics those tools are denied fail-closed, and the operator must hear
+/// that at startup, not in a tool denial. `None` = nothing to announce
+/// (hooks present, or no interactive rules, or no permissions config).
+fn http_interactive_without_hooks_warning(
+    tools: &recursive::tools::ToolRegistry,
+) -> Option<String> {
+    let interactive: usize = tools
+        .permissions_config()?
+        .layers
+        .iter()
+        .map(|l| l.interactive.len())
+        .sum();
+    if interactive == 0 || tools.hook_count() > 0 {
+        return None;
+    }
+    Some(format!(
+        "HTTP: {interactive} interactive rule(s) configured but no PermissionRequest \
+         hook found under ~/.recursive/hooks or <ws>/.recursive/hooks — those tools \
+         will be DENIED on this channel"
+    ))
 }
 
 /// Startup log line for service-level skills (issue #74 拆单 3/3): `Some` only
@@ -5416,6 +5458,114 @@ mod tests {
             ("RECURSIVE_HTTP_AUTH_INSECURE_OK", None),
         ]);
         assert_eq!(http_auth_posture_label(), "unconfigured");
+    }
+
+    // ── Goal 429 S2: HTTP headless semantics (#88) ──────────────────────────
+
+    /// Interactive rules + zero discovered hooks must be announced at startup:
+    /// the fail-closed flip (S2) has to be foreseeable, not discovered in a
+    /// tool denial.
+    #[test]
+    fn http_interactive_without_hooks_warning_names_the_deny_semantics() {
+        use recursive::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let perms = LayeredPermissionsConfig {
+            mode: recursive::permissions::PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: vec!["Bash".into(), "Write".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = recursive::tools::ToolRegistry::local().with_permissions(perms);
+        let warn = http_interactive_without_hooks_warning(&registry)
+            .expect("interactive rules with no hooks must warn at startup");
+        for needle in [
+            "HTTP: 2 interactive rule(s)",
+            "no PermissionRequest hook",
+            "will be DENIED on this channel",
+        ] {
+            assert!(
+                warn.contains(needle),
+                "warning must contain `{needle}` — got: {warn}"
+            );
+        }
+    }
+
+    /// Positive controls: with a discovered hook, with no interactive rules,
+    /// or with no permissions config at all, the warning stays silent.
+    #[test]
+    fn http_interactive_without_hooks_warning_stays_silent_when_not_applicable() {
+        use recursive::hooks::{
+            ExternalHookRunner, HookCommand, HookCommandType, HookMatcher, HooksConfig,
+        };
+        use recursive::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let perms = || LayeredPermissionsConfig {
+            mode: recursive::permissions::PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: vec!["Bash".into()],
+                ..Default::default()
+            }],
+        };
+        // A discovered (never-executed here) PermissionRequest hook.
+        let hooks_cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PermissionRequest".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        r#type: HookCommandType::Command,
+                        command: Some("/bin/true".to_string()),
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+        let hooked = recursive::tools::ToolRegistry::local()
+            .with_permissions(perms())
+            .with_hook_runner(ExternalHookRunner::from_config(hooks_cfg));
+        assert_eq!(hooked.hook_count(), 1);
+        assert!(
+            http_interactive_without_hooks_warning(&hooked).is_none(),
+            "hooks present → no warn"
+        );
+        let no_interactive =
+            recursive::tools::ToolRegistry::local().with_permissions(LayeredPermissionsConfig {
+                mode: recursive::permissions::PermissionMode::Default,
+                layers: vec![PermissionLayer {
+                    source: RuleSource::User,
+                    allow: vec!["Bash".into()],
+                    ..Default::default()
+                }],
+            });
+        assert!(
+            http_interactive_without_hooks_warning(&no_interactive).is_none(),
+            "no interactive rules → no warn"
+        );
+        assert!(
+            http_interactive_without_hooks_warning(&recursive::tools::ToolRegistry::local())
+                .is_none(),
+            "no permissions config (tier3) → no warn"
+        );
+    }
+
+    /// The [policy] wiring itself: the HTTP arm must pin the registry's
+    /// headless semantics. The behavioral pins for the underlying pipeline
+    /// semantics live in `src/tools/mod.rs` (#154 family: empty-runner deny,
+    /// hook allow/deny) — this source pin is the in-process guard against a
+    /// silent revert of the one-line wiring (mutation, merge conflict).
+    #[test]
+    fn http_arm_fixes_headless_semantics() {
+        let src = include_str!("main.rs");
+        // Only the production half: the needle below would otherwise match
+        // this test's own source text (self-match trap — first negative
+        // control stayed green because of it).
+        let (production, _tests) = src.rsplit_once("mod tests {").expect("tests module marker");
+        assert!(
+            production.contains("let tools = tools.with_headless(true);"),
+            "the Cmd::Http arm must fix the registry's headless semantics \
+             (Goal 429 S2 [policy]) — the line went missing"
+        );
     }
 
     #[test]

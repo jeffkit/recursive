@@ -85,6 +85,18 @@ TUI 的双形态锚点以上表两个二进制为准。
   admission 饱和 → **503 + `Retry-After`**（`src/http/handlers.rs:391`，
   header 机制 `src/http/mod.rs:1164-1182`）；`/readyz` 依赖不可用 → 503
   （`src/http/mod.rs:1211`）。
+- **审批语义（Goal 429 S2，[policy]）**：HTTP 恒 headless——权限规则里的
+  `interactive` 工具走外审 hook（`PermissionRequest` 事件，hook 目录
+  `~/.recursive/hooks` / `<ws>/.recursive/hooks`）；有 hook，其
+  `permissionDecision` 为权威（#154 fail-closed），无 hook **一律 DENY**。
+  启动时 `WARN: HTTP: N interactive rule(s) … will be DENIED on this
+  channel` 让该语义可预见。CLI/TUI/ACP 通道的 `interactive` 语义不变
+  （各有终端/控制通道审批 hook）。
+- **启动姿态行（Goal 429 S3）**：stderr 打一行
+  `http security posture: sandbox=<tier> workspace=<path> permissions=<…>
+  approval_hooks=<N> auth=<configured|insecure-debug|unconfigured>` +
+  四档沙箱单租户 WARN（镜像 microvm 先例）——部署事实启动即说，
+  「文档知道的事运行时不说」的缺口收口。
 - **不支持清单**：次生产 ≠ 生产 SLA 承诺（宣称面已按本页对齐）；C 端
   身份装配未落（#146 / 属主 #152，P3 缓行——只指路，此处不展开不代做）；
   Redis session hot-state 不接入 `recursive http`（#92 方向已关）。
@@ -141,7 +153,10 @@ owner 2026-10-18 裁决语义：**实验级 = 修复不排产，但安全底线�
 （`src/tools/dispatch.rs:275`）；权限 = permission layer 加载
 （`src/config_file.rs` `load_permission_layer`，坏 TOML/读失败 → WARN
 可观测，Goal 426 S3(b)）+ 判定主体 = 结构化工具身份
-（`src/tools/tool_identity.rs`，Goal 426 S1；`dispatch.rs:39`）。
+（`src/tools/tool_identity.rs`，Goal 426 S1；`dispatch.rs:39`）；
+HTTP `interactive` = **headless 语义**（Goal 429 S2，[policy]）：外审 hook
+权威、空 runner fail-closed DENY（`Cmd::Http` 臂 `with_headless(true)`，
+管线 Phase 6）。
 
 ## 10. 挂账处置 — `CancelKind::McpServer` 留，实验预留（S3 拍板 (a)）
 

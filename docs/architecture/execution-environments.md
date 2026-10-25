@@ -259,6 +259,32 @@ workspace starts empty; host background tools are dropped). Users who
 need isolation opt in explicitly via `RECURSIVE_SANDBOX`; setup failure
 then aborts loudly rather than degrade.
 
+## HTTP deployment posture
+
+`recursive http` states its security posture at startup on stderr — one
+assertable line plus a per-tier single-tenancy WARN (Goal 429 S3):
+
+```
+WARN: RECURSIVE_SANDBOX=none — all HTTP sessions execute tools on the host and share one workspace (…); files under .recursive/ (sessions, memory, facts) are readable by every session's tools. Not for multi-tenant deployments.
+http security posture: sandbox=none workspace=… permissions=unconfigured (all tools allowed) approval_hooks=0 auth=unconfigured
+```
+
+Every tier in the matrix above is **shared-tenancy in HTTP serve mode**
+(none/policy: host processes over one workspace; container: per-session
+container but the same host workspace bind-mounted into every container;
+microvm: one VM per process). **「无沙箱 + 无权限配置」(sandbox=none,
+permissions=unconfigured) is not a multi-user production posture** — the
+posture line prints `all tools allowed` so it cannot be missed.
+
+Approval semantics follow the headless channel rule (Goal 429 S2,
+[channels.md](channels.md) §9): HTTP is always headless — tools classified
+`interactive` in the permission config go to an external approval hook
+(`PermissionRequest`, discovered under `~/.recursive/hooks` and
+`<ws>/.recursive/hooks`); with a hook its `permissionDecision` is
+authoritative, without one they are **denied** fail-closed. The startup
+WARN `N interactive rule(s) … will be DENIED on this channel` makes that
+foreseeable.
+
 ## Self-hosted microVM requirements (future work checklist)
 
 Running Firecracker-class microVMs without E2B would require, at minimum:
