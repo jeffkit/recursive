@@ -914,17 +914,17 @@ async fn async_main() -> anyhow::Result<()> {
             }
             // Issue #50: the microvm sandbox is per provider/process, so
             // every HTTP session shares one E2B VM (single-tenant).
-            if matches!(
-                recursive::SandboxMode::from_env().ok().flatten(),
-                Some(recursive::SandboxMode::MicroVm)
-            ) {
-                eprintln!(
-                    "WARN: RECURSIVE_SANDBOX=microvm — all HTTP sessions will \
-                     share one E2B microVM (single-tenant); files, processes, \
-                     and network state are mutually visible. Do not use this \
-                     for multi-tenant deployments."
-                );
-            }
+            // Goal 429 S3 (#86 面 1): every tier states its deployment
+            // posture at startup, same WARN posture as microvm — the tier's
+            // tenancy is a deployment fact operators must see.
+            let sandbox_tier = recursive::SandboxMode::from_env()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            eprintln!(
+                "WARN: {}",
+                http_sandbox_tier_warning(&sandbox_tier, &config.workspace)
+            );
             // Goal 399: HTTP sessions get safe execution budgets by default
             // (`RECURSIVE_HTTP_MAX_STEPS`=100, `RECURSIVE_HTTP_WALL_TIMEOUT_SECS`=1800;
             // an explicit 0 restores unbounded). Applied to the server's config
@@ -982,6 +982,19 @@ async fn async_main() -> anyhow::Result<()> {
             // set (sub-agent tools register post-prune and would otherwise
             // escape it).
             cli::builder::apply_operator_allow_list(&mut tools, &config);
+            // Goal 429 S3 (#86 面 1): the HTTP security posture, spoken in one
+            // assertable line at startup — the facts the architecture docs
+            // state, the process says too. Purely descriptive: process-level
+            // facts only (zero tenant identity — owner ruling).
+            eprintln!(
+                "{}",
+                http_security_posture_line(
+                    &tools,
+                    &config.workspace,
+                    &sandbox_tier,
+                    http_auth_posture_label(),
+                )
+            );
             let tool_infos: Vec<recursive::http::ToolInfo> = tools
                 .specs()
                 .into_iter()
@@ -2532,6 +2545,112 @@ fn session_entry_to_json(
             "removed": removed,
         }),
     })
+}
+
+// ── Goal 429 S3 (#86 面 1): HTTP startup security posture ─────────────────
+
+/// The `RECURSIVE_SANDBOX` spelling of a sandbox tier (the enum has no
+/// `Display`; `Debug` is PascalCase while the env value is lowercase).
+fn sandbox_tier_label(tier: &recursive::SandboxMode) -> &'static str {
+    match tier {
+        recursive::SandboxMode::None => "none",
+        recursive::SandboxMode::Policy => "policy",
+        recursive::SandboxMode::Container => "container",
+        recursive::SandboxMode::MicroVm => "microvm",
+    }
+}
+
+/// The single-tenant posture WARN for an HTTP deployment on `tier`, mirroring
+/// the original microvm text (issue #50). Every tier states its tenancy at
+/// startup — `execution-environments.md` documents these facts, the process
+/// says them too.
+fn http_sandbox_tier_warning(tier: &recursive::SandboxMode, workspace: &std::path::Path) -> String {
+    match tier {
+        recursive::SandboxMode::MicroVm => "RECURSIVE_SANDBOX=microvm — all HTTP sessions will \
+             share one E2B microVM (single-tenant); files, processes, \
+             and network state are mutually visible. Do not use this \
+             for multi-tenant deployments."
+            .to_string(),
+        recursive::SandboxMode::Container => {
+            "RECURSIVE_SANDBOX=container — per-session container, but the same host \
+             workspace is bind-mounted into every container — session files are \
+             mutually readable. Not for multi-tenant deployments."
+                .to_string()
+        }
+        tier @ (recursive::SandboxMode::None | recursive::SandboxMode::Policy) => format!(
+            "RECURSIVE_SANDBOX={} — all HTTP sessions execute tools on the host and \
+             share one workspace ({}); files under .recursive/ (sessions, memory, \
+             facts) are readable by every session's tools. Not for multi-tenant \
+             deployments.",
+            sandbox_tier_label(tier),
+            workspace.display()
+        ),
+    }
+}
+
+/// The `auth=` field of the HTTP security posture line. `unconfigured` is the
+/// default-deny state (the middleware answers 503, Goal 277); `insecure-debug`
+/// is the debug-only `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` bypass (release
+/// builds ignore the switch, so it still reads `unconfigured` there).
+fn http_auth_posture_label() -> &'static str {
+    if recursive::http::auth_is_configured() {
+        "configured"
+    } else if recursive::http::auth_insecure_ok_requested() && cfg!(debug_assertions) {
+        "insecure-debug"
+    } else {
+        "unconfigured"
+    }
+}
+
+/// One-line, e2e-assertable HTTP security posture summary. Purely
+/// descriptive: process-level facts only (zero tenant identity — owner
+/// ruling; identity is resolved per request at the serving edge).
+fn http_security_posture_line(
+    tools: &recursive::tools::ToolRegistry,
+    workspace: &std::path::Path,
+    sandbox_tier: &recursive::SandboxMode,
+    auth_label: &str,
+) -> String {
+    let permissions = match tools.permissions_config() {
+        None => "unconfigured (all tools allowed)".to_string(),
+        Some(perms) => {
+            let rules: usize = perms
+                .layers
+                .iter()
+                .map(|l| l.allow.len() + l.deny.len() + l.interactive.len())
+                .sum();
+            let interactive: usize = perms.layers.iter().map(|l| l.interactive.len()).sum();
+            format!(
+                "{} rules, mode={}, interactive={}",
+                rules,
+                permission_mode_label(&perms.mode),
+                interactive
+            )
+        }
+    };
+    format!(
+        "http security posture: sandbox={} workspace={} permissions={} approval_hooks={} auth={}",
+        sandbox_tier_label(sandbox_tier),
+        workspace.display(),
+        permissions,
+        tools.hook_count(),
+        auth_label
+    )
+}
+
+/// The config-file spelling of a permission mode (the enum carries data
+/// variants, so `Debug` is not a stable label).
+fn permission_mode_label(mode: &recursive::permissions::PermissionMode) -> &'static str {
+    use recursive::permissions::PermissionMode as PM;
+    match mode {
+        PM::Default => "default",
+        PM::AcceptEdits => "acceptEdits",
+        PM::BypassPermissions => "bypassPermissions",
+        PM::DontAsk => "dontAsk",
+        PM::Plan { .. } => "plan",
+        PM::Auto => "auto",
+        PM::Strict => "strict",
+    }
 }
 
 /// Startup log line for service-level skills (issue #74 拆单 3/3): `Some` only
@@ -5154,6 +5273,149 @@ mod tests {
             Some("skills: loaded 3 skill(s) via service-level SkillSource"),
             "the count itself is part of the message (`==` mutant would print only 0)"
         );
+    }
+
+    // ── Goal 429 S3: HTTP startup security posture ──────────────────────────
+
+    /// Every tier names itself and its tenancy; none/policy call out the
+    /// shared workspace path, container the shared bind.
+    #[test]
+    fn http_sandbox_tier_warning_names_the_tier_and_its_tenancy() {
+        let ws = std::path::Path::new("/srv/recursive");
+        for (tier, needles) in [
+            (
+                recursive::SandboxMode::None,
+                vec![
+                    "RECURSIVE_SANDBOX=none",
+                    "share one workspace (/srv/recursive)",
+                    "Not for multi-tenant deployments",
+                ],
+            ),
+            (
+                recursive::SandboxMode::Policy,
+                vec![
+                    "RECURSIVE_SANDBOX=policy",
+                    "share one workspace (/srv/recursive)",
+                    "Not for multi-tenant deployments",
+                ],
+            ),
+            (
+                recursive::SandboxMode::Container,
+                vec![
+                    "RECURSIVE_SANDBOX=container",
+                    "bind-mounted into every container",
+                    "Not for multi-tenant deployments",
+                ],
+            ),
+            (
+                recursive::SandboxMode::MicroVm,
+                vec![
+                    "RECURSIVE_SANDBOX=microvm",
+                    "share one E2B microVM (single-tenant)",
+                    "multi-tenant deployments",
+                ],
+            ),
+        ] {
+            let warn = http_sandbox_tier_warning(&tier, ws);
+            for needle in needles {
+                assert!(
+                    warn.contains(needle),
+                    "tier `{}` warning must contain `{needle}` — got: {warn}",
+                    sandbox_tier_label(&tier)
+                );
+            }
+        }
+    }
+
+    /// No `[permissions]` in the config: the posture line says so and spells
+    /// out the consequence (拍板点 2: “all tools allowed”).
+    #[test]
+    fn http_security_posture_line_reports_unconfigured_permissions_as_all_tools_allowed() {
+        let registry = recursive::tools::ToolRegistry::local();
+        let line = http_security_posture_line(
+            &registry,
+            std::path::Path::new("/srv/recursive"),
+            &recursive::SandboxMode::None,
+            "unconfigured",
+        );
+        for needle in [
+            "http security posture:",
+            "sandbox=none",
+            "workspace=/srv/recursive",
+            "permissions=unconfigured (all tools allowed)",
+            "approval_hooks=0",
+            "auth=unconfigured",
+        ] {
+            assert!(
+                line.contains(needle),
+                "posture line must contain `{needle}` — got: {line}"
+            );
+        }
+    }
+
+    /// A permissions config is summarized as rule count / mode / interactive
+    /// count — the fields an operator tunes.
+    #[test]
+    fn http_security_posture_line_summarizes_permissions_rules_mode_and_interactive() {
+        use recursive::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let perms = LayeredPermissionsConfig {
+            mode: recursive::permissions::PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                allow: vec!["Read".into()],
+                interactive: vec!["Bash".into(), "Write".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = recursive::tools::ToolRegistry::local().with_permissions(perms);
+        let line = http_security_posture_line(
+            &registry,
+            std::path::Path::new("/srv/recursive"),
+            &recursive::SandboxMode::Policy,
+            "configured",
+        );
+        for needle in [
+            "permissions=3 rules, mode=default, interactive=2",
+            "sandbox=policy",
+            "auth=configured",
+        ] {
+            assert!(
+                line.contains(needle),
+                "posture line must contain `{needle}` — got: {line}"
+            );
+        }
+    }
+
+    /// The auth label mirrors the middleware's resolution: configured keys
+    /// win; the debug-only `INSECURE_OK` bypass is labeled as such (release
+    /// builds ignore the switch, so it reads `unconfigured` there).
+    #[test]
+    fn http_auth_posture_label_follows_the_middleware_resolution() {
+        let guard = EnvGuard::set(&[
+            (recursive::http::ENV_AUTH_KEYS, Some("k1")),
+            ("RECURSIVE_HTTP_AUTH_INSECURE_OK", None),
+        ]);
+        assert_eq!(http_auth_posture_label(), "configured");
+        drop(guard);
+        let guard = EnvGuard::set(&[
+            (recursive::http::ENV_AUTH_KEYS, None),
+            (recursive::http::ENV_AUTH_KEY_OWNERS, None),
+            (recursive::http::ENV_AUTH_JWT_SECRET, None),
+            ("RECURSIVE_HTTP_AUTH_INSECURE_OK", Some("1")),
+        ]);
+        if cfg!(debug_assertions) {
+            assert_eq!(http_auth_posture_label(), "insecure-debug");
+        } else {
+            assert_eq!(http_auth_posture_label(), "unconfigured");
+        }
+        drop(guard);
+        let _guard = EnvGuard::set(&[
+            (recursive::http::ENV_AUTH_KEYS, None),
+            (recursive::http::ENV_AUTH_KEY_OWNERS, None),
+            (recursive::http::ENV_AUTH_JWT_SECRET, None),
+            ("RECURSIVE_HTTP_AUTH_INSECURE_OK", None),
+        ]);
+        assert_eq!(http_auth_posture_label(), "unconfigured");
     }
 
     #[test]

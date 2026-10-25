@@ -289,6 +289,17 @@ impl<'a> PermissionPipeline<'a> {
                     // Hook allowed/transformed; guard already dropped, skip headless block.
                 } else {
                     // No hook registered — non-headless library caller → allow.
+                    // Goal 429 S1 (issue #88): the `interactive` rule promised a
+                    // human approval that cannot happen here (plain text-mode
+                    // `recursive run` and library callers have no approver to
+                    // block on), so the decision stays "allow" — but the
+                    // promised gate silently vanishing is a degradation and
+                    // must be observable (owner ruling 2026-10-18).
+                    tracing::warn!(
+                        target: "recursive::permissions",
+                        tool = %canonical,
+                        "interactive rule matched but no permission hook is installed; allowing (degradation)"
+                    );
                     drop(guard);
                 }
             } else if self.registry.headless && is_interactive_tool {
@@ -623,6 +634,90 @@ mod tests {
             .check("Bash", serde_json::json!({"command": "ls"}))
             .await;
         assert!(outcome.is_deny());
+    }
+
+    // ── Goal 429 S1 (issue #88): the silent interactive allow is a degradation ──
+
+    /// Phase 5 with an `interactive` rule but no hook installed: the call
+    /// stays an allow (control flow unchanged — plain text-mode runs and
+    /// library callers have no approver to block on), and the degradation
+    /// is announced with the canonical tool name.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn interactive_rule_without_hook_allows_and_warns() {
+        use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: vec!["Bash".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = ToolRegistry::local().with_permissions(config);
+        let pipeline = PermissionPipeline::new(&registry);
+        match pipeline
+            .check("Bash", serde_json::json!({"command": "ls"}))
+            .await
+        {
+            CheckOutcome::Allow { .. } => {}
+            CheckOutcome::Deny { error, .. } => {
+                panic!("the no-hook interactive allow must not flip to a denial: {error:?}")
+            }
+        }
+        assert!(
+            logs_contain("interactive rule matched but no permission hook is installed"),
+            "the promised approval gate vanishing must be announced (degradation)"
+        );
+        assert!(
+            logs_contain("tool=Bash"),
+            "the degradation warning must name the canonical tool"
+        );
+    }
+
+    /// Positive control: with a hook installed the same call routes through
+    /// the hook and stays silent — a wired hook is no degradation.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn interactive_rule_with_hook_stays_silent() {
+        use crate::agent::PermissionDecision;
+        use crate::tools::PermissionHook;
+        use std::sync::Arc;
+
+        struct AllowHook;
+        #[async_trait]
+        impl PermissionHook for AllowHook {
+            async fn check(&self, _name: &str, _args: &serde_json::Value) -> PermissionDecision {
+                PermissionDecision::Allow
+            }
+        }
+
+        use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: vec!["Bash".into()],
+                ..Default::default()
+            }],
+        };
+        let registry = ToolRegistry::local()
+            .with_permissions(config)
+            .with_permission_hook(Arc::new(AllowHook));
+        let pipeline = PermissionPipeline::new(&registry);
+        match pipeline
+            .check("Bash", serde_json::json!({"command": "ls"}))
+            .await
+        {
+            CheckOutcome::Allow { .. } => {}
+            CheckOutcome::Deny { error, .. } => {
+                panic!("hook-allowed call must stay allowed: {error:?}")
+            }
+        }
+        assert!(
+            !logs_contain("interactive rule matched but no permission hook is installed"),
+            "a wired hook must not trigger the degradation warning"
+        );
     }
 
     // ── Issue #182: `auto` without a classifier fails closed ─────────────────

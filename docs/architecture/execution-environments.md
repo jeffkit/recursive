@@ -132,7 +132,7 @@ expire), and **data egress** — file contents transit the E2B cloud API.
 | Kernel / syscalls | host kernel shared | host kernel shared | host kernel shared (syscall surface via dropped caps, seccomp optional) | **hardware-isolated** (Firecracker microVM, KVM); guest kernel owns syscalls |
 | Network | unrestricted | restricted by policy | opt-in bridge (`RECURSIVE_SANDBOX_NETWORK`) | VM NIC; the `base` template allows outbound — gated behind the host-side `RECURSIVE_SANDBOX_NETWORK=on` startup acknowledgment; a custom template owns its own egress decision |
 | Resources | unbounded | unbounded | cgroup limits if configured | VM vCPU/RAM fixed by template |
-| Data tenancy | single tenant on host | same | container-per-session, shared host kernel | shares one VM (`single-tenant`) in HTTP serve mode — see deployment warning above; per-session only for CLI single-run (process ≈ session) |
+| Data tenancy | single tenant on host | same | container-per-session, shared host kernel — but the **same host workspace is bind-mounted into every container** (one dir for all sessions; session files mutually readable) | shares one VM (`single-tenant`) in HTTP serve mode — see deployment warning above; per-session only for CLI single-run (process ≈ session) |
 | Time snapshots | none | none | none | none (`snapshot == false`); TTL renewal only |
 
 ## Threat Model

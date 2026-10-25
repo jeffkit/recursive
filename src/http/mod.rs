@@ -27,8 +27,8 @@ mod workspace_files;
 pub use crate::session_host::SessionHost;
 pub use crate::session_host::{AcquireError, AdmissionGate, RunPermit};
 pub use auth::{
-    AuthConfig, AuthIdentity, JwtConfig, DEFAULT_KEY_SUBJECT, ENV_AUTH_ADMINS, ENV_AUTH_JWT_SECRET,
-    ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS,
+    auth_insecure_ok_requested, auth_is_configured, AuthConfig, AuthIdentity, JwtConfig,
+    DEFAULT_KEY_SUBJECT, ENV_AUTH_ADMINS, ENV_AUTH_JWT_SECRET, ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS,
 };
 // Issue #97: the bounded per-session replay ring behind SSE resume.
 pub(crate) use event_log::frame_seq;

@@ -386,6 +386,25 @@ pub(super) fn auth_config_from_env() -> AuthConfig {
     config
 }
 
+/// Goal 429 S3: whether the auth surface would accept a request.
+///
+/// Runs the same resolution as [`auth_config_from_env`] and reports its
+/// `is_enabled()`, so the startup security-posture line cannot drift from
+/// the middleware's actual decision.
+pub fn auth_is_configured() -> bool {
+    auth_config_from_env().is_enabled()
+}
+
+/// Goal 429 S3: whether `RECURSIVE_HTTP_AUTH_INSECURE_OK` requests the
+/// debug-only bypass. Mirrors the middleware's parsing (`1` / `true`,
+/// case-insensitive) so the startup security-posture line reports what the
+/// middleware will actually honour.
+pub fn auth_insecure_ok_requested() -> bool {
+    std::env::var("RECURSIVE_HTTP_AUTH_INSECURE_OK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Parse a comma-separated env var, trimming each entry and dropping blanks.
 fn comma_list(name: &str) -> Vec<String> {
     std::env::var(name)

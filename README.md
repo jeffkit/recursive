@@ -319,6 +319,12 @@ saturation — for readiness probes.
 > configured. For local dev, set `RECURSIVE_HTTP_AUTH_INSECURE_OK=1` as a
 > debug escape hatch — never use this in production.
 
+At startup the server prints its security posture on stderr —
+`http security posture: sandbox=<tier> workspace=<path> permissions=<…> approval_hooks=<N> auth=<…>` —
+and warns when the sandbox tier is shared-tenancy (every tier in this
+table is, except a dedicated microVM per process). See
+`docs/architecture/execution-environments.md`.
+
 ### Full cloud stack (S3)
 
 Use the bundled `docker-compose.yml` to spin up LocalStack S3 (transcript

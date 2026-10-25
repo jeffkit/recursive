@@ -633,6 +633,14 @@ impl ToolRegistry {
         self.hook_runner = hook_runner;
     }
 
+    /// Number of external hooks discovered for this registry (Goal 429 S3:
+    /// the `approval_hooks` field of the HTTP security posture line). Zero
+    /// also means a headless channel has no approval authority — an
+    /// `interactive`-classified tool is denied fail-closed (issue #154).
+    pub fn hook_count(&self) -> usize {
+        self.hook_runner.len()
+    }
+
     /// Set the permissions configuration for this registry.
     pub fn with_permissions(mut self, permissions: PermissionsConfig) -> Self {
         self.permission_mode = permissions.mode.clone();
