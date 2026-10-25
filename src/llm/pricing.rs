@@ -234,11 +234,23 @@ impl RetryLog {
     }
 
     /// Remove and return every record accumulated so far.
+    ///
+    /// A poisoned lock (a thread panicked while holding it) drains to nothing:
+    /// the records are intact behind the lock but this call hands none of them
+    /// to the ledger. That loss is announced (#240); the drain semantics stay.
     pub fn take(&self) -> Vec<RetryRecord> {
-        self.records
-            .lock()
-            .map(|mut records| std::mem::take(&mut *records))
-            .unwrap_or_default()
+        match self.records.lock() {
+            Ok(mut records) => std::mem::take(&mut *records),
+            Err(poisoned) => {
+                let lost = poisoned.into_inner().len();
+                tracing::warn!(
+                    target: "recursive::llm",
+                    lost,
+                    "pricing retry records lost to poisoned lock (degradation)"
+                );
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -952,5 +964,58 @@ mod tests {
         let clone = log.clone();
         log.record(0, Duration::from_millis(5), None, "network");
         assert_eq!(clone.take().len(), 1, "clones observe the same queue");
+    }
+
+    /// Issue #240: a poisoned retry log must not drain silently. The records
+    /// behind the lock are intact, but `take` hands back nothing — that loss
+    /// is announced on `recursive::llm` with the number of records that fell
+    /// out of the ledger. A healthy drain stays off the warning channel.
+    #[tracing_test::traced_test]
+    #[test]
+    fn retry_log_take_warns_when_lock_is_poisoned() {
+        const SENTENCE: &str = "pricing retry records lost to poisoned lock (degradation)";
+        let log = RetryLog::default();
+
+        // Positive control: a healthy drain returns the records and is silent.
+        log.record(0, Duration::from_millis(1), Some(429), "rate_limited");
+        log.record(1, Duration::from_millis(2), Some(503), "server_error");
+        assert_eq!(log.take().len(), 2, "healthy drain returns the batch");
+        assert!(
+            !logs_contain(SENTENCE),
+            "a healthy drain must not be flagged as lost"
+        );
+
+        // Re-seed, then poison the lock: panic while holding it on another
+        // thread. The three records stay behind the poisoned mutex.
+        log.record(0, Duration::from_millis(1), Some(429), "rate_limited");
+        log.record(1, Duration::from_millis(2), None, "network");
+        log.record(2, Duration::from_millis(4), Some(500), "server_error");
+        let shared = std::sync::Arc::clone(&log.records);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = shared.lock().expect("lock is healthy before poisoning");
+            panic!("poison the retry log");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "the poisoning thread must have panicked"
+        );
+        assert!(
+            log.records.lock().is_err(),
+            "the fixture must actually poison the lock"
+        );
+
+        let drained = log.take();
+        assert!(
+            drained.is_empty(),
+            "accounting still loses the batch (drain semantics unchanged)"
+        );
+        assert!(
+            logs_contain(SENTENCE),
+            "a poisoned drain must be announced, not silently emptied"
+        );
+        assert!(
+            logs_contain("lost=3"),
+            "the warning must count the records that fell out of the ledger"
+        );
     }
 }
