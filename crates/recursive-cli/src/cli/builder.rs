@@ -1084,6 +1084,77 @@ mod tests {
         );
     }
 
+    /// Issue #242: an unpinned multi-URL deployment must clear the positional
+    /// pin-count gate. With `RECURSIVE_SKILL_SOURCE_SHA256` unset the pin list
+    /// is empty and the gate is skipped, so the first URL reaches the
+    /// https-only policy check. A parser that manufactures a phantom pin
+    /// (the `skill_source_sha256_pins -> vec![..]` mutants surviving CI run
+    /// 40144987139) would instead reject every unpinned config with two or
+    /// more URLs as a count mismatch — every existing test used exactly one
+    /// URL, where one phantom pin equals one URL and the gate stays quiet.
+    #[test]
+    fn skills_from_http_sources_unpinned_multi_url_clears_pin_count_gate() {
+        let _env = EnvGuard::set(&[
+            (
+                "RECURSIVE_SKILL_SOURCE_URL",
+                Some("http://a.example.com/index.json,http://b.example.com/index.json"),
+            ),
+            ("RECURSIVE_SKILL_SOURCE_HOSTS", None),
+            ("RECURSIVE_SKILL_SOURCE_SHA256", None),
+        ]);
+        let err = skills_from_http_sources().unwrap_err();
+        assert!(
+            err.contains("https://"),
+            "unpinned URLs must reach the https-only policy, not the pin gate: {err}"
+        );
+        assert!(
+            !err.contains("pin"),
+            "an unset pin env must not be read as a phantom pin: {err}"
+        );
+    }
+
+    /// Issue #242: unset, blank, and separator-only `RECURSIVE_SKILL_SOURCE_SHA256`
+    /// all parse to an empty pin list ("pinning disabled"), never to a list
+    /// holding an empty string. Each arm is scoped: the shared env lock is a
+    /// non-reentrant std Mutex (see `skills_from_http_sources_unset_or_blank_is_empty`).
+    #[test]
+    fn skill_source_sha256_pins_unset_or_separators_only_is_empty() {
+        {
+            let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_SHA256", None)]);
+            assert!(
+                skill_source_sha256_pins().is_empty(),
+                "unset env must disable pinning"
+            );
+        }
+        {
+            let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_SHA256", Some("   "))]);
+            assert!(
+                skill_source_sha256_pins().is_empty(),
+                "blank env must disable pinning"
+            );
+        }
+        {
+            let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_SHA256", Some(" , ,"))]);
+            assert!(
+                skill_source_sha256_pins().is_empty(),
+                "separator-only env must disable pinning, not yield empty pins"
+            );
+        }
+    }
+
+    /// Issue #242: pins are positional over the comma-split value — each
+    /// entry is trimmed, empty entries are dropped, and order is preserved so
+    /// `pins[i]` lines up with `urls[i]` in `skills_from_http_sources`.
+    #[test]
+    fn skill_source_sha256_pins_parses_positionally_trims_and_drops_empties() {
+        let _env = EnvGuard::set(&[("RECURSIVE_SKILL_SOURCE_SHA256", Some(" aaaa , ,bbbb,"))]);
+        assert_eq!(
+            skill_source_sha256_pins(),
+            vec!["aaaa".to_string(), "bbbb".to_string()],
+            "pins must be trimmed, de-blanked, and kept in URL order"
+        );
+    }
+
     /// End-to-end through the service-level entry: an https endpoint that
     /// refuses the connection surfaces as a propagated `Err` — the fetch
     /// really left the process (loopback, no disk involved), and the http

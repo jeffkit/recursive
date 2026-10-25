@@ -10,6 +10,7 @@
 
 - [`195-eef5f42b-cli-survivors.md`](195-eef5f42b-cli-survivors.md) — #195 eef5f42b 幸存者 18 条 triage 与三单处置（#210/#211/#212 + #223 批 2/3）
 - [`223-mutation-batches-1-3.md`](223-mutation-batches-1-3.md) — #223 三批全账（e197bbce / 955a2fa9 / e8b74633）与终判 run 40000505454
+- [`242-85bac8fb-builder-sha256-pins-survivors.md`](242-85bac8fb-builder-sha256-pins-survivors.md) — #242 85bac8fb builder.rs files-scope 幸存 2 条（邻函数 `skill_source_sha256_pins`，run 40144987139）三钉收敛 + 负控 6/6 红
 
 ## 一份证明的最小字段
 
