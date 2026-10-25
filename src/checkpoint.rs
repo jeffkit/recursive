@@ -206,6 +206,15 @@ impl ShadowRepo {
                     message: format!("git add failed: {stderr}"),
                 });
             }
+            // Tolerated failure (informational or empty stderr): previously
+            // silent. The index may be partial, so a snapshot taken from it
+            // can misaccount workspace state — keep the degradation
+            // observable (owner ruling).
+            tracing::warn!(
+                session = %session_id,
+                stderr = %stderr_tail(&add_out.stderr),
+                "checkpoint snapshot: git add exited non-zero with tolerated stderr; snapshot may be partial"
+            );
         }
 
         let tree_out = git_cmd()
@@ -645,7 +654,7 @@ impl ShadowRepo {
         let tmp_index = self.shadow_dir.join("tmp-index-diff");
         let _ = std::fs::remove_file(&tmp_index);
 
-        let _ = git_cmd()
+        let add_out = git_cmd()
             .env("GIT_INDEX_FILE", &tmp_index)
             .env("GIT_DIR", &self.shadow_dir)
             .env("GIT_WORK_TREE", &self.workspace)
@@ -668,7 +677,19 @@ impl ShadowRepo {
                 ":!.dev/transcripts/**",
                 ":!.worktrees/**",
             ])
-            .output();
+            .output()
+            .map_err(git_err)?;
+        if !add_out.status.success() {
+            // Staging failed: the write-tree below still succeeds against
+            // the empty/partial temp index, so the diff would silently
+            // misreport the workspace (e.g. "everything deleted"). The
+            // diff stays best-effort, but the degradation must remain
+            // observable (owner ruling).
+            tracing::warn!(
+                stderr = %stderr_tail(&add_out.stderr),
+                "checkpoint diff: git add failed; diff output may misreport workspace changes"
+            );
+        }
 
         let tree_out = git_cmd()
             .env("GIT_INDEX_FILE", &tmp_index)
@@ -821,6 +842,21 @@ fn git_err(e: std::io::Error) -> Error {
         call_id: None,
         message: format!("git invocation failed: {e}"),
     }
+}
+
+/// Bounded stderr payload for WARN events: the tail carries the actual
+/// error line, while full stderr can be arbitrarily large.
+fn stderr_tail(stderr: &[u8]) -> String {
+    const MAX: usize = 200;
+    let s = String::from_utf8_lossy(stderr);
+    let s = s.trim_end();
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let start = (s.len() - MAX..)
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len());
+    format!("…{}", &s[start..])
 }
 
 fn short_sha(full: &str) -> String {
@@ -1252,6 +1288,122 @@ mod tests {
         assert!(
             !diff.is_empty(),
             "diff vs modified workspace must be non-empty"
+        );
+    }
+
+    // ---- Issue #229: a failed `git add` before diff must be observable ----
+    //
+    // `write_workspace_tree` used to discard the `git add -A --force`
+    // `.output()` entirely, so a staging failure left `write-tree` to
+    // succeed against an empty/partial index and the diff silently
+    // misreported the workspace. The WARN is the fix's observable
+    // behaviour (owner ruling), asserted the same way `config_file.rs`'s
+    // #199 S3(b) capture harness does: `with_default` scopes a fmt
+    // subscriber to the calling thread only — parallel-safe, no
+    // process-global subscriber, no env mutation.
+
+    /// Append-only shared sink the capture subscriber formats into.
+    #[derive(Clone)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local DEBUG-level tracing subscriber and
+    /// return `(f's result, everything it formatted)` (ANSI off, one
+    /// event per line).
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        let logs = String::from_utf8(out).expect("tracing output is utf-8");
+        (value, logs)
+    }
+
+    /// `git add` failing before the diff's `write-tree` must emit a WARN
+    /// carrying the stderr tail. Kills a re-mutation back to
+    /// `let _ = ….output()`.
+    ///
+    /// Injection: the shadow dir is made read-only (0555) after a healthy
+    /// snapshot, so `git add` cannot create its `tmp-index-diff.lock` —
+    /// while `expand_sha` (read-only rev-parse) still succeeds, so the
+    /// failure lands exactly on the staging step. The diff itself still
+    /// errors afterwards (no index to write-tree) — that control flow is
+    /// pre-existing and unchanged; what this pins is that the staging
+    /// failure leaves a WARN trace instead of silently misaccounting.
+    /// `#[cfg(unix)]` per the #224口径: Windows chmod semantics differ
+    /// (cf. `paths.rs` 0555 fixture).
+    #[cfg(unix)]
+    #[test]
+    fn diff_staging_failure_warns_instead_of_silent_misaccounting() {
+        use std::os::unix::fs::PermissionsExt;
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+        fs::write(w.path().join("x.txt"), "v1").unwrap();
+        let c1 = r.snapshot_for_session("s", "v1").unwrap();
+
+        std::fs::set_permissions(&r.shadow_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (result, logs) = capture_logs(|| r.diff(&c1, None, &[]));
+
+        std::fs::set_permissions(&r.shadow_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "diff against an unwritable shadow dir must not pretend success"
+        );
+        assert!(
+            logs.contains("WARN"),
+            "staging failure must emit a WARN, got: {logs}"
+        );
+        assert!(
+            logs.contains("git add failed"),
+            "WARN must name the failed stage, got: {logs}"
+        );
+        assert!(
+            logs.contains("Permission denied"),
+            "WARN must carry the stderr tail, got: {logs}"
+        );
+    }
+
+    /// Negative control for the WARN surface itself: a healthy diff must
+    /// stay SILENT — the warning is for degradation, not for normal
+    /// operation.
+    #[test]
+    fn diff_healthy_staging_stays_silent() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+        fs::write(w.path().join("x.txt"), "v1").unwrap();
+        let c1 = r.snapshot_for_session("s", "v1").unwrap();
+        fs::write(w.path().join("x.txt"), "v2").unwrap();
+
+        let (result, logs) = capture_logs(|| r.diff(&c1, None, &[]));
+        assert!(result.is_ok(), "healthy diff must succeed");
+        assert!(
+            !logs.contains("WARN"),
+            "healthy staging is not a degradation and must not warn, got: {logs}"
         );
     }
 
