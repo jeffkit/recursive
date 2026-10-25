@@ -321,11 +321,27 @@ impl AcpSessionManager {
     /// to avoid double-allocating a `SessionId` in the caller.
     pub fn insert_with_id(&mut self, session_id: SessionId, session: AcpSession) {
         // If persistence is enabled, create the session directory and
-        // save initial metadata.
+        // save initial metadata. Failure is a degradation (#233): the session
+        // then exists only in memory and a later resume silently loses it,
+        // so the owner ruling demands a WARNING-or-louder trace.
         if let Some(pdir) = &self.persistence_dir {
             let session_dir = pdir.join(&session_id);
-            let _ = std::fs::create_dir_all(&session_dir);
-            let _ = self.save_metadata_to_disk(&session_id, &session);
+            if let Err(error) = std::fs::create_dir_all(&session_dir) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    pdir = %pdir.display(),
+                    error = %error,
+                    "ACP session metadata persist failed; resume will lose this session (degradation)"
+                );
+            }
+            if let Err(error) = self.save_metadata_to_disk(&session_id, &session) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    pdir = %pdir.display(),
+                    error = %error,
+                    "ACP session metadata persist failed; resume will lose this session (degradation)"
+                );
+            }
         }
         self.sessions.insert(session_id, session);
     }
@@ -1048,5 +1064,73 @@ mod tests {
                 "{sid}: tracked MCP pids must be cleared by the shutdown path"
             );
         }
+    }
+
+    /// #233: when the initial metadata persist fails at `insert_with_id`,
+    /// the session exists only in memory and a later resume silently loses
+    /// it — the failure must surface as a WARNING (owner ruling: every
+    /// degradation must be observable). A healthy insert stays off the
+    /// warning channel (positive control).
+    #[tracing_test::traced_test]
+    #[test]
+    fn insert_with_id_warns_when_initial_metadata_persist_fails() {
+        use crate::llm::MockProvider;
+
+        let make_session = |sid: &str| {
+            let runtime = AgentRuntime::builder()
+                .llm(Arc::new(MockProvider::new(vec![])))
+                .build()
+                .expect("build runtime");
+            AcpSession {
+                runtime: Arc::new(Mutex::new(runtime)),
+                cwd: PathBuf::from("/tmp"),
+                turn: 0,
+                session_id: sid.to_string(),
+                transcript: vec![],
+                cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
+                system_prompt: None,
+                mcp_servers: None,
+                client_capabilities: None,
+                acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
+                mcp_child_pids: Vec::new(),
+            }
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pdir = tmp.path().to_path_buf();
+        let mut mgr = AcpSessionManager::new().with_persistence_dir(pdir.clone());
+
+        // Positive control: a healthy insert writes metadata.json silently.
+        mgr.insert_with_id("acp-sess-ok".to_string(), make_session("acp-sess-ok"));
+        assert!(
+            pdir.join("acp-sess-ok").join("metadata.json").exists(),
+            "the fixture must actually persist metadata on the healthy path"
+        );
+        assert!(
+            !logs_contain("ACP session metadata persist failed"),
+            "a healthy insert must not be reported as degraded"
+        );
+
+        // Degradation: the session subdir is pre-occupied by a regular file,
+        // so both the dir creation and the metadata write fail.
+        let blocked = pdir.join("acp-sess-bad");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        mgr.insert_with_id("acp-sess-bad".to_string(), make_session("acp-sess-bad"));
+
+        assert!(
+            logs_contain(
+                "ACP session metadata persist failed; resume will lose this session (degradation)"
+            ),
+            "initial-metadata persist failure must be announced, not swallowed"
+        );
+        assert!(
+            logs_contain("session_id=acp-sess-bad"),
+            "the warning must name the affected session"
+        );
+        assert!(
+            logs_contain(&format!("pdir={}", pdir.display())),
+            "the warning must name the persistence dir"
+        );
     }
 }
