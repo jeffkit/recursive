@@ -1131,8 +1131,28 @@ if [[ "${RECURSIVE_SELF_REVIEW:-1}" == "1" ]]; then
 
   while [[ "$REVISION_ROUND" -lt "$MAX_REVISION_ROUNDS" ]]; do
     echo "[self-improve] running code review..."
-    REVIEW_JSON=$(.dev/scripts/review-changes.sh "$SELECTED_PROVIDER" 2>/dev/null || echo '{"verdict":"approve"}')
-    VERDICT=$(echo "$REVIEW_JSON" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('verdict','approve'))" 2>/dev/null || echo "approve")
+    # Issue #238: the review gate must fail CLOSED. A dead review script or
+    # unparseable output used to be rewritten into `approve` (three silent
+    # fail-open arms); now every failure arm downgrades to `request_changes`
+    # with a loud log line, so a broken reviewer can never self-approve.
+    REVIEW_JSON=$(.dev/scripts/review-changes.sh "$SELECTED_PROVIDER" 2>&1)
+    REVIEW_RC=$?
+    VERDICT=""
+    if [[ "$REVIEW_RC" -ne 0 ]]; then
+      echo "[self-improve] review gate FAILED (rc=$REVIEW_RC) — defaulting to request_changes (fail-closed, issue #238)" >&2
+      VERDICT="request_changes"
+    else
+      VERDICT=$(echo "$REVIEW_JSON" | python3 -c "import sys,json
+d = json.loads(sys.stdin.read())
+v = d.get('verdict')
+if v not in ('approve', 'request_changes'):
+    sys.exit(3)
+print(v)" 2>/dev/null)
+      if [[ -z "$VERDICT" ]]; then
+        echo "[self-improve] review gate UNPARSEABLE — defaulting to request_changes (fail-closed, issue #238)" >&2
+        VERDICT="request_changes"
+      fi
+    fi
 
     if [[ "$VERDICT" != "request_changes" ]]; then
       echo "[self-improve] review approved"
