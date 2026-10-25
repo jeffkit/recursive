@@ -560,6 +560,61 @@ mod tests {
             .is_none());
     }
 
+    /// Issue #203: inside the network window the delay is the count-only
+    /// doubling schedule (`initial * 2^attempt`, saturating at `max_backoff`)
+    /// — the window changes *when the loop stops*, not *how long it sleeps*.
+    /// The other window tests only assert `is_some()`; this one pins the
+    /// values, so a schedule that shrinks or flattens instead of doubling
+    /// (e.g. `initial / 2^attempt`) is caught.
+    #[test]
+    fn retry_policy_network_window_backoff_follows_the_doubling_schedule() {
+        let policy = RetryPolicy {
+            max_retries: 3,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(100),
+        };
+        let budget = Some(Duration::from_secs(600));
+        let inside = Duration::from_secs(10);
+
+        // Under the count floor the window path and the count-only path
+        // must agree exactly.
+        for attempt in 0..3 {
+            assert_eq!(
+                policy.backoff_for_budgeted(attempt, inside, None, true, budget),
+                policy.backoff_for(attempt, None, true),
+                "inside the window, attempt {attempt} must back off like the count-only path"
+            );
+        }
+        assert_eq!(
+            policy.backoff_for_budgeted(2, inside, None, true, budget),
+            Some(Duration::from_secs(4)),
+            "attempt 2 is 1s * 2^2"
+        );
+
+        // Past the floor the count-only path has given up; the window keeps
+        // the same doubling schedule and saturates at `max_backoff`.
+        assert_eq!(policy.backoff_for(3, None, true), None);
+        assert_eq!(
+            policy.backoff_for_budgeted(3, inside, None, true, budget),
+            Some(Duration::from_secs(8)),
+            "attempt 3 is 1s * 2^3 — the window extends the schedule, not a flat delay"
+        );
+        let capped = RetryPolicy {
+            max_backoff: Duration::from_secs(5),
+            ..policy
+        };
+        assert_eq!(
+            capped.backoff_for_budgeted(3, inside, None, true, budget),
+            Some(Duration::from_secs(5)),
+            "the window path must saturate at max_backoff"
+        );
+        assert_eq!(
+            capped.backoff_for_budgeted(40, inside, None, true, budget),
+            Some(Duration::from_secs(5)),
+            "a saturated power of two still clamps to max_backoff"
+        );
+    }
+
     #[test]
     fn retry_policy_status_429_returns_some_backoff() {
         let policy = RetryPolicy::default();
@@ -872,6 +927,64 @@ mod tests {
         assert!(w > 0, "effective context window for gpt-4o must be > 0");
     }
 
+    /// A `providers.d` override is honoured only when it carries a *positive*
+    /// window: a 0 means "unspecified" (an incomplete entry for a model the
+    /// upstream catalog has not filled in) and must fall through to the
+    /// bundled value rather than drive the gauge to "ctx x/0 - 100%". Both
+    /// arms pinned by value, under a pinned `RECURSIVE_HOME` so neither the
+    /// developer's real `providers.d` nor a remote cache leaks in.
+    #[test]
+    fn context_window_effective_positive_override_wins_but_zero_falls_through(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+        let dir = tmp.path().join(".recursive").join("providers.d");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("openai.toml"),
+            r#"
+[[providers]]
+id = "openai"
+provider_type = "openai"
+api_base = "https://api.openai.com/v1"
+default_model = "gpt-4o"
+models = [
+  {name = "gpt-4o", context_window = 0},
+  {name = "user-wide-window-model", context_window = 777000},
+]
+"#,
+        )?;
+        // Fixture guard: the merge must really have replaced gpt-4o's spec.
+        let openai =
+            crate::providers::find_preset_effective("openai").expect("bundled openai preset");
+        assert_eq!(
+            openai
+                .models
+                .iter()
+                .find(|m| m.name == "gpt-4o")
+                .map(|m| m.context_window),
+            Some(0),
+            "fixture: the providers.d override must zero gpt-4o's window"
+        );
+
+        assert_eq!(
+            context_window_tokens_for_model_effective("user-wide-window-model"),
+            777_000,
+            "a positive override window is the effective window"
+        );
+        let bundled = context_window_tokens_for_model("gpt-4o");
+        assert!(
+            bundled > 0,
+            "fixture: gpt-4o is catalogued with a real window"
+        );
+        assert_eq!(
+            context_window_tokens_for_model_effective("gpt-4o"),
+            bundled,
+            "a 0 override means unspecified — fall through to the bundled window, never report 0"
+        );
+        Ok(())
+    }
+
     // ── default_compact_threshold_chars ─────────────────────────────────────
 
     #[test]
@@ -920,6 +1033,24 @@ mod tests {
                 "token threshold {threshold} must be below context window {window} for {model}"
             );
         }
+    }
+
+    /// The 20 K summary reserve is capped at a quarter of the window so a
+    /// small model keeps a usable threshold instead of having it zeroed out
+    /// (`8_000.saturating_sub(20_000)` would be 0). Every other threshold
+    /// test uses a ≥128 K model, where the cap never engages; the bundled 8 K
+    /// moonshot entry is the smallest catalogued window.
+    #[test]
+    fn compact_threshold_small_window_caps_the_summary_reserve_at_a_quarter() {
+        assert_eq!(
+            context_window_tokens_for_model("moonshot-v1-8k"),
+            8_000,
+            "fixture: the bundled catalog carries an 8K model"
+        );
+        // 8_000 - min(20_000, 2_000)=2_000 → 6_000 * 0.8 * 4 = 19_200
+        assert_eq!(default_compact_threshold_chars("moonshot-v1-8k"), 19_200);
+        // 8_000 - min(20_000, 2_000)=2_000 → 6_000 * 0.8 = 4_800
+        assert_eq!(default_compact_threshold_tokens("moonshot-v1-8k"), 4_800);
     }
 
     // ── RetryLog / retry_status_reason (issue #116) ─────────────────────────
