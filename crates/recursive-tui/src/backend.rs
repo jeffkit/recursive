@@ -7,6 +7,7 @@
 //! Runtime construction and bash-mode dispatch live in sibling modules
 //! (`runtime_builder`, `bash`) to keep this file focused on event bridging.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -629,6 +630,31 @@ fn finalize_session_on_shutdown(session_writer: &mut Option<Arc<std::sync::Mutex
     }
 }
 
+/// Lazily create the interactive session's writer at the first goal entry
+/// (both `StartLoop` and `SendMessage` route through here). A create
+/// failure — unwritable workspace, full disk, … — silently disables
+/// persistence for the whole TUI session, so it must be observable, hence
+/// the warning. Control flow is unchanged: `None` keeps the previous
+/// implicit else's "no writer" behavior (issue #235; owner ruling: every
+/// degradation must be observable).
+fn create_session_writer_or_warn(
+    ws: &Path,
+    goal: &str,
+) -> Option<Arc<std::sync::Mutex<SessionWriter>>> {
+    let model = crate::cost::detect_model_name();
+    match SessionWriter::create(ws, goal, &model, "tui") {
+        Ok(sw) => Some(Arc::new(std::sync::Mutex::new(sw))),
+        Err(error) => {
+            tracing::warn!(
+                workspace = %ws.display(),
+                %error,
+                "TUI session persistence disabled: SessionWriter::create failed (degradation)"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     mut state: RuntimeBuild,
@@ -859,9 +885,7 @@ async fn worker_loop(
                     if session_writer.is_none() {
                         let ws = resolve_workspace_root();
                         let goal_slug: String = goal.chars().take(200).collect();
-                        let model = crate::cost::detect_model_name();
-                        if let Ok(sw) = SessionWriter::create(&ws, &goal_slug, &model, "tui") {
-                            let sw_arc = Arc::new(std::sync::Mutex::new(sw));
+                        if let Some(sw_arc) = create_session_writer_or_warn(&ws, &goal_slug) {
                             let composite = Arc::new(CompositeSink::new([
                                 Box::new(TuiEventSink {
                                     tx: event_tx.clone(),
@@ -915,9 +939,7 @@ async fn worker_loop(
                     if session_writer.is_none() {
                         let ws = resolve_workspace_root();
                         let goal: String = text.chars().take(200).collect();
-                        let model = crate::cost::detect_model_name();
-                        if let Ok(sw) = SessionWriter::create(&ws, &goal, &model, "tui") {
-                            let sw_arc = Arc::new(std::sync::Mutex::new(sw));
+                        if let Some(sw_arc) = create_session_writer_or_warn(&ws, &goal) {
                             // Build a composite sink: TUI display + session persistence.
                             let composite = Arc::new(CompositeSink::new([
                                 Box::new(TuiEventSink {
@@ -3860,6 +3882,57 @@ mod tests {
         assert!(
             !logs_contain("TUI session shutdown: finish failed"),
             "a healthy shutdown must not be reported as degraded"
+        );
+    }
+
+    // ── #235: SessionWriter::create failure observability ─────────────────
+
+    /// A failed `SessionWriter::create` must warn — persistence for the
+    /// whole TUI session is silently off otherwise. Injection: resolve the
+    /// real sessions dir under a pinned home, then occupy that path with a
+    /// regular file so `create_dir_all` through it fails; platform-neutral,
+    /// hence no cfg gate (#224 口径).
+    #[tracing_test::traced_test]
+    #[test]
+    fn session_writer_create_failure_warns() {
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
+        let sessions = recursive::paths::user_sessions_dir(ws.path()).unwrap();
+        std::fs::remove_dir_all(&sessions).unwrap();
+        std::fs::write(&sessions, "not a directory").unwrap();
+        let ws_display = ws.path().display().to_string();
+
+        let got = create_session_writer_or_warn(ws.path(), "goal");
+
+        assert!(
+            got.is_none(),
+            "a failed create must leave no writer (persistence stays off)"
+        );
+        assert!(
+            logs_contain("TUI session persistence disabled"),
+            "a failed SessionWriter::create must be reported as a degradation"
+        );
+        assert!(
+            logs_contain(&ws_display),
+            "the warning must carry the workspace path"
+        );
+    }
+
+    /// Positive control: a healthy workspace yields a writer, silently.
+    #[tracing_test::traced_test]
+    #[test]
+    fn session_writer_create_healthy_is_silent() {
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
+
+        let got = create_session_writer_or_warn(ws.path(), "goal");
+
+        assert!(got.is_some(), "a healthy workspace must yield a writer");
+        assert!(
+            !logs_contain("TUI session persistence disabled"),
+            "a healthy create must not be reported as degraded"
         );
     }
 }
