@@ -132,6 +132,11 @@ pub(super) fn open_live_writer(
 /// `recursive resume` owns this directory the mirror stands down rather than
 /// clobbering it, so the two writers can never interleave.
 ///
+/// A failed `atomic_write` is not silent: it logs a warning (session id +
+/// path + error) — the mirror stays best-effort (the flat storage transcript
+/// remains authoritative), but the owner ruling that every degradation must
+/// be observable means a missing/stale mirror must be traceable (issue #232).
+///
 /// Residual limitation (out of scope here): the mirror is a snapshot of the
 /// HTTP transcript, so if a session is resumed *after* it was mirrored and the
 /// HTTP server later cold-loads and evicts it again, the snapshot wins. Routing
@@ -150,8 +155,24 @@ fn mirror_into(dir: &Path, input: &MirrorInput<'_>) {
     let Ok(meta) = serde_json::to_string_pretty(&build_meta(input)) else {
         return;
     };
-    let _ = crate::atomic::atomic_write(&dir.join("transcript.jsonl"), transcript.as_bytes());
-    let _ = crate::atomic::atomic_write(&dir.join(".meta.json"), meta.as_bytes());
+    let transcript_path = dir.join("transcript.jsonl");
+    if let Err(e) = crate::atomic::atomic_write(&transcript_path, transcript.as_bytes()) {
+        tracing::warn!(
+            session_id = %input.id,
+            path = %transcript_path.display(),
+            error = %e,
+            "AGUI session mirror persist failed; the session may be missing or stale in CLI listings (degradation)"
+        );
+    }
+    let meta_path = dir.join(".meta.json");
+    if let Err(e) = crate::atomic::atomic_write(&meta_path, meta.as_bytes()) {
+        tracing::warn!(
+            session_id = %input.id,
+            path = %meta_path.display(),
+            error = %e,
+            "AGUI session mirror persist failed; the session may be missing or stale in CLI listings (degradation)"
+        );
+    }
 }
 
 fn role_str(role: &Role) -> &'static str {
@@ -480,5 +501,56 @@ mod tests {
         );
         let meta = crate::session::SessionReader::load_meta(&session_dir).unwrap();
         assert_eq!(meta.message_count, 2);
+    }
+
+    /// #232: a failed mirror write must surface as a WARNING carrying the
+    /// session id and the failing path — the mirror stays best-effort, but
+    /// a missing/stale mirror can no longer be traceless (owner ruling).
+    /// Injection: each target path is occupied by a directory, so
+    /// `atomic_write`'s temp+rename fails; the lock sentinel is a different
+    /// file, so the mirror still proceeds. Platform-neutral (no POSIX-mode
+    /// API involved), hence no cfg gate (#224 口径).
+    #[tracing_test::traced_test]
+    #[test]
+    fn mirror_write_failures_warn_with_session_id_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("mirror");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir(session_dir.join("transcript.jsonl")).unwrap();
+        std::fs::create_dir(session_dir.join(".meta.json")).unwrap();
+
+        let transcript = vec![msg(Role::User, "hello there")];
+        mirror_into(&session_dir, &input("sess-1", "t0", &transcript));
+
+        assert!(
+            logs_contain("AGUI session mirror persist failed"),
+            "a failed mirror write must be reported as a degradation"
+        );
+        assert!(
+            logs_contain("sess-1"),
+            "the warning must carry the session id"
+        );
+        assert!(
+            logs_contain("transcript.jsonl") && logs_contain(".meta.json"),
+            "the warnings must name both failing paths"
+        );
+    }
+
+    /// Positive control: a healthy mirror writes both files and stays off
+    /// the warning channel.
+    #[tracing_test::traced_test]
+    #[test]
+    fn mirror_healthy_write_stays_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("mirror");
+        let transcript = vec![msg(Role::User, "hello there")];
+        mirror_into(&session_dir, &input("sess-1", "t0", &transcript));
+
+        assert!(session_dir.join("transcript.jsonl").is_file());
+        assert!(session_dir.join(".meta.json").is_file());
+        assert!(
+            !logs_contain("AGUI session mirror persist failed"),
+            "a healthy mirror must not be reported as degraded"
+        );
     }
 }
