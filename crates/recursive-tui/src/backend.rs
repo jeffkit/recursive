@@ -3818,7 +3818,10 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
-        let mut sw = SessionWriter::create(ws.path(), "goal", "model", "tui").unwrap();
+        // No `mut`: `sw` is only moved into the slot below (never mutated);
+        // newer stable toolchains (CI) flag the redundant `mut` as
+        // unused_mut under -D warnings (local 1.98 does not — toolchain lag).
+        let sw = SessionWriter::create(ws.path(), "goal", "model", "tui").unwrap();
         let meta_path = sw.session_dir().join(".meta.json");
         std::fs::remove_file(&meta_path).unwrap();
         std::fs::create_dir(&meta_path).unwrap();
