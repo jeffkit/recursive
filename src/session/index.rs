@@ -1541,6 +1541,11 @@ mod tests {
         (value, logs)
     }
 
+    // Unix-only helper (reads permission bits via std::os::unix); the tests
+    // that call it are #[cfg(unix)]-gated, so gate the helper too — windows
+    // has no std::os::unix and would fail to compile (E0433/E0599, windows
+    // clippy job run for 9a8b7056; #224 口径: 解除条件=abstract the mode read).
+    #[cfg(unix)]
     fn private_mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777

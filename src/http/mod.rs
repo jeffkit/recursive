@@ -905,6 +905,9 @@ pub struct SessionPartitioning {
     /// Successful fetches keyed by the expanded concrete URL.
     pub catalog_cache: Arc<std::sync::Mutex<HashMap<String, Arc<Vec<crate::skills::Skill>>>>>,
     /// Raw endpoint registry for per-session header expansion.
+    /// web_fetch-gated: EndpointRegistry/HttpCall only exist with the
+    /// feature (no-default-features builds compile without them).
+    #[cfg(feature = "web_fetch")]
     pub endpoints: Option<crate::tools::EndpointRegistry>,
 }
 
@@ -1033,6 +1036,7 @@ impl AppState {
         // `register` replaces by tool name, so this is a swap, not a
         // duplicate; the allow-list filter below stays the last word
         // (issue #65).
+        #[cfg(feature = "web_fetch")]
         if let Some(raw) = &self.partitioning.endpoints {
             let expanded = raw
                 .expand_headers_with(|template| {
@@ -3526,6 +3530,7 @@ mod goal_396_persistence_tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "web_fetch")]
     async fn session_registry_swaps_in_the_per_session_skill_tool_and_expanded_httpcall() {
         let mut state = test_state(test_host(0), RecordingStorage::new(), None).await;
         state.partitioning.skill_sources = partitioned_state();
