@@ -312,7 +312,20 @@ impl Compactor {
                 return None;
             }
         };
-        let usage = structured.usage.unwrap_or_default();
+        let usage = match structured.usage {
+            Some(usage) => usage,
+            None => {
+                // Degradation (#239): the tokens this call burned vanish from
+                // the budget and cost ledgers; the zero stays, but is announced.
+                tracing::warn!(
+                    target: "recursive::compact",
+                    step,
+                    path = "structured",
+                    "compaction usage missing; accounted as 0 tokens (degradation)"
+                );
+                TokenUsage::default()
+            }
+        };
         let json_val = structured.value;
 
         let obj = match json_val.as_object() {
@@ -704,7 +717,20 @@ impl Compactor {
                 let completion = provider
                     .complete(&[Message::user(summary_prompt)], &[] as &[ToolSpec])
                     .await?;
-                let usage = completion.usage.unwrap_or_default();
+                let usage = match completion.usage {
+                    Some(usage) => usage,
+                    None => {
+                        // Degradation (#239): same ledger hole as the structured
+                        // path above — announce the zero instead of hiding it.
+                        tracing::warn!(
+                            target: "recursive::compact",
+                            step,
+                            path = "free-text",
+                            "compaction usage missing; accounted as 0 tokens (degradation)"
+                        );
+                        TokenUsage::default()
+                    }
+                };
                 Ok((
                     crate::compact::prompt::format_compact_summary(&completion.content),
                     usage,
@@ -951,6 +977,94 @@ mod tests {
             logs_contain("microcompaction replaced old tool results"),
             "placeholdering tool output is a degradation and must be observable"
         );
+    }
+
+    /// Issue #239: a summarisation response that reports no usage must not be
+    /// silently accounted as zero tokens — both the structured and the
+    /// free-text paths announce the degradation on `recursive::compact`,
+    /// naming the step and the path. A response that does report usage stays
+    /// off the warning channel. (`MockProvider`'s structured queue hardwires
+    /// `usage: None`, which is exactly the structured-path injection.)
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_compact_contract_missing_usage_warns() {
+        const SENTENCE: &str = "compaction usage missing; accounted as 0 tokens (degradation)";
+        let compactor = Compactor::new(usize::MAX);
+        let messages = vec![Message::user("u0"), Message::assistant("a0")];
+
+        // Positive control: a reported usage is taken as-is, no warning.
+        let healthy = MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                ..Default::default()
+            }),
+            reasoning_content: None,
+        }]);
+        let (_, usage) = compactor
+            .summarize(&healthy, &messages, 3)
+            .await
+            .expect("free-text summarise");
+        assert_eq!(usage.total_tokens, 15, "reported usage must be kept");
+        assert!(
+            !logs_contain(SENTENCE),
+            "a reported usage must not be flagged as missing"
+        );
+
+        // Structured path: value present, usage absent.
+        let structured = MockProvider::new(vec![]).with_structured_responses(vec![Ok(
+            serde_json::json!({"summary": "s", "kept_facts": ["f"], "next_steps": []}),
+        )]);
+        let (rendered, usage) = compactor
+            .summarize(&structured, &messages, 7)
+            .await
+            .expect("structured summarise");
+        assert!(
+            rendered.contains("[compacted: structured at step 7]"),
+            "the fixture must actually take the structured path"
+        );
+        assert_eq!(
+            usage,
+            TokenUsage::default(),
+            "accounting still records zero"
+        );
+        assert!(
+            logs_contain(SENTENCE),
+            "missing structured usage must be announced, not silently zeroed"
+        );
+        assert!(logs_contain("path=\"structured\""));
+        assert!(logs_contain("step=7"));
+
+        // Free-text path: structured unavailable, completion without usage.
+        let free_text = MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }]);
+        let (rendered, usage) = compactor
+            .summarize(&free_text, &messages, 9)
+            .await
+            .expect("free-text summarise");
+        assert!(
+            !rendered.contains("structured at step"),
+            "the fixture must actually take the free-text path"
+        );
+        assert_eq!(
+            usage,
+            TokenUsage::default(),
+            "accounting still records zero"
+        );
+        assert!(
+            logs_contain("path=\"free-text\""),
+            "missing free-text usage must be announced, not silently zeroed"
+        );
+        assert!(logs_contain("step=9"));
     }
 
     #[tokio::test]
