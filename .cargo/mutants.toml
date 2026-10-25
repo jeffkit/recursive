@@ -112,4 +112,30 @@ exclude_re = [
     # that compiles the line, so ubuntu reporting it MISSED is the
     # cfg-blindness proof in its purest form.
     "restore_reexec_env",
+    # ── Issue #243 (CI run 40167681411), SessionWriter::create_with_tools
+    # directory-allocation loop — true equivalences, each verified by hand:
+    # mutation applied → full writer suite green (27 tests incl. the guard
+    # tests first_session_gets_the_clean_timestamped_id and
+    # file_on_the_clean_session_path_retries_to_a_suffixed_id), then
+    # byte-exact restore. The four killable siblings of the same loop
+    # (delete match arm 0, `>`→`==`, `>`→`>=`, delete `!`) are killed by
+    # those two guard tests — keep them out of exclusion scope.
+    # `>`→`<`: `attempt < 0` is never true for u32, so the mutant guard
+    # reduces to `!exists`; it differs from `attempt > 0 || !exists` only
+    # where the directory already exists, and create_dir_all on an existing
+    # directory is an Ok no-op — identical state on every input.
+    # `||`→`&&`: skipping the outer create_dir_all on attempt 0 changes
+    # nothing — SessionLock::acquire runs its own create_dir_all on the
+    # session dir (src/session/lifecycle.rs) before opening the sentinel,
+    # and every failure path surfaces the same path-less io::Error from
+    # whichever of the two redundant creates hits it.
+    # `<`→`<=` (retry bound): the original loop can only exit via break
+    # (success) or the attempt-7 `Err → return Err(e)`, so the
+    # `ok_or_else` fallback below the loop is unreachable; the mutant's
+    # generic branch fires only when attempt 7's acquire fails, which
+    # would require pre-placing a live lock under a random 8-hex suffix —
+    # outside any deterministic test's reach.
+    "replace > with < in SessionWriter::create_with_tools",
+    "replace \\|\\| with && in SessionWriter::create_with_tools",
+    "replace < with <= in SessionWriter::create_with_tools",
 ]

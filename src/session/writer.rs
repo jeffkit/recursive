@@ -881,6 +881,87 @@ mod tests {
         assert_ne!(w1.session_id(), w2.session_id());
     }
 
+    /// The first session in a fresh workspace gets the clean
+    /// `<timestamp>-<slug>` name: the `-<8 hex>` suffix is the
+    /// collision-retry path, not the default. Mutant hardening for CI run
+    /// 40167681411 — deleting match arm `0` in `create_with_tools` makes
+    /// even the first session suffixed.
+    #[test]
+    fn first_session_gets_the_clean_timestamped_id() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let slug = workspace_slug(ws);
+
+        // 1-second timestamp resolution: whichever tick the writer uses,
+        // it must be one of the two observed around the call — and never
+        // a suffixed name.
+        let ts_before = crate::session::filesystem_safe_timestamp();
+        let writer = SessionWriter::create(ws, "clean id", "gpt-4o", "openai").unwrap();
+        let ts_after = crate::session::filesystem_safe_timestamp();
+
+        let id = writer.session_id();
+        assert!(
+            id == format!("{ts_before}-{slug}") || id == format!("{ts_after}-{slug}"),
+            "first session in a fresh workspace must use the clean timestamped \
+             name without a retry suffix, got: {id}"
+        );
+    }
+
+    /// A stray FILE occupying the clean `<ts>-<slug>` name must degrade to
+    /// the suffixed retry, not abort session creation: the loop sees the
+    /// path exists, skips its own create_dir_all, and the lock's internal
+    /// create fails (parent is a file) so the loop moves to a suffixed
+    /// name. Mutant hardening for CI run 40167681411 — an unconditional
+    /// create_dir_all on attempt 0 (`>` → `==` / `>=`) or dropping the `!`
+    /// turns the stray file into a hard error via `?`.
+    #[test]
+    fn file_on_the_clean_session_path_retries_to_a_suffixed_id() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let slug = workspace_slug(ws);
+        let sessions_root = crate::paths::user_sessions_dir(ws).unwrap();
+
+        // The timestamp is taken inside create_with_tools, so the stray
+        // file must land on the second the writer will use; both read the
+        // same 1-second clock, so one try normally lands. A tick between
+        // placing the file and the call shows up as a clean id from a
+        // *different* second — just try again.
+        for _ in 0..8 {
+            let ts = crate::session::filesystem_safe_timestamp();
+            let blocked = sessions_root.join(&slug).join(format!("{ts}-{slug}"));
+            std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+            std::fs::write(&blocked, b"stray file, not a session").unwrap();
+
+            let writer = match SessionWriter::create(ws, "file blocked", "gpt-4o", "openai") {
+                Ok(w) => w,
+                Err(e) => panic!(
+                    "a stray file on the clean session path must degrade to a \
+                     suffixed retry, not abort creation: {e}"
+                ),
+            };
+            let prefix = format!("{ts}-{slug}-");
+            let id = writer.session_id();
+            if !id.starts_with(&prefix) {
+                continue; // clock ticked: writer used a different second
+            }
+            let suffix = &id[prefix.len()..];
+            assert_eq!(
+                suffix.len(),
+                8,
+                "retry suffix must be the 8-char uuid slice, got: {id}"
+            );
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+                "retry suffix must be hex, got: {id}"
+            );
+            return;
+        }
+        panic!(
+            "could not land the stray file on the writer's timestamp second \
+             in 8 tries (unexpected clock behaviour)"
+        );
+    }
+
     #[test]
     fn open_or_create_is_create_on_first_call_then_open() {
         let tmp = crate::test_util::IsolatedWorkspace::new();
@@ -1007,6 +1088,48 @@ mod tests {
         assert_eq!(meta.preset.as_deref(), Some("deepseek"));
         // Session content untouched by the identity rewrite.
         assert_eq!(meta.message_count, 1);
+    }
+
+    /// Mutant hardening (CI run 40167681411): the idempotence guard in
+    /// `update_identity` is a three-way `&&` — a `||` in either position
+    /// would skip the write when only SOME fields changed, leaving a
+    /// stale `model`/`provider` in meta (cost pricing reads them). Each
+    /// direction below changes exactly one field; it must still land.
+    /// Each scenario gets its own block scope: `IsolatedWorkspace` holds
+    /// the non-re-entrant global env lock for its lifetime, so the first
+    /// scenario must be dropped before the second one pins a fresh home.
+    #[test]
+    fn update_identity_persists_partial_changes() {
+        // Provider only: model and preset unchanged.
+        {
+            let tmp = crate::test_util::IsolatedWorkspace::new();
+            let dir = tmp.path().join("agui-identity-provider-only");
+            let mut writer = SessionWriter::open_or_create(&dir, "goal", "m1", "p1", None).unwrap();
+            writer.update_identity("m1", "p2", None);
+            writer.finish(SessionStatus::Completed).unwrap();
+            let meta = SessionReader::load_meta(&dir).unwrap();
+            assert_eq!(
+                meta.provider, "p2",
+                "provider change must land when model is unchanged"
+            );
+            assert_eq!(meta.model, "m1");
+        }
+
+        // Model only: provider and preset unchanged (None == None).
+        {
+            let tmp = crate::test_util::IsolatedWorkspace::new();
+            let dir = tmp.path().join("agui-identity-model-only");
+            let mut writer = SessionWriter::open_or_create(&dir, "goal", "m1", "p1", None).unwrap();
+            writer.update_identity("m2", "p1", None);
+            writer.finish(SessionStatus::Completed).unwrap();
+            let meta = SessionReader::load_meta(&dir).unwrap();
+            assert_eq!(
+                meta.model, "m2",
+                "model change must land when provider and preset are unchanged"
+            );
+            assert_eq!(meta.provider, "p1");
+            assert_eq!(meta.preset, None);
+        }
     }
 
     /// Issue #134 W2: `set_run_code` persists the sticky capability bit to
