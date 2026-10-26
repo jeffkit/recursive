@@ -319,3 +319,138 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
     }
     std::fs::write(path, contents).map_err(|e| format!("write {}: {e}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn parse_ok(list: &[&str]) -> RunOptions {
+        match parse_run_options(&argv(list)) {
+            Ok(opts) => opts,
+            Err(e) => panic!("parse_run_options({list:?}) unexpectedly failed: {e}"),
+        }
+    }
+
+    fn parse_err(list: &[&str]) -> String {
+        match parse_run_options(&argv(list)) {
+            Ok(_) => panic!("parse_run_options({list:?}) unexpectedly succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    /// Kills the `while i < args.len()` boundary mutants (`<=` panics past the
+    /// end, `>` never enters the loop) and the `args.get(i + 1)` mutants
+    /// (`-` underflows / returns the flag itself, `*` re-reads the flag).
+    ///
+    /// Each `i += 2` arm is killed at two offsets: with the flag first
+    /// (`-= underflows to a panic in debug builds; any other placement
+    /// rewinds into an infinite loop that only the mutation run's timeout
+    /// can catch), and with the flag at offset 4 (`*= jumps over the next
+    /// option pair, observable via the skipped flag's field staying None).
+    #[test]
+    fn parse_run_options_happy_path_parses_every_flag() {
+        // --mode first: the `-= on i` mutant underflows at offset 0.
+        let opts = parse_ok(&[
+            "--mode",
+            "live",
+            "--tasks",
+            "t1,t2",
+            "--report",
+            "r.md",
+            "--presets",
+            " alpha , beta ",
+        ]);
+        assert!(matches!(opts.mode, Mode::Live));
+        assert_eq!(
+            opts.tasks.as_deref(),
+            Some(&["t1".to_string(), "t2".to_string()][..])
+        );
+        assert_eq!(opts.report.as_deref(), Some(Path::new("r.md")));
+        assert_eq!(
+            opts.presets.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..])
+        );
+        assert_eq!(opts.repeat, 1);
+        assert_eq!(opts.out, None);
+
+        // --mode at offset 4: the `*= on i` mutant jumps from 4 to 8 and
+        // skips ["--report", "r.md"], so report must stay None… which this
+        // call refutes by parsing it.
+        let opts = parse_ok(&[
+            "--out", "o.jsonl", "--tasks", "t1", "--mode", "live", "--report", "r.md",
+        ]);
+        assert!(matches!(opts.mode, Mode::Live));
+        assert_eq!(opts.out.as_deref(), Some(Path::new("o.jsonl")));
+        assert_eq!(opts.report.as_deref(), Some(Path::new("r.md")));
+
+        // --presets at offset 4: the `*= on i` mutant skips ["--out", …].
+        let opts = parse_ok(&[
+            "--tasks",
+            "t1",
+            "--report",
+            "r.md",
+            "--presets",
+            " alpha , beta ",
+            "--out",
+            "o.jsonl",
+        ]);
+        assert_eq!(
+            opts.presets.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..])
+        );
+        assert_eq!(opts.out.as_deref(), Some(Path::new("o.jsonl")));
+
+        // --presets first: the `-= on i` mutant underflows at offset 0.
+        let opts = parse_ok(&["--presets", "alpha", "--mode", "live"]);
+        assert_eq!(opts.presets.as_deref(), Some(&["alpha".to_string()][..]));
+        assert!(matches!(opts.mode, Mode::Live));
+    }
+
+    #[test]
+    fn parse_run_options_rejects_bad_values() {
+        let e = parse_err(&["--mode", "bogus"]);
+        assert!(e.contains("unknown mode"), "{e}");
+        let e = parse_err(&["--out"]);
+        assert!(e.contains("needs a value"), "{e}");
+        let e = parse_err(&["--frobnicate"]);
+        assert!(e.contains("unknown option"), "{e}");
+        let e = parse_err(&["--repeat", "notanumber"]);
+        assert!(e.contains("--repeat"), "{e}");
+    }
+
+    #[test]
+    fn repeat_zero_clamps_to_one() {
+        let opts = parse_ok(&["--repeat", "0"]);
+        assert_eq!(opts.repeat, 1);
+        let opts = parse_ok(&["--repeat", "3"]);
+        assert_eq!(opts.repeat, 3);
+    }
+
+    /// Kills the `replace dispatch with Ok(())` mutant: unknown commands must
+    /// be errors, the help path must stay Ok.
+    #[test]
+    fn dispatch_routes_unknown_command_to_error_and_help_to_ok() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => panic!("tokio runtime: {e}"),
+        };
+        let err = match rt.block_on(dispatch(argv(&["definitely-not-a-command"]))) {
+            Ok(()) => panic!("unknown command must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown command"), "{err}");
+        assert!(rt.block_on(dispatch(Vec::new())).is_ok());
+        let err = match rt.block_on(dispatch(argv(&["report"]))) {
+            Ok(()) => panic!("report without a path must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("report needs a JSONL path"), "{err}");
+    }
+}
