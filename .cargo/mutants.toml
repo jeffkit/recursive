@@ -281,4 +281,38 @@ exclude_re = [
     # `..Default::default()` — that would also erase the two killable
     # siblings from the gate's view.
     "delete field skills_base from struct recursive::http::SessionPartitioning expression in async_main",
+    # ── Issue #245 batch 4 (same CI run 40256596759), cli/output.rs stream
+    # family — five exclusions, each hand-verified this batch (mutation
+    # applied → target suite run → byte-exact restore; script and log in
+    # /tmp/b4-negctl/). The 24 killable siblings are pinned by
+    # tests/cli_output_streams.rs (run human stream / resume compaction /
+    # subagent worker lines / piped repl / repl json) plus the in-process
+    # drain_events unit pin — keep them out of exclusion scope.
+    #
+    # `:302:31 > → >=` in stream_events' char-boundary walk is extensionally
+    # equivalent: `end` is usize, so `end >= 0` is always true and the loop
+    # guard reduces to `!output.is_char_boundary(end)` — identical to the
+    # original at every input, because `is_char_boundary(0)` is always true
+    # and stops the loop before `end -= 1` could reach 0. Verified: mutation
+    # applied → full cli_output_streams suite green → byte-exact restore.
+    # The killable siblings of the same walk (`<`, `==`, `&&`→`||`, delete
+    # `!`, `-=→+=`, `-=→/=`) are pinned by the multi-byte-straddling
+    # fixture in run_human_stream_pins_… — the line:col anchor is surgical
+    # per the #245 batch-3 doctrine (a same-named operator mutant lives at
+    # :300:47 and must stay in scope).
+    "output\\.rs:302:31: replace > with >= in stream_events",
+    # The three plan arms of stream_events and the PlanProposed arm of
+    # stream_events_repl are unreachable from every surface that constructs
+    # these printers: `run` and `resume` both build their runtime with
+    # `interactive = false` (main.rs), which does not register
+    # enter_plan_mode / exit_plan_mode (builder test "a headless run must
+    # not register the blocking plan tools"), and the REPL passes false the
+    # same way — so no PlanProposed / PlanConfirmed / PlanRejected can be
+    # emitted into these printers; the TUI / HTTP hosts that do have plan
+    # tools render their own event streams. Verified per arm: deletion
+    # applied → full cli_output_streams suite green → byte-exact restore.
+    # The `$` tail keeps the observable sibling arm deletions (worker / tool
+    # / proposed lines, all pinned) in scope — without it `in stream_events`
+    # would also swallow the repl arms.
+    "delete match arm AgentEvent::Plan(Proposed\\{ref plan_text, \\.\\.\\}|Confirmed|Rejected\\{ref reason\\}) in stream_events(_repl)?$",
 ]

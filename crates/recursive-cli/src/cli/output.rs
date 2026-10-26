@@ -760,4 +760,38 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn drain_events_stays_pending_until_the_last_sender_closes() {
+        // Issue #245 batch 4: a body replaced with `()` still drops `rx`, so
+        // the only observable difference is *when* it finishes — the real
+        // drain keeps polling while any sender is alive. (In-process is safe
+        // here: no `println!`, so libtest's capture is irrelevant.)
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut task = tokio::spawn(drain_events(rx));
+            tx.send(AgentEvent::AssistantText {
+                text: "queued".into(),
+                step: 0,
+            })
+            .unwrap();
+            let finished_early = tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_ok();
+            assert!(
+                !finished_early,
+                "drain must keep consuming while a sender is alive"
+            );
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .expect("drain exits once the channel closes")
+                .expect("drain task");
+        });
+    }
 }
