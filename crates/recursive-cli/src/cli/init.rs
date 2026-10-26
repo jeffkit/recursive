@@ -795,4 +795,54 @@ mod tests {
         // for the third+ fourth non-default models.
         assert_eq!(format_models_brief(&p), "many-default (+2 more, 1 extra)");
     }
+
+    // ── Issue #245 batch 3 (CI run 40256596759) — pins for the six
+    // pure-function mutants in this file. The run_init-body mutants are
+    // pinned behaviourally in crates/recursive-cli/tests/cli_init_wizard.rs
+    // because the wizard is only observable through a real process.
+
+    #[test]
+    fn slugify_collapses_dash_then_space_to_one_dash() {
+        // After a *literal* `-` (last_dash set by the keep branch) a
+        // following separator must be swallowed by the `&&`, not pushed as
+        // a second dash — the `&&`→`||` mutant emits "a--b" for "a- b".
+        assert_eq!(slugify_preset_id("a- b"), "a-b");
+        assert_eq!(slugify_preset_id("a -b"), "a-b");
+    }
+
+    #[test]
+    fn numeric_two_resolves_the_second_catalog_entry() {
+        let presets = all_presets();
+        // The `idx >= 1` → `idx < 1` mutant falls through to the default
+        // for every numeric choice; that is only visible when the entry
+        // under test is not itself the default.
+        assert_ne!(
+            presets[1].id,
+            default_preset().id,
+            "catalog reordered: pick a non-default index for this pin"
+        );
+        match resolve_preset_choice("2", &presets, default_preset()) {
+            PresetChoice::Preset(p) => assert_eq!(p.id, presets[1].id),
+            other => panic!("expected Preset({}), got {other:?}", presets[1].id),
+        }
+    }
+
+    #[test]
+    fn detect_current_preset_names_the_preset_from_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[provider]\npreset = \"deepseek\"\n").expect("write config");
+        let summary = detect_current_preset(&path).expect("existing config must yield a summary");
+        assert!(
+            summary.starts_with("preset=deepseek (model="),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn detect_current_preset_is_none_without_a_config_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("missing.toml");
+        assert_eq!(detect_current_preset(&path), None);
+    }
 }

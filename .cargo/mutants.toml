@@ -198,4 +198,34 @@ exclude_re = [
     "delete match arm FinishReason::TranscriptLimit.*in ClaudeJsonEmitter::build_result",
     "delete match arm FinishReason::PermissionDenialLimit in ClaudeJsonEmitter::build_result",
     "delete match arm FinishReason::ProviderStop.*in ClaudeJsonEmitter::build_result",
+    # ── Issue #245 batch 3 (CI run 40256596759), cli/init.rs — two
+    # context-equivalents, each hand-verified this batch: mutation applied →
+    # full init pin suite green (4 unit tests in cli/init.rs + 6 wizard
+    # subprocess tests + 1 workspace pin in crates/recursive-cli/tests/),
+    # then byte-exact restore. The 26 killable siblings in the same two
+    # files are pinned by those tests — keep them out of exclusion scope.
+    #
+    # REGEX SCOPE: cargo-mutants matches exclude_re against the full
+    # `file:line:col: name` string, so the line anchor is surgical —
+    # verified by probe this batch (a line-anchored pattern removed exactly
+    # init.rs:318:49 from --list while the same-named :284:33/:301:49 and
+    # :528:51's twin :278:68 all stayed). Operator characters are escaped
+    # per the #228 warning above; without the anchor these two names would
+    # collide with seven killable same-name mutants in run_init.
+    #
+    # :318:49 `all_entries.len() + i + 1` → `-`: the Local section always
+    # holds exactly one entry (the wizard's display list is the bundled
+    # catalog from all_presets(), which ships a single `ollama`), and with
+    # i == 0 both `len - i + 1` and `len + i + 1` print the same number.
+    # It diverges only if the bundled catalog ever grows a second local
+    # preset — delete this exclusion together with that catalog change and
+    # the mutant becomes killable by the section-rendering pin.
+    "init\\.rs:318:49: replace \\+ with - in run_init",
+    # :528:51 `m.name == model` → `!=` inside the `any(...)`: the snapshot
+    # block only runs in the manual-preset arm, where `models` is always
+    # the fresh `Vec::new()` of the just-built ProviderPreset, so `any` is
+    # false under both operators and the push happens either way. The push
+    # itself is pinned by
+    # cli_init_wizard::manual_accepted_preset_carries_the_typed_model.
+    "init\\.rs:528:51: replace == with != in run_init",
 ]
