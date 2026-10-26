@@ -1508,9 +1508,13 @@ mod tests {
     // pin there.
 
     /// Append-only shared sink the capture subscriber formats into.
+    /// Unix-gated like its only callers: on windows they are cfg'd out and
+    /// these helpers would be dead_code (E0416-family, -D warnings, #230).
+    #[cfg(unix)]
     #[derive(Clone)]
     struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
+    #[cfg(unix)]
     impl std::io::Write for LogCapture {
         fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -1527,6 +1531,7 @@ mod tests {
     /// Run `f` with a thread-local DEBUG-level tracing subscriber and
     /// return `(f's result, everything it formatted)` (ANSI off, one
     /// event per line).
+    #[cfg(unix)]
     fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
         let sink = buffer.clone();

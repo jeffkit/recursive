@@ -8,6 +8,10 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0410",
 ]
 # 0367/0368/0369 = zip 4.6.1 的 ZipArchive::extract 符号链接外逃 / SUID 位保留族。
 # 暴露面：src/tools/install_skill.rs（远程技能 zip 解压，不可信输入；#103 已做路径
@@ -22,3 +26,10 @@ ignore = [
 # 时序侧信道在本仓使用形态下不可达性高。
 # 解禁条件 = aws-sigv4 或 elliptic-curve 发布支持 crypto-bigint >=0.7 的版本,
 # cargo update 通过后删除本条(届时同步复核 0.7 breaking changes)。
+# 0391/0398/0403/0410 = zstd 家族(zstd 0.13.3 跨流数据泄漏 / zstd-safe 7.2.4
+# Seekable 解压越界写 + legacy frame 未初始化内存 / zstd-sys 2.0.16 同源)。
+# 无范围内补丁(解=zstd >=0.14.3 / zstd-safe >=8.2.0 / zstd-sys >=2.1.2,跨大版本;
+# 钉死方:zip 4.6.1 pin zstd-safe ^7,链式升级 dry-run 零移动,zstd-safe 8 未入索引兼容面)。
+# 暴露面:zstd 仅经 zip 技能包解压可达(#103 已做路径穿越与完整性校验);
+# seekable frame / 跨流复用上下文均非 zip 解压路径,可达性低。
+# 解禁条件 = zip 发布支持 zstd-safe 8 的版本并升级,或更换压缩后端。
