@@ -508,6 +508,62 @@ fn workspace_lifecycle_roundtrips_without_deleting_the_directory() {
     );
 }
 
+/// `workspace show` renders the record through `print_workspace`: the
+/// canonical id line, name / display / state / created, and the session
+/// index — the "not indexed" hint until `workspace index` has run, then one
+/// header line per session. A `show` that prints nothing is a regression,
+/// not a quiet success (issue #245 batch 2).
+#[test]
+fn workspace_show_prints_the_record_and_its_session_index() {
+    let cli = Cli::new();
+    add_demo_workspace(&cli);
+
+    let out = cli.run(&["workspace", "show", "demo"]);
+    assert!(out.status.success(), "show failed: {out:?}");
+    let shown = stdout_of(&out);
+    let canonical = cli
+        .workspace_path()
+        .canonicalize()
+        .expect("canonical workspace path");
+    assert!(
+        shown.lines().next() == Some(canonical.display().to_string().as_str()),
+        "the first line must be the canonical id, got:\n{shown}"
+    );
+    for needle in [
+        "name:       demo",
+        "display:    ",
+        "state:      active",
+        "created:    ",
+        "sessions:   (not indexed; run `recursive workspace index`)",
+    ] {
+        assert!(
+            shown.contains(needle),
+            "`workspace show` must print `{needle}`, got:\n{shown}"
+        );
+    }
+
+    // Once indexed, the hint gives way to the header list.
+    write_active_session(cli.sessions.path(), "sess-show-1");
+    let indexed = cli.run(&["workspace", "index", "demo"]);
+    assert!(
+        stdout_of(&indexed).contains("Indexed 1 session header(s)."),
+        "index must pick up the fixture session: {indexed:?}"
+    );
+    let shown = stdout_of(&cli.run(&["workspace", "show", "demo"]));
+    assert!(
+        shown.contains("sessions (1):"),
+        "an indexed workspace must print its session count, got:\n{shown}"
+    );
+    assert!(
+        shown.contains("sess-show-1  [active]  working on it"),
+        "each indexed header must be listed with id, status and label, got:\n{shown}"
+    );
+    assert!(
+        !shown.contains("not indexed"),
+        "the hint must disappear once indexed, got:\n{shown}"
+    );
+}
+
 /// `Admit` (no `--stop`): a live turn blocks the archive with exit 1 and the
 /// workspace stays active.
 #[test]

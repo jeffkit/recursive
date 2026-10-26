@@ -228,4 +228,57 @@ exclude_re = [
     # itself is pinned by
     # cli_init_wizard::manual_accepted_preset_carries_the_typed_model.
     "init\\.rs:528:51: replace == with != in run_init",
+    # ── Issue #245 batch 2 (same CI run 40256596759), recursive-cli ─────────
+    # crates/recursive-cli/src/otel.rs (14 mutants) is `#[cfg(feature =
+    # "otel")] mod otel;` and the cli-mutants gate runs `--features weixin`
+    # on top of `default = [web_search, http, acp]` — `otel` is opt-in, so
+    # the gate never compiles the file. Every mutant there builds
+    # byte-identical to the baseline and reports MISSED regardless of the
+    # tests (same cfg-blindness class as the #228 batch-2 entries above;
+    # the proof in its purest form is the `init_global_tracer -> Ok((Default,
+    # Default))` mutant: type-invalid — E0277, neither `Tracer` nor
+    # `OtelGuard` is `Default` — yet scored MISSED). All 13 viable mutants
+    # are killed where the file compiles, hand-verified this batch under
+    # `cargo test -p recursive-cli --features otel --bin recursive otel::`
+    # (each mutation applied → red → byte-exact restore): the pure helpers'
+    # six by the pre-existing otel_endpoint_* / otel_service_name_* tests,
+    # the env shells' six by otel_endpoint_env_shell_reads_unset_empty_and_set
+    # and otel_service_name_env_shell_defaults_and_overrides, the Drop body
+    # by otel_guard_drop_shuts_down_the_global_provider. The name string the
+    # regex sees carries the file path (verified with `cargo mutants --list
+    # -E`), so one path-anchored entry covers the whole file; drop it the day
+    # cli-mutants.sh adds `otel` to FEATURES.
+    "crates/recursive-cli/src/otel\\.rs:",
+    # main.rs `SessionPartitioning { skills_base: dir_skills, .. }` (Goal
+    # 431 W2a wiring). `skills_base` only reaches an observable state inside
+    # `AppState::session_skill_catalog` *after* a templated skill-source
+    # fetch succeeds (src/http/mod.rs: the base is extended with the fetched
+    # catalog), and `HttpSkillSource` is https-only by construction — a
+    # loopback stub cannot satisfy it, so no black-box test of the binary
+    # can reach the merge; every reachable path (no templates → startup
+    # catalog; templates + missing label or failed fetch → 503) is
+    # identical with the field deleted. Hand-verified this batch: mutation
+    # applied → cli_http_partitioning + the http/session suites green →
+    # byte-exact restore. The composition itself is pinned in-process by the
+    # src/http/mod.rs tests that set `partitioning.skills_base` directly;
+    # the two siblings in the same literal (`skill_sources`, `endpoints`)
+    # ARE observable through the binary and stay in scope — pinned by
+    # tests/cli_http_partitioning.rs.
+    #
+    # INERT ON cargo-mutants 27.1.0 (the current latest release, and what
+    # CI installs): `visit_expr_struct` pushes `Genre::StructField` mutants
+    # straight onto the mutant list, bypassing `options.allows_mutant`, so
+    # NO exclude_re can touch a `delete field … from struct …` mutant —
+    # verified with `cargo mutants --list --file crates/recursive-cli/src/
+    # main.rs -E '<regex>'`: `async_main` drops 18 FnValue/operator mutants
+    # of the same function while all three StructField mutants stay listed,
+    # and even `-E skills_base` / `-E 'delete field'` remove nothing. The
+    # upstream main branch already routes the genre through
+    # `push_mutant_if_allowed` → `allows_mutant`, so this entry takes effect
+    # on the first release after 27.1.0; until then the gate keeps reporting
+    # this one mutant MISSED (issue #245 batch-2 ledger carries it as the
+    # known residual). Do not "fix" it by respelling the literal without
+    # `..Default::default()` — that would also erase the two killable
+    # siblings from the gate's view.
+    "delete field skills_base from struct recursive::http::SessionPartitioning expression in async_main",
 ]

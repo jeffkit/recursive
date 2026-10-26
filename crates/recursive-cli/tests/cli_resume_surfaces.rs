@@ -21,8 +21,12 @@
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 const OPENAI_TEXT: &str = concat!(
     r#"{"choices":[{"message":{"role":"assistant","content":"resumed and done"},"#,
@@ -257,6 +261,57 @@ fn as_refs(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
+/// A pseudo-terminal pair. The slave end is what the child sees on fd 0, so
+/// `stdin().is_terminal()` reports a terminal — the only way to drive the
+/// resume's TTY heuristic from a test (a pipe or `/dev/null` is never a tty).
+fn open_pty() -> (OwnedFd, OwnedFd) {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: `openpty` writes two fresh descriptors into the out-params; the
+    // name / termios / winsize pointers are optional and null here.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    // SAFETY: both descriptors were just created by `openpty` and nothing
+    // else owns them.
+    unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+}
+
+/// `wait_with_output` with a hard ceiling: a child that parks (e.g. a prompt
+/// nobody answers) is SIGKILLed instead of hanging the test binary.
+fn wait_with_timeout(child: Child, limit: Duration) -> Output {
+    let pid = child.id() as libc::pid_t;
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog_done = Arc::clone(&done);
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < limit {
+            if watchdog_done.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !watchdog_done.load(Ordering::SeqCst) {
+            // SAFETY: plain signal delivery to a pid this test spawned and
+            // has not yet reaped (the reaping `wait_with_output` is still
+            // blocked), so the pid cannot have been recycled.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    });
+    let out = child.wait_with_output().expect("wait for recursive");
+    done.store(true, Ordering::SeqCst);
+    out
+}
+
 // ── tool-registry drift (--allow-tool-drift) ───────────────────────────────
 
 #[test]
@@ -397,6 +452,99 @@ fn resume_refuses_to_proceed_with_orphans_when_asked_to_abort() {
     assert!(
         stderr.contains("refusing to resume"),
         "abort policy must refuse the resume, got:\n{stderr}"
+    );
+}
+
+// ── orphan policy default: the TTY heuristic (issue #245 batch 2) ───────────
+//
+// With no `--orphans` flag the policy is decided by whether stdin is a
+// terminal (`None if interactive => Ask`, else `Abort`). The two halves below
+// drive both branches from outside the process — the only place the heuristic
+// is deterministic: a `/dev/null` stdin for "no terminal", a pty slave for
+// "terminal". (An in-process test would inherit whatever `cargo test` was
+// started from and either hang on the prompt or never reach it.)
+
+/// No terminal and no explicit policy: nobody can be asked, so the resume
+/// refuses and points at the flags — it must not fall into the prompt loop
+/// (which, on a closed stdin, would read an empty line and report a
+/// user-initiated abort instead).
+#[test]
+fn resume_refuses_orphans_without_a_terminal_and_without_a_policy() {
+    let rig = Rig::new();
+    let dir = rig.session_dir("sess-no-tty", &["TotallyUnknownTool"]);
+
+    // `Rig::cmd` wires stdin to /dev/null: `is_terminal()` is false.
+    let out = rig.run(&as_refs(&resume_args(&dir, &[], &[])), None);
+    let stderr = stderr_of(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(
+        !out.status.success(),
+        "orphans with no policy and no terminal must fail the resume"
+    );
+    assert!(
+        stderr.contains("incomplete tool call(s)"),
+        "the orphan report must be printed, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to resume") && stderr.contains("--orphans=skip"),
+        "no terminal → Abort with the escape hatches named, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Orphan: ") && !stderr.contains("aborted by user"),
+        "no terminal → nobody to ask: the Ask path must not run, got:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("[r]edo"),
+        "no terminal → no prompt may be printed, got:\n{stdout}"
+    );
+}
+
+/// A terminal and no explicit policy: the resume asks. The scripted answer
+/// (`a` = abort) proves the prompt was really consulted — the refusal text of
+/// the no-terminal branch must not appear.
+#[test]
+fn resume_asks_about_orphans_on_a_terminal_without_a_policy() {
+    let rig = Rig::new();
+    let dir = rig.session_dir("sess-tty-ask", &["TotallyUnknownTool"]);
+
+    let (master, slave) = open_pty();
+    // Queue the answer before the child starts: the pty line discipline
+    // holds the line until the prompt's `read_line` takes it.
+    {
+        let mut writer = std::fs::File::from(master.try_clone().expect("dup pty master"));
+        writer.write_all(b"a\n").expect("queue the abort answer");
+    }
+    let mut cmd = rig.cmd();
+    cmd.args(as_refs(&resume_args(&dir, &[], &[])));
+    cmd.stdin(Stdio::from(slave));
+    let child = cmd.spawn().expect("spawn recursive");
+    let out = wait_with_timeout(child, Duration::from_secs(60));
+    // Keep the master open until the child is gone: closing it early turns
+    // the child's pending read into EIO instead of the scripted line.
+    drop(master);
+    let stderr = stderr_of(&out);
+    let stdout = stdout_of(&out);
+
+    assert!(
+        !out.status.success(),
+        "the scripted abort answer must fail the resume"
+    );
+    assert!(
+        stderr.contains("Orphan: TotallyUnknownTool"),
+        "a terminal → the Ask path lists each orphan, got:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("[r]edo  [s]kip  [a]bort"),
+        "a terminal → the prompt must be shown, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("aborted by user"),
+        "the scripted `a` must be honoured as a user abort, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("refusing to resume"),
+        "a terminal must be asked, not refused outright, got:\n{stderr}"
     );
 }
 

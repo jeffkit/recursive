@@ -1075,10 +1075,10 @@ pub(crate) async fn run_resumed(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_orphan_answer, cmd_resume, legacy_resume_error, prepare_replay_seed,
-        prompt_orphan_choice_with, redo_orphan, replay_orphan_policy, resolve_resume_message,
-        resolve_resume_target, resume_banner_enabled, run_resumed, seed_session_run_code,
-        OrphanPolicy, ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
+        classify_orphan_answer, cmd_resume, effective_run_code, legacy_resume_error,
+        prepare_replay_seed, prompt_orphan_choice_with, redo_orphan, replay_orphan_policy,
+        resolve_resume_message, resolve_resume_target, resume_banner_enabled, run_resumed,
+        seed_session_run_code, OrphanPolicy, ORPHAN_REDO_FAILED_PREFIX, ORPHAN_SKIPPED_RESULT,
     };
     use crate::cli::session::resolve_session_path;
     // Issue #185: one crate-wide env guard for the whole binary — this module
@@ -1424,6 +1424,42 @@ mod tests {
             recursive::preset::effective_run_code(&cfg),
             Some(false),
             "no recorded field → the declaration alone decides"
+        );
+    }
+
+    /// The resume-side wrapper is what `run_resumed` consults before stamping
+    /// a fresh `--resume-from <file>` session (issue #134 W2). It must hand
+    /// back exactly what the library resolves — the sticky bit in *both*
+    /// states, and `None` for an unresolvable preset — never a constant.
+    #[test]
+    fn effective_run_code_wrapper_mirrors_the_library_resolution() {
+        let mut env = EnvGuard::lock();
+        env.remove_var(recursive::preset::RUN_CODE_ENV);
+        env.remove_var(recursive::preset::PRESET_ENV_VAR);
+        let ws = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(ws.path());
+
+        cfg.session_run_code = Some(true);
+        assert_eq!(
+            effective_run_code(&cfg),
+            Some(true),
+            "a recorded ON must resolve ON (env-less: the sticky bit decides)"
+        );
+        cfg.session_run_code = Some(false);
+        assert_eq!(
+            effective_run_code(&cfg),
+            Some(false),
+            "a recorded OFF must resolve OFF"
+        );
+
+        // An unknown agent preset cannot resolve: the wrapper reports
+        // `None` (the caller then writes no bit), mirroring build_runtime's
+        // hard-fail rather than inventing a state.
+        env.set_var(recursive::preset::PRESET_ENV_VAR, "no-such-preset-245");
+        assert_eq!(
+            effective_run_code(&cfg),
+            None,
+            "an unresolvable preset must yield None, not a fabricated bit"
         );
     }
 
