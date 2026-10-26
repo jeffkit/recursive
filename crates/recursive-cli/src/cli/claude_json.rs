@@ -733,4 +733,313 @@ mod tests {
         assert_eq!(r["num_turns"], 3);
         assert_eq!(r["session_id"], "sess_test");
     }
+
+    // ── issue #245 batch 1 (CI run 40256596759) ─────────────────────────
+
+    fn ctx_without_partials() -> ClaudeJsonContext {
+        let mut c = ctx();
+        c.include_partial_messages = false;
+        c
+    }
+
+    /// Unknown `--output-format` values fall back to the `--json` / `--stream`
+    /// flags (the `||` in the `Some(_)` arm).
+    #[test]
+    fn resolve_unknown_format_falls_back_to_the_flags() {
+        assert_eq!(
+            JsonOutputMode::resolve(Some("weixin"), true, false),
+            Some(JsonOutputMode::Stream)
+        );
+        assert_eq!(
+            JsonOutputMode::resolve(Some("weixin"), false, true),
+            Some(JsonOutputMode::Stream)
+        );
+        assert_eq!(JsonOutputMode::resolve(Some("weixin"), false, false), None);
+    }
+
+    /// Deleting the `AssistantText` arm would route assistant text into the
+    /// non_exhaustive catch-all and drop it from the wire.
+    #[test]
+    fn assistant_text_becomes_an_assistant_message_and_feeds_num_turns() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        let outs = em.on_event(AgentEvent::AssistantText {
+            text: "hello".into(),
+            step: 0,
+        });
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0]["type"], "assistant");
+        assert_eq!(outs[0]["message"]["content"][0]["text"], "hello");
+        // Blank text stays off the wire and must not count as a turn.
+        let outs = em.on_event(AgentEvent::AssistantText {
+            text: "   ".into(),
+            step: 1,
+        });
+        assert!(outs.is_empty());
+        // With steps == 0 the result envelope falls back to the emitter's
+        // per-event turn count (one non-empty AssistantText so far).
+        let r = em.build_result(
+            &FinishReason::NoMoreToolCalls,
+            None,
+            TokenUsage::default(),
+            0,
+            0,
+        );
+        assert_eq!(r["num_turns"], 1);
+    }
+
+    /// Deleting the `Usage` arm (which emits no frames but feeds the
+    /// emitter's counters) would zero every fallback figure in the result
+    /// envelope; the `> 0` guards on the four usage fields flip to
+    /// `>=` / `==` / `<` and either ignore provider-reported usage or let a
+    /// zero trump a counted fallback.
+    #[test]
+    fn usage_events_accumulate_and_backstop_result_usage() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        let outs = em.on_event(AgentEvent::Usage {
+            input_tokens: 77,
+            output_tokens: 9,
+            cache_hit_tokens: 4,
+            cache_miss_tokens: 2,
+            step: 0,
+        });
+        assert!(outs.is_empty());
+        let r = em.build_result(
+            &FinishReason::NoMoreToolCalls,
+            None,
+            TokenUsage::default(),
+            0,
+            1,
+        );
+        assert_eq!(r["usage"]["input_tokens"], 77);
+        assert_eq!(r["usage"]["output_tokens"], 9);
+        assert_eq!(r["usage"]["cache_read_input_tokens"], 4);
+        assert_eq!(r["usage"]["cache_creation_input_tokens"], 2);
+
+        // With no Usage events seen, provider-reported usage must win.
+        let em2 = ClaudeJsonEmitter::new(ctx());
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cache_hit_tokens: 3,
+            cache_miss_tokens: 7,
+            reasoning_tokens: 0,
+        };
+        let r2 = em2.build_result(&FinishReason::NoMoreToolCalls, None, usage, 0, 1);
+        assert_eq!(r2["usage"]["input_tokens"], 10);
+        assert_eq!(r2["usage"]["output_tokens"], 5);
+        assert_eq!(r2["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(r2["usage"]["cache_creation_input_tokens"], 7);
+    }
+
+    /// Deleting the `Latency` arm or flipping the `llm_latency_ms > 0` guard
+    /// breaks the duration_api_ms fallback chain.
+    #[test]
+    fn latency_events_accumulate_into_duration_api_ms() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        assert!(em
+            .on_event(AgentEvent::Latency {
+                step: 0,
+                llm_ms: 500
+            })
+            .is_empty());
+        assert!(em
+            .on_event(AgentEvent::Latency {
+                step: 1,
+                llm_ms: 250
+            })
+            .is_empty());
+        let r = em.build_result(
+            &FinishReason::NoMoreToolCalls,
+            Some("done"),
+            TokenUsage::default(),
+            0,
+            1,
+        );
+        assert_eq!(r["duration_api_ms"], 750);
+        let r2 = em.build_result(
+            &FinishReason::NoMoreToolCalls,
+            Some("done"),
+            TokenUsage::default(),
+            120,
+            1,
+        );
+        assert_eq!(r2["duration_api_ms"], 120);
+    }
+
+    /// Deleting the `Compacted` arm would drop the compact_boundary frame.
+    #[test]
+    fn compacted_event_emits_a_compact_boundary_frame() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        let outs = em.on_event(AgentEvent::Compacted {
+            removed: 100,
+            kept: 50,
+            summary_chars: 9,
+            step: 2,
+        });
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0]["type"], "system");
+        assert_eq!(outs[0]["subtype"], "compact_boundary");
+        assert_eq!(outs[0]["compact_metadata"]["pre_tokens"], 150);
+        assert_eq!(outs[0]["compact_metadata"]["post_tokens"], 50);
+        assert_eq!(outs[0]["compact_metadata"]["summary_chars"], 9);
+    }
+
+    /// Deleting any of the three hook arms would drop the frame (each falls
+    /// into the non_exhaustive catch-all).
+    #[test]
+    fn hook_events_emit_started_progress_and_response_frames() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        let outs = em.on_event(AgentEvent::HookStarted {
+            hook_event: "preToolCall".into(),
+            hook_name: "guard".into(),
+            status_message: None,
+        });
+        assert_eq!(outs[0]["subtype"], "hook_started");
+        assert_eq!(outs[0]["hook_name"], "guard");
+        let outs = em.on_event(AgentEvent::HookProgress {
+            hook_event: "preToolCall".into(),
+            hook_name: "guard".into(),
+            last_line: "scanned 3/10".into(),
+        });
+        assert_eq!(outs[0]["subtype"], "hook_progress");
+        assert_eq!(outs[0]["stdout"], "scanned 3/10");
+        let outs = em.on_event(AgentEvent::HookFinished {
+            hook_event: "preToolCall".into(),
+            hook_name: "guard".into(),
+            outcome: "ok".into(),
+            duration_ms: 25,
+        });
+        assert_eq!(outs[0]["subtype"], "hook_response");
+        assert_eq!(outs[0]["exit_code"], 0);
+        let outs = em.on_event(AgentEvent::HookFinished {
+            hook_event: "preToolCall".into(),
+            hook_name: "guard".into(),
+            outcome: "blocked".into(),
+            duration_ms: 40,
+        });
+        assert_eq!(outs[0]["exit_code"], 1);
+    }
+
+    /// The `include_partial_messages` gate on the `PartialToken` arm must be
+    /// honoured (forcing the guard to `true` would leak stream deltas for
+    /// hosts that never asked for them).
+    #[test]
+    fn partial_tokens_stay_off_the_wire_unless_enabled() {
+        let mut em = ClaudeJsonEmitter::new(ctx_without_partials());
+        let outs = em.on_event(AgentEvent::PartialToken {
+            text: "Hel".into(),
+            step: 0,
+        });
+        assert!(outs.is_empty());
+    }
+
+    /// Behavioural pin behind the two `delete match arm` exclusions in
+    /// `.cargo/mutants.toml`: the big internal-event drop arm and the
+    /// `WorkerEvent` arm both return `Vec::new()`, exactly like the
+    /// non_exhaustive catch-all they fall into when deleted — no test can
+    /// tell them apart, and this pin documents the drop contract they
+    /// implement (issue #119: worker events never become parent frames).
+    #[test]
+    fn internal_events_stay_off_the_claude_wire() {
+        let mut em = ClaudeJsonEmitter::new(ctx());
+        assert!(em
+            .on_event(AgentEvent::TurnFinished {
+                reason: "no_more_tool_calls".into(),
+                steps: 2
+            })
+            .is_empty());
+        assert!(em
+            .on_event(AgentEvent::WorkerEvent {
+                worker_id: "w1".into(),
+                task_id: None,
+                event: Box::new(AgentEvent::AssistantText {
+                    text: "hi".into(),
+                    step: 0
+                }),
+            })
+            .is_empty());
+        assert!(em
+            .on_event(AgentEvent::PartialReasoning {
+                text: "thinking".into(),
+                step: 0
+            })
+            .is_empty());
+    }
+
+    /// Guard behind the five `delete match arm FinishReason::…` exclusions in
+    /// `.cargo/mutants.toml`: each explicit error arm's message is
+    /// byte-identical to the `finish.to_string()` the catch-all arm would
+    /// produce, which is exactly why deleting the arm is unobservable. If
+    /// `Display` ever drifts from an arm literal, the second assert goes red
+    /// and the exclusion must be revisited (the mutant becomes killable).
+    #[test]
+    fn finish_error_arms_stay_byte_equal_to_display() {
+        let cases = vec![
+            (FinishReason::Cancelled, "cancelled"),
+            (
+                FinishReason::Stuck {
+                    repeated_call: "Bash".into(),
+                    repeats: 3,
+                },
+                "stuck:Bash:3",
+            ),
+            (
+                FinishReason::TranscriptLimit {
+                    chars: 123,
+                    limit: 456,
+                },
+                "transcript_limit:123/456",
+            ),
+            (
+                FinishReason::PermissionDenialLimit,
+                "permission_denial_limit",
+            ),
+            (
+                FinishReason::ProviderStop("length".into()),
+                "provider_stop:length",
+            ),
+        ];
+        for (finish, arm_literal) in cases {
+            let em = ClaudeJsonEmitter::new(ctx());
+            let r = em.build_result(&finish, None, TokenUsage::default(), 0, 1);
+            assert_eq!(r["subtype"], "error_during_execution");
+            assert_eq!(r["is_error"], true);
+            assert_eq!(r["errors"][0], arm_literal);
+            assert_eq!(
+                r["errors"][0],
+                finish.to_string(),
+                "Display drifted from the explicit arm for {finish}; \
+                 delete the matching exclusion in .cargo/mutants.toml"
+            );
+        }
+    }
+
+    /// `println_json` writes to process stdout, which no in-process test can
+    /// capture, so its body is pinned to source (the #429/#89db17c9 doctrine
+    /// for bodies unobservable from tests): a `println_json -> ()` mutant
+    /// deletes both anchors and turns this pin red.
+    #[test]
+    fn println_json_body_is_pinned_to_source() {
+        let src = include_str!("claude_json.rs");
+        let tests_at = src
+            .find("#[cfg(test)]")
+            .unwrap_or_else(|| panic!("test module marker moved in claude_json.rs"));
+        let production = &src[..tests_at];
+        let fn_at = production
+            .find("fn println_json")
+            .unwrap_or_else(|| panic!("println_json moved out of the production half"));
+        let body: String = production[fn_at..]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            body.contains("Ok(line) => println!(\"{line}\"),"),
+            "println_json Ok arm moved — update this pin"
+        );
+        assert!(
+            body.contains("Err(e) => eprintln!(\"json: failed to serialise event: {e}\"),"),
+            "println_json Err arm moved — update this pin"
+        );
+    }
 }

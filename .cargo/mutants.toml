@@ -155,4 +155,47 @@ exclude_re = [
     # all killed by the stray-file retry test's attempt-0 acquire failure)
     # stay in scope — the regex is name-specific on `with true`.
     "replace match guard attempt < 7 with true in SessionWriter::create_with_tools",
+    # ── Issue #245 batch 1 (CI run 40256596759), claude_json.rs — true
+    # equivalences, each hand-verified this batch: mutation applied → full
+    # claude_json suite green (18 tests), then byte-exact restore. The 24
+    # killable siblings in the same file are pinned by the new tests
+    # (resolve_unknown_format_falls_back_to_the_flags,
+    # assistant_text_becomes_an_assistant_message_and_feeds_num_turns,
+    # usage_events_accumulate_and_backstop_result_usage,
+    # latency_events_accumulate_into_duration_api_ms,
+    # compacted_event_emits_a_compact_boundary_frame,
+    # hook_events_emit_started_progress_and_response_frames,
+    # partial_tokens_stay_off_the_wire_unless_enabled,
+    # println_json_body_is_pinned_to_source) — keep them out of exclusion
+    # scope.
+    #
+    # Two `delete match arm` mutants fall into the `#[non_exhaustive]`
+    # catch-all `_ => Vec::new()` whose body is the same `Vec::new()` the
+    # deleted arms return: the big internal-event drop arm (TurnFinished |
+    # PartialToken | PartialReasoning | … — note PartialToken also has the
+    # guarded arm above, which this arm only receives when
+    # include_partial_messages is false, and the catch-all drops it
+    # identically) and WorkerEvent (issue #119 drop contract, pinned
+    # behaviourally by internal_events_stay_off_the_claude_wire).
+    # REGEX SCOPE: the bare `{..}` discriminates these two arms from the
+    # killable `TurnFinished{ref reason, steps}` / `WorkerEvent{ref …}`
+    # arm deletions in cli/output.rs (stream_events / stream_events_repl),
+    # which must stay in scope.
+    "delete match arm AgentEvent::TurnFinished\\{\\.\\.\\}",
+    "delete match arm AgentEvent::WorkerEvent\\{\\.\\.\\}",
+    # Five `delete match arm FinishReason::…` mutants in
+    # ClaudeJsonEmitter::build_result: each explicit arm's error string is
+    # byte-identical to `finish.to_string()` (Display in
+    # src/agent/types.rs) that the catch-all arm emits, and subtype /
+    # is_error already match. The byte-equality is pinned by
+    # finish_error_arms_stay_byte_equal_to_display — if Display drifts from
+    # an arm literal, that test goes red and the mutant becomes killable:
+    # delete the exclusion with it. The `in ClaudeJsonEmitter::build_result`
+    # tail keeps the killable sibling arm deletions in cli/output.rs
+    # (print_finish_note / exit_for_finish) in scope.
+    "delete match arm FinishReason::Cancelled in ClaudeJsonEmitter::build_result",
+    "delete match arm FinishReason::Stuck.*in ClaudeJsonEmitter::build_result",
+    "delete match arm FinishReason::TranscriptLimit.*in ClaudeJsonEmitter::build_result",
+    "delete match arm FinishReason::PermissionDenialLimit in ClaudeJsonEmitter::build_result",
+    "delete match arm FinishReason::ProviderStop.*in ClaudeJsonEmitter::build_result",
 ]
