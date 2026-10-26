@@ -361,4 +361,23 @@ exclude_re = [
     # killable `| → &` siblings at the same two columns in scope, and the
     # line:col anchor keeps every other `|` in the file in scope.
     "control\\.rs:742:(28|40): replace \\| with \\^ in base64_encode",
+    # ── Issue #245 batch (B2 seat, cli tail), cli/output.rs — one
+    # context-equivalent, hand-verified this batch: mutation applied →
+    # full recursive-cli package suite green (13 test binaries incl. the
+    # 23 unit tests in cli/output.rs, four of them the new output pins),
+    # then byte-exact restore. print_usage evaluates line 20 only under
+    # the `cache_hit_tokens > 0` gate on line 18, so
+    # `total_cache = cache_hit_tokens + cache_miss_tokens >= 1 > 0`
+    # holds in every reachable state and `>` vs `>=` are
+    # indistinguishable. The regex anchors the full `file:line:col: name`
+    # string, NOT just the location: three mutants share 20:43 and the
+    # `==`/`<` siblings ARE killable (80.0% vs 0.0% hit rate, both red in
+    # negctl) — a bare line anchor would drop them from the gate's view.
+    # Verified with `cargo mutants --list -p recursive-cli`: with the
+    # entry, 96 → 93 output.rs entries and zero `20:43` hits; without it,
+    # exactly the three 20:43 mutants are listed. The 21 killable
+    # print_usage siblings stay pinned by
+    # print_usage_renders_tokens_cache_rate_and_latency_lines +
+    # print_usage_stays_silent_outside_its_gates.
+    "crates/recursive-cli/src/cli/output\\.rs:20:43: replace > with >= in print_usage",
 ]

@@ -990,5 +990,250 @@ mod tests {
             ],
             "stderr: {stderr}"
         );
+    // ── #245 tail segment: surface pins for print_usage / print_finish_note
+    // and exact-error pins for exit_for_finish. The print_* pins observe
+    // stderr through a child process: the test binary re-invokes itself
+    // with OUTPUT_PIN_CHILD naming a case; in the child that same test
+    // returns right after making the real call, and `--nocapture` (which
+    // also skips libtest's spawn-hook capture inheritance) lets the call's
+    // eprintln! reach the real stderr, which the parent captures.
+    // In-process capture is not possible: libtest routes print macros of
+    // every thread into a sink the test cannot read.
+
+    const OUTPUT_PIN_CHILD: &str = "RECURSIVE_OUTPUT_PIN_CHILD";
+
+    fn output_pin_child_case() -> Option<String> {
+        std::env::var(OUTPUT_PIN_CHILD).ok()
+    }
+
+    /// Run this test binary filtered to `test_name` with
+    /// `OUTPUT_PIN_CHILD=case`; returns (success, stderr).
+    fn run_output_pin_child(case: &str, test_name: &str) -> (bool, String) {
+        let exe = std::env::current_exe().expect("current test executable");
+        let out = std::process::Command::new(exe)
+            .arg(format!("cli::output::tests::{test_name}"))
+            .arg("--exact")
+            .arg("--nocapture")
+            .env_clear()
+            .env(OUTPUT_PIN_CHILD, case)
+            .output()
+            .expect("spawn output-pin child");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn print_usage_renders_tokens_cache_rate_and_latency_lines() {
+        const NAME: &str = "print_usage_renders_tokens_cache_rate_and_latency_lines";
+        if output_pin_child_case().as_deref() == Some("usage-full") {
+            print_usage(
+                TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                    cache_hit_tokens: 8,
+                    cache_miss_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+                "no-such-model-245",
+                1_000,
+                4,
+            );
+            return;
+        }
+        let (ok, stderr) = run_output_pin_child("usage-full", NAME);
+        assert!(ok, "child failed: {stderr}");
+        assert!(
+            stderr.contains("tokens: prompt=100 completion=50 total=150"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("cache: hit=8 miss=2 (80.0% hit rate)"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("llm latency: total=1000ms avg=250ms over 4 steps"),
+            "stderr: {stderr}"
+        );
+        // The model is not in the pricing table, so there is no cost line.
+        assert!(!stderr.contains("cost:"), "stderr: {stderr}");
+    }
+
+    #[test]
+    fn print_usage_stays_silent_outside_its_gates() {
+        const NAME: &str = "print_usage_stays_silent_outside_its_gates";
+        let zero_usage = TokenUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let no_cache = TokenUsage {
+            prompt_tokens: 6,
+            completion_tokens: 4,
+            total_tokens: 10,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        match output_pin_child_case() {
+            None => {
+                for case in ["all-zero", "zero-latency", "zero-steps", "no-cache-hits"] {
+                    let (ok, stderr) = run_output_pin_child(case, NAME);
+                    assert!(ok, "case {case}: child failed: {stderr}");
+                    match case {
+                        // Zero traffic and zero latency: no block at all.
+                        "all-zero" => {
+                            assert!(!stderr.contains("tokens: prompt="), "stderr: {stderr}");
+                            assert!(!stderr.contains("cache: hit="), "stderr: {stderr}");
+                            assert!(!stderr.contains("llm latency:"), "stderr: {stderr}");
+                        }
+                        // The latency gate is on the latency value, not on
+                        // the step count: zero latency with steps
+                        // outstanding stays silent.
+                        "zero-latency" => {
+                            assert!(!stderr.contains("llm latency:"), "stderr: {stderr}");
+                        }
+                        // steps == 0 with real latency stays silent and
+                        // must not panic on the average division.
+                        "zero-steps" => {
+                            assert!(!stderr.contains("llm latency:"), "stderr: {stderr}");
+                        }
+                        // The cache block is gated on cache_hit_tokens, not
+                        // on total tokens: traffic without cache hits
+                        // renders no cache line.
+                        "no-cache-hits" => {
+                            assert!(
+                                stderr.contains("tokens: prompt=6 completion=4 total=10"),
+                                "stderr: {stderr}"
+                            );
+                            assert!(
+                                stderr.contains("llm latency: total=100ms avg=50ms over 2 steps"),
+                                "stderr: {stderr}"
+                            );
+                            assert!(!stderr.contains("cache: hit="), "stderr: {stderr}");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            Some(case) => match case.as_str() {
+                "all-zero" => print_usage(zero_usage, "m", 0, 0),
+                "zero-latency" => print_usage(zero_usage, "m", 0, 3),
+                "zero-steps" => print_usage(zero_usage, "m", 500, 0),
+                "no-cache-hits" => print_usage(no_cache, "m", 100, 2),
+                _ => unreachable!("unknown case {case}"),
+            },
+        }
+    }
+
+    #[test]
+    fn print_finish_note_renders_transcript_limit_and_cancelled_notes() {
+        const NAME: &str = "print_finish_note_renders_transcript_limit_and_cancelled_notes";
+        match output_pin_child_case() {
+            None => {
+                for case in ["transcript-limit", "cancelled", "other-silent"] {
+                    let (ok, stderr) = run_output_pin_child(case, NAME);
+                    assert!(ok, "case {case}: child failed: {stderr}");
+                    match case {
+                        "transcript-limit" => assert!(
+                            stderr.contains(
+                                "note: stopped because transcript reached 1234 chars (limit 500)"
+                            ),
+                            "stderr: {stderr}"
+                        ),
+                        "cancelled" => assert!(
+                            stderr.contains(
+                                "shutdown: agent stopped at next step boundary after signal"
+                            ),
+                            "stderr: {stderr}"
+                        ),
+                        // Any other finish reason is silent.
+                        "other-silent" => {
+                            assert!(!stderr.contains("note:"), "stderr: {stderr}");
+                            assert!(!stderr.contains("shutdown:"), "stderr: {stderr}");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            Some(case) => match case.as_str() {
+                "transcript-limit" => print_finish_note(&FinishReason::TranscriptLimit {
+                    chars: 1234,
+                    limit: 500,
+                }),
+                "cancelled" => print_finish_note(&FinishReason::Cancelled),
+                "other-silent" => print_finish_note(&FinishReason::NoMoreToolCalls),
+                _ => unreachable!("unknown case {case}"),
+            },
+        }
+    }
+
+    #[test]
+    fn exit_for_finish_maps_reasons_to_exact_errors_and_successes() {
+        // Byte-exact strings: the `delete match arm` mutants for Stuck /
+        // TranscriptLimit / PermissionDenialLimit fall through to the
+        // `#[non_exhaustive]` wildcard, whose "agent finished with unknown
+        // reason: …" text differs — these assertions are what kills them.
+        let err = exit_for_finish(
+            &FinishReason::Stuck {
+                repeated_call: "Bash".into(),
+                repeats: 3,
+            },
+            12,
+        )
+        .expect_err("stuck must be an error");
+        assert_eq!(
+            err.to_string(),
+            "agent stuck: repeated tool call 'Bash' (3x)"
+        );
+
+        let err = exit_for_finish(
+            &FinishReason::TranscriptLimit {
+                chars: 1234,
+                limit: 500,
+            },
+            12,
+        )
+        .expect_err("transcript limit must be an error");
+        assert_eq!(
+            err.to_string(),
+            "transcript size 1234 exceeded hard limit 500 and could not be reduced"
+        );
+
+        let err = exit_for_finish(&FinishReason::PermissionDenialLimit, 12)
+            .expect_err("permission denial limit must be an error");
+        assert_eq!(
+            err.to_string(),
+            "agent hit permission denial limit (loop of denied tool calls)"
+        );
+
+        // Success reasons stay Ok — Cancelled must never auto-resume.
+        assert!(exit_for_finish(&FinishReason::NoMoreToolCalls, 1).is_ok());
+        assert!(exit_for_finish(&FinishReason::Cancelled, 1).is_ok());
+        assert!(exit_for_finish(&FinishReason::ProviderStop("end_turn".into()), 1).is_ok());
+        // The remaining error arms keep their exact shape too.
+        assert_eq!(
+            exit_for_finish(&FinishReason::BudgetExceeded, 7)
+                .unwrap_err()
+                .to_string(),
+            "agent exceeded step budget (7)"
+        );
+        assert_eq!(
+            exit_for_finish(&FinishReason::WallClockExceeded { secs: 9 }, 7)
+                .unwrap_err()
+                .to_string(),
+            "agent exceeded wall-clock timeout (9s)"
+        );
+        assert_eq!(
+            exit_for_finish(&FinishReason::ProviderStop("rate_limited".into()), 7)
+                .unwrap_err()
+                .to_string(),
+            "provider stopped: rate_limited"
+        );
     }
 }
