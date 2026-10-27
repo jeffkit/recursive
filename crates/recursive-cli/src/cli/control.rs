@@ -1999,4 +1999,305 @@ mod tests {
             [(extra, AccessTier::ReadWrite)].as_slice()
         );
     }
+
+    // ── #245 batch 7: control.rs :805 → :987 ────────────────────────────
+
+    /// Create `rel` (parent directories included) under `ws` with a stub
+    /// payload.
+    fn write_ws_file(ws: &Path, rel: &str) {
+        let path = ws.join(rel);
+        std::fs::create_dir_all(path.parent().expect("rel has a parent")).expect("mkdir");
+        std::fs::write(path, "x").expect("write");
+    }
+
+    /// Poll with real sleeps until `bridge` holds at least `n` parked
+    /// CLI→host waiters. Unlike [`parked_request_ids`] (pure yields), this
+    /// tolerates emitters that only act on a timer — `plan_dialog_loop`
+    /// sleeps 200 ms before its first look at the pending plan.
+    async fn eventually_parked_request_ids(bridge: &ControlBridge, n: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let ids: Vec<String> = bridge.pending.lock().await.keys().cloned().collect();
+            if ids.len() >= n {
+                return ids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {n} parked CLI→host waiter(s) within 5s; the loop never asked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Answer the single parked waiter with `reply` through the real
+    /// `control_response` wire shape and require the pending map to drain.
+    async fn answer_the_parked_waiter(bridge: &ControlBridge, reply: Value) {
+        let ids = eventually_parked_request_ids(bridge, 1).await;
+        assert_eq!(ids.len(), 1, "exactly one waiter expected: {ids:?}");
+        let line = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": ids[0],
+                "response": reply,
+            }
+        });
+        assert!(bridge.resolve_response(&line).await);
+        assert!(
+            bridge.pending.lock().await.is_empty(),
+            "answered waiter must be consumed"
+        );
+    }
+
+    #[test]
+    fn file_suggestions_filters_by_query_and_respects_the_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path();
+        for rel in [
+            "readme.md",
+            "src/main.rs",
+            "src/lib.rs",
+            ".hidden.txt",
+            "target/out.o",
+            "node_modules/pkg.js",
+        ] {
+            write_ws_file(ws, rel);
+        }
+        let sep = std::path::MAIN_SEPARATOR;
+        let src_main = format!("src{sep}main.rs");
+        let src_lib = format!("src{sep}lib.rs");
+
+        // Empty query lists every visible file (hidden / target /
+        // node_modules pruned); walk order is fs-dependent, compare sorted.
+        let mut all = file_suggestions(ws, "", 50);
+        all.sort();
+        assert_eq!(
+            all,
+            vec!["readme.md".to_string(), src_lib.clone(), src_main.clone()]
+        );
+
+        // A non-empty query filters case-insensitively on the relative path.
+        assert_eq!(file_suggestions(ws, "MAIN", 50), vec![src_main.clone()]);
+        assert!(file_suggestions(ws, "no-such-file", 50).is_empty());
+
+        // The limit cuts the result (3 visible files).
+        assert_eq!(file_suggestions(ws, "", 2).len(), 2);
+        assert_eq!(file_suggestions(ws, "", 1).len(), 1);
+    }
+
+    #[test]
+    fn walkdir_shallow_prunes_dot_target_node_modules_and_caps_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path();
+        for rel in [
+            "a.txt",
+            "d1/b.txt",
+            "d1/d2/c.txt",
+            ".hidden.txt",
+            ".hiddendir/x.txt",
+            "target/out.o",
+            "node_modules/n.js",
+        ] {
+            write_ws_file(ws, rel);
+        }
+        let sep = std::path::MAIN_SEPARATOR;
+        let mut got = walkdir_shallow(ws, 1);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ws.join("a.txt").display().to_string(),
+                format!("{}{sep}d1{sep}b.txt", ws.display()),
+            ],
+            "depth-1 walk must surface a.txt and d1/b.txt only (absolute paths)"
+        );
+    }
+
+    #[test]
+    fn rewind_files_reports_dry_run_and_errors_without_a_turn_index() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        let dry = rewind_files(&session, &json!({"dry_run": true})).expect("dry run must succeed");
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["would_rewind"], false);
+        assert_eq!(
+            dry["note"],
+            "use `recursive sessions rewind --to-turn N` for full rewind"
+        );
+
+        let note =
+            "rewind_files requires a turn index; use `recursive sessions rewind --to-turn N`";
+        assert_eq!(
+            rewind_files(&session, &json!({})),
+            Err(note.to_string()),
+            "absent dry_run defaults to false → error path"
+        );
+        assert_eq!(
+            rewind_files(&session, &json!({"dry_run": false})),
+            Err(note.to_string())
+        );
+    }
+
+    #[test]
+    fn list_mcp_servers_status_lists_configured_names_and_tolerates_junk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path();
+        let mcp = ws.join(".mcp.json");
+
+        // No manifest, unparseable manifest, and a manifest whose
+        // `mcpServers` is not an object all report nothing.
+        assert!(list_mcp_servers_status(ws).is_empty());
+        std::fs::write(&mcp, "not json").expect("write");
+        assert!(list_mcp_servers_status(ws).is_empty());
+        std::fs::write(&mcp, json!({"other": 1}).to_string()).expect("write");
+        assert!(list_mcp_servers_status(ws).is_empty());
+        std::fs::write(&mcp, json!({"mcpServers": [1, 2]}).to_string()).expect("write");
+        assert!(list_mcp_servers_status(ws).is_empty());
+
+        std::fs::write(
+            &mcp,
+            json!({"mcpServers": {"git": {}, "fs": {"command": "npx"}}}).to_string(),
+        )
+        .expect("write");
+        let status = list_mcp_servers_status(ws);
+        assert_eq!(status.len(), 2, "{status:?}");
+        let mut named: Vec<(String, String)> = status
+            .iter()
+            .map(|v| {
+                (
+                    v["name"].as_str().expect("name").to_string(),
+                    v["status"].as_str().expect("status").to_string(),
+                )
+            })
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            vec![
+                ("fs".to_string(), "configured".to_string()),
+                ("git".to_string(), "configured".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_stdin_closed_reflects_the_flag_both_ways() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        assert!(!session.is_stdin_closed());
+        session
+            .stdin_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(session.is_stdin_closed());
+    }
+
+    #[test]
+    fn record_usage_accumulates_tokens_and_api_ms() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        session.record_usage(
+            recursive::llm::TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+                ..recursive::llm::TokenUsage::default()
+            },
+            50,
+        );
+        session.record_usage(
+            recursive::llm::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cache_hit_tokens: 3,
+                cache_miss_tokens: 7,
+                reasoning_tokens: 2,
+            },
+            70,
+        );
+
+        let usage = *session.usage.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(usage.prompt_tokens, 110);
+        assert_eq!(usage.completion_tokens, 25);
+        assert_eq!(usage.total_tokens, 135);
+        assert_eq!(usage.cache_hit_tokens, 3);
+        assert_eq!(usage.cache_miss_tokens, 7);
+        assert_eq!(usage.reasoning_tokens, 2);
+        assert_eq!(
+            *session.api_ms.lock().unwrap_or_else(|e| e.into_inner()),
+            120
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_dialog_loop_asks_the_host_and_applies_allow_deny_and_reasks() {
+        let bridge = ControlBridge::new();
+        let gate = Arc::new(recursive::PlanApprovalGate::new());
+        let session = ControlSession::new(
+            bridge.clone(),
+            CancellationToken::new(),
+            std::env::temp_dir(),
+            "m".into(),
+            PermissionMode::Default,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            false,
+            Some(gate.clone()),
+        );
+        let loop_task = {
+            let session = session.clone();
+            tokio::spawn(async move { plan_dialog_loop(session).await })
+        };
+
+        // First plan: the host approves → the gate records Approved.
+        gate.begin_approval("plan one 245b7".into());
+        answer_the_parked_waiter(&bridge, json!({"behavior": "approve"})).await;
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_for_approval())
+                .await
+                .expect("first decision within 5s");
+        assert!(
+            matches!(&decision, recursive::PlanApprovalResult::Approved),
+            "expected Approved, got {decision:?}"
+        );
+        assert_eq!(gate.pending_plan(), None, "the decision clears the plan");
+
+        // Second plan: the host denies with a message → the gate records
+        // Rejected carrying exactly that message (not the generic fallback).
+        gate.begin_approval("plan two 245b7".into());
+        answer_the_parked_waiter(
+            &bridge,
+            json!({"behavior": "deny", "message": "needs changes 245b7"}),
+        )
+        .await;
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_for_approval())
+                .await
+                .expect("second decision within 5s");
+        match decision {
+            recursive::PlanApprovalResult::Rejected { reason } => {
+                assert_eq!(reason, "needs changes 245b7");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // A third, different plan must be asked afresh — last_asked must not
+        // swallow it.
+        gate.begin_approval("plan three 245b7".into());
+        answer_the_parked_waiter(&bridge, json!({"behavior": "approved"})).await;
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_for_approval())
+                .await
+                .expect("third decision within 5s");
+        assert!(
+            matches!(&decision, recursive::PlanApprovalResult::Approved),
+            "expected Approved, got {decision:?}"
+        );
+
+        session.shutdown.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), loop_task)
+            .await
+            .expect("the loop must stop once shutdown is cancelled");
+        joined.expect("join");
+    }
 }
