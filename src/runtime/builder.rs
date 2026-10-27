@@ -1137,6 +1137,19 @@ mod tests {
         let marker = dir.path().join("marker.txt");
         std::fs::write(&marker, "pinned\n").expect("seed marker");
 
+        // The read root under test arrives via the deliverables ledger
+        // (`build()` maps `deliverables().workspace()`), and that ledger's
+        // init resolves `RECURSIVE_HOME` — a process global another test's
+        // env guard may be pointing at its own (dying) tempdir right now.
+        // Racing that teardown fails the init with a filesystem error and
+        // the read root silently falls back to the host process cwd, which
+        // reds the run below with `Access to this API has been restricted`
+        // — observed in a loaded full-suite run (#246); `RECURSIVE_HOME=
+        // /dev/null` reproduces it deterministically. Pin our own home so
+        // the ledger init — and with it the fs-read grant — is hermetic.
+        let home = tempfile::TempDir::new().expect("temp recursive home");
+        let _pinned_home = crate::test_util::PinnedRecursiveHome::new(home.path());
+
         let tools = crate::tools::build_standard_tools(dir.path(), &[], 30);
         let rt = AgentRuntimeBuilder::new()
             .llm(mock_llm())
@@ -1177,6 +1190,13 @@ mod tests {
         let b = dir.path().join("b.txt");
         std::fs::write(&a, "hello\n").expect("seed a.txt");
         std::fs::write(&b, "world\n").expect("seed b.txt");
+
+        // Same hermetic home as `run_code_read_root_is_pinned_to_the_
+        // workspace`: building the standard tools reads `RECURSIVE_HOME`
+        // for the deliverables ledger, and pinning keeps this test from
+        // racing another test's env-guard tempdir teardown (#246).
+        let home = tempfile::TempDir::new().expect("temp recursive home");
+        let _pinned_home = crate::test_util::PinnedRecursiveHome::new(home.path());
 
         let tools = crate::tools::build_standard_tools(dir.path(), &[], 30);
         let rt = AgentRuntimeBuilder::new()

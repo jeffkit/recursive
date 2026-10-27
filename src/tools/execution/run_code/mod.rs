@@ -934,6 +934,13 @@ return "done";
     }
 
     /// Acceptance (#134): the heap budget trips and is classified `heap-limit`.
+    ///
+    /// #246: under heavy parallel load (observed in mutants-copy runs) node
+    /// startup alone can outran the 120s wall-clock budget, rendering as
+    /// `status=timeout` with zero calls and no output — the runtime never
+    /// executed a line, so nothing about the heap classification was
+    /// observed either way. That is a load artifact, not the semantics under
+    /// test: retry once on exactly that never-ran signature before failing.
     #[tokio::test]
     async fn heap_budget_is_enforced_and_classified() {
         if !node_available() {
@@ -948,9 +955,24 @@ return "done";
 const ballast = [];
 for (;;) ballast.push(new Array(100000).fill("xxxxxxxxxxxxxxxx"));
 "#;
-        let out = tool.execute(json!({ "code": code })).await.unwrap();
+        let args = json!({ "code": code });
+        let mut out = tool.execute(args.clone()).await.unwrap();
+        if never_ran(&out) {
+            eprintln!("the runtime never started (load); retrying the heap run once");
+            out = tool.execute(args).await.unwrap();
+        }
         assert!(out.contains("status=heap-limit"), "{out}");
         assert!(out.contains("heap budget"), "{out}");
+    }
+
+    /// The never-ran signature: a wall-clock kill that happened before the
+    /// program produced a single event (`calls=0`, empty ledger). A genuine
+    /// timeout in a run that did execute must not match — its `calls`/output
+    /// would not both be empty.
+    fn never_ran(rendered: &str) -> bool {
+        rendered.contains("status=timeout")
+            && rendered.contains("calls=0")
+            && rendered.contains("--- output ---\n(empty)")
     }
 
     /// The host-cancellation class: an external abort kills the run and is
