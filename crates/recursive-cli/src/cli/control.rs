@@ -2300,4 +2300,235 @@ mod tests {
             .expect("the loop must stop once shutdown is cancelled");
         joined.expect("join");
     }
+
+    // ── #245 batch 8: control.rs :1190 → :1302 (SDK hook forwarder + elicitation) ──
+
+    use recursive::mcp::ElicitationHandler as _;
+    use recursive::SdkHookForwarder as _;
+
+    fn hook_input_for(
+        event: recursive::hooks::external::HookEvent,
+    ) -> recursive::hooks::external::HookInput {
+        recursive::hooks::external::HookInput {
+            event,
+            tool_name: None,
+            args: None,
+            mode: "default".into(),
+            content: None,
+            message: None,
+            depth: None,
+            reason: None,
+            error: None,
+        }
+    }
+
+    fn elicitation_request() -> recursive::mcp::ElicitationRequest {
+        recursive::mcp::ElicitationRequest {
+            mcp_server_name: "maps".into(),
+            message: "open https://example.invalid/auth".into(),
+            mode: Some("url".into()),
+            url: Some("https://example.invalid/auth".into()),
+            elicitation_id: Some("el_245".into()),
+            requested_schema: None,
+            title: Some("Authorize".into()),
+            display_name: None,
+            description: None,
+        }
+    }
+
+    /// Resolve the single parked waiter with `reply` and hand back what the
+    /// typed emitter task returned (batch 6's `answer_single_waiter` is
+    /// hard-shaped `Option<Value>`; `forward` yields a `HookResult`).
+    async fn answered<T>(
+        bridge: &ControlBridge,
+        reply: Value,
+        task: tokio::task::JoinHandle<Option<T>>,
+    ) -> Option<T> {
+        let ids = parked_request_ids(bridge, 1).await;
+        assert_eq!(ids.len(), 1, "exactly one waiter expected: {ids:?}");
+        let line = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": ids[0],
+                "response": reply,
+            }
+        });
+        assert!(bridge.resolve_response(&line).await);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("emitter must return once its waiter is answered")
+            .expect("join");
+        assert!(
+            bridge.pending.lock().await.is_empty(),
+            "answered waiter must be consumed"
+        );
+        got
+    }
+
+    /// The `forward -> Some(Default::default())` mutant must die here: with
+    /// nothing registered the body falls through to local hooks, so `None`
+    /// is the only acceptable answer.
+    #[tokio::test]
+    async fn sdk_hook_forwarder_without_registered_callbacks_returns_none() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        let forwarder = ControlSdkHookForwarder::new(session);
+        let input = hook_input_for(recursive::hooks::external::HookEvent::PreToolCall);
+        let got =
+            tokio::time::timeout(std::time::Duration::from_secs(5), forwarder.forward(&input))
+                .await
+                .expect("the no-callback fall-through must not ask the host");
+        assert!(got.is_none(), "expected None, got {got:?}");
+    }
+
+    /// The `forward -> None` mutant must die here: a callback registered
+    /// under the wire (camelCase) event key reaches the host and its answer
+    /// surfaces as `Some`.
+    #[tokio::test]
+    async fn sdk_hook_forwarder_surfaces_the_host_callback_result() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        session
+            .sdk_hook_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("preToolCall".into(), vec!["cb_direct".into()]);
+        let forwarder = ControlSdkHookForwarder::new(session.clone());
+        let input = hook_input_for(recursive::hooks::external::HookEvent::PreToolCall);
+        let task = tokio::spawn(async move { forwarder.forward(&input).await });
+        let got = answered(
+            &session.bridge,
+            json!({"action": "block", "systemMessage": "held by host"}),
+            task,
+        )
+        .await
+        .expect("registered callback must reach the host");
+        assert!(matches!(got.action, recursive::hooks::HookAction::Skip));
+        assert_eq!(got.system_message.as_deref(), Some("held by host"));
+    }
+
+    /// Deleting any camelCase alias arm strands that event on `_ => None`,
+    /// so each wired event registers its callback under the PascalCase alias
+    /// only and still must get an answer through.
+    #[tokio::test]
+    async fn sdk_hook_forwarder_resolves_pascalcase_aliases_for_all_wired_events() {
+        let cases = [
+            (
+                recursive::hooks::external::HookEvent::PreToolCall,
+                "PreToolUse",
+            ),
+            (
+                recursive::hooks::external::HookEvent::PostToolCall,
+                "PostToolUse",
+            ),
+            (
+                recursive::hooks::external::HookEvent::PermissionRequest,
+                "PermissionRequest",
+            ),
+            (
+                recursive::hooks::external::HookEvent::UserPromptSubmit,
+                "UserPromptSubmit",
+            ),
+            (
+                recursive::hooks::external::HookEvent::SessionStart,
+                "SessionStart",
+            ),
+            (
+                recursive::hooks::external::HookEvent::SessionEnd,
+                "SessionEnd",
+            ),
+        ];
+        for (event, alias) in cases {
+            let session = session_for(std::env::temp_dir(), None, None, None);
+            session
+                .sdk_hook_callbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(alias.to_string(), vec!["cb_alias".into()]);
+            let forwarder = ControlSdkHookForwarder::new(session.clone());
+            let input = hook_input_for(event);
+            let task = tokio::spawn(async move { forwarder.forward(&input).await });
+            let got = answered(
+                &session.bridge,
+                json!({"decision": "deny", "reason": format!("vetoed via {alias}")}),
+                task,
+            )
+            .await
+            .unwrap_or_else(|| panic!("alias {alias} must reach its callback"));
+            match got.action {
+                recursive::hooks::HookAction::Error(m) => {
+                    assert_eq!(m, format!("vetoed via {alias}"));
+                }
+                other => panic!("alias {alias}: expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    /// The `delete !` mutant inverts the early return: a `continue` answer
+    /// must fall through to the next callback id, whose block verdict wins.
+    #[tokio::test]
+    async fn sdk_hook_forwarder_keeps_asking_after_a_continue_answer() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        session
+            .sdk_hook_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "preToolCall".into(),
+                vec!["cb_first".into(), "cb_second".into()],
+            );
+        let forwarder = ControlSdkHookForwarder::new(session.clone());
+        let input = hook_input_for(recursive::hooks::external::HookEvent::PreToolCall);
+        let task = tokio::spawn(async move { forwarder.forward(&input).await });
+
+        let ids = parked_request_ids(&session.bridge, 1).await;
+        let line = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": ids[0],
+                "response": {"action": "continue", "additionalContext": "first said go"},
+            }
+        });
+        assert!(session.bridge.resolve_response(&line).await);
+
+        let got = answered(
+            &session.bridge,
+            json!({"action": "block", "systemMessage": "second said stop"}),
+            task,
+        )
+        .await
+        .expect("the second callback must still be asked");
+        assert!(matches!(got.action, recursive::hooks::HookAction::Skip));
+        assert_eq!(got.system_message.as_deref(), Some("second said stop"));
+    }
+
+    /// The `elicit -> None` mutant must die here: the host's answer has to
+    /// surface as `Some`.
+    #[tokio::test]
+    async fn elicitation_handler_surfaces_the_host_answer() {
+        let bridge = ControlBridge::new();
+        let handler = ControlElicitationHandler::new(bridge.clone());
+        let task = tokio::spawn(async move { handler.elicit(elicitation_request()).await });
+        let got = answered(&bridge, json!({"action": "accept"}), task)
+            .await
+            .expect("host answer must surface as Some");
+        assert_eq!(got["action"], "accept");
+    }
+
+    /// The `elicit -> Some(Default::default())` mutant must die here: a
+    /// dropped waiter closes the oneshot and must come back as `None`, not
+    /// a fabricated answer.
+    #[tokio::test]
+    async fn elicitation_handler_returns_none_when_the_waiter_is_dropped() {
+        let bridge = ControlBridge::new();
+        let handler = ControlElicitationHandler::new(bridge.clone());
+        let task = tokio::spawn(async move { handler.elicit(elicitation_request()).await });
+        let ids = parked_request_ids(&bridge, 1).await;
+        bridge.pending.lock().await.remove(&ids[0]);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("dropped waiter must finish the ask")
+            .expect("join");
+        assert!(got.is_none(), "expected None, got {got:?}");
+    }
 }
