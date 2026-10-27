@@ -1747,4 +1747,177 @@ mod tests {
             Err(e) => panic!("missing path must be Ok(None), not Err({e})"),
         }
     }
+
+    // ------------------------------------------------------------------
+    // snapshot_for_session staging guard + stderr_tail (issue #245 batch 11)
+    // ------------------------------------------------------------------
+
+    /// A healthy snapshot's `git add` exits 0 and must not be reported as a
+    /// tolerated failure — that WARN is for degradation only.
+    #[test]
+    fn snapshot_healthy_git_add_does_not_warn() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+        fs::write(w.path().join("x.txt"), "v1").unwrap();
+
+        let (result, logs) = capture_logs(|| r.snapshot_for_session("s", "v1"));
+
+        result.expect("healthy snapshot must succeed");
+        assert!(
+            !logs.contains("git add exited non-zero"),
+            "a successful git add is not a tolerated failure, got: {logs}"
+        );
+    }
+
+    /// `git add` failing outright (non-empty fatal stderr) must surface as
+    /// `Err("git add failed: …")` from the staging step — neither tolerated
+    /// into a partial snapshot nor left to `write-tree`'s own error.
+    /// Injection: `open_at` keeps an already-existing shadow dir as-is, so an
+    /// empty directory stands in for the shadow repo and git refuses it.
+    #[test]
+    fn snapshot_fails_at_git_add_when_the_shadow_dir_is_not_a_repo() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let not_a_repo = w.shadow.path().join("not-a-repo");
+        fs::create_dir_all(&not_a_repo).unwrap();
+        let r = ShadowRepo::open_at(w.path(), &not_a_repo).unwrap();
+        fs::write(w.path().join("x.txt"), "v1").unwrap();
+
+        let (result, logs) = capture_logs(|| r.snapshot_for_session("s", "v1"));
+
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(id) => panic!("git add against a non-repo must fail, got {id:?}"),
+        };
+        assert!(
+            err.contains("git add failed:"),
+            "the failure must be attributed to the staging step, got: {err}"
+        );
+        assert!(
+            err.contains("not a git repository"),
+            "git's stderr must ride along, got: {err}"
+        );
+        assert!(
+            !logs.contains("git add exited non-zero"),
+            "a fatal stderr is not a tolerated failure, got: {logs}"
+        );
+    }
+
+    const SILENT_ADD_GIT_DIR_VAR: &str = "RECURSIVE_CHECKPOINT_TEST_SILENT_ADD_GIT_DIR";
+
+    /// A `git` shim, first on PATH for the duration of one test: `add`
+    /// against the shadow dir named by `SILENT_ADD_GIT_DIR_VAR` exits 1
+    /// without a word; every other invocation (other subcommands, other
+    /// shadow dirs — i.e. concurrently running tests) is `exec`ed to the
+    /// real git. Created once per process and deliberately not removed:
+    /// deleting it while another thread resolves `git` through PATH would
+    /// race.
+    #[cfg(unix)]
+    fn silent_add_git_shim_dir() -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::OnceLock;
+        static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let real_git = std::env::var_os("PATH")
+                .and_then(|p| {
+                    std::env::split_paths(&p)
+                        .map(|d| d.join("git"))
+                        .find(|c| c.is_file())
+                })
+                .expect("has_git() passed, so a real git is on PATH");
+            let dir = std::env::temp_dir().join(format!(
+                "recursive-checkpoint-git-shim-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("shim dir");
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$3\" = add ] && [ -n \"${var}\" ] && [ \"$GIT_DIR\" = \"${var}\" ]; then\n\
+                 \x20 exit 1\n\
+                 fi\n\
+                 exec \"{git}\" \"$@\"\n",
+                var = SILENT_ADD_GIT_DIR_VAR,
+                git = real_git.display()
+            );
+            let shim = dir.join("git");
+            fs::write(&shim, script).expect("shim script");
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("shim exec bit");
+            dir
+        })
+        .clone()
+    }
+
+    /// The tolerated quadrant of the staging guard: `git add` exits non-zero
+    /// but prints nothing — no "fatal:" to fail on, no "warning:" to ignore.
+    /// The snapshot must continue (the index is simply what git left behind)
+    /// with the degradation on the WARN channel, instead of failing the whole
+    /// checkpoint. `#[cfg(unix)]` for the `/bin/sh` shim and its exec bit
+    /// (#224); PATH is swapped under the crate env lock (#222).
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tolerates_a_silent_non_zero_git_add_and_warns() {
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let r = w.open_repo().unwrap();
+        fs::write(w.path().join("x.txt"), "v1").unwrap();
+
+        let _env = crate::test_util::env_lock();
+        let shim_dir = silent_add_git_shim_dir();
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let shimmed =
+            std::env::join_paths(std::iter::once(shim_dir).chain(std::env::split_paths(&old_path)))
+                .expect("PATH entries join");
+        std::env::set_var("PATH", shimmed);
+        std::env::set_var(SILENT_ADD_GIT_DIR_VAR, &r.shadow_dir);
+
+        let (result, logs) = capture_logs(|| r.snapshot_for_session("s", "v1"));
+
+        std::env::remove_var(SILENT_ADD_GIT_DIR_VAR);
+        std::env::set_var("PATH", old_path);
+
+        result.expect("a silent non-zero git add is tolerated and the snapshot continues");
+        assert!(
+            logs.contains("git add exited non-zero with tolerated stderr"),
+            "the tolerated failure must be WARN-visible, got: {logs}"
+        );
+    }
+
+    /// `stderr_tail` keeps short payloads verbatim (trailing whitespace
+    /// trimmed) and bounds long ones to the last 200 bytes, starting on a
+    /// char boundary and marked with a leading ellipsis.
+    #[test]
+    fn stderr_tail_bounds_to_the_last_200_bytes_on_a_char_boundary() {
+        assert_eq!(stderr_tail(b"fatal: boom\n"), "fatal: boom");
+        let exact = "x".repeat(200);
+        assert_eq!(
+            stderr_tail(exact.as_bytes()),
+            exact,
+            "200 bytes is not truncated"
+        );
+
+        let long: String = (0..300)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        assert_eq!(
+            stderr_tail(long.as_bytes()),
+            format!("…{}", &long[100..]),
+            "exactly the last 200 bytes survive"
+        );
+
+        // 100 two-byte chars + "a" = 201 bytes: len - 200 = 1 falls inside
+        // the first 'é', so the start walks forward to the next boundary.
+        let multi = format!("{}a", "é".repeat(100));
+        assert_eq!(multi.len(), 201);
+        assert_eq!(
+            stderr_tail(multi.as_bytes()),
+            format!("…{}a", "é".repeat(99))
+        );
+    }
 }

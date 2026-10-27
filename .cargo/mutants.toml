@@ -380,4 +380,28 @@ exclude_re = [
     # print_usage_renders_tokens_cache_rate_and_latency_lines +
     # print_usage_stays_silent_outside_its_gates.
     "crates/recursive-cli/src/cli/output\\.rs:20:43: replace > with >= in print_usage",
+    # ── Issue #245 batch 11 (same CI run 40256596759), recursive-agent lib —
+    # src/audit_log.rs 13 / src/compact/mod.rs 10 / src/checkpoint.rs 7. One
+    # exclusion; the other 29 are pinned in the three files' `mod tests`
+    # (compact: mid-transcript System advance in safe_split_point + the
+    # apply_after back-up loop and suffix gate; checkpoint: the staging
+    # guard's three quadrants — healthy add stays silent, fatal stderr is
+    # `Err("git add failed")`, a silent non-zero add is tolerated with a WARN
+    # via a GIT_DIR-gated `git` shim — and stderr_tail's 200-byte bound;
+    # audit_log: now_millis, inclusive ts bounds, tenant filter, limit drain,
+    # the two NotFound-only read guards, set_file_context binding,
+    # SessionActors::forget). Hand-verified: mutation applied → target tests
+    # red (the `-= → /=` and `- → +` loop mutants hang = gate timeout, counted
+    # as caught) → byte-exact restore; script and log in /tmp/b11/negctl/.
+    #
+    # `:300:27 > → >=` in AuditQuery::apply's limit guard is extensionally
+    # equivalent: at `kept.len() == limit` the mutant executes
+    # `kept.drain(0..kept.len() - limit)` = `drain(0..0)`, a no-op, so the
+    # returned vector is identical; below the limit both guards skip, above
+    # it both drain the same prefix. Guard test (the `limit == len` row):
+    # audit_log::tests::query_limit_keeps_the_most_recent_records_in_order.
+    # Verified: mutation applied → full audit_log suite green → byte-exact
+    # restore. The line:col anchor keeps the killable `- → /` sibling at
+    # :301:42 and every other `>` in the file in scope.
+    "audit_log\\.rs:300:27: replace > with >= in AuditQuery::apply",
 ]

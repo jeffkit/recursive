@@ -2600,4 +2600,189 @@ mod tests {
             "first non-System must be User even with multiple leading System messages"
         );
     }
+
+    // ========================================================================
+    // safe_split_point mid-transcript System advance + apply_after back-up
+    // loop (issue #245 batch 11 — neither was reached by any test before).
+    // ========================================================================
+
+    fn summary_provider() -> MockProvider {
+        MockProvider::new(vec![Completion {
+            content: "summary".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }])
+    }
+
+    /// An Assistant tool call and its Tool result, as one pair.
+    fn tool_pair(id: &str) -> (Message, Message) {
+        use crate::llm::ToolCall;
+        (
+            Message::assistant_with_tool_calls(
+                "calling".to_string(),
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!("{}"),
+                }],
+            ),
+            Message::tool_result(id, "result"),
+        )
+    }
+
+    /// The forward pass must step over a System message sitting on the split
+    /// *outside* the leading prefix. `safe_split_point_advances_past_system_at_boundary`
+    /// cannot see this loop: there the prefix is 1 and the `.max(prefix_len)`
+    /// clamp alone yields 1, so a forward pass that never runs passes it too.
+    #[test]
+    fn safe_split_point_advances_past_a_mid_transcript_system_message() {
+        let msgs = vec![
+            Message::user("u0"),
+            Message::assistant("a0"),
+            Message::system("mid-run instruction"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+        ];
+        assert_eq!(Compactor::leading_system_prefix_len(&msgs), 0);
+        // keep_n=3: initial split = 5-3 = 2 (the System) → advance to 3.
+        assert_eq!(
+            Compactor::safe_split_point(&msgs, 3),
+            3,
+            "the retained segment must not start with a mid-transcript System message"
+        );
+    }
+
+    /// Pivot on a Tool result: the loop backs up over the Tool result and
+    /// the Assistant that called it, stopping at the User turn that opened the
+    /// pair — the summarised range starts there.
+    #[tokio::test]
+    async fn apply_after_backs_up_over_the_tool_pair_at_the_pivot() {
+        let (call, result) = tool_pair("c1");
+        let mut transcript = vec![
+            Message::system("prompt"),
+            Message::user("u0"),
+            call,
+            result,
+            Message::user("u1"),
+            Message::assistant("a1"),
+        ];
+        let before = transcript.clone();
+        let outcome = Compactor::new(1)
+            .apply_after(&summary_provider(), &mut transcript, 3, 7)
+            .await
+            .unwrap()
+            .expect("a five-message suffix is summarised");
+        assert_eq!(outcome.bounds.prefix, 0..1);
+        assert_eq!(
+            outcome.bounds.summarized,
+            1..6,
+            "Tool → Assistant+tool_calls → stop at the User that opened the pair"
+        );
+        assert_eq!(outcome.bounds.preserved, 0..1);
+        assert_eq!(outcome.removed, 5);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].content, "prompt");
+        assert!(transcript[1].is_compaction_summary);
+        assert!(verify_compaction_rewrite(&before, &transcript, &outcome));
+    }
+
+    /// A plain Assistant turn (no tool_calls) is a valid cut: the loop must
+    /// not back up over it.
+    #[tokio::test]
+    async fn apply_after_does_not_back_up_over_a_plain_assistant() {
+        let mut transcript = vec![
+            Message::system("prompt"),
+            Message::user("u0"),
+            Message::assistant("a0"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+        ];
+        let before = transcript.clone();
+        let outcome = Compactor::new(1)
+            .apply_after(&summary_provider(), &mut transcript, 4, 9)
+            .await
+            .unwrap()
+            .expect("a three-message suffix is summarised");
+        assert_eq!(
+            outcome.bounds.summarized,
+            4..7,
+            "a plain Assistant at the pivot is where the summary starts"
+        );
+        assert_eq!(outcome.bounds.preserved, 0..4);
+        assert_eq!(transcript.len(), 5);
+        assert_eq!(transcript[3].content, "u1");
+        assert!(transcript[4].is_compaction_summary);
+        assert!(verify_compaction_rewrite(&before, &transcript, &outcome));
+    }
+
+    /// The "worth it?" gate is `suffix_len = len - start`: two trailing
+    /// messages compact, a single one does not, and a pivot past the end is a
+    /// no-op.
+    #[tokio::test]
+    async fn apply_after_compacts_a_two_message_suffix_but_not_a_single_message() {
+        let base = vec![
+            Message::system("prompt"),
+            Message::user("u0"),
+            Message::assistant("a0"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+        ];
+        let compactor = Compactor::new(1);
+
+        let mut two = base.clone();
+        let outcome = compactor
+            .apply_after(&summary_provider(), &mut two, 4, 3)
+            .await
+            .unwrap()
+            .expect("len 6 - start 4 = 2 messages is enough to summarise");
+        assert_eq!(outcome.bounds.summarized, 4..6);
+        assert_eq!(two.len(), 5);
+        assert!(two[4].is_compaction_summary);
+
+        let idle = MockProvider::new(vec![]);
+        let mut one = base.clone();
+        assert!(
+            compactor
+                .apply_after(&idle, &mut one, 5, 3)
+                .await
+                .unwrap()
+                .is_none(),
+            "a single trailing message is not worth a summary"
+        );
+        assert_eq!(one, base, "a no-op must leave the transcript untouched");
+
+        let mut past = base.clone();
+        assert!(compactor
+            .apply_after(&idle, &mut past, 6, 3)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(past, base);
+    }
+
+    /// A transcript whose first message is already an Assistant tool call
+    /// (no System prefix, no opening User turn) backs up to index 0 and stops
+    /// there: the guard is `start > 0`, so index 0 is never re-examined for
+    /// another step back.
+    #[tokio::test]
+    async fn apply_after_stops_backing_up_at_the_first_message() {
+        let (call, result) = tool_pair("c0");
+        let mut transcript = vec![call, result, Message::user("u1"), Message::assistant("a1")];
+        let before = transcript.clone();
+        let outcome = Compactor::new(1)
+            .apply_after(&summary_provider(), &mut transcript, 1, 2)
+            .await
+            .unwrap()
+            .expect("the whole transcript is summarised");
+        assert_eq!(outcome.bounds.summarized, 0..4);
+        assert_eq!(outcome.bounds.preserved, 0..0);
+        assert_eq!(transcript.len(), 1);
+        assert!(transcript[0].is_compaction_summary);
+        assert!(verify_compaction_rewrite(&before, &transcript, &outcome));
+    }
 }

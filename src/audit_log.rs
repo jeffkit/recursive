@@ -986,4 +986,196 @@ mod tests {
         assert_eq!(tracked.order.len(), 1, "order must not leak dead ids");
         assert!(tracked.actors.contains_key("b"));
     }
+
+    // ------------------------------------------------------------------
+    // now_millis / AuditQuery bounds + limit / read guards /
+    // set_file_context / SessionActors::forget (issue #245 batch 11)
+    // ------------------------------------------------------------------
+
+    fn record_at(ts: i64, subject: &str, tenant: Option<&str>) -> AuditRecord {
+        AuditRecord {
+            seq: 0,
+            ts,
+            actor: AuditActor::new(subject, tenant.map(str::to_string)),
+            session: None,
+            action: tool("Read"),
+            prev_hash: GENESIS_HASH.to_string(),
+            hash: String::new(),
+        }
+    }
+
+    fn epoch_millis_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis() as i64
+    }
+
+    #[test]
+    fn now_millis_is_the_current_unix_epoch_in_milliseconds() {
+        let before = epoch_millis_now();
+        let got = now_millis();
+        let after = epoch_millis_now();
+        assert!(
+            before <= got && got <= after,
+            "now_millis()={got} must sit between {before} and {after}"
+        );
+        assert!(
+            got > 1_600_000_000_000,
+            "epoch *milliseconds* (after 2020), not seconds or a sentinel: {got}"
+        );
+    }
+
+    #[test]
+    fn query_ts_bounds_are_inclusive_on_both_ends() {
+        let q = AuditQuery {
+            from_ts: Some(100),
+            to_ts: Some(200),
+            ..Default::default()
+        };
+        assert!(!q.matches(&record_at(99, "a", None)), "below from_ts");
+        assert!(
+            q.matches(&record_at(100, "a", None)),
+            "from_ts is inclusive"
+        );
+        assert!(q.matches(&record_at(150, "a", None)), "inside the window");
+        assert!(q.matches(&record_at(200, "a", None)), "to_ts is inclusive");
+        assert!(!q.matches(&record_at(201, "a", None)), "above to_ts");
+
+        let from_only = AuditQuery {
+            from_ts: Some(100),
+            ..Default::default()
+        };
+        assert!(!from_only.matches(&record_at(99, "a", None)));
+        assert!(from_only.matches(&record_at(101, "a", None)));
+        let to_only = AuditQuery {
+            to_ts: Some(200),
+            ..Default::default()
+        };
+        assert!(to_only.matches(&record_at(199, "a", None)));
+        assert!(!to_only.matches(&record_at(201, "a", None)));
+    }
+
+    #[test]
+    fn query_tenant_filter_matches_only_that_tenant() {
+        let q = AuditQuery {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        };
+        assert!(q.matches(&record_at(1, "alice", Some("acme"))));
+        assert!(!q.matches(&record_at(1, "alice", Some("globex"))));
+        assert!(
+            !q.matches(&record_at(1, "alice", None)),
+            "an untenanted record never matches a tenant filter"
+        );
+    }
+
+    /// `limit` keeps the most recent records in chronological order. The
+    /// `limit == len` row is the boundary where `>` and `>=` on the guard
+    /// are indistinguishable (a `0..0` drain is a no-op) — kept here as the
+    /// guard test for that documented equivalence (`.cargo/mutants.toml`).
+    #[test]
+    fn query_limit_keeps_the_most_recent_records_in_order() {
+        let records: Vec<AuditRecord> = (0..5).map(|i| record_at(i, "a", None)).collect();
+        let ts = |kept: &[AuditRecord]| kept.iter().map(|r| r.ts).collect::<Vec<_>>();
+
+        let two = AuditQuery {
+            limit: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            ts(&two.apply(records.clone())),
+            vec![3, 4],
+            "the last `limit` records, oldest first"
+        );
+
+        let five = AuditQuery {
+            limit: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(ts(&five.apply(records.clone())), vec![0, 1, 2, 3, 4]);
+        let nine = AuditQuery {
+            limit: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(ts(&nine.apply(records.clone())), vec![0, 1, 2, 3, 4]);
+
+        let zero = AuditQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert!(zero.apply(records).is_empty(), "limit 0 keeps nothing");
+    }
+
+    /// Only a *missing* file reads as an empty chain; every other I/O
+    /// failure (here: a directory where the file should be) is reported.
+    #[test]
+    fn read_guards_only_forgive_a_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.jsonl");
+        assert!(read_records(&missing)
+            .expect("a missing file is an empty log")
+            .is_empty());
+        assert_eq!(
+            verify_chain(&missing).expect("a missing file verifies as 0"),
+            0
+        );
+
+        let err = read_records(dir.path()).expect_err("reading a directory is an I/O error");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            matches!(
+                verify_chain(dir.path()),
+                Err(AuditChainError::Io(e)) if e.kind() != std::io::ErrorKind::NotFound
+            ),
+            "verify_chain must report a non-NotFound read failure as Io"
+        );
+    }
+
+    #[test]
+    fn set_file_context_binds_the_workspace_audit_file() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let previous = log_path();
+        clear();
+
+        set_file_context(workspace.path());
+
+        let expected = crate::paths::user_workspace_dir(workspace.path())
+            .expect("workspace data dir")
+            .join("audit")
+            .join("audit.jsonl");
+        assert_eq!(
+            log_path().as_deref(),
+            Some(expected.as_path()),
+            "the process log must be bound under the workspace's user data dir"
+        );
+        assert!(is_enabled());
+
+        clear();
+        if let Some(path) = previous {
+            set_log_path(path).expect("restore the previously bound log");
+        }
+    }
+
+    #[test]
+    fn session_registry_forget_keeps_the_other_sessions_in_order() {
+        let mut tracked = SessionActors::default();
+        tracked.register("a", actor("alice"));
+        tracked.register("b", actor("bob"));
+        tracked.register("c", actor("carol"));
+
+        tracked.forget("b");
+
+        assert_eq!(
+            tracked.order.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a", "c"],
+            "only the forgotten id leaves the eviction order"
+        );
+        assert!(tracked.actors.contains_key("a"));
+        assert!(tracked.actors.contains_key("c"));
+        assert!(!tracked.actors.contains_key("b"));
+    }
 }
