@@ -990,6 +990,8 @@ mod tests {
             ],
             "stderr: {stderr}"
         );
+    }
+
     // ── #245 tail segment: surface pins for print_usage / print_finish_note
     // and exact-error pins for exit_for_finish. The print_* pins observe
     // stderr through a child process: the test binary re-invokes itself
