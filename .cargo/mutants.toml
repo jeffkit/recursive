@@ -315,4 +315,28 @@ exclude_re = [
     # / proposed lines, all pinned) in scope — without it `in stream_events`
     # would also swallow the repl arms.
     "delete match arm AgentEvent::Plan(Proposed\\{ref plan_text, \\.\\.\\}|Confirmed|Rejected\\{ref reason\\}) in stream_events(_repl)?$",
+    # ── Issue #245 batch 5 (same CI run 40256596759), cli/output.rs rest of
+    # file — print_usage / print_finish_note / exit_for_finish /
+    # JsonEventTask::finish_without_result. One exclusion; the other 28 are
+    # pinned in output.rs `mod tests` (exact-message exit_for_finish asserts,
+    # the finish_without_result pending-until-closed pin, the zero-steps
+    # division trap, and the `*_pinned_via_child_process` tests that re-run
+    # this test binary with `--exact … --nocapture` to read the printers'
+    # stderr). Hand-verified: mutation applied → target tests run → byte-exact
+    # restore; script and log in /tmp/b5-negctl/.
+    #
+    # `:20:43 > → >=` in print_usage's cache-rate guard is extensionally
+    # equivalent. The guard `total_cache > 0` sits inside
+    # `if usage.cache_hit_tokens > 0`, and `total_cache = cache_hit_tokens +
+    # cache_miss_tokens` over u32 — so at every reachable input
+    # `total_cache >= cache_hit_tokens > 0` and both `> 0` and `>= 0` are
+    # true (the `else { 0.0 }` arm is defensive dead code). A debug build
+    # panics on the addition before either comparison could differ; the
+    # release-wrap case needs a provider to report ~2^32 cache-miss tokens
+    # alongside a cache hit, which no fixture or response produces. Same
+    # category as the `:302:31` entry above. Verified: mutation applied →
+    # full cli::output::tests green → byte-exact restore. The line:col
+    # anchor keeps the four killable `> → >=` siblings in print_usage
+    # (`:13:27`, `:18:35`, `:35:29`, `:35:42`, all pinned) in scope.
+    "output\\.rs:20:43: replace > with >= in print_usage",
 ]

@@ -617,6 +617,10 @@ mod tests {
         assert!(msg.contains("stuck"), "unexpected: {msg}");
         assert!(msg.contains("Read"), "missing tool name: {msg}");
         assert!(msg.contains("3"), "missing repeat count: {msg}");
+        // Issue #245 batch 5: the `_` arm's "unknown reason: stuck:Read:3"
+        // also satisfies every `contains` above, so only the full message
+        // proves the dedicated arm produced it.
+        assert_eq!(msg, "agent stuck: repeated tool call 'Read' (3x)");
     }
 
     #[test]
@@ -641,6 +645,12 @@ mod tests {
         assert!(msg.contains("transcript"), "unexpected: {msg}");
         assert!(msg.contains("100000"), "missing size: {msg}");
         assert!(msg.contains("80000"), "missing limit: {msg}");
+        // Issue #245 batch 5: the `_` arm renders
+        // "unknown reason: transcript_limit:100000/80000" — same substrings.
+        assert_eq!(
+            msg,
+            "transcript size 100000 exceeded hard limit 80000 and could not be reduced"
+        );
     }
 
     #[test]
@@ -648,6 +658,12 @@ mod tests {
         let err = exit_for_finish(&FinishReason::PermissionDenialLimit, 6).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("permission"), "unexpected: {msg}");
+        // Issue #245 batch 5: the `_` arm renders
+        // "unknown reason: permission_denial_limit" — also contains "permission".
+        assert_eq!(
+            msg,
+            "agent hit permission denial limit (loop of denied tool calls)"
+        );
     }
 
     #[test]
@@ -793,5 +809,186 @@ mod tests {
                 .expect("drain exits once the channel closes")
                 .expect("drain task");
         });
+    }
+
+    #[test]
+    fn finish_without_result_awaits_the_background_drain() {
+        // Issue #245 batch 5: a body replaced with `()` returns before the
+        // owned task has drained. Observable the same way as the drain pin
+        // above — while a sender is alive the real future must stay pending.
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let task = JsonEventTask::Legacy(tokio::spawn(stream_events_json(rx)));
+            let mut fut = Box::pin(task.finish_without_result());
+            let finished_early = tokio::time::timeout(Duration::from_millis(100), fut.as_mut())
+                .await
+                .is_ok();
+            assert!(
+                !finished_early,
+                "finish_without_result must await the drain while a sender is alive"
+            );
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(5), fut.as_mut())
+                .await
+                .expect("finish_without_result returns once the channel closes");
+        });
+    }
+
+    // ── Issue #245 batch 5: the stderr printers ──────────────────────────────
+    //
+    // `print_usage` / `print_finish_note` only `eprintln!`. libtest's capture
+    // on this toolchain is process-wide (batch-4 probe: output from worker
+    // threads is captured too, so redirecting fd 2 sees an empty pipe), which
+    // leaves one way to observe them: re-run this very test binary with
+    // `--exact <child> --nocapture`. The harness chatter goes to stdout, the
+    // child's `eprintln!` lands on fd 2, and the parent reads it back through
+    // `Command::output()`. The `*_child_*` tests below are those children —
+    // plain `#[test]`s that are harmless when the whole suite runs them.
+
+    const UNPRICED_MODEL: &str = "mutants-245-unpriced-model";
+
+    /// Re-run this test binary on one `*_child_*` test with capture off and
+    /// return its stderr. Insists the child ran exactly that one test green:
+    /// a name that matches nothing ("running 0 tests") or a child that panics
+    /// under a mutant must never pass as "printed nothing".
+    fn child_stderr(leaf: &str) -> String {
+        // `module_path!()` keeps the crate root (`recursive::cli::…`); libtest
+        // names tests from the crate root's children (`cli::…`).
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let name = format!("{module}::{leaf}");
+        let exe = std::env::current_exe().expect("current test binary");
+        // Pin the user data dir so `pricing_for` cannot see a developer's
+        // `providers.d/` — the model name is unpriced in the bundled catalog.
+        let home = tempfile::tempdir().expect("tempdir");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", &name, "--nocapture"])
+            .env("RECURSIVE_HOME", home.path())
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8(out.stderr).expect("child stderr is utf-8");
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed"),
+            "child {name} did not run exactly one green test: status={:?}\n\
+             --stdout--\n{stdout}\n--stderr--\n{stderr}",
+            out.status
+        );
+        stderr
+    }
+
+    #[test]
+    fn usage_child_full_positive() {
+        print_usage(
+            TokenUsage {
+                prompt_tokens: 60,
+                completion_tokens: 40,
+                total_tokens: 100,
+                cache_hit_tokens: 30,
+                cache_miss_tokens: 70,
+                reasoning_tokens: 0,
+            },
+            UNPRICED_MODEL,
+            1000,
+            4,
+        );
+    }
+
+    #[test]
+    fn usage_child_all_zero() {
+        print_usage(TokenUsage::default(), UNPRICED_MODEL, 0, 5);
+    }
+
+    #[test]
+    fn usage_child_tokens_without_cache_or_latency() {
+        print_usage(
+            TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                ..Default::default()
+            },
+            UNPRICED_MODEL,
+            0,
+            5,
+        );
+    }
+
+    #[test]
+    fn finish_note_child_transcript_limit_then_cancelled() {
+        print_finish_note(&FinishReason::TranscriptLimit {
+            chars: 123_456,
+            limit: 100_000,
+        });
+        print_finish_note(&FinishReason::Cancelled);
+    }
+
+    #[test]
+    fn print_usage_full_positive_lines_pinned_via_child_process() {
+        let stderr = child_stderr("usage_child_full_positive");
+        // hit=30 miss=70 pins the rate arithmetic (30/100*100 = 30.0; `-`
+        // underflows or wraps, `*`/`%`/`+`/`/` all land elsewhere) and
+        // 1000ms over 4 steps pins the integer average.
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "tokens: prompt=60 completion=40 total=100",
+                "cache: hit=30 miss=70 (30.0% hit rate)",
+                "llm latency: total=1000ms avg=250ms over 4 steps",
+            ],
+            "stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn print_usage_zero_usage_prints_nothing_pinned_via_child_process() {
+        let stderr = child_stderr("usage_child_all_zero");
+        // total_tokens == 0 skips the token block; latency 0 with steps > 0
+        // skips the latency line — neither guard may degrade to `>= 0`.
+        assert!(
+            stderr.trim().is_empty(),
+            "zero usage must print nothing, got: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn print_usage_tokens_only_pinned_via_child_process() {
+        let stderr = child_stderr("usage_child_tokens_without_cache_or_latency");
+        // cache_hit_tokens == 0 must not produce a "0.0% hit rate" line.
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["tokens: prompt=10 completion=5 total=15"],
+            "stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn print_usage_zero_steps_never_divides() {
+        // latency > 0 with steps == 0 cannot happen in a run, but the guard
+        // is what keeps `total / steps` unreachable: `&&`→`||` or
+        // `steps > 0`→`steps >= 0` divides by zero right here. In-process is
+        // fine — the pin is "returns", not what it prints.
+        print_usage(TokenUsage::default(), UNPRICED_MODEL, 100, 0);
+    }
+
+    #[test]
+    fn print_finish_note_lines_pinned_via_child_process() {
+        let stderr = child_stderr("finish_note_child_transcript_limit_then_cancelled");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "note: stopped because transcript reached 123456 chars (limit 100000)",
+                "shutdown: agent stopped at next step boundary after signal",
+            ],
+            "stderr: {stderr}"
+        );
     }
 }
