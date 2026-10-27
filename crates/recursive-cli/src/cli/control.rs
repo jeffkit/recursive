@@ -2301,6 +2301,148 @@ mod tests {
         joined.expect("join");
     }
 
+    // ── #245 batch 8 (B1 first half): control.rs :1043 → :1159 ──────────
+
+    /// Session with an explicit `accept_user_messages` flag — the stdin
+    /// gate pins need both positions of that switch.
+    fn session_with_accept_flag(workspace: PathBuf, accept: bool) -> Arc<ControlSession> {
+        ControlSession::new(
+            ControlBridge::new(),
+            CancellationToken::new(),
+            workspace,
+            "m".into(),
+            PermissionMode::Default,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            accept,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_stdin_line_dispatches_control_response_to_the_parked_waiter() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        let bridge = session.bridge.clone();
+        let task = tokio::spawn({
+            let b = bridge.clone();
+            async move { b.ask_can_use_tool("Bash", &json!({}), None).await }
+        });
+        let ids = parked_request_ids(&bridge, 1).await;
+        let line = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": ids[0],
+                "response": {"behavior": "allow"},
+            }
+        })
+        .to_string();
+        handle_stdin_line(&session, &line).await;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("control_response line must resolve the parked CLI→host waiter")
+            .expect("join");
+        assert_eq!(got, Some(json!({"behavior": "allow"})));
+        assert!(
+            bridge.pending.lock().await.is_empty(),
+            "answered waiter must be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_stdin_line_applies_control_cancel_request_to_the_named_waiter() {
+        let session = session_for(std::env::temp_dir(), None, None, None);
+        let bridge = session.bridge.clone();
+        let task = tokio::spawn({
+            let b = bridge.clone();
+            async move { b.ask_can_use_tool("Bash", &json!({}), None).await }
+        });
+        let ids = parked_request_ids(&bridge, 1).await;
+        let line = json!({"type": "control_cancel_request", "request_id": ids[0]}).to_string();
+        handle_stdin_line(&session, &line).await;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("cancel line must hand the deny payload back to the emitter")
+            .expect("join");
+        assert_eq!(
+            got,
+            Some(json!({
+                "behavior": "deny",
+                "message": "cancelled by host",
+                "interrupt": true,
+            }))
+        );
+        assert!(
+            bridge.pending.lock().await.is_empty(),
+            "cancelled waiter must be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_stdin_line_gates_inbound_user_messages_on_accept_user_messages() {
+        let line = json!({"type": "user", "message": {"content": "hello stdin"}}).to_string();
+
+        // Gate closed: nothing may reach the inbound FIFO.
+        let closed = session_with_accept_flag(std::env::temp_dir(), false);
+        handle_stdin_line(&closed, &line).await;
+        assert!(
+            closed.pop_inbound_user().is_none(),
+            "accept_user_messages=false must not queue inbound user text"
+        );
+
+        // Gate open: the text lands in the FIFO verbatim.
+        let open = session_with_accept_flag(std::env::temp_dir(), true);
+        handle_stdin_line(&open, &line).await;
+        assert_eq!(open.pop_inbound_user().as_deref(), Some("hello stdin"));
+        assert_eq!(open.pop_inbound_user(), None, "FIFO must hold exactly one");
+    }
+
+    #[test]
+    fn parse_permission_result_honours_the_legacy_allowed_bool() {
+        assert_eq!(
+            parse_permission_result(&json!({"allowed": true})),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            parse_permission_result(&json!({"allowed": false})),
+            PermissionDecision::Deny("denied by host".into())
+        );
+        assert_eq!(
+            parse_permission_result(&json!({"allowed": false, "reason": "nope"})),
+            PermissionDecision::Deny("nope".into())
+        );
+    }
+
+    #[test]
+    fn parse_permission_result_unrecognised_shape_falls_to_deny_catchall() {
+        let got = parse_permission_result(&json!({}));
+        let message = match &got {
+            PermissionDecision::Deny(m) => m.clone(),
+            other => panic!("empty response must fall to the deny catch-all, got {other:?}"),
+        };
+        assert!(
+            message.starts_with("unrecognised permission response: "),
+            "catch-all must carry the unrecognised-shape reason, got: {message}"
+        );
+    }
+
+    #[test]
+    fn discover_loaded_skills_for_workspace_finds_recursive_and_claude_skills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path();
+        write_ws_file(ws, ".recursive/skills/alpha/SKILL.md");
+        write_ws_file(ws, ".claude/skills/beta/SKILL.md");
+        let found = discover_loaded_skills_for_workspace(ws);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"alpha") && names.contains(&"beta"),
+            "both workspace skill roots must be discovered, got {names:?}"
+        );
+    }
+
     // ── #245 batch 8: control.rs :1190 → :1302 (SDK hook forwarder + elicitation) ──
 
     use recursive::mcp::ElicitationHandler as _;
