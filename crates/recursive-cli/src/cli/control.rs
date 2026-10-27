@@ -1349,11 +1349,22 @@ mod tests {
             "bypassPermissions",
             "dontAsk",
             "auto",
+            "strict",
             "plan",
         ] {
             let mode = parse_permission_mode(s).expect(s);
             assert_eq!(permission_mode_wire(&mode), s);
         }
+    }
+
+    #[test]
+    fn parse_permission_mode_knows_strict_and_rejects_unknown_names() {
+        assert!(matches!(
+            parse_permission_mode("strict"),
+            Some(PermissionMode::Strict)
+        ));
+        assert!(parse_permission_mode("Strict").is_none());
+        assert!(parse_permission_mode("").is_none());
     }
 
     #[test]
@@ -1580,5 +1591,412 @@ mod tests {
         assert_eq!(session.pop_inbound_user().as_deref(), Some("one"));
         assert_eq!(session.pop_inbound_user().as_deref(), Some("two"));
         assert_eq!(session.pop_inbound_user(), None);
+    }
+
+    // ── #245 batch 6: control.rs :98 → :798 ─────────────────────────────
+
+    /// Minimal session for the handler-level pins: only the slots a given
+    /// pin exercises are populated.
+    fn session_for(
+        workspace: PathBuf,
+        session_writer: Option<Arc<std::sync::Mutex<SessionWriter>>>,
+        read_file_state: Option<Arc<std::sync::Mutex<ReadFileState>>>,
+        sandbox_roots: Option<recursive::tools::SharedSandboxRoots>,
+    ) -> Arc<ControlSession> {
+        ControlSession::new(
+            ControlBridge::new(),
+            CancellationToken::new(),
+            workspace,
+            "m".into(),
+            PermissionMode::Default,
+            None,
+            session_writer,
+            read_file_state,
+            sandbox_roots,
+            vec![],
+            false,
+            None,
+        )
+    }
+
+    /// Yield until `bridge` holds at least `n` parked CLI→host waiters and
+    /// return their request ids. Panics if they never appear — an emitter
+    /// whose body was replaced by `None` / `Some(Default)` registers nothing.
+    async fn parked_request_ids(bridge: &ControlBridge, n: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let ids: Vec<String> = bridge.pending.lock().await.keys().cloned().collect();
+            if ids.len() >= n {
+                return ids;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected {n} parked CLI→host waiter(s); the emitter never registered one");
+    }
+
+    /// Answer the single parked waiter with `reply` through the real
+    /// `control_response` wire shape and hand back what the emitter returned.
+    async fn answer_single_waiter(
+        bridge: &ControlBridge,
+        reply: Value,
+        task: tokio::task::JoinHandle<Option<Value>>,
+    ) -> Option<Value> {
+        let ids = parked_request_ids(bridge, 1).await;
+        assert_eq!(ids.len(), 1, "exactly one waiter expected: {ids:?}");
+        let line = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": ids[0],
+                "response": reply,
+            }
+        });
+        assert!(bridge.resolve_response(&line).await);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("emitter must return once its waiter is answered")
+            .expect("join");
+        assert!(
+            bridge.pending.lock().await.is_empty(),
+            "answered waiter must be consumed"
+        );
+        got
+    }
+
+    #[tokio::test]
+    async fn ask_hook_callback_parks_a_waiter_and_returns_the_host_reply() {
+        let bridge = ControlBridge::new();
+        let task = tokio::spawn({
+            let b = bridge.clone();
+            async move {
+                b.ask_hook_callback("cb_245", json!({"tool_name": "Read"}), Some("toolu_245"))
+                    .await
+            }
+        });
+        let reply = json!({"action": "continue", "additionalContext": "from host"});
+        assert_eq!(
+            answer_single_waiter(&bridge, reply.clone(), task).await,
+            Some(reply)
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_elicitation_parks_a_waiter_and_returns_the_host_reply() {
+        let bridge = ControlBridge::new();
+        let task = tokio::spawn({
+            let b = bridge.clone();
+            async move { b.ask_elicitation(json!({"message": "token?"})).await }
+        });
+        let reply = json!({"action": "accept", "content": {"token": "t"}});
+        assert_eq!(
+            answer_single_waiter(&bridge, reply.clone(), task).await,
+            Some(reply)
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_dialog_parks_a_waiter_and_returns_the_host_reply() {
+        let bridge = ControlBridge::new();
+        let task = tokio::spawn({
+            let b = bridge.clone();
+            async move {
+                b.ask_user_dialog("plan_approval", json!({"plan": "do x"}), None)
+                    .await
+            }
+        });
+        let reply = json!({"behavior": "allow"});
+        assert_eq!(
+            answer_single_waiter(&bridge, reply.clone(), task).await,
+            Some(reply)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_denies_only_the_named_waiter_with_interrupt() {
+        let bridge = ControlBridge::new();
+        let input = json!({"command": "ls"});
+        let task = tokio::spawn({
+            let b = bridge.clone();
+            async move { b.ask_can_use_tool("Bash", &input, Some("toolu_c")).await }
+        });
+        let ids = parked_request_ids(&bridge, 1).await;
+
+        // An unknown id must leave the parked waiter untouched.
+        bridge.cancel_pending("no-such-request").await;
+        assert_eq!(bridge.pending.lock().await.len(), 1);
+
+        bridge.cancel_pending(&ids[0]).await;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("cancel_pending must resolve the waiter")
+            .expect("join");
+        assert_eq!(
+            got,
+            Some(json!({
+                "behavior": "deny",
+                "message": "cancelled by host",
+                "interrupt": true,
+            }))
+        );
+        assert!(bridge.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fail_all_pending_denies_every_parked_waiter_with_the_message() {
+        let bridge = ControlBridge::new();
+        let first = tokio::spawn({
+            let b = bridge.clone();
+            let input = json!({"path": "a"});
+            async move { b.ask_can_use_tool("Read", &input, None).await }
+        });
+        let second = tokio::spawn({
+            let b = bridge.clone();
+            let input = json!({"path": "b"});
+            async move { b.ask_can_use_tool("Write", &input, None).await }
+        });
+        assert_eq!(parked_request_ids(&bridge, 2).await.len(), 2);
+
+        bridge
+            .fail_all_pending("stdin closed before permission response")
+            .await;
+        let expected = json!({
+            "behavior": "deny",
+            "message": "stdin closed before permission response",
+        });
+        for task in [first, second] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("fail_all_pending must resolve every waiter")
+                .expect("join");
+            assert_eq!(got, Some(expected.clone()));
+        }
+        assert!(bridge.pending.lock().await.is_empty());
+    }
+
+    #[test]
+    fn session_id_is_unknown_without_a_writer_and_the_writer_id_with_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+        assert_eq!(
+            session_for(ws.clone(), None, None, None).session_id(),
+            "unknown"
+        );
+
+        let sess_dir = dir.path().join("sess-control-245b6");
+        let writer =
+            SessionWriter::create_at(&sess_dir, "goal", "m", "stub", None).expect("session writer");
+        let with_writer = session_for(
+            ws,
+            Some(Arc::new(std::sync::Mutex::new(writer))),
+            None,
+            None,
+        );
+        assert_eq!(with_writer.session_id(), "sess-control-245b6");
+    }
+
+    #[test]
+    fn error_response_wraps_the_error_in_the_control_response_envelope() {
+        assert_eq!(
+            error_response("req-7", "boom"),
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "req-7",
+                    "error": "boom",
+                }
+            })
+        );
+        assert_eq!(
+            error_response("req-8", String::from("owned message"))["response"]["error"],
+            "owned message"
+        );
+    }
+
+    /// Run `git` in `dir` with a hermetic identity/config so the pin does not
+    /// depend on the developer's global git configuration.
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "safe.directory=*",
+                "-c",
+                "user.name=recursive-test",
+                "-c",
+                "user.email=test@recursive.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn workspace_diff_is_empty_when_clean_and_shows_working_tree_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path();
+        git_in(ws, &["init", "-q"]);
+        std::fs::write(ws.join("notes.txt"), "first line\n").expect("write");
+        git_in(ws, &["add", "-A"]);
+        git_in(ws, &["commit", "-q", "-m", "init"]);
+        assert_eq!(workspace_diff(ws).expect("clean tree"), "");
+
+        std::fs::write(ws.join("notes.txt"), "first line\nsecond line 245b6\n").expect("rewrite");
+        let diff = workspace_diff(ws).expect("dirty tree");
+        assert!(
+            diff.contains("notes.txt"),
+            "diff lacks the file name: {diff}"
+        );
+        assert!(
+            diff.contains("+second line 245b6"),
+            "diff lacks the added line: {diff}"
+        );
+    }
+
+    #[test]
+    fn control_read_file_reads_utf8_and_base64_and_truncates_on_max_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("hello.txt"), "hello world").expect("write");
+        let session = session_for(ws.clone(), None, None, None);
+
+        assert_eq!(
+            control_read_file(&session, &json!({})),
+            Err("missing path".to_string())
+        );
+
+        let body = control_read_file(&session, &json!({"path": "hello.txt"})).expect("utf-8 read");
+        assert_eq!(body["contents"], "hello world");
+        assert_eq!(body["absPath"], ws.join("hello.txt").display().to_string());
+        assert!(body.get("truncated").is_none(), "{body}");
+        assert!(body.get("encoding").is_none(), "{body}");
+
+        let b64 = control_read_file(
+            &session,
+            &json!({"path": "hello.txt", "encoding": "base64"}),
+        )
+        .expect("base64 read");
+        assert_eq!(b64["contents"], "aGVsbG8gd29ybGQ=");
+        assert_eq!(b64["encoding"], "base64");
+        assert!(b64.get("truncated").is_none(), "{b64}");
+
+        // `max_bytes` equal to the file length is not a truncation (strict `>`).
+        let exact = control_read_file(&session, &json!({"path": "hello.txt", "max_bytes": 11}))
+            .expect("exact read");
+        assert_eq!(exact["contents"], "hello world");
+        assert!(exact.get("truncated").is_none(), "{exact}");
+
+        let cut = control_read_file(&session, &json!({"path": "hello.txt", "max_bytes": 5}))
+            .expect("truncated read");
+        assert_eq!(cut["contents"], "hello");
+        assert_eq!(cut["truncated"], true);
+    }
+
+    #[test]
+    fn control_read_file_default_budget_is_512_kib() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+        let session = session_for(ws.clone(), None, None, None);
+
+        // Comfortably above 512 + 1024 and below 512 * 1024: read whole.
+        std::fs::write(ws.join("mid.txt"), "x".repeat(4096)).expect("write");
+        let body = control_read_file(&session, &json!({"path": "mid.txt"})).expect("read");
+        assert_eq!(body["contents"].as_str().map(str::len), Some(4096));
+        assert!(body.get("truncated").is_none(), "{body}");
+
+        // One byte over the default budget: cut to exactly 512 KiB.
+        std::fs::write(ws.join("over.bin"), vec![b'y'; 512 * 1024 + 1]).expect("write");
+        let body = control_read_file(&session, &json!({"path": "over.bin"})).expect("read");
+        assert_eq!(body["contents"].as_str().map(str::len), Some(512 * 1024));
+        assert_eq!(body["truncated"], true);
+    }
+
+    #[test]
+    fn base64_encode_pads_single_byte_remainders() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"h"), "aA==");
+        assert_eq!(base64_encode(b"abcd"), "YWJjZA==");
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd, 0xfc]), "//79/A==");
+    }
+
+    #[test]
+    fn seed_read_state_records_the_file_in_the_read_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+        std::fs::write(ws.join("seed.txt"), "seeded\n").expect("write");
+
+        let bare = session_for(ws.clone(), None, None, None);
+        assert_eq!(
+            seed_read_state(&bare, &json!({"path": "seed.txt"})),
+            Err("read_file_state not available".to_string())
+        );
+
+        let state = Arc::new(std::sync::Mutex::new(ReadFileState::new()));
+        let session = session_for(ws.clone(), None, Some(state.clone()), None);
+        assert_eq!(
+            seed_read_state(&session, &json!({})),
+            Err("missing path".to_string())
+        );
+        assert_eq!(
+            seed_read_state(&session, &json!({"path": "seed.txt"})),
+            Ok(())
+        );
+
+        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        let record = guard.get(&ws.join("seed.txt")).expect("record seeded");
+        assert!(!record.is_partial);
+        assert_eq!(record.content, "seeded\n");
+        assert!(record.timestamp > 0);
+    }
+
+    #[test]
+    fn register_repo_root_adds_an_absolute_read_write_root_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().to_path_buf();
+        let extra = dir.path().join("extra-root");
+        let extra_str = extra.display().to_string();
+
+        let bare = session_for(ws.clone(), None, None, None);
+        assert_eq!(
+            register_repo_root(&bare, &json!({})),
+            Err("missing directory".to_string())
+        );
+        assert_eq!(
+            register_repo_root(&bare, &json!({"directory": "relative/dir"})),
+            Err("directory must be absolute".to_string())
+        );
+        assert_eq!(
+            register_repo_root(&bare, &json!({"directory": extra_str})),
+            Err("sandbox roots not available on this run".to_string())
+        );
+
+        let roots = recursive::tools::new_shared_sandbox_roots();
+        let session = session_for(ws, None, None, Some(roots.clone()));
+        assert_eq!(
+            register_repo_root(&session, &json!({"directory": extra_str})),
+            Ok(extra_str.clone())
+        );
+        // Registering the same root again is idempotent.
+        assert_eq!(
+            register_repo_root(&session, &json!({"directory": extra_str})),
+            Ok(extra_str)
+        );
+        let guard = roots.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            guard.as_slice(),
+            [(extra, AccessTier::ReadWrite)].as_slice()
+        );
     }
 }

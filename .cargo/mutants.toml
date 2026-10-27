@@ -339,4 +339,26 @@ exclude_re = [
     # anchor keeps the four killable `> → >=` siblings in print_usage
     # (`:13:27`, `:18:35`, `:35:29`, `:35:42`, all pinned) in scope.
     "output\\.rs:20:43: replace > with >= in print_usage",
+    # ── Issue #245 batch 6 (same CI run 40256596759), cli/control.rs :98 → :798
+    # — ControlBridge emitters / cancel+fail_all_pending / session_id /
+    # error_response / parse_permission_mode "strict" / workspace_diff /
+    # control_read_file / base64_encode / seed_read_state / register_repo_root.
+    # One exclusion (two mutants); the other 29 are pinned in control.rs
+    # `mod tests` (waiter-parking roundtrips for the ask_* emitters, exact
+    # deny payloads for cancel/fail_all, hermetic git repo for workspace_diff,
+    # byte-budget / encoding matrix for control_read_file, 1-byte-remainder
+    # padding for base64, read-state record for seed_read_state, idempotent
+    # root registration). Hand-verified: mutation applied → target tests run
+    # → byte-exact restore; script and log in /tmp/b6-negctl/.
+    #
+    # `:742:28` and `:742:40` `| → ^` in base64_encode's 24-bit pack
+    # `(b0 << 16) | (b1 << 8) | b2` are extensionally equivalent: each operand
+    # is a `u8 as u32`, so they occupy the pairwise-disjoint bit ranges 16-23,
+    # 8-15 and 0-7, and for disjoint bit sets `a | b == a ^ b` identically.
+    # Verified exhaustively over all 2^24 byte triples (zero mismatches for
+    # either operator position) and by negative control (mutation applied →
+    # all base64 tests green → byte-exact restore). The `\\^` anchor keeps the
+    # killable `| → &` siblings at the same two columns in scope, and the
+    # line:col anchor keeps every other `|` in the file in scope.
+    "control\\.rs:742:(28|40): replace \\| with \\^ in base64_encode",
 ]
