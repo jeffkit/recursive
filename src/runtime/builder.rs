@@ -1250,4 +1250,107 @@ mod tests {
             .expect("session Edit must see the program's Read");
         assert_eq!(std::fs::read_to_string(&b).expect("read b.txt"), "there\n");
     }
+
+    /// Goal #133: on a custom registry that carries the deliverables ledger
+    /// but (unlike `build_standard_tools`) never had the `Present` /
+    /// `ChangeLedger` placeholders, `build()` must seed both tools from the
+    /// shared ledger — that is the `!filtered` half of the seeding guards.
+    /// The strict half stays too: an explicit allow-list that ran without
+    /// the tools must not have them resurrected behind it.
+    #[test]
+    fn deliverables_tools_are_seeded_into_a_ledger_bearing_custom_registry() {
+        let ws = tempfile::TempDir::new().expect("temp workspace");
+        // `Deliverables::for_workspace` resolves `RECURSIVE_HOME` during
+        // init — pin it so a concurrent env-guard teardown cannot race the
+        // ledger into a filesystem error (#246, same hermeticity as the
+        // read-root tests above).
+        let home = tempfile::TempDir::new().expect("temp recursive home");
+        let _pinned_home = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let ledger = Arc::new(
+            crate::deliverables::Deliverables::for_workspace(ws.path())
+                .expect("ledger for a writable temp workspace"),
+        );
+
+        let registry = crate::tools::ToolRegistry::local().with_deliverables(Some(ledger.clone()));
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(registry)
+            .build()
+            .expect("build() with a ledger-bearing custom registry must succeed");
+        assert!(
+            rt.kernel()
+                .tools()
+                .find_by_name(crate::tools::PRESENT_TOOL_NAME)
+                .is_some(),
+            "an unfiltered registry with a ledger must get Present seeded"
+        );
+        assert!(
+            rt.kernel()
+                .tools()
+                .find_by_name(crate::tools::CHANGE_LEDGER_TOOL_NAME)
+                .is_some(),
+            "an unfiltered registry with a ledger must get ChangeLedger seeded"
+        );
+
+        let mut filtered = crate::tools::ToolRegistry::local();
+        filtered.retain_tools(&["Read".to_string()]);
+        let registry = filtered.with_deliverables(Some(ledger));
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(registry)
+            .build()
+            .expect("build() with a filtered ledger-bearing registry must succeed");
+        assert!(
+            rt.kernel()
+                .tools()
+                .find_by_name(crate::tools::PRESENT_TOOL_NAME)
+                .is_none(),
+            "an allow-listed registry must not gain Present back"
+        );
+        assert!(
+            rt.kernel()
+                .tools()
+                .find_by_name(crate::tools::CHANGE_LEDGER_TOOL_NAME)
+                .is_none(),
+            "an allow-listed registry must not gain ChangeLedger back"
+        );
+    }
+
+    /// Issue #134 / #65: when the run_code outer gate skips registration —
+    /// the preset did not opt in, or the surface was explicitly filtered —
+    /// the skip must be SILENT. The else arm's warning belongs to the
+    /// host-transport refusal only (there the gate wanted to register and
+    /// genuinely could not); widening the outer gate into a disjunction
+    /// would push non-registrations into that warn arm.
+    #[tracing_test::traced_test]
+    #[test]
+    fn run_code_outer_gate_skips_are_silent() {
+        // Opted in, but the surface was explicitly filtered: the gate
+        // skips without a word — and without the tool.
+        let mut filtered = crate::tools::ToolRegistry::local();
+        filtered.retain_tools(&["Read".to_string()]);
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(filtered)
+            .with_run_code(true)
+            .build()
+            .expect("filtered build must succeed");
+        assert!(rt.kernel().tools().find_by_name("RunCode").is_none());
+        assert!(
+            !logs_contain("run_code: not registered"),
+            "a filtered-out preset opt-in must skip silently"
+        );
+
+        // Not opted in at all, unfiltered registry: equally silent.
+        let rt = AgentRuntimeBuilder::new()
+            .llm(mock_llm())
+            .tools(crate::tools::ToolRegistry::local())
+            .build()
+            .expect("default build must succeed");
+        assert!(rt.kernel().tools().find_by_name("RunCode").is_none());
+        assert!(
+            !logs_contain("run_code: not registered"),
+            "a non-opted preset must skip silently"
+        );
+    }
 }
