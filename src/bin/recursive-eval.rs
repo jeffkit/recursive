@@ -453,4 +453,248 @@ mod tests {
         };
         assert!(err.contains("report needs a JSONL path"), "{err}");
     }
+
+    /// Kills the `i += 2` mutants in the two arms the batch-1a pins never
+    /// parsed (`--workdir` / `--api-key`) at the same two offsets as the
+    /// happy-path pin: flag first (`-=` underflows to a panic; any other
+    /// placement rewinds into an infinite loop that only the mutation run's
+    /// timeout can catch), and flag at offset 4 (`*=` jumps over the next
+    /// option pair, observable via the skipped flag's field staying default).
+    #[test]
+    fn parse_run_options_workdir_and_api_key_arms_advance_and_store() {
+        // --api-key first: the `-= on i` mutant underflows at offset 0.
+        let opts = parse_ok(&["--api-key", "sk-test", "--mode", "live"]);
+        assert_eq!(opts.api_key.as_deref(), Some("sk-test"));
+        assert!(matches!(opts.mode, Mode::Live));
+
+        // --api-key at offset 4: the `*= on i` mutant jumps from 4 to 8 and
+        // skips ["--mode", "live"], so mode must stay Replay… which this call
+        // refutes by parsing it.
+        let opts = parse_ok(&[
+            "--out",
+            "o.jsonl",
+            "--tasks",
+            "t1",
+            "--api-key",
+            "sk",
+            "--mode",
+            "live",
+        ]);
+        assert_eq!(opts.api_key.as_deref(), Some("sk"));
+        assert!(matches!(opts.mode, Mode::Live));
+        assert_eq!(opts.tasks.as_deref(), Some(&["t1".to_string()][..]));
+
+        // --workdir first: the `-= on i` mutant underflows at offset 0.
+        let opts = parse_ok(&["--workdir", "wd", "--mode", "live"]);
+        assert_eq!(opts.workdir.as_deref(), Some(Path::new("wd")));
+        assert!(matches!(opts.mode, Mode::Live));
+
+        // --workdir at offset 4: the `*= on i` mutant jumps from 4 to 8 and
+        // skips ["--out", "o.jsonl"].
+        let opts = parse_ok(&[
+            "--tasks",
+            "t1",
+            "--report",
+            "r.md",
+            "--workdir",
+            "w",
+            "--out",
+            "o.jsonl",
+        ]);
+        assert_eq!(opts.workdir.as_deref(), Some(Path::new("w")));
+        assert_eq!(opts.out.as_deref(), Some(Path::new("o.jsonl")));
+        assert_eq!(opts.report.as_deref(), Some(Path::new("r.md")));
+    }
+
+    /// Kills the `resolve_presets -> Ok(vec![])` mutant: the default must be
+    /// the whole built-in catalogue, a named id must resolve to that preset,
+    /// and an unknown id must be an error.
+    #[test]
+    fn resolve_presets_returns_catalogue_and_validates_ids() {
+        let none: Option<Vec<String>> = None;
+        let all = match resolve_presets(&none) {
+            Ok(v) => v,
+            Err(e) => panic!("resolve_presets(None): {e}"),
+        };
+        assert_eq!(all.len(), preset::builtin().len());
+        assert!(all.iter().any(|p| p.id == "minimal"));
+        assert!(all.iter().any(|p| p.id == "standard"));
+
+        let one = match resolve_presets(&Some(vec!["minimal".to_string()])) {
+            Ok(v) => v,
+            Err(e) => panic!("resolve_presets(minimal): {e}"),
+        };
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, "minimal");
+
+        let err = match resolve_presets(&Some(vec!["nope".to_string()])) {
+            Ok(_) => panic!("unknown preset must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown preset `nope`"), "{err}");
+    }
+
+    /// Kills the `resolve_tasks -> Ok(vec![])` mutant: same catalogue, named
+    /// resolution and error triple against the fixed task set.
+    #[test]
+    fn resolve_tasks_returns_task_set_and_validates_ids() {
+        let none: Option<Vec<String>> = None;
+        let all = match resolve_tasks(&none) {
+            Ok(v) => v,
+            Err(e) => panic!("resolve_tasks(None): {e}"),
+        };
+        assert_eq!(all.len(), eval::tasks().len());
+        assert!(all.iter().any(|t| t.id == "single-append-row"));
+
+        let one = match resolve_tasks(&Some(vec!["single-append-row".to_string()])) {
+            Ok(v) => v,
+            Err(e) => panic!("resolve_tasks(single-append-row): {e}"),
+        };
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, "single-append-row");
+
+        let err = match resolve_tasks(&Some(vec!["nope".to_string()])) {
+            Ok(_) => panic!("unknown task must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unknown task `nope`"), "{err}");
+    }
+
+    /// Kills the `default_jsonl_path -> "xyzzy"` mutant: the default must stay
+    /// inside `eval/results/` and carry a `YYYYMMDDTHHMMSSZ` UTC stamp plus
+    /// the mode suffix.
+    #[test]
+    fn default_jsonl_path_carries_results_dir_stamp_and_mode() {
+        let replay = default_jsonl_path(Mode::Replay);
+        let stem = match replay
+            .strip_prefix("eval/results/")
+            .and_then(|s| s.strip_suffix("-replay.jsonl"))
+        {
+            Some(s) => s,
+            None => panic!("default replay path has the wrong shape: {replay}"),
+        };
+        let bytes = stem.as_bytes();
+        assert_eq!(bytes.len(), 16, "stamp `{stem}` is not YYYYMMDDTHHMMSSZ");
+        assert!(bytes[..8].iter().all(|b| b.is_ascii_digit()), "{stem}");
+        assert_eq!(bytes[8], b'T', "{stem}");
+        assert!(bytes[9..15].iter().all(|b| b.is_ascii_digit()), "{stem}");
+        assert_eq!(bytes[15], b'Z', "{stem}");
+        assert!(
+            default_jsonl_path(Mode::Live).ends_with("-live.jsonl"),
+            "live default path must keep the -live suffix"
+        );
+    }
+
+    /// Kills both `write_file` mutants: the `Ok(())` body replacement writes
+    /// nothing, and deleting the `!` inverts the empty-parent guard so the
+    /// `create_dir_all` for a missing parent is skipped and the write fails.
+    #[test]
+    fn write_file_creates_missing_parent_and_writes_contents() {
+        let root = tmp_root("write-file");
+        let path = root.join("missing-parent").join("f.txt");
+        match write_file(&path, "payload") {
+            Ok(()) => {}
+            Err(e) => panic!("write_file {:?}: {e}", path),
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => panic!("read back {:?}: {e}", path),
+        };
+        assert_eq!(text, "payload");
+    }
+
+    /// Kills the `cmd_report` loop-bound and advance mutants on the
+    /// positional-first shape: `while <` → `>` never parses the input (the
+    /// call must be Ok), `+=` → `*=` on the `--out` arm rewinds `i` onto the
+    /// out path and overwrites the input with it (the read fails), and
+    /// `+=` → `-=` on the positional arm underflows at offset 0.
+    #[test]
+    fn cmd_report_positional_input_writes_markdown_to_out() {
+        let root = tmp_root("report-positional");
+        let input = root.join("in.jsonl");
+        let out = root.join("rep.md");
+        if let Err(e) = std::fs::write(&input, sample_jsonl()) {
+            panic!("seed {:?}: {e}", input);
+        }
+        let args = argv(&[str_of(&input), "--out", str_of(&out)]);
+        match cmd_report(&args) {
+            Ok(()) => {}
+            Err(e) => panic!("cmd_report: {e}"),
+        }
+        let md = match std::fs::read_to_string(&out) {
+            Ok(t) => t,
+            Err(e) => panic!("read {:?}: {e}", out),
+        };
+        assert!(md.contains("# Preset benchmark"), "{md}");
+    }
+
+    /// Kills the value-lookup mutants on the `--out`-first shape: the
+    /// `args.get(i + 1)` → `get(i - 1)` mutant underflows at offset 0, and so
+    /// does the `--out` arm's `+=` → `-=` on `i` itself.
+    #[test]
+    fn cmd_report_out_flag_first_still_takes_the_next_value() {
+        let root = tmp_root("report-out-first");
+        let input = root.join("in.jsonl");
+        let out = root.join("rep.md");
+        if let Err(e) = std::fs::write(&input, sample_jsonl()) {
+            panic!("seed {:?}: {e}", input);
+        }
+        let args = argv(&["--out", str_of(&out), str_of(&input)]);
+        match cmd_report(&args) {
+            Ok(()) => {}
+            Err(e) => panic!("cmd_report: {e}"),
+        }
+        let md = match std::fs::read_to_string(&out) {
+            Ok(t) => t,
+            Err(e) => panic!("read {:?}: {e}", out),
+        };
+        assert!(md.contains("# Preset benchmark"), "{md}");
+    }
+
+    /// One replay `Sample` serialized through the real `eval::to_jsonl`, so a
+    /// `Sample` field rename breaks these tests at compile time instead of
+    /// rotting a hand-written JSON literal.
+    fn sample_jsonl() -> String {
+        let sample = Sample {
+            task_id: "single-append-row".to_string(),
+            category: "single-file".to_string(),
+            preset: "minimal".to_string(),
+            system_prompt_tokens: 1200,
+            mode: "replay".to_string(),
+            success: true,
+            finish_reason: "stop".to_string(),
+            input_tokens: 1500,
+            output_tokens: 40,
+            cache_read_tokens: 0,
+            wall_ms: 12,
+            turns: 3,
+            tool_calls: 2,
+            failure: None,
+            provider: None,
+            model: None,
+        };
+        match eval::to_jsonl(&[sample]) {
+            Ok(text) => text,
+            Err(e) => panic!("to_jsonl: {e}"),
+        }
+    }
+
+    /// Per-test scratch directory under the system temp dir — never the repo
+    /// tree, since `cmd_report` / `write_file` write wherever their arguments
+    /// point and a relative path would land in the package root.
+    fn tmp_root(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("recursive-eval-bin-{}-{tag}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            panic!("create temp dir {dir:?}: {e}");
+        }
+        dir
+    }
+
+    fn str_of(path: &Path) -> &str {
+        match path.to_str() {
+            Some(s) => s,
+            None => panic!("non-utf8 path {path:?}"),
+        }
+    }
 }
