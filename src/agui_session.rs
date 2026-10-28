@@ -833,6 +833,83 @@ mod tests {
         assert_eq!(SessionReader::load_meta(&dir).unwrap().message_count, 2);
     }
 
+    #[test]
+    fn legacy_migration_finds_the_flat_dir_by_its_documented_name() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let base = crate::paths::user_sessions_dir(ws).unwrap();
+
+        // Seed the pre-#57 dir through the *documented* spelling (`agui-` +
+        // sanitised thread), not through `legacy_thread_dir_name`: seeding
+        // and looking up through the same helper passes by construction —
+        // a broken helper mutates both sides together and nothing fails.
+        let thread = "flat/migr-8";
+        let legacy = base.join(format!("agui-{}", legacy_sanitize_thread_id(thread)));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("transcript.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&user_msg("old world")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        // The helper must spell exactly the documented name …
+        assert_eq!(
+            legacy_thread_dir_name(thread),
+            format!("agui-{}", legacy_sanitize_thread_id(thread))
+        );
+        // … and the migration lookup must find the seeded dir by it.
+        let dir = resolve_session_dir(ws, thread).unwrap();
+        let entries = SessionReader::load_transcript(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "old world");
+    }
+
+    #[test]
+    fn migration_never_clobbers_native_companion_files() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let base = crate::paths::user_sessions_dir(ws).unwrap();
+
+        let thread = "clobber/native-first";
+        let legacy = base.join(format!("agui-{}", legacy_sanitize_thread_id(thread)));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("transcript.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&user_msg("legacy history")).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(legacy.join(".interrupts.json"), r#"[{"legacy":true}]"#).unwrap();
+
+        // The native dir already exists with its own interrupts state but no
+        // transcript yet (crashed before the first append), so the migration
+        // does run — and must copy the transcript without overwriting the
+        // native companion file (the copy guard is `!to.exists()`).
+        let dir = base
+            .join(crate::session::workspace_slug(ws))
+            .join(thread_session_key(thread));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".interrupts.json"), r#"[{"native":true}]"#).unwrap();
+
+        resolve_session_dir(ws, thread).unwrap();
+
+        // The transcript arrived …
+        let entries = SessionReader::load_transcript(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "legacy history");
+        // … and the native interrupts file survived untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".interrupts.json")).unwrap(),
+            r#"[{"native":true}]"#,
+            "a legacy companion file must not overwrite the native one"
+        );
+    }
+
     // ── resume tool-result splices ───────────────────────────────────────
 
     #[test]
@@ -898,6 +975,91 @@ mod tests {
             Some(entries[2].uuid.as_str())
         );
         assert_eq!(SessionReader::load_meta(&dir).unwrap().message_count, 4);
+    }
+
+    #[test]
+    fn resume_replacement_with_identical_content_does_not_rewrite() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let msgs = vec![
+            user_msg("weather?"),
+            Message {
+                role: Role::Assistant,
+                content: "checking".to_string(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "t1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            },
+            Message {
+                role: Role::Tool,
+                content: "[frontend tool] denied".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("t1".to_string()),
+                reasoning_content: None,
+                is_compaction_summary: false,
+            },
+        ];
+        let dir = run_once(ws, "resume-noop", "first prompt", &msgs, None);
+        let transcript = dir.join("transcript.jsonl");
+        let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+
+        // The skip branch (`changed == false`) differs from the rewrite only
+        // in that the atomic write does not happen — the content is
+        // byte-identical either way. Pin a recognisably old mtime so "the
+        // file was rewritten" is directly observable.
+        let past =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&transcript)
+                .unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(past))
+                .unwrap();
+        }
+        assert_eq!(
+            mtime(&transcript),
+            past,
+            "mtime pin must hold before the call"
+        );
+
+        // Already-applied replacement: identical payload → no rewrite.
+        apply_resume_tool_results(
+            &dir,
+            &[("t1".to_string(), "[frontend tool] denied".to_string())],
+            &[],
+        );
+        assert_eq!(
+            mtime(&transcript),
+            past,
+            "an already-applied replacement must not rewrite the transcript"
+        );
+        assert_eq!(
+            SessionReader::load_transcript(&dir).unwrap()[2].content,
+            "[frontend tool] denied"
+        );
+
+        // Harness self-check: a genuinely different payload does rewrite, so
+        // the no-write assertion above cannot pass vacuously.
+        apply_resume_tool_results(
+            &dir,
+            &[("t1".to_string(), "{\"forecast\":\"sunny\"}".to_string())],
+            &[],
+        );
+        assert_ne!(
+            mtime(&transcript),
+            past,
+            "harness check: a real replacement must rewrite"
+        );
+        assert_eq!(
+            SessionReader::load_transcript(&dir).unwrap()[2].content,
+            "{\"forecast\":\"sunny\"}"
+        );
     }
 
     // ── legacy sanitiser (kept for migration lookups only) ───────────────
