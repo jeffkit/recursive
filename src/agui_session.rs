@@ -910,6 +910,37 @@ mod tests {
         );
     }
 
+    /// The rewritten legacy rows must carry the sequential `msg_NNN` ids —
+    /// they are the chain keys the history layer quotes back. A `seq` pinned
+    /// at 0 (a `*=`-style no-op increment) stamps every entry `msg_000` and
+    /// still passes every content-level assertion the migration tests make.
+    #[test]
+    fn migrated_legacy_entries_carry_sequential_msg_ids() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let base = crate::paths::user_sessions_dir(ws).unwrap();
+
+        let thread = "seq/msg-ids";
+        let legacy = base.join(format!("agui-{}", legacy_sanitize_thread_id(thread)));
+        std::fs::create_dir_all(&legacy).unwrap();
+        let raw = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&user_msg("q1")).unwrap(),
+            serde_json::to_string(&assistant_msg("a1")).unwrap(),
+            serde_json::to_string(&user_msg("q2")).unwrap()
+        );
+        std::fs::write(legacy.join("transcript.jsonl"), raw).unwrap();
+
+        let dir = resolve_session_dir(ws, thread).unwrap();
+        let entries = SessionReader::load_transcript(&dir).unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["msg_001", "msg_002", "msg_003"],
+            "rewritten legacy rows must be numbered msg_001.. in order"
+        );
+    }
+
     // ── resume tool-result splices ───────────────────────────────────────
 
     #[test]

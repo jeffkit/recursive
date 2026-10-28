@@ -5640,6 +5640,25 @@ mod tests {
         );
     }
 
+    /// Goal 431 (#244 W2a): the directory-discovered skill catalog must ride
+    /// into the HTTP `SessionPartitioning`. `skills_base` only manifests
+    /// after a templated skill source expands *and* its https fetch succeeds
+    /// (`AppState::session_skill_catalog`); `HttpSkillSource` is https-only
+    /// and the client trusts only webpki roots, so no offline test can drive
+    /// that success path through the real binary. The fail-closed siblings
+    /// (`skill_sources`, `endpoints`) are pinned behaviorally in
+    /// `tests/cli_http_partitioning.rs`; this wiring line gets a source pin
+    /// instead (same rationale as the pins above: `async_main` wiring that
+    /// cannot be executed in-process).
+    #[test]
+    fn http_partitioning_carries_the_directory_skill_catalog() {
+        assert!(
+            production_source().contains("skills_base: dir_skills,"),
+            "async_main must pass the directory skill catalog as \
+             SessionPartitioning.skills_base — the wiring went missing"
+        );
+    }
+
     // ── #150 / #226: standing credential-exposure WARN wiring ───────────────
 
     /// The standing exposure WARN (`warn_if_exposed`, pinned behaviourally in
