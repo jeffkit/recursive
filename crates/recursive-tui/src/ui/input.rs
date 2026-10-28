@@ -823,4 +823,100 @@ mod tests {
             "hint should remain on narrow terminal, got: {footer:?}"
         );
     }
+
+    // ── Cursor geometry, wrap prefixes, human_count, gauge split
+    //    threshold (#245 batch 15) ──────────────────────────────────────
+
+    /// Cursor at a non-zero column inside an unwrapped buffer pins the
+    /// exact screen position: x = 1 (border) + 2 (prefix) + col, y = 1 +
+    /// row. Kills the cursor_x `PREFIX_WIDTH + col` → `*` mutant at
+    /// `:267` (col 4: 2+4=6 vs 2*4=8) and both clamp-boundary `+`→`*`
+    /// mutants at `:272`/`:273` (area at the origin collapses max_x /
+    /// max_y to 0, dragging the clamped cursor there).
+    #[test]
+    fn render_positions_cursor_after_prefix_and_unwrapped_text() {
+        let mut app = App::new();
+        app.prompt.buffer = "abcd".into();
+        app.prompt.cursor = 4;
+        let backend = ratatui::backend::TestBackend::new(24, 6);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = term.backend().buffer();
+        let row1: String = (0..buf.area().width)
+            .map(|x| buf[(x, 1)].symbol())
+            .collect();
+        assert!(
+            row1.contains("❯ abcd"),
+            "first content row should carry indicator + unwrapped text, got: {row1:?}"
+        );
+        let pos = term.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(
+            pos,
+            Position { x: 7, y: 1 },
+            "cursor = border 1 + prefix 2 + col 4 on content row 0"
+        );
+    }
+
+    /// Continuation logical lines keep the plain two-space prefix — the
+    /// mode indicator belongs to the first visual row of the FIRST
+    /// logical line only. Kills the `is_first_logical_line && j == 0` →
+    /// `||` mutant at `:218` (every logical line's first visual row
+    /// would grow an indicator).
+    #[test]
+    fn render_second_logical_line_keeps_space_prefix() {
+        let mut app = App::new();
+        app.prompt.buffer = "ab\ncd".into();
+        app.prompt.cursor = 5;
+        let backend = ratatui::backend::TestBackend::new(24, 6);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = term.backend().buffer();
+        let row2: String = (0..buf.area().width)
+            .map(|x| buf[(x, 2)].symbol())
+            .collect();
+        assert!(
+            row2.contains("  cd") && !row2.contains('❯'),
+            "second logical line must keep the space prefix, got: {row2:?}"
+        );
+    }
+
+    /// Human-count format boundaries: raw below 1000, one-decimal k
+    /// below 1M, one-decimal M at 1M. Kills all three comparison
+    /// mutants in `human_count` (`:347` `==`/`<=` collapse the 999/1000
+    /// boundary; `:349` `<=` pulls 1M into the k branch).
+    #[test]
+    fn human_count_format_boundaries() {
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1000), "1.0k");
+        assert_eq!(human_count(999_999), "1000.0k");
+        assert_eq!(human_count(1_000_000), "1.0M");
+    }
+
+    /// Terminal exactly at the split threshold (gauge width + 2) must
+    /// NOT split: the strict `>` keeps the hint un-clobbered and drops
+    /// the gauge. Kills the `>` → `>=` mutant at `:289`, which would
+    /// carve a 2-column hint gutter and render the gauge at exact-fit
+    /// width. The strictly-wider side of the boundary is pinned by
+    /// render_draws_gauge_in_footer_when_room_available.
+    #[test]
+    fn render_hint_only_when_width_exactly_fits_gauge_plus_margin() {
+        let mut app = App::new();
+        app.context_window = 1_000_000;
+        // used = 0 (fresh UsageStats) → "ctx 0/1.0M · 0%" = 15 columns.
+        let (gauge_text, _) = context_gauge(&app).expect("gauge present");
+        let gw = unicode_width::UnicodeWidthStr::width(gauge_text.as_str()) as u16;
+        assert_eq!(gw, 15, "gauge fixture must be 15 columns: {gauge_text:?}");
+        let backend = ratatui::backend::TestBackend::new(gw + 2, 6);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = term.backend().buffer();
+        let footer_y = buf.area().height - 1;
+        let footer: String = (0..buf.area().width)
+            .map(|x| buf[(x, footer_y)].symbol())
+            .collect();
+        assert!(
+            footer.contains("submit") && !footer.contains("ctx"),
+            "at exact-fit width the hint must win and the gauge drop, got: {footer:?}"
+        );
+    }
 }

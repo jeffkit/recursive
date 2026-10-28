@@ -899,4 +899,49 @@ mod debt_tests {
             "scrolling must change which rows are visible"
         );
     }
+
+    /// Pure windowing: the in-progress anchor is centred
+    /// (`content_rows / 2` rows above it, clamped to the list bounds).
+    /// Kills the `content_rows / 2` → `%` mutant at `:325` (with even
+    /// row counts the mutant pins the anchor at the window head:
+    /// (5, 9) instead of (3, 7)).
+    #[test]
+    fn todo_window_centres_anchor_above_window_head() {
+        assert_eq!(todo_window(10, Some(5), 4), (3, 7));
+        assert_eq!(todo_window(10, None, 4), (6, 10));
+        assert_eq!(todo_window(0, Some(0), 4), (0, 0));
+        assert_eq!(todo_window(3, Some(2), 10), (0, 3));
+    }
+
+    /// Title carries ↑/↓ hidden counts whenever either half is non-zero
+    /// — including the anchor-at-head case where ONLY bottom items are
+    /// hidden. Kills the `hidden_bottom > 0` → `<` mutant at `:364`
+    /// (usize `< 0` is never true, so the `↓4` marker would vanish
+    /// exactly when it is the only indicator needed).
+    #[test]
+    fn todo_panel_title_shows_hidden_bottom_when_anchor_at_head() {
+        let mut app = App::new();
+        app.current_todos = (0..10)
+            .map(|i| TodoItem {
+                content: format!("task {i}"),
+                status: TodoStatus::Pending,
+                active_form: None,
+            })
+            .collect();
+        app.current_todos[0].status = TodoStatus::InProgress;
+
+        let backend = TestBackend::new(30, 8);
+        let mut term = Terminal::new(backend).expect("TestBackend infallible");
+        term.draw(|f| render_todo_panel(f, f.area(), &app))
+            .expect("draw infallible");
+        let buf = term.backend().buffer();
+        let title: String = (0..buf.area().width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect();
+        assert!(title.contains("Tasks"), "panel title missing: {title:?}");
+        assert!(
+            title.contains("↑0") && title.contains("↓4"),
+            "anchor at head hides only the bottom 4, got: {title:?}"
+        );
+    }
 }

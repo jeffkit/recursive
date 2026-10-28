@@ -1895,4 +1895,149 @@ mod tests {
             short.slug
         );
     }
+
+    // ── Context Usage panel arithmetic (#245 batch 15) ──────────────────
+
+    /// Flatten a rendered line to its text.
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The proportional bar is the one non-empty line whose visible
+    /// glyphs are all `█`; return its coloured spans as `(fg, len)`.
+    fn bar_spans(lines: &[Line<'static>]) -> Vec<(Color, usize)> {
+        let bar = lines
+            .iter()
+            .find(|l| {
+                let t = line_text(l);
+                !t.trim().is_empty() && t.trim().chars().all(|c| c == '█')
+            })
+            .expect("proportional bar line present");
+        bar.spans
+            .iter()
+            .filter(|s| s.style.fg.is_some())
+            .map(|s| (s.style.fg.unwrap(), s.content.chars().count()))
+            .collect()
+    }
+
+    /// Text of the legend row carrying `label`.
+    fn legend_text(lines: &[Line<'static>], label: &str) -> String {
+        lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains(label))
+            .unwrap_or_else(|| panic!("no legend row for {label}"))
+    }
+
+    /// Breakdown whose two largest buckets tie at the top: the leftover
+    /// cells from floor rounding must go to the FIRST of the tied maxima
+    /// (strict `>` in the argmax scan). Exact legend pct kills the
+    /// `:500` `/`↔`%` / `*`↔`/` `*`↔`+` mutants; exact per-colour bar
+    /// distribution kills the `:520` `*`→`/`, `:522` `+=`→`*=`, `:527`
+    /// `>`→`==`/`<`, and `:531` tie-breaking `==`/`>=`/`<` mutants.
+    #[test]
+    fn context_usage_legend_pcts_and_bar_distribution_with_tied_max() {
+        let mut usage = UsageStats::default();
+        usage.record_breakdown(recursive::llm::ContextBreakdown {
+            system_prompt: 40,
+            rules: 40,
+            skills: 10,
+            subagents: 5,
+            tools: 3,
+            mcp_dynamic: 1,
+            conversation: 1,
+            overhead: 0,
+        });
+        let lines = render_context_usage_body(&usage, "m", 0);
+
+        let legend = legend_text(&lines, "system prompt");
+        assert!(
+            legend.contains("40 tok ·  40.0%"),
+            "legend pct should be exactly 40.0%, got: {legend:?}"
+        );
+
+        // widths 24/24/6/3/1/0/0/0 → assigned 58, leftover 2 → first
+        // of the tied 40-token buckets grows to 26; zero-width spans
+        // are skipped.
+        assert_eq!(
+            bar_spans(&lines),
+            vec![
+                (Color::Magenta, 26),
+                (Color::Blue, 24),
+                (Color::Cyan, 6),
+                (Color::LightMagenta, 3),
+                (Color::Green, 1),
+            ],
+            "bar distribution: 24/24/6/3/1 + 2 leftover cells to first tied max"
+        );
+    }
+
+    /// Single non-zero bucket equal to the total: it alone fills the bar
+    /// at full width. `value % total` collapses to 0 exactly here (the
+    /// legend/bar `/`→`%` mutants at `:500`/`:520` only diverge when a
+    /// bucket value reaches the total), and the wrong full-width colour
+    /// exposes them.
+    #[test]
+    fn context_usage_single_bucket_fills_whole_bar() {
+        let mut usage = UsageStats::default();
+        usage.record_breakdown(recursive::llm::ContextBreakdown {
+            tools: 100,
+            ..Default::default()
+        });
+        let lines = render_context_usage_body(&usage, "m", 0);
+
+        let legend = legend_text(&lines, "tools");
+        assert!(
+            legend.contains("100 tok · 100.0%"),
+            "single-bucket legend should read 100.0%, got: {legend:?}"
+        );
+        assert_eq!(
+            bar_spans(&lines),
+            vec![(Color::Green, 60)],
+            "the only non-zero bucket must own the whole 60-cell bar"
+        );
+    }
+
+    /// Unknown context window (0) must suppress the window line entirely.
+    /// Kills the `context_window > 0` → `>=` mutant at `:553`: dividing
+    /// by a zero window yields `inf`, which would leak a `· inf%` row.
+    #[test]
+    fn context_usage_omits_window_line_when_window_unknown() {
+        let mut usage = UsageStats::default();
+        usage.record_breakdown(recursive::llm::ContextBreakdown {
+            tools: 100,
+            ..Default::default()
+        });
+        let lines = render_context_usage_body(&usage, "m", 0);
+        for line in &lines {
+            let t = line_text(line);
+            assert!(
+                !t.contains("window") && !t.contains("inf"),
+                "window line must be absent at window=0, got: {t:?}"
+            );
+        }
+    }
+
+    /// Known window: the window line carries the exact `total / window`
+    /// ratio. Kills all four `:554` arithmetic mutants (`/`→`%`, `/`→`*`,
+    /// `*`→`/`, `*`→`+`: they render 10000%, 2000000%, 0% and 100%
+    /// instead of 50%).
+    #[test]
+    fn context_usage_window_line_carries_exact_pct() {
+        let mut usage = UsageStats::default();
+        usage.record_breakdown(recursive::llm::ContextBreakdown {
+            tools: 100,
+            ..Default::default()
+        });
+        let lines = render_context_usage_body(&usage, "m", 200);
+        let window = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("window"))
+            .expect("window line present");
+        assert!(
+            window.contains("100 / 200 tok · 50%"),
+            "window line should read 100 / 200 tok · 50%, got: {window:?}"
+        );
+    }
 }

@@ -404,4 +404,24 @@ exclude_re = [
     # restore. The line:col anchor keeps the killable `- → /` sibling at
     # :301:42 and every other `>` in the file in scope.
     "audit_log\\.rs:300:27: replace > with >= in AuditQuery::apply",
+    # ── Issue #245 batch 15 (same CI run 40256596759), recursive-tui —
+    # ui/modal.rs / ui/input.rs / ui/chat.rs. One true equivalence; the
+    # other 29 mutants of the segment are pinned in the three files'
+    # test mods (modal: tied-max legend/bar distribution + single-bucket
+    # full bar + window-line suppression and exact pct; input: cursor
+    # screen position after prefix, second-logical-line space prefix,
+    # human_count boundaries, exact-fit gauge split threshold; chat:
+    # todo_window centring + hidden-bottom title marker).
+    # Hand-verified this batch: mutation applied → the four new modal
+    # tests + the pre-existing context-usage tests all green → byte-exact
+    # restore. `leftover > 0` → `>=` in render_context_usage_body
+    # (:527:17) is extensionally equivalent: `leftover` is
+    # `usize::saturating_sub`, so `leftover == 0` is the only state the
+    # mutant adds, and the branch body there is
+    # `widths[largest].saturating_add(0)` — a no-op on locals that are
+    # dropped at scope exit; observable output is identical at every
+    # reachable input. The line:col anchor keeps the killable `>`→`==`
+    # and `>`→`<` siblings on the same line in scope (both pinned by
+    # context_usage_legend_pcts_and_bar_distribution_with_tied_max).
+    "crates/recursive-tui/src/ui/modal\\.rs:527:17: replace > with >= in render_context_usage_body",
 ]
