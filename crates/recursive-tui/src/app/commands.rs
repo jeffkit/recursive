@@ -3961,7 +3961,7 @@ mod picker_tests {
 mod handle_key_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::app::{App, InputMode};
+    use crate::app::{App, AppScreen, InputMode};
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -4096,6 +4096,96 @@ mod handle_key_tests {
         assert!(action.is_none());
         assert_eq!(app.prompt.buffer, "x");
         assert!(app.prompt.history_idx.is_none());
+    }
+
+    // ── panel_move_cursor: the delta sign test (#245 batch 17) ──────────
+
+    fn probe_panel(selected: Option<usize>, scroll: u16) -> App {
+        let lines = (0..3)
+            .map(|i| ratatui::text::Line::from(format!("item {i}")))
+            .collect();
+        let mut panel = crate::app::CommandPanelState::new("probe", lines);
+        panel.selected = selected;
+        panel.scroll = scroll;
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::CommandInteract;
+        app.active_command_panel = Some(panel);
+        app
+    }
+
+    #[test]
+    fn panel_move_cursor_zero_delta_reclamps_an_out_of_range_selection() {
+        // Callers pass ±1; the sign test treats 0 as "not up", so a zero
+        // move runs the downward clamp `(sel + 0).min(item_count - 1)`.
+        // kills `<`→`<=` (997:36): the mutant routes 0 through
+        // `saturating_sub(0)` and leaves the stale index 7 in place.
+        let mut app = probe_panel(Some(7), 0);
+        assert!(app.panel_move_cursor(0).is_none());
+        let panel = app.active_command_panel.as_ref().expect("panel stays open");
+        assert_eq!(
+            panel.selected,
+            Some(2),
+            "zero delta must clamp to the last item"
+        );
+    }
+
+    #[test]
+    fn panel_move_cursor_zero_delta_scrolls_a_selection_free_panel_down() {
+        // Same sign test on the no-selection branch: 0 is "not up", so the
+        // scroll offset nudges down. kills `<`→`<=` (1012:22), which would
+        // nudge up instead (5 → 4).
+        let mut app = probe_panel(None, 5);
+        assert!(app.panel_move_cursor(0).is_none());
+        let scroll = app.active_command_panel.as_ref().map(|p| p.scroll);
+        assert_eq!(scroll, Some(6), "zero delta must scroll down by one");
+        let _ = app.panel_move_cursor(-1);
+        let scroll = app.active_command_panel.as_ref().map(|p| p.scroll);
+        assert_eq!(scroll, Some(5), "negative delta must scroll back up");
+    }
+
+    // ── modal_scroll_follow_selection boundary rows ────────────────────
+
+    #[test]
+    fn modal_scroll_follow_selection_moves_only_when_the_row_leaves_the_window() {
+        // MODAL_LIST_VISIBLE = 28 and row = selected + 2. With scroll=3 the
+        // last visible row is 30 (selected 28): it must not move the
+        // window; the next item (row 31) scrolls by exactly one; an item
+        // above the window pulls the window up to one row before it. (At
+        // the last-visible-row step the excluded `>`→`>=` mutant assigns
+        // `row + 1 - 28 == modal_scroll` — a no-op store, hence a true
+        // equivalence; see .cargo/mutants.toml.)
+        let mut app = App::new();
+        app.modal_scroll = 3;
+        app.modal_scroll_follow_selection(28);
+        assert_eq!(app.modal_scroll, 3, "last visible row keeps the window");
+        app.modal_scroll_follow_selection(29);
+        assert_eq!(app.modal_scroll, 4, "first hidden row scrolls by one");
+        app.modal_scroll = 10;
+        app.modal_scroll_follow_selection(3);
+        assert_eq!(app.modal_scroll, 4, "row above the window pulls it up");
+    }
+
+    // ── Down without a history walk ────────────────────────────────────
+
+    #[test]
+    fn down_key_without_a_history_walk_leaves_the_draft_untouched() {
+        // history_idx is None → the `Down if should_walk_history_down()`
+        // arm is skipped and the key falls through to `_ => None`: buffer,
+        // cursor and history_idx stay exactly as typed. (That guard is
+        // redundant with history_next's own `history_idx` check — see the
+        // :274 entry in .cargo/mutants.toml — so this pins the user-visible
+        // contract rather than which arm handled the key.)
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.history = vec!["abc".into(), "def".into()];
+        app.prompt.buffer = "draft".into();
+        app.prompt.cursor = 2;
+        app.prompt.history_idx = None;
+        assert!(app.handle_key(k(KeyCode::Down)).is_none());
+        assert_eq!(app.prompt.buffer, "draft");
+        assert_eq!(app.prompt.cursor, 2);
+        assert_eq!(app.prompt.history_idx, None);
     }
 }
 

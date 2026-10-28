@@ -593,4 +593,35 @@ mod tests {
             "history should be capped at HISTORY_CAPACITY"
         );
     }
+
+    #[test]
+    fn record_submission_keeps_a_history_that_lands_exactly_on_capacity() {
+        // len == HISTORY_CAPACITY is the keep-everything boundary: the
+        // entry that fills the ring exactly keeps the oldest; the next one
+        // drops exactly one from the front. (At len == cap the `>`→`>=`
+        // mutant computes overflow 0 and drains nothing — a true
+        // equivalence, see .cargo/mutants.toml; both open sides are
+        // pinned here.)
+        let mut p = PromptInputState {
+            history: (0..HISTORY_CAPACITY - 1).map(|i| format!("h{i}")).collect(),
+            ..PromptInputState::default()
+        };
+        p.record_submission("fits".to_string());
+        assert_eq!(p.history.len(), HISTORY_CAPACITY);
+        assert_eq!(
+            p.history.first().map(String::as_str),
+            Some("h0"),
+            "nothing is dropped when the ring lands exactly on capacity"
+        );
+        assert_eq!(p.history.last().map(String::as_str), Some("fits"));
+
+        p.record_submission("overflows".to_string());
+        assert_eq!(p.history.len(), HISTORY_CAPACITY);
+        assert_eq!(
+            p.history.first().map(String::as_str),
+            Some("h1"),
+            "one past capacity drops exactly the oldest entry"
+        );
+        assert_eq!(p.history.last().map(String::as_str), Some("overflows"));
+    }
 }

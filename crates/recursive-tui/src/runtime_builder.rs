@@ -1354,4 +1354,50 @@ max_tokens = 128000
             "default skill-reinjector token budget must be 25_000"
         );
     }
+
+    /// The `/model` hot-swap picks the request endpoint by the preset's
+    /// *protocol*: an `anthropic` preset talks to its native endpoint
+    /// (`anthropic_api_base`, falling back to `api_base`), while an
+    /// OpenAI-protocol preset keeps `api_base` even when the catalog also
+    /// lists an Anthropic-compatible endpoint for it (the bundled
+    /// `deepseek` entry does). kills `==`→`!=` (120:37), which would send
+    /// Anthropic-protocol requests to the OpenAI endpoint and vice versa.
+    #[test]
+    fn preset_api_base_follows_the_preset_protocol() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _pin = recursive::test_util::PinnedRecursiveHome::new(home.path());
+        let _g1 = EnvGuard::remove("RECURSIVE_MAX_TOKENS");
+        let _g2 = EnvGuard::remove("RECURSIVE_API_KEY");
+
+        let mut anthropic = recursive::providers::find_preset("anthropic")
+            .expect("bundled anthropic preset")
+            .clone();
+        assert_eq!(anthropic.provider_type, "anthropic");
+        anthropic.api_base = "https://gateway.invalid/v1".into();
+        anthropic.anthropic_api_base = Some("https://native.invalid".into());
+        let model = anthropic.default_model.clone();
+        let config = config_for_preset_model(&anthropic, &model).expect("anthropic config");
+        assert_eq!(config.provider_type, "anthropic");
+        assert_eq!(
+            config.api_base, "https://native.invalid",
+            "anthropic protocol must use the native endpoint"
+        );
+
+        let deepseek = recursive::providers::find_preset("deepseek")
+            .expect("bundled deepseek preset")
+            .clone();
+        assert_ne!(deepseek.provider_type, "anthropic");
+        let native = deepseek
+            .anthropic_api_base
+            .clone()
+            .expect("deepseek also lists an anthropic endpoint");
+        assert_ne!(native, deepseek.api_base);
+        let model = deepseek.default_model.clone();
+        let config = config_for_preset_model(&deepseek, &model).expect("deepseek config");
+        assert_eq!(
+            config.api_base, deepseek.api_base,
+            "openai protocol must keep api_base"
+        );
+        assert_ne!(config.api_base, native);
+    }
 }

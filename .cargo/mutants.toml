@@ -424,4 +424,69 @@ exclude_re = [
     # and `>`→`<` siblings on the same line in scope (both pinned by
     # context_usage_legend_pcts_and_bar_distribution_with_tied_max).
     "crates/recursive-tui/src/ui/modal\\.rs:527:17: replace > with >= in render_context_usage_body",
+    # ── Issue #245 batch 17 (same CI run 40256596759), recursive-tui tail —
+    # the crate's last 24 MISSED (ui/command_menu.rs 7, ollama_probe.rs 5,
+    # app/commands.rs 4, cost.rs 3, app/render.rs 2, app/state.rs 1,
+    # input_state.rs 1, runtime_builder.rs 1). Seventeen are killed by the
+    # new tests in those files' test mods (sticky-viewport quadrants,
+    # loopback probe_once, zero-delta sign test, breakdown store, catalog
+    # floor, pricing-counter reset, protocol-keyed api_base); the seven
+    # below are true equivalences, each hand-verified this batch (mutation
+    # applied → the named guard test and the rest of the crate suite green
+    # → byte-exact restore; script and log in /tmp/b17/). Every anchor is
+    # line:col-surgical per the #245 batch-3 doctrine, so the killable
+    # siblings on the same lines stay in the gate's view.
+    #
+    # command_menu.rs:584:22 `c < sticky` → `<=` in the sticky-viewport
+    # match: the only extra firing is at `c == sticky`, where the arm yields
+    # `c.min(max_scroll)`; `sticky = scroll.min(max_scroll)` is already
+    # ≤ max_scroll, so that value is `sticky` — exactly what the `_` arm
+    # returns. Guard test:
+    # render_debt_tests::interact_panel_cursor_on_the_top_row_keeps_the_window.
+    # The `==` / `>` / guard→false / guard→true siblings at :584 and both
+    # :585 mutants are killed by the three sibling interact_panel_* tests.
+    "crates/recursive-tui/src/ui/command_menu\\.rs:584:22: replace < with <= in render_command_interact_panel",
+    # ollama_probe.rs:156:35 `guard.at.elapsed() < PROBE_TTL` → `<=`: the
+    # mutant differs only when `Instant::elapsed()` lands on exactly
+    # 30.000000000 s — one nanosecond on a monotonic clock that no test can
+    # hit deterministically (`Instant::now()` is sampled afresh on every
+    # compare). Both open sides are pinned:
+    # cache_serves_repeated_calls_within_ttl (fresh → hit, kills the `==` /
+    # `>` siblings) and cache_reprobes_once_the_ttl_has_elapsed (stale →
+    # re-probe + restamp).
+    "crates/recursive-tui/src/ollama_probe\\.rs:156:35: replace < with <= in ollama_models_for_picker",
+    # commands.rs:274:30 `Down if self.should_walk_history_down()` → `true`:
+    # the guard is redundant with its callee — `history_next` opens with
+    # `let Some(idx) = self.history_idx else { return false }`, the same
+    # `history_idx.is_some()` predicate — so with no walk in progress the
+    # mutant calls a no-op and returns None, exactly what the original's
+    # `_ => None` fall-through does. Guard test:
+    # down_key_without_a_history_walk_leaves_the_draft_untouched (plus
+    # should_walk_history_down_false_when_not_walking for the predicate).
+    "crates/recursive-tui/src/app/commands\\.rs:274:30: replace match guard self\\.should_walk_history_down\\(\\) with true in App::handle_key",
+    # commands.rs:1641:27 `row + 1 > modal_scroll + MODAL_LIST_VISIBLE` →
+    # `>=`: at equality the mutant's branch stores
+    # `row + 1 - MODAL_LIST_VISIBLE`, which *is* `modal_scroll` — a no-op
+    # assignment; every other input takes the same branch as the original.
+    # Guard test (its last-visible-row step):
+    # modal_scroll_follow_selection_moves_only_when_the_row_leaves_the_window,
+    # whose next-row step kills the `<` / `==` siblings.
+    "crates/recursive-tui/src/app/commands\\.rs:1641:27: replace > with >= in App::modal_scroll_follow_selection",
+    # input_state.rs:383:35 `history.len() > HISTORY_CAPACITY` → `>=`: the
+    # same shape as the audit_log :300 entry above — at `len == cap` the
+    # mutant computes `overflow = 0` and `drain(0..0)` removes nothing.
+    # Guard test (both open sides):
+    # record_submission_keeps_a_history_that_lands_exactly_on_capacity.
+    "crates/recursive-tui/src/input_state\\.rs:383:35: replace > with >= in PromptInputState::record_submission",
+    # render.rs:213:13 and :214:13 `||` → `&&` in parse_v4a_patch's envelope
+    # skip (`*** Begin Patch` / `*** End Patch` / `*** End of File`): that
+    # skip only short-circuits lines the prefix cascade below it drops
+    # anyway — the cascade admits nothing but `@@` / `+` / `-` / ` ` lines
+    # and every envelope marker starts with `*`. Whatever marker the
+    # mutated condition lets through still contributes no diff line, so
+    # the parse is byte-identical. Guard test:
+    # parse_v4a_patch_envelope_markers_after_the_header_add_no_diff_lines
+    # (goes red if a catch-all arm is ever added — which would make these
+    # killable; delete this entry with it).
+    "crates/recursive-tui/src/app/render\\.rs:21[34]:13: replace \\|\\| with && in parse_v4a_patch",
 ]

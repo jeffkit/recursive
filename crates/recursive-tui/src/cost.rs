@@ -395,4 +395,77 @@ mod tests {
         // never zeroes it, and the bundled fallback covers unknown names.
         assert!(context_window_for_model("deepseek-chat") > 0);
     }
+
+    #[test]
+    fn record_breakdown_replaces_the_previous_breakdown_and_feeds_the_estimate() {
+        // kills record_breakdown -> () (157:9): the stored breakdown is
+        // what current_prompt_estimate() reads once one exists.
+        use recursive::llm::ContextBreakdown;
+        let mut u = UsageStats {
+            last_prompt_tokens: 999,
+            ..UsageStats::default()
+        };
+        assert_eq!(u.current_prompt_estimate(), 999, "no breakdown yet");
+
+        let first = ContextBreakdown {
+            system_prompt: 100,
+            conversation: 50,
+            overhead: 7,
+            ..ContextBreakdown::default()
+        };
+        u.record_breakdown(first);
+        assert_eq!(u.last_breakdown, Some(first));
+        assert_eq!(u.current_prompt_estimate(), 157, "local_sum + overhead");
+
+        let second = ContextBreakdown {
+            conversation: 300,
+            ..ContextBreakdown::default()
+        };
+        u.record_breakdown(second);
+        assert_eq!(u.last_breakdown, Some(second), "newer breakdown wins");
+        assert_eq!(u.current_prompt_estimate(), 300);
+    }
+
+    /// Smallest positive window in the bundled catalog — the floor every
+    /// resolved window clears (bundled models are at least this, unknown
+    /// names fall back to 128K), so a sentinel such as `1` can never pass.
+    fn smallest_bundled_context_window() -> u64 {
+        recursive::providers::all_presets()
+            .iter()
+            .flat_map(|p| p.models.iter())
+            .map(|m| m.context_window as u64)
+            .filter(|&w| w > 0)
+            .min()
+            .expect("bundled catalog lists at least one model window")
+    }
+
+    #[test]
+    fn detect_context_window_resolves_a_catalog_sized_window() {
+        // kills detect_context_window -> 1 (251:5). Whatever model the
+        // environment selects, the resolver answers with a real window —
+        // never below the smallest bundled one (8K at the time of writing).
+        let floor = smallest_bundled_context_window();
+        assert!(floor > 1, "catalog floor must be a real window: {floor}");
+        let window = detect_context_window();
+        assert!(
+            window >= floor,
+            "detected window {window} is below the catalog floor {floor}"
+        );
+    }
+
+    #[test]
+    fn context_window_for_model_resolves_a_catalog_sized_window() {
+        // kills context_window_for_model -> 1 (264:5): a bundled default
+        // model resolves to its catalog window and an unknown name to the
+        // 128K fallback — both clear the catalog floor.
+        let floor = smallest_bundled_context_window();
+        let bundled = recursive::providers::find_preset("anthropic")
+            .expect("bundled anthropic preset")
+            .default_model
+            .clone();
+        let known = context_window_for_model(&bundled);
+        assert!(known >= floor, "{bundled}: {known} below floor {floor}");
+        let unknown = context_window_for_model("no-such-model-b17");
+        assert!(unknown >= floor, "fallback {unknown} below floor {floor}");
+    }
 }

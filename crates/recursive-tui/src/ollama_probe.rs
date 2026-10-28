@@ -471,4 +471,111 @@ mod tests {
             "invalidate_cache must force a re-probe on the next call"
         );
     }
+
+    #[test]
+    fn cache_reprobes_once_the_ttl_has_elapsed() {
+        // The other open side of the TTL guard: age the cached entry past
+        // PROBE_TTL and the next call must re-probe (count=2), return the
+        // fresh result and restamp the cache. Together with
+        // cache_serves_repeated_calls_within_ttl this pins both sides of
+        // `elapsed() < PROBE_TTL`; the exact `elapsed() == PROBE_TTL`
+        // nanosecond is not deterministically reachable (see the `<` → `<=`
+        // entry in .cargo/mutants.toml).
+        let _g = cache_path_guard();
+        let _ = ollama_models_for_picker();
+        assert_eq!(PROBE_CALLS.with(|c| c.get()), 1);
+
+        let stale = Instant::now()
+            .checked_sub(PROBE_TTL + Duration::from_secs(1))
+            .expect("process uptime exceeds the probe TTL");
+        CACHE.with(|c| {
+            let mut slot = c.borrow_mut();
+            let cache = slot.as_mut().expect("first call populated the cache");
+            cache.at = stale;
+        });
+
+        let refreshed = ollama_models_for_picker();
+        assert_eq!(
+            PROBE_CALLS.with(|c| c.get()),
+            2,
+            "a cache entry older than PROBE_TTL must be re-probed"
+        );
+        assert!(
+            matches!(refreshed, OllamaPickerModels::Local(ref m) if m.len() == 1),
+            "the re-probe result must be returned: {refreshed:?}"
+        );
+        let fresh_age = CACHE.with(|c| c.borrow().as_ref().map(|g| g.at.elapsed()));
+        assert!(
+            fresh_age.is_some_and(|age| age < PROBE_TTL),
+            "the re-probe must restamp the cache: {fresh_age:?}"
+        );
+    }
+
+    // ── probe_once against a real loopback listener ─────────────────────
+
+    /// Serve one canned HTTP/1.0 response on an ephemeral loopback port.
+    /// Returns the address to probe and a handle yielding the request
+    /// bytes the probe sent.
+    fn one_shot_http_server(response: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            stream.write_all(response).expect("write response");
+            drop(stream);
+            request
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn probe_once_returns_the_full_raw_response_from_a_live_listener() {
+        // kills probe_once -> None / Some(vec![]) / Some(vec![0]) /
+        // Some(vec![1]) (188:5): the probe must hand back exactly the bytes
+        // the server wrote (status line, headers and body), after sending a
+        // `GET /api/tags` request on the wire.
+        const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"models\":[{\"name\":\"probe:latest\"}]}";
+        let (addr, server) = one_shot_http_server(RESPONSE);
+        let raw = probe_once(&addr).expect("a live listener must yield a response");
+        assert_eq!(raw, RESPONSE, "probe must return the server's raw bytes");
+        let request = server.join().expect("server thread");
+        assert!(
+            request.starts_with(b"GET /api/tags HTTP/1.0\r\n"),
+            "probe must request /api/tags: {:?}",
+            String::from_utf8_lossy(&request)
+        );
+        assert_eq!(
+            http_body(&raw).map(parse_tags).map(|m| m.len()),
+            Some(1),
+            "the raw response must flow through http_body + parse_tags"
+        );
+    }
+
+    #[test]
+    fn probe_once_returns_none_for_an_unreachable_or_unparsable_address() {
+        // The failure side of the same body mutants: a port nobody listens
+        // on (connection refused) and a hostname (SocketAddr does not
+        // resolve names) both yield None — never a phantom response.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let closed = listener.local_addr().expect("local addr").to_string();
+        drop(listener);
+        assert_eq!(probe_once(&closed), None, "refused connect must be None");
+        assert_eq!(
+            probe_once("localhost:11434"),
+            None,
+            "hostnames do not parse"
+        );
+    }
 }

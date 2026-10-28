@@ -1548,4 +1548,92 @@ mod render_debt_tests {
         let frame = Rect::new(0, 3, 80, 24);
         assert!(popup_rect(input, 3, frame).is_some());
     }
+
+    // ── render_command_interact_panel: sticky viewport follows the cursor ──
+    //
+    // Ten content lines `L0..L9` in a 5-row area with no hint → 3 content
+    // rows (`content_rows = 3`, `max_scroll = 7`). `scroll` is the sticky
+    // "last window"; the renderer only moves the window when the cursor
+    // leaves it. Each test reads back which three lines are painted and
+    // which content row (1..=3) carries the selection highlight.
+
+    const INTERACT_SELECTED_BG: Color = Color::Rgb(205, 100, 50);
+
+    fn interact_window(scroll: u16, selected: usize) -> (Vec<String>, Option<u16>) {
+        let lines: Vec<Line<'static>> = (0..10).map(|i| Line::from(format!("L{i}"))).collect();
+        let mut panel = crate::app::CommandPanelState::new("probe", lines);
+        panel.selected = Some(selected);
+        panel.scroll = scroll;
+        let mut app = App::new();
+        app.screen = AppScreen::Chat;
+        app.prompt.mode = InputMode::CommandInteract;
+        app.active_command_panel = Some(panel);
+        let area = Rect::new(0, 0, 20, 5);
+        let buf = draw(20, 5, |f| render_command_interact_panel(f, area, &app));
+        let rows = (1..=3).map(|y| row_text(&buf, y, 20)).collect();
+        let highlighted = (1..=3).find(|&y| row_has_bg(&buf, y, 20, INTERACT_SELECTED_BG));
+        (rows, highlighted)
+    }
+
+    fn assert_window(rows: &[String], expected: [&str; 3]) {
+        for (row, label) in rows.iter().zip(expected) {
+            assert!(
+                row.contains(label),
+                "expected {label} in row {row:?}; window = {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interact_panel_cursor_above_the_window_pulls_the_window_up_to_it() {
+        // scroll=4 (window L4..L6), cursor on L2 → the window becomes L2..L4
+        // with the cursor on the first content row. kills :584 guard→false,
+        // `<`→`==` and `<`→`>`: all keep the stale window (L4..L6) and leave
+        // the cursor off-screen.
+        let (rows, highlighted) = interact_window(4, 2);
+        assert_window(&rows, ["L2", "L3", "L4"]);
+        assert_eq!(
+            highlighted,
+            Some(1),
+            "cursor row must be the top content row"
+        );
+    }
+
+    #[test]
+    fn interact_panel_cursor_inside_the_window_keeps_it_sticky() {
+        // scroll=4, cursor on L5 (middle row) → the window stays L4..L6 and
+        // the highlight sits on the second content row. kills :584
+        // guard→true and `<`→`>` (both jump the window to L5..L7) and :585
+        // guard→true (re-anchors the cursor to the bottom: L3..L5).
+        let (rows, highlighted) = interact_window(4, 5);
+        assert_window(&rows, ["L4", "L5", "L6"]);
+        assert_eq!(highlighted, Some(2), "cursor row must stay where it was");
+    }
+
+    #[test]
+    fn interact_panel_cursor_below_the_window_nudges_the_minimum() {
+        // scroll=2 (window L2..L4), cursor on L5 = the first row past the
+        // window (5 == sticky + content_rows) → the window becomes L3..L5
+        // with the cursor on the last content row. kills :585 `+`→`*`: the
+        // threshold becomes 2*3=6, the window stays L2..L4 and the cursor
+        // is off-screen.
+        let (rows, highlighted) = interact_window(2, 5);
+        assert_window(&rows, ["L3", "L4", "L5"]);
+        assert_eq!(
+            highlighted,
+            Some(3),
+            "cursor row must be the bottom content row"
+        );
+    }
+
+    #[test]
+    fn interact_panel_cursor_on_the_top_row_keeps_the_window() {
+        // scroll=4, cursor on L4 (== sticky): the `_` arm keeps sticky. The
+        // excluded `<`→`<=` mutant takes the first arm instead and lands on
+        // `4.min(7) == 4` — the identical window, which is why that mutant
+        // is a true equivalence (see .cargo/mutants.toml).
+        let (rows, highlighted) = interact_window(4, 4);
+        assert_window(&rows, ["L4", "L5", "L6"]);
+        assert_eq!(highlighted, Some(1), "cursor on the top row of the window");
+    }
 }

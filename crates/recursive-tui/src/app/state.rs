@@ -694,4 +694,25 @@ mod tests {
             "notice must count characters, not bytes"
         );
     }
+
+    #[test]
+    fn reset_pricing_lookup_count_zeroes_the_counter() {
+        // kills reset_pricing_lookup_count -> () (110:9). Two distinct
+        // models cost two catalog lookups (the cache holds one entry); the
+        // reset must read back as 0 and the next miss count from there.
+        let app = App::new();
+        let _ = app.pricing_for_model("claude-sonnet-4-6");
+        let _ = app.pricing_for_model("claude-sonnet-4-6");
+        assert_eq!(app.pricing_lookup_count(), 1, "cached repeat is free");
+        let _ = app.pricing_for_model("gpt-4o-mini");
+        assert_eq!(app.pricing_lookup_count(), 2);
+        app.reset_pricing_lookup_count();
+        assert_eq!(app.pricing_lookup_count(), 0, "reset must zero the counter");
+        let _ = app.pricing_for_model("claude-sonnet-4-6");
+        assert_eq!(
+            app.pricing_lookup_count(),
+            1,
+            "counting restarts after reset"
+        );
+    }
 }

@@ -582,4 +582,31 @@ mod tests {
             "no empty context line expected; got {hunks:?}"
         );
     }
+
+    #[test]
+    fn parse_v4a_patch_envelope_markers_after_the_header_add_no_diff_lines() {
+        // `*** Begin Patch` / `*** End of File` / `*** End Patch` are
+        // envelope, not content: once the file header has been seen they
+        // must not surface as diff lines. They are dropped twice over — by
+        // the explicit skip and by the prefix cascade below it, which only
+        // admits `@@` / `+` / `-` / ` ` lines — which is why the `||`→`&&`
+        // mutants in that skip are true equivalences (see
+        // .cargo/mutants.toml). This pins the contract so a future
+        // catch-all arm would be caught.
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n*** Begin Patch\n@@ fn x\n+added\n*** End of File\n*** End Patch\n";
+        let (path, hunks) = parse_v4a_patch(patch).expect("one hunk");
+        assert_eq!(path, "a.rs");
+        let lines: Vec<(DiffLineKind, &str)> = hunks
+            .iter()
+            .flat_map(|h| h.lines.iter().map(|l| (l.kind.clone(), l.text.as_str())))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (DiffLineKind::Context, "fn x"),
+                (DiffLineKind::Add, "added")
+            ],
+            "envelope markers must not become diff lines: {hunks:?}"
+        );
+    }
 }
