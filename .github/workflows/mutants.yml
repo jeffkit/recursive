@@ -50,6 +50,10 @@ on:
           - incremental
           - full
         default: incremental
+      agent_shards:
+        description: 'recursive-agent 分片模式：JSON matrix（{"shard": [["src/a.rs", …], …]}）。设置后跳过 full/regression，按文件清单并行跑 agent 分片（每个 ≤~850 变异体，330min 内可完成；--all 全量在 4 核 runner 实证两度超 330min，见 run 40598348438 / 40927380347）'
+        type: string
+        default: ""
   schedule:
     - cron: "37 18 1,15 * *"
 
@@ -310,7 +314,7 @@ jobs:
     runs-on: ubuntu-latest
     # 4h，控制在托管 runner 的 6h 单 job 上限内，且给 4 核降速留余量。
     timeout-minutes: 330
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full')
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && inputs.agent_shards == '')
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -361,7 +365,7 @@ jobs:
     # 全特性编译（cloud-runtime 的 aws-sdk/bollard、weixin、otel 都要编）+
     # 全测试套件，4 核冷缓存给 180min（缓存热后显著缩短）。
     timeout-minutes: 180
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && inputs.agent_shards == ''
     steps:
       - uses: actions/checkout@v4
         with:
@@ -405,3 +409,56 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+  # ── agent 分片模式（dispatch 专用）────────────────────────────────
+  # 动机：recursive-agent 全量 --all ≈9.6k 变异体，4 核 runner 实测吞吐
+  # ~78s/个（4 并发 ≈19.5s/个）≈46h，两次 dispatch（40598348438 /
+  # 40927380347）均在 330min 处被掐，全量终判永远跑不完。
+  # 形制：agent_shards 传 {"shard": [[file,…],…]}（由本地 --list 按变异体
+  # 数均衡切分，≤850/片，并集=全集），matrix 展开并行跑，每腿独立
+  # 330min 预算。复用 agent-mutants.sh 的 file-args 路径：rc 分诊
+  # （rc=3+无 MISSED=pass）与 #241 恢复守卫保持单点；copy 模式不触真源。
+  agent-shards:
+    name: agent mutants shard (${{ matrix.shard[0] }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    if: github.event_name == 'workflow_dispatch' && inputs.agent_shards != ''
+    strategy:
+      fail-fast: false
+      max-parallel: 13
+      matrix:
+        shard: ${{ fromJSON(inputs.agent_shards).shard }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # 同 regression：#184 门（invariants）依赖 HEAD~1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mutants-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mutants-cargo-
+
+      - name: Cache cargo-mutants binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('.github/workflows/mutants.yml') }}
+
+      - name: Install cargo-mutants
+        run: command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+
+      - name: Run agent mutation shard
+        env:
+          SHARD_FILES: ${{ join(matrix.shard, ' ') }}
+        run: |
+          echo "shard: $(echo $SHARD_FILES | wc -w) files"
+          bash .dev/scripts/agent-mutants.sh --jobs 4 $SHARD_FILES
