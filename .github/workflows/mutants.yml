@@ -365,7 +365,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # 必须 >=2：#184 门 dep_justification::dep_check_script_passes 依赖
+          # HEAD~1 解析（fail-closed），浅检出会让整个 job 必红（run 40871284828）。
+          fetch-depth: 2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
