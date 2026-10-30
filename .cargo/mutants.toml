@@ -489,4 +489,47 @@ exclude_re = [
     # (goes red if a catch-all arm is ever added — which would make these
     # killable; delete this entry with it).
     "crates/recursive-tui/src/app/render\\.rs:21[34]:13: replace \\|\\| with && in parse_v4a_patch",
+    # ── Issue #245 batch 18 (B2, run head b4bf273c), src/tools/http_call.rs
+    # true-equivalence trio. All three were applied by hand and left the
+    # whole http_call suite green (58/58; logs
+    # /tmp/b2-b18/negctl-m573-plus-times.log, …m770-or-and-group.log,
+    # …m770-eq-ne.log) after the 27 killable siblings of the same listing
+    # were pinned red one-by-one by the same driver.
+    #
+    # placeholders :573:26 `end + 1` → `end * 1`: multiplying by the
+    # literal 1 is the identity, so the mutant only moves the rescan point
+    # from after a placeholder's `}` onto the `}` itself. By induction the
+    # mutant's k-th `rest` is the original's k-th `rest` prefixed by k `}`
+    # characters; `}` never matches `find('{')` and `start`/`end`/`name`
+    # are all computed relative to the current `rest`, so every later scan
+    # runs in lockstep and the emitted names — and both error kinds, which
+    # embed the untouched full `template` — are identical for every input.
+    # The `+` → `-` sibling is killable and pinned by
+    # placeholders_reject_invalid_names_and_parse_adjacent_placeholders
+    # (adjacent `{a}{b}` would splice an empty name under the mutant).
+    "src/tools/http_call\\.rs:573:26: replace \\+ with \\* in placeholders",
+    # build_url :770:17 `||` → `&&` between the first two disjuncts of
+    # `within_base`'s parenthesised group: Rust precedence makes the mutant
+    # `(base_path.is_empty() && resolved == base_path) ||
+    # resolved.starts_with(base_path + "/")`. The group is only evaluated
+    # once `!has_dot_segment(&full_path)` already holds, and then the last
+    # disjunct is always true — with an empty base path every http URL
+    # path starts with "/", and with a non-empty base path the template
+    # (validated to start with "/") makes `full_path` begin with
+    # `base_path + "/"`, which set_path cannot collapse without a dot
+    # segment. So the group never changes `within_base` (the three
+    # disjuncts only select the error-message branch below) and `&&` vs
+    # `||` is unobservable. The `==`/`!=` sibling on the same line is
+    # covered by the next entry.
+    "src/tools/http_call\\.rs:770:17: replace \\|\\| with && in HttpCall::build_url",
+    # build_url :770:29 `resolved == base_path` → `!=`: a dot-free resolve
+    # is always at least `base_path + "/"` (template starts with "/", and
+    # set_path keeps a trailing slash — pinned by
+    # template_landing_on_the_base_path_itself_stays_under_base), so the
+    # `starts_with` disjunct is already true whenever the group is
+    # evaluated; the equality never has to carry the verdict, and flipping
+    # it only adds another true term. Both :770 mutants are guarded by that
+    # pin plus the escape-family tests (dot-segment, sibling-prefix,
+    # root-base) that own the `within_base == false` side.
+    "src/tools/http_call\\.rs:770:29: replace == with != in HttpCall::build_url",
 ]

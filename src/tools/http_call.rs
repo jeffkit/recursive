@@ -1143,6 +1143,69 @@ mod tests {
         assert!(err.to_string().contains("unknown method"), "{err}");
     }
 
+    /// Explicit non-empty `auth_header` / `auth_prefix` are kept verbatim;
+    /// explicit *empty* strings fall back to the defaults (the
+    /// `filter(|s| !s.is_empty())` guards — both sides: keep non-empty,
+    /// replace blank).
+    #[test]
+    fn explicit_auth_header_and_prefix_are_kept_and_blank_falls_back() {
+        let explicit = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "ep": {
+                "method": "GET", "base_url": "http://127.0.0.1:1", "path": "/x",
+                "allow_private": true,
+                "auth_header": "X-Custom-Auth", "auth_prefix": "Token "
+            }}})
+            .to_string(),
+        )
+        .expect("ok");
+        let e = explicit.get("ep").expect("ep");
+        assert_eq!(e.auth_header, "X-Custom-Auth");
+        assert_eq!(e.auth_prefix, "Token ");
+
+        let blank = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "ep": {
+                "method": "GET", "base_url": "http://127.0.0.1:1", "path": "/x",
+                "allow_private": true,
+                "auth_header": "", "auth_prefix": ""
+            }}})
+            .to_string(),
+        )
+        .expect("ok");
+        let e = blank.get("ep").expect("ep");
+        assert_eq!(
+            e.auth_header, "Authorization",
+            "a blank auth_header must fall back to the default"
+        );
+        assert_eq!(
+            e.auth_prefix, DEFAULT_AUTH_PREFIX,
+            "a blank auth_prefix must fall back to the default"
+        );
+    }
+
+    /// Every listed method must parse to its own variant (case
+    /// insensitively). One deleted match arm in `Method::parse` makes the
+    /// corresponding name fall into the `_ => None` catch-all — each
+    /// assertion here names its arm.
+    #[test]
+    fn parse_accepts_all_six_methods_case_insensitively() {
+        let cases = [
+            ("get", Method::Get),
+            ("HEAD", Method::Head),
+            ("Post", Method::Post),
+            ("PUT", Method::Put),
+            ("patch", Method::Patch),
+            ("dElEtE", Method::Delete),
+        ];
+        for (spelling, want) in cases {
+            assert_eq!(
+                Method::parse(spelling),
+                Some(want),
+                "parse({spelling}) must yield {want:?}"
+            );
+        }
+        assert_eq!(Method::parse("TRACE"), None);
+    }
+
     #[test]
     fn parse_rejects_bad_name_and_path() {
         let bad_name = EndpointRegistry::from_json(
@@ -1209,11 +1272,17 @@ mod tests {
             "v6 loopback is opt-in allowed"
         );
         // IMDS / metadata / unspecified stay blocked even with the opt-in.
+        // `[fe80::1]` and `[::]` pin `classify_ip`'s v6 branch: the
+        // fe80::/10 mask test (`seg0 & 0xffc0 == 0xfe80`) and the
+        // unspecified check are independent failure modes — link-local must
+        // be Blocked here, not merely Private-under-opt-in.
         for base in [
             "http://169.254.169.254/latest",
             "http://metadata.google.internal/",
             "http://0.0.0.0/",
             "http://[::ffff:169.254.169.254]/",
+            "http://[fe80::1]/",
+            "http://[::]/",
         ] {
             let err = spec_with(base, true).unwrap_err();
             let msg = err.to_string();
@@ -1228,6 +1297,11 @@ mod tests {
     fn guard_rejects_userinfo_fragment_and_scheme() {
         for (base, fragment) in [
             ("http://user:pass@api.example.com", "userinfo"),
+            // The two userinfo disjuncts are independent: a username without
+            // a password, and a password without a username, must each be
+            // rejected on their own.
+            ("http://user@api.example.com", "userinfo"),
+            ("http://:pass@api.example.com", "userinfo"),
             ("https://api.example.com/#frag", "fragment"),
             ("ftp://api.example.com", "scheme"),
         ] {
@@ -1241,12 +1315,14 @@ mod tests {
 
     #[test]
     fn discover_missing_file_is_none() {
+        let _guard = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(EndpointRegistry::discover(tmp.path()).is_none());
     }
 
     #[test]
     fn discover_valid_file_yields_registry() {
+        let _guard = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join(".recursive");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1266,6 +1342,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[test]
     fn discover_unreadable_file_is_none_and_warns() {
+        let _guard = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let file = tmp.path().join(".recursive").join("endpoints.json");
         std::fs::create_dir_all(&file).expect("mkdir");
@@ -1283,6 +1360,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[test]
     fn discover_invalid_json_is_none_and_warns() {
+        let _guard = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join(".recursive");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1297,6 +1375,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[test]
     fn discover_missing_file_stays_silent() {
+        let _guard = crate::test_util::env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
 
         assert!(EndpointRegistry::discover(tmp.path()).is_none());
@@ -1304,6 +1383,126 @@ mod tests {
             !logs_contain("endpoints file unreadable"),
             "an absent config is benign — no warning noise"
         );
+    }
+
+    /// RAII override of `RECURSIVE_ENDPOINTS_FILE`, restoring the previous
+    /// value (or removing it) on drop. The caller must already hold
+    /// `crate::test_util::env_lock()` — see `PinnedRecursiveHome` for the
+    /// same pattern.
+    struct ScopedEndpointsVar {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEndpointsVar {
+        fn set(value: &Path) -> Self {
+            let prev = std::env::var_os("RECURSIVE_ENDPOINTS_FILE");
+            // SAFETY: process-global env; the caller holds env_lock, so no
+            // other test observes or mutates the variable concurrently.
+            unsafe {
+                std::env::set_var("RECURSIVE_ENDPOINTS_FILE", value);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ScopedEndpointsVar {
+        fn drop(&mut self) {
+            // SAFETY: same lock discipline as `set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("RECURSIVE_ENDPOINTS_FILE", v),
+                    None => std::env::remove_var("RECURSIVE_ENDPOINTS_FILE"),
+                }
+            }
+        }
+    }
+
+    /// An explicit `RECURSIVE_ENDPOINTS_FILE` must win over the workspace
+    /// default path — even when the default file does not exist at all
+    /// (this is the only input that separates "override honoured" from
+    /// "override consulted but the same file found anyway").
+    #[test]
+    fn discover_prefers_explicit_env_file_over_workspace_default() {
+        let _guard = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No `<workspace>/.recursive/endpoints.json` anywhere — only the
+        // override exists.
+        let custom = tmp.path().join("custom-endpoints.json");
+        std::fs::write(&custom, registry_json("http://127.0.0.1:8899", json!({})))
+            .expect("write override");
+        let _var = ScopedEndpointsVar::set(&custom);
+        let reg = EndpointRegistry::discover(tmp.path()).expect("override must be honoured");
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("get_order").is_some());
+    }
+
+    /// A set-but-empty override is "not specified" (the `!p.is_empty()`
+    /// guard), so discovery must fall back to the workspace default file.
+    #[test]
+    fn discover_treats_empty_env_value_as_unspecified() {
+        let _guard = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".recursive");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("endpoints.json"),
+            registry_json("http://127.0.0.1:8899", json!({})),
+        )
+        .expect("write default");
+        let _var = ScopedEndpointsVar::set(Path::new(""));
+        let reg = EndpointRegistry::discover(tmp.path()).expect("empty override must fall back");
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("get_order").is_some());
+    }
+
+    /// A syntactically valid registry with zero endpoints is "not
+    /// configured" — the tool must not register as an empty shell.
+    #[test]
+    fn discover_empty_registry_file_is_none() {
+        let _guard = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join(".recursive");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("endpoints.json"),
+            json!({ "endpoints": {} }).to_string(),
+        )
+        .expect("write");
+        assert!(
+            EndpointRegistry::discover(tmp.path()).is_none(),
+            "an empty registry must degrade to None, not to an empty tool"
+        );
+    }
+
+    /// `is_empty` / `len` mirror the endpoint map (the 0- and 2-element
+    /// sides; the 1-element side is covered by
+    /// `discover_valid_file_yields_registry`).
+    #[test]
+    fn is_empty_and_len_reflect_registry_contents() {
+        let empty = EndpointRegistry::from_json("{\"endpoints\": {}}").expect("ok");
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let two = EndpointRegistry::from_json(
+            &json!({ "endpoints": {
+                "create_ticket": {
+                    "method": "POST",
+                    "base_url": "http://127.0.0.1:1",
+                    "path": "/tickets",
+                    "allow_private": true
+                },
+                "head_check": {
+                    "method": "HEAD",
+                    "base_url": "http://127.0.0.1:1",
+                    "path": "/health",
+                    "allow_private": true
+                }
+            }})
+            .to_string(),
+        )
+        .expect("ok");
+        assert!(!two.is_empty());
+        assert_eq!(two.len(), 2);
     }
 
     // ── schema hygiene ──────────────────────────────────────────────────
@@ -1346,6 +1545,64 @@ mod tests {
             mutating.side_effect_class(),
             super::super::audit::ToolSideEffect::External
         );
+    }
+
+    /// The classification is `mutating || !idempotent` — the two disjuncts
+    /// must each be able to tip a registry on its own, and a fully
+    /// read-only registry must stay ReadOnly/Fetch. The existing
+    /// `side_effect_class_tracks_registry` cannot see the split: a POST
+    /// defaults to non-idempotent, so both disjuncts fire together there.
+    #[test]
+    fn side_effect_and_kind_track_each_disjunct_independently() {
+        // `is_mutating` alone: POST, but explicitly idempotent.
+        let post_idempotent = HttpCall::new(loopback_registry(json!({
+            "create_ticket": {
+                "method": "POST",
+                "base_url": "http://127.0.0.1:1",
+                "path": "/tickets",
+                "allow_private": true,
+                "idempotent": true
+            }
+        })));
+        assert_eq!(
+            post_idempotent.side_effect_class(),
+            super::super::audit::ToolSideEffect::External,
+            "a mutating endpoint must classify External even when idempotent"
+        );
+        assert_eq!(
+            post_idempotent.kind(),
+            ToolKind::Other,
+            "a mutating endpoint must classify Other even when idempotent"
+        );
+
+        // `!idempotent` alone: GET (a read), but explicitly non-idempotent.
+        let get_flaky = HttpCall::new(loopback_registry(json!({
+            "flaky_read": {
+                "method": "GET",
+                "base_url": "http://127.0.0.1:1",
+                "path": "/flaky",
+                "allow_private": true,
+                "idempotent": false
+            }
+        })));
+        assert_eq!(
+            get_flaky.side_effect_class(),
+            super::super::audit::ToolSideEffect::External,
+            "a non-idempotent endpoint must classify External even when read-only"
+        );
+        assert_eq!(
+            get_flaky.kind(),
+            ToolKind::Other,
+            "a non-idempotent endpoint must classify Other even when read-only"
+        );
+
+        // Fully read-only (GET, default idempotent): ReadOnly / Fetch.
+        let read_only = HttpCall::new(loopback_registry(json!({})));
+        assert_eq!(
+            read_only.side_effect_class(),
+            super::super::audit::ToolSideEffect::ReadOnly
+        );
+        assert_eq!(read_only.kind(), ToolKind::Fetch);
     }
 
     // ── execution against a loopback mock (allow_private opt-in) ────────
@@ -1393,6 +1650,81 @@ mod tests {
         let reg = EndpointRegistry::from_json(&registry_json(&format!("http://{addr}"), json!({})))
             .expect("registry");
         HttpCall::new(reg)
+    }
+
+    /// One-shot mock answering with a `Transfer-Encoding: chunked` body
+    /// split into the given chunks — exercises `read_capped` across
+    /// multiple body chunks (a small `Content-Length` body arrives as a
+    /// single chunk, which hides mid-stream cap handling).
+    fn spawn_chunked_mock(
+        chunks: &[String],
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let chunks = chunks.to_vec();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let mut resp = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            );
+            for chunk in &chunks {
+                resp.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+            }
+            resp.push_str("0\r\n\r\n");
+            stream.write_all(resp.as_bytes()).ok();
+            stream.flush().ok();
+        });
+        (addr, handle)
+    }
+
+    /// Mock that drops the first connection without reading or answering
+    /// (the client sees a transport-level failure), then polls for a second
+    /// connection for a short window. Returns `None` from the handle when
+    /// no second request arrived — the observable difference between a
+    /// retried and a non-retried endpoint.
+    fn spawn_drop_first_then_serve() -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Option<Captured>>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept #1");
+            drop(first);
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 8192];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                        stream.write_all(response.as_bytes()).ok();
+                        stream.flush().ok();
+                        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                        let mut head_lines = head.split("\r\n");
+                        let request_line = head_lines.next().unwrap_or_default().to_string();
+                        let headers = head_lines.collect::<Vec<_>>().join("\r\n");
+                        return Some(Captured {
+                            request_line,
+                            headers,
+                            body: body.to_string(),
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return None,
+                }
+            }
+        });
+        (addr, handle)
     }
 
     #[tokio::test]
@@ -1562,6 +1894,18 @@ mod tests {
         assert_eq!(url.path(), "/svc/orders/v1.2");
     }
 
+    /// A template that lands exactly on the base path (plus trailing slash)
+    /// is within bounds — the `resolved == base_path` disjunct's boundary
+    /// neighbour. This is the equality-side input: the request path is the
+    /// base prefix itself, not something beneath it.
+    #[test]
+    fn template_landing_on_the_base_path_itself_stays_under_base() {
+        let spec = templated_spec("https://gw.internal/svc/orders", "/");
+        let url = HttpCall::build_url(&spec, &BTreeMap::new())
+            .expect("template resolving to the base path is within bounds");
+        assert_eq!(url.path(), "/svc/orders/");
+    }
+
     #[test]
     fn template_dot_segment_escaping_base_is_rejected() {
         // A literal `..` in the template collapses under `set_path`; the
@@ -1692,6 +2036,78 @@ mod tests {
         );
     }
 
+    /// A chunk that straddles the cap while earlier chunks are already in
+    /// the buffer must be clipped to exactly `max_bytes - buf.len()`: the
+    /// body stops at the cap (90 `z`s = 100 - the 10 leading `q`s), with
+    /// the truncation marker. A cap that added instead of subtracting would
+    /// blow past 100 `z`s (or panic on the slice).
+    #[tokio::test]
+    async fn chunked_overflow_is_capped_mid_stream() {
+        let (addr, handle) = spawn_chunked_mock(&["q".repeat(10), "z".repeat(200)]);
+        let reg = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "get_order": {
+                "method": "GET",
+                "base_url": format!("http://{addr}"),
+                "path": "/api/orders/{order_id}",
+                "max_response_bytes": 100,
+                "allow_private": true
+            }}})
+            .to_string(),
+        )
+        .expect("registry");
+        let tool = HttpCall::new(reg);
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"endpoint": "get_order", "params": {"order_id": "A"}})),
+        )
+        .await
+        .expect("no hang")
+        .expect("ok");
+        handle.join().expect("join");
+        assert!(out.contains("HTTP 200"), "{out}");
+        assert!(out.contains("truncated at 100 bytes"), "{out}");
+        assert_eq!(
+            out.matches('z').count(),
+            90,
+            "body must stop exactly at the cap: {out}"
+        );
+    }
+
+    /// Two chunks totalling *under* the cap must both be read: the
+    /// early-break guard is `buf.len() >= max_bytes` (an exact-cap stop),
+    /// not a stop at the first short chunk.
+    #[tokio::test]
+    async fn chunked_body_under_the_cap_is_read_in_full() {
+        let (addr, handle) = spawn_chunked_mock(&["q".repeat(60), "z".repeat(30)]);
+        let reg = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "get_order": {
+                "method": "GET",
+                "base_url": format!("http://{addr}"),
+                "path": "/api/orders/{order_id}",
+                "max_response_bytes": 100,
+                "allow_private": true
+            }}})
+            .to_string(),
+        )
+        .expect("registry");
+        let tool = HttpCall::new(reg);
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"endpoint": "get_order", "params": {"order_id": "A"}})),
+        )
+        .await
+        .expect("no hang")
+        .expect("ok");
+        handle.join().expect("join");
+        assert!(out.contains("HTTP 200"), "{out}");
+        assert!(!out.contains("truncated"), "90 bytes < 100 cap: {out}");
+        assert_eq!(
+            out.matches('z').count(),
+            30,
+            "the second chunk must not be dropped: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn redirect_is_an_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1743,6 +2159,74 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("http://"), "error leaked a URL: {msg}");
+    }
+
+    /// A transport failure on an idempotent endpoint (GET is idempotent by
+    /// default) is retried once: the dropped first attempt is followed by a
+    /// second, successful request. The attempt counter must actually reach
+    /// 1 — a counter that never leaves 0 (or goes negative) reports the
+    /// failure without retrying.
+    #[tokio::test]
+    async fn transport_failure_is_retried_once_for_idempotent_endpoints() {
+        let (addr, handle) = spawn_drop_first_then_serve();
+        let reg = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "get_order": {
+                "method": "GET",
+                "base_url": format!("http://{addr}"),
+                "path": "/api/orders/{order_id}",
+                "allow_private": true
+            }}})
+            .to_string(),
+        )
+        .expect("registry");
+        let tool = HttpCall::new(reg);
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"endpoint": "get_order", "params": {"order_id": "A"}})),
+        )
+        .await
+        .expect("no hang")
+        .expect("GET is idempotent by default: the dropped attempt must be retried");
+        let captured = handle
+            .join()
+            .expect("join")
+            .expect("a second request must have arrived");
+        assert_eq!(captured.request_line, "GET /api/orders/A HTTP/1.1");
+        assert!(out.contains("HTTP 200"), "{out}");
+    }
+
+    /// A transport failure on a non-idempotent endpoint (POST defaults to
+    /// non-idempotent) surfaces immediately: exactly one connection is
+    /// made, and the error names the endpoint without the URL.
+    #[tokio::test]
+    async fn transport_failure_is_not_retried_for_non_idempotent_endpoints() {
+        let (addr, handle) = spawn_drop_first_then_serve();
+        let reg = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "create_ticket": {
+                "method": "POST",
+                "base_url": format!("http://{addr}"),
+                "path": "/tickets",
+                "allow_private": true
+            }}})
+            .to_string(),
+        )
+        .expect("registry");
+        let tool = HttpCall::new(reg);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"endpoint": "create_ticket", "body": {"x": 1}})),
+        )
+        .await
+        .expect("no hang");
+        let msg = result
+            .expect_err("the dropped first attempt must surface as an error")
+            .to_string();
+        assert!(msg.contains("create_ticket"), "{msg}");
+        assert!(!msg.contains("http://"), "error leaked a URL: {msg}");
+        assert!(
+            handle.join().expect("join").is_none(),
+            "POST must not be retried: no second request may arrive"
+        );
     }
 
     #[tokio::test]
@@ -1819,6 +2303,42 @@ mod tests {
         let names = placeholders("/api/orders/{order_id}/items/{sku}").expect("ok");
         assert_eq!(names, vec!["order_id", "sku"]);
         assert!(placeholders("/no/placeholders").expect("ok").is_empty());
+    }
+
+    /// The empty-name check and the charset check are independent failure
+    /// modes: `{}` dies on emptiness, `{a-b}` on illegal characters (this
+    /// is the non-empty side of the `||`). Adjacent `{a}{b}` pins the scan
+    /// resumption point: after emitting `a` the walk must continue after
+    /// the first `}` — resuming one byte early would splice the closing
+    /// brace into the next name's window and die on the empty check.
+    #[test]
+    fn placeholders_reject_invalid_names_and_parse_adjacent_placeholders() {
+        let err = placeholders("/x/{a-b}").expect_err("hyphen is not [a-zA-Z0-9_]");
+        assert!(err.to_string().contains("invalid placeholder"), "{err}");
+        let err = placeholders("/x/{}").expect_err("empty placeholder");
+        assert!(err.to_string().contains("invalid placeholder"), "{err}");
+        let names = placeholders("/{a}{b}").expect("adjacent placeholders parse");
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// Numbers, bools and strings render; null/object/array do not (they
+    /// belong in `body`). A numeric path param must substitute exactly like
+    /// a string one.
+    #[test]
+    fn scalar_to_string_renders_scalars_and_rejects_non_scalars() {
+        assert_eq!(scalar_to_string(&json!(42)), Some("42".to_string()));
+        assert_eq!(scalar_to_string(&json!(2.5)), Some("2.5".to_string()));
+        assert_eq!(scalar_to_string(&json!(true)), Some("true".to_string()));
+        assert_eq!(scalar_to_string(&json!("raw")), Some("raw".to_string()));
+        assert_eq!(scalar_to_string(&Value::Null), None);
+        assert_eq!(scalar_to_string(&json!({ "k": 1 })), None);
+        assert_eq!(scalar_to_string(&json!([1, 2])), None);
+
+        let spec = templated_spec("https://gw.internal/svc/orders", "/{id}");
+        let mut params = BTreeMap::new();
+        params.insert("id".to_string(), json!(42));
+        let url = HttpCall::build_url(&spec, &params).expect("numeric placeholder");
+        assert_eq!(url.path(), "/svc/orders/42");
     }
 
     // ── static headers (Goal 431 / #244 W2b) ────────────────────────────
