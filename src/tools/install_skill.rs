@@ -1300,6 +1300,17 @@ mod tests {
     }
 
     #[test]
+    fn byte_caps_keep_their_documented_magnitudes() {
+        // The two fetch caps are pure arithmetic consts and the fixed
+        // skillhub.cn hosts cannot be intercepted in tests, so their
+        // documented magnitudes (module doc: search bodies 1 MiB, archives
+        // 32 MiB) are pinned literally. Any operator flip (`*`→`/`/`+`)
+        // silently collapses or shifts the cap while still compiling.
+        assert_eq!(MAX_SEARCH_BYTES, 1_048_576);
+        assert_eq!(MAX_ARCHIVE_BYTES, 33_554_432);
+    }
+
+    #[test]
     fn extract_zip_strips_leading_slug_component() {
         // kills mutation of split_once('/') path stripping logic
         use std::io::Write;

@@ -966,6 +966,18 @@ mod tests {
         (tmp, ws, private)
     }
 
+    fn fc(path: &str, status: ChangeStatus) -> FileChange {
+        FileChange {
+            path: path.to_string(),
+            status,
+            bytes_before: None,
+            bytes_after: None,
+            diff: String::new(),
+            coarse: false,
+            coarse_reason: None,
+        }
+    }
+
     #[test]
     fn turn_ledger_reports_added_modified_deleted_with_diffs() {
         let (_tmp, ws, private) = repo_fixture();
@@ -988,6 +1000,10 @@ mod tests {
         assert_eq!(changes.modified[0].path, "keep.txt");
         assert_eq!(changes.deleted[0].path, "gone.txt");
         assert!(changes.baseline_tree.is_some());
+        assert!(
+            !changes.truncated,
+            "an in-budget git turn is never truncated"
+        );
 
         let modified = &changes.modified[0];
         assert!(!modified.coarse);
@@ -1090,6 +1106,12 @@ mod tests {
         assert_eq!(changes.sources, vec!["workspace_walk".to_string()]);
         assert_eq!(changes.added.len(), 1);
         assert_eq!(changes.modified.len(), 1);
+        assert_eq!(
+            changes.baseline_tree, None,
+            "walk snapshots carry no git tree handle"
+        );
+        assert_eq!(changes.current_tree, None);
+        assert!(!changes.truncated, "an in-budget walk is not truncated");
         assert!(
             changes.modified[0].diff.contains("+two\n"),
             "{:?}",
@@ -1307,6 +1329,10 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+        // Exact unit boundaries: exactly 1 KiB is already KiB, exactly 1 MiB
+        // is already MiB — neither may render as a raw byte count.
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_048_576), "1.0 MiB");
     }
 
     #[test]
@@ -1354,5 +1380,219 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn changed_count_is_the_sum_of_all_three_buckets() {
+        // Uneven buckets so no single operator swap can land back on 6.
+        let changes = TurnChanges {
+            turn: 1,
+            added: vec![fc("a", ChangeStatus::Added)],
+            modified: vec![
+                fc("b", ChangeStatus::Modified),
+                fc("c", ChangeStatus::Modified),
+            ],
+            deleted: vec![
+                fc("d", ChangeStatus::Deleted),
+                fc("e", ChangeStatus::Deleted),
+                fc("f", ChangeStatus::Deleted),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(changes.changed_count(), 6);
+    }
+
+    #[test]
+    fn summary_truth_table_buckets_and_coarse() {
+        assert_eq!(TurnChanges::default().summary(), "no file changes");
+
+        let one_added = TurnChanges {
+            added: vec![fc("a", ChangeStatus::Added)],
+            ..Default::default()
+        };
+        // The exact line does double duty: the bucket must be reported
+        // ("+1", not "no file changes") and, with nothing coarse, the
+        // summary must not grow a "(0 coarse)" suffix.
+        assert_eq!(one_added.summary(), "+1");
+
+        let one_modified = TurnChanges {
+            modified: vec![fc("m", ChangeStatus::Modified)],
+            ..Default::default()
+        };
+        assert_eq!(one_modified.summary(), "~1");
+
+        let one_deleted = TurnChanges {
+            deleted: vec![fc("d", ChangeStatus::Deleted)],
+            ..Default::default()
+        };
+        assert_eq!(one_deleted.summary(), "-1");
+
+        let one_coarse = TurnChanges {
+            added: vec![FileChange {
+                coarse: true,
+                coarse_reason: Some("why".to_string()),
+                ..fc("a", ChangeStatus::Added)
+            }],
+            ..Default::default()
+        };
+        assert_eq!(one_coarse.summary(), "+1 (1 coarse)");
+    }
+
+    #[test]
+    fn size_delta_renders_all_four_absence_patterns() {
+        let both = FileChange {
+            bytes_before: Some(100),
+            bytes_after: Some(200),
+            ..fc("a", ChangeStatus::Modified)
+        };
+        assert_eq!(size_delta(&both), "100 B → 200 B");
+        let only_after = FileChange {
+            bytes_before: None,
+            bytes_after: Some(2048),
+            ..fc("b", ChangeStatus::Added)
+        };
+        assert_eq!(size_delta(&only_after), "2.0 KiB");
+        let only_before = FileChange {
+            bytes_before: Some(512),
+            bytes_after: None,
+            ..fc("c", ChangeStatus::Deleted)
+        };
+        assert_eq!(size_delta(&only_before), "512 B");
+        let neither = FileChange {
+            bytes_before: None,
+            bytes_after: None,
+            ..fc("d", ChangeStatus::Modified)
+        };
+        assert_eq!(size_delta(&neither), "?");
+    }
+
+    #[test]
+    fn default_budgets_carry_the_documented_defaults() {
+        // Literal pins: these defaults are pure arithmetic consts, so a
+        // changed operator silently moves every user-facing budget at once.
+        assert_eq!(DEFAULT_MAX_FILES, 500);
+        assert_eq!(DEFAULT_MAX_FILE_BYTES, 2_097_152);
+        assert_eq!(DEFAULT_COMPARE_DEADLINE_MS, 100);
+    }
+
+    #[test]
+    fn budgets_accessor_returns_the_configured_budgets() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let budgets = Budgets {
+            max_files: 7,
+            max_file_bytes: 9,
+            compare_deadline_ms: 3,
+            context_lines: 1,
+        };
+        let ledger = Deliverables::new(&ws, tmp.path().join("private"), budgets.clone()).unwrap();
+        assert_eq!(ledger.budgets(), &budgets);
+    }
+
+    #[test]
+    fn walk_truncation_flags_the_ledger_even_when_the_render_budget_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("plain");
+        std::fs::create_dir_all(&ws).unwrap();
+        for i in 0..5 {
+            std::fs::write(ws.join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        let budgets = Budgets {
+            max_files: 2,
+            ..Budgets::default()
+        };
+        let ledger = Deliverables::new(&ws, tmp.path().join("private"), budgets).unwrap();
+        ledger.begin_turn(1);
+        // Baseline walks 5 files under a 2-file cap → truncated; the current
+        // snapshot (trimmed back under the cap) is not. One-sided truncation
+        // must still flag the ledger, with no rendered changes to lean on.
+        ledger.ensure_baseline().unwrap();
+        for i in 2..5 {
+            std::fs::remove_file(ws.join(format!("f{i}.txt"))).unwrap();
+        }
+        let changes = ledger.finalize_turn(1).unwrap();
+        assert_eq!(
+            changes.changed_count(),
+            0,
+            "the two tracked files never changed"
+        );
+        assert!(
+            changes.truncated,
+            "a truncated baseline must flag the ledger even with no rendered changes"
+        );
+    }
+
+    #[test]
+    fn last_changes_reflects_only_finalized_turns() {
+        let (_tmp, ws, private) = repo_fixture();
+        let ledger = ledger(&ws, &private);
+        ledger.begin_turn(1);
+        assert!(
+            ledger.last_changes().is_none(),
+            "an armed but unfinalized turn has no ledger yet"
+        );
+        ledger.ensure_baseline().unwrap();
+        std::fs::write(ws.join("a.txt"), "a\n").unwrap();
+        let finalized = ledger.finalize_turn(1).unwrap();
+        assert_eq!(
+            ledger.last_changes(),
+            Some(finalized),
+            "the finalized ledger must come back verbatim"
+        );
+    }
+
+    #[test]
+    fn changes_stay_frozen_after_finalize() {
+        let (_tmp, ws, private) = repo_fixture();
+        let ledger = ledger(&ws, &private);
+        ledger.begin_turn(1);
+        ledger.ensure_baseline().unwrap();
+        std::fs::write(ws.join("a.txt"), "a\n").unwrap();
+        let finalized = ledger.finalize_turn(1).unwrap();
+        // Edits after the turn closed belong to the next turn: changes()
+        // must keep serving the finalized ledger, not a live diff.
+        std::fs::write(ws.join("b.txt"), "b\n").unwrap();
+        assert_eq!(
+            ledger.changes().unwrap().unwrap(),
+            finalized,
+            "post-finalize edits must not leak into the closed turn"
+        );
+    }
+
+    #[test]
+    fn render_is_none_until_there_is_something_to_say() {
+        let (_tmp, ws, private) = repo_fixture();
+        let ledger = ledger(&ws, &private);
+        ledger.begin_turn(1);
+        ledger.ensure_baseline().unwrap();
+        assert!(
+            ledger.render().unwrap().is_none(),
+            "an armed turn with no changes and no presentations renders nothing"
+        );
+        std::fs::write(ws.join("a.txt"), "a\n").unwrap();
+        let rendered = ledger.render().unwrap().expect("a real change must render");
+        assert!(rendered.contains("+ a.txt — added"), "{rendered}");
+    }
+
+    #[test]
+    fn walk_diff_ignores_unchanged_files() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("plain");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.txt"), "same\n").unwrap();
+        let ledger = ledger(&ws, &tmp.path().join("private"));
+        ledger.begin_turn(1);
+        ledger.ensure_baseline().unwrap();
+        // a.txt is untouched; only b.txt may appear in the ledger.
+        std::fs::write(ws.join("b.txt"), "new\n").unwrap();
+        let changes = ledger.finalize_turn(1).unwrap();
+        assert_eq!(changes.added.len(), 1);
+        assert_eq!(changes.added[0].path, "b.txt");
+        assert!(
+            changes.modified.is_empty(),
+            "an unchanged file must not be reported as modified: {changes:?}"
+        );
+        assert!(changes.deleted.is_empty());
     }
 }
