@@ -463,4 +463,144 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         (workspace, home, guard)
     }
+
+    // ── #245 batch 21 mutant pins ────────────────────────────────────────────
+
+    #[test]
+    fn now_ms_is_current_wall_clock_unix_millis() {
+        // 2020-01-01T00:00:00Z ..= 2100-01-01T00:00:00Z — pins "current wall
+        // clock in unix millis" against any constant sentinel (0 / 1 /
+        // negative).
+        let t = now_ms();
+        assert!(
+            (1_577_836_800_000..=4_102_444_800_000).contains(&t),
+            "now_ms must be current unix millis, got {t}"
+        );
+        assert!(now_ms() >= t, "the clock must not go backwards");
+    }
+
+    #[test]
+    fn clear_errors_when_the_record_cannot_be_removed() {
+        let d = dir();
+        // A directory at the record path: remove_file fails with a non-NotFound
+        // error (EISDIR/EPERM), which must surface as Err — only the absent
+        // file case is tolerated.
+        std::fs::create_dir_all(path_in(d.path())).unwrap();
+        let res = clear(d.path());
+        assert!(
+            res.is_err(),
+            "non-NotFound removal failure must be Err, got {res:?}"
+        );
+    }
+
+    /// Append-only shared sink the capture subscriber formats into
+    /// (same harness as `checkpoint.rs` / `config_file.rs`).
+    #[derive(Clone)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local WARN-level tracing subscriber and return
+    /// `(f's result, everything it formatted)` — parallel-safe, no
+    /// process-global subscriber, no env mutation.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        let logs = String::from_utf8(out).expect("tracing output is utf-8");
+        (value, logs)
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "forces a non-NotFound unlink failure via unix permission bits (0555 dir); Windows chmod is a no-op so the failure is not reproducible there"
+    )]
+    fn unremovable_record_is_restored_with_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let (workspace, _home, _guard) = workspace_with_sessions();
+        let slug_dir = crate::paths::user_sessions_dir(&workspace)
+            .unwrap()
+            .join(crate::session::workspace_slug(&workspace));
+        let session = slug_dir.join("2026-01-01T00-00-00Z-slug");
+        let now = 5_000_000i64;
+        persist(
+            &session,
+            &PersistedWakeup::new("poll", "check ci", Duration::from_secs(1), now - 60_000),
+        )
+        .unwrap();
+
+        // A read-only session dir: read_dir/load still succeed, but unlink
+        // fails with EACCES/EPERM — a non-NotFound consume failure that must
+        // WARN (any degradation is observable) while the record is still
+        // handed back to the caller.
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (result, logs) = capture_logs(|| take_due_in_workspace(&workspace, now));
+        std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (dir, w) = result.expect("the due record is still restored");
+        assert_eq!(dir, session);
+        assert_eq!(w.prompt, "check ci");
+        assert!(
+            logs.contains("could not consume restored wakeup"),
+            "a non-NotFound consume failure must WARN, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn scan_descends_to_max_depth_and_finds_nested_records() {
+        let root = dir();
+        let slug = root.path().join("some-slug");
+        // outer(1) / inner(2): the record's directory sits exactly at
+        // MAX_SCAN_DEPTH and must still be scanned (the slack the module doc
+        // promises for a nested layout).
+        let inner = slug.join("outer").join("inner");
+        let now = 1_000_000i64;
+        persist(
+            &inner,
+            &PersistedWakeup::new("deep", "p", Duration::from_secs(1), now - 2_000),
+        )
+        .unwrap();
+        let mut due = Vec::new();
+        collect_due(&slug, now, 0, &mut due);
+        assert_eq!(due.len(), 1, "a record at MAX_SCAN_DEPTH must be found");
+        assert_eq!(due[0].1.reason, "deep");
+    }
+
+    #[test]
+    fn scan_stops_below_max_depth() {
+        let root = dir();
+        let slug = root.path().join("some-slug");
+        // c sits one level past MAX_SCAN_DEPTH — out of scan range by design.
+        let deep = slug.join("a").join("b").join("c");
+        let now = 1_000_000i64;
+        persist(
+            &deep,
+            &PersistedWakeup::new("too-deep", "p", Duration::from_secs(1), now - 2_000),
+        )
+        .unwrap();
+        let mut due = Vec::new();
+        collect_due(&slug, now, 0, &mut due);
+        assert!(
+            due.is_empty(),
+            "records beyond MAX_SCAN_DEPTH must not be restored"
+        );
+    }
 }

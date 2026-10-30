@@ -640,4 +640,88 @@ mod tests {
         std::env::remove_var("RECURSIVE_TEAMS_DIR");
         assert_eq!(dir, std::path::PathBuf::from(custom));
     }
+
+    // ── #245 batch 21 mutant pins ────────────────────────────────────────────
+
+    #[test]
+    fn member_names_lists_all_members_sorted() {
+        let mut tf = TeamFile::new("alpha");
+        tf.add_member(TeamMember::new("zeta", "general"));
+        tf.add_member(TeamMember::new("alpha", "general"));
+        tf.add_member(TeamMember::new("mid", "general"));
+        assert_eq!(
+            tf.member_names(),
+            vec!["alpha", "mid", "zeta"],
+            "every member name, in BTreeMap (sorted) order"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_persists_registered_team_back_to_disk() {
+        let _g = with_temp_teams_dir();
+        let reg = TeamRegistry::create("delta").await.unwrap();
+        std::fs::remove_file(team_file_path("delta")).unwrap();
+        assert!(!team_file_path("delta").exists());
+        reg.save().await.unwrap();
+        assert!(
+            team_file_path("delta").exists(),
+            "save must re-persist every registered team, not just report Ok"
+        );
+        let reloaded = TeamRegistry::load("delta").await.unwrap();
+        assert_eq!(reloaded.get("delta").await.unwrap().name, "delta");
+    }
+
+    #[test]
+    fn list_on_disk_lists_only_regular_json_stems_sorted() {
+        let g = with_temp_teams_dir();
+        let dir = g.path();
+        std::fs::write(dir.join("beta.json"), b"{}").unwrap();
+        std::fs::write(dir.join("alpha.json"), b"{}").unwrap();
+        // Decoys that must all be skipped: a subdirectory (even one named
+        // *.json), a non-json regular file, and a temp leftover from an
+        // interrupted atomic write.
+        std::fs::create_dir_all(dir.join("subdir.json")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"not a team").unwrap();
+        std::fs::write(dir.join(".tmp-team-x.json"), b"{}").unwrap();
+
+        assert_eq!(
+            TeamRegistry::list_on_disk().unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "only regular non-temp *.json stems, sorted"
+        );
+    }
+
+    #[test]
+    fn list_on_disk_without_dir_is_empty() {
+        let g = with_temp_teams_dir();
+        std::fs::remove_dir_all(g.path()).unwrap();
+        assert_eq!(
+            TeamRegistry::list_on_disk().unwrap(),
+            Vec::<String>::new(),
+            "absent teams dir is an empty catalog, not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_errors_when_target_cannot_be_unlinked() {
+        let _g = with_temp_teams_dir();
+        // A directory at the team-file path: remove_file fails with an error
+        // that is NOT NotFound (EISDIR/EPERM), which must surface as Err
+        // rather than be folded into the idempotent Ok(false) arm.
+        std::fs::create_dir_all(team_file_path("deldir")).unwrap();
+        let res = TeamRegistry::delete("deldir").await;
+        assert!(
+            res.is_err(),
+            "non-NotFound unlink failure must be Err, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_teams_dir_creates_and_returns_the_pinned_dir() {
+        let g = with_temp_teams_dir();
+        std::fs::remove_dir_all(g.path()).unwrap();
+        let got = ensure_teams_dir().unwrap();
+        assert_eq!(got, g.path(), "must return the configured teams dir");
+        assert!(g.path().is_dir(), "must create the directory");
+    }
 }

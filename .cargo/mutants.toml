@@ -687,4 +687,13 @@ exclude_re = [
     # guard at :485 is a different match — its flip DOES divert control (an
     # empty Ok would return before Bing gets its chance) and stays killable.
     "src/tools/web_search\\.rs:493:28: replace match guard !results\\.is_empty\\(\\) with true in WebSearch::search_html_fallback",
+    # ── Issue #245 batch 21 (B2 seat, task list /tmp/b2-batch21.txt) ───────
+    # HookResult::continue_default :225:9 — the function body IS
+    # `Self::default()` (the doc comment says exactly that: "Shorthand for
+    # the default do-nothing result"), so replacing the body with
+    # `Default::default()` is the identity: every call site observes the
+    # same constructed struct (action Continue, all Option fields None).
+    # The fail-open/fail-closed semantics that route through it are pinned
+    # by from_fail_mode / timeout-fallback tests elsewhere in the module.
+    "src/hooks/external\\.rs:225:9: replace HookResult::continue_default -> Self with Default::default\\(\\)",
 ]

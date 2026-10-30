@@ -819,4 +819,157 @@ key_url = "https://custom.example.com/keys"
         );
         Ok(())
     }
+
+    // ── #245 batch 21 mutant pins ────────────────────────────────────────────
+
+    #[test]
+    fn additional_presets_reads_only_regular_toml_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+
+        let dir = tmp.path().join(".recursive").join("providers.d");
+        write_user_override(
+            &dir,
+            "aaa-vendor.toml",
+            r#"
+[[providers]]
+id = "aaa-vendor"
+provider_type = "openai"
+api_base = "https://aaa.example.com/v1"
+default_model = "a1"
+models = [{name = "a1", context_window = 1000}]
+"#,
+        )?;
+        // Valid TOML under a non-.toml extension: the extension filter must
+        // skip it even though it would parse fine.
+        write_user_override(
+            &dir,
+            "bbb-backup.bak",
+            r#"
+[[providers]]
+id = "bbb-backup"
+provider_type = "openai"
+api_base = "https://bbb.example.com/v1"
+default_model = "b1"
+models = [{name = "b1", context_window = 2000}]
+"#,
+        )?;
+        // A directory inside providers.d must never be read as a preset file.
+        std::fs::create_dir_all(dir.join("ccc.toml"))?;
+
+        let loaded = additional_presets();
+        let ids: Vec<&str> = loaded.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["aaa-vendor"],
+            "only the regular .toml file may load, got {ids:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_preset_into_empty_override_fields_preserve_existing() {
+        // A partial override that omits identity fields must not clobber the
+        // existing preset's values with empty ones — the whole point of the
+        // per-field `!…is_empty()` guards.
+        let mut existing = sample_test_preset("merge-me");
+        let mut over = sample_test_preset("merge-me");
+        over.api_base = String::new();
+        over.provider_type = String::new();
+        over.default_model = String::new();
+        over.anthropic_api_base = None;
+        over.key_env = String::new();
+        over.key_url = String::new();
+        over.models = vec![ModelSpec {
+            name: "user-extra".to_string(),
+            context_window: 4096,
+            max_tokens: None,
+            pricing: None,
+        }];
+
+        merge_preset_into(&mut existing, over);
+
+        assert_eq!(existing.api_base, "https://write-helper.example.com/v1");
+        assert_eq!(existing.provider_type, "openai");
+        assert_eq!(existing.default_model, "wh-1");
+        assert_eq!(existing.key_env, "WH_KEY");
+        assert_eq!(existing.key_url, "https://write-helper.example.com/keys");
+        assert!(existing.anthropic_api_base.is_none());
+        // Model merge still applies: a new name is appended after the kept one.
+        let names: Vec<&str> = existing.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["wh-1", "user-extra"]);
+    }
+
+    #[test]
+    fn merge_preset_into_present_override_fields_replace_existing() {
+        // The positive side of the same guards: a non-empty override field
+        // must win over the existing value.
+        let mut existing = sample_test_preset("merge-me");
+        let mut over = sample_test_preset("merge-me");
+        over.api_base = "https://override.example.com/v1".to_string();
+        over.provider_type = "anthropic".to_string();
+        over.default_model = "ov-1".to_string();
+        over.anthropic_api_base = Some("https://override.example.com/anthropic".to_string());
+        over.key_env = "OV_KEY".to_string();
+        over.key_url = "https://override.example.com/keys".to_string();
+        over.models = Vec::new();
+
+        merge_preset_into(&mut existing, over);
+
+        assert_eq!(existing.api_base, "https://override.example.com/v1");
+        assert_eq!(existing.provider_type, "anthropic");
+        assert_eq!(existing.default_model, "ov-1");
+        assert_eq!(existing.key_env, "OV_KEY");
+        assert_eq!(existing.key_url, "https://override.example.com/keys");
+        assert_eq!(
+            existing.anthropic_api_base.as_deref(),
+            Some("https://override.example.com/anthropic")
+        );
+        // An override with no models must not clobber the existing list.
+        assert!(
+            existing.models.iter().any(|m| m.name == "wh-1"),
+            "empty override models must leave the existing catalog intact"
+        );
+    }
+
+    #[test]
+    fn find_model_pricing_returns_bundled_pricing() {
+        let p = find_model_pricing("claude-opus-4-7")
+            .expect("bundled claude-opus-4-7 must carry pricing");
+        assert_eq!(p.input_per_million, 5.00);
+        assert_eq!(p.output_per_million, 25.00);
+        assert_eq!(p.cache_hit_input_per_million, Some(0.50));
+    }
+
+    #[test]
+    fn preset_without_name_mirrors_its_id() -> Result<(), Box<dyn std::error::Error>> {
+        // The serde default for `name` must be the empty string so the
+        // mirror-id step in additional_presets kicks in; any non-empty
+        // default would mask the id on partial overrides.
+        assert!(default_name().is_empty());
+
+        let tmp = tempfile::tempdir()?;
+        let _pin = crate::test_util::PinnedRecursiveHome::new(tmp.path().join(".recursive"));
+        let dir = tmp.path().join(".recursive").join("providers.d");
+        write_user_override(
+            &dir,
+            "noname-vendor.toml",
+            r#"
+[[providers]]
+id = "noname-vendor"
+provider_type = "openai"
+api_base = "https://noname.example.com/v1"
+default_model = "n1"
+models = [{name = "n1", context_window = 3000}]
+"#,
+        )?;
+        let loaded = additional_presets();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].name, "noname-vendor",
+            "omitted name must mirror the preset id"
+        );
+        Ok(())
+    }
 }

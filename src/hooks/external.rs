@@ -2401,4 +2401,121 @@ mod tests {
             result.action
         );
     }
+
+    // ── #245 batch 21 mutant pins ────────────────────────────────────────────
+
+    #[test]
+    fn default_hook_timeout_is_five_seconds_and_env_overridable() {
+        let _lock = crate::test_util::env_lock();
+        let prev = std::env::var_os("RECURSIVE_HOOK_TIMEOUT_SECS");
+        // SAFETY: env lock held for the whole span.
+        unsafe { std::env::remove_var("RECURSIVE_HOOK_TIMEOUT_SECS") };
+        assert_eq!(default_hook_timeout(), Duration::from_secs(5));
+        assert_eq!(
+            default_hook_timeout(),
+            HOOK_TIMEOUT,
+            "the default must be the documented 5s constant"
+        );
+        // SAFETY: env lock held.
+        unsafe { std::env::set_var("RECURSIVE_HOOK_TIMEOUT_SECS", "30") };
+        assert_eq!(
+            default_hook_timeout(),
+            Duration::from_secs(30),
+            "the env override must win"
+        );
+        // SAFETY: env lock held.
+        unsafe { std::env::set_var("RECURSIVE_HOOK_TIMEOUT_SECS", "not-a-number") };
+        assert_eq!(
+            default_hook_timeout(),
+            Duration::from_secs(5),
+            "an unparseable env value must fall back to the default"
+        );
+        // SAFETY: env lock held; restore the previous value.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RECURSIVE_HOOK_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("RECURSIVE_HOOK_TIMEOUT_SECS") },
+        }
+    }
+
+    struct RecordingForwarder {
+        result: HookResult,
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SdkHookForwarder for RecordingForwarder {
+        async fn forward(&self, _input: &HookInput) -> Option<HookResult> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(self.result.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn set_sdk_forwarder_routes_dispatch_and_clearing_stops_it() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let called = Arc::new(AtomicBool::new(false));
+        let mut runner = ExternalHookRunner::discover(&[]);
+        runner.set_sdk_forwarder(Some(Arc::new(RecordingForwarder {
+            result: HookResult {
+                action: HookAction::Skip,
+                ..Default::default()
+            },
+            called: called.clone(),
+        })));
+
+        let input = make_tool_input(
+            HookEvent::PreToolCall,
+            "Bash",
+            serde_json::json!({"command": "ls"}),
+        );
+        let res = runner.dispatch(&input).await;
+        assert!(
+            matches!(res.action, HookAction::Skip),
+            "the forwarder's decision must take precedence, got {:?}",
+            res.action
+        );
+        assert!(
+            called.load(SeqCst),
+            "the registered forwarder must be consulted"
+        );
+
+        // Replacing with None detaches it again: dispatch falls through to
+        // the (empty) local hooks and the forwarder is left alone.
+        runner.set_sdk_forwarder(None);
+        called.store(false, SeqCst);
+        let res = runner.dispatch(&input).await;
+        assert!(
+            matches!(res.action, HookAction::Continue),
+            "no hooks and no forwarder must continue, got {:?}",
+            res.action
+        );
+        assert!(
+            !called.load(SeqCst),
+            "a cleared forwarder must not be consulted"
+        );
+    }
+
+    #[test]
+    fn emit_forwards_events_to_the_registered_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = ExternalHookRunner::discover(&[]).with_event_tx(tx);
+        runner.emit(AgentEvent::AssistantText {
+            text: "hook progress".to_string(),
+            step: 1,
+        });
+        match rx.try_recv() {
+            Ok(AgentEvent::AssistantText { text, step }) => {
+                assert_eq!(text, "hook progress");
+                assert_eq!(step, 1);
+            }
+            Ok(other) => panic!("unexpected event: {other:?}"),
+            Err(e) => panic!("emit must forward to the registered channel: {e}"),
+        }
+
+        // Without a channel, emit is a silent no-op — never a panic.
+        let silent = ExternalHookRunner::discover(&[]);
+        silent.emit(AgentEvent::Latency { step: 0, llm_ms: 1 });
+    }
 }
