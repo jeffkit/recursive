@@ -4413,9 +4413,17 @@ mod tests {
     ///   a closed stdout.
     /// * `REQUIRE_NOTIF=1` — `tools/call` is only served after the
     ///   `notifications/initialized` notification arrived.
+    ///
+    /// Two observation knobs for the process-lifecycle contract:
+    /// * `MOCK_PID_FILE=<path>` — the script writes its own `$$` there at
+    ///   start-up, so a test can compare it with `stdio_child_pid()`.
+    /// * `MOCK_HEARTBEAT_FILE=<path>` — once initialized, the script stops
+    ///   reading stdin and appends a line every 50ms; the only way to stop
+    ///   it is to kill the process.
     const STDIO_MOCK_SCRIPT: &str = r#"
 notified=0
 if [ "$REQUIRE_NOTIF" != "1" ]; then notified=1; fi
+if [ -n "$MOCK_PID_FILE" ]; then echo "$$" > "$MOCK_PID_FILE"; fi
 seen=""
 while IFS= read -r line; do
   id=""
@@ -4426,7 +4434,20 @@ while IFS= read -r line; do
   fi
   case "$line" in
     *'"method":"notifications/initialized"'*)
-      notified=1 ;;
+      notified=1
+      if [ -n "$MOCK_HEARTBEAT_FILE" ]; then
+        # Shutdown-contract mode: report a heartbeat every 50ms without
+        # ever reading stdin again, so a merely-closed pipe cannot end us
+        # — only an explicit kill can. Self-terminates after 30s so even
+        # a mutant run leaks nothing.
+        i=0
+        while [ "$i" -lt 600 ]; do
+          i=$((i+1))
+          echo "$i" >> "$MOCK_HEARTBEAT_FILE"
+          sleep 0.05
+        done
+        exit 0
+      fi ;;
     *'"method":"initialize"'*)
       echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"stdio-mock\",\"version\":\"1\"}}}" ;;
     *'"method":"tools/call"'*)
@@ -5155,5 +5176,330 @@ done
             ToolSideEffect::External,
             "missing annotations stay conservative even when trusted"
         );
+    }
+
+    // ── McpToolRouter: exact + prefixed routing, no false positives ──────
+
+    /// `register_server` must record both the raw and the `mcp__<server>__`
+    /// prefixed name (deduped on re-registration), and `route` must resolve
+    /// each shape to its server while leaving unknown names — including
+    /// other servers' namespaces — unrouted. Kills every mutation of the
+    /// register loop, both route scans, and the `Some(...)` replacements.
+    #[test]
+    fn tool_router_routes_raw_prefixed_and_leaves_unknowns_unrouted() {
+        let mut router = McpToolRouter::new();
+        router.register_server("alpha", &["echo".to_string(), "fetch".to_string()]);
+        router.register_server("beta", &["send".to_string()]);
+
+        // Prefixed (mcp__<server>__<tool>) dispatch.
+        assert_eq!(router.route("mcp__alpha__echo"), Some("alpha"));
+        assert_eq!(router.route("mcp__alpha__fetch"), Some("alpha"));
+        assert_eq!(router.route("mcp__beta__send"), Some("beta"));
+        // Raw (exact) dispatch.
+        assert_eq!(router.route("echo"), Some("alpha"));
+        assert_eq!(router.route("send"), Some("beta"));
+        // No false positives: unknown names and foreign namespaces.
+        assert_eq!(router.route("unknown"), None);
+        assert_eq!(router.route("mcp__gamma__echo"), None);
+        assert_eq!(router.route(""), None);
+
+        // Re-registering the same tool must not duplicate prefixes.
+        let before = router.server_prefixes["alpha"].len();
+        router.register_server("alpha", &["echo".to_string()]);
+        assert_eq!(
+            router.server_prefixes["alpha"].len(),
+            before,
+            "duplicate registration must not grow the prefix list"
+        );
+        assert_eq!(router.route("echo"), Some("alpha"));
+    }
+
+    // ── stdio process lifecycle: pid reporting + kill-on-drop ────────────
+
+    fn beat_lines(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// `stdio_child_pid` must report the pid of the server process itself —
+    /// the mock publishes its own `$$` at start-up, so `Some(1)`-style
+    /// stand-ins and `None` both miss. The HTTP transports have no child.
+    #[tokio::test]
+    async fn stdio_child_pid_is_the_spawned_server_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let mut server = stdio_mock_server("", false, false);
+        server
+            .env
+            .get_or_insert_with(HashMap::new)
+            .insert("MOCK_PID_FILE".to_string(), pid_file.display().to_string());
+
+        let client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake");
+
+        let reported: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the mock published its pid")
+            .trim()
+            .parse()
+            .expect("pid file holds an integer pid");
+        assert_eq!(
+            client.stdio_child_pid(),
+            Some(reported),
+            "the client must report the pid the mock published for itself"
+        );
+    }
+
+    /// Dropping a stdio client must kill the server process: the mock
+    /// heartbeats a file every 50ms without ever reading stdin again, so a
+    /// merely-closed pipe cannot end it — only the kill in `Drop` can. The
+    /// heartbeat is proven live before the drop, so a mock that never beats
+    /// cannot pass vacuously.
+    #[tokio::test]
+    async fn dropping_the_stdio_client_kills_the_server_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let beats = dir.path().join("beats");
+        let mut server = stdio_mock_server("", false, false);
+        let env = server.env.get_or_insert_with(HashMap::new);
+        env.insert(
+            "MOCK_HEARTBEAT_FILE".to_string(),
+            beats.display().to_string(),
+        );
+        // Reuse the published pid as the kill-target cross-check.
+        let pid_file = dir.path().join("pid");
+        env.insert("MOCK_PID_FILE".to_string(), pid_file.display().to_string());
+
+        let client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake");
+        let reported: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the mock published its pid")
+            .trim()
+            .parse()
+            .expect("pid file holds an integer pid");
+        assert_eq!(client.stdio_child_pid(), Some(reported));
+
+        // Wait until the heartbeat is demonstrably flowing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while beat_lines(&beats) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mock never started its heartbeat"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(client);
+
+        // Give the kill a moment to land, then the file must stop growing.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let before = beat_lines(&beats);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let after = beat_lines(&beats);
+        assert_eq!(
+            before, after,
+            "the heartbeat kept running after the client was dropped: \
+             the server child was not killed"
+        );
+    }
+
+    // ── do_initialize protocol-version warning ───────────────────────────
+
+    /// Append-only shared sink the capture subscriber formats into (same
+    /// harness as `checkpoint.rs` / `config_file.rs`: `with_default` scopes
+    /// a fmt subscriber to the calling thread — parallel-safe).
+    #[derive(Clone)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` under a thread-local DEBUG-level fmt subscriber and return
+    /// `(f's result, everything it formatted)` (ANSI off).
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        let logs = String::from_utf8(out).expect("tracing output is utf-8");
+        (value, logs)
+    }
+
+    /// Loopback Streamable HTTP mock that only completes the handshake,
+    /// answering `initialize` with the given `protocolVersion`.
+    fn spawn_initialize_mock(protocol_version: &str) -> String {
+        use std::io::{Read, Write};
+        let protocol_version = protocol_version.to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = vec![0u8; 16384];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let request: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = request.get("id").cloned();
+                let (status, extra, payload) = match method {
+                    "initialize" => (
+                        "200 OK",
+                        "Mcp-Session-Id: s-1\r\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": protocol_version,
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "mock", "version": "1"}
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    "notifications/initialized" => ("202 Accepted", "", String::new()),
+                    _ => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {"code": -32601, "message": "unknown"}
+                        })
+                        .to_string(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    /// Spawn against `url` (Streamable HTTP) on a single-threaded runtime
+    /// running under the capture subscriber; returns client + log text.
+    fn spawn_streamable_capturing_logs(url: &str) -> (McpClient, String) {
+        let server = server_with_url(url, Some("streamable-http"));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (client, logs) = capture_logs(|| {
+            rt.block_on(McpClient::spawn_with_timeout(
+                &server,
+                Duration::from_secs(2),
+            ))
+        });
+        (client.expect("handshake"), logs)
+    }
+
+    /// The handshake warns about a protocol version mismatch exactly when
+    /// the server picks a revision this client does not implement: an
+    /// unsupported one is reported, a supported older one is accepted
+    /// silently. (Deleting the `!` inverts the guard: the warning fires on
+    /// healthy servers and goes quiet on broken ones.)
+    #[test]
+    fn initialize_warns_only_for_an_unsupported_protocol_version() {
+        let (client, logs) = spawn_streamable_capturing_logs(&spawn_initialize_mock("1999-01-01"));
+        assert!(
+            logs.contains("MCP server protocol version mismatch"),
+            "an unsupported revision must be reported: {logs:?}"
+        );
+        assert!(
+            logs.contains("1999-01-01"),
+            "the offending revision is named: {logs:?}"
+        );
+        assert_eq!(
+            client.stdio_child_pid(),
+            None,
+            "remote transports have no child process"
+        );
+        drop(client);
+
+        let (_client, logs) = spawn_streamable_capturing_logs(&spawn_initialize_mock("2024-11-05"));
+        assert!(
+            !logs.contains("protocol version mismatch"),
+            "a supported revision is not a mismatch: {logs:?}"
+        );
+    }
+
+    // ── legacy SSE handshake: 64 KiB scan cap ────────────────────────────
+
+    /// Loopback SSE endpoint that streams exactly `total` bytes of SSE
+    /// comment padding — never an `endpoint` event — then holds the
+    /// connection open until the returned sender is dropped.
+    fn spawn_sse_padding_mock(total: usize) -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Cache-Control: no-cache\r\n\r\n";
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            // 64-byte comment blocks (":" + 61 filler + "\n\n"), so any
+            // multiple of 64 sizes the payload exactly.
+            let block = format!(":{}\n\n", "p".repeat(61));
+            assert_eq!(block.len(), 64);
+            let payload = block.repeat(total / 64);
+            assert_eq!(payload.len(), total);
+            if stream.write_all(payload.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            // Keep the stream open (no EOF): the client must give up on its
+            // own bookkeeping, not on a closed socket.
+            let _ = hold_rx.recv();
+        });
+        (format!("http://{addr}/sse"), hold_tx)
+    }
+
+    /// `spawn_http_sse` stops scanning for the `endpoint` event once the
+    /// handshake buffer reaches its 64 KiB cap: a server that streams
+    /// exactly that much padding and then idles must fail the handshake
+    /// with "did not send an `endpoint` event" right away — not wait for a
+    /// 65537th byte until the read timeout turns the same situation into a
+    /// timeout error.
+    #[tokio::test]
+    async fn legacy_sse_handshake_stops_scanning_at_the_64k_cap() {
+        let (url, _hold) = spawn_sse_padding_mock(65536);
+        let server = server_with_url(&url, Some("sse"));
+        let err = McpClient::spawn_with_timeout(&server, Duration::from_millis(500))
+            .await
+            .expect_err("no endpoint event → the handshake must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not send an `endpoint` event"),
+            "the cap — not the read timeout — must end the scan: {msg}"
+        );
+        assert!(!msg.contains("timeout reading SSE stream"), "{msg}");
     }
 }

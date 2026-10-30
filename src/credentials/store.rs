@@ -689,6 +689,107 @@ mod tests {
         assert_eq!(map.len(), 3);
     }
 
+    /// A commented-out assignment (`# KEY=value`) is a comment, not a key
+    /// named `# KEY`: the comment check must fire on its own, independently
+    /// of the blank-line check (a line cannot be both).
+    #[test]
+    fn env_parser_ignores_commented_out_assignments() {
+        let map = parse_env_file("# COMMENTED=out\n  # INDENTED=out\nLIVE=1\n");
+        assert_eq!(map.get("LIVE").unwrap(), "1");
+        assert!(
+            !map.keys().any(|k| k.starts_with('#')),
+            "a commented-out assignment must not become a key: {map:?}"
+        );
+        assert_eq!(map.len(), 1);
+    }
+
+    /// Quotes are stripped only as a *matching pair* at both ends: a value
+    /// that merely starts or ends with a quote — or mixes the two kinds —
+    /// is taken verbatim, so a stray quote cannot silently eat two
+    /// characters of a real secret.
+    #[test]
+    fn env_parser_strips_only_matching_quote_pairs() {
+        let map = parse_env_file(
+            "LEAD_DQ=\"abc\n\
+             LEAD_SQ='abc\n\
+             TRAIL_DQ=abc\"\n\
+             TRAIL_SQ=abc'\n\
+             MIXED=\"abc'\n\
+             EMPTY_DQ=\"\"\n\
+             LONE_DQ=\"\n\
+             PAIR_DQ=\"x y\"\n\
+             PAIR_SQ='x y'\n",
+        );
+        assert_eq!(map.get("LEAD_DQ").unwrap(), "\"abc");
+        assert_eq!(map.get("LEAD_SQ").unwrap(), "'abc");
+        assert_eq!(map.get("TRAIL_DQ").unwrap(), "abc\"");
+        assert_eq!(map.get("TRAIL_SQ").unwrap(), "abc'");
+        assert_eq!(map.get("MIXED").unwrap(), "\"abc'");
+        assert_eq!(map.get("EMPTY_DQ").unwrap(), "");
+        assert_eq!(map.get("LONE_DQ").unwrap(), "\"");
+        assert_eq!(map.get("PAIR_DQ").unwrap(), "x y");
+        assert_eq!(map.get("PAIR_SQ").unwrap(), "x y");
+    }
+
+    /// Only "the file does not exist" is absence. Any other failure to
+    /// stat the credentials file must surface as an I/O error, never be
+    /// swallowed into `None` (an operator would see "not configured" for a
+    /// key that *is* configured behind a broken path). The fault is
+    /// injected on the credentials file alone — a symlink pointing at
+    /// itself, so `stat` fails with `ELOOP` — while both dotenv layers stay
+    /// genuinely absent; a fault on the whole user-data dir would also trip
+    /// the `<home>/.env` read and mask which guard reported it.
+    ///
+    /// Unix-only because the fixture is a symlink (creating one on Windows
+    /// needs a privilege the CI runner does not have); the guard under test
+    /// is platform-neutral. Lift the gate once a Windows-constructible
+    /// non-`NotFound` stat failure for a *single file* is available.
+    #[cfg(unix)]
+    #[test]
+    fn an_unstatable_credentials_file_is_an_error_not_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let path = store.credentials_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(CREDENTIALS_FILE_NAME, &path).unwrap();
+        assert!(
+            std::fs::metadata(&path).is_err(),
+            "fixture: the self-referential symlink must not stat"
+        );
+        let reference = CredentialRef::parse("RECURSIVE_TEST_CRED_ELOOP").unwrap();
+
+        let err = store.resolve(&reference).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "expected an I/O error, got {err:?}"
+        );
+        let err = store.lookup(&reference).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "expected an I/O error, got {err:?}"
+        );
+    }
+
+    /// The dotenv layers follow the same rule: a `.env` that exists but
+    /// cannot be read is an I/O error, not a missing layer that silently
+    /// falls through to the next one. The fixture is a *directory* named
+    /// `.env`: reading it fails on every platform with a non-`NotFound`
+    /// kind (`EISDIR` on unix, `PermissionDenied` on Windows), unlike a
+    /// path through a regular file, which Windows reports as `NotFound`.
+    #[test]
+    fn an_unreadable_dotenv_layer_is_an_error_not_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        std::fs::create_dir_all(store.cwd_env_file()).unwrap();
+        let reference = CredentialRef::parse("RECURSIVE_TEST_CRED_ENV_EISDIR").unwrap();
+
+        let err = store.resolve(&reference).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "expected an I/O error, got {err:?}"
+        );
+    }
+
     #[test]
     fn info_reports_provenance_without_touching_the_value() {
         let _guard = env_lock();

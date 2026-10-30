@@ -1526,6 +1526,40 @@ mod tests {
         );
     }
 
+    /// The endpoint catalogue in the tool description is a `; `-joined
+    /// list with no leading separator: `a (POST); b (GET): desc`. A
+    /// separator placed before the first entry, only before the first
+    /// entry, or dropped altogether would garble the catalogue the model
+    /// picks endpoints from — three endpoints pin every one of those shapes.
+    #[test]
+    fn spec_joins_endpoint_entries_with_one_separator_between_them() {
+        let tool = HttpCall::new(loopback_registry(json!({
+            "create_ticket": {
+                "method": "POST",
+                "base_url": "http://127.0.0.1:1",
+                "path": "/tickets",
+                "allow_private": true
+            },
+            "list_tickets": {
+                "method": "GET",
+                "base_url": "http://127.0.0.1:1",
+                "path": "/tickets",
+                "description": "List tickets",
+                "allow_private": true
+            }
+        })));
+        let description = tool.spec().description;
+        let catalogue = description
+            .split("Registered endpoints: ")
+            .nth(1)
+            .expect("the description ends with the endpoint catalogue");
+        // Registry order is the BTreeMap key order.
+        assert_eq!(
+            catalogue,
+            "create_ticket (POST); get_order (GET): 查询订单状态; list_tickets (GET): List tickets"
+        );
+    }
+
     #[test]
     fn side_effect_class_tracks_registry() {
         let read_only = HttpCall::new(loopback_registry(json!({})));
@@ -1679,6 +1713,22 @@ mod tests {
         (addr, handle)
     }
 
+    /// One-shot mock that writes a caller-supplied raw HTTP response, so a
+    /// test can control the header set exactly (every other mock always
+    /// sends a `Content-Type`).
+    fn spawn_raw_mock(response: String) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            stream.write_all(response.as_bytes()).ok();
+            stream.flush().ok();
+        });
+        (addr, handle)
+    }
+
     /// Mock that drops the first connection without reading or answering
     /// (the client sees a transport-level failure), then polls for a second
     /// connection for a short window. Returns `None` from the handle when
@@ -1745,6 +1795,39 @@ mod tests {
         assert_eq!(captured.request_line, "GET /api/orders/A-1001 HTTP/1.1");
         assert!(out.contains("HTTP 200"), "{out}");
         assert!(out.contains("已发货"), "{out}");
+    }
+
+    /// The `content-type:` line mirrors the upstream header exactly: it is
+    /// echoed verbatim when the server sent one and absent — not an empty
+    /// `content-type: ` line — when the server sent none.
+    #[tokio::test]
+    async fn content_type_line_mirrors_the_upstream_header() {
+        let call = json!({"endpoint": "get_order", "params": {"order_id": "A-1"}});
+
+        let (addr, handle) = spawn_mock("HTTP/1.1 200 OK".to_string(), "{}".to_string());
+        let out =
+            tokio::time::timeout(Duration::from_secs(10), tool_at(addr).execute(call.clone()))
+                .await
+                .expect("no hang")
+                .expect("ok");
+        handle.join().expect("join");
+        assert_eq!(
+            out, "HTTP 200\ncontent-type: application/json\n\n{}",
+            "an upstream Content-Type is echoed on its own line"
+        );
+
+        let (addr, handle) = spawn_raw_mock(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string(),
+        );
+        let out = tokio::time::timeout(Duration::from_secs(10), tool_at(addr).execute(call))
+            .await
+            .expect("no hang")
+            .expect("ok");
+        handle.join().expect("join");
+        assert_eq!(
+            out, "HTTP 200\n\n{}",
+            "no upstream Content-Type → no content-type line at all"
+        );
     }
 
     #[tokio::test]

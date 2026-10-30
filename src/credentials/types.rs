@@ -336,12 +336,30 @@ mod tests {
 
     #[test]
     fn credential_key_rejects_ill_formed_wire_forms() {
-        for bad in ["", "/", "a/", "/b", "a/b/c", "a b/c"] {
-            assert!(
-                CredentialKey::parse(bad).is_err(),
-                "{bad:?} must not parse as a credential key"
-            );
+        // Every wire-form violation — too few or too many parts, an empty
+        // part on either side — is reported as a *form* error that names
+        // the expected shape, not as a downstream "component must not be
+        // empty" complaint: the operator typed the wrong form, so the fix
+        // hint must say so. (Each of the three disjuncts must fire on its
+        // own; `"a/"` and `"/b"` each leave the other two false.)
+        for bad in ["", "/", "a/", "/b", "a/b/c"] {
+            match CredentialKey::parse(bad) {
+                Err(Error::Credential {
+                    code: CredentialErrorCode::Invalid,
+                    message,
+                }) => assert!(
+                    message.contains("must have the form <scope>/<id>"),
+                    "{bad:?} must be rejected as a malformed wire form, got: {message}"
+                ),
+                other => panic!("{bad:?} must not parse as a credential key, got {other:?}"),
+            }
         }
+        // A well-formed wire form with an invalid component fails component
+        // validation instead.
+        assert!(
+            CredentialKey::parse("a b/c").is_err(),
+            "\"a b/c\" must not parse as a credential key"
+        );
         // A scope or id may not smuggle a second separator in via `new`.
         assert!(CredentialKey::new("a/b", "c").is_err());
     }

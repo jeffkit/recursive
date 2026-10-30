@@ -739,16 +739,39 @@ mod tests {
         assert!(gate.try_acquire_run().is_err());
         assert_eq!(in_flight.load(Ordering::Relaxed), 0);
 
-        // Success path: held while the permit lives, released on Drop.
+        // Success path: held while the permit lives, released on Drop. The
+        // public `runs_in_flight()` accessor must report the same gauge the
+        // shared counter holds (a stuck-at-zero accessor would hide every
+        // in-flight run from `/metrics`).
         let gate_ok =
             AdmissionGate::new(2, Duration::from_secs(5), waiting, Arc::clone(&in_flight));
+        assert_eq!(gate_ok.runs_in_flight(), 0);
         let p1 = gate_ok.acquire_run().await.unwrap();
         let p2 = gate_ok.try_acquire_run().unwrap();
         assert_eq!(in_flight.load(Ordering::Relaxed), 2);
+        assert_eq!(gate_ok.runs_in_flight(), 2);
         drop(p1);
         assert_eq!(in_flight.load(Ordering::Relaxed), 1);
+        assert_eq!(gate_ok.runs_in_flight(), 1);
         drop(p2);
         assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+        assert_eq!(gate_ok.runs_in_flight(), 0);
+    }
+
+    /// The configuration accessors hand back exactly what the gate was
+    /// built with: the admission window drives the `503` + `Retry-After`
+    /// path, so a gate that reports `Duration::ZERO` ("wait forever") for a
+    /// bounded window would mislead every caller that inspects it.
+    #[test]
+    fn admission_gate_reports_its_configured_window_and_pool_size() {
+        let bounded = AdmissionGate::new(3, Duration::from_millis(1500), counter(), counter());
+        assert_eq!(bounded.admission_timeout(), Duration::from_millis(1500));
+        assert_eq!(bounded.max_concurrent_runs(), 3);
+
+        // The legacy "unlimited" configuration is reported verbatim too.
+        let unlimited = AdmissionGate::new(0, Duration::ZERO, counter(), counter());
+        assert_eq!(unlimited.admission_timeout(), Duration::ZERO);
+        assert_eq!(unlimited.max_concurrent_runs(), 0);
     }
 
     // ── SessionHost ────────────────────────────────────────────────────────
@@ -825,6 +848,10 @@ mod tests {
         h.insert("a".into(), FakeSession::new()).await;
         h.insert("b".into(), FakeSession::new()).await;
         assert_eq!(h.len().await, 2);
+        assert!(
+            !h.is_empty().await,
+            "is_empty must flip to false once a session is registered"
+        );
         assert!(h.contains_key("a").await);
         assert!(h.get_with("a", |s| s.is_some()).await);
         assert_eq!(h.ids().await.len(), 2);
@@ -833,7 +860,11 @@ mod tests {
         assert!(removed.is_some());
         assert!(!h.contains_key("a").await);
         assert_eq!(h.len().await, 1);
+        assert!(!h.is_empty().await, "one live session is not empty");
         assert!(h.remove("missing").await.is_none());
+
+        assert!(h.remove("b").await.is_some());
+        assert!(h.is_empty().await, "draining the table restores is_empty");
     }
 
     /// TTL semantics: fresh sessions stay, expired ones go.

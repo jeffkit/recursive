@@ -578,4 +578,18 @@ exclude_re = [
     # is pinned by read_stream_mirror_captures_every_byte_below_the_cap; the
     # killable `==` and `>` siblings on the same line die on that same test.
     "src/tasks/run_background\\.rs:874:35: replace < with <= in read_stream",
+    # ── Issue #245 batch 20 (B1; CI run 41023437517, store.rs shard job
+    # 123955901190), src/credentials/store.rs — one cfg-blind entry.
+    #
+    # write_owner_only :280:5 → `Ok(())` is the `#[cfg(not(unix))]` twin of
+    # the unix writer at :258. Neither the ubuntu mutation gate nor the macOS
+    # seats ever compile that body, so the mutant builds byte-identical to
+    # the baseline and reports MISSED whatever any unix test asserts (the
+    # #228 cfg-blind shape; the --list name is identical to the unix twin's
+    # except for the line, hence the line:col anchor). The unix twin at
+    # :259:5 is killed by set_commits_a_value_that_resolve_reads_back and
+    # set_writes_the_credentials_file_owner_only; the non-unix body is only
+    # reachable from a Windows build, which has no mutation gate. Drop this
+    # entry if a Windows mutation leg is ever added.
+    "src/credentials/store\\.rs:280:5: replace write_owner_only -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]
