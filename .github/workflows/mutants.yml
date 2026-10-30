@@ -58,7 +58,10 @@ on:
     - cron: "37 18 1,15 * *"
 
 concurrency:
-  group: mutation-${{ github.ref }}
+  # 按事件类型分组：push 互掐（增量门串行）与 dispatch 互掐（同派发幂等）
+  # 保留，但 push 不再杀 dispatch 的长跑全量扫描（run 41008594494 实证：
+  # 落地 push 触发的新 run 把 27 片 dispatch 全腿 cancel）。
+  group: mutation-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
