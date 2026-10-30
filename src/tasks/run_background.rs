@@ -1943,4 +1943,562 @@ mod tests {
             "descendant {descendant} survived the timeout — the group was not killed (issue #165)"
         );
     }
+
+    // ── Issue #245 batch 19: MISSED-mutant pins ────────────────────────────
+    //
+    // One section per surviving mutant family from the #245 ledger, each
+    // asserting the behaviour (not the line) the mutant would break.
+
+    /// The manager's scope is a fresh `bgm-N` id per table, unique inside
+    /// one process, and it names every job registration the table spawns
+    /// (`background-job:<scope>/<job-id>`).
+    ///
+    /// Mutation guards (batch 19): `scope()` → `""`/`"xyzzy"` (:182) breaks
+    /// the prefix or the key echo; `next_scope_id` → `""`/`"xyzzy"` (:61)
+    /// breaks the prefix and the per-table uniqueness.
+    #[test]
+    fn scope_is_unique_bgm_id_and_names_job_registrations() {
+        let mut mgr = BackgroundJobManager::new();
+        let scope = mgr.scope().to_string();
+        assert!(
+            scope.starts_with("bgm-"),
+            "scope must be a bgm- id, got {scope:?}"
+        );
+
+        let other = BackgroundJobManager::new();
+        assert_ne!(
+            scope,
+            other.scope(),
+            "two job tables must not share a scope"
+        );
+
+        let id = mgr.insert(Job::running());
+        let handle = mgr
+            .cancel_handle(&id)
+            .expect("a running job must be registered in the task table");
+        assert_eq!(
+            handle.key(),
+            format!("{}:{scope}/{id}", CancelKind::BackgroundJob.as_str(),),
+            "the registration key must be built from this table's scope"
+        );
+        assert_eq!(handle.scope(), Some(scope.as_str()));
+    }
+
+    /// Cancel is "handled" only for a job that is still running — the bool
+    /// is the caller's report, not decoration. A terminal job keeps no
+    /// live registration, an unknown id never had one.
+    ///
+    /// Mutation guards (batch 19): `cancel()` → `false`/`true` (:237); the
+    /// `!` delete and both guard flips on `!self.is_terminal(id)` (:238);
+    /// fed by `is_terminal` (:261).
+    #[test]
+    fn cancel_reports_handled_only_for_running_jobs() {
+        let mut mgr = BackgroundJobManager::new();
+        let running = mgr.insert(Job::running());
+        assert!(
+            mgr.cancel(&running),
+            "cancel of a running job must report handled"
+        );
+
+        let completed = mgr.insert(Job {
+            state: JobState::Completed {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            created_at: Instant::now(),
+        });
+        assert!(
+            !mgr.cancel(&completed),
+            "a terminal job must no longer be cancellable"
+        );
+
+        assert!(
+            !mgr.cancel("bg-999"),
+            "an unknown job id is not cancellable"
+        );
+    }
+
+    /// `is_terminal` reads the job's own state; an id with no row counts
+    /// as terminal — the safe default, since nothing is addressable.
+    ///
+    /// Mutation guard (batch 19): `is_terminal` → `false` (:261).
+    #[test]
+    fn is_terminal_reflects_job_state_and_unknown_ids_count_as_terminal() {
+        let mut mgr = BackgroundJobManager::new();
+        let running = mgr.insert(Job::running());
+        let completed = mgr.insert(Job {
+            state: JobState::Completed {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            created_at: Instant::now(),
+        });
+        assert!(!mgr.is_terminal(&running), "a running job is not terminal");
+        assert!(mgr.is_terminal(&completed), "a completed job is terminal");
+        assert!(mgr.is_terminal("bg-999"), "unknown ids count as terminal");
+    }
+
+    /// Minimal recording subscriber: captures the structured fields of
+    /// every event published on one target, so the destroy-time WARNING is
+    /// observable without a logging stack.
+    struct FieldCapture {
+        target: &'static str,
+        events: std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>,
+    }
+
+    impl FieldCapture {
+        fn new(target: &'static str) -> Self {
+            Self {
+                target,
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    struct FieldVisitor {
+        map: std::collections::BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.map
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for FieldCapture {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != self.target {
+                return;
+            }
+            let mut visitor = FieldVisitor {
+                map: std::collections::BTreeMap::new(),
+            };
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.map);
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    /// Clearing a table that still has running jobs is a silent process
+    /// leak (#177) — it must leave exactly one WARNING naming how many
+    /// were running; an empty table stays quiet.
+    ///
+    /// Mutation guards (batch 19): `running > 0` → `<`/`==`/`>=` (:320) —
+    /// the first two go quiet on a real leak, the third warns on an empty
+    /// table.
+    #[test]
+    fn clear_warns_once_when_leaking_running_jobs_and_stays_quiet_when_empty() {
+        let quiet = Arc::new(FieldCapture::new(crate::process::CANCEL_TARGET));
+        let mut mgr = BackgroundJobManager::new();
+        tracing::subscriber::with_default(Arc::clone(&quiet), || mgr.clear());
+        assert!(
+            quiet.events.lock().unwrap().is_empty(),
+            "clearing an empty table must not warn"
+        );
+
+        let leaky = Arc::new(FieldCapture::new(crate::process::CANCEL_TARGET));
+        let mut mgr = BackgroundJobManager::new();
+        mgr.insert(Job::running());
+        mgr.insert(Job::running());
+        tracing::subscriber::with_default(Arc::clone(&leaky), || mgr.clear());
+        let events = leaky.events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a leaking clear must warn exactly once: {events:?}"
+        );
+        assert_eq!(
+            events[0].get("running").map(String::as_str),
+            Some("2"),
+            "the warning must carry the running-job count: {events:?}"
+        );
+    }
+
+    /// Deferred tools stay out of the prompt-visible tool set until the
+    /// runtime opts in — `ToolRegistry::is_deferred_spec` partitions specs
+    /// on exactly this flag. Both background tools ride deferred.
+    ///
+    /// Mutation guards (batch 19): `is_deferred` → `false` on
+    /// `RunBackground` (:559) and `CheckBackground` (:768).
+    #[test]
+    fn background_tools_are_deferred() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        assert!(
+            RunBackground::new(tmp.path(), manager.clone()).is_deferred(),
+            "run_background must be deferred"
+        );
+        assert!(
+            CheckBackground::new(manager).is_deferred(),
+            "check_background must be deferred"
+        );
+    }
+
+    /// Scripted transport: returns a canned `ExecResult`, or an `io::Error`
+    /// of the given kind — no container, no scheduler.
+    #[derive(Debug)]
+    struct ScriptedTransport {
+        exit_code: Option<i32>,
+        err: Option<std::io::ErrorKind>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::transport::ToolTransport for ScriptedTransport {
+        async fn read_file(&self, _path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not used",
+            ))
+        }
+
+        async fn write_file(
+            &self,
+            _path: &std::path::Path,
+            _contents: &[u8],
+        ) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not used",
+            ))
+        }
+
+        async fn list_dir(
+            &self,
+            _path: &std::path::Path,
+        ) -> std::io::Result<Vec<crate::tools::transport::DirEntry>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not used",
+            ))
+        }
+
+        async fn create_dir_all(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not used",
+            ))
+        }
+
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &std::path::Path,
+            _env: &[(String, String)],
+            _timeout: Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<crate::tools::transport::ExecResult> {
+            match self.err {
+                Some(kind) => Err(std::io::Error::new(kind, "scripted transport failure")),
+                None => Ok(crate::tools::transport::ExecResult {
+                    exit_code: self.exit_code,
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    /// A transport result with no exit code (the process was reaped without
+    /// a status) must surface as `-1`, the codebase's "no code" convention —
+    /// `1` would read as an ordinary command failure to the model.
+    ///
+    /// Mutation guard (batch 19): `r.exit_code.unwrap_or(-1)` →
+    /// `unwrap_or(1)` (:627).
+    #[tokio::test]
+    async fn transport_exec_without_exit_code_reports_minus_one() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone()).with_transport(Arc::new(
+            ScriptedTransport {
+                exit_code: None,
+                err: None,
+            },
+        ));
+        let check_tool = CheckBackground::new(manager);
+
+        let result = run_tool
+            .execute(json!({"command": "whatever"}))
+            .await
+            .unwrap();
+        let job_id = serde_json::from_str::<Value>(&result).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(5)).await;
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(
+            parsed["exit_code"], -1,
+            "a missing exit code must surface as -1: {parsed}"
+        );
+    }
+
+    /// A transport-level timeout is a `timed_out` job, not a `failed` one —
+    /// the agent must be able to tell a budget overrun from a broken exec.
+    ///
+    /// Mutation guards (batch 19): the match guard `e.kind() == TimedOut`
+    /// → `false` (:630) and `==` → `!=` (:630) both reclassify the timeout
+    /// as `failed` with an "exec failed" message.
+    #[tokio::test]
+    async fn transport_exec_timeout_error_maps_to_timed_out() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone()).with_transport(Arc::new(
+            ScriptedTransport {
+                exit_code: None,
+                err: Some(std::io::ErrorKind::TimedOut),
+            },
+        ));
+        let check_tool = CheckBackground::new(manager);
+
+        let result = run_tool
+            .execute(json!({"command": "whatever"}))
+            .await
+            .unwrap();
+        let job_id = serde_json::from_str::<Value>(&result).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(5)).await;
+        assert_eq!(
+            parsed["status"], "timed_out",
+            "an io timeout must surface as timed_out: {parsed}"
+        );
+    }
+
+    /// Any other transport error is a `failed` job carrying the exec error;
+    /// it must not be misreported as a timeout.
+    ///
+    /// Mutation guard (batch 19): the match guard → `true` (:630) would
+    /// call every exec error a timeout.
+    #[tokio::test]
+    async fn transport_exec_other_error_maps_to_failed_not_timed_out() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone()).with_transport(Arc::new(
+            ScriptedTransport {
+                exit_code: None,
+                err: Some(std::io::ErrorKind::InvalidInput),
+            },
+        ));
+        let check_tool = CheckBackground::new(manager);
+
+        let result = run_tool
+            .execute(json!({"command": "whatever"}))
+            .await
+            .unwrap();
+        let job_id = serde_json::from_str::<Value>(&result).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(5)).await;
+        assert_eq!(
+            parsed["status"], "failed",
+            "non-timeout exec errors are failures, not timeouts: {parsed}"
+        );
+        let message = parsed["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("exec failed"),
+            "the exec error must be carried in the message: {message}"
+        );
+    }
+
+    /// A job whose process dies by signal has no exit code; the reported
+    /// `exit_code` must be `-1` (the codebase's "killed by signal"
+    /// convention), never `1` — which would read as a normal failure.
+    ///
+    /// Mutation guard (batch 19): `status.code().unwrap_or(-1)` →
+    /// `unwrap_or(1)` (:994).
+    #[tokio::test]
+    async fn signal_terminated_job_reports_minus_one_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(BackgroundJobManager::new()));
+        let run_tool = RunBackground::new(tmp.path(), manager.clone());
+        let check_tool = CheckBackground::new(manager);
+
+        let result = run_tool
+            .execute(json!({"command": "kill -9 $$"}))
+            .await
+            .unwrap();
+        let job_id = serde_json::from_str::<Value>(&result).unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let parsed = poll_until_done(&check_tool, &job_id, Duration::from_secs(5)).await;
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(
+            parsed["exit_code"], -1,
+            "signal death must surface as -1: {parsed}"
+        );
+    }
+
+    /// A file smaller than the 16 KiB wake chunk is delivered whole in one
+    /// poll. Pinned with a literal byte count — an assertion written in
+    /// terms of `WATCH_CHUNK_BYTES` itself survives any change to the
+    /// constant, which is exactly how the `16 * 1024` → `16 + 1024` mutant
+    /// went MISSED (the sibling `poll_watch_caps_chunk_size` test).
+    ///
+    /// Mutation guard (batch 19): `*` → `+` (:49) shrinks the chunk to
+    /// 1040 bytes and this 5000-byte file would split across two polls.
+    #[tokio::test]
+    async fn poll_watch_delivers_a_sub_chunk_file_in_one_poll() {
+        let mut mgr = BackgroundJobManager::new();
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("events.log");
+        std::fs::write(&log, "x".repeat(5000)).unwrap();
+        mgr.set_watch(log, 0);
+
+        let first = mgr.poll_watch().expect("new bytes wake");
+        assert_eq!(
+            first.len(),
+            5000,
+            "5000 bytes are below the 16 KiB chunk cap and must arrive in one poll"
+        );
+        assert!(
+            mgr.poll_watch().is_none(),
+            "the whole file was delivered; nothing may remain"
+        );
+    }
+
+    /// Deterministic reader: hands out fixed-size chunks regardless of pipe
+    /// scheduling, so truncation-boundary tests do not depend on how the
+    /// kernel chunks a pipe.
+    struct FixedChunkReader {
+        data: std::io::Cursor<Vec<u8>>,
+        chunk: usize,
+    }
+
+    impl tokio::io::AsyncRead for FixedChunkReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let pos = self.data.position() as usize;
+            let data = self.data.get_ref();
+            let n = self.chunk.min(buf.remaining()).min(data.len() - pos);
+            buf.put_slice(&data[pos..pos + n]);
+            self.data.set_position((pos + n) as u64);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stream that lands exactly on the 128 KiB cap and then EOFs is NOT
+    /// truncated: `total + n > MAX_OUTPUT_BYTES` is false on the boundary
+    /// read, so the full bytes come back with no marker.
+    ///
+    /// Mutation guard (batch 19): `>` → `>=` (:861) fires on the boundary
+    /// read and appends a spurious "[stdout truncated]" marker.
+    #[tokio::test]
+    async fn read_stream_exact_cap_ends_clean_without_marker() {
+        // 128 KiB = 16 × 8192: the final read lands exactly on the cap.
+        let data = vec![b'x'; MAX_OUTPUT_BYTES];
+        let mirror: OutputMirror = OutputMirror::default();
+        let out = read_stream(
+            Some(FixedChunkReader {
+                data: std::io::Cursor::new(data),
+                chunk: 8192,
+            }),
+            "stdout",
+            mirror,
+        )
+        .await;
+
+        assert_eq!(
+            out.len(),
+            MAX_OUTPUT_BYTES,
+            "the full capped stream must be returned"
+        );
+        assert!(
+            !out.contains("truncated"),
+            "an exact-cap stream is not truncated and must carry no marker"
+        );
+    }
+
+    /// A crossing read that jumps *past* the cap without landing on it
+    /// (6000-byte chunks never make `total + n` exactly 128 KiB) must
+    /// truncate the take at the cap and append the marker.
+    ///
+    /// Mutation guard (batch 19): `>` → `==` (:861) only fires on exact
+    /// boundary hits, which this stream never produces — the mutant would
+    /// keep appending past the cap and never mark the truncation.
+    #[tokio::test]
+    async fn read_stream_unaligned_crossing_truncates_at_cap() {
+        let data = vec![b'x'; MAX_OUTPUT_BYTES + 3000];
+        let mirror: OutputMirror = OutputMirror::default();
+        let out = read_stream(
+            Some(FixedChunkReader {
+                data: std::io::Cursor::new(data),
+                chunk: 6_000,
+            }),
+            "stdout",
+            mirror,
+        )
+        .await;
+
+        let marker = "\n... [stdout truncated]";
+        assert_eq!(
+            out.len(),
+            MAX_OUTPUT_BYTES + marker.len(),
+            "output must stop at the cap plus the marker"
+        );
+        assert!(
+            out.ends_with(marker),
+            "the crossing read must mark the truncation"
+        );
+        assert!(
+            out[..MAX_OUTPUT_BYTES].chars().all(|c| c == 'x'),
+            "the captured prefix must be the stream's own bytes"
+        );
+    }
+
+    /// The mirror records every byte the reader captured, verbatim, while
+    /// the capture stays under the cap — it is what a drained or failed
+    /// reader task falls back to.
+    ///
+    /// Mutation guards (batch 19): `mirrored.len() < MAX` → `==`/`>`
+    /// (:874) leave the mirror empty; `mirrored_text` → `""`/`"xyzzy"`
+    /// (:885) break the fallback readback.
+    #[tokio::test]
+    async fn read_stream_mirror_captures_every_byte_below_the_cap() {
+        let data: Vec<u8> = (0..30_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let expected = String::from_utf8_lossy(&data).into_owned();
+
+        let mirror: OutputMirror = OutputMirror::default();
+        let out = read_stream(
+            Some(FixedChunkReader {
+                data: std::io::Cursor::new(data),
+                chunk: 8192,
+            }),
+            "stdout",
+            OutputMirror::clone(&mirror),
+        )
+        .await;
+
+        assert_eq!(out, expected, "the capture is the whole stream");
+        assert_eq!(
+            mirrored_text(&mirror),
+            expected,
+            "the mirror records the same bytes verbatim"
+        );
+    }
 }

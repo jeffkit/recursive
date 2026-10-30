@@ -532,4 +532,50 @@ exclude_re = [
     # pin plus the escape-family tests (dot-segment, sibling-prefix,
     # root-base) that own the `within_base == false` side.
     "src/tools/http_call\\.rs:770:29: replace == with != in HttpCall::build_url",
+    # ── Issue #245 batch 19 (B1, run head 2e144d69), src/tasks/run_background.rs
+    # true-equivalence trio. All three were applied by hand and left the whole
+    # run_background module green (47/47; logs /tmp/b19/logs/m09.log, m13.log,
+    # m25.log) after the 27 killable siblings of the same listing were pinned
+    # red one-by-one by the same driver (/tmp/b19/negctl.py).
+    #
+    # cleanup :305:50 `>` → `>=` in `jobs.retain(|_, job| job.created_at >
+    # cutoff)`: cutoff = Instant::now() - JOB_TTL is derived *inside* cleanup,
+    # so the only divergence is a job whose created_at equals that cutoff
+    # exactly — which requires the caller's Instant::now() reading t0 (used
+    # for created_at = t0 - TTL) and cleanup's internal reading t1 to be the
+    # same tick (cutoff = t1 - TTL, t1 == t0). Consecutive Instant::now()
+    # calls are strictly increasing on both target platforms (mach 1 ns ticks
+    # on aarch64 macOS, ns-resolution CLOCK_MONOTONIC on the linux CI; one
+    # call costs tens of ns), so the equality side is unreachable under every
+    # realizable schedule and the eviction set is identical. The strict side
+    # (TTL + 1 s job evicted, fresh job kept) is pinned by
+    # manager_cleanup_removes_old_jobs; cleanup_does_not_panic_on_young_process
+    # holds the underflow branch.
+    "src/tasks/run_background\\.rs:305:50: replace > with >= in BackgroundJobManager::cleanup",
+    # poll_watch :379:29 `-` → `+` in `((len - offset) as usize)`: the value
+    # only sizes the read buffer; the file is seeked to `offset` and the read
+    # is EOF-bounded. Post-guard `len > offset >= 0`, so with C = CHUNK the
+    # bytes read are n = min(to_read, len - offset) under both arms — if
+    # C >= len - offset both to_reads give n = len - offset, else both are
+    # capped at C and give n = C. n alone drives the returned text, the
+    # advanced offset and every later poll, so the mutant is pointwise equal
+    # for every deterministic input (only a file growing between the
+    # metadata() and read() calls could tell the two apart — a concurrent
+    # schedule, not an input of this function). The read/advance/chunk sides
+    # are pinned by poll_watch_returns_new_bytes_and_advances_offset,
+    # poll_watch_caps_chunk_size and poll_watch_delivers_a_sub_chunk_file_in_
+    # one_poll.
+    "src/tasks/run_background\\.rs:379:29: replace - with \\+ in BackgroundJobManager::poll_watch",
+    # read_stream :874:35 `<` → `<=` on the mirror guard: the guard is only
+    # evaluated after `total += n` in the non-truncating arm, where the
+    # invariant mirrored.len() == total_before_read holds and the outer branch
+    # has already established total_before_read + n <= MAX; with n >= 1 that
+    # puts total_before_read strictly below MAX, so the guard is true on every
+    # reachable evaluation. The len == MAX state where `<` and `<=` would
+    # differ is unreachable: a read landing exactly on the cap leaves
+    # total == MAX and any further non-empty read is taken by the truncation
+    # branch first (which breaks before the mirror code runs). Mirror content
+    # is pinned by read_stream_mirror_captures_every_byte_below_the_cap; the
+    # killable `==` and `>` siblings on the same line die on that same test.
+    "src/tasks/run_background\\.rs:874:35: replace < with <= in read_stream",
 ]
