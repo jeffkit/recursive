@@ -3637,13 +3637,65 @@ mod tests {
                             "id": id,
                             "result": {
                                 "protocolVersion": "2025-03-26",
-                                "capabilities": {},
+                                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                                 "serverInfo": {"name": "mock", "version": "1"}
                             }
                         })
                         .to_string(),
                     ),
                     "notifications/initialized" => ("202 Accepted", "", String::new()),
+                    "resources/list" => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"resources": [{
+                                "uri": "file:///a.txt",
+                                "name": "a",
+                                "description": "A",
+                                "mimeType": "text/plain"
+                            }]}
+                        })
+                        .to_string(),
+                    ),
+                    "resources/read" => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"contents": [{
+                                "uri": "file:///a.txt",
+                                "mimeType": "text/plain",
+                                "text": "hello"
+                            }]}
+                        })
+                        .to_string(),
+                    ),
+                    "prompts/list" => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"prompts": [{"name": "greet", "description": "Greet"}]}
+                        })
+                        .to_string(),
+                    ),
+                    "prompts/get" => (
+                        "200 OK",
+                        "",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"messages": [{
+                                "role": "assistant",
+                                "content": {"type": "text", "text": "hi"}
+                            }]}
+                        })
+                        .to_string(),
+                    ),
                     "tools/list" => (
                         "200 OK",
                         "",
@@ -4342,6 +4394,766 @@ mod tests {
         assert!(
             err.to_string().contains("text/event-stream"),
             "the Content-Type must be validated: {err}"
+        );
+    }
+
+    // ── issue #245 batch 18 (B1): pins for the src/mcp.rs survivor table ──
+    //
+    // Each test here kills specific cargo-mutants survivors; the mutant it
+    // targets is named in a comment. Negative controls (mutation applied →
+    // test red → byte-exact restore) were run per mutant for this batch.
+
+    /// A stdio MCP server mock: a `bash -c` script reading one JSON-RPC
+    /// message per line. It answers `initialize`, and serves `tools/call`
+    /// with the reply carried in through the `MOCK_TOOL_CALL_REPLY` env.
+    /// Two protocol guards, each toggleable per test so a negative control
+    /// exercises exactly one invariant:
+    /// * `REJECT_DUPES=1` — a JSON-RPC session must never reuse a request
+    ///   id; a duplicate makes the server exit, which the client reads as
+    ///   a closed stdout.
+    /// * `REQUIRE_NOTIF=1` — `tools/call` is only served after the
+    ///   `notifications/initialized` notification arrived.
+    const STDIO_MOCK_SCRIPT: &str = r#"
+notified=0
+if [ "$REQUIRE_NOTIF" != "1" ]; then notified=1; fi
+seen=""
+while IFS= read -r line; do
+  id=""
+  if [[ $line =~ \"id\":([0-9]+) ]]; then id="${BASH_REMATCH[1]}"; fi
+  if [ "$REJECT_DUPES" = "1" ] && [ -n "$id" ]; then
+    case ",$seen," in *",$id,"*) exit 3 ;; esac
+    seen="$seen,$id"
+  fi
+  case "$line" in
+    *'"method":"notifications/initialized"'*)
+      notified=1 ;;
+    *'"method":"initialize"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"stdio-mock\",\"version\":\"1\"}}}" ;;
+    *'"method":"tools/call"'*)
+      if [ "$notified" -eq 1 ]; then
+        echo "$MOCK_TOOL_CALL_REPLY"
+      else
+        exit 4
+      fi ;;
+  esac
+done
+"#;
+
+    fn stdio_mock_server(
+        tools_call_reply: &str,
+        require_notif: bool,
+        reject_dupes: bool,
+    ) -> McpServer {
+        McpServer {
+            name: "stdio-mock".into(),
+            command: "bash".into(),
+            args: vec!["-c".into(), STDIO_MOCK_SCRIPT.into()],
+            url: None,
+            env: Some(HashMap::from([
+                (
+                    "MOCK_TOOL_CALL_REPLY".to_string(),
+                    tools_call_reply.to_string(),
+                ),
+                (
+                    "REQUIRE_NOTIF".to_string(),
+                    u8::from(require_notif).to_string(),
+                ),
+                (
+                    "REJECT_DUPES".to_string(),
+                    u8::from(reject_dupes).to_string(),
+                ),
+            ])),
+            headers: None,
+            transport: None,
+        }
+    }
+
+    /// Records every elicitation request the client forwards to the host.
+    #[derive(Default)]
+    struct RecordingElicitor {
+        calls: std::sync::Mutex<Vec<ElicitationRequest>>,
+    }
+
+    #[async_trait]
+    impl ElicitationHandler for RecordingElicitor {
+        async fn elicit(&self, request: ElicitationRequest) -> Option<Value> {
+            self.calls.lock().unwrap().push(request);
+            None
+        }
+    }
+
+    /// `call_tool` guard `message.contains("code -32042")` → false: the
+    /// UrlElicitationRequired error must page the host elicitation handler
+    /// (and still surface as the same error).
+    #[tokio::test]
+    async fn stdio_url_elicitation_error_reaches_the_host_handler() {
+        let slot = new_elicitation_slot();
+        let elicitor = Arc::new(RecordingElicitor::default());
+        slot.write().await.replace(elicitor.clone());
+
+        let server = stdio_mock_server(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32042,"message":"UrlElicitationRequired","data":{"url":"https://example.com/approve"}}}"#,
+            true,
+            true,
+        );
+        let mut client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake")
+            .with_elicitation(slot);
+
+        let err = client
+            .call_tool("fetch", serde_json::json!({}))
+            .await
+            .expect_err("the -32042 error must still surface to the caller");
+        assert!(err.to_string().contains("-32042"), "error surfaces: {err}");
+
+        let calls = elicitor.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the host handler must be paged exactly once for -32042"
+        );
+        assert_eq!(calls[0].mcp_server_name, "stdio-mock");
+        assert_eq!(calls[0].mode.as_deref(), Some("url"));
+    }
+
+    /// `call_tool` guard `message.contains("code -32042")` → true: every
+    /// `Error::Mcp` would page the host handler; plain tool errors must
+    /// not.
+    #[tokio::test]
+    async fn stdio_plain_tool_error_does_not_page_the_host_handler() {
+        let slot = new_elicitation_slot();
+        let elicitor = Arc::new(RecordingElicitor::default());
+        slot.write().await.replace(elicitor.clone());
+
+        let server = stdio_mock_server(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"tool exploded"}}"#,
+            true,
+            true,
+        );
+        let mut client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake")
+            .with_elicitation(slot);
+
+        let err = client
+            .call_tool("fetch", serde_json::json!({}))
+            .await
+            .expect_err("a plain tool error still surfaces");
+        assert!(
+            err.to_string().contains("code -32601"),
+            "error surfaces verbatim: {err}"
+        );
+        assert!(
+            elicitor.calls.lock().unwrap().is_empty(),
+            "a non--32042 error must never page the host handler"
+        );
+    }
+
+    /// `send_request` `next_id += 1` → `*=`: request ids would stick at 1
+    /// forever. The mock rejects a duplicate id by exiting, so the second
+    /// call can only succeed if it carried a fresh id.
+    #[tokio::test]
+    async fn stdio_request_ids_stay_unique_across_calls() {
+        let server = stdio_mock_server(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}]}}"#,
+            false,
+            true,
+        );
+        let mut client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake");
+
+        let out = client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .expect("every request must carry a fresh JSON-RPC id");
+        assert_eq!(out, "pong");
+    }
+
+    /// `send_notification` body → `Ok(())`: the initialized notification
+    /// would never reach the wire. The mock only serves `tools/call` after
+    /// seeing it, so the call below can only succeed if the notification
+    /// was actually written.
+    #[tokio::test]
+    async fn stdio_sends_the_initialized_notification_before_tool_calls() {
+        let server = stdio_mock_server(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}]}}"#,
+            true,
+            false,
+        );
+        let mut client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake");
+
+        let out = client
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .expect("tools/call must follow the `notifications/initialized` notification");
+        assert_eq!(out, "pong");
+    }
+
+    /// `read_stdio_response` `unwrap_or(-1)` → `unwrap_or(1)`: an error
+    /// object without a `code` field must report code -1.
+    #[tokio::test]
+    async fn stdio_error_without_code_reports_minus_one() {
+        let server = stdio_mock_server(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"message":"boom"}}"#,
+            true,
+            true,
+        );
+        let mut client = McpClient::spawn_with_timeout(&server, Duration::from_secs(2))
+            .await
+            .expect("handshake");
+
+        let err = client
+            .call_tool("fetch", serde_json::json!({}))
+            .await
+            .expect_err("the error reply surfaces");
+        assert!(
+            err.to_string().contains("code -1"),
+            "a missing code must default to -1: {err}"
+        );
+    }
+
+    /// A loopback legacy-SSE mock whose message endpoint (POST) always
+    /// answers HTTP 500: the stream itself is healthy, so only the POST
+    /// status can explain the failure.
+    fn spawn_sse_post_error_mock() -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let Ok(clone) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(clone);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        return;
+                    }
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if line.trim().is_empty() => break,
+                            Ok(_) => {
+                                let lower = line.to_ascii_lowercase();
+                                if let Some(v) = lower.strip_prefix("content-length:") {
+                                    content_length = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    let mut stream = stream;
+                    if request_line.starts_with("GET ") {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                    Cache-Control: no-cache\r\n\r\n";
+                        if stream.write_all(head.as_bytes()).is_err() {
+                            return;
+                        }
+                        let endpoint = "event: endpoint\ndata: /messages\n\n";
+                        let _ = stream.write_all(endpoint.as_bytes());
+                        let _ = stream.flush();
+                        // Park, keeping the event stream open forever.
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                });
+            }
+        });
+        format!("http://{addr}/sse")
+    }
+
+    /// `write_line` HttpSse guard `response.status().is_success()` → true:
+    /// a failed POST must surface its HTTP status, not be treated as
+    /// success and leave the caller waiting on a reply that never comes.
+    #[tokio::test]
+    async fn legacy_sse_post_failure_is_reported_not_swallowed() {
+        let url = spawn_sse_post_error_mock();
+        let server = server_with_url(&url, Some("sse"));
+
+        let err = McpClient::spawn_with_timeout(&server, Duration::from_secs(1))
+            .await
+            .expect_err("a 500 on the message POST must fail the handshake");
+        assert!(
+            err.to_string().contains("returned HTTP 500"),
+            "the POST status must surface: {err}"
+        );
+    }
+
+    /// `answer_sse_server_request` `method == "ping"` → `!=`: a server
+    /// ping must be answered with an empty result, never a -32601 error.
+    #[tokio::test]
+    async fn legacy_sse_answers_server_ping_with_an_empty_result() {
+        let state = Arc::new(LegacySseState::default());
+        let url = spawn_legacy_sse_mock(state.clone());
+        let server = server_with_url(&url, Some("sse"));
+
+        let mut client = McpClient::spawn(&server).await.expect("handshake");
+        let _ = client
+            .list_tools()
+            .await
+            .expect("tools/list; the mock fires its server ping right after");
+
+        // The ping reply is the one POST body carrying the server's id.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let reply = loop {
+            let bodies = state.post_bodies.lock().unwrap().clone();
+            if let Some(body) = bodies.iter().find(|b| b.contains("\"srv-ping-1\"")) {
+                break body.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server ping must be answered over POST; saw {:?}",
+                state.post_bodies.lock().unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let reply: Value = serde_json::from_str(&reply).expect("the ping reply is JSON");
+        assert!(
+            reply.get("result").is_some(),
+            "a ping must be answered with a result: {reply}"
+        );
+        assert!(
+            reply.get("error").is_none(),
+            "a ping must not be answered with a -32601 error: {reply}"
+        );
+    }
+
+    /// `SseEvent::is_empty` `&&` → `||`: an event carrying only `data:`
+    /// (the common JSON-RPC case) must still be framed and delivered.
+    #[test]
+    fn sse_parser_delivers_data_only_events() {
+        let mut parser = SseParser::new(b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
+        let events = parser.take();
+        assert_eq!(
+            events.len(),
+            1,
+            "a data-only event is not empty and must be framed: {events:?}"
+        );
+        assert_eq!(
+            events[0].data,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"
+        );
+        assert_eq!(events[0].event, None);
+    }
+
+    /// `SseEvent::is_empty` body → `false`: blank lines after the last
+    /// event must not frame extra empty events.
+    #[test]
+    fn sse_parser_does_not_emit_events_for_trailing_blank_lines() {
+        let mut parser = SseParser::new(b"event: e\ndata: x\n\n\n");
+        let events = parser.take();
+        assert_eq!(
+            events.len(),
+            1,
+            "a trailing blank line must not emit an empty event: {events:?}"
+        );
+        assert_eq!(events[0].data, "x");
+    }
+
+    /// `jsonrpc_outcome` `unwrap_or(-1)` → `unwrap_or(1)`: an error object
+    /// without `code` (plain-JSON HTTP body path) must report -1.
+    #[test]
+    fn http_jsonrpc_error_without_code_reports_minus_one() {
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"message\":\"boom\"}}";
+        let err = parse_http_jsonrpc_response(body, "application/json", 3, "srv").unwrap_err();
+        assert!(
+            err.to_string().contains("code -1"),
+            "a missing code must default to -1: {err}"
+        );
+    }
+
+    /// `parse_sse_response` blank-line guard `!current_data.is_empty()` →
+    /// `current_data.is_empty()`: the first completed event must be
+    /// returned at its blank line, before a later event can corrupt the
+    /// accumulator.
+    #[test]
+    fn sse_response_returns_the_first_matching_event_before_later_ones() {
+        let first = r#"{"jsonrpc":"2.0","id":1,"result":{"v":1}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":2,"result":{"v":2}}"#;
+        let buffer = format!("data: {first}\n\ndata: {second}\n\n");
+        let result = parse_sse_response(&buffer, 1, "srv")
+            .expect("the first completed event must be returned at its blank line");
+        let val = result.expect("the first event carries the matching id");
+        assert_eq!(val.get("v").and_then(Value::as_i64), Some(1));
+    }
+
+    /// `parse_sse_response` unknown-line guards `&&` → `||` (both the
+    /// `data:` and the `is_empty` conjunct): an `event:` line inside an
+    /// event must not clear the data accumulator.
+    #[test]
+    fn sse_response_event_field_lines_do_not_reset_data() {
+        let buffer =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"v\":9}}\nevent: message\n\n";
+        let result = parse_sse_response(buffer, 9, "srv")
+            .expect("an `event:` line must not reset the data accumulator");
+        let val = result.expect("the event parses at its blank line");
+        assert_eq!(val.get("v").and_then(Value::as_i64), Some(9));
+    }
+
+    /// `parse_sse_response` tail `unwrap_or(-1)` → `unwrap_or(1)`: an
+    /// error object without `code` in a newline-less buffer must report -1.
+    #[test]
+    fn sse_response_tail_error_without_code_reports_minus_one() {
+        let buffer = "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"message\":\"late\"}}";
+        let result = parse_sse_response(buffer, 4, "srv")
+            .expect("a buffer without a trailing newline still parses");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("code -1"),
+            "a missing code must default to -1: {err_msg}"
+        );
+    }
+
+    // ── dispatch_request: the recursive-as-MCP-server surface ─────────────
+
+    async fn dispatch_fixture() -> McpClient {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_streamable_mock(captured);
+        let server = server_with_url(&url, None);
+        McpClient::spawn(&server)
+            .await
+            .expect("spawn the streamable mock")
+    }
+
+    fn rpc_request(method: &str, params: Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: method.into(),
+            params,
+        }
+    }
+
+    /// `dispatch_request` body → `None` (and the `initialize` arm): the
+    /// canned initialize response must come back as a success response.
+    #[tokio::test]
+    async fn dispatch_initialize_returns_the_canned_server_info() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request("initialize", serde_json::json!({})),
+            &mut client,
+        )
+        .await
+        .expect("initialize must produce a response");
+        assert!(
+            resp.error.is_none(),
+            "initialize must succeed: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("initialize carries a result");
+        assert_eq!(
+            result.get("protocolVersion").and_then(Value::as_str),
+            Some("2024-11-05")
+        );
+        assert_eq!(
+            result
+                .get("serverInfo")
+                .and_then(|s| s.get("name"))
+                .and_then(Value::as_str),
+            Some("recursive-agent")
+        );
+    }
+
+    /// The `notifications/initialized` arm: a notification (no id) gets no
+    /// response at all.
+    #[tokio::test]
+    async fn dispatch_initialized_notification_yields_no_response() {
+        let mut client = dispatch_fixture().await;
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "notifications/initialized".into(),
+            params: serde_json::json!({}),
+        };
+        assert!(
+            dispatch_request(&request, &mut client).await.is_none(),
+            "a notification must not produce a response"
+        );
+    }
+
+    /// The `tools/list` arm: the server's tools are proxied as a success
+    /// response, not a method-not-found error.
+    #[tokio::test]
+    async fn dispatch_tools_list_proxies_the_server_tools() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request("tools/list", serde_json::json!({})),
+            &mut client,
+        )
+        .await
+        .expect("tools/list must produce a response");
+        let result = resp.result.expect("tools/list must succeed");
+        assert_eq!(
+            result
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| tools.len()),
+            Some(1)
+        );
+        assert_eq!(
+            result
+                .get("tools")
+                .and_then(Value::as_array)
+                .and_then(|tools| tools[0].get("name"))
+                .and_then(Value::as_str),
+            Some("echo")
+        );
+    }
+
+    /// The `tools/call` arm: the tool result text is proxied in the
+    /// content envelope.
+    #[tokio::test]
+    async fn dispatch_tools_call_proxies_the_tool_result() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request(
+                "tools/call",
+                serde_json::json!({"name": "echo", "arguments": {}}),
+            ),
+            &mut client,
+        )
+        .await
+        .expect("tools/call must produce a response");
+        let result = resp.result.expect("tools/call must succeed");
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|c| c[0].get("text"))
+                .and_then(Value::as_str),
+            Some("pong")
+        );
+    }
+
+    /// The `resources/list` arm.
+    #[tokio::test]
+    async fn dispatch_resources_list_proxies_resources() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request("resources/list", serde_json::json!({})),
+            &mut client,
+        )
+        .await
+        .expect("resources/list must produce a response");
+        let result = resp.result.expect("resources/list must succeed");
+        assert_eq!(
+            result
+                .get("resources")
+                .and_then(Value::as_array)
+                .and_then(|r| r[0].get("uri"))
+                .and_then(Value::as_str),
+            Some("file:///a.txt")
+        );
+    }
+
+    /// The `resources/read` arm.
+    #[tokio::test]
+    async fn dispatch_resources_read_proxies_contents() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request(
+                "resources/read",
+                serde_json::json!({"uri": "file:///a.txt"}),
+            ),
+            &mut client,
+        )
+        .await
+        .expect("resources/read must produce a response");
+        let result = resp.result.expect("resources/read must succeed");
+        assert_eq!(
+            result
+                .get("contents")
+                .and_then(Value::as_array)
+                .and_then(|c| c[0].get("text"))
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+    }
+
+    /// The `prompts/list` arm.
+    #[tokio::test]
+    async fn dispatch_prompts_list_proxies_prompts() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request("prompts/list", serde_json::json!({})),
+            &mut client,
+        )
+        .await
+        .expect("prompts/list must produce a response");
+        let result = resp.result.expect("prompts/list must succeed");
+        assert_eq!(
+            result
+                .get("prompts")
+                .and_then(Value::as_array)
+                .and_then(|p| p[0].get("name"))
+                .and_then(Value::as_str),
+            Some("greet")
+        );
+    }
+
+    /// The `prompts/get` arm.
+    #[tokio::test]
+    async fn dispatch_prompts_get_proxies_messages() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request(
+                "prompts/get",
+                serde_json::json!({"name": "greet", "arguments": {"who": "world"}}),
+            ),
+            &mut client,
+        )
+        .await
+        .expect("prompts/get must produce a response");
+        let result = resp.result.expect("prompts/get must succeed");
+        assert_eq!(
+            result
+                .get("messages")
+                .and_then(Value::as_array)
+                .and_then(|m| m[0].get("content"))
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str),
+            Some("hi")
+        );
+    }
+
+    /// The `_` fallthrough (contrast arm for every `delete match arm`
+    /// mutant): an unknown method is a -32601 naming the method.
+    #[tokio::test]
+    async fn dispatch_unknown_method_is_method_not_found() {
+        let mut client = dispatch_fixture().await;
+        let resp = dispatch_request(
+            &rpc_request("bogus/method", serde_json::json!({})),
+            &mut client,
+        )
+        .await
+        .expect("unknown methods still get a response");
+        let err = resp.error.expect("an unknown method must be an error");
+        assert_eq!(err.code, -32601);
+        assert!(
+            err.message.contains("bogus/method"),
+            "the error must name the method: {err:?}"
+        );
+    }
+
+    // ── McpTool: identity, deferral, side-effect classification ───────────
+
+    fn mcp_tool_fixture(trust: McpServerTrust, annotations: Option<McpToolAnnotations>) -> McpTool {
+        let client = Arc::new(Mutex::new(idle_streamable_client(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )));
+        let spec = McpToolSpec {
+            name: "search".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations,
+        };
+        McpTool::new(client, spec, "docs-srv").with_trust(trust)
+    }
+
+    /// `McpTool::server_name` → `""`/`"xyzzy"` and `mcp_server_name` →
+    /// `None`/`Some("")`/`Some("xyzzy")`: the proxied server identity must
+    /// survive (the registry rebuild re-attaches tools by it).
+    #[test]
+    fn mcp_tool_keeps_its_proxied_server_identity() {
+        let tool = mcp_tool_fixture(McpServerTrust::Untrusted, None);
+        assert_eq!(
+            tool.server_name(),
+            "docs-srv",
+            "server_name must return the server this tool was discovered on"
+        );
+        assert_eq!(
+            tool.mcp_server_name(),
+            Some("docs-srv"),
+            "mcp_server_name drives the registry rebuild re-attachment"
+        );
+    }
+
+    /// `<McpTool as Tool>::is_deferred` → `false`: MCP tools ride as
+    /// name-only deferred entries in the initial prompt.
+    #[test]
+    fn mcp_tool_is_deferred_in_the_initial_prompt() {
+        let tool = mcp_tool_fixture(McpServerTrust::Untrusted, None);
+        assert!(
+            tool.is_deferred(),
+            "MCP tools must be advertised as deferred (name-only) tools"
+        );
+    }
+
+    /// `side_effect_class` guard `trust != Trusted` → `==`: trust must gate
+    /// annotation use — untrusted hints never earn ReadOnly, trusted hints
+    /// do, and the trusted hint ladder (read-only → open-world → mutating)
+    /// holds.
+    #[test]
+    fn mcp_tool_side_effect_honours_trust_before_annotations() {
+        use crate::tools::ToolSideEffect;
+        let read_only = McpToolAnnotations {
+            read_only_hint: true,
+            ..Default::default()
+        };
+
+        let untrusted = mcp_tool_fixture(McpServerTrust::Untrusted, Some(read_only.clone()))
+            .side_effect_class();
+        assert_eq!(
+            untrusted,
+            ToolSideEffect::External,
+            "an untrusted server must stay External even with a read-only hint"
+        );
+
+        let trusted_ro =
+            mcp_tool_fixture(McpServerTrust::Trusted, Some(read_only)).side_effect_class();
+        assert_eq!(
+            trusted_ro,
+            ToolSideEffect::ReadOnly,
+            "a trusted read-only hint must classify as ReadOnly"
+        );
+
+        let trusted_ow = mcp_tool_fixture(
+            McpServerTrust::Trusted,
+            Some(McpToolAnnotations {
+                open_world_hint: true,
+                ..Default::default()
+            }),
+        )
+        .side_effect_class();
+        assert_eq!(
+            trusted_ow,
+            ToolSideEffect::External,
+            "a trusted open-world hint must classify as External"
+        );
+
+        let trusted_plain =
+            mcp_tool_fixture(McpServerTrust::Trusted, Some(McpToolAnnotations::default()))
+                .side_effect_class();
+        assert_eq!(
+            trusted_plain,
+            ToolSideEffect::Mutating,
+            "a trusted tool without hints defaults to Mutating"
+        );
+
+        let unannotated = mcp_tool_fixture(McpServerTrust::Trusted, None).side_effect_class();
+        assert_eq!(
+            unannotated,
+            ToolSideEffect::External,
+            "missing annotations stay conservative even when trusted"
         );
     }
 }
