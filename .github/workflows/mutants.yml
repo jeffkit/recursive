@@ -425,7 +425,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.agent_shards != ''
     strategy:
       fail-fast: false
-      max-parallel: 13
+      max-parallel: 20
       matrix:
         shard: ${{ fromJSON(inputs.agent_shards).shard }}
     steps:
