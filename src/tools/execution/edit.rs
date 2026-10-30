@@ -944,6 +944,16 @@ mod tests {
         );
     }
 
+    /// The 1 GiB edit ceiling is a documented contract (module doc: aligned
+    /// with fake-cc's `MAX_EDIT_FILE_SIZE`), not an implementation detail.
+    /// Kills the `* -> /` and `* -> +` mutations of the literal:
+    /// `1024 / 1024 * 1024` = 1024 and `1024 * 1024 + 1024` = 1_049_600 are
+    /// both far from 1 GiB.
+    #[test]
+    fn max_edit_file_size_is_one_gib() {
+        assert_eq!(MAX_EDIT_FILE_SIZE, 1_073_741_824);
+    }
+
     // ── apply_curly_double ────────────────────────────────────────────────
     // Kills: replace == with != in apply_curly_double (127:14)
 

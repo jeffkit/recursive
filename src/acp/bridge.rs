@@ -688,6 +688,44 @@ mod tests {
         );
     }
 
+    /// The full stop_reason contract of the terminal notification. Kills the
+    /// `TurnFinished` stop_reason match mutations:
+    /// - delete `cancelled` arm → falls to `_ => "end_turn"`,
+    /// - delete `budget_exceeded` arm → falls to `_ => "end_turn"`,
+    /// - guard `-> false` and first `|| -> &&` → `"stuck:…"` loses `"error"`,
+    /// - second `|| -> &&` → `"transcript_limit:…"` loses `"error"`,
+    /// - third `|| -> &&` → `"provider_stop:…"` / `"permission_denial_limit"`
+    ///   lose `"error"`,
+    /// - guard `-> true` and `== -> !=` → an unknown reason turns `"error"`
+    ///   instead of the `_ => "end_turn"` catch-all.
+    #[tokio::test]
+    async fn turn_finished_reasons_map_to_their_contracted_stop_reasons() {
+        let cases: &[(&str, &str)] = &[
+            ("no_more_tool_calls", "end_turn"),
+            ("cancelled", "cancelled"),
+            ("budget_exceeded", "max_turns"),
+            ("stuck:3 identical failing tool calls", "error"),
+            ("transcript_limit:97000 tokens", "error"),
+            ("provider_stop:end_of_stream", "error"),
+            ("permission_denial_limit", "error"),
+            ("model_finished_early", "end_turn"),
+        ];
+        for (reason, want) in cases {
+            let (bridge, mut rx) = make_bridge(default_kind_map());
+            bridge
+                .emit(AgentEvent::TurnFinished {
+                    reason: (*reason).into(),
+                    steps: 1,
+                })
+                .await;
+            let notif = rx.try_recv().expect("end_turn notification");
+            assert_eq!(
+                notif["params"]["update"]["stopReason"], *want,
+                "reason {reason:?} must map to stopReason {want:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn bridge_message_id_is_content_hash_of_full_text() {
         let (bridge, mut rx) = make_bridge(default_kind_map());

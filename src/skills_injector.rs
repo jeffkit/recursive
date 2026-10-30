@@ -275,4 +275,53 @@ mod tests {
             "** should not match wrong filename"
         );
     }
+
+    #[test]
+    fn star_matches_within_one_segment_only() {
+        // Kills the `i - 1` -> `i / 1` and `i - 1` -> `i + 1` mutations in the
+        // segment-boundary check: on a segment with no match the scan runs to
+        // the end of the string, where either mutant indexes out of bounds
+        // (s_bytes[i] / s_bytes[i + 1] at i == s.len()) and panics instead of
+        // answering false.
+        assert!(glob_matches("*.md", "readme.md"), "same segment matches");
+        assert!(
+            !glob_matches("*.rs", "abc"),
+            "no dot suffix, no match — must not panic"
+        );
+        assert!(
+            !glob_matches("*.md", "docs/readme.md"),
+            "`*` cannot cross a `/`"
+        );
+    }
+
+    /// A `Globs`-mode skill whose pattern matches a tool-result path must be
+    /// injected with its SKILL.md body, exactly once per run. Kills:
+    /// - `check -> vec![]` (nothing ever injected),
+    /// - `delete !` / guard `!g.is_empty()` -> false (both make a non-empty
+    ///   globs list fall to `_ => continue`, so nothing ever injects).
+    #[test]
+    fn injector_injects_a_matching_globs_skill_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill_path = dir.path().join("SKILL.md");
+        std::fs::write(&skill_path, "guide body").expect("write skill file");
+
+        let mut skill = crate::skills::skill_from_content("docs-guide", "guide body", vec![]);
+        skill.mode = SkillMode::Globs;
+        skill.globs = Some(vec!["docs/**".to_string()]);
+        skill.path = skill_path;
+        skill.body = None;
+
+        let mut injector = SkillInjector::new(&[skill]);
+        let hits = injector.check(&["wrote docs/guide.md".to_string()]);
+        assert_eq!(
+            hits,
+            vec![("docs-guide".to_string(), "guide body".to_string())],
+            "matching path must inject the skill body exactly once"
+        );
+        let again = injector.check(&["wrote docs/guide.md".to_string()]);
+        assert!(
+            again.is_empty(),
+            "each skill is injected at most once per run"
+        );
+    }
 }

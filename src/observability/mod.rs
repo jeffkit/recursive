@@ -263,6 +263,51 @@ mod tests {
         assert_eq!(sinks.len(), 1);
     }
 
+    // ── live-run wiring (otel builds; the inert half is pinned above) ─────
+
+    /// A configured run attaches a live exporter: `is_active` flips true and
+    /// `sink` hands out the collector sink. Kills `is_active -> false` and
+    /// `sink -> None`. Purely local: the exporter builds against a port-1
+    /// endpoint and no export is triggered (same shape as the exporter
+    /// module's own `pipeline_builds_with_an_http_client`).
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn active_run_is_live_and_hands_out_a_sink() {
+        let cfg = LangfuseConfig {
+            endpoint: "http://127.0.0.1:1/v1/traces".to_string(),
+            headers: Vec::new(),
+            service_name: "recursive-test".to_string(),
+            sample_ratio: 1.0,
+            redact: true,
+        };
+        let run = LangfuseRun::from_config(RunMeta::new("s1", "test-model", "mock"), Some(cfg));
+        assert!(
+            run.is_active(),
+            "sample_ratio 1.0 + buildable exporter = live run"
+        );
+        assert!(run.sink().is_some(), "a live run must hand out its sink");
+    }
+
+    /// `with_sink` appends the live run's sink to the host's composite list.
+    /// Kills `replace with_sink with ()` — the inactive no-push case is
+    /// pinned by `with_sink_is_a_noop_when_inactive`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn with_sink_appends_the_active_run_sink() {
+        let cfg = LangfuseConfig {
+            endpoint: "http://127.0.0.1:1/v1/traces".to_string(),
+            headers: Vec::new(),
+            service_name: "recursive-test".to_string(),
+            sample_ratio: 1.0,
+            redact: true,
+        };
+        let run = LangfuseRun::from_config(RunMeta::new("s1", "test-model", "mock"), Some(cfg));
+        assert!(run.is_active(), "test needs a live run");
+        let mut sinks: Vec<Box<dyn EventSink>> = vec![Box::new(DropMarker)];
+        with_sink(&run, &mut sinks);
+        assert_eq!(sinks.len(), 2, "active run's sink must be appended");
+    }
+
     #[tokio::test]
     async fn finish_is_safe_when_inactive() {
         let run = inert_run();

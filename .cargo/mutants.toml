@@ -592,4 +592,61 @@ exclude_re = [
     # reachable from a Windows build, which has no mutation gate. Drop this
     # entry if a Windows mutation leg is ever added.
     "src/credentials/store\\.rs:280:5: replace write_owner_only -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # ── Issue #245 batch 20 (B2 seat, task list /tmp/b2-batch20.txt) ───────
+    # True-equivalence exclusions, per the #223/#228 doctrine: exhaustive
+    # case analysis below, each verified by applying the mutation and running
+    # its mapped test (GREEN under the mutant; logs in /tmp/b2-b20/negctl/).
+    #
+    # bridge emit :300:21 — the literal arm "no_more_tool_calls" =>
+    # "end_turn" is redundant with the trailing catch-all `_ => "end_turn"`:
+    # deleting the arm routes the string through the guard (false for it) to
+    # `_`, which returns the same value. The arm is documentation; the
+    # killable siblings on this match (cancelled/budget_exceeded arms, guard
+    # flips, || -> &&, == -> !=) are pinned by
+    # turn_finished_reasons_map_to_their_contracted_stop_reasons.
+    "src/acp/bridge\\.rs:300:21: delete match arm \"no_more_tool_calls\" in <impl EventSink for AcpBridge>::emit",
+    # bridge emit :452:13 — the ProgrammaticRunStarted/ProgrammaticRunFinished
+    # arm body is `{}` and the next arm is the catch-all `_ => {}` (the
+    # in-code comment says the drop is deliberate and pinned here so the
+    # decision is visible): deleting the arm is behaviorally identical.
+    "src/acp/bridge\\.rs:452:13: delete match arm AgentEvent::ProgrammaticRunStarted\\{\\.\\.\\} \\| AgentEvent::ProgrammaticRunFinished\\{\\.\\.\\} in <impl EventSink for AcpBridge>::emit",
+    # match_glob :73:9 — the (None, None) arm is unreachable: the function
+    # returns early when pat.is_empty(), so at the literal-char match the
+    # pattern always yields a first char and (Some, _) is the only shape that
+    # reaches the tail; equal-length exhaustion recurses into the empty
+    # pattern early-return instead. Deleting dead code cannot change behavior.
+    "src/skills_injector\\.rs:73:9: delete match arm \\(None, None\\) in match_glob",
+    # SkillInjector::check :113:28 guard -> true — for the only input the
+    # flip admits (globs = Some(empty)), `patterns.iter().any(...)` over an
+    # empty slice is false, so the skill neither injects nor marks itself
+    # injected — identical to the original `_ => continue`. The killable
+    # siblings (delete !, guard -> false) are pinned by
+    # injector_injects_a_matching_globs_skill_exactly_once.
+    "src/skills_injector\\.rs:113:28: replace match guard !g\\.is_empty\\(\\) with true in SkillInjector::check",
+    # apply_curly_single :172:33 `>` -> `<` and :172:48 `-` -> `/` — both
+    # fold prev_letter to a constant false (`i < 0` is never true for usize;
+    # `chars[i / 1]` is the apostrophe itself, never alphabetic), and
+    # prev_letter == false is behaviorally identical to the original on every
+    # input: when the char before the apostrophe is not a letter the original
+    # flag is false anyway, and when it IS a letter both arms converge —
+    # original takes `prev && next` -> RIGHT_SINGLE, or falls to
+    # is_opening_context, whose `matches!` set (whitespace, brackets, dashes
+    # — no letters) is false after a letter, so also RIGHT_SINGLE. The
+    # panicking siblings on these expressions (`==`/`>=` index chars[-1],
+    # `+` overruns the tail) are killed by the existing apply_curly_single_*
+    # tests; the `// cargo-mutants::skip` comments on these lines document
+    # the equivalence class but are inert as comments.
+    "src/tools/execution/edit\\.rs:172:33: replace > with < in apply_curly_single",
+    "src/tools/execution/edit\\.rs:172:48: replace - with / in apply_curly_single",
+    # observability :137:9 — the #[cfg(not(feature = "otel"))] inert() body.
+    # The mutants gate (agent-mutants.sh) compiles WITH otel in FEATURES, so
+    # this fn is cfg'd out there: every mutation of it builds a
+    # byte-identical binary and reports MISSED regardless of tests (the
+    # recursive-cli otel.rs cfg-blindness class). Where the fn does compile
+    # (otel off), `Default::default()` is type-invalid — the empty struct has
+    # no Default impl, E0277 — so the mutant is compiler-killed there. No
+    # configuration exists where it both compiles and is observable; the
+    # otel-half twin at :132:9 is likewise compiler-killed in otel builds.
+    # Drop this entry the day the gate's FEATURES lose otel.
+    "src/observability/mod\\.rs:137:9: replace LangfuseRun::inert -> Self with Default::default\\(\\)",
 ]

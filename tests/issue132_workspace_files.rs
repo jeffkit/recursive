@@ -354,8 +354,91 @@ mod issue132_workspace_files_tests {
         );
     }
 
-    // ── headline: directory listing ─────────────────────────────────────
+    // ── headline: stat error mapping and page-limit boundary ────────────
 
+    /// A missing path answers 404 with the "no such entry" spelling. The
+    /// metadata error closure must keep distinguishing `NotFound` from other
+    /// stat failures — flipping its `==` would turn every miss into a 500
+    /// `stat '…' failed`.
+    #[tokio::test]
+    async fn missing_path_is_not_found_not_internal() {
+        let (state, _tmp) = workspace_state();
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+
+        let (status, body) = files_get(&app, &id, "?path=never-written.txt").await;
+        assert_eq!(status, 404, "{body}");
+        assert!(body.contains("no such entry"), "{body}");
+        assert!(!body.contains("stat '"), "{body}");
+    }
+
+    /// A full page of exactly `MAX_LINES_PER_PAGE` lines is served — the
+    /// page gate is `>`, not `>=`, and the page size must stay
+    /// `end - start + 1`. Kills `-` → `+` (1..=50000 would size to 50002)
+    /// and `>` → `>=` (50000 would exceed) on the page-limit line.
+    #[tokio::test]
+    async fn full_page_of_exactly_the_line_limit_is_served() {
+        let (state, tmp) = workspace_state();
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+
+        let limit = 50_000;
+        // One byte of content per line: the whole file must stay under the
+        // 256 KiB whole-file gate so the page-limit boundary is what's hit.
+        let mut content = String::new();
+        for _ in 1..=limit {
+            content.push_str("x\n");
+        }
+        write_file(tmp.path(), "big-page.txt", content.as_bytes());
+
+        let (status, body) = files_get(
+            &app,
+            &id,
+            &format!("?path=big-page.txt&start_line=1&end_line={limit}"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            200,
+            "tail: {}",
+            &body[body.len().saturating_sub(300)..]
+        );
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total_lines"], limit);
+        assert_eq!(page["end_line"], limit);
+        assert_eq!(page["start_line"], 1);
+    }
+
+    /// One line past `MAX_LINES_PER_PAGE` is an explicit range error — never
+    /// a clamped or oversized page. Kills `+` → `*`
+    /// (`end - start * 1` sizes the 1..=50001 page to 50000 and slips it
+    /// through) and `>` → `==` on the page-limit line.
+    #[tokio::test]
+    async fn page_past_the_line_limit_is_refused() {
+        let (state, tmp) = workspace_state();
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+
+        let limit = 50_000;
+        // One byte of content per line: the whole file must stay under the
+        // 256 KiB whole-file gate so the page-limit boundary is what's hit.
+        let mut content = String::new();
+        for _ in 1..=limit + 1 {
+            content.push_str("x\n");
+        }
+        write_file(tmp.path(), "over-page.txt", content.as_bytes());
+
+        let (status, body) = files_get(
+            &app,
+            &id,
+            &format!("?path=over-page.txt&start_line=1&end_line={}", limit + 1),
+        )
+        .await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("page limit"), "{body}");
+    }
+
+    // ── headline: directory listing ─────────────────────────────────────
     /// `mode=list` stays inside the root, classifies entries by their own
     /// type and never follows a symlink — a link to a file is listed as
     /// `symlink`, not resolved into the file it points at.
