@@ -1559,8 +1559,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
     async fn execute_without_config_prefers_html_over_jina() {
         use mockito::Server;
+
+        // Env read side must hold the crate-wide env lock: other tests set
+        // RECURSIVE_WEB_SEARCH_* under the same lock (issue #222).
+        let _lock = crate::test_util::env_lock();
 
         // Ensure env vars from other tests don't leak into this path.
         // Per AGENTS.md: keep env mutation inside a single test body.
@@ -1638,5 +1643,68 @@ mod tests {
             out.contains("Summary: A systems programming language."),
             "result must include the snippet"
         );
+    }
+
+    // ── Issue #245 batch 21: load_config override/env resolution ────────────
+
+    /// The full resolution chain: struct overrides beat a *present* env, env
+    /// feeds the config when no override is set, and non-blank values are
+    /// required on both sides. This is the contract `execute()` relies on to
+    /// route a configured search to its provider.
+    #[test]
+    fn load_config_overrides_beat_env_and_env_fills_the_gap() {
+        let _lock = crate::test_util::env_lock();
+        let previous_provider = std::env::var("RECURSIVE_WEB_SEARCH_PROVIDER").ok();
+        let previous_key = std::env::var("RECURSIVE_WEB_SEARCH_API_KEY").ok();
+        // SAFETY: test-only env mutation under the env lock, restored below.
+        unsafe {
+            std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", "tavily");
+            std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", "env-key");
+        }
+
+        // (a) No overrides → env vars feed the config.
+        let from_env = WebSearch::new();
+        assert_eq!(
+            from_env.load_config(),
+            Some((Provider::Tavily, "env-key".to_string())),
+            "env must supply provider + key when no override is set"
+        );
+
+        // (b) Overrides win over the *present* env (a default-constructed
+        // tool would answer Tavily/env-key here).
+        let overridden = WebSearch::new().with_search_config(
+            Some("brave".to_string()),
+            Some("override-key".to_string()),
+            None,
+        );
+        assert_eq!(
+            overridden.load_config(),
+            Some((Provider::Brave, "override-key".to_string())),
+            "config overrides must take precedence over env vars"
+        );
+
+        // (c) With env cleared the override still resolves — the override is
+        // really the source, not an env coincidence.
+        unsafe {
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_PROVIDER");
+            std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY");
+        }
+        assert_eq!(
+            overridden.load_config(),
+            Some((Provider::Brave, "override-key".to_string())),
+            "overrides must resolve with the env unset as well"
+        );
+
+        // Restore prior env.
+        unsafe {
+            match previous_provider {
+                Some(v) => std::env::set_var("RECURSIVE_WEB_SEARCH_PROVIDER", v),
+                None => std::env::remove_var("RECURSIVE_WEB_SEARCH_PROVIDER"),
+            }
+            match previous_key {
+                Some(v) => std::env::set_var("RECURSIVE_WEB_SEARCH_API_KEY", v),
+                None => std::env::remove_var("RECURSIVE_WEB_SEARCH_API_KEY"),
+            }
+        }
     }
 }

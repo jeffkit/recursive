@@ -1871,7 +1871,7 @@ mod tests {
 
     use super::{
         effective_step_limit, estimate_prompt_tokens, estimate_tokens_by_bytes, finish_reason_str,
-        CostBudget, RunCore, TokenUsage, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
+        retry_reason, CostBudget, RunCore, TokenUsage, MIN_TRIM_LENGTH, TRIM_PLACEHOLDER,
     };
     use crate::context_breakdown::StaticBreakdownCache;
     use crate::message::Message;
@@ -5434,5 +5434,354 @@ mod tests {
         );
         // Transcript kept: 1 user + 3 × (assistant tool_call + tool result).
         assert_eq!(outcome.messages.len(), 7, "transcript must be preserved");
+    }
+
+    // ── Issue #245 batch 21: retry_reason label contract ────────────────────
+    // `retry_reason` feeds the `reason` field of `AgentEvent::LlmRetry`; the
+    // CLI's api_retry mapper keys off these exact strings.
+
+    #[test]
+    fn retry_reason_labels_each_error_class() {
+        use crate::error::Error;
+        let llm = |msg: &str| Error::Llm {
+            provider: "mock".into(),
+            model: None,
+            request_id: None,
+            message: msg.to_string(),
+        };
+        // The structured Timeout variant carries no HTTP status, so its label
+        // can only come from the dedicated match arm.
+        assert_eq!(
+            retry_reason(&Error::Timeout { duration_ms: 1_000 }),
+            "timeout"
+        );
+        // A 429 in the adapters' exhausted-failure format ("HTTP <status>: …")
+        // and the structured RateLimited variant are both "rate_limited".
+        assert_eq!(retry_reason(&llm("HTTP 429: slow down")), "rate_limited");
+        assert_eq!(
+            retry_reason(&Error::RateLimited {
+                provider: "mock".into(),
+                retry_after_ms: 500,
+                request_id: None,
+            }),
+            "rate_limited"
+        );
+        // 5xx is a server_error; other statuses and status-less transport
+        // failures are "network".
+        assert_eq!(retry_reason(&llm("HTTP 503: unavailable")), "server_error");
+        assert_eq!(retry_reason(&llm("HTTP 404: no such model")), "network");
+        assert_eq!(retry_reason(&llm("HTTP 400: bad request")), "network");
+        assert_eq!(
+            retry_reason(&llm("request failed: connection refused")),
+            "network"
+        );
+    }
+
+    // ── Issue #245 batch 21: complete_with_budget wall-clock machinery ──────
+
+    /// A provider whose `complete()` never resolves — only the wall-budget
+    /// select (or the test harness timeout) can end the call.
+    struct WallHangProvider;
+    #[async_trait::async_trait]
+    impl crate::llm::ChatProvider for WallHangProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> crate::error::Result<crate::llm::Completion> {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            unreachable!("wall budget must fire first")
+        }
+        async fn stream(
+            &self,
+            _m: &[Message],
+            _t: &[crate::llm::ToolSpec],
+            _tx: Option<crate::llm::StreamSender>,
+            _c: Option<tokio_util::sync::CancellationToken>,
+        ) -> crate::error::Result<crate::llm::Completion> {
+            unreachable!("stream not used")
+        }
+    }
+
+    fn scripted_completion(content: &str) -> crate::llm::Completion {
+        crate::llm::Completion {
+            content: content.to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// A provider that completes after a short async delay — Pending on its
+    /// first poll, so a `tokio::select!` against it has a deterministic
+    /// winner regardless of poll order.
+    struct DelayedOkProvider;
+    #[async_trait::async_trait]
+    impl crate::llm::ChatProvider for DelayedOkProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> crate::error::Result<crate::llm::Completion> {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(scripted_completion("done"))
+        }
+        async fn stream(
+            &self,
+            _m: &[Message],
+            _t: &[crate::llm::ToolSpec],
+            _tx: Option<crate::llm::StreamSender>,
+            _c: Option<tokio_util::sync::CancellationToken>,
+        ) -> crate::error::Result<crate::llm::Completion> {
+            unreachable!("stream not used")
+        }
+    }
+
+    /// With no wall budget configured (`wall_timeout_secs == 0`) but a running
+    /// `wall_start`, the call must complete normally: the spent-budget
+    /// short-circuit must not fire (its guard is `> 0`), and no budget sleep
+    /// may be armed (a zero-second sleep would trip `WallClockExceeded`
+    /// before the provider ever answers).
+    #[tokio::test]
+    async fn complete_with_budget_ignores_wall_machinery_when_unbudgeted() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        core.llm = Arc::new(DelayedOkProvider);
+        core.wall_timeout_secs = 0;
+        core.wall_start = Some(std::time::Instant::now());
+
+        let msgs = vec![Message::user("hi".to_string())];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            core.complete_with_budget(&msgs, &[]),
+        )
+        .await
+        .expect("unbudgeted call must finish, not trip the harness timeout");
+        match outcome {
+            Ok(completion) => assert_eq!(completion.content, "done"),
+            other => panic!(
+                "expected Ok(completion) with no wall budget, got {:?}",
+                other.map(|c| c.content)
+            ),
+        }
+    }
+
+    /// When the wall budget expires *during* the awaited `complete()`, the
+    /// armed budget sleep must surface `WallClockExceeded` — the select must
+    /// actually be wired up for a positive budget.
+    #[tokio::test]
+    async fn complete_with_budget_enforces_wall_deadline_during_the_await() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("hi".to_string())], &hooks);
+        core.llm = Arc::new(WallHangProvider);
+        core.wall_timeout_secs = 1;
+        core.wall_start = Some(std::time::Instant::now());
+
+        let msgs = vec![Message::user("hi".to_string())];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            core.complete_with_budget(&msgs, &[]),
+        )
+        .await
+        .expect("the 1s wall budget must end the call well before the 8s harness timeout");
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::error::Error::WallClockExceeded { secs: 1 })
+            ),
+            "expected Err(WallClockExceeded{{secs:1}}) from the budget sleep, got {:?}",
+            outcome.map(|_| ())
+        );
+    }
+
+    // ── Issue #245 batch 21: provider-usage fallback in dispatch_llm_step ───
+
+    fn full_usage(prompt: u32, completion: u32, total: u32) -> Option<crate::llm::TokenUsage> {
+        Some(crate::llm::TokenUsage {
+            reasoning_tokens: 0,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+        })
+    }
+
+    /// Provider reports zero input tokens but real output: the input side is
+    /// backfilled with the 4-chars-per-token estimate (40 chars → 10) so
+    /// usage accounting never shows a zero prompt.
+    #[tokio::test]
+    async fn usage_fallback_estimates_prompt_tokens_when_output_is_reported() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("x".repeat(40))], &hooks);
+        let mut completion = scripted_completion("done");
+        completion.usage = full_usage(0, 5, 5);
+        core.llm = Arc::new(crate::llm::MockProvider::new(vec![completion]));
+
+        let mut total = TokenUsage::default();
+        core.dispatch_llm_step(&[], 0, &mut total)
+            .await
+            .expect("step must succeed");
+        assert_eq!(
+            core.last_prompt_tokens, 10,
+            "zero provider input + positive output must be backfilled with the estimate"
+        );
+        assert_eq!(total.prompt_tokens, 10);
+    }
+
+    /// Provider reports zero input AND zero output: there is nothing to
+    /// backfill from — the estimate must stay out of the way (otherwise an
+    /// idle call would fabricate input tokens).
+    #[tokio::test]
+    async fn usage_fallback_does_not_estimate_when_output_is_zero() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("x".repeat(40))], &hooks);
+        let mut completion = scripted_completion("done");
+        completion.usage = full_usage(0, 0, 0);
+        core.llm = Arc::new(crate::llm::MockProvider::new(vec![completion]));
+
+        let mut total = TokenUsage::default();
+        core.dispatch_llm_step(&[], 0, &mut total)
+            .await
+            .expect("step must succeed");
+        assert_eq!(
+            core.last_prompt_tokens, 0,
+            "no output reported → no fabricated input tokens"
+        );
+        assert_eq!(total.prompt_tokens, 0);
+    }
+
+    /// After the backfill, `total_tokens` must be at least estimated input +
+    /// reported output (here max(provider 0, 10 + 3) = 13).
+    #[tokio::test]
+    async fn usage_fallback_total_covers_estimated_input_plus_reported_output() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let mut core = make_test_core(vec![Message::user("x".repeat(40))], &hooks);
+        let mut completion = scripted_completion("done");
+        completion.usage = full_usage(0, 3, 0);
+        core.llm = Arc::new(crate::llm::MockProvider::new(vec![completion]));
+
+        let mut total = TokenUsage::default();
+        core.dispatch_llm_step(&[], 0, &mut total)
+            .await
+            .expect("step must succeed");
+        assert_eq!(
+            total.total_tokens, 13,
+            "total must cover estimated input (10) + reported output (3)"
+        );
+    }
+
+    // ── Issue #245 batch 21: deferred-tools block injection position ────────
+
+    /// A provider that declares deferred-tool support and records every
+    /// request payload it was sent.
+    struct DeferredCapableProvider {
+        calls: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::llm::ChatProvider for DeferredCapableProvider {
+        fn supports_deferred_tools(&self) -> bool {
+            true
+        }
+        async fn complete(
+            &self,
+            messages: &[Message],
+            _tools: &[crate::llm::ToolSpec],
+        ) -> crate::error::Result<crate::llm::Completion> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(messages.to_vec());
+            Ok(scripted_completion("ok"))
+        }
+        async fn stream(
+            &self,
+            _m: &[Message],
+            _t: &[crate::llm::ToolSpec],
+            _tx: Option<crate::llm::StreamSender>,
+            _c: Option<tokio_util::sync::CancellationToken>,
+        ) -> crate::error::Result<crate::llm::Completion> {
+            unreachable!("stream not used")
+        }
+    }
+
+    /// Minimal deferred tool double (mirrors registry.rs's DeferredTool).
+    struct DeferredTestTool {
+        name: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for DeferredTestTool {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::llm::ToolSpec {
+                name: self.name.to_string(),
+                description: "deferred test tool.".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
+        }
+        fn is_deferred(&self) -> bool {
+            true
+        }
+        fn kind(&self) -> crate::tools::tool_kind::ToolKind {
+            crate::tools::tool_kind::ToolKind::Other
+        }
+        async fn execute(&self, _args: serde_json::Value) -> crate::error::Result<String> {
+            Ok("ok".into())
+        }
+    }
+
+    /// The `<available-deferred-tools>` block must be inserted AFTER the
+    /// leading system prompt — index 0 stays the system message (request
+    /// shape + prefix-cache contract), never displaced by the block.
+    #[tokio::test]
+    async fn deferred_tool_block_is_injected_after_the_leading_system_prompt() {
+        let hooks = crate::hooks::HookRegistry::new();
+        let provider = Arc::new(DeferredCapableProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut core = make_test_core(
+            vec![
+                Message::system("you are terse".to_string()),
+                Message::user("hi".to_string()),
+            ],
+            &hooks,
+        );
+        core.llm = provider.clone();
+        core.tools = Arc::new(
+            crate::tools::ToolRegistry::default()
+                .register(Arc::new(DeferredTestTool { name: "DSearch" })),
+        );
+
+        let specs = core.tools.specs();
+        core.call_llm(&specs, None)
+            .await
+            .expect("call must succeed");
+
+        let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1, "exactly one LLM call must be recorded");
+        let sent = &calls[0];
+        assert_eq!(
+            sent.len(),
+            3,
+            "payload must be system + deferred-block + original user message"
+        );
+        assert_eq!(
+            sent[0].role,
+            crate::message::Role::System,
+            "index 0 must stay the system prompt"
+        );
+        assert_eq!(sent[0].content, "you are terse");
+        assert_eq!(sent[1].role, crate::message::Role::User);
+        assert!(
+            sent[1].content.contains("<available-deferred-tools>"),
+            "second message must carry the deferred block, got: {}",
+            sent[1].content
+        );
+        assert!(
+            sent[1].content.contains("DSearch"),
+            "the deferred catalog must list the deferred tool name"
+        );
+        assert_eq!(sent[2].role, crate::message::Role::User);
+        assert_eq!(sent[2].content, "hi");
     }
 }

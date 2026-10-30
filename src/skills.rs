@@ -3300,4 +3300,114 @@ mod tests {
         assert!(logs_contain("1.2.3"));
         assert!(logs_contain("https://skills.example.com/index.json"));
     }
+
+    // ── Issue #245 batch 21 ─────────────────────────────────────────────────
+
+    /// Frontmatter `name` wins; without frontmatter the caller-supplied name
+    /// (recovered from the virtual skill dir) is kept.
+    #[test]
+    fn skill_from_content_prefers_frontmatter_name_and_falls_back_to_caller_name() {
+        let with_fm = skill_from_content(
+            "caller-skill",
+            "---\nname: front-name\ndescription: d\n---\n\nBody",
+            Vec::new(),
+        );
+        assert_eq!(with_fm.name, "front-name");
+
+        let no_fm = skill_from_content("caller-skill", "## Usage\n\nRun queries.", Vec::new());
+        assert_eq!(no_fm.name, "caller-skill");
+    }
+
+    /// The index-body cap keeps its documented magnitude (8 MiB — "defense
+    /// against a hostile endpoint streaming forever").
+    #[test]
+    fn max_body_bytes_keeps_documented_magnitude() {
+        assert_eq!(HttpSkillSource::MAX_BODY_BYTES, 8_388_608);
+    }
+
+    /// A body at exactly `MAX_BODY_BYTES` must be accepted: both the
+    /// Content-Length pre-check and the post-read check are strictly `>`.
+    #[tokio::test]
+    async fn fetch_remote_index_accepts_body_at_the_cap() {
+        use mockito::Server;
+        let body = vec![b'x'; HttpSkillSource::MAX_BODY_BYTES];
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(&body)
+            .create_async()
+            .await;
+
+        let fetched = super::fetch_remote_index(&server.url(), std::time::Duration::from_secs(30))
+            .await
+            .expect("a body exactly at the cap must not be rejected");
+        assert_eq!(fetched.len(), HttpSkillSource::MAX_BODY_BYTES);
+    }
+
+    /// One byte over the cap must be rejected with the "exceeds" error.
+    #[tokio::test]
+    async fn fetch_remote_index_rejects_body_over_the_cap() {
+        use mockito::Server;
+        let body = vec![b'x'; HttpSkillSource::MAX_BODY_BYTES + 1];
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(&body)
+            .create_async()
+            .await;
+
+        let err = super::fetch_remote_index(&server.url(), std::time::Duration::from_secs(30))
+            .await
+            .expect_err("an over-cap body must be rejected");
+        assert!(
+            matches!(err, HttpSkillSourceError::Request(ref m) if m.contains("exceeds")),
+            "expected the exceeds-cap Request error, got: {err:?}"
+        );
+    }
+
+    /// A blank remote `description` must NOT be injected as frontmatter — the
+    /// guard is `!desc.trim().is_empty()`, so only non-blank descriptions
+    /// synthesize a frontmatter block.
+    #[test]
+    fn remote_entry_blank_description_is_not_injected_as_frontmatter() {
+        let content = "## Usage\n\nRun queries.";
+        let skills = skills_from_remote_entries(
+            vec![RemoteSkillEntry {
+                name: "sql".to_string(),
+                content: content.to_string(),
+                description: Some("   ".to_string()),
+                sha256: None,
+                version: None,
+            }],
+            "https://skills.example.com/index.json",
+        )
+        .expect("entry without a declared digest needs no verification");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].body.as_deref(),
+            Some(content),
+            "a blank description must leave the served content byte-for-byte intact"
+        );
+    }
+
+    /// `#` and `//` comment lines WITHOUT a trailing space are still
+    /// description lines — the `||` in each match guard keeps the bare-prefix
+    /// arm alive alongside the space-prefixed one.
+    #[test]
+    fn extract_script_description_reads_hash_comment_without_space() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("s.sh");
+        fs::write(&path, "#desc line\nbody\n").unwrap();
+        assert_eq!(extract_script_description(&path), "desc line");
+    }
+
+    #[test]
+    fn extract_script_description_reads_slash_comment_without_space() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("s.js");
+        fs::write(&path, "//desc line\nbody\n").unwrap();
+        assert_eq!(extract_script_description(&path), "desc line");
+    }
 }

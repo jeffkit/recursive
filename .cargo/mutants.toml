@@ -649,4 +649,42 @@ exclude_re = [
     # otel-half twin at :132:9 is likewise compiler-killed in otel builds.
     # Drop this entry the day the gate's FEATURES lose otel.
     "src/observability/mod\\.rs:137:9: replace LangfuseRun::inert -> Self with Default::default\\(\\)",
+    # ── Issue #245 batch 21 (B1 seat, task list /tmp/b1-batch21.txt) ───────
+    # Four exclusions of 30, per the #223/#228 doctrine; the other 26 are
+    # pinned and each verified red-by-hand-mutation (logs in /tmp/b1-b21/negctl/).
+    #
+    # retry_reason :142:9 — the structured RateLimited arm is redundant with
+    # the status arm two lines below: Error::RateLimited's http_status() is
+    # hardcoded Some(429) (src/error.rs:299), so deleting the arm routes
+    # RateLimited through `_` into `Some(429) => "rate_limited"` — the same
+    # label on every input. The arm is documentation; the killable siblings
+    # on this match (Timeout arm, Some(429) arm, 5xx guard flips) are pinned
+    # by retry_reason_labels_each_error_class.
+    "src/run_core\\.rs:142:9: delete match arm crate::error::Error::RateLimited\\{\\.\\.\\} in retry_reason",
+    # HttpSkillSource::skills :678:9 — the body only diverges from vec![] on
+    # the load_skills() Ok path, which needs an HTTPS endpoint whose cert
+    # chains to webpki-roots (reqwest is built rustls-tls, no system trust
+    # store, no env override): unreachable from tests. Every reachable domain
+    # — constructor config rejection, DNS failure, TLS handshake failure —
+    # degrades to the same empty catalog in pristine and mutant; that
+    # contract is pinned by
+    # http_skill_source_skills_degrades_to_empty_on_request_failure. (Its
+    # sibling vec![Default::default()] is compiler-domain killed by that same
+    # test and stays out of this list.)
+    "src/skills\\.rs:678:9: replace <impl SkillSource for HttpSkillSource>::skills -> Vec<Skill> with vec!\\[\\]",
+    # is_executable :810:5 — the #[cfg(not(unix))] twin of the PermissionsExt
+    # implementation right above it. On the unix gate platform the function
+    # is cfg'd out entirely, so the mutation builds a byte-identical binary
+    # and can never be observed (same cfg-blindness class as the
+    # observability/otel and credentials/store exclusions); a kill test would
+    # have to run on Windows.
+    "src/skills\\.rs:810:5: replace is_executable -> bool with true",
+    # search_html_fallback :493:28 — flipping the Bing-stage guard to true is
+    # extensionally identical: for Ok(results) the first arm then returns
+    # Ok(results) where pristine returns Ok(Vec::new()) from `Ok(_)`, and the
+    # two are equal exactly when results is empty (the only case the guard
+    # rules out); non-empty Ok and the Err arm are untouched. The DDG-stage
+    # guard at :485 is a different match — its flip DOES divert control (an
+    # empty Ok would return before Bing gets its chance) and stays killable.
+    "src/tools/web_search\\.rs:493:28: replace match guard !results\\.is_empty\\(\\) with true in WebSearch::search_html_fallback",
 ]
