@@ -751,4 +751,20 @@ exclude_re = [
     # keeps the `| → &` siblings in scope and the line:col anchor keeps every
     # other `|` in the file in scope.
     "src/tools/transport_layer/container_transport\\.rs:1004:(28|40): replace \\| with \\^ in base64_encode",
+    # Issue #245 batch 24 (B2; task list = e2b_provider positions 61-90 of CI
+    # run 41023437517, job 123955901330): one true equivalence of 30. The
+    # char-boundary back-off in cap_string is
+    # `while cut > 0 && !s.is_char_boundary(cut) { cut -= 1; }` and
+    # `str::is_char_boundary(0)` is true by definition, so at `cut == 0` the
+    # second operand already ends the loop: the `cut > 0` guard is redundant,
+    # `>=` can never run the body at 0 (no usize underflow is reachable), and
+    # every input stops at the same boundary under both operators. Verified by
+    # negative control (mutant applied → whole e2b module green, 40/40, under
+    # `--features …,e2b-sandbox`; log /tmp/b2-b24/negctl/m10.log). The line:col
+    # anchor keeps the killable siblings at the same column in scope — `>`→`<`
+    # and `>`→`==` (the loop never runs, `truncate` panics mid-char) — as well
+    # as `-=`→`+=` on the next line (over-long output) and `>`→`>=` at :686
+    # (len == max must stay verbatim), all killed by
+    # cap_string_respects_exact_length_and_char_boundaries.
+    "src/tools/transport_layer/e2b_provider\\.rs:689:19: replace > with >= in cap_string",
 ]

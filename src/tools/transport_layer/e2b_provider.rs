@@ -1914,6 +1914,296 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cap_string_respects_exact_length_and_char_boundaries() {
+        // len == max must stay verbatim — no truncation marker appears.
+        let mut exact = "x".repeat(10);
+        cap_string(&mut exact, 10);
+        assert_eq!(
+            exact,
+            "x".repeat(10),
+            "a string of exactly max bytes is kept"
+        );
+
+        // A max landing inside a multi-byte char keeps the longest
+        // char-boundary-safe prefix ("héy": byte 2 is inside 'é').
+        let mut s = String::from("héy");
+        cap_string(&mut s, 2);
+        assert_eq!(s, "h\n... [output truncated]");
+    }
+
+    #[tokio::test]
+    async fn destroy_tears_down_the_sandbox_exactly_once() {
+        let (base, log) = spawn_e2b_mock(transport_route);
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        t.ensure_started().await.expect("ensure_started");
+        t.destroy().await;
+        t.destroy().await;
+        assert!(
+            t.sandbox.lock().await.is_none(),
+            "destroy takes the sandbox — a destroyed transport holds none"
+        );
+        let log = requests(&log);
+        let deletes: Vec<&MockReq> = log.iter().filter(|r| r.method == "DELETE").collect();
+        assert_eq!(deletes.len(), 1, "destroy is idempotent: one DELETE total");
+        assert_eq!(deletes[0].target, "/sandboxes/sb-1");
+        assert_eq!(deletes[0].header("x-api-key"), Some("k-test"));
+    }
+
+    #[tokio::test]
+    async fn read_file_downloads_the_file_bytes_verbatim() {
+        let payload: &'static [u8] = b"vm file\x00\xff";
+        let (base, log) = spawn_e2b_mock(move |req| {
+            if req.method == "GET" && req.target.starts_with("/sandboxes/sb-1/files") {
+                reply(200, payload)
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        let got = t
+            .read_file(Path::new("/host/ws/a.bin"))
+            .await
+            .expect("read_file");
+        assert_eq!(got, payload, "file bytes cross the VM boundary verbatim");
+        let log = requests(&log);
+        let get = log
+            .iter()
+            .find(|r| r.method == "GET")
+            .expect("the download reaches the VM");
+        assert_eq!(
+            get.target,
+            "/sandboxes/sb-1/files?path=%2Fworkspace%2Fa.bin"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_the_parent_dir_then_uploads_the_bytes() {
+        let (base, log) = spawn_e2b_mock(|req| {
+            if req.method == "POST" && req.target.starts_with("/sandboxes/sb-1/files") {
+                reply(200, "{}")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        t.write_file(Path::new("/host/ws/dir/a.txt"), b"hello")
+            .await
+            .expect("write_file");
+        {
+            let log = requests(&log);
+            let mkdir = log
+                .iter()
+                .find(|r| r.body_str().contains("mkdir -p '/workspace/dir'"))
+                .expect("the parent directory is created inside the VM");
+            assert_eq!(mkdir.body_json()["cmds"][0], "mkdir -p '/workspace/dir'");
+            let upload = log
+                .iter()
+                .find(|r| r.method == "POST" && r.target.starts_with("/sandboxes/sb-1/files"))
+                .expect("the file is uploaded");
+            assert_eq!(
+                upload.target,
+                "/sandboxes/sb-1/files?path=%2Fworkspace%2Fdir%2Fa.txt"
+            );
+            assert_eq!(upload.body, b"hello");
+        }
+
+        // A failed parent mkdir fails the whole write; nothing is uploaded.
+        let (bad, bad_log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("mkdir -p '/workspace/dir'") {
+                run_reply(7, "", "mkdir: cannot create directory")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t_bad = E2bTransport::new(config_at(&bad, 3600), "/host/ws");
+        let err = t_bad
+            .write_file(Path::new("/host/ws/dir/a.txt"), b"hello")
+            .await
+            .expect_err("a failed parent mkdir must fail the write");
+        let msg = err.to_string();
+        assert!(msg.contains("mkdir failed in e2b vm"), "{msg}");
+        assert!(msg.contains("cannot create directory"), "{msg}");
+        assert!(
+            !requests(&bad_log)
+                .iter()
+                .any(|r| r.target.contains("/files")),
+            "no upload is attempted past the failed mkdir"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_parses_the_find_output_and_maps_failures() {
+        let (base, log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("%f") {
+                run_reply(0, "d\tsub\nf\ta.txt\n", "")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        let entries = t
+            .list_dir(Path::new("/host/ws/sub"))
+            .await
+            .expect("list_dir");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.name.as_str(), e.is_dir))
+                .collect::<Vec<_>>(),
+            vec![("sub", true), ("a.txt", false)]
+        );
+        {
+            let log = requests(&log);
+            let find = log
+                .iter()
+                .find(|r| r.body_str().contains("%f"))
+                .expect("the find command reaches the VM");
+            assert_eq!(
+                find.body_json()["cmds"][0],
+                "find '/workspace/sub' -mindepth 1 -maxdepth 1 -printf '%y\\t%f\\n'"
+            );
+        }
+
+        // A non-zero find is NotFound, whatever its stderr says.
+        let (bad, _bad_log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("%f") {
+                run_reply(1, "", "find: raced away")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t_bad = E2bTransport::new(config_at(&bad, 3600), "/host/ws");
+        let err = t_bad
+            .list_dir(Path::new("/host/ws/sub"))
+            .await
+            .expect_err("a non-zero find must fail the listing");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(msg.contains("dir not found in e2b vm"), "{msg}");
+        assert!(msg.contains("raced away"), "{msg}");
+
+        // So is a zero exit with "No such file or directory" on stderr.
+        let (gone, _gone_log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("%f") {
+                run_reply(0, "", "find: '/workspace/sub': No such file or directory")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t_gone = E2bTransport::new(config_at(&gone, 3600), "/host/ws");
+        let err = t_gone
+            .list_dir(Path::new("/host/ws/sub"))
+            .await
+            .expect_err("a missing directory must be NotFound");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn walk_runs_one_find_and_enforces_depth_prune_and_ignore() {
+        // The VM's find output, deliberately including an entry under an
+        // ignored dir (the client-side filter is defence in depth).
+        let walk_stdout = "f\t/workspace/src/a.rs\t1\nd\t/workspace/src/sub\t2\nf\t/workspace/target/x.rs\t3\nf\t/workspace/README.md\t4\n";
+        let (base, log) = spawn_e2b_mock(move |req| {
+            if req.body_str().contains("%p") {
+                run_reply(0, walk_stdout, "")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        let opts = WalkOptions {
+            max_depth: 5,
+            ignore_dirs: vec!["target".into()],
+            ..Default::default()
+        };
+        let entries = t.walk(Path::new("/host/ws"), &opts).await.expect("walk");
+        assert_eq!(
+            entries,
+            vec![
+                WalkEntry {
+                    path: PathBuf::from("README.md"),
+                    is_file: true,
+                    size: 4,
+                },
+                WalkEntry {
+                    path: PathBuf::from("src/a.rs"),
+                    is_file: true,
+                    size: 1,
+                },
+                WalkEntry {
+                    path: PathBuf::from("src/sub"),
+                    is_file: false,
+                    size: 2,
+                },
+            ],
+            "root-relative, sorted, ignore_dirs pruned"
+        );
+        {
+            let log = requests(&log);
+            let finds: Vec<&MockReq> = log.iter().filter(|r| r.body_str().contains("%p")).collect();
+            assert_eq!(finds.len(), 1, "a walk is a single round trip");
+            assert_eq!(
+                finds[0].body_json()["cmds"][0],
+                "find '/workspace' -maxdepth 5 \\( -name 'target' \\) -prune -o -printf '%y\\t%p\\t%s\\n'"
+            );
+        }
+
+        // A non-zero find is NotFound.
+        let (bad, _bad_log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("%p") {
+                run_reply(1, "", "find: bad root")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t_bad = E2bTransport::new(config_at(&bad, 3600), "/host/ws");
+        let err = t_bad
+            .walk(Path::new("/host/ws"), &opts)
+            .await
+            .expect_err("a non-zero find must fail the walk");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(msg.contains("walk root not found in e2b vm"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn create_dir_all_maps_the_path_and_surfaces_failures() {
+        let (base, log) = spawn_e2b_mock(transport_route);
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        t.create_dir_all(Path::new("/host/ws/sub/deep"))
+            .await
+            .expect("create_dir_all");
+        {
+            let log = requests(&log);
+            let mkdir = log
+                .iter()
+                .find(|r| r.body_str().contains("mkdir -p '/workspace/sub/deep'"))
+                .expect("the mkdir command reaches the VM");
+            assert_eq!(
+                mkdir.body_json()["cmds"][0],
+                "mkdir -p '/workspace/sub/deep'"
+            );
+        }
+
+        // A non-zero mkdir surfaces the VM's stderr.
+        let (bad, _bad_log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("mkdir -p '/workspace/sub/deep'") {
+                run_reply(3, "", "mkdir: read-only file system")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t_bad = E2bTransport::new(config_at(&bad, 3600), "/host/ws");
+        let err = t_bad
+            .create_dir_all(Path::new("/host/ws/sub/deep"))
+            .await
+            .expect_err("a failed mkdir must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("mkdir failed in e2b vm"), "{msg}");
+        assert!(msg.contains("read-only file system"), "{msg}");
+    }
+
     /// Live round-trip against the real E2B API. Gated by
     /// `RECURSIVE_TEST_E2B_API_KEY` (skip when absent).
     #[tokio::test]
