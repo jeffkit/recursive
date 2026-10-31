@@ -2235,14 +2235,53 @@ mod tests {
                 },
             ],
         );
-        // transcript with the denied tool results for both interrupts
-        let lines: Vec<String> = ["tc-1", "tc-2"]
+        // transcript with the denied tool results for both interrupts —
+        // full TranscriptEntry rows (the shape SessionWriter puts on disk),
+        // anchored by a real turn so the tool rows are not leading orphans
+        // the seed rebuild would drop.
+        let row = |uuid: &str,
+                   role: &str,
+                   content: &str,
+                   tool_calls: Vec<crate::llm::ToolCall>,
+                   tool_call_id: Option<&str>| crate::session::TranscriptEntry {
+            uuid: uuid.into(),
+            parent_uuid: None,
+            source_tool_assistant_uuid: None,
+            id: format!("id-{uuid}"),
+            parent_id: None,
+            role: role.into(),
+            content: content.into(),
+            tool_calls,
+            tool_call_id: tool_call_id.map(|s| s.to_string()),
+            reasoning_content: None,
+            usage: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            audit: None,
+            step: None,
+            is_compaction_summary: false,
+        };
+        let tc = |id: &str| crate::llm::ToolCall {
+            id: id.into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({"command": "cargo test"}),
+        };
+        let lines = [
+            row("u1", "user", "run the checks", vec![], None),
+            row(
+                "u2",
+                "assistant",
+                "running it",
+                vec![tc("tc-1"), tc("tc-2")],
+                None,
+            ),
+            row("u3", "tool", "denied", vec![], Some("tc-1")),
+            row("u4", "tool", "denied", vec![], Some("tc-2")),
+        ];
+        let lines: Vec<String> = lines
             .into_iter()
-            .map(|tc| {
-                serde_json::to_string(&crate::message::Message::tool_result(tc, "denied")).unwrap()
-            })
+            .map(|entry| serde_json::to_string(&entry).unwrap())
             .collect();
-        std::fs::write(dir.join("transcript.jsonl"), lines.join("\n")).unwrap();
+        std::fs::write(dir.join("transcript.jsonl"), lines.join("\n") + "\n").unwrap();
 
         let partial = vec![agui_protocol::Resume {
             interrupt_id: "i1".into(),
@@ -2293,6 +2332,22 @@ mod tests {
         assert!(
             load_open_interrupts(&dir).is_empty(),
             "open interrupts must be cleared after resume"
+        );
+        // The same splices must land on disk (issue #57): the persisted
+        // transcript carries the resolved payload / cancelled sentinel, not
+        // the deny text a later resume would re-seed.
+        let disk = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap();
+        assert!(
+            disk.contains("from-client"),
+            "resolved payload must be rewritten into the persisted transcript: {disk}"
+        );
+        assert!(
+            disk.contains("[interrupt cancelled by user]"),
+            "cancelled sentinel must be rewritten into the persisted transcript: {disk}"
+        );
+        assert!(
+            !disk.contains("denied"),
+            "no denied tool result may survive the resume on disk: {disk}"
         );
     }
 
@@ -3046,5 +3101,551 @@ mod tests {
             Some(3),
             "AG-UI records carry the continued turn_id"
         );
+    }
+
+    // ── Batch-29 mutation nails ────────────────────────────────────────────
+    //
+    // Each test below pins one documented behavior whose guard/arm/expression
+    // was a mutation survivor. Assertions target behavior semantics (the
+    // forwarded event payload, the persisted cost record, the interrupt
+    // detail), never line numbers.
+
+    /// Hook lifecycle and todo events forward as AG-UI Custom events — a
+    /// client watching the SSE stream must see every payload field.
+    #[test]
+    fn agui_convert_forwards_hook_and_todo_events_as_custom() {
+        let mut conv = AguiConverter::new();
+
+        let events = conv.convert(&AgentEvent::HookStarted {
+            hook_event: "PreToolUse".into(),
+            hook_name: "lint".into(),
+            status_message: Some("running lint".into()),
+        });
+        let [ev] = &events[..] else {
+            panic!("HookStarted must forward exactly one event, got {events:?}")
+        };
+        let ag::Event::Custom(custom) = ev else {
+            panic!("HookStarted must forward as Custom, got {ev:?}")
+        };
+        assert_eq!(custom.name, "agui-tui/hook_started");
+        assert_eq!(custom.value["hookEvent"], "PreToolUse");
+        assert_eq!(custom.value["hookName"], "lint");
+        assert_eq!(custom.value["statusMessage"], "running lint");
+
+        let events = conv.convert(&AgentEvent::HookProgress {
+            hook_event: "PostToolUse".into(),
+            hook_name: "lint".into(),
+            last_line: "3 warnings".into(),
+        });
+        let [ev] = &events[..] else {
+            panic!("HookProgress must forward exactly one event, got {events:?}")
+        };
+        let ag::Event::Custom(custom) = ev else {
+            panic!("HookProgress must forward as Custom, got {ev:?}")
+        };
+        assert_eq!(custom.name, "agui-tui/hook_progress");
+        assert_eq!(custom.value["hookEvent"], "PostToolUse");
+        assert_eq!(custom.value["hookName"], "lint");
+        assert_eq!(custom.value["lastLine"], "3 warnings");
+
+        let events = conv.convert(&AgentEvent::HookSystemMessage {
+            text: "hook says hi".into(),
+        });
+        let [ev] = &events[..] else {
+            panic!("HookSystemMessage must forward exactly one event, got {events:?}")
+        };
+        let ag::Event::Custom(custom) = ev else {
+            panic!("HookSystemMessage must forward as Custom, got {ev:?}")
+        };
+        assert_eq!(custom.name, "agui-tui/hook_system_message");
+        assert_eq!(custom.value["text"], "hook says hi");
+
+        let events = conv.convert(&AgentEvent::TodoUpdated {
+            todos: vec![crate::tools::todo::TodoItem {
+                content: "nail the mutants".into(),
+                status: crate::tools::todo::TodoStatus::InProgress,
+                active_form: None,
+            }],
+        });
+        let [ev] = &events[..] else {
+            panic!("TodoUpdated must forward exactly one event, got {events:?}")
+        };
+        let ag::Event::Custom(custom) = ev else {
+            panic!("TodoUpdated must forward as Custom, got {ev:?}")
+        };
+        assert_eq!(custom.name, "agui-tui/todo_updated");
+        assert_eq!(custom.value["todos"][0]["content"], "nail the mutants");
+    }
+
+    /// The client-tool stub is a defensive fallback: the deny hook fires
+    /// before dispatch, so if `execute` ever runs it must say so — loudly,
+    /// naming the marker and the tool, never with a bare arbitrary string.
+    #[tokio::test]
+    async fn client_tool_stub_execute_reports_the_deny_fallback() {
+        use crate::tools::Tool as _;
+        let stub = ClientToolStub {
+            name: "get_weather".into(),
+            description: "frontend-owned".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let out = stub
+            .execute(serde_json::json!({"city": "sf"}))
+            .await
+            .expect("stub execute succeeds");
+        assert!(
+            out.contains(CLIENT_TOOL_DENY_PREFIX),
+            "the deny marker must be in the fallback result: {out:?}"
+        );
+        assert!(
+            out.contains("get_weather"),
+            "the tool name must be echoed in the fallback result: {out:?}"
+        );
+        assert!(
+            out.contains("not executed server-side"),
+            "the fallback must state it did not run server-side: {out:?}"
+        );
+    }
+
+    /// A row is a compact-boundary marker only when BOTH the entry type and
+    /// the subtype match — either half alone is an ordinary row the seed
+    /// keeps.
+    #[test]
+    fn is_compact_boundary_line_requires_both_type_and_subtype() {
+        let marker = r#"{"type":"system","subtype":"compact_boundary","turn":1,"compacted_count":2,"timestamp":"2026-01-01T00:00:00Z"}"#;
+        assert!(is_compact_boundary_line(marker), "the real marker matches");
+        let wrong_type =
+            r#"{"type":"summary","subtype":"compact_boundary","timestamp":"2026-01-01T00:00:00Z"}"#;
+        assert!(
+            !is_compact_boundary_line(wrong_type),
+            "a compact_boundary subtype with a non-system type is NOT a boundary"
+        );
+        let wrong_subtype =
+            r#"{"type":"system","subtype":"other","timestamp":"2026-01-01T00:00:00Z"}"#;
+        assert!(
+            !is_compact_boundary_line(wrong_subtype),
+            "a system row with a non-boundary subtype is NOT a boundary"
+        );
+        assert!(!is_compact_boundary_line("not json at all"));
+    }
+
+    /// Only the LAST assistant row carrying `tool_calls` is examined for
+    /// unpaired calls — a later plain assistant turn must not become the
+    /// examined row (which would hide call `b`'s missing answer).
+    #[test]
+    fn unanswered_tool_calls_examine_the_last_assistant_row_with_tool_calls() {
+        let tc = |id: &str| crate::llm::ToolCall {
+            id: id.into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let msgs = vec![
+            crate::message::Message::assistant_with_tool_calls("batch", vec![tc("a"), tc("b")]),
+            crate::message::Message::tool_result("a", "ok"),
+            // A trailing assistant turn with NO tool calls: the scan must
+            // keep looking at the earlier row, not this one.
+            crate::message::Message::assistant("plain follow-up"),
+        ];
+        let unanswered = unanswered_tool_calls(&msgs);
+        assert_eq!(
+            unanswered,
+            vec![(
+                "b".to_string(),
+                crate::session::ORPHAN_SKIPPED_RESULT.to_string()
+            )],
+            "call b was never answered and must be reported as skipped"
+        );
+    }
+
+    /// First-turn seeding drops exactly the LAST non-empty user turn (it
+    /// becomes the goal) and keeps a trailing assistant turn in the seed.
+    #[test]
+    fn prepare_run_seed_excludes_only_the_last_nonempty_user_turn() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut input = run_input("t-trailing-assistant", None);
+        input.messages = vec![
+            agui_protocol::Message {
+                id: "m0".into(),
+                role: "user".into(),
+                content: Some("hello".into()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            agui_protocol::Message {
+                id: "m1".into(),
+                role: "assistant".into(),
+                content: Some("reply".into()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let prepared = prepare_run(AguiRunInput {
+            workspace: ws.path(),
+            input: &input,
+        })
+        .expect("prepare");
+        assert_eq!(prepared.goal, "hello");
+        assert!(prepared.seed_is_new_history);
+        let seed = prepared.seed_transcript.expect("seed");
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["reply"],
+            "the user goal row is dropped from the seed; the trailing assistant \
+             row must stay"
+        );
+    }
+
+    /// Drive `spawn_agui_run` end-to-end on a throwaway workspace and
+    /// collect the AG-UI event stream until the driver closes it. Returns
+    /// the events and the run's metrics so bookkeeping assertions can read
+    /// the real counters.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_spawn(
+        ws: &Path,
+        thread: &str,
+        script: Vec<crate::llm::Completion>,
+        client_tools: &[ag::Tool],
+        seed: Option<Vec<crate::message::Message>>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (Vec<ag::Event>, Arc<crate::http::Metrics>) {
+        let metrics = Arc::new(crate::http::Metrics::default());
+        let gate = crate::session_host::AdmissionGate::new(
+            1,
+            std::time::Duration::ZERO,
+            Arc::clone(&metrics.runs_waiting),
+            Arc::clone(&metrics.runs_in_flight),
+        );
+        let permit = gate.try_acquire_run().expect("admission permit");
+        let host: crate::session_host::SessionHost<()> =
+            crate::session_host::SessionHost::new(std::time::Duration::from_secs(60), gate);
+        let run_guard = host.try_begin_run(thread).expect("run fence");
+        let mut deps = runtime_deps(crate::tools::ToolRegistry::local(), client_tools, &[]);
+        deps.llm = Arc::new(crate::llm::MockProvider::new(script));
+        deps.seed_transcript = seed;
+        let (runtime, hooks) = build_agui_runtime(ws, thread, deps).expect("runtime builds");
+        let mut sse_rx = spawn_agui_run(
+            runtime,
+            "drive".into(),
+            AguiRunContext {
+                thread_id: thread.to_string(),
+                run_id: "r1".into(),
+                client_tools: client_tools.to_vec(),
+                hooks,
+                workspace: ws.to_path_buf(),
+                metrics: Arc::clone(&metrics),
+                model: "test-model".into(),
+                provider: "mock".into(),
+                preset: None,
+                cancel,
+                permit,
+                run_guard,
+                active_runs: Arc::new(Mutex::new(HashMap::new())),
+                seed_to_persist: Vec::new(),
+                owner: None,
+                tenant: None,
+            },
+        );
+        let mut events = Vec::new();
+        while let Some(ev) = sse_rx.recv().await {
+            events.push(ev);
+        }
+        (events, metrics)
+    }
+
+    /// A plain-text completion with the given usage.
+    fn text_completion(content: &str, usage: crate::llm::TokenUsage) -> crate::llm::Completion {
+        crate::llm::Completion {
+            content: content.to_string(),
+            tool_calls: vec![],
+            finish_reason: None,
+            usage: Some(usage),
+            reasoning_content: None,
+        }
+    }
+
+    /// A tool-call completion: the agent asks for a tool the local registry
+    /// does not have, so the step records an error result and loops on.
+    fn tool_call_completion(id: &str, usage: crate::llm::TokenUsage) -> crate::llm::Completion {
+        crate::llm::Completion {
+            content: String::new(),
+            tool_calls: vec![crate::llm::ToolCall {
+                id: id.into(),
+                name: "NoSuchTool".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: None,
+            usage: Some(usage),
+            reasoning_content: None,
+        }
+    }
+
+    fn run_finished(events: &[ag::Event]) -> &ag::RunFinished {
+        events
+            .iter()
+            .find_map(|ev| match ev {
+                ag::Event::RunFinished(f) => Some(f),
+                _ => None,
+            })
+            .expect("the driver always emits RunFinished last")
+    }
+
+    /// Issue #66: a cancelled run counts as FAILED (never inflating
+    /// `agent_runs_success`), and its RunFinished reports the `cancelled`
+    /// error outcome instead of masquerading as Success.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_cancelled_run_counts_as_failed_and_reports_cancelled() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel(); // cancelled before the first step boundary
+        let (events, metrics) = drive_spawn(ws.path(), "t-cancel", vec![], &[], None, cancel).await;
+
+        assert_eq!(
+            metrics
+                .agent_runs_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the cancelled run is still counted as a run"
+        );
+        assert_eq!(
+            metrics
+                .agent_runs_success
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a cancelled run must not count as success"
+        );
+        assert_eq!(
+            metrics
+                .agent_runs_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a cancelled run counts as failed"
+        );
+        assert_eq!(
+            metrics.agent_runs_finished.snapshot(),
+            vec![(vec!["cancelled".to_string()], 1)],
+            "the finished-run breakdown must name the cancelled reason"
+        );
+
+        let finished = run_finished(&events);
+        match &finished.outcome {
+            Some(ag::RunFinishedOutcome::Error { code, message }) => {
+                assert_eq!(code.as_deref(), Some("cancelled"));
+                assert!(message.contains("cancel"), "{message:?}");
+            }
+            other => panic!("cancelled run must report the cancelled error outcome, got {other:?}"),
+        }
+    }
+
+    /// Issue #115: a failed run that burned prompt tokens persists them —
+    /// `cost.json` carries the wasted spend exactly.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_failed_run_persists_nonzero_prompt_usage() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let usage = crate::llm::TokenUsage {
+            prompt_tokens: 100,
+            total_tokens: 100,
+            ..crate::llm::TokenUsage::default()
+        };
+        let (events, _) = drive_spawn(
+            ws.path(),
+            "t-usage-prompt",
+            vec![tool_call_completion("call-a", usage)], // step 2 finds an empty script → LLM failure
+            &[],
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let finished = run_finished(&events);
+        assert!(
+            matches!(
+                &finished.outcome,
+                Some(ag::RunFinishedOutcome::Error { code: None, .. })
+            ),
+            "the script-exhaustion run must end in a plain error outcome, got {:?}",
+            finished.outcome
+        );
+        let dir = agui_session_dir(ws.path(), "t-usage-prompt").unwrap();
+        let cost = std::fs::read_to_string(dir.join("cost.json"))
+            .expect("prompt tokens burned before the failure must reach cost.json");
+        let v: serde_json::Value = serde_json::from_str(&cost).unwrap();
+        assert_eq!(v["total_usage"]["prompt_tokens"], 100);
+        assert_eq!(v["total_usage"]["completion_tokens"], 0);
+    }
+
+    /// Issue #115 (mirror): completion tokens burned before the failure are
+    /// persisted too — the completion half alone is enough to record usage.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_failed_run_persists_nonzero_completion_usage() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let usage = crate::llm::TokenUsage {
+            completion_tokens: 50,
+            total_tokens: 50,
+            ..crate::llm::TokenUsage::default()
+        };
+        drive_spawn(
+            ws.path(),
+            "t-usage-completion",
+            vec![tool_call_completion("call-c", usage)],
+            &[],
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let dir = agui_session_dir(ws.path(), "t-usage-completion").unwrap();
+        let cost = std::fs::read_to_string(dir.join("cost.json"))
+            .expect("completion tokens burned before the failure must reach cost.json");
+        let v: serde_json::Value = serde_json::from_str(&cost).unwrap();
+        // run_core's provider-compat fallback byte-estimates the prompt side
+        // whenever a completion reports output tokens with a zero input side,
+        // so prompt_tokens is not asserted here — the completion half must
+        // land verbatim.
+        assert_eq!(v["total_usage"]["completion_tokens"], 50);
+    }
+
+    /// Zero wasted tokens record nothing: an all-zero failed usage must NOT
+    /// write a cost record (the "zero means nothing to record" contract).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_failed_run_with_zero_usage_writes_no_cost_record() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        drive_spawn(
+            ws.path(),
+            "t-usage-zero",
+            vec![tool_call_completion(
+                "call-z",
+                crate::llm::TokenUsage::default(),
+            )],
+            &[],
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let dir = agui_session_dir(ws.path(), "t-usage-zero").unwrap();
+        assert!(
+            !dir.join("cost.json").exists(),
+            "an all-zero wasted usage means nothing to record — no cost.json"
+        );
+    }
+
+    /// The interrupt the client sees must bind to the DENIED call's id: the
+    /// driver scans the transcript for the deny marker and even a later
+    /// assistant message echoing the marker (no tool_call_id of its own)
+    /// must not hijack it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_client_deny_interrupt_carries_the_denied_call_id() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let client_tools = vec![ag::Tool {
+            name: "get_weather".into(),
+            description: "frontend-owned".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let script = vec![
+            crate::llm::Completion {
+                content: String::new(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "call-1".into(),
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({"city": "sf"}),
+                }],
+                finish_reason: None,
+                usage: Some(crate::llm::TokenUsage::default()),
+                reasoning_content: None,
+            },
+            // Final text that ECHOES the deny marker: a role-blind scan
+            // would pair the interrupt with this id-less message.
+            text_completion(
+                &format!("pending: {CLIENT_TOOL_DENY_PREFIX} echoed"),
+                crate::llm::TokenUsage::default(),
+            ),
+        ];
+        let (events, _) = drive_spawn(
+            ws.path(),
+            "t-deny-id",
+            script,
+            &client_tools,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let finished = run_finished(&events);
+        match &finished.outcome {
+            Some(ag::RunFinishedOutcome::Interrupt { interrupts }) => {
+                assert_eq!(interrupts.len(), 1, "one denied call, one interrupt");
+                assert_eq!(
+                    interrupts[0].tool_call_id.as_deref(),
+                    Some("call-1"),
+                    "the interrupt must bind to the denied tool call's id"
+                );
+            }
+            other => panic!(
+                "a denied client tool must interrupt, got {other:?} (events: {})",
+                events.len()
+            ),
+        }
+    }
+
+    /// The interrupt's response schema is the FRONTEND tool's own input
+    /// schema, not a generic object placeholder.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn agui_client_deny_interrupt_carries_the_frontend_schema() {
+        let (_home, _guard) = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        });
+        let client_tools = vec![ag::Tool {
+            name: "get_weather".into(),
+            description: "frontend-owned".into(),
+            parameters: schema.clone(),
+        }];
+        let script = vec![
+            crate::llm::Completion {
+                content: String::new(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "call-2".into(),
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({"city": "sf"}),
+                }],
+                finish_reason: None,
+                usage: Some(crate::llm::TokenUsage::default()),
+                reasoning_content: None,
+            },
+            text_completion("done", crate::llm::TokenUsage::default()),
+        ];
+        let (events, _) = drive_spawn(
+            ws.path(),
+            "t-deny-schema",
+            script,
+            &client_tools,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let finished = run_finished(&events);
+        match &finished.outcome {
+            Some(ag::RunFinishedOutcome::Interrupt { interrupts }) => {
+                assert_eq!(interrupts.len(), 1, "one denied call, one interrupt");
+                assert_eq!(
+                    interrupts[0].response_schema.as_ref(),
+                    Some(&schema),
+                    "the interrupt must carry the frontend tool's own input schema"
+                );
+            }
+            other => panic!("a denied client tool must interrupt, got {other:?}"),
+        }
     }
 }

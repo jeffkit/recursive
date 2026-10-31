@@ -1124,6 +1124,16 @@ mod tests {
         assert_eq!(MAX_TIMEOUT_SECS, 600);
         assert_eq!(DEFAULT_OUTPUT_LIMIT_BYTES, 2 * 1024 * 1024);
         assert_eq!(DEFAULT_HEAP_LIMIT_MIB, 512);
+        assert_eq!(
+            STDERR_CAPTURE_BYTES,
+            64 * 1024,
+            "stderr capture follows its documented 64 KiB budget"
+        );
+        assert_eq!(
+            PROTOCOL_LINE_SLACK_BYTES,
+            64 * 1024,
+            "a protocol line gets the documented 64 KiB of JSON-framing slack"
+        );
     }
 
     /// The output budget must not exceed the tool layer's hard cap, or a run
@@ -1221,6 +1231,27 @@ mod tests {
             assert!(
                 allowed.contains(&key.as_ref()),
                 "unexpected env key leaked into the fresh process: {key}"
+            );
+        }
+        // The allowlist is a filter, not a vacuum: the exec-search path (and
+        // the unix temp dir the runtime needs to start) must actually be
+        // carried through, not dropped along with the credentials.
+        let carried: std::collections::HashMap<String, OsString> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.clone()))
+            .collect();
+        let ambient_path = std::env::var_os("PATH").expect("test process always has a PATH");
+        assert_eq!(
+            carried.get("PATH").map(OsString::as_os_str),
+            Some(ambient_path.as_os_str()),
+            "the fresh process must inherit the ambient exec-search path"
+        );
+        #[cfg(unix)]
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            assert_eq!(
+                carried.get("TMPDIR").map(OsString::as_os_str),
+                Some(tmpdir.as_os_str()),
+                "the fresh process must inherit the ambient temp dir"
             );
         }
     }
@@ -1847,5 +1878,217 @@ return process.cwd();"#
         ));
         probe_cache().lock().unwrap().remove(&a);
         probe_cache().lock().unwrap().remove(&b);
+    }
+
+    // ── Batch-29 mutation nails ────────────────────────────────────────────
+
+    /// A line whose bytes (including its newline) fill the cap exactly is a
+    /// COMPLETE line, not an overflow — the cap bounds buffering, and the
+    /// line fits.
+    #[tokio::test]
+    async fn read_capped_line_returns_line_at_the_exact_cap_boundary() {
+        // 7 bytes of content + newline = 8 = cap.
+        let mut reader = BufReader::new(std::io::Cursor::new(b"1234567\n".to_vec()));
+        let mut out = Vec::new();
+        let outcome = read_capped_line(&mut reader, &mut out, 8).await.unwrap();
+        assert!(
+            matches!(outcome, CappedLine::Line),
+            "a line that fits the cap exactly is not an overflow"
+        );
+        assert_eq!(out, b"1234567\n");
+    }
+
+    /// Name collisions on `recursive-run-code-{pid}-{nanos}` are retried —
+    /// a hollow trap net (pre-existing names spaced ~2 ms apart across the
+    /// whole subsec-nanos range) makes a first-attempt draw that lands on a
+    /// taken name surface as an `AlreadyExists`, and every such draw must
+    /// end in another attempt, never in the collision error surfacing.
+    #[test]
+    fn create_scratch_dir_retries_name_collisions() {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        // 500 traps at 2 ms spacing: the clock quantizes subsec nanos to 1 µs,
+        // so a draw lands on a trap once every ~7k draws (probe: 4 hits per
+        // 30k) — near-certain across ≥30k draws — while the ~100 µs retry
+        // steps always land far from the next trap (green tree escapes every
+        // hit; 64 consecutive trap hits are impossible at 2 ms spacing).
+        let net: Vec<String> = (0..500)
+            .map(|k| format!("recursive-run-code-{pid}-{}", k * 2_000_000))
+            .collect();
+        for name in &net {
+            let _ = std::fs::create_dir(base.join(name));
+        }
+        let started = std::time::Instant::now();
+        let mut draws = 0;
+        // Long enough to make ≥30k draws whatever the pace, so the expected
+        // trap-hit count stays well above 1 even on a loaded host.
+        while draws < 30_000 || started.elapsed() < std::time::Duration::from_millis(2500) {
+            let dir = create_scratch_dir()
+                .unwrap_or_else(|e| panic!("draw {draws}: collision retries must succeed: {e}"));
+            std::fs::remove_dir(&dir).unwrap();
+            draws += 1;
+        }
+        for name in &net {
+            let _ = std::fs::remove_dir(base.join(name));
+        }
+    }
+
+    /// A temp root that cannot host the scratch dir surfaces the REAL error
+    /// kind — the retry loop absorbs name collisions (`AlreadyExists`), not
+    /// every failure, and exhaustion must not masquerade as a permission
+    /// problem (or vice versa).
+    // unix-only（#224）：夹具依赖 `std::os::unix::fs::PermissionsExt` 的 000 权限目录；
+    // windows 的目录拒绝需 DACL/属性语义，无 POSIX 等价。解除条件：提供 windows 端
+    // 等价的“不可写 temp root”夹具（如只读属性目录实测 mkdir 是否 EACCES）。
+    #[cfg(unix)]
+    #[test]
+    fn create_scratch_dir_surfaces_a_real_permission_error() {
+        // Child-process form: the parent re-executes this test with `TMPDIR`
+        // pointed at an unwritable dir it already prepared (and restores
+        // afterwards), so the shared test process env — which every sibling
+        // `tempfile` call reads — stays untouched.
+        if std::env::var_os("RECURSIVE_TEST_TMPDIR_BLOCKER").is_some() {
+            let err = create_scratch_dir()
+                .expect_err("an unwritable temp root must fail the scratch creation");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "the real error kind must surface, got: {err}"
+            );
+            return;
+        }
+        let outer = tempfile::tempdir().unwrap();
+        let blocker = outer.path().join("blocked");
+        std::fs::create_dir_all(&blocker).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let child_out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                // `--exact` matches the FULL test path — a bare name runs
+                // zero tests and would fake a green child.
+                "tools::execution::run_code::runner::tests::\
+                 create_scratch_dir_surfaces_a_real_permission_error",
+                "--nocapture",
+            ])
+            .env("TMPDIR", &blocker)
+            .env("RECURSIVE_TEST_TMPDIR_BLOCKER", "1")
+            .output()
+            .expect("re-exec of the test binary");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let child_stdout = String::from_utf8_lossy(&child_out.stdout);
+        assert!(
+            child_out.status.success(),
+            "child assertion failed: the real error kind must surface ({})",
+            String::from_utf8_lossy(&child_out.stderr)
+        );
+        assert!(
+            child_stdout.contains("1 passed"),
+            "the child must run exactly the re-executed test, got: {child_stdout}"
+        );
+    }
+
+    /// Best-effort cleanup is never silent: a scratch dir whose contents
+    /// cannot be removed is announced with the path, so an operator learns
+    /// what survived (降级可观测). A missing dir is not a failure and must
+    /// not be announced.
+    // unix-only（#224）：夹具用 000 权限子目录使 remove_dir_all 以 EACCES 失败，
+    // windows 无 POSIX 权限等价。解除条件：windows 端等价的不可删夹具。
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn cleanup_scratch_announces_a_real_failure() {
+        let outer = tempfile::tempdir().unwrap();
+        let scratch = outer.path().join("scratch");
+        let child = scratch.join("locked-child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("keep.txt"), b"survives").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        cleanup_scratch(&scratch);
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            logs_contain("scratch directory cleanup failed"),
+            "a failed scratch cleanup must be announced, not swallowed"
+        );
+        assert!(
+            scratch.exists(),
+            "the announced leftover must in fact still exist"
+        );
+    }
+
+    /// `output_bytes` reports the retained log text AND the completion value
+    /// TOGETHER — the observation a failure description quotes is the sum,
+    /// so a log-bearing run never reports only one half.
+    // windows（#224）：内联夹具 runtime 是 #!/bin/sh 脚本，CreateProcess 不认 shebang
+    //（os error 193），权限探针在 exec 即失败 → SandboxUnavailable。解除条件：夹具改 .cmd/.exe。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: the sh-script runtime shim is not a Win32 executable (os error 193); the probe fails at exec"
+    )]
+    #[tokio::test]
+    async fn run_report_output_bytes_counts_log_text_plus_value() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ptc-shim-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let node = tmp.join("shim-bytes");
+        let source = r#"#!/bin/sh
+is_probe=0
+if [ "$#" -eq 3 ]; then
+  last=""
+  for arg in "$@"; do last="$arg"; done
+  [ "$last" = "process.exit(0)" ] && is_probe=1
+fi
+[ "$is_probe" = 1 ] && exit 0
+read -r line
+printf '%s\n' '{"t":"log","level":"info","text":"hello-log"}'
+printf '%s\n' '{"t":"result","value":"abc"}'
+exit 0
+"#;
+        std::fs::write(&node, source).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let read_root = tmp.clone();
+        let request = RunProgramRequest {
+            source: "return 'ignored';".to_string(),
+            bindings: BindingTable::empty(),
+            invoker: Arc::new(NullInvoker),
+            limits: RunCodeLimits::default(),
+            node_bin: Some(node),
+            abort: None,
+            read_root: Some(read_root),
+            min_free_bytes: None,
+        };
+        let report = run_program(request).await;
+
+        assert_eq!(report.failure, None, "{:?}", report.detail);
+        assert_eq!(report.value.as_deref(), Some("abc"));
+        assert_eq!(report.output, "hello-log\n");
+        assert_eq!(
+            report.output_bytes,
+            "hello-log\n".len() + "abc".len(),
+            "the observation counts retained log text plus the value"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

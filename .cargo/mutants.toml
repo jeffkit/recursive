@@ -913,4 +913,31 @@ exclude_re = [
     # them out of exclusion scope.
     "src/session/index\\.rs:820:17: replace > with >= in snippet",
     "src/session/index\\.rs:824:15: replace < with <= in snippet",
+    # ── Issue #245 batch 29 (B1 seat; task list /tmp/b1-batch29.txt) ───────
+    # src/http/agui.rs spawn_agui_run — the batch's single true equivalence
+    # out of 30 survivors (the other 29 are pinned; negative-control log
+    # /tmp/b1-batch29/negctl.jsonl, 29× rc=101 on the mapped test + this one
+    # × rc=0 SURVIVOR-GREEN, byte-exact restores verified per mutant).
+    #
+    # :1532:79 completion-side `>` → `<` in
+    # `(wasted.prompt_tokens > 0 || wasted.completion_tokens > 0)`: `wasted`
+    # is `AgentRuntime::last_failed_usage()`, fed exclusively by run_core's
+    # per-call usage normalisation, where any completion reporting
+    # `completion_tokens > 0` with `prompt_tokens == 0` gets its prompt side
+    # byte-estimated (GLM-streaming compat fallback, run_core.rs:459) and
+    # `estimate_prompt_tokens` is `.max(1)` (run_core.rs:160, "the system
+    # prompt always exists"). Summation over calls preserves the invariant:
+    # prompt_tokens == 0 ⟹ completion_tokens == 0 for every total that can
+    # reach this expression. So the original `p > 0 || c > 0` ≡ `p > 0`,
+    # and the mutant `p > 0 || c < 0` ≡ `p > 0` (u32 is never negative) —
+    # identical on every reachable input, no assertion can tell them apart
+    # (#223 true-equivalence doctrine). Negative control: mutation applied
+    # by hand → agui_failed_run_persists_nonzero_completion_usage green
+    # (rc=0). The killable siblings stay in scope: the prompt-side trio at
+    # :1532:47 (`<`/`==` via agui_failed_run_persists_nonzero_prompt_usage,
+    # `>=` via agui_failed_run_with_zero_usage_writes_no_cost_record), the
+    # `||`→`&&` at :1532:51, and completion `==`/`>=` here (both killed by
+    # the zero-usage test — an all-zero wasted usage must not write
+    # cost.json).
+    "src/http/agui\\.rs:1532:79: replace > with < in spawn_agui_run",
 ]
