@@ -1720,6 +1720,200 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ttl_renewal_is_due_once_half_the_timeout_has_elapsed() {
+        // timeout 20 s → renewal threshold 10 s. The renewal clock is
+        // backdated rather than slept on.
+        let (base, log) = spawn_e2b_mock(transport_route);
+        let t = E2bTransport::new(config_at(&base, 20), "/host/ws");
+        t.ensure_started().await.expect("ensure_started");
+        let patches = || {
+            requests(&log)
+                .iter()
+                .filter(|r| r.method == "PATCH")
+                .count()
+        };
+        let ago = |secs| {
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("the monotonic clock reaches back that far")
+        };
+
+        *t.last_refresh.lock().await = Some(ago(15));
+        t.maybe_refresh_ttl().await.expect("renewal");
+        assert_eq!(
+            patches(),
+            1,
+            "15 s since the last renewal is past timeout/2 = 10 s"
+        );
+
+        *t.last_refresh.lock().await = Some(ago(2));
+        t.maybe_refresh_ttl().await.expect("no renewal due");
+        assert_eq!(
+            patches(),
+            1,
+            "2 s since the last renewal is short of timeout/2 = 10 s"
+        );
+
+        let log = requests(&log);
+        let patch = log
+            .iter()
+            .find(|r| r.method == "PATCH")
+            .expect("the renewal");
+        assert_eq!(patch.target, "/sandboxes/sb-1");
+        assert_eq!(patch.body_json(), json!({ "timeout": 20 }));
+    }
+
+    #[tokio::test]
+    async fn a_failed_ttl_renewal_fails_the_exec_and_is_retried() {
+        let (base, log) = spawn_e2b_mock(|req| {
+            if req.method == "PATCH" {
+                reply(500, "ttl backend down")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        for attempt in 1..=2 {
+            let err = t
+                .exec_shell(
+                    "echo hi",
+                    Path::new("/host/ws"),
+                    &[],
+                    Duration::from_secs(30),
+                    4096,
+                )
+                .await
+                .expect_err("a failed renewal must surface, never be swallowed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("e2b refresh_timeout HTTP 500"),
+                "attempt {attempt}: {msg}"
+            );
+            assert!(msg.contains("ttl backend down"), "attempt {attempt}: {msg}");
+        }
+        let patches = requests(&log)
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .count();
+        assert_eq!(
+            patches, 2,
+            "a failed renewal is not recorded as one — the next exec retries it"
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_exec_starts_the_sandbox_on_demand_and_returns_the_raw_triple() {
+        let (base, log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("vm-cmd") {
+                run_reply(42, "vm-out", "vm-err")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        let got = t
+            .vm_exec("vm-cmd", Duration::from_secs(7))
+            .await
+            .expect("vm_exec");
+        assert_eq!(
+            got,
+            (42, "vm-out".to_string(), "vm-err".to_string()),
+            "a non-zero exit and stderr are data, returned verbatim"
+        );
+        t.vm_exec("vm-cmd", Duration::from_millis(250))
+            .await
+            .expect("vm_exec");
+        let log = requests(&log);
+        let creates = log
+            .iter()
+            .filter(|r| r.method == "POST" && r.target == "/sandboxes")
+            .count();
+        assert_eq!(creates, 1, "created on first use, reused afterwards");
+        let runs: Vec<serde_json::Value> = log
+            .iter()
+            .filter(|r| r.body_str().contains("vm-cmd"))
+            .map(MockReq::body_json)
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                json!({ "cmds": ["vm-cmd"], "timeout": 7 }),
+                json!({ "cmds": ["vm-cmd"], "timeout": 1 }),
+            ],
+            "the timeout is sent in whole seconds, never 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_exec_io_passes_the_triple_through_and_maps_failures_to_io_errors() {
+        let (base, _log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("io-cmd") {
+                run_reply(9, "io-out", "io-err")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        assert_eq!(
+            t.vm_exec_io("io-cmd", Duration::from_secs(5))
+                .await
+                .expect("vm_exec_io"),
+            (9, "io-out".to_string(), "io-err".to_string())
+        );
+
+        let (down, _down_log) = spawn_e2b_mock(|_| reply(503, "e2b unavailable"));
+        let t_down = E2bTransport::new(config_at(&down, 3600), "/host/ws");
+        let err = t_down
+            .vm_exec_io("io-cmd", Duration::from_secs(5))
+            .await
+            .expect_err("a sandbox that cannot be created must surface");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        let msg = err.to_string();
+        assert!(msg.contains("e2b create sandbox HTTP error"), "{msg}");
+        assert!(msg.contains("503"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn probe_trim_returns_the_trimmed_stdout_or_none() {
+        let (base, log) = spawn_e2b_mock(|req| {
+            let body = req.body_str();
+            if body.contains("padded") {
+                run_reply(0, "  vm-user \n", "")
+            } else if body.contains("blank") {
+                run_reply(0, " \n\t", "")
+            } else if body.contains("failing") {
+                run_reply(1, "vm-user\n", "denied")
+            } else {
+                reply(500, "probe backend down")
+            }
+        });
+        let sb = sandbox_at(&base, "sb-probe");
+        assert_eq!(probe_trim(&sb, "padded").await.as_deref(), Some("vm-user"));
+        assert_eq!(
+            probe_trim(&sb, "blank").await,
+            None,
+            "blank stdout is no answer"
+        );
+        assert_eq!(
+            probe_trim(&sb, "failing").await,
+            None,
+            "a non-zero exit is no answer, whatever its stdout"
+        );
+        assert_eq!(
+            probe_trim(&sb, "unrouted").await,
+            None,
+            "a failed request is no answer"
+        );
+        let log = requests(&log);
+        assert_eq!(log.len(), 4);
+        assert_eq!(log[0].target, "/sandboxes/sb-probe/process");
+        assert_eq!(
+            log[0].body_json(),
+            json!({ "cmds": ["padded"], "timeout": 10 })
+        );
+    }
+
     /// Live round-trip against the real E2B API. Gated by
     /// `RECURSIVE_TEST_E2B_API_KEY` (skip when absent).
     #[tokio::test]
