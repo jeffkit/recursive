@@ -821,4 +821,16 @@ exclude_re = [
     # proxy_env_names_collapse_case_variants_when_lookup_is_case_insensitive.
     # Drop this entry if a Windows mutation leg is ever added.
     "src/llm/mod\\.rs:327:5: replace lookup_proxy_env_name -> Option<String> with (None|Some\\(\"xyzzy\"\\.into\\(\\)\\)|Some\\(String::new\\(\\)\\))",
+    # ── Issue #245 batch 26 (B1 seat; task list /tmp/b1-batch26.txt) ─────
+    # src/workspace/registry.rs — 1 true equivalence of the batch's 30.
+    # default_schema_version is the serde default for RegistryIndex::version
+    # and its body IS `REGISTRY_SCHEMA_VERSION`, whose value is 1: replacing
+    # the nullary body with the literal `1` is extensionally identical for
+    # the only input there is (none), so no assertion can tell them apart.
+    # Revisit if REGISTRY_SCHEMA_VERSION ever bumps — the `with 1` mutant
+    # name stays stable while becoming killable, so this anchor must be
+    # dropped then. The killable `with 0` sibling at the same column stays
+    # in scope, covered by
+    # unversioned_index_is_stamped_with_current_schema_on_rewrite.
+    "src/workspace/registry\\.rs:146:5: replace default_schema_version -> u32 with 1",
 ]

@@ -1029,4 +1029,299 @@ mod tests {
         assert_eq!(stored.sessions[0].session_id, "sess-1");
         assert_eq!(stored.sessions[0].status, SessionStatus::Active);
     }
+
+    /// A record shaped like one a crashed `create` had journaled: the id is
+    /// the realpath of `dir` (the uniqueness key recovery matches on).
+    fn crashed_create_record(dir: &Path, name: &str) -> WorkspaceRecord {
+        let canonical = std::fs::canonicalize(dir).unwrap();
+        WorkspaceRecord {
+            id: canonical.to_string_lossy().into_owned(),
+            display: dir.to_string_lossy().into_owned(),
+            name: name.into(),
+            created_at: crate::session::chrono_lite_now(),
+            archived: false,
+            sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recovery_report_is_clean_reflects_each_counter() {
+        // The default report (nothing done, nothing to do) is the only clean
+        // state; any single non-zero counter must read as "not clean".
+        assert!(RecoveryReport::default().is_clean());
+        let applied = RecoveryReport {
+            applied: 1,
+            ..Default::default()
+        };
+        assert!(!applied.is_clean());
+        let already = RecoveryReport {
+            already_applied: 1,
+            ..Default::default()
+        };
+        assert!(!already.is_clean());
+        let cleared = RecoveryReport {
+            cleared: 1,
+            ..Default::default()
+        };
+        assert!(!cleared.is_clean());
+    }
+
+    #[test]
+    fn unversioned_index_is_stamped_with_current_schema_on_rewrite() {
+        // An index.json written before the version field existed must come
+        // back stamped with the CURRENT schema version once the registry
+        // rewrites it — not downgraded to 0.
+        let (_home, _pin, reg) = registry();
+        std::fs::write(reg.index_path(), br#"{"workspaces": []}"#).unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        reg.create(ws.path(), Some("stamp".into())).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reg.index_path()).unwrap()).unwrap();
+        assert_eq!(
+            saved["version"].as_u64(),
+            Some(u64::from(REGISTRY_SCHEMA_VERSION)),
+            "the rewritten index must carry the current schema version"
+        );
+    }
+
+    #[test]
+    fn pending_markers_for_distinct_records_stay_distinct() {
+        // The marker filename is derived from the mutation's registry key:
+        // two crashes in flight must not collide on one marker file, or the
+        // second write silently swallows the first mutation.
+        let (_home, _pin, reg) = registry();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let rec_a = crashed_create_record(dir_a.path(), "crash-a");
+        let rec_b = crashed_create_record(dir_b.path(), "crash-b");
+        reg.write_marker(&PendingMutation::Create {
+            record: rec_a.clone(),
+        })
+        .unwrap();
+        reg.write_marker(&PendingMutation::Create {
+            record: rec_b.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            reg.read_markers().unwrap().len(),
+            2,
+            "distinct records must journal to distinct marker files"
+        );
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 2, "both crashed creates must be applied");
+        let ids: Vec<String> = reg.list().unwrap().into_iter().map(|w| w.id).collect();
+        assert!(ids.contains(&rec_a.id) && ids.contains(&rec_b.id));
+    }
+
+    #[test]
+    fn unreadable_index_fails_loud() {
+        // A read error that is NOT NotFound (here: index.json is a directory)
+        // must surface as an error, never be absorbed as "fresh registry".
+        let (_home, _pin, reg) = registry();
+        std::fs::create_dir(reg.index_path()).unwrap();
+        let err = reg.list().unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn create_clears_its_pending_marker() {
+        // A completed create must leave no marker behind; a surviving marker
+        // would replay the create on the next start.
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        reg.create(ws.path(), None).unwrap();
+        assert!(
+            reg.read_markers().unwrap().is_empty(),
+            "a completed create must clear its marker"
+        );
+    }
+
+    #[test]
+    fn clear_marker_absent_key_is_idempotent_ok() {
+        // Clearing a marker that is not there is success, not an error: the
+        // two-write protocol treats "effect durable, marker gone" as done.
+        let (_home, _pin, reg) = registry();
+        reg.clear_marker("no-such-workspace").unwrap();
+    }
+
+    #[test]
+    fn clear_marker_unremovable_marker_is_an_error() {
+        // A marker that cannot be removed (here: a directory where the
+        // marker file would live) is a real I/O failure and must not be
+        // mistaken for the benign NotFound case.
+        let (_home, _pin, reg) = registry();
+        std::fs::create_dir_all(reg.marker_path("stuck")).unwrap();
+        let err = reg.clear_marker("stuck").unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn stop_then_archive_with_no_active_work_never_calls_stop() {
+        // With nothing active there is nothing to stop: the probe must not be
+        // woken at all, even under StopThenArchive.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingProbe {
+            stops: AtomicUsize,
+        }
+        impl ActivityProbe for CountingProbe {
+            fn active_work(&self, _record: &WorkspaceRecord) -> Vec<ActiveWork> {
+                Vec::new()
+            }
+            fn stop(&self, _record: &WorkspaceRecord, work: &[ActiveWork]) -> Vec<ActiveWork> {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                work.to_vec()
+            }
+        }
+
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        let rec = reg.create(ws.path(), None).unwrap();
+        let probe = CountingProbe {
+            stops: AtomicUsize::new(0),
+        };
+        let outcome = reg
+            .archive(&rec.id, &probe, ArchivePolicy::StopThenArchive)
+            .unwrap();
+        assert!(outcome.active_work.is_empty());
+        assert!(outcome.stopped.is_empty());
+        assert_eq!(
+            probe.stops.load(Ordering::SeqCst),
+            0,
+            "no active work → the probe must never be asked to stop"
+        );
+    }
+
+    #[test]
+    fn recover_create_marker_already_applied_reports_no_op() {
+        // Crash AFTER the index write but BEFORE the marker clear: the record
+        // is already there. Recovery must recognise the no-op — not duplicate
+        // the row nor claim it applied anything.
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        let rec = reg.create(ws.path(), Some("done".into())).unwrap();
+        reg.write_marker(&PendingMutation::Create {
+            record: rec.clone(),
+        })
+        .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 1);
+        assert_eq!(reg.list().unwrap().len(), 1, "no duplicate row");
+    }
+
+    #[test]
+    fn recover_create_marker_applies_missing_record() {
+        // Crash between marker-write and index-write for a record the index
+        // has never seen: recovery must apply it and say so.
+        let (_home, _pin, reg) = registry();
+        let dir = tempfile::tempdir().unwrap();
+        let record = crashed_create_record(dir.path(), "crashed");
+        reg.write_marker(&PendingMutation::Create {
+            record: record.clone(),
+        })
+        .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(reg.list().unwrap()[0].id, record.id);
+    }
+
+    #[test]
+    fn recover_delete_marker_already_applied_reports_no_op() {
+        // A delete whose effect is already on disk (row gone) must count as
+        // a no-op, not as an applied mutation.
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        let rec = reg.create(ws.path(), None).unwrap();
+        reg.remove(&rec.id).unwrap();
+        reg.write_marker(&PendingMutation::Delete { id: rec.id })
+            .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 1);
+    }
+
+    #[test]
+    fn recover_delete_marker_applies_removal() {
+        // Crash between marker-write and index-write for a delete: recovery
+        // must finish the removal and say so.
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        let rec = reg.create(ws.path(), None).unwrap();
+        reg.write_marker(&PendingMutation::Delete { id: rec.id.clone() })
+            .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 1, "the row was still present");
+        assert!(reg.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recover_archive_marker_targets_named_workspace_only() {
+        // The marker names exactly one workspace. A recovery that flips any
+        // OTHER row (or nothing) corrupts the archive lifecycle.
+        let (_home, _pin, reg) = registry();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let a = reg.create(ws_a.path(), Some("aaa".into())).unwrap();
+        let b = reg.create(ws_b.path(), Some("bbb".into())).unwrap();
+        reg.write_marker(&PendingMutation::Archive {
+            id: b.id.clone(),
+            archived: true,
+        })
+        .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(!reg.is_archived(&a.id).unwrap(), "aaa must stay untouched");
+        assert!(reg.is_archived(&b.id).unwrap(), "bbb must be archived");
+    }
+
+    #[test]
+    fn recover_archive_marker_applies_flip_and_counts() {
+        // Crash between marker-write and index-write: the archive flip is
+        // still pending and must be applied — to the named workspace, and
+        // counted as applied.
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        let rec = reg.create(ws.path(), None).unwrap();
+        reg.write_marker(&PendingMutation::Archive {
+            id: rec.id.clone(),
+            archived: true,
+        })
+        .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.already_applied, 0);
+        assert!(reg.is_archived(&rec.id).unwrap());
+    }
+
+    #[test]
+    fn recover_archive_marker_already_applied_reports_no_op() {
+        // Crash AFTER the index write: the flip is durable. Recovery must
+        // call it a no-op — "applied" would overstate what happened.
+        let (_home, _pin, reg) = registry();
+        let ws = tempfile::tempdir().unwrap();
+        let rec = reg.create(ws.path(), None).unwrap();
+        reg.archive(&rec.id, &NoActivityProbe, ArchivePolicy::Admit)
+            .unwrap();
+        assert!(reg.is_archived(&rec.id).unwrap());
+        reg.write_marker(&PendingMutation::Archive {
+            id: rec.id,
+            archived: true,
+        })
+        .unwrap();
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 1);
+    }
 }
