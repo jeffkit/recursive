@@ -979,6 +979,7 @@ impl ToolSetProvider for E2bToolSetProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     #[test]
     fn e2b_provider_sandbox_mode_is_microvm() {
@@ -1184,6 +1185,538 @@ mod tests {
         assert!(
             !dbg.contains("secret-key-value"),
             "Debug must not leak the API key"
+        );
+    }
+
+    // ── loopback mock of the E2B REST surface ────────────────────────────
+    //
+    // The sandbox client talks plain HTTP to `api_base`, so a std
+    // TcpListener on 127.0.0.1 standing in for api.e2b.dev drives every
+    // request shape and status-code branch without credentials.
+
+    /// One recorded request: method, target (path + query), lowercased
+    /// header names and the raw body.
+    struct MockReq {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl MockReq {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn body_str(&self) -> String {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+
+        fn body_json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body).expect("request body is JSON")
+        }
+    }
+
+    /// Canned reply: status code + raw body.
+    struct MockReply {
+        status: u16,
+        body: Vec<u8>,
+    }
+
+    fn reply(status: u16, body: impl AsRef<[u8]>) -> MockReply {
+        MockReply {
+            status,
+            body: body.as_ref().to_vec(),
+        }
+    }
+
+    /// A `POST /sandboxes/{id}/process` reply in the legacy nested shape.
+    fn run_reply(exit_code: i32, stdout: &str, stderr: &str) -> MockReply {
+        reply(
+            200,
+            json!({ "run": { "exit_code": exit_code, "stdout": stdout, "stderr": stderr } })
+                .to_string(),
+        )
+    }
+
+    type MockLog = Arc<std::sync::Mutex<Vec<MockReq>>>;
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<MockReq> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines.next()?.split(' ');
+        let method = request_line.next()?.to_string();
+        let target = request_line.next()?.to_string();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        let len: usize = headers
+            .iter()
+            .find(|(k, _)| k == "content-length")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = buf[head_end..].to_vec();
+        while body.len() < len {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(len);
+        Some(MockReq {
+            method,
+            target,
+            headers,
+            body,
+        })
+    }
+
+    /// Loopback stand-in for the E2B REST API. Every connection is parsed
+    /// into a [`MockReq`], answered by `route` with `Connection: close`
+    /// (so reqwest opens a fresh connection per call), and appended to the
+    /// returned log *before* the reply is written — once a client call
+    /// returns, its request is visible to the test. Returns the base URL.
+    fn spawn_e2b_mock(route: impl Fn(&MockReq) -> MockReply + Send + 'static) -> (String, MockLog) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let log: MockLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some(req) = read_request(&mut stream) else {
+                    continue;
+                };
+                let rep = route(&req);
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(req);
+                let head = format!(
+                    "HTTP/1.1 {} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    rep.status,
+                    rep.body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&rep.body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    fn requests(log: &MockLog) -> std::sync::MutexGuard<'_, Vec<MockReq>> {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn config_at(api_base: &str, timeout_secs: u32) -> E2bConfig {
+        E2bConfig {
+            api_key: "k-test".into(),
+            template_id: "custom".into(),
+            timeout_secs,
+            api_base: api_base.to_string(),
+        }
+    }
+
+    /// A sandbox handle as `create` would have returned it, bound to a mock.
+    fn sandbox_at(api_base: &str, id: &str) -> E2bSandbox {
+        E2bSandbox {
+            config: config_at(api_base, 1234),
+            sandbox_id: id.to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Router for the whole transport lifecycle against sandbox `sb-1`:
+    /// create, the `/workspace` mkdir, the two capability probes, an
+    /// `exec_shell` round trip, TTL renewal and teardown.
+    fn transport_route(req: &MockReq) -> MockReply {
+        match (req.method.as_str(), req.target.as_str()) {
+            ("POST", "/sandboxes") => reply(200, r#"{"sandboxId":"sb-1"}"#),
+            ("POST", "/sandboxes/sb-1/process") => {
+                let body = req.body_str();
+                if body.contains("whoami") {
+                    run_reply(0, "vm-user\n", "")
+                } else if body.contains("command -v") {
+                    run_reply(0, "git\nrg\n", "")
+                } else if body.contains("mkdir -p") {
+                    run_reply(0, "", "")
+                } else {
+                    run_reply(0, "hi\n", "")
+                }
+            }
+            ("PATCH", "/sandboxes/sb-1") | ("DELETE", "/sandboxes/sb-1") => reply(200, "{}"),
+            _ => reply(404, "unexpected request"),
+        }
+    }
+
+    #[test]
+    fn sandbox_id_exposes_the_id_the_api_assigned() {
+        let (base, _log) = spawn_e2b_mock(|_| reply(200, "{}"));
+        let sb = sandbox_at(&base, "sb-id-123");
+        assert_eq!(sb.sandbox_id(), "sb-id-123");
+    }
+
+    #[tokio::test]
+    async fn exec_raw_forwards_the_command_and_returns_the_nested_run_triple() {
+        let (base, log) = spawn_e2b_mock(|_| run_reply(7, "out-value", "err-value"));
+        let sb = sandbox_at(&base, "sb-raw");
+        let got = sb.exec_raw("printf hi", 42).await.expect("exec_raw");
+        assert_eq!(got, (7, "out-value".to_string(), "err-value".to_string()));
+        let log = requests(&log);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].method, "POST");
+        assert_eq!(log[0].target, "/sandboxes/sb-raw/process");
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+        assert_eq!(
+            log[0].body_json(),
+            json!({ "cmds": ["printf hi"], "timeout": 42 })
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_raw_accepts_the_flat_response_shape() {
+        let (base, _log) = spawn_e2b_mock(|_| {
+            reply(
+                200,
+                r#"{"exit_code":2,"stdout":"flat-out","stderr":"flat-err"}"#,
+            )
+        });
+        let sb = sandbox_at(&base, "sb-flat");
+        let got = sb.exec_raw("true", 5).await.expect("exec_raw");
+        assert_eq!(got, (2, "flat-out".to_string(), "flat-err".to_string()));
+    }
+
+    #[tokio::test]
+    async fn exec_raw_surfaces_http_failures_as_storage_errors() {
+        let (base, _log) = spawn_e2b_mock(|_| reply(502, "upstream down"));
+        let sb = sandbox_at(&base, "sb-raw-err");
+        match sb.exec_raw("true", 5).await {
+            Err(Error::Storage { message }) => {
+                assert!(message.contains("e2b exec HTTP error"), "{message}");
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_returns_stdout_and_appends_stderr_only_when_present() {
+        let (base, _log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("quiet") {
+                run_reply(0, "s-out", "")
+            } else {
+                run_reply(0, "s-out", "s-err")
+            }
+        });
+        let sb = sandbox_at(&base, "sb-exec");
+        assert_eq!(sb.exec("quiet", 5).await.expect("exec"), "s-out");
+        assert_eq!(
+            sb.exec("noisy", 5).await.expect("exec"),
+            "s-out\n[stderr]: s-err"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_turns_a_non_zero_exit_into_a_bash_tool_error() {
+        let (base, _log) = spawn_e2b_mock(|_| run_reply(3, "partial", "boom"));
+        let sb = sandbox_at(&base, "sb-exec-fail");
+        match sb.exec("false", 5).await {
+            Err(Error::Tool {
+                name,
+                call_id,
+                message,
+            }) => {
+                assert_eq!(name, "Bash");
+                assert_eq!(call_id, None);
+                assert!(message.contains("command exited with code 3"), "{message}");
+                assert!(message.contains("boom"), "{message}");
+            }
+            other => panic!("expected Error::Tool, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_file_posts_the_raw_body_under_the_path_query() {
+        let (base, log) = spawn_e2b_mock(|_| reply(200, "{}"));
+        let sb = sandbox_at(&base, "sb-up");
+        sb.upload_file("/workspace/dir/a.txt", b"hello\x00world")
+            .await
+            .expect("upload");
+        let log = requests(&log);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].method, "POST");
+        assert_eq!(
+            log[0].target,
+            "/sandboxes/sb-up/files?path=%2Fworkspace%2Fdir%2Fa.txt"
+        );
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+        assert_eq!(log[0].body, b"hello\x00world");
+    }
+
+    #[tokio::test]
+    async fn upload_file_maps_http_failures_to_io_errors() {
+        let (base, _log) = spawn_e2b_mock(|_| reply(403, "key revoked"));
+        let sb = sandbox_at(&base, "sb-up-err");
+        let err = sb
+            .upload_file("/workspace/a.txt", b"x")
+            .await
+            .expect_err("403 must fail the upload");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains("e2b HTTP 403"), "{msg}");
+        assert!(msg.contains("key revoked"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn download_file_returns_the_body_bytes_verbatim() {
+        let payload: &'static [u8] = b"payload\x00\xff\n";
+        let (base, log) = spawn_e2b_mock(move |_| reply(200, payload));
+        let sb = sandbox_at(&base, "sb-down");
+        let got = sb
+            .download_file("/workspace/b.bin")
+            .await
+            .expect("download");
+        assert_eq!(got, payload);
+        let log = requests(&log);
+        assert_eq!(log[0].method, "GET");
+        assert_eq!(
+            log[0].target,
+            "/sandboxes/sb-down/files?path=%2Fworkspace%2Fb.bin"
+        );
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+    }
+
+    #[tokio::test]
+    async fn download_file_maps_404_to_not_found() {
+        let (base, _log) = spawn_e2b_mock(|_| reply(404, "no such file"));
+        let sb = sandbox_at(&base, "sb-down-404");
+        let err = sb
+            .download_file("/workspace/missing")
+            .await
+            .expect_err("404 must fail the download");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(msg.contains("e2b HTTP 404"), "{msg}");
+        assert!(msg.contains("no such file"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_patches_the_configured_ttl() {
+        let (base, log) = spawn_e2b_mock(|_| reply(200, "{}"));
+        let sb = sandbox_at(&base, "sb-ttl");
+        sb.refresh_timeout().await.expect("refresh");
+        let log = requests(&log);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].method, "PATCH");
+        assert_eq!(log[0].target, "/sandboxes/sb-ttl");
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+        assert_eq!(log[0].body_json(), json!({ "timeout": 1234 }));
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_surfaces_http_failures() {
+        let (base, _log) = spawn_e2b_mock(|_| reply(500, "ttl backend down"));
+        let sb = sandbox_at(&base, "sb-ttl-err");
+        match sb.refresh_timeout().await {
+            Err(Error::Storage { message }) => {
+                assert!(
+                    message.contains("e2b refresh_timeout HTTP 500"),
+                    "{message}"
+                );
+                assert!(message.contains("ttl backend down"), "{message}");
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_is_authenticated_and_treats_404_as_idempotent_success() {
+        let (base, log) = spawn_e2b_mock(|req| {
+            if req.target.ends_with("sb-gone") {
+                reply(404, "not found")
+            } else {
+                reply(200, "{}")
+            }
+        });
+        let sb = sandbox_at(&base, "sb-del");
+        sb.delete().await.expect("delete 200");
+        let gone = sandbox_at(&base, "sb-gone");
+        gone.delete()
+            .await
+            .expect("404 is success for an idempotent delete");
+        let log = requests(&log);
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            (log[0].method.as_str(), log[0].target.as_str()),
+            ("DELETE", "/sandboxes/sb-del")
+        );
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+        assert_eq!(
+            (log[1].method.as_str(), log[1].target.as_str()),
+            ("DELETE", "/sandboxes/sb-gone")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_surfaces_non_404_failures() {
+        let (base, _log) = spawn_e2b_mock(|_| reply(500, "backend down"));
+        let sb = sandbox_at(&base, "sb-del-err");
+        match sb.delete().await {
+            Err(Error::Storage { message }) => {
+                assert!(message.contains("e2b delete HTTP 500"), "{message}");
+                assert!(message.contains("backend down"), "{message}");
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_reclaims_the_sandbox_even_outside_a_runtime() {
+        // No ambient runtime here, so `Handle::try_current()` fails and Drop
+        // must take the blocking current-thread fallback — the DELETE has
+        // completed by the time `drop` returns. The env opt-out is the
+        // documented escape hatch and must suppress it.
+        let _env = crate::test_util::env_lock();
+        let saved = std::env::var("RECURSIVE_E2B_NO_DROP_DELETE").ok();
+        std::env::remove_var("RECURSIVE_E2B_NO_DROP_DELETE");
+        let (base, log) = spawn_e2b_mock(|_| reply(200, "{}"));
+        drop(sandbox_at(&base, "sb-drop"));
+        std::env::set_var("RECURSIVE_E2B_NO_DROP_DELETE", "1");
+        drop(sandbox_at(&base, "sb-kept"));
+        match saved {
+            Some(v) => std::env::set_var("RECURSIVE_E2B_NO_DROP_DELETE", v),
+            None => std::env::remove_var("RECURSIVE_E2B_NO_DROP_DELETE"),
+        }
+        let log = requests(&log);
+        assert_eq!(
+            log.len(),
+            1,
+            "exactly one DELETE: the opted-out drop sends nothing"
+        );
+        assert_eq!(log[0].method, "DELETE");
+        assert_eq!(log[0].target, "/sandboxes/sb-drop");
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+    }
+
+    #[tokio::test]
+    async fn ensure_started_creates_the_vm_root_and_probes_capabilities_once() {
+        let (base, log) = spawn_e2b_mock(transport_route);
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        t.ensure_started().await.expect("ensure_started");
+        t.ensure_started()
+            .await
+            .expect("second call must be a no-op");
+        let caps = t.capabilities();
+        assert_eq!(
+            caps.user.as_deref(),
+            Some("vm-user"),
+            "the whoami probe must replace the pre-probe default"
+        );
+        assert_eq!(caps.toolchain, vec!["git".to_string(), "rg".to_string()]);
+        assert_eq!(caps.path_root, PathBuf::from("/workspace"));
+        let log = requests(&log);
+        let creates = log
+            .iter()
+            .filter(|r| r.method == "POST" && r.target == "/sandboxes")
+            .count();
+        assert_eq!(creates, 1, "one sandbox per transport");
+        assert_eq!(log[0].header("x-api-key"), Some("k-test"));
+        assert_eq!(
+            log[0].body_json(),
+            json!({ "template_id": "custom", "timeout": 3600 })
+        );
+        assert_eq!(log[1].target, "/sandboxes/sb-1/process");
+        assert_eq!(log[1].body_json()["cmds"], json!(["mkdir -p '/workspace'"]));
+        assert_eq!(
+            log.len(),
+            4,
+            "create + mkdir + whoami + toolchain; the no-op second call adds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_started_fails_when_the_vm_root_cannot_be_created() {
+        let (base, _log) = spawn_e2b_mock(|req| {
+            if req.body_str().contains("mkdir -p") {
+                run_reply(1, "", "mkdir: read-only file system")
+            } else {
+                transport_route(req)
+            }
+        });
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        match t.ensure_started().await {
+            Err(Error::Storage { message }) => {
+                assert!(
+                    message.contains("e2b mkdir workspace root failed"),
+                    "{message}"
+                );
+                assert!(message.contains("read-only file system"), "{message}");
+            }
+            other => panic!("expected Error::Storage, got {other:?}"),
+        }
+        assert!(
+            t.sandbox.lock().await.is_none(),
+            "a sandbox whose root could not be created is not kept"
+        );
+        assert_eq!(
+            t.capabilities().user.as_deref(),
+            Some("root"),
+            "no probe ran past the failed mkdir"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_is_renewed_once_until_half_the_timeout_has_elapsed() {
+        let (base, log) = spawn_e2b_mock(transport_route);
+        let t = E2bTransport::new(config_at(&base, 3600), "/host/ws");
+        for _ in 0..2 {
+            let r = t
+                .exec_shell(
+                    "echo hi",
+                    Path::new("/host/ws"),
+                    &[],
+                    Duration::from_secs(30),
+                    4096,
+                )
+                .await
+                .expect("exec_shell");
+            assert_eq!(r.exit_code, Some(0));
+            assert_eq!(r.stdout, "hi\n");
+        }
+        let log = requests(&log);
+        let patches: Vec<&MockReq> = log.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(
+            patches.len(),
+            1,
+            "the first exec renews (never renewed yet); the second, milliseconds \
+             later, is far short of timeout/2"
+        );
+        assert_eq!(patches[0].target, "/sandboxes/sb-1");
+        assert_eq!(patches[0].body_json(), json!({ "timeout": 3600 }));
+        let script = log
+            .iter()
+            .find(|r| r.body_str().contains("echo hi"))
+            .expect("the exec_shell command reached the VM");
+        assert_eq!(
+            script.body_json()["cmds"],
+            json!(["cd '/workspace' && sh -c 'echo hi'"])
         );
     }
 
