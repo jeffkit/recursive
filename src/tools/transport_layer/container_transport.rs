@@ -1058,6 +1058,11 @@ mod tests {
         assert_eq!(cfg.image.as_deref(), Some("debian:bookworm-slim"));
         // Non-root runtime user is on the container Config in bollard 0.18.
         assert_eq!(cfg.user.as_deref(), Some(RUN_AS_USER));
+        // The container's init must be kept alive: without an open stdin
+        // and a tty the image's default shell exits immediately and every
+        // later exec fails with "container is not running".
+        assert_eq!(cfg.open_stdin, Some(true));
+        assert_eq!(cfg.tty, Some(true));
     }
 
     #[test]
@@ -1260,6 +1265,47 @@ mod tests {
     #[test]
     fn shell_quotes_single_quotes() {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// `base64_encode` feeds binary payloads through `exec` as text, so it
+    /// must be standard RFC 4648 output: the 24-bit pack / 6-bit unpack
+    /// arithmetic and the `=` padding rule are pinned by fixed vectors
+    /// (goldens from Python's `base64.b64encode`), not by a decoder written
+    /// in the test.
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        // RFC 4648 §10 vectors: every chunk length (1/2/3 bytes) and both
+        // padding shapes, plus the classic "Man".
+        let cases: &[(&[u8], &str)] = &[
+            (b"", ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+            (b"Man", "TWFu"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(base64_encode(input), *expected, "input {input:?}");
+        }
+        // High-bit payloads reach the '+' / '/' end of the alphabet and set
+        // the top bit of every 6-bit group.
+        assert_eq!(base64_encode(&[0x00, 0xFF, 0xFE]), "AP/+");
+        assert_eq!(base64_encode(&[0xFB, 0xFF, 0xBF]), "+/+/");
+        // Every byte value once: any shift / mask / pack mistake surfaces
+        // somewhere in this string.
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(
+            base64_encode(&all),
+            concat!(
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7",
+                "PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3",
+                "eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKz",
+                "tLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v",
+                "8PHy8/T19vf4+fr7/P3+/w==",
+            )
+        );
     }
 
     /// The walk `find` command must be syntactically valid in BOTH edge

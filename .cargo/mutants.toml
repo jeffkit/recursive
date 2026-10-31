@@ -696,4 +696,34 @@ exclude_re = [
     # The fail-open/fail-closed semantics that route through it are pinned
     # by from_fail_mode / timeout-fallback tests elsewhere in the module.
     "src/hooks/external\\.rs:225:9: replace HookResult::continue_default -> Self with Default::default\\(\\)",
+    # ── Issue #245 batch 22 (B1 seat, task list /tmp/b1-batch22.txt) ───────
+    # Two exclusions of 30 in src/tools/transport_layer/container_transport.rs;
+    # the other 28 are pinned (base64_encode_matches_rfc4648_vectors,
+    # container_config_binds_workspace_rw, map_path_translates_workspace_prefix)
+    # and each verified red by hand-mutation under `--features …,cloud-runtime`
+    # (logs in /tmp/b1-b22/negctl/).
+    #
+    # NOTE on the whole file (ledger, not an exclusion): container_transport.rs
+    # is `#[cfg(feature = "cloud-runtime")]` and that feature is NOT in
+    # agent-mutants.sh FEATURES, so under the CI gate the module is never
+    # compiled — every one of its mutants (182 in CI run 41023437517, job
+    # 123955901330: 0 caught, 0 unviable) builds a byte-identical binary and
+    # reports MISSED whatever the tests assert (the observability/otel
+    # cfg-blindness class, at file scale; docker_provider.rs 6/6 and
+    # docker_sandbox.rs 11/11 in the same shard are the same artifact). The
+    # pins below only become CI-observable once cloud-runtime joins FEATURES.
+    #
+    # `:1004:28` and `:1004:40` `| → ^` in base64_encode's 24-bit pack
+    # `(b0 << 16) | (b1 << 8) | b2` are extensionally equivalent (same shape
+    # as the control.rs:742 entry above): each operand is a `u8 as u32`, so
+    # they occupy the pairwise-disjoint bit ranges 16-23, 8-15 and 0-7, and
+    # for disjoint bit sets `a | b == a ^ b` identically — `^` binds tighter
+    # than `|`, so both mutated parses still XOR only disjoint operands.
+    # Verified exhaustively over all 2^24 byte triples (zero mismatches at
+    # either column; the killable `| → &` siblings at the same two columns
+    # mismatch on 16,776,960 of them) and by negative control (mutation
+    # applied → whole module green → byte-exact restore). The `\\^` anchor
+    # keeps the `| → &` siblings in scope and the line:col anchor keeps every
+    # other `|` in the file in scope.
+    "src/tools/transport_layer/container_transport\\.rs:1004:(28|40): replace \\| with \\^ in base64_encode",
 ]
