@@ -594,4 +594,59 @@ mod tests {
         assert!(p.is_mcp);
         assert!(p.parts.contains(&"tool".to_string()));
     }
+
+    // ── Issue #245 batch 28: fast-path guard and required-filter nails ──────
+
+    #[test]
+    fn mcp_prefix_fast_path_requires_the_mcp_prefix() {
+        // "readfi" prefix-matches ReadFile but is not an mcp__ query: it must
+        // fall through to scoring, where no candidate scores, instead of the
+        // fast path returning the prefix hit verbatim.
+        assert!(resolve("readfi", &specs(), 5).is_empty());
+    }
+
+    #[test]
+    fn bare_mcp_prefix_is_not_a_special_case() {
+        // Exactly "mcp__" (5 chars) fails the len() > 5 guard on purpose
+        // (see max_results_caps_output): the keyword scorer finds nothing for
+        // it, so the result is empty.
+        assert!(resolve("mcp__", &specs(), 5).is_empty());
+    }
+
+    #[test]
+    fn plus_prefixed_terms_are_required_and_bare_plus_is_dropped() {
+        let s = vec![
+            (spec("FooTool", "Does foo things."), None),
+            (spec("BarTool", "Does bar things."), None),
+        ];
+        // "+foo" is required: only FooTool survives the filter; "bar" only
+        // adds score. (Under a stripped.is_empty() inversion the "+foo" term
+        // vanishes entirely and BarTool wins on the description.)
+        assert_eq!(resolve("+foo bar", &s, 5), vec!["FooTool".to_string()]);
+        // A bare "+" carries no term at all.
+        assert!(resolve("+", &s, 5).is_empty());
+        // A required term with no optional terms still drives the search.
+        assert_eq!(resolve("+foo", &s, 5), vec!["FooTool".to_string()]);
+    }
+
+    #[test]
+    fn required_filter_excludes_candidates_missing_the_term() {
+        let s = vec![
+            (spec("FooTool", "Does foo things."), None),
+            (spec("OtherTool", "Does other things."), None),
+        ];
+        // No candidate has "jupyter" as a name part / partial part / desc
+        // word — not even FooTool, which scores on "foo": the filter must
+        // compare parts against the term, not merely differ from it.
+        assert!(resolve("+jupyter foo", &s, 5).is_empty());
+    }
+
+    #[test]
+    fn required_filter_keeps_partial_name_part_matches() {
+        let s = vec![(spec("ReadFile", "Open files from disk."), None)];
+        // "rea" is a partial (non-exact) match on the "read" part and appears
+        // nowhere in the description: the contains arm alone must pass the
+        // filter.
+        assert_eq!(resolve("+rea", &s, 5), vec!["ReadFile".to_string()]);
+    }
 }

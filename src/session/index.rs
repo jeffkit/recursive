@@ -1427,6 +1427,8 @@ mod tests {
         let events = index.read_events(&session_id, 0, 10).unwrap();
         assert_eq!(events.len(), 3, "system + user + assistant");
         assert_eq!(events[0].index, 0);
+        assert_eq!(events[1].index, 1, "entry_index advances per event");
+        assert_eq!(events[2].index, 2, "entry_index advances per event");
         assert_eq!(events[1].content, "hello");
         assert_eq!(events[2].role, "assistant");
         assert_eq!(index.event_count(&session_id).unwrap(), 3);
@@ -1468,9 +1470,12 @@ mod tests {
     fn snippet_windows_around_the_match() {
         let content = format!("{}needle{}", "a".repeat(400), "b".repeat(400));
         let out = snippet(&content, &["needle".to_string()], 40);
-        assert!(out.starts_with('…'));
-        assert!(out.ends_with('…'));
-        assert!(out.contains("needle"));
+        // The window is exactly the width-40 span around the match —
+        // start = 400 - 20 (already a char boundary), end = start + 40 —
+        // with an ellipsis on each open side. Pinning the exact window also
+        // kills guard-widening mutants of the forward walk (a widened guard
+        // walks `end` all the way to the content length).
+        assert_eq!(out, format!("…{}needle{}…", "a".repeat(20), "b".repeat(14)));
         assert!(out.chars().count() < content.chars().count());
     }
 
@@ -1625,5 +1630,238 @@ mod tests {
             logs.contains(&missing.display().to_string()),
             "WARN must carry the offending path, got: {logs}"
         );
+    }
+
+    // ---- Issue #245 batch 28: rebuild-guard, revision and snippet nails ----
+
+    /// A database stamped by another application but carrying the *current*
+    /// user_version must still be rebuilt: the application stamp is the
+    /// stronger half of the self-identifying header. Kills the
+    /// `application_id !=` → `==` arm of the rebuild guard (a fresh database
+    /// can't see it — both stamps mismatch there, so every operator agrees).
+    #[test]
+    fn foreign_application_id_is_rebuilt_even_with_current_user_version() {
+        let env = IsolatedWorkspace::new();
+        write_session(env.path(), "goal", "recoverable needle", "ok");
+        let path = {
+            let mut index = open_index(env.path());
+            index.refresh().unwrap();
+            index.path().to_path_buf()
+        };
+        // A foreign database that happens to carry our format version and
+        // none of our tables.
+        std::fs::remove_file(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA application_id = 1234; PRAGMA user_version = 1;")
+                .unwrap();
+        }
+
+        let mut index = open_index(env.path());
+        let stamp: i32 = index
+            .conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stamp, INDEX_APPLICATION_ID,
+            "a foreign application_id must be re-stamped by rebuild"
+        );
+        assert_eq!(index.refresh().unwrap().indexed, 1);
+        assert_eq!(index.search_events("needle", 10, None).unwrap().len(), 1);
+    }
+
+    /// The user_version half: a database with the correct application stamp
+    /// but a stale format version must be rebuilt (tables dropped and
+    /// recreated), not trusted. Kills the `user_version !=` → `==` arm; the
+    /// foreign tests together cover every mismatch quadrant, so the
+    /// `||` → `&&` widening of the same guard has no surviving input either.
+    #[test]
+    fn stale_user_version_is_rebuilt_even_with_current_application_id() {
+        let env = IsolatedWorkspace::new();
+        write_session(env.path(), "goal", "version bumped needle", "ok");
+        let path = {
+            let mut index = open_index(env.path());
+            index.refresh().unwrap();
+            index.path().to_path_buf()
+        };
+        // The shape a schema migration leaves: same application, bumped
+        // version, events table gone.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 42; DROP TABLE events;")
+                .unwrap();
+        }
+
+        let mut index = open_index(env.path());
+        let version: i32 = index
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, INDEX_FORMAT_VERSION,
+            "a stale user_version must be re-stamped by rebuild"
+        );
+        assert_eq!(index.refresh().unwrap().indexed, 1);
+        assert_eq!(
+            index.search_events("needle", 10, None).unwrap().len(),
+            1,
+            "the dropped events table must be recreated"
+        );
+    }
+
+    /// `first_uuid` is the FIRST message uuid, not the last one: a fork that
+    /// shares the origin transcript but continued past it (extra appended
+    /// messages) must still be reported by `same_origin`. Kills the
+    /// `is_none() &&` → `||` widening in index_session, which would let
+    /// every subsequent non-empty uuid overwrite the stored origin.
+    #[test]
+    fn same_origin_detects_a_fork_that_continued_past_the_origin() {
+        let env = IsolatedWorkspace::new();
+        let source = write_session(env.path(), "origin", "hello", "world");
+        let dirs = SessionReader::list_sessions(env.path()).unwrap();
+        let source_dir = dirs
+            .iter()
+            .find(|d| d.file_name().unwrap().to_string_lossy() == source)
+            .unwrap()
+            .clone();
+        let copy_id = format!("{source}-fork");
+        let copy_dir = source_dir.parent().unwrap().join(&copy_id);
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        std::fs::copy(
+            source_dir.join(TRANSCRIPT_FILE),
+            copy_dir.join(TRANSCRIPT_FILE),
+        )
+        .unwrap();
+        let mut meta = SessionReader::load_meta(&source_dir).unwrap();
+        meta.session_id = copy_id.clone();
+        std::fs::write(copy_dir.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+        // The fork keeps the origin's messages and appends its own.
+        {
+            let mut fork = SessionWriter::open_existing(&copy_dir).unwrap();
+            fork.append(&Message::assistant("continued".to_string()), None, None)
+                .unwrap();
+            fork.finish(SessionStatus::Completed).unwrap();
+        }
+
+        let mut index = open_index(env.path());
+        index.refresh().unwrap();
+        assert_eq!(
+            index.same_origin(&source).unwrap(),
+            vec![copy_id],
+            "a fork that continued past the origin shares first_uuid"
+        );
+    }
+
+    /// A lease stamps who holds it (`instance_id`) and when (`leased_at`);
+    /// both are readable from the TEMP table. Kills constant-body mutants of
+    /// `instance_id` ("xyzzy" / "") and of `now_millis` (-1 / 0 / 1).
+    #[test]
+    fn lease_records_this_instance_identity_and_wall_clock() {
+        let env = IsolatedWorkspace::new();
+        let session_id = write_session(env.path(), "goal", "hello", "world");
+        let mut index = open_index(env.path());
+        index.lease(&session_id).unwrap();
+
+        let (instance, leased_at): (String, i64) = index
+            .conn
+            .query_row(
+                "SELECT instance_id, leased_at FROM active_sessions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            instance,
+            std::process::id().to_string(),
+            "the lease names this process"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(
+            leased_at > now - 5_000 && leased_at <= now + 5_000,
+            "leased_at must be the wall-clock lease time, got {leased_at} vs now {now}"
+        );
+    }
+
+    /// A three-character term sits exactly on the trigram side of the
+    /// length split (`>= 3` goes to MATCH, `< 3` to LIKE) — so a mutant that
+    /// widens the LIKE side to `<= 3` filters the term through BOTH
+    /// predicates ANDed, collapsing the result to what plain LIKE finds.
+    /// Trigram matching case-folds non-ASCII; SQLite's LIKE does not fold
+    /// outside ASCII: Cyrillic stored uppercase, queried lowercase, must
+    /// still hit.
+    #[test]
+    fn three_char_terms_search_the_case_folding_trigram_not_like() {
+        let env = IsolatedWorkspace::new();
+        write_session(env.path(), "goal", "ПРИВЕТ МИР", "ok");
+        let mut index = open_index(env.path());
+        index.refresh().unwrap();
+        let hits = index.search_events("при", 10, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the trigram index folds non-ASCII case; LIKE cannot"
+        );
+    }
+
+    /// The revision carries an mtime component, not just sizes: rewriting
+    /// the transcript with a *same-length* payload (mtime moves, size does
+    /// not) must re-index the session. Kills constant-revision bodies of
+    /// `stat_revision` ("xyzzy" / "") and constant-mtime bodies of
+    /// `mtime_nanos` (0 / 1) — under each, the second refresh sees an
+    /// unchanged revision and skips the re-read.
+    #[test]
+    fn a_same_size_rewrite_reindexes_through_the_mtime_component() {
+        let env = IsolatedWorkspace::new();
+        write_session(env.path(), "revision", "hello body", "world");
+        let mut index = open_index(env.path());
+        assert_eq!(index.refresh().unwrap().indexed, 1);
+
+        let dir = &SessionReader::list_sessions(env.path()).unwrap()[0];
+        let transcript = dir.join(TRANSCRIPT_FILE);
+        let bytes = std::fs::read(&transcript).unwrap();
+        let needle = b"hello";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("seeded body present");
+        let mut rewritten = bytes.clone();
+        rewritten[pos..pos + needle.len()].copy_from_slice(b"hallo");
+        assert_eq!(
+            rewritten.len(),
+            bytes.len(),
+            "the rewrite must not change the size component"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&transcript, &rewritten).unwrap();
+
+        let report = index.refresh().unwrap();
+        assert_eq!(
+            report.indexed, 1,
+            "mtime moved with size constant: the session must be re-read"
+        );
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            index.search_events("hallo", 10, None).unwrap().len(),
+            1,
+            "the re-read must see the rewritten body"
+        );
+    }
+
+    /// The snippet window walks OUT of multibyte characters on both sides:
+    /// with width 5 over "ab甲乙丙" the raw window starts mid-乙 (byte 6) and
+    /// ends mid-丙 (byte 10); the result must be the walk-back /
+    /// walk-forward window holding the last two characters with a leading
+    /// ellipsis. Kills every walker mutation that skips a walk (guard
+    /// `>`→`<`/`==`, step `-=`→`/=` identity — those slice a non-boundary
+    /// byte and panic) and the direction flippers (`-=`→`+=`, `+=`→`-=`),
+    /// which shift the window onto different characters.
+    #[test]
+    fn snippet_window_walks_to_char_boundaries_on_both_sides() {
+        // bytes: a(0) b(1) 甲(2..5) 乙(5..8) 丙(8..11); the match sits at 8.
+        let out = snippet("ab甲乙丙", &["丙".to_string()], 5);
+        assert_eq!(out, "…乙丙");
     }
 }

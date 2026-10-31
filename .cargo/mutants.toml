@@ -889,4 +889,28 @@ exclude_re = [
     # (base64_encode_pads_a_single_trailing_byte_twice) in scope.
     "src/tools/transport_layer/transport\\.rs:1073:33: replace \\| with \\^ in base64_encode",
     "src/tools/transport_layer/transport\\.rs:1073:45: replace \\| with \\^ in base64_encode",
+    # ── Issue #245 batch 28 (B1 seat; task list /tmp/b1-batch28.txt) ───────
+    # src/session/index.rs — the 2 true equivalences of the batch's 30, both
+    # guards of `snippet`'s char-boundary walks. Negative controls: mutation
+    # applied by hand → all three snippet tests green (rc=0) → byte-exact
+    # restore (/tmp/b28/negctl.jsonl).
+    # :820:17 `start > 0` → `>=`: `start` is a usize, so `start >= 0` is
+    # vacuously true and the mutant guard reduces to
+    # `!content.is_char_boundary(start)`; the two guards differ only at
+    # start == 0, and byte 0 is always a char boundary (std guarantee), so
+    # the mutant stops exactly where the original does — identical
+    # iteration over every input, and no underflow in either variant.
+    # :824:15 `end < content.len()` → `<=`: `end` is clamped to
+    # `content.len()` by `(start + width).min(content.len())` and only ever
+    # incremented, so the guards differ only at end == content.len(), and a
+    # string's byte length is always a char boundary — `!is_char_boundary`
+    # is false there, so the mutant exits where the original does.
+    # The killable walker siblings (guard `>`→`<`/`==` skips that slice a
+    # non-boundary byte, step `-=`→`+=`/`/=` and `+=`→`-=`/`*=` flippers,
+    # the `&&`→`||` guard widenings and `delete !` skips on both walks) are
+    # pinned by snippet_window_walks_to_char_boundaries_on_both_sides and
+    # the exact-window asserts in snippet_windows_around_the_match — keep
+    # them out of exclusion scope.
+    "src/session/index\\.rs:820:17: replace > with >= in snippet",
+    "src/session/index\\.rs:824:15: replace < with <= in snippet",
 ]
