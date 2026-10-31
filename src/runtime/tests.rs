@@ -3903,3 +3903,184 @@ async fn current_todos_recovers_snapshot_when_lock_poisoned() {
         "the recovery must be observable, not silent"
     );
 }
+
+// ── #245 batch 27: AgentRuntime surface nails ───────────────────────────────
+
+/// Goal-331 circuit breaker (cross-turn): every failed proactive compaction
+/// must count, and once `MAX_CONSECUTIVE_COMPACT_FAILURES` are in a row the
+/// next call must be suppressed — `CompactionSkipped { CircuitBreaker }`
+/// instead of yet another LLM round-trip. A counter that never advances keeps
+/// hammering a failing summariser on every turn.
+#[tokio::test]
+async fn cross_turn_compaction_failures_trip_the_circuit_breaker() {
+    // kills `replace += with *=` / `replace += with -=` on
+    // `consecutive_compact_failures` in maybe_compact_cross_turn
+    fn llm_err() -> crate::error::Error {
+        crate::error::Error::Llm {
+            provider: "mock".into(),
+            model: None,
+            request_id: None,
+            message: "summariser down".into(),
+        }
+    }
+    let failures = crate::compact::MAX_CONSECUTIVE_COMPACT_FAILURES as usize;
+    let provider = Arc::new(
+        MockProvider::new(vec![]).with_errors((0..failures + 2).map(|_| llm_err()).collect()),
+    );
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    // Threshold 1 byte: the trigger fires on every call; keep_recent_n stays
+    // at the default 8, so 12 conversational messages always plan a cut.
+    let compactor = crate::compact::Compactor::new(1);
+    let mut rt = AgentRuntime::builder()
+        .llm(provider)
+        .compactor(compactor)
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    let mut msgs: Vec<Message> = Vec::new();
+    for i in 0..6 {
+        msgs.push(Message::user(format!("user {i}")));
+        msgs.push(Message::assistant(format!("asst {i}")));
+    }
+    *Arc::make_mut(&mut rt.transcript) = msgs;
+    while rx.try_recv().is_ok() {}
+
+    for _ in 0..=failures {
+        rt.maybe_compact_cross_turn(&TokenUsage::default())
+            .await
+            .unwrap();
+    }
+
+    let mut reasons = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::CompactionSkipped { reason, .. } = ev {
+            reasons.push(reason);
+        }
+    }
+    let mut expected = vec![crate::event::CompactionSkipReason::Error; failures];
+    expected.push(crate::event::CompactionSkipReason::CircuitBreaker);
+    assert_eq!(
+        reasons, expected,
+        "each failure must advance the breaker; the call after the third must be suppressed"
+    );
+}
+
+/// The TUI abort path restores the transcript to its pre-turn length so a
+/// half-finished turn cannot leave an orphan tool_call behind: everything
+/// after `len` must actually be gone.
+#[tokio::test]
+async fn truncate_transcript_discards_everything_after_len() {
+    // kills `replace AgentRuntime::truncate_transcript with ()`
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .unwrap();
+    let msgs: Vec<Message> = (0..5).map(|i| Message::user(format!("m{i}"))).collect();
+    *Arc::make_mut(&mut rt.transcript) = msgs;
+
+    rt.truncate_transcript(2);
+
+    let kept: Vec<&str> = rt.transcript().iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        kept,
+        ["m0", "m1"],
+        "only the first `len` messages may survive"
+    );
+}
+
+/// `/model` hot-swap: after `set_llm` the *next* turn must be answered by the
+/// new provider — the replaced one (still holding a scripted reply) must not
+/// be consulted at all.
+#[tokio::test]
+async fn set_llm_routes_the_next_turn_to_the_new_provider() {
+    // kills `replace AgentRuntime::set_llm with ()`
+    let old = Arc::new(MockProvider::new(vec![reply("from the old provider")]));
+    let swapped = Arc::new(MockProvider::new(vec![reply(
+        "from the swapped-in provider",
+    )]));
+    let mut rt = AgentRuntime::builder().llm(old.clone()).build().unwrap();
+
+    rt.set_llm(swapped.clone());
+    let out = rt.run("hi").await.unwrap();
+
+    assert_eq!(
+        out.final_text.as_deref(),
+        Some("from the swapped-in provider")
+    );
+    assert_eq!(
+        swapped.calls().len(),
+        1,
+        "the swapped-in provider must take the turn"
+    );
+    assert!(
+        old.calls().is_empty(),
+        "the replaced provider must not be called"
+    );
+}
+
+/// Issue #177 / owner ruling 2026-10-18: a liquidation that leaves companion
+/// jobs running is a degradation and must be WARN-visible — never dressed up
+/// as the clean "background tasks reclaimed" line.
+#[tokio::test]
+async fn destroy_environment_warns_when_a_job_outlives_the_reclaim_grace() {
+    // kills `replace > with <` / `replace > with ==` on
+    // `report.unreclaimed > 0` in destroy_environment
+    let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+    let _guard = tracing::subscriber::set_default(sub);
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .unwrap();
+    // A job no loop owns never reports a terminal state, so it is still
+    // "running" when the grace expires — the unreclaimed case.
+    rt.kernel()
+        .tools()
+        .bg_manager()
+        .lock()
+        .await
+        .insert(crate::tools::run_background::Job::running());
+
+    rt.destroy_environment().await;
+
+    let lines = lines.lock().unwrap();
+    assert!(
+        lines.iter().any(|l| l.starts_with("[WARN]")
+            && l.contains("companion background tasks still running")
+            && l.contains("unreclaimed=1")),
+        "an unreclaimed job must surface as a WARN, got {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("background tasks reclaimed")),
+        "a leaky teardown must not claim a clean reclaim, got {lines:?}"
+    );
+}
+
+/// The complementary branch: with nothing left running the teardown is
+/// reported as clean at INFO, and no leak WARN is raised.
+#[tokio::test]
+async fn destroy_environment_reports_a_clean_reclaim_without_a_leak_warning() {
+    // kills `replace > with >=` on `report.unreclaimed > 0` in destroy_environment
+    let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+    let _guard = tracing::subscriber::set_default(sub);
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .unwrap();
+
+    rt.destroy_environment().await;
+
+    let lines = lines.lock().unwrap();
+    assert!(
+        lines.iter().any(|l| l.starts_with("[INFO]")
+            && l.contains("destroy_environment: background tasks reclaimed")),
+        "a clean teardown must log the reclaim at INFO, got {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("companion background tasks still running")),
+        "no leak WARN may fire when every job was reclaimed, got {lines:?}"
+    );
+}
