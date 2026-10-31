@@ -184,7 +184,11 @@ fn chrono_now_rfc3339() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = dur.as_secs();
+    unix_secs_to_rfc3339(dur.as_secs())
+}
+
+/// Format seconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+fn unix_secs_to_rfc3339(secs: u64) -> String {
     // Format as ISO 8601 / RFC 3339
     let days = secs / 86400;
     let time_secs = secs % 86400;
@@ -1943,5 +1947,271 @@ mod tests {
             index_lines[2].contains("N1"),
             "oldest note (N1) should appear last"
         );
+    }
+
+    // ── Issue #245 batch 24 pins ─────────────────────────────────────────────
+
+    /// The formatter is pure, so it is pinned on fixed epochs rather than on
+    /// the wall clock. `1_000_000_000` (the "billennium") lands on
+    /// `01:46:40` — every time field non-zero and distinct — so each of the
+    /// `/`, `%`, `*`, `+` arithmetic mutants in it produces a different
+    /// string; the day boundaries pin the `secs / 86400` split.
+    #[test]
+    fn unix_secs_to_rfc3339_formats_fixed_epochs_exactly() {
+        assert_eq!(unix_secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix_secs_to_rfc3339(1), "1970-01-01T00:00:01Z");
+        assert_eq!(unix_secs_to_rfc3339(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(unix_secs_to_rfc3339(86_400), "1970-01-02T00:00:00Z");
+        assert_eq!(
+            unix_secs_to_rfc3339(1_000_000_000),
+            "2001-09-09T01:46:40Z",
+            "billennium second must format exactly"
+        );
+        assert_eq!(unix_secs_to_rfc3339(1_793_404_800), "2026-10-31T00:00:00Z");
+        assert_eq!(unix_secs_to_rfc3339(1_793_491_199), "2026-10-31T23:59:59Z");
+    }
+
+    /// The wrapper's only job is to feed `SystemTime::now()` into the pure
+    /// formatter; bracket it with an independent clock so a bad feed (or a
+    /// wrapper that stops calling the formatter) is still caught.
+    #[test]
+    fn chrono_now_rfc3339_tracks_the_wall_clock_to_the_second() {
+        let before = chrono::Utc::now().timestamp();
+        let ts = chrono_now_rfc3339();
+        let after = chrono::Utc::now().timestamp();
+
+        let parsed = chrono::DateTime::parse_from_rfc3339(&ts)
+            .unwrap_or_else(|e| panic!("wrapper output must stay RFC 3339 parseable: {ts}: {e}"))
+            .timestamp();
+        assert!(
+            (before..=after).contains(&parsed),
+            "timestamp {ts} ({parsed}) must fall within [{before}, {after}]"
+        );
+    }
+
+    /// The month loop breaks on `days < md`: the day that *equals* the
+    /// month's length is the first day of the next month, not day `md + 1`
+    /// of the same one. Pins every month-start the `<=` mutant would bleed
+    /// into the previous month.
+    #[test]
+    fn days_to_date_month_starts_do_not_bleed_into_the_previous_month() {
+        assert_eq!(days_to_date(31), (1970, 2, 1), "Jan has 31 days");
+        assert_eq!(days_to_date(59), (1970, 3, 1), "Jan+Feb (non-leap) = 59");
+        assert_eq!(days_to_date(334), (1970, 12, 1), "Jan..Nov = 334");
+        assert_eq!(days_to_date(365 + 31), (1971, 2, 1), "same rule next year");
+    }
+
+    /// The hook truncation threshold is *exclusive*: an exactly-80-byte note
+    /// is listed verbatim, 81 bytes gets the `...` treatment.
+    #[test]
+    fn memory_summary_hook_threshold_is_exclusive_at_80_bytes() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = memory_path(tmp.path());
+        let exactly_80 = format!("{}Z", "x".repeat(79));
+        assert_eq!(exactly_80.len(), 80);
+
+        let mut store = MemoryStore::default();
+        store.add(exactly_80.clone(), vec![]);
+        store.save(&path).unwrap();
+        let summary = memory_summary(tmp.path(), 10);
+        assert!(
+            summary.contains(&format!("- [N1](recall) — {exactly_80}")),
+            "an 80-byte hook must be listed verbatim: {summary}"
+        );
+        assert!(
+            !summary.contains("..."),
+            "an 80-byte hook must not be truncated: {summary}"
+        );
+
+        store.add("y".repeat(81), vec![]);
+        store.save(&path).unwrap();
+        let summary = memory_summary(tmp.path(), 10);
+        let long_line = summary
+            .lines()
+            .find(|l| l.starts_with("- [N2](recall) — "))
+            .expect("N2 must be listed");
+        assert!(
+            long_line.ends_with("..."),
+            "an 81-byte hook must be truncated: {long_line}"
+        );
+    }
+
+    /// Same exclusive threshold for scratchpad values at 200 bytes.
+    #[test]
+    fn scratchpad_summary_value_threshold_is_exclusive_at_200_bytes() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = scratchpad_path(tmp.path());
+        let exactly_200 = format!("{}Z", "w".repeat(199));
+        assert_eq!(exactly_200.len(), 200);
+
+        let mut pad = Scratchpad::default();
+        pad.set("k200".into(), exactly_200.clone());
+        pad.set("k201".into(), "v".repeat(201));
+        pad.save(&path).unwrap();
+
+        let summary = scratchpad_summary(tmp.path());
+        assert!(
+            summary.contains(&format!("- k200: {exactly_200}")),
+            "a 200-byte value must be listed verbatim: {summary}"
+        );
+        let long_line = summary
+            .lines()
+            .find(|l| l.starts_with("- k201: "))
+            .expect("k201 must be listed");
+        assert!(
+            long_line.ends_with("..."),
+            "a 201-byte value must be truncated: {long_line}"
+        );
+    }
+
+    /// Every memory tool is deferred: the registry keeps all of them out of
+    /// the eager schema set the LLM is sent, surfacing them through the
+    /// deferred catalog instead. One tool flipping to eager is a prompt-size
+    /// regression, so the partition is asserted as a whole.
+    #[test]
+    fn memory_tools_are_all_kept_out_of_the_eager_schema_set() {
+        use crate::tools::ToolRegistry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::local();
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(Remember::new(tmp.path())),
+            Arc::new(Recall::new(tmp.path())),
+            Arc::new(Forget::new(tmp.path())),
+            Arc::new(WorkingMemoryTool::new(tmp.path())),
+            Arc::new(ScratchpadGet::new(tmp.path())),
+            Arc::new(ScratchpadDelete::new(tmp.path())),
+            Arc::new(ScratchpadList::new(tmp.path())),
+        ];
+        for tool in tools {
+            registry.register_mut(tool);
+        }
+
+        let (eager, deferred) = registry.specs_partitioned();
+        let eager_names: Vec<&str> = eager.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            eager_names.is_empty(),
+            "memory tools must not be sent eagerly: {eager_names:?}"
+        );
+        let mut deferred_names: Vec<&str> = deferred.iter().map(|s| s.name.as_str()).collect();
+        deferred_names.sort_unstable();
+        assert_eq!(
+            deferred_names,
+            [
+                "forget",
+                "recall",
+                "remember",
+                "scratchpad_delete",
+                "scratchpad_get",
+                "scratchpad_list",
+                "scratchpad_set",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_set_tool_persists_the_pair_and_reports_the_key() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let tool = WorkingMemoryTool::new(tmp.path());
+
+        let out = tool
+            .execute(json!({ "key": "branch", "value": "fix/batch24" }))
+            .await
+            .unwrap();
+        assert_eq!(out, "scratchpad key 'branch' set");
+        let pad = Scratchpad::load(&scratchpad_path(tmp.path())).unwrap();
+        assert_eq!(
+            pad.get("branch"),
+            Some("fix/batch24"),
+            "the pair must be durable on disk"
+        );
+
+        let err = tool
+            .execute(json!({ "value": "no key" }))
+            .await
+            .expect_err("a missing key must be rejected");
+        assert!(
+            matches!(&err, Error::BadToolArgs { name, .. } if name == "scratchpad_set"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_get_tool_returns_the_value_or_reports_the_miss() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = scratchpad_path(tmp.path());
+        let mut pad = Scratchpad::default();
+        pad.set("k".into(), "stored value".into());
+        pad.save(&path).unwrap();
+
+        let tool = ScratchpadGet::new(tmp.path());
+        assert_eq!(
+            tool.execute(json!({ "key": "k" })).await.unwrap(),
+            "stored value"
+        );
+        assert_eq!(
+            tool.execute(json!({ "key": "ghost" })).await.unwrap(),
+            "no such key: ghost"
+        );
+        let err = tool
+            .execute(json!({}))
+            .await
+            .expect_err("a missing key must be rejected");
+        assert!(
+            matches!(&err, Error::BadToolArgs { name, .. } if name == "scratchpad_get"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_delete_tool_removes_only_that_key_and_reports_misses() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let path = scratchpad_path(tmp.path());
+        let mut pad = Scratchpad::default();
+        pad.set("gone".into(), "1".into());
+        pad.set("kept".into(), "2".into());
+        pad.save(&path).unwrap();
+
+        let tool = ScratchpadDelete::new(tmp.path());
+        assert_eq!(
+            tool.execute(json!({ "key": "gone" })).await.unwrap(),
+            "scratchpad key 'gone' deleted"
+        );
+        let pad = Scratchpad::load(&path).unwrap();
+        assert!(
+            pad.get("gone").is_none(),
+            "deleted key must be gone on disk"
+        );
+        assert_eq!(pad.get("kept"), Some("2"), "other keys must survive");
+
+        assert_eq!(
+            tool.execute(json!({ "key": "gone" })).await.unwrap(),
+            "no such key: gone"
+        );
+        let err = tool
+            .execute(json!({}))
+            .await
+            .expect_err("a missing key must be rejected");
+        assert!(
+            matches!(&err, Error::BadToolArgs { name, .. } if name == "scratchpad_delete"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_list_tool_lists_keys_in_order_or_reports_empty() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let tool = ScratchpadList::new(tmp.path());
+        assert_eq!(
+            tool.execute(json!({})).await.unwrap(),
+            "scratchpad is empty"
+        );
+
+        let path = scratchpad_path(tmp.path());
+        let mut pad = Scratchpad::default();
+        pad.set("alpha".into(), "1".into());
+        pad.set("beta".into(), "2".into());
+        pad.save(&path).unwrap();
+        assert_eq!(tool.execute(json!({})).await.unwrap(), "alpha\nbeta");
     }
 }

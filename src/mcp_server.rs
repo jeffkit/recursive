@@ -600,4 +600,207 @@ mod tests {
             err.message
         );
     }
+
+    // ── Issue #245 batch 24 pins ─────────────────────────────────────────────
+
+    /// `run_on` is the whole stdio loop on injectable I/O: one reply line per
+    /// request, a `-32700` line for a non-JSON request, nothing at all for a
+    /// notification or a blank line, and a clean `Ok` at EOF.
+    #[tokio::test]
+    async fn run_on_answers_requests_flags_garbage_and_skips_notifications() {
+        let runner = McpServerRunner::new(ToolRegistry::local());
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            "this is not json\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "   \n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"no/such/method\"}\n",
+        );
+        let mut out: Vec<u8> = Vec::new();
+
+        runner
+            .run_on(input.as_bytes(), &mut out)
+            .await
+            .expect("run_on must return Ok at EOF");
+
+        let replies: Vec<Value> = out
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice(l).expect("every reply line must be JSON"))
+            .collect();
+        assert_eq!(
+            replies.len(),
+            3,
+            "one reply per request, none for the notification or blank line: {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(replies[0]["id"], 1);
+        assert_eq!(replies[0]["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(
+            replies[1]["id"],
+            Value::Null,
+            "a parse error carries a null id"
+        );
+        assert_eq!(replies[1]["error"]["code"], -32700);
+        assert_eq!(replies[2]["id"], 2);
+        assert_eq!(replies[2]["error"]["code"], -32601);
+    }
+
+    /// A stdio MCP server mock for the lifecycle tests, in the shape of the
+    /// `mcp.rs` test helper (bash reading one JSON-RPC line at a time — the
+    /// `tests/bin/mock_mcp_server` binary is only exposed to `tests/`). It
+    /// answers `initialize` and serves two tools on `tools/list`; anything
+    /// else is ignored and EOF on stdin ends it.
+    const LIFECYCLE_MOCK_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=""
+  if [[ $line =~ \"id\":([0-9]+) ]]; then id="${BASH_REMATCH[1]}"; fi
+  case "$line" in
+    *'"method":"initialize"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"lifecycle-mock\",\"version\":\"1\"}}}" ;;
+    *'"method":"tools/list"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"ping\",\"description\":\"Pong\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+  esac
+done
+"#;
+
+    fn lifecycle_mock_server(name: &str) -> McpServer {
+        McpServer {
+            name: name.into(),
+            command: "bash".into(),
+            args: vec!["-c".into(), LIFECYCLE_MOCK_SCRIPT.into()],
+            url: None,
+            env: None,
+            headers: None,
+            transport: None,
+        }
+    }
+
+    /// `register_all` must spawn the server, discover its tools, register
+    /// them under the `mcp__<server>__<tool>` namespace, keep the client
+    /// alive, and report `(server, tool_count)` — an empty result over an
+    /// untouched registry is exactly what the `Ok(vec![])` mutant returns.
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "#224: the stdio MCP mock is a bash script; unlock with a portable mock reachable from unit tests"
+    )]
+    async fn register_all_spawns_discovers_and_namespaces_tools() {
+        let manager = McpServerManager::new(vec![lifecycle_mock_server("lc")]);
+        let mut registry = ToolRegistry::local();
+
+        let results = manager
+            .register_all(&mut registry)
+            .await
+            .expect("register_all against the mock");
+
+        assert_eq!(results, vec![("lc".to_string(), 2)]);
+        let mut names = registry.names();
+        names.sort_unstable();
+        assert_eq!(names, ["mcp__lc__echo", "mcp__lc__ping"]);
+        assert_eq!(
+            manager.running_count().await,
+            1,
+            "the client must be kept alive to serve tool calls"
+        );
+    }
+
+    /// `shutdown` drops every running client; the mutant that empties its
+    /// body leaves the registered servers running.
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "#224: the stdio MCP mock is a bash script; unlock with a portable mock reachable from unit tests"
+    )]
+    async fn shutdown_drops_every_running_client() {
+        let manager = McpServerManager::new(vec![
+            lifecycle_mock_server("one"),
+            lifecycle_mock_server("two"),
+        ]);
+        let mut registry = ToolRegistry::local();
+        manager
+            .register_all(&mut registry)
+            .await
+            .expect("register_all");
+        assert_eq!(manager.running_count().await, 2);
+
+        manager.shutdown().await;
+
+        assert_eq!(
+            manager.running_count().await,
+            0,
+            "shutdown must drop every client"
+        );
+    }
+
+    /// Opt-in switch for `mcp_runner_stdio_child`: `run()` binds the
+    /// process's own stdin/stdout, so the child only does work when the
+    /// parent test re-executes this binary with the variable set.
+    const RUNNER_CHILD: &str = "RECURSIVE_MCP_RUNNER_STDIO_CHILD";
+
+    /// Child half of `run_serves_json_rpc_on_process_stdio`; a no-op under
+    /// the normal suite.
+    #[tokio::test]
+    async fn mcp_runner_stdio_child() {
+        if std::env::var_os(RUNNER_CHILD).is_none() {
+            return;
+        }
+        McpServerRunner::new(ToolRegistry::local())
+            .run()
+            .await
+            .expect("run must return Ok once stdin hits EOF");
+    }
+
+    /// `run()` is the production binding of the loop to process stdio. It is
+    /// unobservable in-process (stdin belongs to the harness), so — as in
+    /// `crates/recursive-cli/src/cli/output.rs` — re-run this test binary on
+    /// the `*_child` test with capture off, feed it one request on stdin and
+    /// read the reply back from its stdout. The `Ok(())` mutant answers
+    /// nothing.
+    #[test]
+    fn run_serves_json_rpc_on_process_stdio() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        // `module_path!()` keeps the crate root (`recursive::mcp_server::…`);
+        // libtest names tests from the crate root's children.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let child_name = format!("{module}::mcp_runner_stdio_child");
+        let exe = std::env::current_exe().expect("current test binary");
+
+        let mut child = Command::new(exe)
+            .args(["--exact", &child_name, "--nocapture"])
+            .env(RUNNER_CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test binary");
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{}}\n",
+                )
+                .expect("write request");
+        } // dropping the pipe is the EOF that ends `run()`
+        let out = child.wait_with_output().expect("child exit");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed"),
+            "child {child_name} did not run exactly one green test: status={:?}\n\
+             --stdout--\n{stdout}\n--stderr--\n{stderr}",
+            out.status
+        );
+
+        let reply = stdout
+            .lines()
+            .find(|l| l.starts_with('{'))
+            .unwrap_or_else(|| panic!("run() must write the reply to process stdout:\n{stdout}"));
+        let reply: Value = serde_json::from_str(reply).expect("reply must be JSON");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["result"]["protocolVersion"], "2024-11-05");
+    }
 }
