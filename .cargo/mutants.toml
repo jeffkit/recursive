@@ -833,4 +833,36 @@ exclude_re = [
     # in scope, covered by
     # unversioned_index_is_stamped_with_current_schema_on_rewrite.
     "src/workspace/registry\\.rs:146:5: replace default_schema_version -> u32 with 1",
+    # ── Issue #245 batch 26 (B2 seat, task list /tmp/b2-batch26.txt) ───────
+    # src/acp/session.rs — all 30 survivors handled: 28 pinned + the two
+    # true equivalents below exempted (negative control 30/30 = 28×rc=101 on
+    # the mapped test + 2× whole-module green; results in
+    # /tmp/b2-b26/negctl/{results.json,driver.log}). Bonus pins in the same
+    # module kill the `:610:34` `>`→`==`/`>`→`>=` survivors that run
+    # 41159489504 shard job 124413644561 lists beyond the task list
+    # (summarize_more_actions_tail_applies_strictly_past_three).
+    # acp::session::tests: kill_mcp_children_* / persistence_dir_accessor_* /
+    # remove_* / all_turns_* / contains_* / save_transcript_* /
+    # load_transcript_* / save_metadata_* / session_exists_on_disk_* /
+    # summarize_*.
+    #
+    # summarize_transcript :550:40 — `messages.len() - 1` is the first
+    # disjunct of
+    #   `i == messages.len() - 1 || messages[messages.len() - 1].role == User`
+    # and that condition is only evaluated in the `Role::User` match arm.
+    # There `i == len - 1` means *this* user message is the last one, so the
+    # second disjunct (`messages[len - 1].role == User`) is true whenever the
+    # first is: the whole condition reduces to the second disjunct alone.
+    # `-`→`+` (`i == len + 1`) and `-`→`/` (`i == len / 1`, i.e. `i == len`)
+    # both turn the first disjunct into a constant `false` (i < len inside
+    # the loop), which leaves exactly the reduced condition — identical
+    # behaviour under every input, hence no assertion can tell them apart
+    # (#223 true-equivalence doctrine). Negative control: each mutation
+    # applied by hand → whole acp::session::tests module green (not red),
+    # restored byte-exact (logs /tmp/b2-b26/negctl/m13.log, m14.log). The
+    # line:col anchor keeps the killable `==`→`!=` at :550:22 and the
+    # `-`→`+`/`/` at :551:48 (index out of bounds, killed by every
+    # summarize_* test) in scope.
+    "src/acp/session\\.rs:550:40: replace - with \\+ in summarize_transcript",
+    "src/acp/session\\.rs:550:40: replace - with / in summarize_transcript",
 ]

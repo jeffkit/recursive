@@ -1133,4 +1133,552 @@ mod tests {
             "the warning must name the persistence dir"
         );
     }
+
+    // ── #245 batch 26: session registry / persistence / summarizer pins ──
+
+    fn fixture_session(sid: &str) -> AcpSession {
+        use crate::llm::MockProvider;
+        let runtime = AgentRuntime::builder()
+            .llm(Arc::new(MockProvider::new(vec![])))
+            .build()
+            .expect("build runtime");
+        AcpSession {
+            runtime: Arc::new(Mutex::new(runtime)),
+            cwd: PathBuf::from("/tmp"),
+            turn: 0,
+            session_id: sid.to_string(),
+            transcript: vec![],
+            cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
+            system_prompt: None,
+            mcp_servers: None,
+            client_capabilities: None,
+            acp_state: Arc::new(Mutex::new(AcpClientFsState::new())),
+            mcp_child_pids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn persistence_dir_accessor_roundtrips() {
+        assert_eq!(AcpSessionManager::new().persistence_dir(), None);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pdir = tmp.path().to_path_buf();
+        let mgr = AcpSessionManager::new().with_persistence_dir(pdir.clone());
+        assert_eq!(
+            mgr.persistence_dir(),
+            Some(pdir.as_path()),
+            "the accessor must expose the configured persistence dir"
+        );
+    }
+
+    #[test]
+    fn remove_returns_session_and_deregisters_it() {
+        let mut mgr = AcpSessionManager::new();
+        mgr.insert_with_id("acp-sess-1".to_string(), fixture_session("acp-sess-1"));
+
+        let removed = mgr.remove("acp-sess-1");
+        assert!(
+            removed.is_some(),
+            "remove must hand back the session being released"
+        );
+        assert_eq!(removed.unwrap().session_id, "acp-sess-1");
+        assert!(mgr.get("acp-sess-1").is_none(), "removed session is gone");
+        assert!(!mgr.contains("acp-sess-1"));
+        assert!(
+            mgr.remove("acp-sess-1").is_none(),
+            "a second remove finds nothing"
+        );
+    }
+
+    #[test]
+    fn all_turns_reports_id_and_turn_pairs() {
+        let mut mgr = AcpSessionManager::new();
+        let mut a = fixture_session("acp-sess-1");
+        a.turn = 3;
+        let mut b = fixture_session("acp-sess-2");
+        b.turn = 7;
+        mgr.insert_with_id("acp-sess-1".to_string(), a);
+        mgr.insert_with_id("acp-sess-2".to_string(), b);
+
+        let mut turns = mgr.all_turns();
+        turns.sort();
+        assert_eq!(
+            turns,
+            vec![("acp-sess-1".to_string(), 3), ("acp-sess-2".to_string(), 7)],
+            "all_turns must snapshot every (id, turn) pair"
+        );
+    }
+
+    #[test]
+    fn contains_reflects_registration() {
+        let mut mgr = AcpSessionManager::new();
+        assert!(
+            !mgr.contains("acp-sess-1"),
+            "an unregistered id must not be contained"
+        );
+        mgr.insert_with_id("acp-sess-1".to_string(), fixture_session("acp-sess-1"));
+        assert!(
+            mgr.contains("acp-sess-1"),
+            "a registered id must be contained"
+        );
+    }
+
+    #[test]
+    fn save_transcript_reports_missing_session_and_roundtrips_content() {
+        let missing = AcpSessionManager::new().save_transcript("no-such-session");
+        assert!(
+            missing.is_err(),
+            "saving a transcript for an unknown session must be an error"
+        );
+        assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pdir = tmp.path().to_path_buf();
+        let mut mgr = AcpSessionManager::new().with_persistence_dir(pdir.clone());
+        let mut session = fixture_session("acp-sess-1");
+        session.transcript = vec![Message::user("hello"), Message::assistant("hi")];
+        mgr.insert_with_id("acp-sess-1".to_string(), session);
+
+        mgr.save_transcript("acp-sess-1")
+            .expect("save must succeed");
+        let content = std::fs::read_to_string(pdir.join("acp-sess-1").join("transcript.jsonl"))
+            .expect("transcript.jsonl must be written");
+        let loaded: Vec<SavedMessage> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is a SavedMessage"))
+            .collect();
+        assert_eq!(loaded.len(), 2, "one JSONL line per transcript message");
+        assert_eq!(loaded[0].message.content, "hello");
+        assert_eq!(loaded[1].message.content, "hi");
+        assert_eq!(loaded[0].id, sha256_first_12("hello"));
+        assert_eq!(loaded[1].id, sha256_first_12("hi"));
+    }
+
+    #[test]
+    fn load_transcript_requires_persistence_dir_and_roundtrips_content() {
+        let no_dir = AcpSessionManager::new().load_transcript_from_disk("acp-sess-1");
+        assert!(
+            no_dir.is_err(),
+            "loading without a persistence dir must be an error"
+        );
+        assert_eq!(no_dir.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("acp-sess-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let mut file = std::fs::File::create(session_dir.join("transcript.jsonl")).unwrap();
+        for msg in [Message::user("alpha"), Message::assistant("beta")] {
+            let line = serde_json::to_string(&SavedMessage::from_message(msg)).unwrap();
+            writeln!(file, "{line}").unwrap();
+        }
+        writeln!(file).unwrap();
+        drop(file);
+
+        let mgr = AcpSessionManager::new().with_persistence_dir(tmp.path().to_path_buf());
+        let loaded = mgr
+            .load_transcript_from_disk("acp-sess-1")
+            .expect("load must succeed");
+        assert_eq!(
+            loaded.len(),
+            2,
+            "blank lines are skipped, both messages load"
+        );
+        assert_eq!(loaded[0].message.content, "alpha");
+        assert_eq!(loaded[1].message.content, "beta");
+        assert_eq!(loaded[1].id, sha256_first_12("beta"));
+    }
+
+    #[test]
+    fn save_metadata_reports_missing_session_and_persists_turn() {
+        let missing = AcpSessionManager::new().save_metadata("no-such-session");
+        assert!(
+            missing.is_err(),
+            "saving metadata for an unknown session must be an error"
+        );
+        assert_eq!(missing.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = AcpSessionManager::new().with_persistence_dir(tmp.path().to_path_buf());
+        mgr.insert_with_id("acp-sess-1".to_string(), fixture_session("acp-sess-1"));
+        mgr.get_mut("acp-sess-1").unwrap().turn = 9;
+
+        mgr.save_metadata("acp-sess-1").expect("save must succeed");
+        let meta = mgr
+            .load_metadata_from_disk("acp-sess-1")
+            .expect("metadata must load back");
+        assert_eq!(
+            meta.turn, 9,
+            "save_metadata must persist the current turn, not the one written at insert"
+        );
+        assert_eq!(meta.session_id, "acp-sess-1");
+    }
+
+    #[test]
+    fn session_exists_on_disk_follows_metadata_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut mgr = AcpSessionManager::new().with_persistence_dir(tmp.path().to_path_buf());
+        assert!(
+            !mgr.session_exists_on_disk("acp-sess-1"),
+            "nothing persisted yet → must not exist on disk"
+        );
+
+        mgr.insert_with_id("acp-sess-1".to_string(), fixture_session("acp-sess-1"));
+        assert!(
+            mgr.session_exists_on_disk("acp-sess-1"),
+            "insert_with_id writes metadata.json → must exist on disk"
+        );
+        assert!(
+            !AcpSessionManager::new().session_exists_on_disk("acp-sess-1"),
+            "without a persistence dir nothing can exist on disk"
+        );
+    }
+
+    // ── kill_mcp_children: graceful-shutdown wait loop ─────────────
+    //
+    // Platform note (#224 convention): these rely on POSIX `kill -0` liveness
+    // probing and on `trap '' TERM` being inherited by the backgrounded child.
+    // Mechanism: `#[cfg(unix)]`. Unlock for a Windows leg: port the fixture
+    // to the `taskkill` arm (handle-based liveness, no signal dispositions).
+
+    #[cfg(unix)]
+    fn spawn_grandchild(script: &str) -> (std::process::Child, u32) {
+        use std::io::BufRead;
+        let mut sh = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let pid_line = std::io::BufReader::new(sh.stdout.take().expect("stdout"))
+            .lines()
+            .next()
+            .expect("grandchild pid line")
+            .expect("read pid line");
+        let pid: u32 = pid_line.trim().parse().expect("pid is numeric");
+        (sh, pid)
+    }
+
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn wait_until_gone(pid: u32, budget: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < budget {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        !pid_is_alive(pid)
+    }
+
+    #[cfg(unix)]
+    fn reap_fixture(mut sh: std::process::Child, pid: u32) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &sh.id().to_string()])
+            .status();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        let _ = sh.wait();
+    }
+
+    /// A child that ignores SIGTERM must be escalated to SIGKILL. If the wait
+    /// loop treated the first liveness probe as "gone", the grace period would
+    /// never elapse, SIGKILL would never be sent and the TERM-immune child
+    /// would outlive the session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_mcp_children_escalates_to_sigkill_when_term_is_ignored() {
+        let (sh, pid) = spawn_grandchild("trap '' TERM; sleep 60 & echo $!; wait");
+        assert!(pid_is_alive(pid), "fixture: grandchild must be alive first");
+
+        let mut session = fixture_session("acp-sess-kill");
+        session.mcp_child_pids = vec![pid];
+        session.kill_mcp_children().await;
+
+        let gone = wait_until_gone(pid, std::time::Duration::from_secs(5));
+        reap_fixture(sh, pid);
+        assert!(
+            session.mcp_child_pids.is_empty(),
+            "tracked pids must be drained"
+        );
+        assert!(
+            gone,
+            "a SIGTERM-immune MCP child must be escalated to SIGKILL and die"
+        );
+    }
+
+    /// A child that exits on SIGTERM must be reaped on the graceful path: no
+    /// SIGKILL escalation, no full grace-period burn. If the wait loop ignored
+    /// the liveness probe it would stall until the timeout and log the
+    /// escalation warning for a process that is already gone.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn kill_mcp_children_reaps_term_obedient_child_without_escalation() {
+        let (sh, pid) = spawn_grandchild("sleep 60 & echo $!; wait");
+        assert!(pid_is_alive(pid), "fixture: grandchild must be alive first");
+
+        let mut session = fixture_session("acp-sess-kill-2");
+        session.mcp_child_pids = vec![pid];
+        let start = std::time::Instant::now();
+        session.kill_mcp_children().await;
+        let elapsed = start.elapsed();
+
+        let gone = wait_until_gone(pid, std::time::Duration::from_secs(5));
+        reap_fixture(sh, pid);
+        assert!(gone, "a SIGTERM-obedient child must be dead");
+        assert!(
+            !logs_contain("SIGTERM timeout"),
+            "a child that exits on SIGTERM must not be escalated to SIGKILL"
+        );
+        assert!(
+            elapsed < crate::tools::run_background::DEFAULT_KILL_GRACE_PERIOD,
+            "graceful exit must not burn the full grace period (took {elapsed:?})"
+        );
+    }
+
+    // ── summarize_transcript: classification + truncation boundaries ──
+
+    #[test]
+    fn summarize_user_goal_appends_ellipsis_only_past_80_bytes() {
+        let long = "a".repeat(100);
+        let ctx = summarize_transcript(&[Message::user(long), Message::assistant("done")]);
+        let goal = "a".repeat(80);
+        assert!(
+            ctx.summary
+                .contains(&format!("user request: \"{goal}...\"")),
+            "a 100-byte user goal is cut to 80 chars plus an ellipsis: {}",
+            ctx.summary
+        );
+
+        let exact = "b".repeat(80);
+        let ctx = summarize_transcript(&[Message::user(exact.clone()), Message::assistant("done")]);
+        assert!(
+            ctx.summary.contains(&format!("user request: \"{exact}\""))
+                && !ctx.summary.contains("..."),
+            "an 80-byte user goal is the boundary: verbatim, no ellipsis: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_assistant_snippet_appends_ellipsis_only_past_80_bytes() {
+        let long = "c".repeat(100);
+        let ctx = summarize_transcript(&[Message::user("task"), Message::assistant(long)]);
+        let snippet = "c".repeat(80);
+        assert!(
+            ctx.summary
+                .contains(&format!("assistant responded: \"{snippet}...\"")),
+            "a 100-byte assistant reply is cut to 80 chars plus an ellipsis: {}",
+            ctx.summary
+        );
+
+        let exact = "d".repeat(80);
+        let ctx = summarize_transcript(&[Message::user("task"), Message::assistant(exact.clone())]);
+        assert!(
+            ctx.summary
+                .contains(&format!("assistant responded: \"{exact}\""))
+                && !ctx.summary.contains("..."),
+            "an 80-byte assistant reply is the boundary: verbatim, no ellipsis: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_tool_blocker_snippet_appends_ellipsis_only_past_60_bytes() {
+        let long = format!("error {}", "e".repeat(100));
+        let ctx = summarize_transcript(&[Message::tool_result("tc-1", long)]);
+        let snippet = format!("error {}", "e".repeat(54));
+        assert!(
+            ctx.summary
+                .contains(&format!("tool error: \"{snippet}...\"")),
+            "a 106-byte tool error is cut to 60 chars plus an ellipsis: {}",
+            ctx.summary
+        );
+
+        let exact = format!("error {}", "x".repeat(54));
+        let ctx = summarize_transcript(&[Message::tool_result("tc-2", exact.clone())]);
+        assert!(
+            ctx.summary.contains(&format!("tool error: \"{exact}\""))
+                && !ctx.summary.contains("..."),
+            "a 60-byte tool error is the boundary: verbatim, no ellipsis: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_tool_result_snippet_appends_ellipsis_only_past_60_bytes() {
+        let long = "r".repeat(100);
+        let ctx = summarize_transcript(&[Message::tool_result("tc-1", long)]);
+        let snippet = "r".repeat(60);
+        assert!(
+            ctx.summary
+                .contains(&format!("tool result: \"{snippet}...\"")),
+            "a 100-byte tool result is cut to 60 chars plus an ellipsis: {}",
+            ctx.summary
+        );
+
+        let exact = "s".repeat(60);
+        let ctx = summarize_transcript(&[Message::tool_result("tc-2", exact.clone())]);
+        assert!(
+            ctx.summary.contains(&format!("tool result: \"{exact}\""))
+                && !ctx.summary.contains("..."),
+            "a 60-byte tool result is the boundary: verbatim, no ellipsis: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_last_user_request_supersedes_earlier_ones() {
+        let ctx = summarize_transcript(&[
+            Message::user("early goal: write tests"),
+            Message::assistant("working on it"),
+            Message::user("latest: ship it"),
+        ]);
+        assert_eq!(ctx.message_count, 3);
+        assert!(
+            !ctx.summary.contains("user request:"),
+            "while the latest message is a user turn, earlier user turns stay in-flight \
+             rather than becoming accomplishments: {}",
+            ctx.summary
+        );
+        assert!(
+            ctx.summary
+                .contains("The user's current request is: \"latest: ship it\"."),
+            "the most recent user turn is the in-flight request: {}",
+            ctx.summary
+        );
+        assert!(
+            ctx.summary
+                .contains("assistant responded: \"working on it\""),
+            "assistant turns are still accomplishments: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_earlier_user_messages_become_accomplishments_when_conversation_moved_on() {
+        let ctx = summarize_transcript(&[
+            Message::user("early goal: fix the login bug"),
+            Message::assistant("fixed, tests green"),
+        ]);
+        assert!(
+            ctx.summary
+                .contains("user request: \"early goal: fix the login bug\""),
+            "once the conversation moved past it, a user turn is an accomplished request: {}",
+            ctx.summary
+        );
+        assert!(
+            ctx.summary.contains("No active user request."),
+            "no in-flight request when the last message is not a user turn: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_blocker_patterns_match_lowercase_error_and_failed() {
+        let ctx = summarize_transcript(&[
+            Message::tool_result("tc-1", "error: disk on fire"),
+            Message::tool_result("tc-2", "step 3 failed"),
+            Message::tool_result("tc-3", "Error: upstream 502"),
+        ]);
+        assert!(
+            ctx.summary.contains("tool error: \"error: disk on fire\""),
+            "lowercase `error` alone must classify as a blocker: {}",
+            ctx.summary
+        );
+        assert!(
+            ctx.summary.contains("tool error: \"step 3 failed\""),
+            "`failed` alone must classify as a blocker: {}",
+            ctx.summary
+        );
+        // The blocker sample lists at most two entries; the capitalised
+        // `Error` message is covered by the count below.
+        assert!(
+            !ctx.summary.contains("tool result:"),
+            "no blocker may be reclassified as a plain tool result: {}",
+            ctx.summary
+        );
+        assert!(
+            ctx.summary.contains("encountered 3 blocker(s)"),
+            "all three blockers (error / failed / Error) must be counted: {}",
+            ctx.summary
+        );
+    }
+
+    #[test]
+    fn summarize_skips_empty_tool_results() {
+        let ctx = summarize_transcript(&[
+            Message::tool_result("tc-1", ""),
+            Message::tool_result("tc-2", "fine output"),
+        ]);
+        assert!(
+            ctx.summary.contains("tool result: \"fine output\""),
+            "a non-empty tool result is an accomplishment: {}",
+            ctx.summary
+        );
+        assert!(
+            !ctx.summary.contains("tool result: \"\""),
+            "an empty tool result must not be summarized: {}",
+            ctx.summary
+        );
+        assert_eq!(ctx.message_count, 2);
+    }
+
+    /// The "And N more action(s)" tail appears strictly past three
+    /// accomplishments — and never with a zero count. (Bonus pins beyond the
+    /// task list: the `:610:34` `>`→`==` / `>`→`>=` survivors of mutation run
+    /// 41159489504 shard job 124413644561.)
+    #[test]
+    fn summarize_more_actions_tail_applies_strictly_past_three() {
+        let many = vec![
+            Message::user("goal one"),
+            Message::assistant("did one"),
+            Message::user("goal two"),
+            Message::assistant("did two"),
+            Message::user("goal three"),
+            Message::assistant("did three"),
+            Message::user("goal four"),
+            Message::assistant("did four"),
+        ];
+        let ctx = summarize_transcript(&many);
+        assert!(
+            ctx.summary
+                .contains("The session has 8 recorded action(s):"),
+            "all eight accomplishments are counted: {}",
+            ctx.summary
+        );
+        assert!(
+            ctx.summary.contains("And 5 more action(s)."),
+            "eight accomplishments sample three and report 8-3=5 more: {}",
+            ctx.summary
+        );
+
+        let exactly_three = vec![
+            Message::user("goal one"),
+            Message::assistant("did one"),
+            Message::tool_result("tc-1", "plain ok output"),
+        ];
+        let ctx = summarize_transcript(&exactly_three);
+        assert!(
+            ctx.summary
+                .contains("The session has 3 recorded action(s):"),
+            "three accomplishments are counted: {}",
+            ctx.summary
+        );
+        assert!(
+            !ctx.summary.contains("more action(s)"),
+            "at exactly three accomplishments there is no overflow tail: {}",
+            ctx.summary
+        );
+    }
 }
