@@ -375,3 +375,91 @@ pub fn runtime_outcome_fixture(final_text: Option<String>) -> crate::runtime::Ru
         checkpoint_id: None,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tracing capture (issue #245 batch 25)
+// ---------------------------------------------------------------------------
+
+/// A [`tracing::Subscriber`] that appends one line per event to a shared
+/// buffer: `[LEVEL] message field=value …`. Tests use it with
+/// `tracing::subscriber::set_default` to assert both the presence and the
+/// *absence* of a log line without touching process-global subscriber
+/// state — unlike `#[traced_test]`, whose buffer is shared across the whole
+/// test binary, so a per-test subscriber keeps "must not log" assertions
+/// hermetic under `cargo test` parallelism.
+///
+/// Spans are ignored (only events are recorded); every level is enabled.
+pub struct RecordingSubscriber {
+    lines: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingSubscriber {
+    /// Create the subscriber and the buffer it writes into.
+    pub fn new() -> (Self, std::sync::Arc<Mutex<Vec<String>>>) {
+        let lines = std::sync::Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                lines: lines.clone(),
+            },
+            lines,
+        )
+    }
+}
+
+struct LineVisitor {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for LineVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={:?}", field.name(), value));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+    }
+}
+
+impl tracing::Subscriber for RecordingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = LineVisitor {
+            message: String::new(),
+            fields: Vec::new(),
+        };
+        event.record(&mut visitor);
+        let mut line = format!("[{}] {}", event.metadata().level(), visitor.message);
+        for field in visitor.fields {
+            line.push(' ');
+            line.push_str(&field);
+        }
+        self.lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line);
+    }
+
+    fn enter(&self, _span: &tracing::Id) {}
+
+    fn exit(&self, _span: &tracing::Id) {}
+}

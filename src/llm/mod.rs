@@ -857,4 +857,219 @@ mod tests {
         });
         assert_eq!(names, present);
     }
+
+    /// Provider that records the merged tool list the default
+    /// `complete_with_search` / `stream_with_search` forward to `complete`,
+    /// so the delegation contract is observable — not just the returned
+    /// completion — and can optionally carry reasoning content for the
+    /// default `stream` chunking tests.
+    struct RecordingChatProvider {
+        content: String,
+        reasoning: Option<String>,
+        seen_tools: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatProvider for RecordingChatProvider {
+        async fn complete(&self, _messages: &[Message], tools: &[ToolSpec]) -> Result<Completion> {
+            self.seen_tools
+                .lock()
+                .unwrap()
+                .extend(tools.iter().map(|t| t.name.clone()));
+            Ok(Completion {
+                content: self.content.clone(),
+                tool_calls: vec![],
+                reasoning_content: self.reasoning.clone(),
+                usage: Some(TokenUsage::default()),
+                finish_reason: None,
+            })
+        }
+    }
+
+    fn spec_named(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// The default `complete_with_search` must concatenate eager + deferred
+    /// (dropping the partition hints) and delegate to `complete` — the
+    /// provider sees every tool and answers with its real completion, not a
+    /// synthetic default.
+    #[tokio::test]
+    async fn default_complete_with_search_merges_eager_and_deferred() {
+        // kills `replace ChatProvider::complete_with_search -> Result<Completion> with Ok(Default::default())`
+        let eager = spec_named("eager_one");
+        let deferred = spec_named("deferred_one");
+        let provider = RecordingChatProvider {
+            content: "merged answer".into(),
+            reasoning: None,
+            seen_tools: std::sync::Mutex::new(Vec::new()),
+        };
+        let completion = provider
+            .complete_with_search(&[], &[(eager, None)], &[(deferred, None)])
+            .await
+            .expect("delegation to complete must succeed");
+        assert_eq!(
+            completion.content, "merged answer",
+            "default must delegate to complete(), not fabricate a default completion"
+        );
+        assert_eq!(
+            *provider.seen_tools.lock().unwrap(),
+            ["eager_one", "deferred_one"],
+            "eager tools come first, deferred second, hints dropped"
+        );
+    }
+
+    /// The default `stream_with_search` merges both lists and delegates to
+    /// `stream` (which streams via `complete`): the provider sees the merged
+    /// tools, the channel receives the content, and the returned completion
+    /// is the provider's own.
+    #[tokio::test]
+    async fn default_stream_with_search_merges_and_delegates_to_stream() {
+        // kills `replace ChatProvider::stream_with_search -> Result<Completion> with Ok(Default::default())`
+        use tokio::sync::mpsc;
+        let provider = RecordingChatProvider {
+            content: "streamed answer".into(),
+            reasoning: None,
+            seen_tools: std::sync::Mutex::new(Vec::new()),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let completion = provider
+            .stream_with_search(
+                &[],
+                &[(spec_named("eager_one"), None)],
+                &[(spec_named("deferred_one"), None)],
+                Some(tx),
+                None,
+            )
+            .await
+            .expect("delegation to stream must succeed");
+        assert_eq!(
+            completion.content, "streamed answer",
+            "default must delegate, not fabricate a default completion"
+        );
+        assert_eq!(
+            *provider.seen_tools.lock().unwrap(),
+            ["eager_one", "deferred_one"],
+            "merged eager+deferred tool list reaches complete()"
+        );
+        let chunk = rx.try_recv().expect("delegated stream must emit content");
+        match chunk {
+            StreamChunk::Text(t) => assert_eq!(t, "streamed answer"),
+            other => panic!("expected Text chunk, got {other:?}"),
+        }
+    }
+
+    /// The default `stream` forwards non-empty reasoning as a Reasoning chunk
+    /// ahead of the Text chunk.
+    #[tokio::test]
+    async fn default_stream_emits_reasoning_chunk_for_non_empty_reasoning() {
+        // kills `delete ! in ChatProvider::stream` (reasoning-emptiness guard)
+        use tokio::sync::mpsc;
+        let provider = RecordingChatProvider {
+            content: "answer".into(),
+            reasoning: Some("deep thought".into()),
+            seen_tools: std::sync::Mutex::new(Vec::new()),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let completion = provider.stream(&[], &[], Some(tx), None).await.unwrap();
+        assert_eq!(completion.content, "answer");
+        match rx.try_recv().expect("non-empty reasoning must be streamed") {
+            StreamChunk::Reasoning(r) => assert_eq!(r, "deep thought"),
+            other => panic!("first chunk must be Reasoning, got {other:?}"),
+        }
+        match rx.try_recv().expect("content must follow the reasoning") {
+            StreamChunk::Text(t) => assert_eq!(t, "answer"),
+            other => panic!("second chunk must be Text, got {other:?}"),
+        }
+    }
+
+    /// Empty reasoning must NOT emit a Reasoning chunk — the mirror image of
+    /// the non-empty case, so neither inversion of the guard passes.
+    #[tokio::test]
+    async fn default_stream_emits_no_reasoning_chunk_for_empty_reasoning() {
+        use tokio::sync::mpsc;
+        let provider = RecordingChatProvider {
+            content: "answer".into(),
+            reasoning: Some(String::new()),
+            seen_tools: std::sync::Mutex::new(Vec::new()),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let completion = provider.stream(&[], &[], Some(tx), None).await.unwrap();
+        assert_eq!(completion.content, "answer");
+        match rx.try_recv().expect("content chunk must still be sent") {
+            StreamChunk::Text(t) => assert_eq!(t, "answer"),
+            other => panic!("first chunk must be Text, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "empty reasoning must not emit a Reasoning chunk"
+        );
+    }
+
+    /// The terminal give-up WARN (issue #112) must actually be emitted, and
+    /// must carry the HTTP status plus the provider request id so a 429
+    /// storm can be correlated — a no-op body is an observability defect.
+    #[test]
+    fn warn_provider_giving_up_logs_status_and_request_id() {
+        // kills `replace warn_provider_giving_up with ()`
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        warn_provider_giving_up("deepseek-chat", Some(429), Some("req-42"));
+        warn_provider_giving_up("minimax", None, None);
+
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("provider call failed; giving up (deepseek-chat)")),
+            "give-up WARN must be emitted with the label, got {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("status=429") && l.contains("request_id=req-42")),
+            "give-up WARN must carry status and request_id, got {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("status=0") && l.contains("request_id=")),
+            "absent status/request_id fall back to 0/empty, got {lines:?}"
+        );
+    }
+
+    /// The network-exhaustion WARN (issue #203) must be emitted with the
+    /// elapsed wall clock, the proxy-env presence summary and the raw
+    /// detail, so a failure can be attributed without another repro.
+    #[test]
+    fn warn_network_giving_up_logs_elapsed_proxy_and_detail() {
+        // kills `replace warn_network_giving_up with ()`
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        warn_network_giving_up(
+            "openai/chat",
+            "connection reset by peer",
+            std::time::Duration::from_millis(1234),
+        );
+
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("network retries exhausted; giving up (openai/chat)")),
+            "network give-up WARN must be emitted with the label, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("elapsed_ms=1234")
+                && l.contains("detail=connection reset by peer")
+                && l.contains("proxy_env=")),
+            "WARN must carry elapsed_ms, detail and proxy_env presence, got {lines:?}"
+        );
+    }
 }

@@ -767,4 +767,35 @@ exclude_re = [
     # (len == max must stay verbatim), all killed by
     # cap_string_respects_exact_length_and_char_boundaries.
     "src/tools/transport_layer/e2b_provider\\.rs:689:19: replace > with >= in cap_string",
+    # ── Issue #245 batch 25 (B1 seat, task list /tmp/b1-batch25.txt) ───────
+    # src/llm/mod.rs — 4 of the batch's 9 llm/mod.rs survivors are
+    # structurally unkillable; the other 5 (complete_with_search,
+    # stream reasoning guard, stream_with_search, warn_provider_giving_up,
+    # warn_network_giving_up) are pinned by the default_*_search /
+    # default_stream_emits_* / warn_*_logs_* tests in llm::tests.
+    #
+    # take_retry_records :222:9 `Vec::new()` → `vec![]` is a textual, not a
+    # behavioural, mutation: std defines `vec![]` as
+    # `macro_rules! vec { () => ($crate::vec::Vec::new()) }`, so the mutant
+    # expands to the exact pristine expression (same empty Vec, capacity 0,
+    # no allocation) — identical under every input, hence no assertion can
+    # tell them apart (the #223 batch-3 true-equivalence doctrine; same
+    # genre as the skills.rs:678:9 `vec![]` entry above). Negative control:
+    # mutation applied → llm::tests green (not red), restored byte-exact.
+    "src/llm/mod\\.rs:222:9: replace ChatProvider::take_retry_records -> Vec<RetryRecord> with vec!\\[\\]",
+    # lookup_proxy_env_name :327:5 (None / Some("xyzzy") / Some("")) is the
+    # `#[cfg(windows)]` twin of the `#[cfg(not(windows))]` lookup at :321.
+    # Neither the ubuntu mutation gate nor the macOS seats ever compile that
+    # body, so each of the three mutants builds byte-identical to the
+    # baseline and reports MISSED whatever any test asserts (the #228
+    # cfg-blind shape; same class as credentials/store.rs:280:5 and
+    # skills.rs:810:5 above — the --list names are identical to the unix
+    # twin's except for the line, hence the line:col anchor). The unix twin
+    # at :322 is killed by proxy_env_summary_reports_presence_without_values
+    # (all three return shapes flip its `direct` / `HTTPS_PROXY` asserts),
+    # and the case-collapsing logic the windows arm feeds is pinned
+    # platform-independently through resolve_proxy_names by
+    # proxy_env_names_collapse_case_variants_when_lookup_is_case_insensitive.
+    # Drop this entry if a Windows mutation leg is ever added.
+    "src/llm/mod\\.rs:327:5: replace lookup_proxy_env_name -> Option<String> with (None|Some\\(\"xyzzy\"\\.into\\(\\)\\)|Some\\(String::new\\(\\)\\))",
 ]

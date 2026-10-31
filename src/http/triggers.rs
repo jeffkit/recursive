@@ -1057,4 +1057,331 @@ mod tests {
             assert!(schemas.contains_key(name), "missing schema {name}");
         }
     }
+
+    // ── Issue #245 batch 25: handler-level pins ───────────────────────────
+
+    use crate::llm::{Completion, MockProvider, TokenUsage};
+    use crate::runtime::AgentRuntimeBuilder;
+
+    /// Minimal AppState over a temp workspace, modelled on the cold_load
+    /// tests' `test_state` — enough for the trigger handlers and a full
+    /// one-shot agent run against a scripted `MockProvider`.
+    fn trigger_state(workspace: std::path::PathBuf, provider: Arc<MockProvider>) -> Arc<AppState> {
+        let storage_dir = workspace.join(".storage");
+        let config = crate::config::Config {
+            workspace,
+            api_base: "https://example.invalid/v1".into(),
+            api_key: Some("test-key".into()),
+            model: "mock".into(),
+            provider_type: "openai".into(),
+            preset: None,
+            max_steps: 32,
+            max_tokens: 65536,
+            temperature: 0.0,
+            system_prompt: "test prompt".into(),
+            retry_max: 0,
+            retry_initial_backoff_secs: 1,
+            retry_max_backoff_secs: 1,
+            retry_network_budget_secs: 600,
+            shell_timeout_secs: 5,
+            headless: false,
+            memory_summary_limit: 5,
+            thinking_budget: None,
+            reasoning_effort: None,
+            session_name: None,
+            max_budget_usd: None,
+            extra_dirs: Vec::new(),
+            extra_readonly_dirs: Vec::new(),
+            allow_tools: Vec::new(),
+            context_window_override: None,
+            subagent_max_depth: 2,
+            subagent_enabled: false,
+            allow_bypass_permissions: false,
+            max_search_rounds: 3,
+            stuck_window: 10,
+            stuck_error_rate: 0.8,
+            max_concurrent_runs: 8,
+            session_run_code: None,
+            goal_eval_transcript_tail: 12,
+            sse_replay_capacity: 512,
+            workspace_file_max_bytes: 256 * 1024,
+            uplink_max_bytes: 1024 * 1024,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_search_jina_key: None,
+            wall_timeout_secs: 0,
+        };
+        Arc::new(AppState {
+            tools: vec![],
+            tool_registry: crate::tools::ToolRegistry::default(),
+            config,
+            provider,
+            host: Arc::new(crate::session_host::SessionHost::new(
+                std::time::Duration::from_secs(3600),
+                crate::http::AdmissionGate::new(
+                    8,
+                    std::time::Duration::ZERO,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ),
+            )),
+            event_channels: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(Vec::new()),
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            partitioning: Default::default(),
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(storage_dir)),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_mirror_root: None,
+        })
+    }
+
+    fn plain_completion(content: &str) -> Completion {
+        Completion {
+            content: content.to_string(),
+            tool_calls: vec![],
+            reasoning_content: None,
+            usage: Some(TokenUsage::default()),
+            finish_reason: None,
+        }
+    }
+
+    /// Serialise against every other env-mutating test and pin
+    /// `RECURSIVE_HOME` to a private tempdir: both the trigger store and the
+    /// notify sandbox root derive from `user_workspace_dir`, which is
+    /// home-relative, so a concurrent test re-pinning the home would move
+    /// the store (500 on upsert) or the sandbox root mid-handler. Field
+    /// order matters: the pin restores the env while the lock is still held.
+    fn pinned_home() -> (
+        crate::test_util::PinnedRecursiveHomeNoLock,
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lock = crate::test_util::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let pin = crate::test_util::PinnedRecursiveHomeNoLock::new(home.path(), &lock);
+        (pin, home, lock)
+    }
+
+    /// POST /triggers id handling: a blank (or whitespace-only) id falls
+    /// through to auto-generation, a supplied id must be [A-Za-z0-9_-]
+    /// (400 otherwise), and a valid supplied id is preserved verbatim —
+    /// underscore included.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn create_trigger_blank_id_autogenerates_and_charset_is_enforced() {
+        let _env = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let state = trigger_state(ws.path().to_path_buf(), Arc::new(MockProvider::new(vec![])));
+
+        for blank in ["", "   "] {
+            let body: CreateTriggerRequest = serde_json::from_str(&format!(
+                r#"{{"kind":"webhook","goal":"g","id":"{blank}"}}"#
+            ))
+            .unwrap();
+            let (status, resp) = create_trigger(
+                State(state.clone()),
+                Extension(AuthIdentity::local()),
+                Json(body),
+            )
+            .await
+            .expect("blank id must fall through to auto-generation");
+            assert_eq!(status, StatusCode::CREATED);
+            assert!(
+                resp.id.starts_with("trig-") && resp.id.len() > "trig-".len(),
+                "blank id {blank:?} must auto-generate a trig- id, got {:?}",
+                resp.id
+            );
+        }
+
+        let body: CreateTriggerRequest =
+            serde_json::from_str(r#"{"kind":"webhook","goal":"g","id":"bad id!"}"#).unwrap();
+        let err = create_trigger(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("trigger id must be"));
+
+        let body: CreateTriggerRequest =
+            serde_json::from_str(r#"{"kind":"webhook","goal":"g","id":"ok_id-1"}"#).unwrap();
+        let (status, resp) = create_trigger(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Json(body),
+        )
+        .await
+        .expect("id inside the charset must be accepted");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.id, "ok_id-1");
+    }
+
+    /// A file notify target outside the bound sandbox root must be rejected
+    /// at registration time (400), while a target inside the root passes —
+    /// "surface a bad notify target at registration, not at 9am".
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn create_trigger_rejects_file_notify_target_outside_sandbox() {
+        let _env = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let state = trigger_state(ws.path().to_path_buf(), Arc::new(MockProvider::new(vec![])));
+
+        // Bind the sandbox root exactly as validate_notify_path will, and
+        // aim the in-sandbox case at the derived root (which is
+        // home-derived, not the raw workspace path).
+        crate::notify::set_file_context(&state.config.workspace);
+        let root = crate::notify::file_context_root().expect("root bound");
+
+        let body: CreateTriggerRequest = serde_json::from_str(&format!(
+            r#"{{"kind":"webhook","goal":"g","notify":{{"kind":"file","path":"{}"}}}}"#,
+            root.join("notify.jsonl").display()
+        ))
+        .unwrap();
+        let (status, _) = create_trigger(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Json(body),
+        )
+        .await
+        .expect("in-sandbox notify path must be accepted");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let body: CreateTriggerRequest = serde_json::from_str(
+            r#"{"kind":"webhook","goal":"g","notify":{"kind":"file","path":"/etc/passwd"}}"#,
+        )
+        .unwrap();
+        let err = create_trigger(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Json(body),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::BAD_REQUEST,
+            "out-of-sandbox notify file target must be rejected at registration"
+        );
+    }
+
+    /// Firing a webhook with a non-empty body must forward that body to the
+    /// agent as payload context after the goal — the entire point of the
+    /// `?key=` POST body. Kills both halves of the forwarding gate: the
+    /// `Some(body)`-only-when-non-empty gate in `fire_webhook` and the
+    /// non-empty-append guard in `fire_trigger`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn fire_webhook_forwards_body_as_goal_payload_context() {
+        let _env = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(
+            MockProvider::new(vec![plain_completion("done")]).with_on_complete(arrived.clone()),
+        );
+        let state = trigger_state(ws.path().to_path_buf(), provider.clone());
+
+        let mut trigger = Trigger::new(
+            "trig-payload",
+            TriggerSpec::Webhook {
+                secret: "s3cr3t".into(),
+            },
+            "do the thing",
+            None,
+            None,
+        );
+        trigger.enabled = true;
+        store(&state).upsert(trigger).unwrap();
+
+        let resp = fire_webhook(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Path("trig-payload".to_string()),
+            Query(WebhookKeyQuery {
+                key: Some("s3cr3t".into()),
+            }),
+            axum::body::Bytes::from_static(b"hello payload"),
+        )
+        .await
+        .expect("fire accepted");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Deterministic wait (no wall-clock sleep): the provider notifier
+        // fires exactly when the spawned fire reaches the LLM call.
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+            .await
+            .expect("trigger fire must reach the provider");
+
+        let calls = provider.calls();
+        let last = calls.last().expect("at least one provider call");
+        let prompt = last
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prompt.contains("do the thing\n\nWebhook payload:\nhello payload"),
+            "webhook body must be forwarded as payload context after the goal, got: {prompt:?}"
+        );
+    }
+
+    /// `run_in_session` returns the session's own identity plus the real
+    /// turn outcome, and actually enqueues the goal into that session's
+    /// runtime — not a fabricated ("xyzzy" / empty) triple.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn run_in_session_returns_real_session_id_and_turn_outcome() {
+        let _env = pinned_home();
+        let ws = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![plain_completion("turn answer")]));
+        let state = trigger_state(ws.path().to_path_buf(), provider.clone());
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(crate::tools::ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let session = Arc::new(SessionState {
+            id: "sess-trig-run".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
+            owner: None,
+            tenant: None,
+            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            usage: Arc::new(crate::http::SessionUsage::new("test-model")),
+            event_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            event_log: Arc::new(crate::http::SessionEventLog::new(
+                crate::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
+        });
+        let before = session.runtime.lock().await.transcript().len();
+
+        let (session_id, final_text, finish_reason) =
+            run_in_session(&state, &session, "trigger goal").await;
+
+        assert_eq!(
+            session_id, "sess-trig-run",
+            "must return the session's own id"
+        );
+        assert_eq!(
+            final_text.as_deref(),
+            Some("turn answer"),
+            "must return the turn's final text"
+        );
+        assert_eq!(
+            finish_reason, "no_more_tool_calls",
+            "must return the turn's finish reason"
+        );
+        let after = session.runtime.lock().await.transcript().len();
+        assert!(
+            after > before,
+            "the goal must actually be enqueued into the session runtime"
+        );
+    }
 }

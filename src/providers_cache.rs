@@ -102,8 +102,15 @@ pub fn needs_update() -> bool {
         Ok(t) => t,
         Err(_) => return true,
     };
-    SystemTime::now()
-        .duration_since(modified)
+    cache_is_stale(modified, SystemTime::now())
+}
+
+/// Staleness of a cache written at `modified`, judged at `now`: stale once
+/// its age *exceeds* [`CACHE_TTL`] (exactly TTL old is still fresh). A
+/// `modified` in the future (clock skew) also counts as stale, so a bogus
+/// timestamp triggers a refresh instead of pinning the cache forever.
+fn cache_is_stale(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
         .map(|age| age > CACHE_TTL)
         .unwrap_or(true)
 }
@@ -206,7 +213,15 @@ pub async fn fetch_and_save(url: &str) -> Result<ProvidersCache> {
         .await
         .map_err(Error::Http)?;
 
-    let cache: ProvidersCache = serde_json::from_str(&body).map_err(|e| Error::Config {
+    parse_and_save(&body)
+}
+
+/// Parse a downloaded catalog body, reject unknown schema versions, and
+/// persist it to [`cache_path`] — the post-download half of
+/// [`fetch_and_save`], network-free so the schema gate is unit-testable
+/// (the SSRF guard rules out a loopback mock server).
+fn parse_and_save(body: &str) -> Result<ProvidersCache> {
+    let cache: ProvidersCache = serde_json::from_str(body).map_err(|e| Error::Config {
         message: format!("providers JSON parse error: {e}"),
     })?;
 
@@ -568,5 +583,236 @@ mod tests {
             "freshly written cache must not need update"
         );
         Ok(())
+    }
+
+    // ── Issue #245 batch 25 ──────────────────────────────────────────────
+
+    /// Exactly TTL old is still fresh: the boundary instant itself must not
+    /// demand a refresh (`>`), only ages strictly beyond it.
+    #[test]
+    fn cache_is_stale_exactly_ttl_old_is_still_fresh() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        assert!(
+            !cache_is_stale(t0, t0 + CACHE_TTL),
+            "age == CACHE_TTL must still count as fresh"
+        );
+        assert!(!cache_is_stale(
+            t0,
+            t0 + CACHE_TTL - Duration::from_nanos(1)
+        ));
+    }
+
+    /// Any age strictly beyond the TTL is stale — one tick past as much as
+    /// twice the TTL.
+    #[test]
+    fn cache_is_stale_beyond_ttl_is_stale() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        assert!(cache_is_stale(t0, t0 + CACHE_TTL + Duration::from_nanos(1)));
+        assert!(cache_is_stale(t0, t0 + 2 * CACHE_TTL));
+    }
+
+    /// Zero age is fresh; a modification time in the future (clock skew)
+    /// counts as stale so a bogus timestamp refreshes rather than pins.
+    #[test]
+    fn cache_is_stale_zero_age_fresh_and_future_mtime_stale() {
+        let t0 = SystemTime::UNIX_EPOCH + CACHE_TTL;
+        assert!(!cache_is_stale(t0, t0));
+        assert!(
+            cache_is_stale(t0 + Duration::from_secs(1), t0),
+            "an mtime ahead of the clock must be treated as stale"
+        );
+    }
+
+    /// End to end through the filesystem: a cache file whose mtime is older
+    /// than the TTL reports stale.
+    #[test]
+    fn needs_update_true_when_cache_older_than_ttl() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let _pin = PinnedRecursiveHome::new(tmp.path());
+        let path = cache_path();
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, "{}")?;
+        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.set_modified(SystemTime::now() - 2 * CACHE_TTL)?;
+        drop(file);
+        assert!(
+            needs_update(),
+            "a cache whose mtime is twice the TTL old must need update"
+        );
+        Ok(())
+    }
+
+    fn catalog_body(schema_version: u32) -> String {
+        serde_json::json!({
+            "schema_version": schema_version,
+            "updated_at": "2026-06-06T00:00:00Z",
+            "source_url": "https://example.com/providers.json",
+            "providers": [],
+        })
+        .to_string()
+    }
+
+    /// A schema-1 body is accepted and persisted where `load_cache` finds it.
+    #[test]
+    fn parse_and_save_accepts_schema_v1_and_persists() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let _pin = PinnedRecursiveHome::new(tmp.path());
+        let cache = parse_and_save(&catalog_body(1))?;
+        assert_eq!(cache.schema_version, 1);
+        assert!(
+            cache_path().exists(),
+            "an accepted catalog must be written to the cache path"
+        );
+        let loaded = load_cache().expect("persisted cache must reload");
+        assert_eq!(loaded.source_url, "https://example.com/providers.json");
+        Ok(())
+    }
+
+    /// Any schema version other than 1 is rejected — and nothing is written,
+    /// so a stale-but-valid cache is never clobbered by an unreadable one.
+    #[test]
+    fn parse_and_save_rejects_unknown_schema_and_writes_nothing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let _pin = PinnedRecursiveHome::new(tmp.path());
+        let err = parse_and_save(&catalog_body(2)).expect_err("schema 2 must be rejected");
+        assert!(
+            err.to_string()
+                .contains("unsupported providers cache schema version: 2"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !cache_path().exists(),
+            "a rejected catalog must not be persisted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_and_save_rejects_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = PinnedRecursiveHome::new(tmp.path());
+        let err = parse_and_save("not json at all").expect_err("malformed body must be rejected");
+        assert!(
+            err.to_string().contains("providers JSON parse error"),
+            "unexpected error: {err}"
+        );
+        assert!(!cache_path().exists());
+    }
+
+    /// Env knobs for the background-refresh tests, restored on drop. Must be
+    /// created while holding `env_lock()`.
+    struct RefreshEnv {
+        auto_refresh: Option<String>,
+        url: Option<String>,
+    }
+
+    impl RefreshEnv {
+        fn set(auto_refresh: Option<&str>, url: &str) -> Self {
+            let saved = Self {
+                auto_refresh: std::env::var("RECURSIVE_PROVIDERS_AUTO_REFRESH").ok(),
+                url: std::env::var(PROVIDERS_URL_ENV).ok(),
+            };
+            match auto_refresh {
+                Some(v) => std::env::set_var("RECURSIVE_PROVIDERS_AUTO_REFRESH", v),
+                None => std::env::remove_var("RECURSIVE_PROVIDERS_AUTO_REFRESH"),
+            }
+            std::env::set_var(PROVIDERS_URL_ENV, url);
+            saved
+        }
+    }
+
+    impl Drop for RefreshEnv {
+        fn drop(&mut self) {
+            match &self.auto_refresh {
+                Some(v) => std::env::set_var("RECURSIVE_PROVIDERS_AUTO_REFRESH", v),
+                None => std::env::remove_var("RECURSIVE_PROVIDERS_AUTO_REFRESH"),
+            }
+            match &self.url {
+                Some(v) => std::env::set_var(PROVIDERS_URL_ENV, v),
+                None => std::env::remove_var(PROVIDERS_URL_ENV),
+            }
+        }
+    }
+
+    /// A URL that fails `validate_providers_url` before any I/O, so the
+    /// refresh attempt is observable (as the documented non-fatal debug
+    /// line) without touching the network.
+    const UNFETCHABLE_URL: &str = "ftp://providers.example.invalid/catalog.json";
+
+    /// Run `spawn_background_refresh` on the current-thread test runtime and
+    /// return every tracing line it (and the task it spawned) emitted.
+    async fn refresh_log_lines() -> Vec<String> {
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            spawn_background_refresh();
+            // The spawned task fails at URL validation on its first poll;
+            // yielding hands the current-thread scheduler to it.
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let captured = lines.lock().unwrap().clone();
+        captured
+    }
+
+    /// Stale cache + `RECURSIVE_PROVIDERS_AUTO_REFRESH=1` must actually
+    /// attempt the refresh: with the URL failing validation, the attempt
+    /// surfaces as the non-fatal debug log. A no-op body emits nothing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn spawn_background_refresh_attempts_fetch_when_stale_and_enabled() {
+        let _lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_lock);
+        let _env = RefreshEnv::set(Some("1"), UNFETCHABLE_URL);
+        assert!(needs_update(), "precondition: no cache file → stale");
+
+        let lines = refresh_log_lines().await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("providers cache refresh failed (non-fatal)")),
+            "stale + enabled must attempt the fetch and log its failure, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("must start with http")),
+            "the attempt must fail fast at URL validation (no network), got {lines:?}"
+        );
+    }
+
+    /// Guards: a fresh cache, or the knob unset, must spawn nothing — no
+    /// network attempt, hence no failure log.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    async fn spawn_background_refresh_is_quiet_when_fresh_or_disabled() {
+        let _lock = crate::test_util::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let _pin = crate::test_util::PinnedRecursiveHomeNoLock::new(tmp.path(), &_lock);
+
+        // Knob unset, cache stale → quiet.
+        {
+            let _env = RefreshEnv::set(None, UNFETCHABLE_URL);
+            let lines = refresh_log_lines().await;
+            assert!(
+                !lines.iter().any(|l| l.contains("providers cache refresh")),
+                "unset knob must not spawn a refresh, got {lines:?}"
+            );
+        }
+
+        // Knob on, cache fresh → quiet.
+        {
+            let _env = RefreshEnv::set(Some("1"), UNFETCHABLE_URL);
+            let path = cache_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, catalog_body(1)).unwrap();
+            assert!(!needs_update(), "precondition: fresh cache");
+            let lines = refresh_log_lines().await;
+            assert!(
+                !lines.iter().any(|l| l.contains("providers cache refresh")),
+                "a fresh cache must not spawn a refresh, got {lines:?}"
+            );
+        }
     }
 }
