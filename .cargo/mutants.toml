@@ -8,6 +8,31 @@
 # Test helper binaries are not product code; surviving mutants there are not debt.
 exclude_globs = [
     "tests/bin/**/*.rs",
+    # ── Issue #245 batch 23 (B1 seat) — whole-file cfg-blind exclusion ─────
+    # container_transport.rs is `#[cfg(feature = "cloud-runtime")]` and that
+    # feature is NOT in agent-mutants.sh FEATURES (CI run 41023437517, job
+    # 123955901330, head b5209dcd: 182 MISSED / 0 caught / 0 unviable, while
+    # e2b_provider.rs in the same shard — whose feature IS in FEATURES —
+    # scored a normal 92 missed / 29 caught / 12 unviable). Under the gate
+    # the module is never compiled, so every one of its mutants builds
+    # byte-identical to the baseline and reports MISSED whatever any test
+    # asserts — the #228 batch-2 cfg-blindness class (and the recursive-cli
+    # otel file in exclude_re below), at file scale; docker_provider.rs 6/6
+    # and docker_sandbox.rs 11/11 in the same shard are the same artifact.
+    # The 30 batch-22 mutants are pinned where the file actually compiles
+    # (28 behaviour pins + the two :1004 disjoint-bit equivalences, whose
+    # per-line exclude_re entries are kept for the day this glob goes),
+    # each hand-verified under `--features …,cloud-runtime` (logs in
+    # /tmp/b1-b22/negctl/); the other ~152 are unexamined phantoms.
+    # A glob, not a path-anchored exclude_re like the otel entry: cargo-
+    # mutants 27.1.0 never applies exclude_re to the "delete field … from
+    # struct … expression" genre (31 of this file's 187 mutants survive
+    # even `-E 'delete field binds'`), while a glob drops the whole file —
+    # and wins over the explicit `--file` the agent-shards job passes.
+    # UNLOCK CONDITION: the day `cloud-runtime` joins agent-mutants.sh
+    # FEATURES (owner call — cost is bollard/aws-sdk-s3/redis per run), drop
+    # this entry and the file's own pins take over.
+    "src/tools/transport_layer/container_transport.rs",
 ]
 
 # Regexes match the mutant *name* string cargo-mutants prints.

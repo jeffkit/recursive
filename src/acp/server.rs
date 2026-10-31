@@ -4652,4 +4652,890 @@ mod tests {
             .expect("second session stored");
         assert!(session.mcp_child_pids.is_empty());
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // issue #245 batch 23: pins for the 30 MISSED mutants of this file
+    // (CI run 41023437517, shard job 123955901286, head b5209dcd). Each
+    // test names the mutants it kills; the two true equivalences
+    // (TurnControl/TurnRegistry::cancel_session -> false) are excluded in
+    // .cargo/mutants.toml with the argument, not here.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// The error-code constants are the client-visible contract, so the
+    /// pins assert their literal wire values (asserting against the
+    /// constants themselves is a tautology and is exactly why the
+    /// `delete -` mutants survived). Kills `:101:29 delete -`
+    /// (INVALID_PARAMS) and, as a bonus, `:98:26 delete -` (PARSE_ERROR).
+    #[tokio::test]
+    async fn jsonrpc_error_code_constants_hold_their_documented_values() {
+        // PARSE_ERROR = -32700 on a malformed line.
+        let lines = run_server("not json").await;
+        assert_eq!(
+            parse_line(&lines, 0)["error"]["code"],
+            -32700,
+            "PARSE_ERROR"
+        );
+
+        // INVALID_PARAMS = -32602 on a non-numeric protocolVersion.
+        let lines = run_server(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1"}}"#,
+        )
+        .await;
+        assert_eq!(
+            parse_line(&lines, 0)["error"]["code"],
+            -32602,
+            "INVALID_PARAMS"
+        );
+    }
+
+    /// Every session method rejected before `initialize` must answer
+    /// -32002 (literal). Kills `:102:37 delete -` (SERVER_NOT_INITIALIZED);
+    /// the session/cancel entry also covers its pre-init special case.
+    #[tokio::test]
+    async fn uninitialized_session_methods_report_server_not_initialized() {
+        for method in [
+            "session/new",
+            "session/prompt",
+            "session/cancel",
+            "session/load",
+            "session/resume",
+            "session/close",
+        ] {
+            let input = format!(r#"{{"jsonrpc":"2.0","id":7,"method":"{method}","params":{{}}}}"#);
+            let lines = run_server(&input).await;
+            let v = parse_line(&lines, lines.len() - 1);
+            assert_eq!(v["id"], 7, "{method}");
+            assert_eq!(
+                v["error"]["code"], -32002,
+                "{method} must report SERVER_NOT_INITIALIZED before initialize: {v}"
+            );
+        }
+    }
+
+    /// The `ACP_CLIENT_RPC_TIMEOUT_MS` override is the only lever on the
+    /// agent→client fs/RPC timeout (documented default 30_000 ms). Kills
+    /// the `client_rpc_timeout_ms -> u64` body replacements `0` and `1`:
+    /// the "0" override proves zero is a *reachable, legal* value, so a
+    /// function pinned to 0 (or 1) cannot produce it. Env mutation is
+    /// process-global — the whole test runs under the crate env lock with
+    /// an RAII restore (#222).
+    #[test]
+    fn client_rpc_timeout_env_override_and_default() {
+        let _guard = crate::test_util::env_lock();
+        struct RestorePrev(Option<std::ffi::OsString>);
+        impl Drop for RestorePrev {
+            fn drop(&mut self) {
+                // SAFETY: process-global env mutation; the env lock is
+                // held for this struct's whole lifetime.
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("ACP_CLIENT_RPC_TIMEOUT_MS", v),
+                        None => std::env::remove_var("ACP_CLIENT_RPC_TIMEOUT_MS"),
+                    }
+                }
+            }
+        }
+        let prev = std::env::var_os("ACP_CLIENT_RPC_TIMEOUT_MS");
+        // SAFETY: env lock held above.
+        unsafe {
+            std::env::remove_var("ACP_CLIENT_RPC_TIMEOUT_MS");
+        }
+        let _restore = RestorePrev(prev);
+
+        assert_eq!(
+            client_rpc_timeout_ms(),
+            30_000,
+            "no override → the documented 30s default"
+        );
+
+        for (raw, want) in [("0", 0u64), ("1", 1), ("250", 250)] {
+            // SAFETY: env lock held.
+            unsafe {
+                std::env::set_var("ACP_CLIENT_RPC_TIMEOUT_MS", raw);
+            }
+            assert_eq!(
+                client_rpc_timeout_ms(),
+                want,
+                "override `{raw}` must parse (0 is a legal, if pathological, budget)"
+            );
+        }
+
+        for bad in ["", "abc", "-1", "1.5", " 500 "] {
+            // SAFETY: env lock held.
+            unsafe {
+                std::env::set_var("ACP_CLIENT_RPC_TIMEOUT_MS", bad);
+            }
+            assert_eq!(
+                client_rpc_timeout_ms(),
+                30_000,
+                "`{bad}` must fall back to the default"
+            );
+        }
+    }
+
+    /// The turn registry's active count is what keeps the S1-C9 idle
+    /// shutdown away from a running turn: a dispatched prompt must count
+    /// as in flight until its task reports finished, through the shared
+    /// `TurnControl` wrapper. Kills the six registry-bookkeeping mutants:
+    /// `:194:9 TurnControl::register -> ()`, `:214:9 TurnControl::is_idle
+    /// -> true`, `:259:9 TurnRegistry::register -> ()` and `:260:21
+    /// += → *=` (all report idle mid-turn), plus `:199:9
+    /// TurnControl::turn_finished -> ()` and `:265:9
+    /// TurnRegistry::turn_finished -> ()` (never idle again). The turn
+    /// task marks itself finished *before* sending its response frame,
+    /// and nothing yields between dispatch and the first check, so both
+    /// checkpoints are race-free under the current-thread test runtime.
+    #[tokio::test]
+    async fn turn_control_is_idle_tracks_an_inflight_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+        assert!(srv.control.is_idle(), "no turn started yet");
+
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 3, "method": "session/prompt",
+                "params": {"sessionId": "acp-sess-1",
+                           "prompt": [{"type": "text", "text": "hello"}]},
+            }))
+            .await;
+        assert!(
+            resp.is_none(),
+            "prompt turns are detached; response is a frame"
+        );
+        assert!(
+            !srv.control.is_idle(),
+            "a dispatched turn must clear is_idle"
+        );
+
+        let response = srv.wait_for_response(3).await;
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        assert!(
+            srv.control.is_idle(),
+            "a finished turn must restore is_idle"
+        );
+    }
+
+    /// S1-C9 + #179: 60s of stdin silence must NOT shut the server down
+    /// while a turn is in flight (the idle check is
+    /// `control.is_idle() && elapsed >= timeout`, and both operands are
+    /// load-bearing). Kills `:1911:42 && → ||` in run_stdio: the mutated
+    /// guard shuts the read loop down under the parked turn, so the
+    /// cancel written afterwards is never read, the turn never ends, and
+    /// the cancelled-response wait goes red. (The registry mutants that
+    /// fake idleness are killed more directly by
+    /// `turn_control_is_idle_tracks_an_inflight_turn`.)
+    ///
+    /// The settle sleeps are load-bearing: `tokio::time::timeout` polls the
+    /// inner read *before* its timer, so if the cancel line were already
+    /// buffered when the server next ran, the read would win and the idle
+    /// branch would never execute under either guard. Sleeping on the
+    /// paused clock only returns once every other task is parked, i.e.
+    /// after the server has taken its idle branch.
+    #[tokio::test]
+    async fn idle_timeout_spares_an_inflight_turn() {
+        tokio::time::pause();
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+        let reader = tokio::io::BufReader::new(reader);
+        let (out_peer, out_server) = tokio::io::duplex(64 * 1024);
+        let mut out_lines = BufReader::new(out_peer).lines();
+
+        let llm = BlockingOnCancelProvider::armed();
+        let handle = tokio::spawn(async move {
+            AcpServer::run_stdio(reader, out_server, Some(llm as Arc<dyn ChatProvider>)).await;
+        });
+
+        tokio::task::yield_now().await;
+
+        let new_session = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/new","params":{{"cwd":{}}}}}"#,
+            json_path(workspace.path())
+        );
+        let input = format!(
+            "{}\n{}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}"#,
+            new_session,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"acp-sess-1","prompt":[{"type":"text","text":"long answer please"}]}}"#,
+        );
+        use tokio::io::AsyncWriteExt;
+        writer
+            .write_all(input.as_bytes())
+            .await
+            .expect("write handshake+prompt");
+        writer.flush().await.expect("flush handshake+prompt");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // 61s of silence with the turn parked in the provider: the server
+        // takes its idle branch and must keep serving.
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !handle.is_finished(),
+            "an in-flight turn must hold the server open past the idle timeout"
+        );
+
+        // Cancel the turn; the parked provider unblocks and the turn ends
+        // `cancelled`, its response reaching the wire before shutdown.
+        writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"acp-sess-1"}}"#,
+            )
+            .await
+            .expect("write cancel");
+        writer
+            .write_all(b"\n")
+            .await
+            .expect("terminate cancel line");
+        writer.flush().await.expect("flush cancel");
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let line = out_lines
+                    .next_line()
+                    .await
+                    .expect("output stream open")
+                    .expect("output line");
+                let v: Value = serde_json::from_str(&line).expect("frame is JSON");
+                if v.get("id") == Some(&Value::from(3)) {
+                    return v;
+                }
+            }
+        })
+        .await
+        .expect("the cancelled turn's response frame");
+        assert_eq!(
+            cancelled["result"]["stopReason"], "cancelled",
+            "{cancelled}"
+        );
+
+        // The turn is finished: the next 60s of silence must shut the
+        // server down.
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "server must shut down 60s after the turn finished"
+        );
+    }
+
+    /// A stdio MCP server for the drain pin below: answers `initialize` and
+    /// `tools/list` (one tool, `slow`) at once, and `tools/call` only after
+    /// a 3s sleep, so a turn calling it is reliably still in flight when
+    /// the client hangs up. (A bash script: cargo only exposes the
+    /// `mock_mcp_server` binary path to integration tests under `tests/`,
+    /// and `run_stdio` is private to this module.)
+    const SLOW_TOOL_MCP_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=""
+  if [[ $line =~ \"id\":([0-9]+) ]]; then id="${BASH_REMATCH[1]}"; fi
+  case "$line" in
+    *'"method":"initialize"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"slow-mock\",\"version\":\"1\"}}}" ;;
+    *'"method":"tools/list"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"slow\",\"description\":\"answers after 3s\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+    *'"method":"tools/call"'*)
+      sleep 3
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Slow: done\"}]}}" ;;
+  esac
+done
+"#;
+
+    /// The shutdown drain (#179) must await in-flight turns *before*
+    /// `run_stdio` reaps the sessions' MCP children (#183) — otherwise a
+    /// turn whose MCP tool call is still executing when the client hangs
+    /// up loses its server mid-call. Kills `:204:9 TurnControl::track_task
+    /// -> ()` and `:221:9 TurnControl::take_tasks -> vec![]` (and the same
+    /// body mutant on `TurnRegistry::take_tasks`): with nothing to drain,
+    /// `kill_all_mcp_children` runs the instant EOF is read and the tool
+    /// call fails, so the agent never sees the server's answer.
+    ///
+    /// `run_stdio` specifically: `run_io` has no reap step, and there the
+    /// turn task's own runtime handle keeps the MCP client alive anyway —
+    /// the drain is only observable through the reap ordering.
+    #[cfg_attr(
+        windows,
+        ignore = "#224: the stdio MCP mock is a bash script and the reap sends kill -TERM; unlock with a portable mock reachable from unit tests"
+    )]
+    #[tokio::test]
+    async fn eof_drain_lets_an_inflight_mcp_tool_finish_before_reaping() {
+        /// Call #1 asks for the slow tool; call #2 records whether the tool
+        /// result actually carries the server's answer.
+        struct SlowToolInspectorProvider {
+            saw_tool_output: std::sync::atomic::AtomicBool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl ChatProvider for SlowToolInspectorProvider {
+            async fn complete(
+                &self,
+                messages: &[crate::message::Message],
+                _tools: &[crate::llm::ToolSpec],
+            ) -> crate::error::Result<crate::llm::Completion> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    return Ok(crate::llm::Completion {
+                        tool_calls: vec![crate::message::ToolCall {
+                            id: "tc-1".into(),
+                            name: "mcp__slowmock__slow".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        ..Default::default()
+                    });
+                }
+                for msg in messages {
+                    if matches!(msg.role, crate::message::Role::Tool)
+                        && msg.content.contains("Slow: done")
+                    {
+                        self.saw_tool_output
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                Ok(crate::llm::Completion {
+                    content: "done".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let provider = Arc::new(SlowToolInspectorProvider {
+            saw_tool_output: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (server_r, server_w) = tokio::io::split(server_io);
+        let llm = provider.clone();
+        let server = tokio::spawn(async move {
+            AcpServer::run_stdio(server_r, server_w, Some(llm as Arc<dyn ChatProvider>)).await;
+        });
+        let (client_r, mut client_w) = tokio::io::split(client);
+        let mut lines = BufReader::new(client_r).lines();
+
+        use tokio::io::AsyncWriteExt;
+        let requests = [
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {
+                    "cwd": workspace.path().to_string_lossy(),
+                    "mcpServers": [{
+                        "name": "slowmock",
+                        "command": "bash",
+                        "args": ["-c", SLOW_TOOL_MCP_SCRIPT],
+                    }],
+                },
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {"sessionId": "acp-sess-1",
+                           "prompt": [{"type": "text", "text": "use the slow tool"}]},
+            }),
+        ];
+        for req in &requests {
+            client_w
+                .write_all(format!("{req}\n").as_bytes())
+                .await
+                .expect("write request");
+        }
+        client_w.flush().await.expect("flush requests");
+
+        // mcp__* tools are interactive: the turn parks until we approve.
+        let deadline = std::time::Duration::from_secs(30);
+        let perm_id = loop {
+            let line = tokio::time::timeout(deadline, lines.next_line())
+                .await
+                .expect("frame within 30s")
+                .expect("stream open")
+                .expect("line read");
+            let v: Value = serde_json::from_str(&line).expect("frame is JSON");
+            if v["params"]["update"]["sessionUpdate"] == "request_permission" {
+                break v["params"]["update"]["permissionId"]
+                    .as_str()
+                    .expect("permissionId on the request frame")
+                    .to_string();
+            }
+        };
+
+        // Approve, then hang up while the tool call sleeps. Dropping a
+        // `tokio::io::split` half does not close the stream; shutdown()
+        // is what the server's read half sees as EOF.
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0", "id": 99, "method": "session/request_permission",
+            "params": {"permissionId": perm_id, "outcome": "allowed"},
+        });
+        client_w
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .expect("write permission reply");
+        client_w.shutdown().await.expect("signal EOF");
+
+        // The drained turn still delivers its response, then the server
+        // finishes shutting down.
+        let response = loop {
+            let line = tokio::time::timeout(deadline, lines.next_line())
+                .await
+                .expect("frame within 30s")
+                .expect("stream open")
+                .expect("line read");
+            let v: Value = serde_json::from_str(&line).expect("frame is JSON");
+            if v.get("method").is_none() && v.get("id") == Some(&Value::from(3)) {
+                break v;
+            }
+        };
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        tokio::time::timeout(deadline, server)
+            .await
+            .expect("run_stdio returns once the drained turn is done")
+            .expect("server task");
+        assert!(
+            provider
+                .saw_tool_output
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the in-flight turn's MCP tool call must complete before the shutdown reaps its server"
+        );
+    }
+
+    /// ACP-S1-13: `session/resume` without (or with a missing) params must
+    /// answer -32602 naming the field — not go silent. Kills the
+    /// `(None, vec![…])` body replacements of `handle_session_resume`
+    /// (`:1260:5`, two shapes): the mutated handler answers nothing.
+    #[tokio::test]
+    async fn resume_param_errors_name_the_missing_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        let (resp, _) = AcpServer::dispatch_one(
+            &serde_json::json!({"jsonrpc":"2.0","id":7,"method":"session/resume"}),
+            &mut srv.state,
+            &mut srv.sessions,
+            Some(&srv.llm),
+            &srv.sync_table,
+            &srv.control,
+        )
+        .await;
+        let resp = resp.expect("resume must answer even with no params at all");
+        assert_eq!(resp["error"]["code"], INVALID_PARAMS, "{resp}");
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("sessionId"),
+            "the error must name the missing field: {resp}"
+        );
+    }
+
+    /// ACP-S1-13a: an unknown session id must produce -32000 (literal)
+    /// with the "Session not found" wording *before* any transcript
+    /// parsing is attempted. Kills `:1290:8 delete !` (the existence
+    /// guard flips: the fall-through surfaces the transcript-parse error
+    /// message instead) and pins the literal value of
+    /// SESSION_NOT_FOUND (`:104:32 delete -`, whose constant-based
+    /// assertions elsewhere are tautologies).
+    #[tokio::test]
+    async fn resume_unknown_session_reports_session_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        let (resp, _) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":8,"method":"session/resume",
+                "params":{"sessionId":"ghost-1"},
+            }),
+            &mut srv.state,
+            &mut srv.sessions,
+            Some(&srv.llm),
+            &srv.sync_table,
+            &srv.control,
+        )
+        .await;
+        let resp = resp.expect("resume of an unknown session must still answer");
+        assert_eq!(
+            resp["error"]["code"], -32000,
+            "unknown session must be SESSION_NOT_FOUND: {resp}"
+        );
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("Session not found"),
+            "the unknown-session error must come from the existence guard: {resp}"
+        );
+    }
+
+    /// A persisted session resumable into a fresh server: the response
+    /// must carry the real restored context (system prompt, turn,
+    /// message count, exact compaction hints) and nothing else — resume
+    /// emits no notifications by contract (ACP-S1-03). Kills the
+    /// `(Some(Default::default()), …)` body replacements of
+    /// `handle_session_resume` (`:1260:5`, two shapes): a null result
+    /// fails every field assert.
+    #[tokio::test]
+    async fn resume_round_trip_restores_context_without_notifications() {
+        use crate::acp::session::{SavedMessage, SessionMetadata};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let persist = tempfile::TempDir::new().unwrap();
+        let sid = "persisted-1";
+
+        // Persist the files a real session writes: 3 saved messages
+        // (the oldest compressible), turn 7, system prompt "keeper".
+        let session_dir = persist.path().join(sid);
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        let msgs = [
+            crate::message::Message::user("one"),
+            crate::message::Message::assistant("two"),
+            crate::message::Message::user("three"),
+        ];
+        let mut transcript_lines = Vec::new();
+        for (i, m) in msgs.iter().enumerate() {
+            let mut saved = SavedMessage::from_message(m.clone());
+            saved.compressible = i == 0; // recency threshold 2 over 3 messages
+            transcript_lines.push(serde_json::to_string(&saved).expect("serialize"));
+        }
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            transcript_lines.join("\n") + "\n",
+        )
+        .expect("write transcript");
+        let metadata = SessionMetadata {
+            session_id: sid.to_string(),
+            cwd: workspace.path().to_path_buf(),
+            turn: 7,
+            system_prompt: Some("keeper".into()),
+            mcp_servers: None,
+        };
+        std::fs::write(
+            session_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        let (out, _out_rx) = mpsc::channel::<Value>(256);
+        let control = TurnControl::new(out);
+        let mut state = ServerState::Uninitialized;
+        let mut sessions =
+            AcpSessionManager::new().with_persistence_dir(persist.path().to_path_buf());
+        let sync_table = build_sync_dispatch_table();
+        let llm = mock_llm();
+
+        let (init_resp, _) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"protocolVersion":1},
+            }),
+            &mut state,
+            &mut sessions,
+            Some(&llm),
+            &sync_table,
+            &control,
+        )
+        .await;
+        assert!(init_resp
+            .expect("initialize responds")
+            .get("result")
+            .is_some());
+
+        let (resp, notifs) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":9,"method":"session/resume",
+                "params":{"sessionId":sid},
+            }),
+            &mut state,
+            &mut sessions,
+            Some(&llm),
+            &sync_table,
+            &control,
+        )
+        .await;
+        let resp = resp.expect("resume of a persisted session must answer");
+        assert!(resp.get("result").is_some(), "resume must succeed: {resp}");
+        assert_eq!(resp["result"]["sessionId"], sid);
+        assert_eq!(resp["result"]["systemPrompt"], "keeper");
+        assert_eq!(resp["result"]["turn"], 7);
+        assert_eq!(resp["result"]["messageCount"], 3);
+        assert_eq!(
+            resp["result"]["compactionHints"],
+            serde_json::json!([
+                {"turnIndex": 0, "compressible": true},
+                {"turnIndex": 1, "compressible": false},
+                {"turnIndex": 2, "compressible": false},
+            ]),
+            "hints follow the recency-2 heuristic over the restored transcript"
+        );
+        assert!(
+            notifs.is_empty(),
+            "resume must not emit session/update notifications: {notifs:?}"
+        );
+    }
+
+    /// S2-E11: `session/close` answers exactly `true` with no
+    /// notifications and actually frees the session; a second close of
+    /// the same id is -32000 (literal), not a second success. Kills all
+    /// five `handle_session_close` survivors: the four `:1806:5` body
+    /// replacements (`(None, …)` leaves the request unanswered;
+    /// `(Some(Default::default()), …)` answers `null`) and the
+    /// `:1821:8 delete !` guard flip (the first close errors and leaks
+    /// the session). The pre-existing
+    /// `acp_mcp_servers_are_spawned_and_reaped_on_close` integration test
+    /// never looks at the close response, which is why those survived.
+    #[tokio::test]
+    async fn close_success_returns_bare_true_and_frees_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+        assert!(srv.sessions.contains("acp-sess-1"));
+
+        let (resp, notifs) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":5,"method":"session/close",
+                "params":{"sessionId":"acp-sess-1"},
+            }),
+            &mut srv.state,
+            &mut srv.sessions,
+            Some(&srv.llm),
+            &srv.sync_table,
+            &srv.control,
+        )
+        .await;
+        let resp = resp.expect("close must answer");
+        assert_eq!(
+            resp["result"],
+            Value::Bool(true),
+            "close result is exactly true: {resp}"
+        );
+        assert!(
+            notifs.is_empty(),
+            "close emits no notifications: {notifs:?}"
+        );
+        assert!(
+            !srv.sessions.contains("acp-sess-1"),
+            "close must free the session"
+        );
+
+        let (resp2, _) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":6,"method":"session/close",
+                "params":{"sessionId":"acp-sess-1"},
+            }),
+            &mut srv.state,
+            &mut srv.sessions,
+            Some(&srv.llm),
+            &srv.sync_table,
+            &srv.control,
+        )
+        .await;
+        let resp2 = resp2.expect("second close must still answer");
+        assert_eq!(
+            resp2["error"]["code"], -32000,
+            "closing an unknown session must be SESSION_NOT_FOUND: {resp2}"
+        );
+    }
+
+    /// A detached turn outlives its session entry: `session/close` drops
+    /// the session from the manager without cancelling its turn, while the
+    /// turn task keeps the runtime alive. The turn registry is then the
+    /// only handle left on that turn, so a later `session/cancel` for the
+    /// id must still reach it and report success — not answer "Session not
+    /// found" and leave an unstoppable turn running. Kills `:209:9
+    /// TurnControl::cancel_session -> false` and `:270:9
+    /// TurnRegistry::cancel_session -> false`: everywhere else the
+    /// session's own token *is* the registered token (refresh_cancel_token
+    /// stores the Arc it returns), so the fallback path masks a dead
+    /// registry lookup — a closed session is the one state where it cannot.
+    #[tokio::test]
+    async fn cancel_reaches_an_inflight_turn_whose_session_was_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(BlockingOnCancelProvider::armed());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        let prompt = srv
+            .request(serde_json::json!({
+                "id": 3, "method": "session/prompt",
+                "params": {"sessionId": "acp-sess-1",
+                           "prompt": [{"type": "text", "text": "long answer please"}]},
+            }))
+            .await;
+        assert!(prompt.is_none(), "prompt turns are detached");
+
+        let closed = srv
+            .request(serde_json::json!({
+                "id": 4, "method": "session/close",
+                "params": {"sessionId": "acp-sess-1"},
+            }))
+            .await
+            .expect("session/close responds");
+        assert_eq!(closed["result"], Value::Bool(true), "{closed}");
+        assert!(
+            !srv.sessions.contains("acp-sess-1"),
+            "close removed the session entry"
+        );
+
+        let cancel = srv
+            .request(serde_json::json!({
+                "id": 5, "method": "session/cancel",
+                "params": {"sessionId": "acp-sess-1"},
+            }))
+            .await
+            .expect("request-form cancel responds");
+        assert_eq!(
+            cancel["result"],
+            Value::Bool(true),
+            "cancel must reach the closed session's in-flight turn through the turn registry: {cancel}"
+        );
+        let resp = srv.wait_for_response(3).await;
+        assert_eq!(resp["result"]["stopReason"], "cancelled", "{resp}");
+    }
+
+    /// Prompt routing and the turn counter: a prompt that carries text
+    /// runs a real (detached) agent turn even when it also carries
+    /// unsupported blocks; only a prompt with *no* text gets the inline
+    /// "Unsupported content types" answer; and every prompt, of either
+    /// kind, advances `turnId` by exactly one. Kills `:1531:32 && → ||`
+    /// (the mixed prompt B is answered inline instead of running the
+    /// agent), `:1594:18 += → *=` (the text-path counter freezes: B
+    /// reports turnId 0) and `:1534:22 += → *=` (the no-text counter
+    /// freezes, visible only on the *following* prompt D, since a turn
+    /// reports the counter's value from before its own increment).
+    #[tokio::test]
+    async fn turn_ids_advance_by_exactly_one_per_prompt() {
+        async fn next_end_turn_turnid(srv: &mut TestServer) -> String {
+            let deadline = std::time::Duration::from_secs(10);
+            loop {
+                let frame = tokio::time::timeout(deadline, srv.out_rx.recv())
+                    .await
+                    .expect("frame within 10s")
+                    .expect("writer channel stays open until the turn finishes");
+                if frame["params"]["update"]["sessionUpdate"] == "end_turn" {
+                    return frame["params"]["update"]["turnId"]
+                        .as_str()
+                        .expect("turnId on end_turn")
+                        .to_string();
+                }
+            }
+        }
+
+        /// A no-text prompt answers inline: the result plus exactly the
+        /// three canned notifications; returns the end_turn turnId.
+        async fn inline_no_text_turnid(srv: &mut TestServer, id: u64) -> String {
+            let (resp, notifs) = AcpServer::dispatch_one(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                    "params": {"sessionId": "acp-sess-1",
+                               "prompt": [{"type": "resource_link",
+                                           "uri": "file:///workspace/README.md"}]},
+                }),
+                &mut srv.state,
+                &mut srv.sessions,
+                Some(&srv.llm),
+                &srv.sync_table,
+                &srv.control,
+            )
+            .await;
+            let resp = resp.expect("a no-text prompt must answer inline");
+            assert_eq!(resp["result"]["stopReason"], "end_turn", "{resp}");
+            assert_eq!(
+                notifs.len(),
+                3,
+                "user chunk + agent chunk + end_turn: {notifs:?}"
+            );
+            assert_eq!(
+                notifs[0]["params"]["update"]["sessionUpdate"],
+                "user_message_chunk"
+            );
+            let agent_text = notifs[1]["params"]["update"]["content"]["text"]
+                .as_str()
+                .expect("agent chunk text");
+            assert!(agent_text.contains("Unsupported"), "{agent_text}");
+            assert_eq!(notifs[2]["params"]["update"]["sessionUpdate"], "end_turn");
+            notifs[2]["params"]["update"]["turnId"]
+                .as_str()
+                .expect("turnId on end_turn")
+                .to_string()
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let completions = vec![
+            crate::llm::Completion {
+                content: "first".into(),
+                ..Default::default()
+            },
+            crate::llm::Completion {
+                content: "second".into(),
+                ..Default::default()
+            },
+        ];
+        let mut srv = TestServer::new(mock_llm_multi(completions));
+        srv.initialize_and_open_session(&tmp, false).await;
+        let mut turn_ids = Vec::new();
+
+        // A: text only — a detached agent turn.
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 3, "method": "session/prompt",
+                "params": {"sessionId": "acp-sess-1",
+                           "prompt": [{"type": "text", "text": "hello"}]},
+            }))
+            .await;
+        assert!(resp.is_none(), "a text prompt runs a detached turn");
+        srv.wait_for_response(3).await;
+        turn_ids.push(next_end_turn_turnid(&mut srv).await);
+
+        // B: text + an unsupported block — still a detached agent turn on
+        // the text, not the inline no-text answer.
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 4, "method": "session/prompt",
+                "params": {"sessionId": "acp-sess-1",
+                           "prompt": [{"type": "text", "text": "hello"},
+                                      {"type": "resource_link",
+                                       "uri": "file:///workspace/README.md"}]},
+            }))
+            .await;
+        assert!(
+            resp.is_none(),
+            "a prompt that carries text must run the agent, not the no-text fallback: {resp:?}"
+        );
+        let response = srv.wait_for_response(4).await;
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        turn_ids.push(next_end_turn_turnid(&mut srv).await);
+
+        // C and D: no text at all — answered inline; D exposes whether C
+        // advanced the counter.
+        turn_ids.push(inline_no_text_turnid(&mut srv, 5).await);
+        turn_ids.push(inline_no_text_turnid(&mut srv, 6).await);
+
+        assert_eq!(
+            turn_ids,
+            ["0", "1", "2", "3"],
+            "every prompt advances the turn counter by exactly one: {turn_ids:?}"
+        );
+    }
+
+    /// A JSON-RPC message missing `jsonrpc` must be rejected with an
+    /// error that names the field. Kills `:2048:13 delete match arm None
+    /// in AcpServer::dispatch_one`: without the arm the envelope falls
+    /// through to the method check and reports the *wrong missing
+    /// field* ("method" instead of "jsonrpc"; both are -32600, so only
+    /// the message discriminates).
+    #[tokio::test]
+    async fn missing_jsonrpc_field_error_names_the_field() {
+        let lines = run_server(r#"{"id":1}"#).await;
+        assert_eq!(lines.len(), 1);
+        let v = parse_line(&lines, 0);
+        assert_eq!(v["error"]["code"], INVALID_REQUEST);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("'jsonrpc'"),
+            "the error must name the missing field: {v}"
+        );
+    }
 }
