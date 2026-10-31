@@ -1368,15 +1368,14 @@ mod tests {
     }
 
     // TODO(goal-360): the SSH timeout arms in `ssh_exec` and `exec_shell`
-    // now kill the child and drain both reader tasks before returning,
-    // but that behavior can't be exercised end-to-end here without an SSH
-    // server in the test environment — spawning `ssh user@host` against a
-    // missing server fails fast with connection refused and never reaches
-    // the timeout branch. The kill-then-drain contract is pinned by
-    // `shell_timeout_drains_reader_tasks` in shell.rs (same spawn → two
-    // reader tasks → timeout(child.wait()) structure) and is
-    // grep-verifiable in this file: the timeout `Err(_)` arms contain
-    // `start_kill` and `stdout_task.await`.
+    // now kill the child and drain both reader tasks before returning.
+    // The `exec_shell` arm is exercised end-to-end by
+    // `ssh_exec_shell_times_out_with_timed_out_error` (fake `ssh` shim,
+    // batch #245-27); the kill-then-drain structure is also pinned by
+    // `shell_timeout_drains_reader_tasks` in shell.rs. The `ssh_exec`
+    // timeout arm itself remains grep-verifiable only: the timeout `Err(_)`
+    // arms route through `crate::process::terminate_group` and await both
+    // reader tasks before returning.
 
     #[tokio::test]
     async fn local_transport_create_dir_all() {
@@ -2021,5 +2020,621 @@ mod tests {
         assert!(t.insecure_host_key_checking);
         let t = t.with_insecure_host_key_checking(false);
         assert!(!t.insecure_host_key_checking);
+    }
+
+    // --- Issue #245 batch 27 (B2 seat): survivor pins -------------------
+    // Pins for the MISSED mutants in this file: is_retryable_io_error,
+    // render_environment_segment's toolchain line, the default walk
+    // fallback's depth limit, base64_encode padding, spawn_reader's chunk
+    // mirror, and the whole SshTransport surface (end-to-end over a fake
+    // `ssh`, below — no SSH server required).
+
+    /// Mutant `is_retryable_io_error -> true`: only transient infra faults
+    /// may be advertised as retryable — a permanent failure (NotFound /
+    /// PermissionDenied / …) carrying the `retryable: ` prefix would make
+    /// the agent loop forever on a lost cause.
+    #[test]
+    fn retryable_classification_covers_only_transient_io_kinds() {
+        let transient = [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::WouldBlock,
+        ];
+        for kind in transient {
+            let e = std::io::Error::new(kind, "transient");
+            assert!(
+                is_retryable_io_error(&e),
+                "{kind:?} must classify retryable"
+            );
+            assert_eq!(
+                retryable_prefix(&e),
+                "retryable: ",
+                "{kind:?} must carry the retryable prefix"
+            );
+        }
+        let permanent = [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::AlreadyExists,
+            std::io::ErrorKind::Other,
+        ];
+        for kind in permanent {
+            let e = std::io::Error::new(kind, "permanent");
+            assert!(
+                !is_retryable_io_error(&e),
+                "{kind:?} must not classify retryable"
+            );
+            assert_eq!(
+                retryable_prefix(&e),
+                "",
+                "{kind:?} must not carry the retryable prefix"
+            );
+        }
+    }
+
+    /// Mutant `delete !` in the toolchain guard: a probed toolchain must be
+    /// listed, and an unprobed one must not render an empty toolchain line
+    /// (the `<environment>` segment feeds the system prompt verbatim).
+    #[test]
+    fn environment_segment_lists_toolchain_only_when_probed() {
+        let mut caps = EnvironmentCapabilities::local();
+        caps.toolchain = vec!["cargo".to_string(), "rg".to_string()];
+        let seg = caps.render_environment_segment();
+        assert!(
+            seg.contains("- available toolchain: cargo, rg\n"),
+            "probed toolchains must be listed verbatim, got: {seg}"
+        );
+        let bare = EnvironmentCapabilities::local().render_environment_segment();
+        assert!(
+            !bare.contains("available toolchain"),
+            "an unprobed environment must not advertise a toolchain line, got: {bare}"
+        );
+    }
+
+    /// A transport whose directory tree is a scripted map and which records
+    /// every `list_dir` round-trip — pins the default `walk` fallback on
+    /// results AND round-trip count (its doc prices it at O(directories)).
+    #[derive(Debug)]
+    struct ScriptedDirs {
+        dirs: std::collections::HashMap<PathBuf, Vec<DirEntry>>,
+        listed: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl ScriptedDirs {
+        fn new() -> Self {
+            Self {
+                dirs: std::collections::HashMap::new(),
+                listed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn dir(mut self, path: &str, entries: Vec<(&str, bool)>) -> Self {
+            self.dirs.insert(
+                PathBuf::from(path),
+                entries
+                    .into_iter()
+                    .map(|(name, is_dir)| DirEntry {
+                        name: name.to_string(),
+                        is_dir,
+                    })
+                    .collect(),
+            );
+            self
+        }
+    }
+
+    #[async_trait]
+    impl ToolTransport for ScriptedDirs {
+        async fn read_file(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "scripted transport serves list_dir only",
+            ))
+        }
+        async fn write_file(&self, _path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "scripted transport serves list_dir only",
+            ))
+        }
+        async fn list_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>> {
+            self.listed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(path.to_path_buf());
+            self.dirs.get(path).cloned().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("scripted: no directory {}", path.display()),
+                )
+            })
+        }
+        async fn create_dir_all(&self, _path: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "scripted transport serves list_dir only",
+            ))
+        }
+        async fn exec_shell(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _env: &[(String, String)],
+            _timeout: Duration,
+            _max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "scripted transport serves list_dir only",
+            ))
+        }
+    }
+
+    /// Mutants in the fallback's depth handling (`>`→`>=`, `<`→`<=`,
+    /// `delete !` on `is_file`): entries AT the depth limit stay in the
+    /// result as files/dirs with the right kind, and a directory sitting at
+    /// the limit must not be listed at all — one `list_dir` round-trip per
+    /// listed directory, never one more. `/src` deliberately has no scripted
+    /// entry, so an extra round-trip surfaces as `NotFound`, not as silence.
+    #[tokio::test]
+    async fn default_walk_fallback_keeps_entries_at_the_depth_limit_without_listing_them() {
+        let t = ScriptedDirs::new().dir("/r", vec![("a.txt", false), ("src", true)]);
+        let opts = WalkOptions {
+            max_depth: 1,
+            ..WalkOptions::default()
+        };
+
+        let entries = t
+            .walk(Path::new("/r"), &opts)
+            .await
+            .expect("depth-limit entries stay in the result");
+        assert_eq!(
+            entries,
+            vec![
+                WalkEntry {
+                    path: PathBuf::from("a.txt"),
+                    is_file: true,
+                    size: 0,
+                },
+                WalkEntry {
+                    path: PathBuf::from("src"),
+                    is_file: false,
+                    size: 0,
+                },
+            ],
+            "depth-limit entries must be reported with the correct kind"
+        );
+        assert_eq!(
+            *t.listed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![PathBuf::from("/r")],
+            "exactly one list_dir round-trip: directories at the depth limit are never listed"
+        );
+    }
+
+    /// Mutant `>`→`>=` in base64_encode's padding guard: a trailing
+    /// one-byte chunk has only one real output character left, so it must
+    /// pad twice (`YQ==`), never emit a second data character (`YQA=`).
+    #[test]
+    fn base64_encode_pads_a_single_trailing_byte_twice() {
+        assert_eq!(base64_encode(b"a"), "YQ==");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+        assert_eq!(base64_encode(b"abcdef"), "YWJjZGVm");
+        assert_eq!(base64_encode(&[0x00, 0xFF, 0xFE, 0x7F]), "AP/+fw==");
+    }
+
+    /// Mutant `*`→`+` in spawn_reader's read buffer: the mirror (what
+    /// `drain_with_grace` hands back when a reader task is cut off) is fed
+    /// per read chunk, so the recoverable partial output is whole 8 KiB
+    /// chunks — the first read pulls a full chunk even though the cap is
+    /// 100 bytes, and everything past the cap is drained unmirrored. The
+    /// `Cursor` reader fills every read completely, making the chunk count
+    /// deterministic.
+    #[tokio::test]
+    async fn spawn_reader_mirrors_whole_read_chunks_up_to_the_cap() {
+        let data = vec![b'x'; 20_000];
+        let (task, mirror) = spawn_reader(std::io::Cursor::new(data), 100);
+        let out = task.await.expect("reader task completes on EOF");
+        assert_eq!(
+            out,
+            format!("{}{}", "x".repeat(100), "\n... [output truncated]"),
+            "the returned output is capped at exactly `max` bytes plus the marker"
+        );
+        let mirrored = mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert_eq!(
+            mirrored,
+            8 * 1024,
+            "the mirror must retain the whole 8 KiB read chunk that crossed the cap"
+        );
+    }
+
+    // --- SshTransport end-to-end over a fake `ssh` ----------------------
+
+    /// A fake `ssh` that makes `SshTransport` runnable without an SSH
+    /// server: the shim drops every ssh option plus the host argument and
+    /// executes the trailing "remote command" locally under `/bin/sh`, so
+    /// the transport's real `cat` / `ls -1a` / `mkdir -p` / `test -d`
+    /// plumbing acts on a real temp dir. Installed by prepending its
+    /// directory to `PATH`; callers MUST hold
+    /// `crate::test_util::env_lock()` across the whole test (#222) and
+    /// declare this guard before the lock guard so PATH is restored before
+    /// unlock. `#[cfg(unix)]`: the shim is a `#!/bin/sh` script needing the
+    /// exec bit (#224); a non-unix port would need a `.bat`/`.cmd` shim.
+    #[cfg(unix)]
+    struct FakeSshOnPath {
+        _dir: TempDir,
+        old_path: std::ffi::OsString,
+    }
+
+    #[cfg(unix)]
+    impl FakeSshOnPath {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("shim temp dir");
+            let script = "#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n";
+            let shim = dir.path().join("ssh");
+            std::fs::write(&shim, script).expect("write ssh shim");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("shim exec bit");
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            let shimmed = std::env::join_paths(
+                std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&old_path)),
+            )
+            .expect("PATH entries join");
+            // SAFETY: process-global PATH swap, serialised by the crate env
+            // lock the caller holds (#222).
+            unsafe { std::env::set_var("PATH", shimmed) };
+            Self {
+                _dir: dir,
+                old_path,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeSshOnPath {
+        fn drop(&mut self) {
+            // SAFETY: the caller's env-lock guard outlives this one, so the
+            // restore happens while still holding the lock (#222).
+            unsafe { std::env::set_var("PATH", &self.old_path) };
+        }
+    }
+
+    /// Mutant `ssh_exec -> Ok(Default::default())`: the remote command must
+    /// actually run, and its exit status plus both streams must travel back
+    /// as data (`failure` stays `None` — the command completed).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_exec_runs_remote_command_and_captures_status_and_streams() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+
+        let r = t
+            .ssh_exec("printf out-x; printf err-y >&2; exit 3")
+            .await
+            .expect("ssh_exec runs over the fake ssh");
+        assert_eq!(r.exit_code, Some(3), "exit status must travel as data");
+        assert_eq!(r.stdout, "out-x");
+        assert_eq!(r.stderr, "err-y");
+        assert_eq!(
+            r.failure, None,
+            "a command that ran to completion is not a transport failure"
+        );
+    }
+
+    /// Mutants `128 * 1024` → `128 + 1024` (1152) and `128 / 1024` (0) in
+    /// `ssh_exec`: an output far below the 128 KiB cap must arrive whole and
+    /// unmarked, while one above the cap is truncated at exactly 131072
+    /// bytes plus the marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_exec_caps_output_at_128_kib_and_marks_truncation() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+
+        let whole = t
+            .ssh_exec("awk 'BEGIN{for(i=0;i<10000;i++)printf \"x\"}'")
+            .await
+            .expect("10 KiB output arrives");
+        assert_eq!(
+            whole.stdout.len(),
+            10_000,
+            "10 KiB is far below the 128 KiB cap — must arrive whole, got {} bytes",
+            whole.stdout.len()
+        );
+        assert!(
+            !whole.stdout.contains("[output truncated]"),
+            "output under the cap must not be marked truncated"
+        );
+
+        let capped = t
+            .ssh_exec("awk 'BEGIN{for(i=0;i<200000;i++)printf \"y\"}'")
+            .await
+            .expect("200 KiB output arrives capped");
+        let marker = "\n... [output truncated]";
+        assert_eq!(
+            capped.stdout,
+            format!("{}{}", "y".repeat(128 * 1024), marker),
+            "output past the cap must be cut at exactly 128 KiB and marked"
+        );
+    }
+
+    /// Mutants `read_file -> Ok(vec![0]) / Ok(vec![1]) / Ok(vec![])` and
+    /// `!=`→`==` on its exit check: a successful read returns the remote
+    /// bytes verbatim, and a failed `cat` (missing file) must map to
+    /// `NotFound` naming the path — never an `Ok` payload.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_read_file_round_trips_bytes_and_maps_failure_to_not_found() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hello.txt");
+        std::fs::write(&path, b"ssh round trip\n").unwrap();
+
+        let bytes = t
+            .read_file(&path)
+            .await
+            .expect("read_file over the fake ssh");
+        assert_eq!(
+            bytes,
+            b"ssh round trip\n".to_vec(),
+            "read_file must return the remote bytes verbatim"
+        );
+
+        let err = t
+            .read_file(&tmp.path().join("missing.bin"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("remote file not found")
+                && err.to_string().contains("missing.bin"),
+            "the error must name the transport classification and the path, got: {err}"
+        );
+    }
+
+    /// Mutants `ssh_write_file -> Ok(())`, trait `write_file -> Ok(())`,
+    /// and `!=`→`==` on the mkdir/write exit checks: a write through the
+    /// trait must create parents, land exact bytes on the remote, and
+    /// satisfy the write-then-read contract — any inverted check turns a
+    /// success into an `Err`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_write_file_creates_parents_and_round_trips_bytes() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("deep").join("inner").join("file.txt");
+
+        t.write_file(&path, b"it's \"quoted\"\n")
+            .await
+            .expect("write through the fake ssh creates parents and writes");
+        let on_disk = std::fs::read(&path).expect("file must exist on the (fake) remote");
+        assert_eq!(
+            on_disk,
+            b"it's \"quoted\"\n".to_vec(),
+            "exact bytes must survive the base64+shell round trip"
+        );
+        let back = t.read_file(&path).await.expect("write-then-read contract");
+        assert_eq!(back, b"it's \"quoted\"\n".to_vec());
+    }
+
+    /// Negative side of the `!=`→`==` mutants in `ssh_write_file`: a failing
+    /// parent `mkdir` must be reported as "mkdir failed on remote" (not as a
+    /// write failure, and never as `Ok`), and a failing redirect must be
+    /// reported as "write failed on remote".
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_write_file_reports_mkdir_and_write_failures_distinctly() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let err = t
+            .write_file(&blocker.join("under.txt"), b"x")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mkdir failed on remote"),
+            "a mkdir failure must be reported as such, got: {err}"
+        );
+
+        let adir = tmp.path().join("adir");
+        std::fs::create_dir(&adir).unwrap();
+        let err = t.write_file(&adir, b"x").await.unwrap_err();
+        assert!(
+            err.to_string().contains("write failed on remote"),
+            "a failed redirect must be reported as a write failure, got: {err}"
+        );
+    }
+
+    /// Mutants in `list_dir`: the `Ok(vec![])` body, the inverted exit
+    /// check, all four operator flips on the `.`/`..` filter, and the
+    /// flipped `test -d` mapping. `ls -1a` output must drop exactly `.` and
+    /// `..` (keeping dotfiles), report every name, and classify directories
+    /// via `test -d`; a missing directory must map to `NotFound`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_list_dir_filters_dot_entries_and_classifies_directories() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+
+        let entries = t.list_dir(tmp.path()).await.expect("list over fake ssh");
+        let mut names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![".hidden", "a.txt", "sub"],
+            "ls -1a must drop exactly . and .. while keeping dotfiles"
+        );
+        for e in &entries {
+            assert_eq!(
+                e.is_dir,
+                e.name == "sub",
+                "is_dir for {} must come from the remote test -d",
+                e.name
+            );
+        }
+
+        let err = t
+            .list_dir(&tmp.path().join("missing-dir"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("remote dir not found"),
+            "a missing directory must be classified as such, got: {err}"
+        );
+    }
+
+    /// Mutants `create_dir_all -> Ok(())` and `!=`→`==` on its exit check:
+    /// nested remote directories must really be created, a success must be
+    /// `Ok`, and a `mkdir -p` that hits a regular file must surface as
+    /// "mkdir failed on remote".
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_create_dir_all_creates_nested_dirs_and_surfaces_failures() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+
+        let deep = tmp.path().join("x").join("y").join("z");
+        t.create_dir_all(&deep)
+            .await
+            .expect("mkdir -p over the fake ssh");
+        assert!(deep.is_dir(), "nested directories must exist afterwards");
+
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let err = t.create_dir_all(&blocker.join("under")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("mkdir failed on remote"),
+            "a mkdir failure must be reported as such, got: {err}"
+        );
+    }
+
+    /// Mutant `exec_shell -> Ok(Default::default())`: the remote command
+    /// must run inside `cwd`, receive the explicit env pairs, and report its
+    /// real exit status; `max_output_bytes` must cap the returned output.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_exec_shell_runs_in_cwd_with_env_and_honours_output_cap() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("marker.txt"), b"marker-ok\n").unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        let r = t
+            .exec_shell(
+                "cat marker.txt",
+                &cwd,
+                &[],
+                Duration::from_secs(10),
+                64 * 1024,
+            )
+            .await
+            .expect("exec_shell runs over the fake ssh");
+        assert_eq!(r.exit_code, Some(0));
+        assert_eq!(
+            r.stdout, "marker-ok\n",
+            "exec_shell must cd into cwd before running the command"
+        );
+
+        let r = t
+            .exec_shell(
+                "printenv FOO",
+                &cwd,
+                &[("FOO".to_string(), "bar baz".to_string())],
+                Duration::from_secs(10),
+                64 * 1024,
+            )
+            .await
+            .expect("env-prefixed exec runs");
+        assert_eq!(
+            r.stdout, "bar baz\n",
+            "explicit env pairs must prefix the remote command (shell-escaped)"
+        );
+
+        let r = t
+            .exec_shell("exit 7", &cwd, &[], Duration::from_secs(10), 64 * 1024)
+            .await
+            .expect("exit-status exec runs");
+        assert_eq!(r.exit_code, Some(7), "remote exit status travels as data");
+
+        let r = t
+            .exec_shell(
+                "awk 'BEGIN{for(i=0;i<500;i++)printf \"y\"}'",
+                &cwd,
+                &[],
+                Duration::from_secs(10),
+                100,
+            )
+            .await
+            .expect("capped exec runs");
+        assert_eq!(
+            r.stdout,
+            format!("{}{}", "y".repeat(100), "\n... [output truncated]"),
+            "max_output_bytes must cap the returned output with the marker"
+        );
+    }
+
+    /// The `exec_shell` timeout arm (Goal 412 kill-then-drain): a hung
+    /// remote command must be reaped and surface as `TimedOut`, not park
+    /// forever. (The sibling `ssh_exec` arm shares the same structure.)
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the async body by design (#222)
+    async fn ssh_exec_shell_times_out_with_timed_out_error() {
+        let _env = crate::test_util::env_lock();
+        let _ssh = FakeSshOnPath::new();
+        let t = SshTransport::new("user@host", "/remote/workspace");
+        let tmp = TempDir::new().unwrap();
+
+        let err = t
+            .exec_shell(
+                "sleep 5",
+                tmp.path(),
+                &[],
+                Duration::from_millis(200),
+                64 * 1024,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains("SSH command timed out"),
+            "the timeout error must say so, got: {err}"
+        );
     }
 }

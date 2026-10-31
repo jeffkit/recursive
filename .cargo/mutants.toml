@@ -865,4 +865,28 @@ exclude_re = [
     # summarize_* test) in scope.
     "src/acp/session\\.rs:550:40: replace - with \\+ in summarize_transcript",
     "src/acp/session\\.rs:550:40: replace - with / in summarize_transcript",
+    # ── Issue #245 batch 27 (B2 seat, task list /tmp/b2-batch27.txt) ───────
+    # src/tools/transport_layer/transport.rs — all 30 survivors handled: 28
+    # pinned + the two true equivalents below exempted (negative control
+    # 30/30 = 28×rc=101 on the mapped test + 2× whole-module green; results
+    # in /tmp/b2-b27/negctl/{results.json,driver.log}).
+    # tools::transport_layer::transport::tests: retryable_classification_* /
+    # environment_segment_lists_toolchain_* / default_walk_fallback_keeps_* /
+    # base64_encode_pads_* / spawn_reader_mirrors_* / ssh_* (the SshTransport
+    # surface runs end-to-end over a fake `ssh` shim prepended to PATH under
+    # the crate env lock — no SSH server needed).
+    #
+    # base64_encode :1073:33 and :1073:45 — `(b0 << 16) | (b1 << 8) | b2`
+    # combines three bit fields that never overlap: b0/b1/b2 are `u8 as u32`
+    # (≤ 0xFF), so `b0 << 16` occupies bits 16–23, `b1 << 8` bits 8–15 and
+    # `b2` bits 0–7. On disjoint bit sets OR and XOR are the same operator
+    # (x | y == x ^ y whenever x & y == 0), so both `|`→`^` mutants produce
+    # byte-identical output for every input — no assertion can tell them
+    # apart (#223 true-equivalence doctrine). Negative control: each mutation
+    # applied by hand → whole transport::tests module green (not red),
+    # restored byte-exact (logs /tmp/b2-b27/negctl/m02.log, m03.log). The
+    # line:col anchor keeps the killable `>`→`>=` at :1078:24
+    # (base64_encode_pads_a_single_trailing_byte_twice) in scope.
+    "src/tools/transport_layer/transport\\.rs:1073:33: replace \\| with \\^ in base64_encode",
+    "src/tools/transport_layer/transport\\.rs:1073:45: replace \\| with \\^ in base64_encode",
 ]
