@@ -1125,4 +1125,161 @@ mod tests {
         assert!(t.session_id.is_none());
         assert!(t.notify.is_none());
     }
+
+    // ── issue #245 batch 29 pins ───────────────────────────────────────
+
+    /// Only *NotFound* means "empty registry, first run". Any other I/O
+    /// error (here: a directory sitting at the store path → EISDIR) must
+    /// surface as `Err(Io)`, not masquerade as an empty registry.
+    #[test]
+    fn store_load_surfaces_io_errors_other_than_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("triggers.json");
+        std::fs::create_dir(&path).expect("create a directory at the store path");
+        let store = TriggerStore::new(path);
+        match store.load() {
+            Err(Error::Io(e)) => {
+                assert_ne!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "the surfaced error must be the read failure, not a miss"
+                );
+            }
+            other => panic!("a directory at the store path must surface as Err(Io), got {other:?}"),
+        }
+    }
+
+    /// `days_from_civil` ↔ `utc_from_epoch` must round-trip across every
+    /// era boundary the algorithm branches on: negative years (the
+    /// `y - 399` era correction fires), the leap-table rollover at
+    /// `yoe == 100` where the `- yoe / 100` term stops being 0, and plain
+    /// modern dates.
+    #[test]
+    fn days_from_civil_round_trips_across_era_boundaries() {
+        for (y, m, d) in [
+            (1969, 12, 31),
+            (2000, 2, 29),
+            (-1, 1, 1),   // negative year: exercises the era else-branch
+            (2101, 1, 1), // yoe == 100: the `- yoe / 100` correction bites
+        ] {
+            let days = days_from_civil(y, m, d);
+            let t = utc_from_epoch(days * 86_400);
+            assert_eq!(
+                (t.year, t.month, t.day),
+                (y, m, d),
+                "round trip failed for {y:04}-{m:02}-{d:02}"
+            );
+        }
+    }
+
+    /// The parser requires the full 19-char `YYYY-MM-DDTHH:MM:SS` prefix;
+    /// the trailing `Z` is optional, so a 19-char timestamp without it
+    /// parses to the same instant as its Z-suffixed twin.
+    #[test]
+    fn parse_rfc3339_needs_the_19_char_prefix_and_nothing_more() {
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:30:00"),
+            parse_rfc3339_utc("2026-03-05T09:30:00Z"),
+            "exactly 19 chars must parse — the trailing Z is optional"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:3"),
+            None,
+            "truncated past the seconds prefix is rejected"
+        );
+        assert_eq!(parse_rfc3339_utc(""), None, "empty is not a time");
+    }
+
+    /// Separator discipline: lowercase `t` and space are accepted aliases
+    /// of `T`, but a missing date dash or a stray separator rejects.
+    #[test]
+    fn parse_rfc3339_separator_positions_are_strict() {
+        let canonical = parse_rfc3339_utc("2026-03-05T09:30:00Z");
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05t09:30:00Z"),
+            canonical,
+            "lowercase t accepted"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05 09:30:00Z"),
+            canonical,
+            "space accepted"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026a01-05T09:30:00Z"),
+            None,
+            "first date dash missing"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03a05T09:30:00Z"),
+            None,
+            "second date dash missing"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05X09:30:00Z"),
+            None,
+            "stray date-time separator rejected"
+        );
+    }
+
+    /// Field ceilings: 23:59:60 is the accepted maximum (leap second folds
+    /// into the next minute); one tick past any field rejects; and the
+    /// minute/second guards are independent `||` disjuncts — a bad minute
+    /// is rejected even when the second is fine, and vice versa.
+    #[test]
+    fn parse_rfc3339_field_ceilings() {
+        let base = parse_rfc3339_utc("2026-03-05T09:30:00Z").expect("base");
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T23:59:59Z"),
+            Some(base + 14 * 3600 + 29 * 60 + 59),
+            "23:59:59 is in range"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:59:59Z"),
+            Some(base + 29 * 60 + 59),
+            "minute 59 is in range"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:30:60Z"),
+            Some(base + 60),
+            "leap second 60 folds into the next minute"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T24:00:00Z"),
+            None,
+            "hour 24 rejected"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:60:00Z"),
+            None,
+            "minute 60 rejected"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:30:61Z"),
+            None,
+            "second 61 rejected"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:70:30Z"),
+            None,
+            "minute 70 rejected despite a fine second"
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:30:70Z"),
+            None,
+            "second 70 rejected"
+        );
+    }
+
+    /// A nonzero second must carry weight: :45 is 45 seconds past :00,
+    /// not a no-op rounding.
+    #[test]
+    fn parse_rfc3339_second_term_counts() {
+        let base = parse_rfc3339_utc("2026-03-05T09:30:00Z").expect("base");
+        assert_eq!(
+            parse_rfc3339_utc("2026-03-05T09:30:45Z").expect("45s parseable") - base,
+            45,
+            "the second term must add to the epoch, not subtract"
+        );
+    }
 }

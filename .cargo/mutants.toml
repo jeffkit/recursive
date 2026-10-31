@@ -940,4 +940,36 @@ exclude_re = [
     # the zero-usage test — an all-zero wasted usage must not write
     # cost.json).
     "src/http/agui\\.rs:1532:79: replace > with < in spawn_agui_run",
+    # ── Issue #245 batch 29 (B2 seat, task list /tmp/b2-batch29.txt) ───────
+    # src/triggers.rs (17) + src/process.rs (13) — all 30 survivors handled:
+    # 29 pinned + the one true equivalence below exempted (negative control
+    # 30/30 = 29×rc=101 red on the mapped test + 1× whole-module green;
+    # results in /tmp/b2-b29/negctl/{results.json,driver.log}).
+    # triggers::tests: store_load_surfaces_io_errors_other_than_not_found /
+    # days_from_civil_round_trips_across_era_boundaries (negative year and
+    # yoe == 100 rows) / parse_rfc3339_needs_the_19_char_prefix_* /
+    # parse_rfc3339_separator_positions_are_strict /
+    # parse_rfc3339_field_ceilings (23:59:60 ceiling, `||` independence) /
+    # parse_rfc3339_second_term_counts.
+    # process::tests: cancel_event_at_ms_is_the_wall_clock_instant /
+    # cancel_history_is_bounded_and_drops_oldest_first /
+    # global_scope_cancel_reaches_registered_task (strengthened: pre-cancel
+    # is_cancelled, note_stage↔stage, active_tasks while live) /
+    # task_registration_cancel_reports_exactly_once /
+    # signal_group_warns_and_skips_unusable_pids.
+    #
+    # parse_cron :456:49 — `(dow.max - dow.min + 1)` in the dow_star
+    # full-range check. `dow` comes from parse_field(fields[4], 0, 7), so
+    # `dow.min` is unconditionally 0, and the line just above assigns
+    # `dow.max = 6` unconditionally; the expression is therefore the
+    # constant 7, and the mutant `(dow.max + dow.min + 1)` folds to the
+    # same 7. Both variants agree on every input, so dow_star, dom_dow_or
+    # and every downstream schedule are identical — no assertion can tell
+    # them apart (#223 true-equivalence doctrine). Negative control: the
+    # mutation applied by hand → whole triggers::tests module green 47/47
+    # (not red), restored byte-exact (log /tmp/b2-b29/negctl/m17.log). The
+    # `-`→`/` sibling at the same :456:49 divides by dow.min == 0 and
+    # panics in every parse_cron test — killable, kept out of scope by the
+    # exact replacement text in the anchor.
+    "src/triggers\\.rs:456:49: replace - with \\+ in parse_cron",
 ]

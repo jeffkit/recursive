@@ -735,6 +735,20 @@ mod tests {
         let registration = TaskRegistration::spawn(CancelKind::Exec, Some(&scope));
         let token = registration.token();
         assert!(!token.is_cancelled());
+        assert!(
+            !registration.is_cancelled(),
+            "a fresh registration must not report cancelled"
+        );
+        registration.note_stage("parsing-input");
+        assert_eq!(
+            registration.stage(),
+            "parsing-input",
+            "note_stage before the cancel must be observable through stage()"
+        );
+        assert!(
+            active_tasks() >= 1,
+            "the process-wide table must report the live task"
+        );
 
         assert_eq!(cancel_scope(&scope), 1);
         assert!(token.is_cancelled());
@@ -772,5 +786,108 @@ mod tests {
         let events = registry.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "reaping-process-group");
+    }
+
+    // ── issue #245 batch 29 pins ───────────────────────────────────────
+
+    /// Contract: the record's `at_ms` is the wall-clock instant of the
+    /// cancel (unix millis), bracketed by the clock reads around the call
+    /// — a stub constant cannot masquerade as a timestamp.
+    #[tokio::test]
+    async fn cancel_event_at_ms_is_the_wall_clock_instant() {
+        let mut registry = CancelRegistry::new();
+        let handle = registry.register(CancelKind::Exec, None);
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        assert!(registry.cancel(handle.key()), "cancel must land");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        let events = registry.events();
+        assert_eq!(events.len(), 1);
+        let at = events[0].at_ms;
+        assert!(
+            at >= before && at <= after,
+            "at_ms {at} must fall inside the wall-clock bracket [{before}, {after}]"
+        );
+    }
+
+    /// Contract: the in-process history is bounded — past
+    /// `MAX_CANCEL_EVENTS` records the oldest are dropped first, so a
+    /// pathological cancel loop cannot grow the log without limit. The
+    /// surviving window is exactly the newest 64 records.
+    #[tokio::test]
+    async fn cancel_history_is_bounded_and_drops_oldest_first() {
+        let mut registry = CancelRegistry::new();
+        let mut keys = Vec::new();
+        for _ in 0..100 {
+            let handle = registry.register(CancelKind::Exec, None);
+            assert!(handle.cancel(), "each distinct handle cancels once");
+            keys.push(handle.key().to_string());
+        }
+        let events = registry.events();
+        assert_eq!(
+            events.len(),
+            MAX_CANCEL_EVENTS,
+            "history must sit at the cap, not grow past it"
+        );
+        assert_eq!(
+            events[0].key,
+            keys[keys.len() - MAX_CANCEL_EVENTS],
+            "the oldest survivor is the first of the newest window"
+        );
+        assert_eq!(
+            events.last().expect("non-empty").key,
+            keys.last().expect("non-empty").clone(),
+            "the newest record is kept"
+        );
+    }
+
+    /// Contract: `TaskRegistration::cancel` is the explicit-cancel edge on
+    /// a registration — the first call reports the record was written, a
+    /// second call reports the task was already cancelled.
+    #[tokio::test]
+    async fn task_registration_cancel_reports_exactly_once() {
+        let registration = TaskRegistration::spawn(CancelKind::McpServer, None);
+        assert!(!registration.is_cancelled());
+        assert!(registration.cancel(), "first cancel must report it landed");
+        assert!(registration.token().is_cancelled());
+        assert!(
+            !registration.cancel(),
+            "second cancel must report already-cancelled"
+        );
+    }
+
+    /// Contract: pids that cannot address a group (outside `pid_t` range)
+    /// are refused *before* any kill(2) — skipped with a WARNING naming
+    /// the signal — while a pid that fits `pid_t` goes out as a real
+    /// kill(2): an ESRCH miss (no such group here) stays silent by
+    /// contract, and is never conflated with the "unusable pid" skip.
+    #[tracing_test::traced_test]
+    #[test]
+    fn signal_group_warns_and_skips_unusable_pids() {
+        // pid == i32::MAX still fits pid_t → NOT unusable: a real kill(2)
+        // attempt (ESRCH here, silent), never the skip.
+        assert!(!signal_group(i32::MAX as u32, GroupSignal::Kill));
+        assert!(
+            !logs_contain("unusable pid"),
+            "a pid_t-sized pid must go out as kill(2), not be skipped"
+        );
+
+        // Beyond pid_t: the guard must skip before any kill(2), warned,
+        // with the signal named.
+        assert!(!signal_group(3_000_000_000, GroupSignal::Terminate));
+        assert!(
+            logs_contain("unusable pid"),
+            "the skip must be warned on the cancellation target"
+        );
+        assert!(
+            !logs_contain("process group signal failed"),
+            "no kill(2) may have been attempted for an unusable pid"
+        );
+        assert!(logs_contain("SIGTERM"), "the log names the signal");
     }
 }
