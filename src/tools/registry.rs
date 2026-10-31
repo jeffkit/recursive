@@ -2978,4 +2978,253 @@ mod tests {
         let rebuilt = make_registry().register(mcp.into_iter().next().unwrap());
         assert!(rebuilt.find_by_name("mcp__gh__search").is_some());
     }
+
+    // ── Issue #245 batch 25 (B2 seat, /tmp/b2-batch25.txt) ────────────────────
+
+    #[test]
+    fn with_same_transport_shares_transport_arc_and_carries_session_state() {
+        let src = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "Src" }))
+            .with_policy(super::policy_sandbox::PolicyConfig::default_restrictive())
+            .with_headless(true);
+        let forked = src.with_same_transport();
+        assert!(
+            forked.names().is_empty(),
+            "with_same_transport must return an empty registry"
+        );
+        assert!(
+            Arc::ptr_eq(forked.transport(), src.transport()),
+            "with_same_transport must share the SAME transport Arc, not a fresh default one"
+        );
+        assert!(
+            forked.policy().is_some(),
+            "policy must carry over (a fresh default registry has none)"
+        );
+        assert!(
+            forked.headless,
+            "headless must carry over (a fresh default registry is not headless)"
+        );
+    }
+
+    #[test]
+    fn set_policy_stores_the_restrictive_config_via_mutable_ref() {
+        use super::policy_sandbox::PolicyConfig;
+        let mut reg = make_registry();
+        assert!(reg.policy().is_none(), "fresh registry has no policy");
+        reg.set_policy(PolicyConfig::default_restrictive());
+        let stored = reg
+            .policy()
+            .expect("set_policy must attach the policy config");
+        assert!(
+            stored.shell.deny_patterns.iter().any(|p| p == "mkfs"),
+            "stored policy must be the config actually passed in"
+        );
+    }
+
+    #[test]
+    fn set_headless_sets_flag_via_mutable_ref() {
+        let mut reg = make_registry();
+        assert!(!reg.headless, "fresh registry must not be headless");
+        reg.set_headless(true);
+        assert!(
+            reg.headless,
+            "set_headless(true) must flip the flag on the registry itself"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_hook_runner_installs_runner_and_hook_count_reports_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut reg = make_registry();
+        assert_eq!(reg.hook_count(), 0, "fresh registry has no hooks");
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["hook-a.sh", "hook-b.sh"] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0").unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        reg.set_hook_runner(crate::hooks::ExternalHookRunner::discover(&[tmp
+            .path()
+            .to_path_buf()]));
+        assert_eq!(
+            reg.hook_count(),
+            2,
+            "hook_count must report the hooks of the runner set_hook_runner installed"
+        );
+    }
+
+    #[test]
+    fn with_shared_permissions_attaches_handle_and_snapshots_mode() {
+        use crate::permissions::LayeredPermissionsConfig;
+        let sp: crate::permissions::SharedPermissions =
+            Arc::new(RwLock::new(LayeredPermissionsConfig {
+                mode: PermissionMode::AcceptEdits,
+                layers: Vec::new(),
+            }));
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "Kept" }))
+            .with_shared_permissions(sp.clone());
+        assert!(
+            reg.find_by_name("Kept").is_some(),
+            "tools must survive with_shared_permissions (a fresh default registry would drop them)"
+        );
+        assert_eq!(
+            reg.permission_mode(),
+            PermissionMode::AcceptEdits,
+            "mode must be snapshotted from the shared config"
+        );
+        let attached = reg
+            .shared_permissions()
+            .expect("shared handle must be attached");
+        assert!(
+            Arc::ptr_eq(&attached, &sp),
+            "shared_permissions() must return the SAME Arc handle that was passed in"
+        );
+    }
+
+    #[test]
+    fn shared_permissions_accessor_is_none_until_attached() {
+        let reg = make_registry();
+        assert!(
+            reg.shared_permissions().is_none(),
+            "fresh registry has no shared handle"
+        );
+        let sp: crate::permissions::SharedPermissions =
+            Arc::new(RwLock::new(crate::permissions::LayeredPermissionsConfig {
+                mode: PermissionMode::Default,
+                layers: Vec::new(),
+            }));
+        let reg = reg.with_shared_permissions(sp.clone());
+        let got = reg
+            .shared_permissions()
+            .expect("handle must be visible after attach");
+        assert!(
+            Arc::ptr_eq(&got, &sp),
+            "accessor must return the attached Arc, not a fresh one"
+        );
+    }
+
+    #[test]
+    fn set_permission_mode_updates_mode_and_writes_through_to_shared_config() {
+        let mut reg = make_registry();
+        // Branch 1: no shared config yet — the mode is set AND a shared
+        // config holding it is created.
+        reg.set_permission_mode(PermissionMode::AcceptEdits);
+        assert_eq!(reg.permission_mode(), PermissionMode::AcceptEdits);
+        let created = reg
+            .shared_permissions()
+            .expect("set_permission_mode must create the shared config when absent");
+        assert_eq!(
+            created.try_read().expect("lock").mode,
+            PermissionMode::AcceptEdits,
+            "created shared config must carry the new mode"
+        );
+        // Branch 2: shared config attached — the write must go THROUGH to it
+        // (observed via the original Arc handle, not via the registry).
+        let external: crate::permissions::SharedPermissions =
+            Arc::new(RwLock::new(crate::permissions::LayeredPermissionsConfig {
+                mode: PermissionMode::Default,
+                layers: Vec::new(),
+            }));
+        let mut reg2 = make_registry().with_shared_permissions(external.clone());
+        reg2.set_permission_mode(PermissionMode::DontAsk);
+        assert_eq!(reg2.permission_mode(), PermissionMode::DontAsk);
+        assert_eq!(
+            external.try_read().expect("lock").mode,
+            PermissionMode::DontAsk,
+            "mode change must write through to the shared config"
+        );
+    }
+
+    #[test]
+    fn next_fork_seq_is_strictly_monotonic() {
+        let a = super::next_fork_seq();
+        let b = super::next_fork_seq();
+        assert!(
+            b > a,
+            "fork seq must strictly increase (got {a} then {b}): duplicate seqs would make two \
+             forks share one shadow index file"
+        );
+        let c = super::next_fork_seq();
+        assert!(c > b, "fork seq must keep increasing across calls");
+    }
+
+    #[test]
+    fn container_tier_never_registers_deliverables_even_when_enabled() {
+        let _guard = crate::test_util::env_lock();
+        let saved = std::env::var("RECURSIVE_DELIVERABLES").ok();
+        // Force the env gate OPEN so disable_host_exec is the ONLY thing that
+        // can keep the deliverables tools out of a container-tier registry.
+        std::env::set_var("RECURSIVE_DELIVERABLES", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = make_registry().transport().clone();
+        let registry = super::build_standard_tools_with_transport_opt(
+            transport,
+            tmp.path(),
+            &[],
+            None,
+            &[],
+            30,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(
+            registry.deliverables().is_none(),
+            "container tier must not carry the host-fs deliverables ledger"
+        );
+        assert!(
+            registry
+                .find_by_name(super::super::present::PRESENT_TOOL_NAME)
+                .is_none(),
+            "{} must not be registered in the container tier",
+            super::super::present::PRESENT_TOOL_NAME
+        );
+        assert!(
+            registry
+                .find_by_name(super::super::ledger::CHANGE_LEDGER_TOOL_NAME)
+                .is_none(),
+            "{} must not be registered in the container tier",
+            super::super::ledger::CHANGE_LEDGER_TOOL_NAME
+        );
+        match saved {
+            Some(v) => std::env::set_var("RECURSIVE_DELIVERABLES", v),
+            None => std::env::remove_var("RECURSIVE_DELIVERABLES"),
+        }
+    }
+
+    #[test]
+    fn load_skill_registered_exactly_when_skills_nonempty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = super::build_standard_tools(tmp.path(), &[], 30);
+        assert!(
+            empty.find_by_name("Skill").is_none(),
+            "load_skill must NOT be registered when the skills slice is empty"
+        );
+        let skills = vec![crate::skills::Skill {
+            name: "demo".to_string(),
+            description: "batch 25 pin".to_string(),
+            path: tmp.path().join("demo/SKILL.md"),
+            mode: crate::skills::SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: None,
+        }];
+        let with_skill = super::build_standard_tools(tmp.path(), &skills, 30);
+        assert!(
+            with_skill.find_by_name("Skill").is_some(),
+            "load_skill must be registered when the skills slice is non-empty"
+        );
+    }
 }

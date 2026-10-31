@@ -33,6 +33,29 @@ exclude_globs = [
     # FEATURES (owner call — cost is bollard/aws-sdk-s3/redis per run), drop
     # this entry and the file's own pins take over.
     "src/tools/transport_layer/container_transport.rs",
+    # ── Issue #245 batch 25 (B2 seat, task list /tmp/b2-batch25.txt) ───────
+    # storage/s3.rs is the second whole-file cfg-blind case, same class as
+    # container_transport.rs above: `src/storage/mod.rs` declares it
+    # `#[cfg(feature = "cloud-runtime")]` and that feature is NOT in
+    # agent-mutants.sh FEATURES, so under the gate the module is never
+    # compiled and each of its mutants builds byte-identical to the baseline
+    # — the 18 "MISSED" rows of this batch's task list are that artifact
+    # (the file itself already says so on its two `mutants::skip` attributes).
+    # Two of the 18 cannot even compile where the module IS built:
+    # `with_client → Default::default()` (:54, no `Default` for
+    # S3StorageBackend) and `load_transcript → Ok(vec![Default::default()])`
+    # (:77, no `Default` for Message) — cargo-mutants reports those unviable,
+    # never MISSED, once the feature is in the gate.
+    # All 18 are pinned where the file compiles: 7 tests in the file's
+    # `mod tests` drive the backend against a loopback fake S3 (recorded
+    # request line pins the tenant-scoped key layout; canned 200 / 404
+    # NoSuchKey / 403 AccessDenied pin parse / Ok(empty|None) / Err mapping),
+    # each hand-verified under `--features cloud-runtime` (16 red + 2
+    # unviable, logs in /tmp/b2-b25/logs-s3/).
+    # UNLOCK CONDITION: identical to the entry above — the day
+    # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
+    # the file's own pins take over.
+    "src/storage/s3.rs",
 ]
 
 # Regexes match the mutant *name* string cargo-mutants prints.
