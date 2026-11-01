@@ -1152,4 +1152,75 @@ mod tests {
         let msgs = r.reinject();
         assert!(msgs.is_empty());
     }
+
+    // ── #245 compact batch mc4a (主控直落) ──
+
+    #[test]
+    fn reinject_exact_budget_file_is_included() {
+        // Kills :111:41 `>→>=`: a file whose token estimate lands exactly on
+        // the budget is included — only strictly-greater exceeds.
+        let body = "A".repeat(396); // 396/4 + 1 = 100 tokens
+        let state = make_state_with(vec![("exact.rs", &body)]);
+        let r = FileReinjector {
+            token_budget: 100,
+            per_file_budget: 5000,
+            ..FileReinjector::new(state)
+        };
+        let msgs = r.reinject(&[]);
+        assert_eq!(msgs.len(), 1, "exact-budget file must be included");
+    }
+
+    #[test]
+    fn reinject_budget_walk_is_additive_and_strict() {
+        // Kills :108 `+→*` / :111:28 `+=→*`: per-file tokens must add one
+        // (400/4+1 = 101) and tokens_used must accumulate additively. With
+        // budget 200 the second file (100 tokens) exceeds 101+100=201 →
+        // exactly one message. Multiplicative variants never exhaust the
+        // budget → two messages.
+        let big = "A".repeat(400);
+        let body2 = "A".repeat(396);
+        let state = make_state_with(vec![("one.rs", &big), ("two.rs", &body2)]);
+        let r = FileReinjector {
+            token_budget: 200,
+            per_file_budget: 5000,
+            ..FileReinjector::new(state)
+        };
+        let msgs = r.reinject(&[]);
+        assert_eq!(msgs.len(), 1, "budget 200 must fit only the first file");
+    }
+
+    #[test]
+    fn reinject_no_truncation_marker_at_exact_byte_budget() {
+        // Kills :98:46 `>→>=`: content exactly per_file_budget*4 bytes is
+        // NOT truncated — no marker.
+        let body = "A".repeat(400); // per_file_budget 100 tokens = 400 bytes
+        let state = make_state_with(vec![("exact.rs", &body)]);
+        let r = FileReinjector {
+            token_budget: 5000,
+            per_file_budget: 100,
+            ..FileReinjector::new(state)
+        };
+        let msgs = r.reinject(&[]);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            !msgs[0].content.contains("truncated for compaction"),
+            "exact-byte-budget content must not be marked as truncated"
+        );
+    }
+
+    #[test]
+    fn file_reinjector_zero_spelled_with_leading_zeroes_disables() {
+        // Kills :181:58 `>→>=`: "00" parses to 0 but misses the Some("0")
+        // literal arm — the `n > 0` filter is the only guard; `>=` would
+        // build a max_files=0 spec instead of disabling.
+        assert!(file_reinjector_spec_from_env(Some("00"), None).is_none());
+    }
+
+    #[test]
+    fn file_reinjector_zero_budget_falls_back_to_default() {
+        // Kills :187:58 `>→>=`: a zero budget fails the filter → unwrap_or
+        // restores the 50_000 default; `>=` would accept budget 0.
+        let spec = file_reinjector_spec_from_env(None, Some("00")).unwrap();
+        assert_eq!(spec.token_budget, 50_000);
+    }
 }

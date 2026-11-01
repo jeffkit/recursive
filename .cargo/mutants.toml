@@ -1186,4 +1186,11 @@ exclude_re = [
     # is false for both. negctl: mutation applied → compact suite 150/150
     # green (compact mc2, 主控直落).
     "src/compact/mod\\.rs:640:35: replace > with >= in Compactor::split_for_compaction",
+    # reinject.rs :31:15 `>→>=` in truncate_on_char_boundary — true
+    # equivalence: max_bytes == s.len() takes the early return under `>=`,
+    # and under `>` falls through to end = max_bytes = s.len() which IS a
+    # char boundary, so &s[..end] == s unchanged. Identical on the whole
+    # domain (the `==`/`>` siblings are killed by existing pins). negctl:
+    # mutation applied → compact::reinject suite green (compact mc4a).
+    "src/compact/reinject\\.rs:31:15: replace > with >= in truncate_on_char_boundary",
 ]
