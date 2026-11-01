@@ -4665,7 +4665,10 @@ mod tests {
     /// pins assert their literal wire values (asserting against the
     /// constants themselves is a tautology and is exactly why the
     /// `delete -` mutants survived). Kills `:101:29 delete -`
-    /// (INVALID_PARAMS) and, as a bonus, `:98:26 delete -` (PARSE_ERROR).
+    /// (INVALID_PARAMS) and, as a bonus, `:98:26 delete -` (PARSE_ERROR);
+    /// batch 32 adds `:100:31 delete -` (METHOD_NOT_FOUND) and, as a
+    /// bonus, `:99:30 delete -` (INVALID_REQUEST) — same tautology shape,
+    /// every other assertion in the suite compares against the constant.
     #[tokio::test]
     async fn jsonrpc_error_code_constants_hold_their_documented_values() {
         // PARSE_ERROR = -32700 on a malformed line.
@@ -4685,6 +4688,23 @@ mod tests {
             parse_line(&lines, 0)["error"]["code"],
             -32602,
             "INVALID_PARAMS"
+        );
+
+        // METHOD_NOT_FOUND = -32601 on an unknown method before initialize.
+        let lines =
+            run_server(r#"{"jsonrpc":"2.0","id":1,"method":"no/such/method","params":{}}"#).await;
+        assert_eq!(
+            parse_line(&lines, 0)["error"]["code"],
+            -32601,
+            "METHOD_NOT_FOUND"
+        );
+
+        // INVALID_REQUEST = -32600 on an empty batch.
+        let lines = run_server("[]").await;
+        assert_eq!(
+            parse_line(&lines, 0)["error"]["code"],
+            -32600,
+            "INVALID_REQUEST"
         );
     }
 
@@ -5536,6 +5556,76 @@ done
                 .expect("error message")
                 .contains("'jsonrpc'"),
             "the error must name the missing field: {v}"
+        );
+    }
+
+    // ── writer task frame-dropping contract (issue #245 batch 32) ────
+
+    /// A writer whose `flush` fails while plain writes succeed (peer
+    /// wedged, not cleanly gone). The first frame's flush failure must
+    /// flip the writer task into peer-gone mode so every *later* frame is
+    /// dropped. Kills `:314:17 replace || with &&` in spawn_writer_task:
+    /// under the mutant a lone flush failure (write_all still Ok) no
+    /// longer sets peer_gone, so later frames keep being delivered. The
+    /// `:313:17` sibling needs exactly this scenario too and dies with
+    /// the same pin.
+    struct FlushAlwaysFailsWriter {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncWrite for FlushAlwaysFailsWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.buf
+                .lock()
+                .expect("test buffer mutex")
+                .extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test writer: flush always fails",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_task_drops_later_frames_after_a_flush_failure() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, handle) = spawn_writer_task(FlushAlwaysFailsWriter { buf: buf.clone() });
+        tx.send(serde_json::json!({"marker": "frame-a"}))
+            .await
+            .expect("send frame a");
+        tx.send(serde_json::json!({"marker": "frame-b"}))
+            .await
+            .expect("send frame b");
+        drop(tx);
+        handle.await.expect("writer task");
+
+        let out = String::from_utf8(buf.lock().expect("test buffer mutex").clone())
+            .expect("frames are UTF-8");
+        assert!(
+            out.contains("frame-a"),
+            "the first frame must be written before the flush failure: {out}"
+        );
+        assert!(
+            !out.contains("frame-b"),
+            "frames after a flush failure must be dropped (peer is gone): {out}"
         );
     }
 }
