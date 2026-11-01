@@ -1517,4 +1517,259 @@ mod tests {
         assert_eq!(spliced.len(), 3);
         assert_eq!(spliced[2].tool_call_id.as_deref(), Some("tc-1"));
     }
+
+    // ── #245 batch 31 ─────────────────────────────────────────────────
+
+    /// Append raw JSONL lines to a finished session's transcript.
+    fn append_raw_lines(session_dir: &Path, lines: &[String]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(session_dir.join("transcript.jsonl"))
+            .unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+    }
+
+    /// Minimal valid `.meta.json` body (pre-Goal-269 shape, no
+    /// schema_version — loads via the serde defaults).
+    fn valid_meta_json(session_id: &str) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "goal": "batch 31 fixture",
+            "model": "m",
+            "provider": "p",
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "message_count": 0,
+            "status": "completed"
+        })
+        .to_string()
+    }
+
+    /// Fixture shared by the two non-boundary-decoy tests: a transcript with
+    /// two system-shaped decoy rows that parse as `CompactBoundaryEntry` but
+    /// are NOT `compact_boundary` declarations (`type:system/subtype:other`,
+    /// and the mirrored `type:note/subtype:compact_boundary`). Neither may
+    /// trigger the compaction cut.
+    fn session_with_non_boundary_system_decoys() -> (crate::test_util::IsolatedWorkspace, PathBuf) {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "decoys", "m", "p").unwrap();
+        w.append(&Message::user("one".to_string()), None, None)
+            .unwrap();
+        drop(w);
+        // list_sessions resolves the sessions dir the same way the writer
+        // does (user_sessions_dir), unlike list_all_sessions which joins
+        // base/.recursive/sessions directly.
+        let dir = SessionReader::list_sessions(tmp.path()).unwrap().remove(0);
+        append_raw_lines(
+            &dir,
+            &[
+                r#"{"type":"system","subtype":"other","timestamp":"2020-01-01T00:00:00Z"}"#
+                    .to_string(),
+                r#"{"type":"note","subtype":"compact_boundary","timestamp":"2020-01-01T00:00:00Z"}"#
+                    .to_string(),
+            ],
+        );
+        // Post-decoy exchange, written directly as raw rows (the writer was
+        // dropped to release the lock; a plain user row is all we need).
+        append_raw_lines(
+            &dir,
+            &[serde_json::json!({
+                "id": "msg_last", "role": "user", "content": "two",
+                "timestamp": "2020-01-01T00:00:01Z"
+            })
+            .to_string()],
+        );
+        (tmp, dir)
+    }
+
+    /// `read_transcript` cuts at `compact_boundary` declarations only — a
+    /// `system`-typed row with any other subtype (and any other type with a
+    /// `compact_boundary` subtype) is not one. `&& → ||` cuts the transcript
+    /// at the first decoy and silently drops everything before it.
+    #[test]
+    fn read_transcript_ignores_system_entries_that_are_not_compact_boundaries() {
+        let (_tmp, dir) = session_with_non_boundary_system_decoys();
+        let entries = SessionReader::load_transcript(&dir).unwrap();
+        let contents: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["one", "two"],
+            "decoy system rows must be skipped, not treated as a compaction cut"
+        );
+    }
+
+    /// Same contract for `load_full_history`: the decoys must not surface as
+    /// `CompactBoundary` markers (they are skipped as corrupt rows here,
+    /// having no `TranscriptEntry` shape).
+    #[test]
+    fn load_full_history_ignores_system_entries_that_are_not_compact_boundaries() {
+        let (_tmp, dir) = session_with_non_boundary_system_decoys();
+        let loaded = SessionReader::load_full_history(&dir).unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "only the two real messages may load, no marker rows: {loaded:?}"
+        );
+        assert!(
+            loaded.iter().all(|e| matches!(e, LoadedEntry::Message(_))),
+            "a non-boundary system row must never become a CompactBoundary marker: {loaded:?}"
+        );
+    }
+
+    /// `load_seed_for_existing_runtime` re-attaches the runtime's LEADING
+    /// system prompt only: the take_while stops at the first non-system row
+    /// and at a compaction summary. `&& → ||` swallows stale user rows and
+    /// the summary into the "prompt", duplicating runtime state in front of
+    /// the seed.
+    #[test]
+    fn load_seed_for_existing_runtime_scans_only_the_leading_prompt() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "lead scan", "m", "p").unwrap();
+        w.append(&Message::user("hello".to_string()), None, None)
+            .unwrap();
+        w.append(&Message::assistant("hi".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+        let dir = w.session_dir().to_path_buf();
+        drop(w);
+
+        // Prompt followed by a stale non-system row: the scan stops there.
+        let runtime = vec![
+            Message::system("RUNTIME PROMPT".to_string()),
+            Message::user("stale".to_string()),
+        ];
+        let seed = SessionReader::load_seed_for_existing_runtime(&dir, &runtime).unwrap();
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["RUNTIME PROMPT", "hello", "hi"],
+            "only the leading system row is the prompt; the stale user row must not join it"
+        );
+
+        // Prompt followed by a compaction summary (a System row that IS
+        // conversation state): the scan stops at the summary.
+        let runtime = vec![
+            Message::system("RUNTIME PROMPT".to_string()),
+            Message::system("[compacted]".to_string()).with_compaction_summary(),
+        ];
+        let seed = SessionReader::load_seed_for_existing_runtime(&dir, &runtime).unwrap();
+        let contents: Vec<&str> = seed.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["RUNTIME PROMPT", "hello", "hi"],
+            "the compaction summary must end the prompt scan (the seed already carries it)"
+        );
+    }
+
+    /// The orphan scan keys on the LAST assistant message that HAS
+    /// tool_calls. `&& → ||` lets any plain assistant reply match, so a
+    /// transcript that ends `assistant(tool_call) → assistant(text)` finds
+    /// the text-only tail and reports no orphans.
+    #[test]
+    fn scan_orphan_tool_calls_finds_the_last_tool_calling_assistant() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
+        let mut asst = Message::assistant("calling".to_string());
+        asst.tool_calls = vec![crate::llm::ToolCall {
+            id: "tc-x".to_string(),
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        }];
+        w.append(&Message::user("go".to_string()), None, None)
+            .unwrap();
+        w.append(&asst, None, None).unwrap();
+        // The crash left the call unanswered, but a plain assistant reply
+        // follows it — that reply must not become the scan target.
+        w.append(&Message::assistant("all done".to_string()), None, None)
+            .unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let reg = crate::tools::ToolRegistry::local();
+        let orphans = SessionReader::scan_orphan_tool_calls(w.session_dir(), &reg).unwrap();
+        assert_eq!(orphans.len(), 1, "the unanswered call is still an orphan");
+        assert_eq!(orphans[0].tool_call_id, "tc-x");
+    }
+
+    /// An assistant with tool_calls as the very FIRST transcript entry: the
+    /// answered-set slice starts at `asst_idx + 1`. `+ → -` underflows usize
+    /// (0 - 1 panics) instead of yielding the empty tail.
+    #[test]
+    fn scan_orphan_tool_calls_handles_assistant_at_transcript_start() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let mut w = SessionWriter::create(tmp.path(), "g", "m", "p").unwrap();
+        let mut asst = Message::assistant("first thing".to_string());
+        asst.tool_calls = vec![crate::llm::ToolCall {
+            id: "tc-0".to_string(),
+            name: "Read".to_string(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        }];
+        w.append(&asst, None, None).unwrap();
+        w.finish(SessionStatus::Completed).unwrap();
+
+        let reg = crate::tools::ToolRegistry::local();
+        let orphans = SessionReader::scan_orphan_tool_calls(w.session_dir(), &reg).unwrap();
+        assert_eq!(orphans.len(), 1, "the leading orphan call is detected");
+        assert_eq!(orphans[0].tool_call_id, "tc-0");
+    }
+
+    /// A session directory counts only when it carries `.meta.json`. `&& →
+    /// ||` admits any directory inside a workspace slug — e.g. a bare dir
+    /// mid-creation — as a listed session.
+    #[test]
+    fn list_sessions_excludes_dirs_without_meta_json() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+        let w = SessionWriter::create(ws, "meta gate", "m", "p").unwrap();
+        drop(w);
+
+        let sessions = SessionReader::list_sessions(ws).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let slug_dir = sessions[0].parent().unwrap().to_path_buf();
+        std::fs::create_dir(slug_dir.join("bare-dir")).unwrap();
+
+        let sessions = SessionReader::list_sessions(ws).unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a directory without .meta.json must not be listed as a session: {sessions:?}"
+        );
+    }
+
+    /// `list_all_sessions` needs real session dirs (with `.meta.json`) and
+    /// must survive stray non-directory entries under `sessions/`. Deleting
+    /// the slug `is_dir` guard inverts it: real sessions are skipped and the
+    /// stray file is handed to `read_dir` (an error). `&& → ||` lists the
+    /// metaless directory. The fixture is laid out by hand because this
+    /// reader joins `base/.recursive/sessions` directly (the writer routes
+    /// through `user_sessions_dir`, which points elsewhere in tests).
+    #[test]
+    fn list_all_sessions_requires_meta_and_skips_stray_files() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let base = tmp.path();
+        let valid = base
+            .join(".recursive")
+            .join("sessions")
+            .join("ws-slug")
+            .join("20260101T000000Z-valid");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(valid.join(".meta.json"), valid_meta_json("valid-id")).unwrap();
+        std::fs::write(valid.join("transcript.jsonl"), "").unwrap();
+        std::fs::create_dir_all(valid.parent().unwrap().join("bare-dir")).unwrap();
+        std::fs::write(
+            base.join(".recursive").join("sessions").join("stray.tmp"),
+            b"x",
+        )
+        .unwrap();
+
+        let sessions = SessionReader::list_all_sessions(base)
+            .expect("a stray file under sessions/ must not fail the listing");
+        assert_eq!(
+            sessions,
+            vec![valid],
+            "only the session with .meta.json may be listed: {sessions:?}"
+        );
+    }
 }

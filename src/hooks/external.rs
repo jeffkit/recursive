@@ -2518,4 +2518,166 @@ mod tests {
         let silent = ExternalHookRunner::discover(&[]);
         silent.emit(AgentEvent::Latency { step: 0, llm_ms: 1 });
     }
+
+    // ── #245 batch 31: find_env_var_refs scanner arithmetic ─────────
+
+    /// `$` as the *last* byte of the string: the scanner must fall into the
+    /// `$VAR` branch, find no alphanumeric run, and emit nothing. Pins the
+    /// `i + 1 < bytes.len()` lookahead bound — `+ → *` makes the guard
+    /// trivially true and `→ <=` lets the lookahead through, both of which
+    /// index `bytes[len]` on this input and panic.
+    #[test]
+    fn find_env_var_refs_ignores_trailing_dollar() {
+        assert_eq!(find_env_var_refs("total 5$"), vec![]);
+        assert_eq!(find_env_var_refs("a$"), vec![]);
+    }
+
+    /// After a `${VAR}` hit the scan index must jump past the closing brace
+    /// (`i += 3 + end`): a following `$$`-adjacent ref must still be found.
+    /// `+= → *=` overshoots from any index ≥ 2 and drops the second ref
+    /// (`a=${A}${B}` loses `${B}`); the `3 + end → 3 * end` variant
+    /// undershoots on `end > 1` (`a${AB}$C` loses `$C`).
+    #[test]
+    fn find_env_var_refs_keeps_adjacent_refs_around_curly_jumps() {
+        assert_eq!(
+            find_env_var_refs("a=${A}${B}"),
+            vec![
+                ("${A}".to_string(), "A".to_string()),
+                ("${B}".to_string(), "B".to_string()),
+            ],
+            "the scan must resume right after the first closing brace"
+        );
+        // `end == 2` here: the `3 * end` undershoot lands before the `$C`.
+        assert_eq!(
+            find_env_var_refs("a${AB}$C"),
+            vec![
+                ("${AB}".to_string(), "AB".to_string()),
+                ("$C".to_string(), "C".to_string()),
+            ],
+            "a multi-char var must not swallow the following bare ref"
+        );
+    }
+
+    /// A `$` followed by a non-name byte (`$`, space, …) starts no variable:
+    /// `end == start` and the scanner must skip it silently. `end > start →
+    /// end >= start` pushes an empty-named ref for every bare `$` instead.
+    #[test]
+    fn find_env_var_refs_skips_bare_dollar() {
+        assert_eq!(find_env_var_refs("a $$ b"), vec![]);
+        assert_eq!(find_env_var_refs("$ "), vec![]);
+    }
+
+    // ── #245 batch 31: fail_mode=open-on-approval warning ───────────
+
+    /// Run `run_hook` for a command hook and return the log lines captured
+    /// while it ran. Uses a real `/bin/true` command — cheap, no output.
+    async fn run_hook_capture_log(
+        fail_mode: Option<HookFailMode>,
+        event: HookEvent,
+    ) -> Vec<String> {
+        let hook = ResolvedHook {
+            kind: ResolvedHookKind::Command(PathBuf::from("/bin/true"), vec![]),
+            timeout_secs: Some(5),
+            event_name: None,
+            matcher: None,
+            once: false,
+            r#async: false,
+            async_rewake: false,
+            fail_mode,
+        };
+        let runner = ExternalHookRunner::discover(&[]);
+        let input = make_tool_input(event, "Bash", serde_json::json!({"command": "ls"}));
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            let _ = runner.run_hook(&hook, 0, &input).await;
+        }
+        let captured = lines.lock().unwrap().clone();
+        captured
+    }
+
+    /// The fail-open-on-approval warning fires for *exactly* the overlap:
+    /// explicit `fail_mode=open` AND an approval event. `== → !=` warns on
+    /// every OTHER combination (closed/default approval) and goes silent on
+    /// the real one; `&& → ||` warns whenever either side alone holds.
+    /// All three off-diagonal combinations must stay silent.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_hook_warns_exactly_when_open_fail_mode_meets_approval_event() {
+        // Explicit open + approval (PreToolCall) → the warning is the point.
+        let lines = run_hook_capture_log(Some(HookFailMode::Open), HookEvent::PreToolCall).await;
+        assert!(
+            lines.iter().any(|l| l.contains("fail_mode=open")
+                && l.contains("approval")
+                && l.starts_with("[WARN]")),
+            "explicit fail_mode=open on an approval event must WARN, got: {lines:?}"
+        );
+
+        // Unset fail mode on approval → per-event default is CLOSED; the
+        // fail-open warning must stay silent.
+        let lines = run_hook_capture_log(None, HookEvent::PreToolCall).await;
+        assert!(
+            !lines.iter().any(|l| l.contains("fail_mode=open")),
+            "default (closed) approval posture must not warn about fail_mode=open, got: {lines:?}"
+        );
+
+        // Explicit open on a notification event (non-approval) → fail-open
+        // is the expected posture there; no warning.
+        let lines = run_hook_capture_log(Some(HookFailMode::Open), HookEvent::PostToolCall).await;
+        assert!(
+            !lines.iter().any(|l| l.contains("fail_mode=open")),
+            "fail_mode=open on a non-approval event must not warn, got: {lines:?}"
+        );
+    }
+
+    // ── #245 batch 31: asyncRewake exit-code plumbing ───────────────
+
+    /// `run_command_exit_code` must surface the child's real exit status:
+    /// the `Ok(Ok(s)) => Ok(s.code())` arm is the only path that maps a
+    /// completed process to its code; deleting the arm funnels every
+    /// successful run into the `_ => Ok(None)` fallback and asyncRewake
+    /// would never fire again.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_command_exit_code_reports_the_child_exit_status() {
+        use crate::hooks::config::{HookCommand, HookCommandType, HookMatcher, HooksConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("exit7.sh");
+        std::fs::write(&hook_path, "#!/bin/sh\nexit 7\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hook_path, perms).unwrap();
+        }
+        let cfg = HooksConfig {
+            events: std::collections::HashMap::from([(
+                "PreToolCall".to_string(),
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        r#type: HookCommandType::Command,
+                        command: Some(hook_path.to_string_lossy().to_string()),
+                        async_rewake: true,
+                        timeout: 5,
+                        ..Default::default()
+                    }],
+                }],
+            )]),
+        };
+        // No mock exit codes → the real spawn path runs (the mock slot is
+        // empty, so `run_command_exit_code` cannot short-circuit).
+        let runner = ExternalHookRunner::from_config(cfg);
+        let hook = runner.hooks[0].clone();
+        let input = make_tool_input(HookEvent::PreToolCall, "Bash", serde_json::json!({}));
+        let code = runner
+            .run_command_exit_code(&hook, 0, &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            code,
+            Some(7),
+            "a hook that exits 7 must report Some(7) to the asyncRewake path"
+        );
+    }
 }

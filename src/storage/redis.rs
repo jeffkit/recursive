@@ -164,4 +164,25 @@ mod tests {
             .expect("load_state");
         assert_eq!(result, None);
     }
+
+    /// #245 batch 31: the key namespace is `<prefix>:session:<id>` — the
+    /// tenant boundary between stores — and `with_default_ttl` builds the
+    /// same store with the 2-hour TTL (deadpool pool creation is lazy, so no
+    /// live Redis is needed to construct one). Pinning `key()` directly:
+    /// a mutant constant ("xyzzy" / empty) would silently cross-wire every
+    /// tenant onto one key. This test is itself inside the
+    /// `cloud-runtime`-gated module — see the batch-31 exclude_globs entry
+    /// in .cargo/mutants.toml for why the mutation gate still excludes the
+    /// whole file.
+    #[test]
+    fn redis_key_namespacing_and_default_ttl_constructor() {
+        let store = RedisSessionStore::with_default_ttl("redis://127.0.0.1:1", "tenant-a")
+            .expect("pool creation must be lazy (no server at :1)");
+        assert_eq!(store.key("sess-1"), "tenant-a:session:sess-1");
+        assert_eq!(store.key("other"), "tenant-a:session:other");
+
+        let store = RedisSessionStore::new("redis://127.0.0.1:1", Duration::from_secs(60), "p2")
+            .expect("pool creation must be lazy (no server at :1)");
+        assert_eq!(store.key("s"), "p2:session:s");
+    }
 }

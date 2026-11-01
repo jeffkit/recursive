@@ -81,6 +81,27 @@ exclude_globs = [
     # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
     # the file's own pins take over.
     "src/tools/transport_layer/docker_sandbox.rs",
+    # ── Issue #245 batch 31 (B1 seat, task list /tmp/b1-batch31.txt) ───────
+    # storage/redis.rs is the fourth whole-file cfg-blind case, same class
+    # as container_transport.rs / storage/s3.rs / docker_sandbox.rs above:
+    # src/storage/mod.rs declares it `#[cfg(feature = "cloud-runtime")]`
+    # and that feature is NOT in agent-mutants.sh FEATURES, so under the
+    # gate the module is never compiled and each of its mutants builds
+    # byte-identical to the baseline — the 3 "MISSED" rows of this batch's
+    # task list are that artifact. All 3 are dispositioned where the file
+    # DOES compile (`--features cloud-runtime`, hand-verified locally,
+    # logs in /tmp/b1-b31/negctl/):
+    # - `key → "xyzzy".into()` and `key → String::new()` are pinned by
+    #   redis_key_namespacing_and_default_ttl_constructor (the tenant
+    #   `<prefix>:session:<id>` layout asserted on two prefixes);
+    # - `with_default_ttl → Ok(Default::default())` is unviable when the
+    #   file compiles (E0277: RedisSessionStore implements no Default —
+    #   same unviable-when-compiled class as the s3.rs rows of batch 25
+    #   and the docker_sandbox.rs rows of batch 30).
+    # UNLOCK CONDITION: identical to the entries above — the day
+    # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
+    # the file's own pins take over.
+    "src/storage/redis.rs",
 ]
 
 # Regexes match the mutant *name* string cargo-mutants prints.
@@ -1041,4 +1062,50 @@ exclude_re = [
     "src/knowledge/episodic_recall\\.rs:277:25: replace match guard err\\.kind\\(\\) == std::io::ErrorKind::NotFound with false in episodic_recall_summary",
     "src/tasks/task_get\\.rs:85:19: replace > with >= in truncate",
     "src/tasks/task_list\\.rs:123:19: replace > with >= in truncate",
+    # ── Issue #245 batch 31 (B1 seat, task list /tmp/b1-batch31.txt) ───────
+    # 30 survivors dispositioned: 26 pinned (negative controls 26/26 red on
+    # the mapped test, rc=101) + 1 unviable-when-compiled (redis.rs, under
+    # the whole-file exclude_globs above) + the three true equivalences
+    # below (each hand-verified: mutation applied → whole module green →
+    # byte-exact restore; logs in /tmp/b1-b31/negctl/).
+    #
+    # rate_limit.rs :291:24 — `trusted_proxies > 0` → `>=` in
+    # extract_client_key_with_config. On usize, `>= 0` is vacuously true,
+    # so the branch is entered for every hop count the mutant adds (0); at
+    # `trusted_proxies == 0` the inner trusted_xff_client(req, 0) returns
+    # None unconditionally (`entries.len().checked_sub(0)` = Some(len),
+    # `entries.get(len)` = None) and the caller falls through to the socket
+    # IP exactly as the skipped branch did. Identical key for every
+    # request. Verified: mutation applied → whole http::rate_limit module
+    # 22/22 green → restored (log rate_limit.rs_291_24_gt_ge.log). The
+    # killable `>`→`==` and `>`→`<` siblings at the same :291:24 stay in
+    # scope via the exact replacement text in the anchor (both red under
+    # the existing forged-XFF tests).
+    "src/http/rate_limit\\.rs:291:24: replace > with >= in extract_client_key_with_config",
+    # rate_limit.rs :415:53 — `b.last_refill < bb.last_refill` → `<=` in
+    # pick_eviction_victim's within-class tiebreak. `<` and `<=` differ
+    # only when two same-class idle candidates carry EXACTLY equal
+    # Instant values (two separate check() calls landing on the same clock
+    # tick); even then both variants evict one of the tied-oldest
+    # same-class buckets — a choice the original already randomises via
+    # HashMap iteration order — and no deterministic fixture can produce
+    # equal Instants across two syscalls to name which key must go.
+    # Verified: mutation applied → whole http::rate_limit module 22/22
+    # green → restored (log rate_limit.rs_415_53_lt_le.log). The killable
+    # `<`→`==` and `<`→`>` siblings stay in scope (the `==` variant is
+    # pinned by
+    # eviction_within_class_picks_the_oldest_bucket_under_any_iteration_order).
+    "src/http/rate_limit\\.rs:415:53: replace < with <= in pick_eviction_victim",
+    # reader.rs :309:76 — `entries[asst_idx + 1..]` → `entries[asst_idx *
+    # 1..]` in scan_orphan_tool_calls. asst_idx provably indexes a row with
+    # `role == "assistant"` (the find predicate), so the extra slice head
+    # entries[asst_idx] is that same assistant row, which the
+    # `role == "tool"` filter always drops: the answered-id set is
+    # identical for every transcript. Verified: mutation applied → whole
+    # session::reader module 34/34 green → restored (log
+    # reader.rs_309_76_plus_times.log). The killable `+`→`-` sibling stays
+    # in scope (pinned by
+    # scan_orphan_tool_calls_handles_assistant_at_transcript_start: the
+    # assistant as the very first row underflows usize).
+    "src/session/reader\\.rs:309:76: replace \\+ with \\* in SessionReader::scan_orphan_tool_calls",
 ]

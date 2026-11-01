@@ -631,6 +631,101 @@ mod tests {
         let limiter = rate_limiter_from_env();
         assert_eq!(limiter.max_buckets, 1);
 
+        // ── #245 batch 31: env-parsing observability + RPM conversion ──
+        // Degradations must be observable (owner ruling): rpm=0 and
+        // burst=0 each WARN about the starvation they cause, and the
+        // direct-exposure posture (trusted_proxies=0) INFOs that XFF is
+        // untrusted. Each message appears exactly in its own condition.
+        std::env::remove_var("RECURSIVE_RATE_LIMIT_RPM");
+        std::env::remove_var("RECURSIVE_RATE_LIMIT_BURST");
+        std::env::remove_var("RECURSIVE_RATE_LIMIT_TRUSTED_PROXIES");
+        std::env::remove_var("RECURSIVE_RATE_LIMIT_MAX_BUCKETS");
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let captured;
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            // RPM conversion (rpm / 60.0): 120 RPM is exactly 2 tokens/s —
+            // `/ → %` collapses it to 0.0 (bucket never refills), `/ → *`
+            // inflates it 3600×.
+            std::env::set_var("RECURSIVE_RATE_LIMIT_RPM", "120");
+            let limiter = rate_limiter_from_env();
+            assert_eq!(
+                limiter.refill_rate, 2.0,
+                "120 RPM must parse to 2 tokens/second"
+            );
+            captured = lines.lock().unwrap().clone();
+        }
+        assert!(
+            !captured.iter().any(|l| l.contains("never refills")),
+            "a healthy RPM must not warn about starvation, got: {captured:?}"
+        );
+
+        // rpm = 0 → the never-refills WARN fires.
+        std::env::set_var("RECURSIVE_RATE_LIMIT_RPM", "0");
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let captured;
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            let _ = rate_limiter_from_env();
+            captured = lines.lock().unwrap().clone();
+        }
+        assert!(
+            captured
+                .iter()
+                .any(|l| l.starts_with("[WARN]") && l.contains("never refills")),
+            "RECURSIVE_RATE_LIMIT_RPM=0 must WARN that clients starve, got: {captured:?}"
+        );
+        std::env::remove_var("RECURSIVE_RATE_LIMIT_RPM");
+
+        // burst = 0 → the reject-everything WARN fires.
+        std::env::set_var("RECURSIVE_RATE_LIMIT_BURST", "0");
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let captured;
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            let _ = rate_limiter_from_env();
+            captured = lines.lock().unwrap().clone();
+        }
+        assert!(
+            captured.iter().any(|l| l.starts_with("[WARN]")
+                && l.contains("all requests will be rejected")),
+            "RECURSIVE_RATE_LIMIT_BURST=0 must WARN that all requests are rejected, got: {captured:?}"
+        );
+        std::env::remove_var("RECURSIVE_RATE_LIMIT_BURST");
+
+        // Direct exposure (trusted_proxies unset → 0) INFOs the XFF posture;
+        // with trusted hops configured the notice stays silent.
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let captured;
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            let limiter = rate_limiter_from_env();
+            assert_eq!(limiter.trusted_proxies, 0);
+            captured = lines.lock().unwrap().clone();
+        }
+        assert!(
+            captured
+                .iter()
+                .any(|l| l.starts_with("[INFO]") && l.contains("NOT trusted for rate limiting")),
+            "the direct-exposure posture must be announced, got: {captured:?}"
+        );
+
+        std::env::set_var("RECURSIVE_RATE_LIMIT_TRUSTED_PROXIES", "2");
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let captured;
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            let limiter = rate_limiter_from_env();
+            assert_eq!(limiter.trusted_proxies, 2);
+            captured = lines.lock().unwrap().clone();
+        }
+        assert!(
+            !captured
+                .iter()
+                .any(|l| l.contains("NOT trusted for rate limiting")),
+            "behind trusted proxies the direct-exposure notice must stay silent, got: {captured:?}"
+        );
+
         std::env::remove_var("RECURSIVE_RATE_LIMIT_TRUSTED_PROXIES");
         std::env::remove_var("RECURSIVE_RATE_LIMIT_MAX_BUCKETS");
     }
@@ -778,6 +873,33 @@ mod tests {
             limiter.bucket_count().await,
             0,
             "buckets refilled to capacity should be pruned"
+        );
+    }
+
+    /// #245 batch 31: idleness must hold at burst capacity 1 as well. The
+    /// `capacity - ε` slack in [`is_idle`] looks shiftable to `capacity + ε`
+    /// (every other prune test runs at capacity 2, where f64 rounding makes
+    /// `2.0 + ε == 2.0`), but at capacity 1 the mutant threshold is the f64
+    /// just above 1.0 — the min-capped projection can never reach it — and a
+    /// drained single-token bucket would never be pruned again.
+    #[tokio::test]
+    async fn prune_reclaims_drained_single_token_buckets() {
+        let limiter = RateLimiter::new(1, IDLE_REFILL_RATE);
+        assert!(limiter.check("solo").await); // drains the only token
+        limiter.prune().await;
+        assert_eq!(
+            limiter.bucket_count().await,
+            1,
+            "a just-used capacity-1 bucket is not idle yet"
+        );
+
+        // 250 ms at 5 tokens/s projects past the 1-token capacity.
+        tokio::time::sleep(IDLE_WAIT).await;
+        limiter.prune().await;
+        assert_eq!(
+            limiter.bucket_count().await,
+            0,
+            "a refilled capacity-1 bucket must be pruned like any other"
         );
     }
 
@@ -1065,5 +1187,66 @@ mod goal_h3_xff {
         );
         assert!(b.contains_key("apikey:aaa"), "authenticated key survives");
         assert!(b.contains_key("apikey:zzz"));
+    }
+
+    /// #245 batch 31: the at-cap eviction branch exists to admit a NEW key —
+    /// it must not run for a key that is already stored. `&& → ||` evicts an
+    /// idle victim on every check at cap, so a live client's neighbours
+    /// (here the header-derived bucket) vanish while the map services an
+    /// existing key and the map never needed the room.
+    #[tokio::test]
+    async fn check_at_cap_does_not_evict_for_an_already_stored_key() {
+        let limiter = RateLimiter::new(2, IDLE_REFILL_RATE).with_max_buckets(2);
+        assert!(limiter.check("xff:x").await);
+        assert!(limiter.check("apikey:a").await);
+        // Both buckets are idle after the refill window — a victim exists.
+        tokio::time::sleep(IDLE_WAIT).await;
+
+        // An EXISTING key at cap: no insert, no eviction — least of all the
+        // unrelated `xff:` bucket (the highest-eviction-priority class).
+        assert!(limiter.check("apikey:a").await);
+        let b = limiter.buckets.lock().await;
+        assert!(
+            b.contains_key("xff:x"),
+            "servicing an already-stored key must not evict an idle bystander"
+        );
+        assert_eq!(
+            b.len(),
+            2,
+            "at cap with no new key, the map must not shrink or grow"
+        );
+    }
+
+    /// #245 batch 31: within one class the OLDEST last_refill is the victim,
+    /// regardless of HashMap iteration order (the order is random per map).
+    /// `< → ==` never replaces the running best on the age comparison, so
+    /// the winner degenerates to whatever the iteration visits first —
+    /// over 24 fresh maps (24 fresh RandomStates) it survives only if the
+    /// oldest bucket happened to be visited first in every single one
+    /// (probability 24⁻²⁴); the original evicts the oldest in all of them.
+    #[test]
+    fn eviction_within_class_picks_the_oldest_bucket_under_any_iteration_order() {
+        for map in 0..24 {
+            let now = Instant::now();
+            let mut buckets: HashMap<String, TokenBucket> = HashMap::new();
+            for i in 0..24 {
+                // k23 carries the largest age (oldest last_refill); a token
+                // count at capacity makes every bucket idle (clock-projected).
+                let age_ms = 1000 + i * 7;
+                buckets.insert(
+                    format!("xff:k{i:02}"),
+                    TokenBucket {
+                        tokens: 2.0,
+                        last_refill: now - std::time::Duration::from_millis(age_ms),
+                    },
+                );
+            }
+            let victim =
+                pick_eviction_victim(&buckets, 2, IDLE_REFILL_RATE).expect("idle candidates");
+            assert_eq!(
+                victim, "xff:k23",
+                "map {map}: the oldest idle bucket in the class must be the victim"
+            );
+        }
     }
 }
