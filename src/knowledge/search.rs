@@ -340,6 +340,109 @@ mod tests {
         assert!(!out.contains("big.log"));
     }
 
+    /// The size cap is "larger than": a file sitting exactly on
+    /// `MAX_GREP_FILE_BYTES` is still searched.
+    #[tokio::test]
+    async fn grep_reads_a_file_exactly_at_the_size_cap() {
+        let tmp = TempDir::new().unwrap();
+        let needle = "match-at-cap";
+        let mut body = format!("{needle}\n");
+        body.push_str(&"a".repeat(MAX_GREP_FILE_BYTES as usize - body.len() - 1));
+        body.push('\n');
+        assert_eq!(body.len() as u64, MAX_GREP_FILE_BYTES);
+        write(&tmp, "edge.log", &body);
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": needle}))
+            .await
+            .unwrap();
+        assert!(out.contains("edge.log:1: match-at-cap"), "output: {out}");
+    }
+
+    /// The line cap is "longer than": a line of exactly `DEFAULT_MAX_LINE_LEN`
+    /// bytes comes through verbatim, one byte more is cut to the cap and
+    /// marked with the ellipsis.
+    #[tokio::test]
+    async fn grep_truncates_only_lines_longer_than_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let at_cap = format!("hit{}", "x".repeat(DEFAULT_MAX_LINE_LEN - 3));
+        let over_cap = format!("hit{}", "y".repeat(DEFAULT_MAX_LINE_LEN - 2));
+        assert_eq!(at_cap.len(), DEFAULT_MAX_LINE_LEN);
+        assert_eq!(over_cap.len(), DEFAULT_MAX_LINE_LEN + 1);
+        write(&tmp, "at.txt", &at_cap);
+        write(&tmp, "over.txt", &over_cap);
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "hit"}))
+            .await
+            .unwrap();
+        let expect_at = format!("at.txt:1: {at_cap}");
+        let expect_over = format!("over.txt:1: {}…", &over_cap[..DEFAULT_MAX_LINE_LEN]);
+        assert!(out.lines().any(|l| l == expect_at), "output: {out}");
+        assert!(out.lines().any(|l| l == expect_over), "output: {out}");
+    }
+
+    /// When the cap lands mid-character the cut backs up to the previous
+    /// boundary — it never runs forward past the cap to the next one.
+    #[tokio::test]
+    async fn grep_truncation_backs_up_to_the_previous_char_boundary() {
+        let tmp = TempDir::new().unwrap();
+        // `─` (3 bytes) occupies bytes 238..=240, so byte 240 is mid-char.
+        let prefix = format!("hit{}", "x".repeat(DEFAULT_MAX_LINE_LEN - 5));
+        let line = format!("{prefix}─{}", "y".repeat(20));
+        assert_eq!(prefix.len(), DEFAULT_MAX_LINE_LEN - 2);
+        assert!(!line.is_char_boundary(DEFAULT_MAX_LINE_LEN));
+        write(&tmp, "uni.txt", &line);
+        let out = SearchFiles::new(tmp.path())
+            .execute(json!({"pattern": "hit"}))
+            .await
+            .unwrap();
+        assert_eq!(out, format!("uni.txt:1: {prefix}…"));
+    }
+
+    /// Goal 394: Grep holds the session-mutable roots slot, so a session fork
+    /// must yield a clone bound to the fork's fresh slot — a root granted to
+    /// the forked session afterwards is visible to the fork and only to it.
+    #[tokio::test]
+    async fn fork_box_rewires_grep_onto_the_fresh_session_roots_slot() {
+        let workspace = TempDir::new().unwrap();
+        let granted = TempDir::new().unwrap();
+        std::fs::write(granted.path().join("note.txt"), "needle in granted root\n").unwrap();
+
+        let parent_slot = crate::tools::new_shared_sandbox_roots();
+        let tool = SearchFiles::new(workspace.path()).with_session_roots(parent_slot);
+        let fresh_slot = crate::tools::new_shared_sandbox_roots();
+        let state = SessionToolState {
+            read_state: None,
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                crate::tools::BackgroundJobManager::new(),
+            )),
+            session_roots: Some(fresh_slot.clone()),
+            deliverables: None,
+        };
+        let forked = tool
+            .fork_box(&state)
+            .expect("Grep carries session roots, so it must fork onto the fresh slot");
+
+        fresh_slot
+            .write()
+            .unwrap()
+            .push((granted.path().to_path_buf(), AccessTier::ReadOnly));
+        let scope = granted.path().to_string_lossy().to_string();
+        let out = forked
+            .execute(json!({"pattern": "needle", "path": scope.as_str()}))
+            .await
+            .unwrap();
+        assert!(out.contains("needle in granted root"), "output: {out}");
+
+        let err = tool
+            .execute(json!({"pattern": "needle", "path": scope.as_str()}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadToolArgs { .. }),
+            "parent must not see the fork's grant: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn path_argument_scopes_search() {
         let tmp = TempDir::new().unwrap();

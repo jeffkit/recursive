@@ -256,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn matcher_arg_pattern_without_wildcard_is_exact_match() {
+        // `Bash(git)` — no trailing `*` — falls through to glob_match's exact
+        // branch: the command must equal the pattern, not merely differ from
+        // every other command.
+        let m = Some("Bash(git)".to_string());
+        let git_args = serde_json::json!({"command": "git"});
+        assert!(matches_hook(&m, "Bash", &git_args));
+
+        let ls_args = serde_json::json!({"command": "ls"});
+        assert!(!matches_hook(&m, "Bash", &ls_args));
+    }
+
+    #[test]
     fn matcher_tool_name_with_arg_prefix_no_match() {
         let m = Some("Bash(git *)".to_string());
         let args = serde_json::json!({"command": "rm -rf /"});

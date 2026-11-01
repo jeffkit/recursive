@@ -1228,6 +1228,25 @@ mod tests {
     }
 
     #[test]
+    fn now_ms_is_the_wall_clock_not_a_constant() {
+        // `now_ms` anchors every emitted event to the wall clock (issue #117);
+        // a constant would silently destroy the event↔log interleaving the
+        // correlation key exists for. Pin it to the present: past a 2020 floor
+        // and within a day of the system clock — no constant can satisfy both.
+        let now = EventMeta::now_ms();
+        assert!(now >= 1_600_000_000_000, "now_ms below 2020 floor: {now}");
+        let system_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let drift = system_now.saturating_sub(now);
+        assert!(
+            drift <= 86_400_000,
+            "now_ms {now} drifted from system clock {system_now}"
+        );
+    }
+
+    #[test]
     fn enveloped_event_round_trips_meta_and_payload() {
         let env = EnvelopedEvent::new(
             EventMeta {

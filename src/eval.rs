@@ -2456,8 +2456,9 @@ mod tests {
 
     /// Issue #223 (run 39854090906): a seeder body swapped for `Ok(())`
     /// survived — the generic seeder test only checks it does not crash and
-    /// is idempotent, never what it leaves on disk. These four seeders are
-    /// the ones the run flagged; each is pinned by its exact bytes.
+    /// is idempotent, never what it leaves on disk. Each seeder the runs
+    /// flagged is pinned by its exact bytes; the long-context pair below was
+    /// flagged by the batch-34 mutation sweep (#245) and joined the same pin.
     #[test]
     fn seeders_place_their_exact_files_on_disk() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2498,6 +2499,34 @@ mod tests {
             std::fs::read_to_string(ws.join("input.txt")).expect("input.txt"),
             "abc\n"
         );
+
+        // Batch 34 (#245): the two long-context seeders, same pin — their
+        // bodies swapped for `Ok(())` previously survived because the replay
+        // harness tolerates a failed script step.
+        seed_big_txt(ws).expect("seed big.txt");
+        let big = std::fs::read_to_string(ws.join("big.txt")).expect("big.txt");
+        let big_lines: Vec<&str> = big.lines().collect();
+        assert_eq!(big_lines.len(), 801, "800 filler lines + the FLAG line");
+        assert_eq!(big_lines[0], "filler line 0");
+        assert_eq!(big_lines[799], "filler line 799");
+        assert_eq!(big_lines[800], "FLAG: 12345");
+
+        seed_notes_md(ws).expect("seed notes");
+        for (name, body) in [
+            ("a.md", "alpha note\n"),
+            ("b.md", "beta note\n"),
+            ("c.md", "gamma note\n"),
+            ("d.md", "the SECRET is 42\n"),
+            ("e.md", "epsilon note\n"),
+            ("f.md", "zeta note\n"),
+        ] {
+            let path = ws.join(name);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}")),
+                body,
+                "exact bytes of {name}"
+            );
+        }
     }
 
     /// Issue #223: `Mode::as_str` swapped for a constant (`""` / `"xyzzy"`)

@@ -708,6 +708,58 @@ mod tests {
             .ends_with("…[truncated]"));
     }
 
+    /// Seven alternating user/assistant entries, `entry 0` … `entry 6`.
+    fn write_numbered_session(ws: &Path) -> String {
+        let mut writer = SessionWriter::create(ws, "goal", "m", "p").unwrap();
+        for i in 0..7 {
+            let message = if i % 2 == 0 {
+                Message::user(format!("entry {i}"))
+            } else {
+                Message::assistant(format!("entry {i}"))
+            };
+            writer.append(&message, None, None).unwrap();
+        }
+        writer.finish(SessionStatus::Completed).unwrap();
+        writer.session_id().to_string()
+    }
+
+    #[test]
+    fn session_event_read_honours_an_explicit_context_lines() {
+        let env = IsolatedWorkspace::new();
+        let session_id = write_numbered_session(env.path());
+        let tool = SessionEventRead::new(query_for(env.path()));
+
+        let out = block_on(
+            tool.execute(json!({"session_id": session_id, "index": 3, "context_lines": 5})),
+        )
+        .unwrap();
+        let read: Value = serde_json::from_str(&out).unwrap();
+        let entries = read["entries"].as_array().unwrap();
+        // 3 ± 5 clamped to the session covers every entry; the default
+        // window (±2) would stop at 1..=5.
+        assert_eq!(entries.len(), 7, "output: {out}");
+        assert_eq!(entries[0]["index"], 0);
+        assert_eq!(entries[6]["index"], 6);
+    }
+
+    #[test]
+    fn session_event_read_window_ends_at_index_plus_context() {
+        let env = IsolatedWorkspace::new();
+        let session_id = write_numbered_session(env.path());
+        let tool = SessionEventRead::new(query_for(env.path()));
+
+        let out = block_on(
+            tool.execute(json!({"session_id": session_id, "index": 2, "context_lines": 3})),
+        )
+        .unwrap();
+        let read: Value = serde_json::from_str(&out).unwrap();
+        let entries = read["entries"].as_array().unwrap();
+        // 2 − 3 clamps to 0; 2 + 3 = 5 stays below the last entry (6).
+        assert_eq!(entries.len(), 6, "output: {out}");
+        assert_eq!(entries[0]["index"], 0);
+        assert_eq!(entries[5]["index"], 5);
+    }
+
     #[test]
     fn unknown_session_and_event_are_reported_as_errors() {
         let env = IsolatedWorkspace::new();
