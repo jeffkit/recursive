@@ -194,7 +194,10 @@ impl Tool for DockerShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn docker_shell_executes_echo() {
@@ -207,5 +210,132 @@ mod tests {
             .expect("start container");
         let out = tool.exec_command("echo hello").await.expect("exec");
         assert!(out.contains("hello"), "expected 'hello' in: {out}");
+    }
+
+    // ── Issue #245 batch 30 (B1 seat) — Drop / execute pins ─────────────────
+    //
+    // These drive the real bollard client against a loopback fake Docker API
+    // (a raw HTTP/1.1 listener that records the request line and answers 204),
+    // so the container-removal semantics of `Drop` are observable without a
+    // Docker daemon. `Docker::connect_with_http` only builds the client
+    // struct — the connection is lazy — so a literal-constructed
+    // `DockerShellTool` never dials anywhere until a tool call does.
+
+    /// Spawn a fake Docker daemon on 127.0.0.1 that records every request
+    /// line and answers `204 No Content`. Returns its `http://` address and
+    /// the shared record buffer.
+    async fn spawn_fake_docker_api() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let reqs = reqs.clone();
+                tokio::spawn(async move {
+                    let mut sock = sock;
+                    let mut buf = vec![0u8; 8192];
+                    let mut read = 0;
+                    loop {
+                        let n = sock.read(&mut buf[read..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let first = text.lines().next().unwrap_or("").to_string();
+                    reqs.lock().unwrap_or_else(|e| e.into_inner()).push(first);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, requests)
+    }
+
+    /// `DockerShellTool`'s `Drop` must issue `DELETE /containers/{id}` (via
+    /// bollard's `remove_container`) so the per-instance container cannot
+    /// outlive the tool. Kills `replace <impl Drop>::drop with ()`: with the
+    /// mutant no request ever reaches the fake daemon and the wait times out
+    /// at the "must issue a remove" assert. Kills `delete field force from
+    /// RemoveContainerOptions`: bollard serialises every bool of the options
+    /// struct (no `skip_serializing_if`), so the mutant's `force=false`
+    /// request line lacks `force=true` and the force assert goes red while
+    /// the arrival assert stays green.
+    #[tokio::test]
+    async fn drop_removes_container_with_force_via_docker_api() {
+        let (addr, requests) = spawn_fake_docker_api().await;
+        let docker = Docker::connect_with_http(&addr, 120, bollard::API_DEFAULT_VERSION)
+            .expect("lazy client must build");
+        let tool = DockerShellTool {
+            docker,
+            container_id: "fake-container-id".to_string(),
+            timeout: Duration::from_secs(5),
+        };
+        drop(tool);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = requests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let remove = snap
+                .iter()
+                .find(|l| l.starts_with("DELETE ") && l.contains("/containers/fake-container-id"));
+            if let Some(line) = remove {
+                assert!(
+                    line.contains("force=true"),
+                    "container removal must set force=true (a lingering exited \
+                     container would otherwise accumulate); got: {line}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drop must issue a remove_container call against the docker \
+                 API; requests seen: {snap:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `execute` without a `command` argument must be a `BadToolArgs` error,
+    /// raised before any docker call (the fake address above is never
+    /// dialled on this path). Kills `replace execute -> Result<String> with
+    /// Ok("xyzzy".into())`: the mutant returns Ok for the same input and the
+    /// is_err assert goes red.
+    #[tokio::test]
+    async fn execute_rejects_missing_command_argument() {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:1", 5, bollard::API_DEFAULT_VERSION)
+                .expect("lazy client must build");
+        let tool = DockerShellTool {
+            docker,
+            container_id: "unused".to_string(),
+            timeout: Duration::from_secs(1),
+        };
+        let err = tool.execute(json!({})).await;
+        assert!(
+            err.is_err(),
+            "missing `command` must be rejected, got: {:?}",
+            err
+        );
+        let msg = err.expect_err("missing command must error").to_string();
+        assert!(
+            msg.contains("missing required argument: command"),
+            "error must name the missing argument; got: {msg}"
+        );
     }
 }

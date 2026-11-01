@@ -831,7 +831,14 @@ mod tests {
     /// the middleware returns 503. With INSECURE_OK=1, it passes through.
     /// Single combined test to avoid env-var races.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
     async fn auth_inscure_ok_toggles() {
+        // Issue #245 batch 30: this test mutates RECURSIVE_HTTP_AUTH_INSECURE_OK
+        // and the middleware reads it during request handling — hold the
+        // process-global env lock so env-driven tests in other modules
+        // (and this module's own new batch-30 pins) cannot observe a torn
+        // value mid-phases.
+        let _guard = crate::test_util::env_lock();
         // Ensure we start from a clean env for this test binary.
         unsafe {
             std::env::remove_var("RECURSIVE_HTTP_AUTH_INSECURE_OK");
@@ -958,5 +965,321 @@ mod tests {
             "auth_middleware must have an explicit release-build branch that \
              surfaces a misuse warning when INSECURE_OK is set"
         );
+    }
+
+    // ── Issue #245 batch 30 (B1 seat) — env-resolution / middleware pins ────
+
+    /// `JwtConfig::is_valid` is the *authenticity* check: a token minted
+    /// under a different secret (or not a token at all) must be rejected.
+    /// Kills `replace JwtConfig::is_valid -> bool with true` (:306): the
+    /// mutant accepts any input and both rejection asserts go red.
+    #[test]
+    fn jwt_is_valid_rejects_foreign_secret_and_garbage() {
+        let jwt = JwtConfig::hs256("s3cret", None).expect("verifier");
+        let wrong_secret = mint_jwt(
+            "other",
+            serde_json::json!({"exp": exp_in(60), "sub": "alice"}),
+        );
+        assert!(
+            !jwt.is_valid(&wrong_secret),
+            "a token signed with another secret must fail is_valid"
+        );
+        assert!(
+            !jwt.is_valid("not-a-token"),
+            "garbage input must fail is_valid"
+        );
+    }
+
+    /// Malformed `RECURSIVE_HTTP_AUTH_KEY_OWNERS` entries (empty subject,
+    /// empty key, both, or no `=`) must be dropped with a warning — an empty
+    /// key that slipped through would authenticate requests that present
+    /// nothing at all. Kills the `:359` guard mutations: `guard → true`
+    /// admits every shape (including `=` → `with_key_subject("", "")`),
+    /// `&& → ||` admits every shape with one non-empty side (`=k2` /
+    /// `k4=`); each makes one of the `is_none` / `is_enabled` asserts red.
+    #[test]
+    fn auth_config_from_env_ignores_malformed_owner_entries() {
+        let _guard = crate::test_util::env_lock();
+        let vars = [ENV_AUTH_KEYS, ENV_AUTH_KEY_OWNERS, ENV_AUTH_ADMINS];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        unsafe {
+            std::env::set_var(ENV_AUTH_KEYS, "k1");
+            // alice=k1 well-formed; the rest are the four malformed shapes:
+            // empty subject, no `=`, empty key, both empty.
+            std::env::set_var(ENV_AUTH_KEY_OWNERS, "alice=k1,=k2,broken,k4=,=");
+            std::env::remove_var(ENV_AUTH_ADMINS);
+        }
+
+        let cfg = auth_config_from_env();
+
+        assert_eq!(
+            cfg.identify("k1").expect("k1").subject,
+            "alice",
+            "well-formed entry must attribute its key"
+        );
+        assert!(
+            cfg.identify("k2").is_none(),
+            "entry with an empty subject must be ignored"
+        );
+        assert!(
+            cfg.identify("").is_none(),
+            "an entry with an empty key must not mint an empty-string credential"
+        );
+        assert!(
+            !cfg.is_enabled() || cfg.identify("k1").is_some(),
+            "malformed entries must not silently disable auth either"
+        );
+        // With only malformed entries and no keys/JWT, the config must stay
+        // disabled — an empty-string key admitted by a broken guard would
+        // flip is_enabled to true (the `&& → ||` mutant shape).
+        unsafe {
+            std::env::set_var(ENV_AUTH_KEY_OWNERS, "k4=");
+            std::env::remove_var(ENV_AUTH_KEYS);
+        }
+        let cfg2 = auth_config_from_env();
+        assert!(
+            !cfg2.is_enabled(),
+            "a malformed entry alone must not enable auth"
+        );
+        assert!(cfg2.identify("").is_none());
+
+        for (name, value) in saved {
+            match value {
+                Some(v) => unsafe { std::env::set_var(name, v) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+
+    /// A blank `RECURSIVE_HTTP_AUTH_JWT_AUDIENCE` must be treated as unset
+    /// (audience checking skipped), not as a required-audience of `""`.
+    /// Kills `delete ! in auth_config_from_env` (:374, the audience
+    /// `filter(|s| !s.is_empty())`): the mutant keeps `Some("")`, `hs256`
+    /// then pins `validate_aud` to require `aud == ""`, and the minted
+    /// `my-app` token fails verification — `identify_bearer` goes `None`
+    /// and the assert is red.
+    #[test]
+    fn auth_config_from_env_treats_blank_jwt_audience_as_unset() {
+        let _guard = crate::test_util::env_lock();
+        let vars = [
+            ENV_AUTH_KEYS,
+            ENV_AUTH_JWT_SECRET,
+            "RECURSIVE_HTTP_AUTH_JWT_AUDIENCE",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        unsafe {
+            std::env::remove_var(ENV_AUTH_KEYS);
+            std::env::set_var(ENV_AUTH_JWT_SECRET, "aud-secret");
+            std::env::set_var("RECURSIVE_HTTP_AUTH_JWT_AUDIENCE", "");
+        }
+
+        let cfg = auth_config_from_env();
+        assert!(cfg.is_enabled(), "a JWT secret alone must enable auth");
+
+        let token = mint_jwt(
+            "aud-secret",
+            serde_json::json!({"exp": exp_in(60), "sub": "alice", "aud": "my-app"}),
+        );
+        let id = cfg
+            .identify_bearer(&token)
+            .expect("blank audience must mean 'no audience check'");
+        assert_eq!(id.subject, "alice");
+
+        // Contrast anchor: a NON-blank audience is enforced. Kills the
+        // sibling shape where the filter were deleted in the other direction.
+        unsafe {
+            std::env::set_var("RECURSIVE_HTTP_AUTH_JWT_AUDIENCE", "my-app");
+        }
+        let cfg = auth_config_from_env();
+        assert!(
+            cfg.identify_bearer(&token).is_some(),
+            "token carrying the configured audience must verify"
+        );
+        let wrong_aud = mint_jwt(
+            "aud-secret",
+            serde_json::json!({"exp": exp_in(60), "sub": "alice", "aud": "other-app"}),
+        );
+        assert!(
+            cfg.identify_bearer(&wrong_aud).is_none(),
+            "token with a foreign audience must be rejected"
+        );
+
+        for (name, value) in saved {
+            match value {
+                Some(v) => unsafe { std::env::set_var(name, v) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+
+    /// The "auth is NOT configured" error line is posture telemetry: it must
+    /// fire exactly when the resolved config is disabled. Kills `delete ! in
+    /// auth_config_from_env` (:378, `if !config.is_enabled()`): the mutant
+    /// logs the error when auth IS configured and stays silent when it is
+    /// not — each direction trips one of the asserts.
+    #[test]
+    fn auth_config_from_env_logs_unconfigured_error_only_when_disabled() {
+        let _guard = crate::test_util::env_lock();
+        let vars = [ENV_AUTH_KEYS, ENV_AUTH_JWT_SECRET];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+
+        // Configured: the NOT-configured error must be absent.
+        unsafe {
+            std::env::set_var(ENV_AUTH_KEYS, "k1");
+            std::env::remove_var(ENV_AUTH_JWT_SECRET);
+        }
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        {
+            let _sub = tracing::subscriber::set_default(sub);
+            let _ = auth_config_from_env();
+        }
+        let configured_lines = lines.lock().unwrap().clone();
+        assert!(
+            !configured_lines
+                .iter()
+                .any(|l| l.contains("is NOT configured")),
+            "configured auth must not log the NOT-configured error; got: {configured_lines:?}"
+        );
+
+        // Unconfigured: the error must be present (Goal 277 posture).
+        unsafe {
+            std::env::remove_var(ENV_AUTH_KEYS);
+            std::env::remove_var(ENV_AUTH_JWT_SECRET);
+        }
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        {
+            let _sub = tracing::subscriber::set_default(sub);
+            let _ = auth_config_from_env();
+        }
+        let unconfigured_lines = lines.lock().unwrap().clone();
+        assert!(
+            unconfigured_lines
+                .iter()
+                .any(|l| l.contains("is NOT configured")),
+            "unconfigured auth must log the NOT-configured error; got: {unconfigured_lines:?}"
+        );
+
+        for (name, value) in saved {
+            match value {
+                Some(v) => unsafe { std::env::set_var(name, v) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+
+    /// `auth_is_configured` runs the same env resolution as
+    /// `auth_config_from_env` — its answer must track the env, not collapse
+    /// to a constant. Kills both `replace auth_is_configured -> bool with
+    /// false/true` (:395): the unset arm trips the `-> true` mutant, the
+    /// configured arm trips the `-> false` mutant.
+    #[test]
+    fn auth_is_configured_tracks_the_env_resolution() {
+        let _guard = crate::test_util::env_lock();
+        let vars = [ENV_AUTH_KEYS, ENV_AUTH_JWT_SECRET];
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        unsafe {
+            std::env::remove_var(ENV_AUTH_KEYS);
+            std::env::remove_var(ENV_AUTH_JWT_SECRET);
+        }
+        assert!(
+            !auth_is_configured(),
+            "no keys and no JWT secret: auth must report unconfigured"
+        );
+        unsafe {
+            std::env::set_var(ENV_AUTH_KEYS, "k1");
+        }
+        assert!(
+            auth_is_configured(),
+            "an API key configured: auth must report configured"
+        );
+        for (name, value) in saved {
+            match value {
+                Some(v) => unsafe { std::env::set_var(name, v) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+
+    /// `auth_insecure_ok_requested` mirrors the middleware's parsing
+    /// (`1` / `true`, case-insensitive; everything else and unset → false).
+    /// Kills `replace auth_insecure_ok_requested -> bool with false/true`
+    /// (:403), `replace == with !=` (:404:20) and `replace || with &&`
+    /// (:404:27): unset and junk trip the constant-`true` mutants, `1` and
+    /// `TRUE` trip the constant-`false`, `!=` (which rejects `1`) and `&&`
+    /// (which rejects every value) mutants.
+    #[test]
+    fn auth_insecure_ok_requested_parses_truthy_values() {
+        let _guard = crate::test_util::env_lock();
+        let name = "RECURSIVE_HTTP_AUTH_INSECURE_OK";
+        let saved = std::env::var(name).ok();
+        for value in [None, Some("0"), Some("yes"), Some("")] {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+            assert!(
+                !auth_insecure_ok_requested(),
+                "INSECURE_OK={value:?} must not count as requested"
+            );
+        }
+        for value in ["1", "true", "TRUE", "True"] {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            assert!(
+                auth_insecure_ok_requested(),
+                "INSECURE_OK={value} must count as requested"
+            );
+        }
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// Goal 277 default-deny: with auth unconfigured and no escape hatch
+    /// set, the middleware must answer 503 — never pass through. Kills
+    /// `replace && with || in auth_middleware` (:461, the debug-bypass
+    /// gate): in a debug build the mutant evaluates
+    /// `insecure_ok_set || cfg!(debug_assertions)` = always true, bypasses
+    /// auth for every request and the 503 assert goes red.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock spans the request by design (#222 precedent)
+    async fn middleware_denies_when_unconfigured_without_escape_hatch() {
+        let _guard = crate::test_util::env_lock();
+        let name = "RECURSIVE_HTTP_AUTH_INSECURE_OK";
+        let saved = std::env::var(name).ok();
+        unsafe {
+            std::env::remove_var(name);
+        }
+        let app = router_with_auth(AuthConfig::default());
+        let resp = app
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unconfigured auth with no INSECURE_OK must default-deny with 503"
+        );
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 }

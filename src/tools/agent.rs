@@ -3634,4 +3634,426 @@ allowed_tools:
         let plain = agent.build_sub_registry(&["Read".to_string()]);
         assert!(plain.find_by_name("RunCode").is_none());
     }
+
+    // ── Issue #245 batch 30 (B1 seat) — shared memory / registry / depth pins
+
+    /// A `Config` built from a pinned throwaway `RECURSIVE_HOME`, so a
+    /// developer's `~/.recursive/config.toml` cannot leak into the pool.
+    fn pool_config() -> crate::config::Config {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        crate::config::Config::from_env().expect("default config")
+    }
+
+    fn done(content: &str) -> Completion {
+        Completion {
+            content: content.to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".into()),
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// `shared_memory_read` must return the *stored value*: kills
+    /// `replace <impl Tool for SharedMemoryRead>::execute -> Result<String>
+    /// with Ok("xyzzy".into())` and `Ok(String::new())` (:143) — both
+    /// mutants return a constant for every key, so the exact-value assert
+    /// and the missing-key message assert go red.
+    #[tokio::test]
+    async fn shared_memory_read_returns_stored_value_and_reports_missing() {
+        let provider = mock_provider(vec![]);
+        let pool = Arc::new(RwLock::new(AgentPool::new(provider, pool_config())));
+        pool.read()
+            .await
+            .memory()
+            .set(
+                "finding".to_string(),
+                "publish-finding-42".to_string(),
+                "lead".to_string(),
+            )
+            .await;
+        let tool = SharedMemoryRead::new(pool.clone());
+
+        let hit = tool.execute(json!({"key": "finding"})).await.unwrap();
+        assert_eq!(
+            hit, "publish-finding-42",
+            "read must return the exact stored value"
+        );
+
+        let miss = tool.execute(json!({"key": "absent-key"})).await.unwrap();
+        assert!(
+            miss.contains("absent-key") && miss.contains("not found"),
+            "a missing key must be reported as not-found, got: {miss}"
+        );
+    }
+
+    /// `shared_memory_write` must store the value AND confirm with the
+    /// `Stored '<key>'` line: kills `replace <impl Tool for
+    /// SharedMemoryWrite>::execute -> Result<String> with Ok("xyzzy".into())`
+    /// and `Ok(String::new())` (:202) — the mutants skip `set()` entirely
+    /// and return a constant, so both the exact-confirmation assert and the
+    /// read-back assert go red.
+    #[tokio::test]
+    async fn shared_memory_write_stores_value_and_confirms() {
+        let provider = mock_provider(vec![]);
+        let pool = Arc::new(RwLock::new(AgentPool::new(provider, pool_config())));
+        let tool = SharedMemoryWrite::new(pool.clone(), "worker-a".to_string());
+
+        let out = tool
+            .execute(json!({"key": "decision", "value": "ship-it"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "Stored 'decision' in shared memory.",
+            "write must confirm the stored key verbatim"
+        );
+
+        let stored = pool
+            .read()
+            .await
+            .memory()
+            .get("decision")
+            .await
+            .expect("written key must be readable from the pool");
+        assert_eq!(stored.value, "ship-it");
+        assert_eq!(stored.author, "worker-a");
+    }
+
+    /// Registry with parent Read/Edit/Write instances all bound to ONE
+    /// explicit parent `ReadFileState` — the shape `build_sub_registry`'s
+    /// match arms exist to break away from.
+    fn fs_registry_with_shared_read_state(
+        ws: &std::path::Path,
+    ) -> (ToolRegistry, Arc<Mutex<ReadFileState>>) {
+        let transport: Arc<dyn crate::tools::ToolTransport> = Arc::new(LocalTransport);
+        let state = Arc::new(Mutex::new(ReadFileState::new()));
+        let reg = ToolRegistry::new(transport.clone())
+            .register(Arc::new(ReadFile::new(ws).with_read_state(state.clone())))
+            .register(Arc::new(EditTool::new(ws).with_read_state(state.clone())))
+            .register(Arc::new(WriteFile::new(ws).with_read_state(state.clone())));
+        (reg, state)
+    }
+
+    /// The `Read` arm must bind the worker's ReadFile to the worker's FRESH
+    /// `ReadFileState` (issue #134): a worker read must mark the worker's
+    /// state so its own Edit passes the read-before-edit guard. Kills
+    /// `delete match arm "Read" in build_sub_registry` (:655): the mutant
+    /// falls back to `source.get("Read")` — the PARENT instance marking the
+    /// PARENT state — so the worker's fresh state stays empty and its Edit
+    /// is refused with "has not been read yet", going red.
+    #[tokio::test]
+    async fn sub_registry_read_arm_gives_worker_a_fresh_read_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, "alpha beta").unwrap();
+        let (all_tools, _parent_state) = fs_registry_with_shared_read_state(tmp.path());
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+
+        let sub = agent.build_sub_registry(&["Read".to_string(), "Edit".to_string()]);
+        let read = sub.find_by_name("Read").expect("Read in the worker set");
+        read.execute(json!({"path": file.to_str().unwrap()}))
+            .await
+            .expect("worker read must succeed");
+
+        let edit = sub.find_by_name("Edit").expect("Edit in the worker set");
+        edit.execute(json!({
+            "file_path": file.to_str().unwrap(),
+            "old_string": "alpha",
+            "new_string": "ALPHA"
+        }))
+        .await
+        .expect("a file the worker itself read must be editable by it");
+
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(on_disk.contains("ALPHA"), "edit must land; got: {on_disk}");
+    }
+
+    /// The `Edit` arm must bind the worker's EditTool to the worker's FRESH
+    /// `ReadFileState`: the parent may have read the file, but the worker's
+    /// read-before-edit guard is its own. Kills `delete match arm "Edit" in
+    /// build_sub_registry` (:658): the mutant hands the worker the PARENT's
+    /// EditTool instance — whose state HAS the record — so the edit succeeds
+    /// and the "must refuse" assert goes red.
+    #[tokio::test]
+    async fn sub_registry_edit_arm_gives_worker_a_fresh_read_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, "alpha beta").unwrap();
+        let (all_tools, parent_state) = fs_registry_with_shared_read_state(tmp.path());
+
+        // The PARENT read the file — its state carries the read record.
+        let parent_read = ReadFile::new(tmp.path()).with_read_state(parent_state.clone());
+        parent_read
+            .execute(json!({"path": file.to_str().unwrap()}))
+            .await
+            .expect("parent read must succeed");
+
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+        let sub = agent.build_sub_registry(&["Edit".to_string()]);
+        let edit = sub.find_by_name("Edit").expect("Edit in the worker set");
+        let outcome = edit
+            .execute(json!({
+                "file_path": file.to_str().unwrap(),
+                "old_string": "alpha",
+                "new_string": "ALPHA"
+            }))
+            .await;
+        let err =
+            outcome.expect_err("the worker never read the file — its fresh state has no record");
+        assert!(
+            err.to_string().contains("has not been read yet"),
+            "edit must be refused by the worker's own read-before-edit guard; got: {err}"
+        );
+    }
+
+    /// The `Write` arm must bind the worker's WriteFile to the worker's
+    /// FRESH `ReadFileState`: overwriting an existing file requires that
+    /// THIS worker read it, not that the parent did. Kills `delete match arm
+    /// "Write" in build_sub_registry` (:661): the mutant hands the worker
+    /// the PARENT's WriteFile — whose state HAS the record — so the
+    /// overwrite succeeds and the "must refuse" assert goes red.
+    #[tokio::test]
+    async fn sub_registry_write_arm_gives_worker_a_fresh_read_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.txt");
+        std::fs::write(&file, "seed").unwrap();
+        let (all_tools, parent_state) = fs_registry_with_shared_read_state(tmp.path());
+
+        let parent_read = ReadFile::new(tmp.path()).with_read_state(parent_state.clone());
+        parent_read
+            .execute(json!({"path": file.to_str().unwrap()}))
+            .await
+            .expect("parent read must succeed");
+
+        let agent = AgentTool::new(tmp.path(), mock_provider(vec![]), all_tools, 2, 0, None);
+        let sub = agent.build_sub_registry(&["Write".to_string()]);
+        let write = sub.find_by_name("Write").expect("Write in the worker set");
+        let outcome = write
+            .execute(json!({
+                "path": file.to_str().unwrap(),
+                "contents": "clobbered"
+            }))
+            .await;
+        let err =
+            outcome.expect_err("the worker never read the existing file it is about to clobber");
+        assert!(
+            err.to_string().contains("has not been read yet"),
+            "write-to-existing must be refused by the worker's own guard; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "seed",
+            "a refused write must not touch the file"
+        );
+    }
+
+    /// The default worker tool set when a manifest entry lists no
+    /// `allowed_tools` is the documented read-only+basic five — as data.
+    /// Kills all three `replace default_tool_names -> Vec<String> with
+    /// vec!["xyzzy".into()] / vec![String::new()] / vec![]` mutants (:697).
+    #[test]
+    fn default_tool_names_is_the_documented_read_only_set() {
+        assert_eq!(
+            AgentTool::default_tool_names(),
+            vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Glob".to_string(),
+                "WebFetch".to_string(),
+                "SearchFiles".to_string(),
+            ],
+            "the default worker allow-list is load-bearing: read-only + basic"
+        );
+    }
+
+    /// A worker's system prompt must carry the pool's shared-memory context
+    /// so the worker knows what other workers published (the whole point of
+    /// `to_context_string` in `build_worker_runtime`). Kills `delete ! in
+    /// AgentTool::build_worker_runtime` (:809, `if !memory_ctx.is_empty()`):
+    /// the mutant appends the context only when memory is EMPTY, so the
+    /// non-empty-pool assert below goes red because the marker never reaches
+    /// the system prompt.
+    #[tokio::test]
+    async fn worker_system_prompt_carries_shared_memory_context() {
+        let mock = Arc::new(MockProvider::new(vec![done("done")]));
+        let provider: Arc<dyn ChatProvider> = mock.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let pool = Arc::new(RwLock::new(AgentPool::new(provider.clone(), pool_config())));
+        pool.read()
+            .await
+            .memory()
+            .set(
+                "coordination-note".to_string(),
+                "WARP-CHANNEL-42".to_string(),
+                "lead".to_string(),
+            )
+            .await;
+        let agent = AgentTool::new(tmp.path(), provider.clone(), all_tools, 2, 0, None)
+            .with_pool(pool.clone());
+
+        agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": { "w": { "system_prompt": "You are a worker.", "allowed_tools": [] } },
+                "prompt": "hi"
+            }))
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        let system = &calls[0][0];
+        assert!(
+            system.content.contains("You are a worker."),
+            "entry system prompt must survive: {}",
+            system.content
+        );
+        assert!(
+            system.content.contains("WARP-CHANNEL-42"),
+            "worker system prompt must carry the shared-memory context: {:?}",
+            system.content
+        );
+    }
+
+    /// ...and when the pool's memory is EMPTY the system prompt must stay
+    /// verbatim — no stray separator. Second kill direction for `delete !
+    /// in build_worker_runtime` (:809): the mutant appends `"\n\n"` + an
+    /// empty context, so the exact-equality assert goes red.
+    #[tokio::test]
+    async fn worker_system_prompt_is_verbatim_when_memory_empty() {
+        let mock = Arc::new(MockProvider::new(vec![done("done")]));
+        let provider: Arc<dyn ChatProvider> = mock.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let pool = Arc::new(RwLock::new(AgentPool::new(provider.clone(), pool_config())));
+        let agent =
+            AgentTool::new(tmp.path(), provider.clone(), all_tools, 2, 0, None).with_pool(pool);
+
+        agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": { "w": { "system_prompt": "You are a worker.", "allowed_tools": [] } },
+                "prompt": "hi"
+            }))
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0][0].content, "You are a worker.",
+            "empty shared memory must leave the system prompt untouched"
+        );
+    }
+
+    /// A parallel worker's registry presence must end when the worker ends:
+    /// the per-task `ParallelDeregister` guard runs `deregister_sync` on
+    /// every exit path. Kills `replace <impl Drop for
+    /// ParallelDeregister>::drop with ()` (:1265): the mutant leaves both
+    /// entries in the table after a successful dispatch, so the absence
+    /// asserts go red.
+    #[tokio::test]
+    async fn execute_parallel_deregisters_finished_workers_from_registry() {
+        let provider = mock_provider(vec![done("report-a"), done("report-b")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let worker_registry = WorkerRegistry::new();
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 2, 0, None)
+            .with_registry(worker_registry.clone());
+
+        let out = agent
+            .execute(json!({
+                "mode": "parallel",
+                "manifest": {
+                    "w0": { "system_prompt": "a", "allowed_tools": [] },
+                    "w1": { "system_prompt": "b", "allowed_tools": [] }
+                },
+                "prompt": "go"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("=== w0 ===") && out.contains("=== w1 ==="),
+            "{out}"
+        );
+
+        for id in ["w0", "w1"] {
+            assert!(
+                worker_registry.get(id).await.is_none(),
+                "finished parallel worker '{id}' must be deregistered from the \
+                 worker table (no sweep, no abort — the drop guard owns this)"
+            );
+        }
+        assert!(
+            worker_registry.active_workers().await.is_empty(),
+            "a completed parallel dispatch must leave the worker table empty"
+        );
+    }
+
+    /// The delegation chain must bottom out at `max_depth`: a worker spawned
+    /// by a depth-0/max-1 agent gets a child `agent` tool with
+    /// `current_depth = current_depth + 1`, so its own delegation attempt is
+    /// refused with the depth-limit error instead of recursing. Kills
+    /// `replace + with * in <impl Tool for AgentTool>::execute` (:1744,
+    /// `child_depth = self.current_depth + 1`): the mutant passes
+    /// `current_depth * 1` — the child stays at depth 0 forever, spawns the
+    /// grandchild for real, and the transcript grows a third provider call
+    /// with no depth-limit refusal anywhere.
+    #[tokio::test]
+    async fn depth_limit_stops_delegation_chain_at_the_configured_maximum() {
+        let mock = Arc::new(MockProvider::new(vec![
+            Completion {
+                content: String::new(),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "c1".to_string(),
+                    name: "agent".to_string(),
+                    arguments: json!({
+                        "mode": "single",
+                        "prompt": "delegate please",
+                        "manifest": {
+                            "g": { "system_prompt": "grandchild", "allowed_tools": [] }
+                        }
+                    }),
+                }],
+                finish_reason: Some("tool_calls".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+            done("gc-final"),
+            done("w-final"),
+        ]));
+        let provider: Arc<dyn ChatProvider> = mock.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let all_tools = full_tool_registry(tmp.path());
+        let agent = AgentTool::new(tmp.path(), provider, all_tools, 1, 0, None);
+
+        agent
+            .execute(json!({
+                "mode": "single",
+                "manifest": { "w": { "system_prompt": "worker", "allowed_tools": [] } },
+                "prompt": "spawn",
+                "max_steps": 4
+            }))
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "depth-0 worker under max_depth=1: its delegation attempt must be \
+             refused in-process (2 provider calls), not spawn a grandchild; \
+             got {len} calls",
+            len = calls.len()
+        );
+        assert!(
+            calls[1]
+                .iter()
+                .any(|m| m.content.contains("depth limit reached")),
+            "the refusal must reach the worker as its agent-tool result; \
+             transcript: {calls:?}"
+        );
+    }
 }

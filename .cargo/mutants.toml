@@ -56,6 +56,31 @@ exclude_globs = [
     # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
     # the file's own pins take over.
     "src/storage/s3.rs",
+    # ── Issue #245 batch 30 (B1 seat, task list /tmp/b1-batch30.txt) ────────
+    # docker_sandbox.rs is the third whole-file cfg-blind case, same class as
+    # container_transport.rs / storage/s3.rs above: transport_layer/mod.rs
+    # declares it `#[cfg(feature = "cloud-runtime")]` and that feature is NOT
+    # in agent-mutants.sh FEATURES, so under the gate the module is never
+    # compiled and each of its mutants builds byte-identical to the baseline
+    # — the 5 "MISSED" rows of this batch's task list are that artifact
+    # (the batch-23 container_transport entry already flagged it as "the
+    # same artifact"). All 5 are dispositioned where the file DOES compile
+    # (`--features …,cloud-runtime`, hand-verified locally):
+    # - `drop → ()` and `delete field force from RemoveContainerOptions`
+    #   are pinned by drop_removes_container_with_force_via_docker_api,
+    #   which drives the real bollard client against a loopback fake Docker
+    #   API and asserts DELETE /containers/{id} arrives with force=true;
+    # - `execute → Ok("xyzzy".into())` is pinned by
+    #   execute_rejects_missing_command_argument (BadToolArgs raised before
+    #   any docker call);
+    # - `spec → Default::default()` / `side_effect_class →
+    #   Default::default()` are unviable when the file compiles (E0277:
+    #   neither ToolSpec nor ToolSideEffect implements Default — same
+    #   unviable-when-compiled class as the two s3.rs rows of batch 25).
+    # UNLOCK CONDITION: identical to the entries above — the day
+    # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
+    # the file's own pins take over.
+    "src/tools/transport_layer/docker_sandbox.rs",
 ]
 
 # Regexes match the mutant *name* string cargo-mutants prints.
