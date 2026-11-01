@@ -1179,4 +1179,11 @@ exclude_re = [
     "src/compact/retry\\.rs:139:36: replace \\|\\| with \\&\\& in truncate_head_for_retry",
     "src/compact/retry\\.rs:139:69: replace \\&\\& with \\|\\| in truncate_head_for_retry",
     "src/compact/retry\\.rs:139:72: delete ! in truncate_head_for_retry",
+    # mod.rs :640:35 `>→>=` in split_for_compaction — true equivalence: the
+    # only divergent input is split == prefix_len, where the conversational
+    # count is taken over an empty range (0) and MIN_CONVERSATIONAL_IN_OLDER
+    # = 2 keeps `acceptable` false under both spellings; split < prefix_len
+    # is false for both. negctl: mutation applied → compact suite 150/150
+    # green (compact mc2, 主控直落).
+    "src/compact/mod\\.rs:640:35: replace > with >= in Compactor::split_for_compaction",
 ]

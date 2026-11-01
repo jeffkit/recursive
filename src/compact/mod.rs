@@ -2785,4 +2785,98 @@ mod tests {
         assert!(transcript[0].is_compaction_summary);
         assert!(verify_compaction_rewrite(&before, &transcript, &outcome));
     }
+
+    // ── #245 compact batch mc2 (主控直落): summarize_bounds retry pins ──
+
+    /// A plain (non-PTL) LLM error must propagate immediately even when the
+    /// transcript could be truncated. Kills :799 `guard→true`: with the
+    /// guard gone the non-PTL error enters the retry branch, truncation
+    /// succeeds and the queued success completion is consumed → Ok instead
+    /// of Err.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn mc1_summarize_bounds_propagates_non_ptl_error() {
+        let compactor = Compactor::new(usize::MAX);
+        // 4 groups so truncate_head_for_retry(None) would succeed if the
+        // (wrong) retry branch were taken.
+        let transcript: Vec<Message> = std::iter::once(Message::system("sys".to_string()))
+            .chain((0..6).map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("u{i}"))
+                } else {
+                    Message::assistant(format!("a{i}"))
+                }
+            }))
+            .collect();
+        let bounds = CompactionBounds {
+            prefix: 0..0,
+            summarized: 0..transcript.len(),
+            preserved: transcript.len()..transcript.len(),
+        };
+        let provider = MockProvider::new(vec![Completion {
+            content: "should never be reached".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }])
+        .with_errors(vec![crate::error::Error::Llm {
+            provider: "mock".into(),
+            model: None,
+            request_id: None,
+            message: "HTTP 400: invalid request".into(),
+        }]);
+        let result = compactor
+            .summarize_bounds(&provider, &transcript, &bounds, 0)
+            .await;
+        assert!(result.is_err(), "non-PTL error must propagate");
+        assert!(
+            result.unwrap_err().to_string().contains("invalid request"),
+            "the original non-PTL error must be the one propagated"
+        );
+    }
+
+    /// Four PTL errors exhaust MAX_PTL_RETRIES(3): the counter must count
+    /// attempts additively and the third retry must still happen.
+    /// Kills :800 `+=→*=` (counter pinned at 0 → never exhausts → the
+    /// queued success is consumed → Ok) and :801 `>→==` / `>→>=` (give up
+    /// on the third attempt → no `ptl_attempts=3` retry is logged).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn mc1_summarize_bounds_ptl_counter_exhausts_on_fourth_error() {
+        let compactor = Compactor::new(usize::MAX);
+        let transcript: Vec<Message> = (0..12).map(|i| Message::user(format!("g{i}"))).collect();
+        let bounds = CompactionBounds {
+            prefix: 0..0,
+            summarized: 0..transcript.len(),
+            preserved: transcript.len()..transcript.len(),
+        };
+        let errors = (0..=MAX_PTL_RETRIES)
+            .map(|_| crate::error::Error::Llm {
+                provider: "mock".into(),
+                model: None,
+                request_id: None,
+                message: "HTTP 400: context_length_exceeded".into(),
+            })
+            .collect::<Vec<_>>();
+        let provider = MockProvider::new(vec![Completion {
+            content: "only reachable if the counter never exhausts".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            reasoning_content: None,
+        }])
+        .with_errors(errors);
+        let result = compactor
+            .summarize_bounds(&provider, &transcript, &bounds, 0)
+            .await;
+        assert!(
+            result.is_err(),
+            "the fourth PTL error must exhaust the retry counter"
+        );
+        assert!(
+            logs_contain("ptl_attempts=3"),
+            "the third retry must be logged before the fourth attempt errors"
+        );
+    }
 }
