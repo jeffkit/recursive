@@ -209,4 +209,26 @@ mod tests {
         assert!(output.starts_with("Summary:"));
         assert!(output.contains("Just a summary"));
     }
+
+    // ── #245 compact batch mc3 (主控直落) ──
+
+    #[test]
+    fn format_single_char_summary_leaves_no_tag_residue() {
+        // Kills prompt.rs:63:44 (second `+→-` in end_absolute): with a
+        // one-char summary the mutant under-advances the replace range and
+        // leaves the closing tag behind.
+        let out = format_compact_summary("<summary>x</summary>");
+        assert_eq!(out, "Summary:\nx");
+    }
+
+    #[test]
+    fn format_preserves_double_newline_separators() {
+        // Kills prompt.rs:78:30 `<=→>` in the newline collapse: two
+        // consecutive newlines are inside the budget and must survive.
+        let out = format_compact_summary("<summary>x</summary>\n\npost-material");
+        assert!(
+            out.contains("x\n\npost-material"),
+            "double newline must survive: {out:?}"
+        );
+    }
 }

@@ -378,4 +378,37 @@ mod tests {
             "unparseable trigger must return None"
         );
     }
+
+    // ── #245 compact batch mc3 (主控直落) ──
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn prune_noop_does_not_log_degradation() {
+        // Kills micro.rs:113:19 `>→>=`: the degradation warn must fire only
+        // when at least one message was actually replaced. Count > trigger
+        // but the single eligible message is already a placeholder →
+        // pruned == 0 → no warn (the `>=` mutant warns with pruned=0).
+        let compactor = Microcompactor::new(1, 2);
+        let mut msgs = vec![
+            Message::user("u".to_string()),
+            Message::tool_result("c1", MICROCOMPACT_PLACEHOLDER.to_string()),
+            Message::tool_result("c2", "x".repeat(300)),
+            Message::tool_result("c3", "y".repeat(300)),
+        ];
+        let pruned = compactor.prune(&mut msgs);
+        assert_eq!(pruned, 0);
+        assert!(
+            !logs_contain("microcompaction replaced old tool results"),
+            "a no-op prune must not announce degradation"
+        );
+    }
+
+    #[test]
+    fn build_microcompactor_rejects_zero_spelled_with_leading_zeroes() {
+        // Kills micro.rs:149:58 `>→>=`: "00" parses to 0 but is not caught
+        // by the `Some("0")` literal arm — the `n > 0` filter is the only
+        // guard; `>=` would build a trigger-0 microcompactor.
+        assert!(build_microcompactor_from_env(Some("00"), None).is_none());
+        assert!(build_microcompactor_from_env(Some("40"), None).is_some());
+    }
 }
