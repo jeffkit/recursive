@@ -702,4 +702,294 @@ mod tests {
             "truncated content must still contain prefix: {output}"
         );
     }
+
+    // ── Issue #245 batch 30 (B2 seat) pins ────────────────────────────────
+
+    /// A `session_id` that is a proper suffix of the session directory name
+    /// must still select the session: the filter accepts an exact name match
+    /// OR a suffix match. Kills the `||`→`&&` at :101:46 — a suffix cannot
+    /// equal the full name, so under the mutant the conjunction is false and
+    /// the session drops out entirely.
+    #[test]
+    fn session_id_suffix_match_selects_the_session() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let sid = setup_session_with_messages(ws, "suffix-goal", &[("user", "needle-suffix")]);
+        assert!(sid.len() > 8, "session dir name must be long enough: {sid}");
+        let suffix = &sid[sid.len() - 8..];
+        assert_ne!(suffix, sid, "must be a proper suffix, not the whole name");
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({
+                "query": "needle-suffix",
+                "session_id": suffix
+            })))
+            .unwrap();
+        assert!(
+            output.contains("needle-suffix"),
+            "a proper-suffix session_id must match via the ends_with arm: {output}"
+        );
+    }
+
+    /// Tool-call matching must fire on the call name OR the arguments text,
+    /// independently: entry A's name contains the query (arguments don't),
+    /// entry B's arguments contain it (name doesn't). Kills the `||`→`&&`
+    /// at :159:25, which would demand both and drop both entries.
+    #[test]
+    fn tool_call_matches_on_name_or_arguments_independently() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let mut writer =
+            SessionWriter::create(ws, "tool-call-goal", "test-model", "test-provider").unwrap();
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "alpha-entry-body",
+                    vec![crate::message::ToolCall {
+                        id: "call-a".into(),
+                        name: "run_bashfile".into(),
+                        arguments: json!({"path": "notes.txt"}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "beta-entry-body",
+                    vec![crate::message::ToolCall {
+                        id: "call-b".into(),
+                        name: "plain_reader".into(),
+                        arguments: json!({"cmd": "grep bashfile config"}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "bashfile"})))
+            .unwrap();
+
+        assert!(
+            output.contains("alpha-entry-body"),
+            "a tool-call NAME hit must match (arguments don't): {output}"
+        );
+        assert!(
+            output.contains("beta-entry-body"),
+            "a tool-call ARGUMENTS hit must match (name doesn't): {output}"
+        );
+    }
+
+    /// The context window around a match covers
+    /// `[idx - context_lines, idx + context_lines]` inclusive: with
+    /// context_lines=2 and a single match at index 1 in a 5-entry session,
+    /// entries 0-3 render and entry 4 does not. Kills the `+`→`*` and
+    /// `+`→`-` mutations at :191:32/:191:48, all of which shrink `end` and
+    /// drop the trailing context entries.
+    #[test]
+    fn context_window_covers_full_surroundings_of_a_match() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        setup_session_with_messages(
+            ws,
+            "window-goal",
+            &[
+                ("user", "c0-plain"),
+                ("user", "has midneedle inside"),
+                ("user", "c2-plain"),
+                ("user", "c3-plain"),
+                ("user", "c4-plain"),
+            ],
+        );
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "midneedle", "limit": 10})))
+            .unwrap();
+
+        for body in ["c0-plain", "has midneedle inside", "c2-plain", "c3-plain"] {
+            assert!(
+                output.contains(body),
+                "context window must render {body}; got: {output}"
+            );
+        }
+        assert!(
+            !output.contains("c4-plain"),
+            "entry beyond idx+context_lines must not be rendered: {output}"
+        );
+    }
+
+    /// Content of exactly 200 bytes sits at the truncation threshold: the
+    /// `>` at :206:62 must keep it verbatim (no `...` appended). Kills the
+    /// `>`→`>=` mutant, which would truncate a 200-byte body.
+    #[test]
+    fn content_of_exactly_200_bytes_is_not_truncated() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let body = format!("EXACT200-{}", "y".repeat(200 - "EXACT200-".len()));
+        assert_eq!(body.len(), 200);
+        setup_session_with_messages(ws, "exact200-goal", &[("user", &body)]);
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "EXACT200"})))
+            .unwrap();
+
+        assert!(
+            output.contains(&body),
+            "200-byte content sits at the `> 200` boundary and must stay verbatim: {output}"
+        );
+        assert!(
+            !output.contains("..."),
+            "no truncation marker expected at exactly 200 bytes: {output}"
+        );
+    }
+
+    /// An entry carrying tool calls must render its `[tool_calls: ...]`
+    /// summary. Kills the `!` deletion at :211:36, which inverts the branch:
+    /// the real call list disappears and empty entries grow a bare
+    /// `[tool_calls: ]`.
+    #[test]
+    fn tool_calls_are_rendered_in_the_output() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let mut writer =
+            SessionWriter::create(ws, "render-goal", "test-model", "test-provider").unwrap();
+        writer
+            .append(
+                &Message::assistant_with_tool_calls(
+                    "recallprobe assistant body",
+                    vec![crate::message::ToolCall {
+                        id: "call-r".into(),
+                        name: "unique_tool_name".into(),
+                        arguments: json!({"x": 1}),
+                    }],
+                ),
+                None,
+                None,
+            )
+            .unwrap();
+        writer
+            .append(&Message::user("recallprobe plain body"), None, None)
+            .unwrap();
+        writer.finish(SessionStatus::Completed).unwrap();
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({"query": "recallprobe"})))
+            .unwrap();
+
+        assert!(
+            output.contains("[tool_calls: unique_tool_name]"),
+            "the tool-call entry must list its calls: {output}"
+        );
+        assert!(
+            !output.contains("[tool_calls: ]"),
+            "entries without calls must not render a tool summary: {output}"
+        );
+    }
+
+    /// `limit` caps the number of rendered match lines: with 5 matches and
+    /// limit=2, exactly 2 `>>> ` match lines appear, then the truncation
+    /// note naming the 2-of-3 tally. Kills the `>`→`==` and `>`→`>=`
+    /// mutants at :238:32, which cut off at the limit-th match (only 1 line
+    /// shown) — the pre-existing "contains 'truncated'" test cannot see
+    /// that difference.
+    #[test]
+    fn limit_renders_exactly_limit_match_lines() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        setup_session_with_messages(
+            ws,
+            "limit-goal",
+            &[
+                ("user", "matchline-one"),
+                ("user", "matchline-two"),
+                ("user", "matchline-three"),
+                ("user", "matchline-four"),
+                ("user", "matchline-five"),
+            ],
+        );
+
+        let tool = EpisodicRecall::new(ws);
+        let output = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.execute(json!({
+                "query": "matchline",
+                "limit": 2,
+                "context_lines": 0
+            })))
+            .unwrap();
+
+        let marker_count = output.lines().filter(|l| l.starts_with(" >>> ")).count();
+        assert_eq!(
+            marker_count, 2,
+            "exactly `limit` match lines must render: {output}"
+        );
+        assert!(
+            output.contains("showing 2/3"),
+            "truncation note must name the 2-of-3 tally at the break: {output}"
+        );
+    }
+
+    /// A listed-but-missing `.meta.json` (removed between list and read) is
+    /// a benign NotFound skip: it must NOT announce a failure. Kills the
+    /// match-guard `== NotFound`→`false` at :277:25, which reroutes the
+    /// benign race into the corruption-warning arm.
+    #[tracing_test::traced_test]
+    #[test]
+    fn summary_missing_meta_is_skipped_silently() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let dir = setup_session_dir(ws, "bare-meta-goal", &[("user", "hi")]);
+        std::fs::remove_file(dir.join(".meta.json")).unwrap();
+
+        let summary = episodic_recall_summary(ws, 5);
+        assert!(
+            !logs_contain("session meta read failed"),
+            "a NotFound .meta.json is a benign race skip — no warning: {summary}"
+        );
+    }
+
+    /// A goal of exactly 80 bytes sits at the preview threshold: the `>`
+    /// at :297:47 must keep it verbatim. Kills the `>`→`>=` mutant, which
+    /// would truncate an 80-byte goal.
+    #[test]
+    fn goal_of_exactly_80_bytes_is_not_truncated() {
+        let tmp = crate::test_util::IsolatedWorkspace::new();
+        let ws = tmp.path();
+
+        let goal = format!("EXACT80-{}", "g".repeat(80 - "EXACT80-".len()));
+        assert_eq!(goal.len(), 80);
+        setup_session_with_messages(ws, &goal, &[("user", "hello")]);
+
+        let summary = episodic_recall_summary(ws, 5);
+        assert!(
+            summary.contains(&goal),
+            "80-byte goal sits at the `> 80` boundary and must stay verbatim: {summary}"
+        );
+        assert!(
+            !summary.contains("..."),
+            "no truncation marker expected at exactly 80 bytes: {summary}"
+        );
+    }
 }

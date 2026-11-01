@@ -220,4 +220,64 @@ mod tests {
             "empty team and name must display as '-'; got: {out}"
         );
     }
+
+    #[test]
+    fn truncate_backs_up_to_the_exact_boundary() {
+        // kills the `>`→`<` / `>`→`==` / `!`-deletion mutants at :123 (all
+        // skip the back-up loop and slice mid-char → panic), `&&`→`||` at
+        // :123:23 (backs up to 0 → bare "…") and `-=→+=` at :124:17 (walks
+        // forward into the multibyte char → "aβ…"; the `-=→/=` sibling
+        // spins forever and dies on the runner timeout).
+        assert_eq!(truncate("aβcd", 2), "a…");
+        assert_eq!(truncate("Hello World", 5), "Hello…");
+    }
+
+    #[tokio::test]
+    async fn status_filter_maps_every_status_arm_exactly() {
+        // kills `delete match arm "completed"/"failed"/"stopped"` at
+        // :64-66: a deleted arm makes that status filter collapse to
+        // "no filter", listing every task instead of just its own.
+        let reg = Arc::new(TaskRegistry::new());
+        let (run, id_run) = TaskState::new("runner", "t", "a");
+        let (comp, id_comp) = TaskState::new("finisher", "t", "b");
+        let (fail, id_fail) = TaskState::new("breaker", "t", "c");
+        let (stop, id_stop) = TaskState::new("halter", "t", "d");
+        let arc_c = reg.register(comp).await;
+        let arc_f = reg.register(fail).await;
+        let arc_s = reg.register(stop).await;
+        arc_c.mark_completed("done".into()).await;
+        arc_f.mark_failed("boom".into()).await;
+        arc_s
+            .set_handle(tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }))
+            .await;
+        arc_s.stop().await;
+        reg.register(run).await;
+
+        let tool = TaskListTool::new(reg);
+        let cases = [
+            ("running", &id_run),
+            ("completed", &id_comp),
+            ("failed", &id_fail),
+            ("stopped", &id_stop),
+        ];
+        for (status, want) in &cases {
+            let out = tool.execute(json!({ "status": status })).await.unwrap();
+            assert!(
+                out.contains("1 task(s)"),
+                "status={status} must match exactly one task; got: {out}"
+            );
+            assert!(
+                out.contains(&want.to_string()),
+                "status={status} must include its own task: {out}"
+            );
+            for (_, other_id) in &cases {
+                assert!(
+                    other_id == want || !out.contains(&other_id.to_string()),
+                    "status={status} must not list tasks of other statuses; got: {out}"
+                );
+            }
+        }
+    }
 }

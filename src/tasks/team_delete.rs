@@ -150,4 +150,29 @@ mod tests {
         let res = tool.execute(json!({ "name": "a\\b" })).await;
         assert!(res.is_err(), "backslash in name must be rejected");
     }
+
+    #[tokio::test]
+    async fn tool_layer_rejects_invalid_names_itself() {
+        // kills the three `||`→`&&` mutants at :74 (cols 28/50/73): a
+        // mutated guard lets the name through to TeamRegistry::delete,
+        // whose own validate_team_name still errors — but tags the error
+        // `name: "<team>"` instead of this tool's `name: "team_delete"`.
+        // Defense layers must be independently observable, so this test
+        // pins the tool-layer tag (the pre-existing is_err() assertions
+        // are satisfied by the registry's backstop and cannot see the
+        // difference).
+        let _g = with_temp_teams_dir();
+        let tool = TeamDeleteTool::new();
+        for bad in ["", "a/b", "a..b"] {
+            let res = tool.execute(json!({ "name": bad })).await;
+            let Err(Error::BadToolArgs { name, message }) = res else {
+                panic!("name '{bad}' must be rejected by the tool layer");
+            };
+            assert_eq!(
+                name, "team_delete",
+                "name '{bad}' must be rejected by team_delete's own guard, not the registry's backstop"
+            );
+            assert_eq!(message, format!("invalid team name: '{bad}'"));
+        }
+    }
 }

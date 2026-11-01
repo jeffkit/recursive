@@ -997,4 +997,48 @@ exclude_re = [
     # panics in every parse_cron test — killable, kept out of scope by the
     # exact replacement text in the anchor.
     "src/triggers\\.rs:456:49: replace - with \\+ in parse_cron",
+    # ── Issue #245 batch 30 (B2 seat, task list /tmp/b2-batch30.txt) ───────
+    # src/knowledge/episodic_recall.rs (11) + src/tasks/{task_get,task_list,
+    # team_delete}.rs (16) — all 27 survivors handled: 24 pinned + the three
+    # unobservables below exempted (negative control 27/27 = 24 red on the
+    # mapped test [23×rc=101 + 1 hang→watchdog kill, the `-=→/=` identity
+    # division in task_list::truncate] + 3× green; results + per-mutant
+    # logs in /tmp/b2-b30/negctl/).
+    # Pins: episodic — session_id suffix filter, tool-call name|arguments
+    # arms, context-window ends (:191 both columns), the 200-byte content
+    # and 80-byte goal boundaries, [tool_calls: …] rendering, the limit
+    # tally (exact `>>> ` marker count + "showing 2/3"; the pre-existing
+    # contains-"truncated" test cannot see the `==`/`>=` cut-off);
+    # task_list — every status match arm mapped exactly (a deleted arm
+    # collapses the filter to no-filter and lists all 4 tasks), truncate
+    # back-up-to-boundary exactness; task_get — the same truncate pin;
+    # team_delete — the tool-layer guard tagged `name: "team_delete"`:
+    # TeamRegistry::delete's own validate_team_name backstop rejects the
+    # same names but tags the error `<team>`, which is exactly why the
+    # pre-existing is_err()-only tests could not see these three
+    # `||`→`&&` mutants.
+    #
+    # Unobservables, two kinds:
+    # • truncate `while end > 0` → `>=` (task_get :85:19, task_list
+    #   :123:19): `end` is a usize, so `>= 0` is always true, and the loop
+    #   body never runs at end==0 because the second operand
+    #   `!s.is_char_boundary(0)` is always false — both variants exit
+    #   identically on every input (negative control green: the whole
+    #   scoped suite passes under the mutant). The killable `<` / `==`
+    #   siblings at the same column stay in scope: both skip the back-up
+    #   loop and panic on the mid-char slice.
+    # • episodic_recall_summary :277:25 match guard `== NotFound` →
+    #   `false`: list_sessions() only yields directories whose `.meta.json`
+    #   is a regular file at list time, so load_meta() can only return
+    #   NotFound inside the window where an external deleter races the
+    #   in-process loop — no deterministic single-threaded fixture can
+    #   enter it (negative control green: whole episodic suite passes under
+    #   the mutant). The `→true` sibling at the same position is killable
+    #   (summary_skips_corrupt_meta_with_warning goes red) and stays in
+    #   scope. execute()'s transcript counterpart at :122 has no list-time
+    #   precondition and is pinned by
+    #   recall_missing_transcript_is_skipped_silently.
+    "src/knowledge/episodic_recall\\.rs:277:25: replace match guard err\\.kind\\(\\) == std::io::ErrorKind::NotFound with false in episodic_recall_summary",
+    "src/tasks/task_get\\.rs:85:19: replace > with >= in truncate",
+    "src/tasks/task_list\\.rs:123:19: replace > with >= in truncate",
 ]

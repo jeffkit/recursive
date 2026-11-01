@@ -261,6 +261,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn truncate_backs_up_to_the_exact_boundary() {
+        // kills `&&`→`||` at :85:23 (backs all the way up to 0 → bare "…")
+        // and `-=→+=` at :86:17 (walks forward into the multibyte char →
+        // "aβ…"); both must land exactly one char back.
+        assert_eq!(truncate("aβcd", 2), "a…");
+        assert_eq!(truncate("Hello World", 5), "Hello…");
+    }
+
     #[tokio::test]
     async fn missing_task_id_errors() {
         // kills `lookup_task_id(...)` guard removal mutation
