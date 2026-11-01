@@ -1423,7 +1423,10 @@ mod tests {
             ),
         ];
         let msgs = r.reinject(&pre);
-        assert_eq!(msgs.len(), 2, "exact-budget edge must include the second skill");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "exact-budget edge must include the second skill"
+        );
     }
-
 }
