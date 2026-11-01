@@ -1338,4 +1338,92 @@ mod tests {
         let spec = skill_reinjector_spec_from_env(None, Some("00")).unwrap();
         assert_eq!(spec.token_budget, 25_000);
     }
+
+    #[test]
+    fn skill_reinject_budget_products_never_fit_second_skill() {
+        // Kills :338:28 `+→*` in the budget check: `used + att > budget`
+        // with a generous budget (5000) admits both skills; the multiplicative
+        // check (T*T ≈ 13225 > 5000) rejects the second → one message.
+        let body = "A".repeat(400);
+        let p1 = write_fixed_skill("alpha", &body);
+        let p2 = write_fixed_skill("bravo", &body);
+        let mk = |name: &str, path: &std::path::Path| Skill {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            path: path.to_path_buf(),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: Some(body.clone()),
+        };
+        let r = SkillReinjector {
+            token_budget: 5000,
+            per_skill_budget: 5000,
+            skills: vec![mk("alpha", &p1), mk("bravo", &p2)],
+        };
+        let pre = vec![
+            Message::assistant_with_tool_calls(
+                "Loading skill".to_string(),
+                vec![skill_tool_call("alpha")],
+            ),
+            Message::assistant_with_tool_calls(
+                "Loading skill".to_string(),
+                vec![skill_tool_call("bravo")],
+            ),
+        ];
+        let msgs = r.reinject(&pre);
+        assert_eq!(msgs.len(), 2, "generous budget must admit both skills");
+    }
+
+    #[test]
+    fn skill_reinject_exact_budget_edge_is_inclusive() {
+        // Kills :338:41 `>→>=`: with budget exactly equal to one skill's
+        // token estimate, the second skill (same estimate) sits at the edge
+        // and must be INCLUDED by the strict `>` check.
+        let body = "A".repeat(400);
+        let p1 = write_fixed_skill("alpha", &body);
+        let p2 = write_fixed_skill("bravo", &body);
+        let mk = |name: &str, path: &std::path::Path| Skill {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            path: path.to_path_buf(),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: Some(body.clone()),
+        };
+        // Mirror the production estimate: header + body chars, /4 + 1.
+        let hdr = format!("[post-compact skill restore: alpha @ {}]\n", p1.display());
+        let t = (hdr.len() + 400) / 4 + 1;
+        let r = SkillReinjector {
+            token_budget: 2 * t,
+            per_skill_budget: 5000,
+            skills: vec![mk("alpha", &p1), mk("bravo", &p2)],
+        };
+        let pre = vec![
+            Message::assistant_with_tool_calls(
+                "Loading skill".to_string(),
+                vec![skill_tool_call("alpha")],
+            ),
+            Message::assistant_with_tool_calls(
+                "Loading skill".to_string(),
+                vec![skill_tool_call("bravo")],
+            ),
+        ];
+        let msgs = r.reinject(&pre);
+        assert_eq!(msgs.len(), 2, "exact-budget edge must include the second skill");
+    }
+
 }
