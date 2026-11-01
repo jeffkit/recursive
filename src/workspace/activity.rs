@@ -342,4 +342,117 @@ mod tests {
         assert_eq!(work[0].kind, ActiveWorkKind::Turn);
         assert_eq!(work[0].id, "sess-9");
     }
+
+    // ── Issue #245 batch 32 pins ────────────────────────────────────────────
+
+    /// #245 batch 32: `as_str` is the archive-admission spelling of each
+    /// kind — a constant replacement ("xyzzy" / "") must fail.
+    #[test]
+    fn active_work_kind_as_str_spellings() {
+        assert_eq!(ActiveWorkKind::Turn.as_str(), "turn");
+        assert_eq!(ActiveWorkKind::Job.as_str(), "job");
+        assert_eq!(ActiveWorkKind::Subagent.as_str(), "subagent");
+        assert_eq!(ActiveWorkKind::Schedule.as_str(), "schedule");
+    }
+
+    /// #245 batch 32: `stop` must not claim a DISABLED trigger merely
+    /// because the caller listed it in `work`. With `enabled &&` flipped to
+    /// `enabled ||`, an already-disabled trigger whose id appears in the
+    /// reported slice would be "disarmed" (a no-op write) and claimed as
+    /// stopped — an archive admission report over a trigger that was never
+    /// running. The pre-existing stop tests only ever pass work reported by
+    /// `active_work`, which already filters to enabled triggers.
+    #[test]
+    fn stop_leaves_disabled_triggers_out_even_if_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = PinnedRecursiveHome::new(home.path());
+        let ws = tempfile::tempdir().unwrap();
+        let mut armed = Trigger::new(
+            "t-1",
+            TriggerSpec::Cron {
+                expr: "* * * * *".into(),
+            },
+            "wake up",
+            None,
+            None,
+        );
+        armed.enabled = true;
+        let mut disabled = Trigger::new(
+            "t-2",
+            TriggerSpec::Cron {
+                expr: "* * * * *".into(),
+            },
+            "already off",
+            None,
+            None,
+        );
+        disabled.enabled = false;
+        TriggerStore::for_workspace(ws.path())
+            .save(&[armed, disabled])
+            .unwrap();
+
+        let work = vec![
+            ActiveWork {
+                kind: ActiveWorkKind::Schedule,
+                id: "t-1".into(),
+                detail: "wake up".into(),
+            },
+            ActiveWork {
+                kind: ActiveWorkKind::Schedule,
+                id: "t-2".into(),
+                detail: "already off".into(),
+            },
+        ];
+        let stopped = StoreActivityProbe.stop(&record(ws.path()), &work);
+        assert_eq!(
+            stopped.len(),
+            1,
+            "only the armed trigger may be claimed: {stopped:?}"
+        );
+        assert_eq!(stopped[0].id, "t-1");
+    }
+
+    /// #245 batch 32: the returned subset filters on kind first — a Turn
+    /// entry sharing the disarmed trigger's id must not be claimed. With
+    /// the final `&&` flipped to `||`, the id hit alone would claim a live
+    /// turn as "stopped", exactly what the probe contract forbids.
+    #[test]
+    fn stop_does_not_claim_a_turn_sharing_the_disarmed_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _pin = PinnedRecursiveHome::new(home.path());
+        let ws = tempfile::tempdir().unwrap();
+        let mut armed = Trigger::new(
+            "t-1",
+            TriggerSpec::Cron {
+                expr: "* * * * *".into(),
+            },
+            "wake up",
+            None,
+            None,
+        );
+        armed.enabled = true;
+        TriggerStore::for_workspace(ws.path())
+            .save(&[armed])
+            .unwrap();
+
+        let work = vec![
+            ActiveWork {
+                kind: ActiveWorkKind::Schedule,
+                id: "t-1".into(),
+                detail: "wake up".into(),
+            },
+            ActiveWork {
+                kind: ActiveWorkKind::Turn,
+                id: "t-1".into(),
+                detail: "a live turn with the same id".into(),
+            },
+        ];
+        let stopped = StoreActivityProbe.stop(&record(ws.path()), &work);
+        assert_eq!(
+            stopped.len(),
+            1,
+            "the live turn must not be claimed: {stopped:?}"
+        );
+        assert_eq!(stopped[0].kind, ActiveWorkKind::Schedule);
+    }
 }

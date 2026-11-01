@@ -1545,4 +1545,141 @@ mod tests {
         assert_eq!(c.finish_reason, None);
         assert_eq!(c.total_usage.prompt_tokens, 0);
     }
+
+    // ── Issue #245 batch 32 pins ────────────────────────────────────────────
+
+    /// #245 batch 32: `fingerprint` must fold bytes with `^=` — the exact
+    /// FNV-1a-64 reference constants pin the fold. An `|=` mutant saturates
+    /// toward all-ones and an `&=` mutant collapses toward zero; both stay
+    /// deterministic and input-distinguishing, so the pre-existing
+    /// determinism test cannot see them, only the constants can.
+    #[test]
+    fn fingerprint_matches_fnv1a_64_reference_constants() {
+        assert_eq!(fingerprint(""), 0xcbf2_9ce4_8422_2325); // init: no bytes folded
+        assert_eq!(fingerprint("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fingerprint("hello"), 0xa430_d846_80aa_bd0b);
+        assert_eq!(fingerprint("hello world"), 0x779a_65e7_023c_d2e7);
+    }
+
+    /// #245 batch 32: a "timeout" retry must land in its own class —
+    /// deleting the `"timeout"` match arm routes it to the catch-all return
+    /// and the counter stays 0. The pre-existing classification test never
+    /// bumps timeout (it only asserts the counter reads 0), so it cannot see
+    /// the deleted arm.
+    #[test]
+    fn timeout_retries_land_in_their_class() {
+        let mut c = collector();
+        c.ingest(
+            &AgentEvent::LlmRetry {
+                step: 0,
+                attempt: 1,
+                wait_ms: 10,
+                status: None,
+                reason: "timeout".into(),
+            },
+            at(1),
+        );
+        let root = &c.records()[0];
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}llm_retries")),
+            Some(&AttrValue::Int(1))
+        );
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}llm_retries_timeout")),
+            Some(&AttrValue::Int(1))
+        );
+        for class in ["rate_limited", "server_error", "network", "empty_body"] {
+            assert_eq!(
+                attr(root, &format!("{TRACE_METADATA_PREFIX}llm_retries_{class}")),
+                Some(&AttrValue::Int(0)),
+                "unexpected bump in class {class}"
+            );
+        }
+    }
+
+    /// #245 batch 32: the run input is the FIRST user message and non-user
+    /// messages never capture it. With `&&` flipped to `||`,
+    /// `input.is_none()` alone would capture the assistant greeting, and any
+    /// later user message would overwrite it (last-wins instead of
+    /// first-wins). The pre-existing input test ingests a single user
+    /// message, where both operators agree.
+    #[test]
+    fn first_user_message_wins_the_run_input() {
+        let mut c = collector();
+        for (at_ms, message) in [
+            (1, crate::message::Message::assistant("hello, I will help")),
+            (2, crate::message::Message::user("first goal")),
+            (3, crate::message::Message::user("second goal")),
+        ] {
+            c.ingest(
+                &AgentEvent::MessageAppended {
+                    message,
+                    usage: None,
+                    step: None,
+                },
+                at(at_ms),
+            );
+        }
+        let root = &c.records()[0];
+        assert_eq!(
+            attr(root, ATTR_OBSERVATION_INPUT),
+            Some(&AttrValue::Str(redact("first goal"))),
+            "run input must be the first user message, redacted"
+        );
+    }
+
+    /// #245 batch 32: a tool span's parent is its step record
+    /// (`1 + step_index`, the step's record index). With `+` flipped to
+    /// `-`, index 0 is indistinguishable (1-0 == 1+0 — the pre-existing
+    /// parenting test only uses a single step 0), index 1 re-parents the
+    /// tool onto the root, and index 2 underflows.
+    #[test]
+    fn tool_spans_parent_on_their_step_record_not_the_root() {
+        let mut c = collector();
+        for t in 0u64..=2 {
+            let step = t as usize;
+            c.ingest(
+                &AgentEvent::ToolCall {
+                    name: "Bash".into(),
+                    id: format!("call-{step}"),
+                    arguments: "{}".into(),
+                    step,
+                },
+                at(t + 1),
+            );
+            c.ingest(
+                &AgentEvent::ToolResult {
+                    id: format!("call-{step}"),
+                    name: "Bash".into(),
+                    output: "ok".into(),
+                    step,
+                    is_error: false,
+                    duration_ms: 5,
+                },
+                at(t * 10 + 2),
+            );
+        }
+        let parents: Vec<_> = c
+            .records()
+            .iter()
+            .filter(|r| r.name.starts_with("tool "))
+            .map(|r| r.parent)
+            .collect();
+        assert_eq!(parents, vec![Some(1), Some(2), Some(3)]);
+    }
+
+    /// #245 batch 32: a non-empty model name is advertised as trace
+    /// metadata. Deleting the `!` inverts the guard, so a configured model
+    /// would be withheld (and an empty one advertised). The pre-existing
+    /// identity test asserts session id / tags / totals but never the model
+    /// attribute.
+    #[test]
+    fn model_metadata_is_advertised_on_the_root() {
+        let c = collector(); // meta(): model = "deepseek-chat"
+        let root = &c.records()[0];
+        assert_eq!(
+            attr(root, &format!("{TRACE_METADATA_PREFIX}model")),
+            Some(&AttrValue::Str("deepseek-chat".into()))
+        );
+    }
 }

@@ -102,6 +102,37 @@ exclude_globs = [
     # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
     # the file's own pins take over.
     "src/storage/redis.rs",
+    # ── Issue #245 batch 32 (B2 seat, task list /tmp/b2-batch32.txt) ───────
+    # docker_provider.rs is the FIFTH whole-file cfg-blind case, same class
+    # as container_transport.rs / storage/s3.rs / docker_sandbox.rs /
+    # storage/redis.rs above: transport_layer/mod.rs declares it
+    # `#[cfg(feature = "cloud-runtime")]` and that feature is NOT in
+    # agent-mutants.sh FEATURES, so under the gate the module is never
+    # compiled and each of its mutants builds byte-identical to the
+    # baseline — the 6 "MISSED" rows of this batch's task list are that
+    # artifact (the batch-23 container_transport entry already flagged
+    # "docker_provider.rs 6/6" as "the same artifact"). All 6 are
+    # dispositioned where the file DOES compile (`--features cloud-runtime`,
+    # hand-verified locally, logs d*.log in /tmp/b2-b32/logs/):
+    # - `start → Default::default()` (:45), `with_starter →
+    #   Default::default()` (:89) and `ubuntu → Default::default()` (:99)
+    #   are unviable when the file compiles (E0277: neither StartFuture =
+    #   Pin<Box<dyn Future…>> nor DockerToolSetProvider implements Default —
+    #   same unviable-when-compiled class as the s3.rs/redis.rs rows);
+    # - `build_registry → Default::default()` (:106) is pinned by
+    #   container_start_failure_warns_and_reports_actual_tier (a default
+    #   registry registers no Bash; the fallback contract requires it) and
+    #   container_start_success_reports_container_and_uses_container_bash;
+    # - `sandbox_mode → Default::default()` (:148, SandboxMode::#[default]
+    #   None) is pinned by container_start_success_…: a successful container
+    #   start must keep reporting Container;
+    # - `record_actual_mode → ()` (:161) is pinned by
+    #   container_start_failure_…: the degraded provider must stop claiming
+    #   Container (issue #167 observability contract).
+    # UNLOCK CONDITION: identical to the entries above — the day
+    # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
+    # the existing pins above take over.
+    "src/tools/transport_layer/docker_provider.rs",
 ]
 
 # Regexes match the mutant *name* string cargo-mutants prints.
@@ -1108,4 +1139,20 @@ exclude_re = [
     # scan_orphan_tool_calls_handles_assistant_at_transcript_start: the
     # assistant as the very first row underflows usize).
     "src/session/reader\\.rs:309:76: replace \\+ with \\* in SessionReader::scan_orphan_tool_calls",
+    # ── Issue #245 batch 32 (B2 seat, task list /tmp/b2-batch32.txt) ───────
+    # activity.rs :80:9 — `NoActivityProbe::active_work` body replaced with
+    # `vec![]` is the identity: the function body IS `Vec::new()` (the trait
+    # contract says "an empty vector means the workspace is idle"), and
+    # `vec![]` expands to exactly that. Every caller observes the same empty
+    # Vec; the existing no_activity_probe / archive-admission tests cannot
+    # distinguish the two spellings because there is nothing to distinguish.
+    # Verified: mutation applied → whole workspace::activity module 8/8
+    # green → restored (log a80.log in /tmp/b2-b32/logs/).
+    # The `vec![Default::default()]` twin at the same :80:9 stays in scope:
+    # ActiveWork implements no Default (E0277 unviable-when-compiled), and
+    # any future Default would hand the probe a non-empty report, killed by
+    # no_activity_probe_reports_nothing. The as_str/stop mutants of the same
+    # batch (positions :36/:158/:171) are pinned, not excluded — see the
+    # batch-32 tests in src/workspace/activity.rs.
+    "src/workspace/activity\\.rs:80:9: replace <impl ActivityProbe for NoActivityProbe>::active_work -> Vec<ActiveWork> with vec!\\[\\]",
 ]

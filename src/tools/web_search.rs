@@ -1707,4 +1707,123 @@ mod tests {
             }
         }
     }
+
+    // ── Issue #245 batch 32 pins ────────────────────────────────────────────
+
+    /// #245 batch 32: a body of exactly `JINA_MAX_CHARS` bytes is passed
+    /// through verbatim — `>` flipped to `>=` would take the truncation
+    /// branch and append the marker to a body that needs no truncation. The
+    /// pre-existing truncation test uses 5000 bytes, which both operators
+    /// truncate identically (that is exactly why the mutant survived).
+    #[tokio::test]
+    async fn jina_fallback_passes_exact_max_body_untruncated() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let body = "x".repeat(4096);
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "text/markdown")
+            .with_body(body.as_str())
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .search_jina_fallback("anything")
+            .await
+            .expect("jina exact-max mock");
+        assert_eq!(
+            out, body,
+            "an exact-max body must not gain a truncation marker"
+        );
+    }
+
+    /// #245 batch 32: truncation backs OFF to the char boundary before the
+    /// cap — `end -= 1` flipped to `+=` would walk FORWARD past the
+    /// multi-byte char and include it (byte 4096 sits mid-`€` here). The
+    /// `/=` sibling at the same site is an infinite loop on this input (end
+    /// never moves, the boundary check never passes) — killed by the
+    /// mutation gate's timeout, which is the intended semantics for a hung
+    /// test binary.
+    #[tokio::test]
+    async fn jina_fallback_truncates_before_a_multibyte_char_straddling_the_cap() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let body = format!("{}€€€z", "a".repeat(4095)); // 4100 bytes; the cap lands mid-€
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "text/markdown")
+            .with_body(body.as_str())
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url());
+        let out = tool
+            .search_jina_fallback("anything")
+            .await
+            .expect("jina multibyte mock");
+        assert_eq!(
+            out,
+            format!("{}\n\n[...truncated at 4096 chars]", "a".repeat(4095)),
+            "the truncated slice must end at the last boundary before the cap"
+        );
+    }
+
+    /// #245 batch 32: EITHER challenge marker alone must trip the detector —
+    /// `||` flipped to `&&` would require both strings in one page, letting
+    /// a real anomaly-modal interstitial through as if it were results. The
+    /// pre-existing detection test embeds both markers in a single page,
+    /// where both operators return true.
+    #[test]
+    fn duckduckgo_challenge_detected_on_either_marker_alone() {
+        assert!(is_duckduckgo_challenge(
+            r#"<div class="anomaly-modal"></div><a class="result__a">x</a>"#
+        ));
+        assert!(is_duckduckgo_challenge(
+            r#"<p>Unfortunately, bots use DuckDuckGo too</p>"#
+        ));
+        assert!(!is_duckduckgo_challenge("clean results page"));
+    }
+
+    /// #245 batch 32: a 3-result batch IS eligible for the spam check —
+    /// `<` flipped to `<=` would exempt exactly-3 batches, letting a
+    /// three-pages-one-domain stuffed SERP through parse.
+    #[test]
+    fn spam_heuristic_judges_a_three_result_batch() {
+        let mk = |url: &str| SearchResult {
+            title: "t".into(),
+            url: url.into(),
+            snippet: "s".into(),
+        };
+        let results = vec![
+            mk("https://spam.example/a"),
+            mk("https://spam.example/b"),
+            mk("https://spam.example/c"),
+        ];
+        assert!(is_likely_spam_results(&results));
+    }
+
+    /// #245 batch 32: 2-of-4 results sharing a domain is NOT spam — the
+    /// 60% threshold (`max * 5 >= results.len() * 3`) deliberately keeps
+    /// it. Flipping the second `*` to `+` (`results.len() + 3`) would flag
+    /// this batch (10 >= 7), i.e. classify a kept batch as spam.
+    #[test]
+    fn spam_heuristic_keeps_two_of_four_sharing_a_domain() {
+        let mk = |url: &str| SearchResult {
+            title: "t".into(),
+            url: url.into(),
+            snippet: "s".into(),
+        };
+        let results = vec![
+            mk("https://spam.example/a"),
+            mk("https://spam.example/b"),
+            mk("https://other.org/c"),
+            mk("https://third.net/d"),
+        ];
+        assert!(!is_likely_spam_results(&results));
+    }
 }
