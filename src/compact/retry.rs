@@ -487,4 +487,73 @@ mod tests {
         // 128000 * 4 * 0.8 = 409600
         assert_eq!(target.unwrap(), 409600);
     }
+
+    // ── #245 compact batch mc1: truncate_head_for_retry boundary pins ──
+
+    #[test]
+    fn truncate_head_retry_exact_drop_walks_groups_additively() {
+        // Kills :104 `+→*` / :107 `+=→*=`: the cumulative walk must be
+        // additive. Four User groups (chars 3/3/1/1, total 8), target 2 →
+        // need 6 → with `+`: 3 ≤ 6, 3+3=6 ≤ 6, 6+1=7 > 6 breaks → exactly
+        // two groups dropped → keep_from 2 → ["c","d"]. A multiplicative
+        // walk keeps cumulative at 0 forever (0*x=0), drops ALL groups and
+        // clamps to the final one → ["d"].
+        let msgs = vec![
+            Message::user("aaa".to_string()),
+            Message::user("bbb".to_string()),
+            Message::user("c".to_string()),
+            Message::user("d".to_string()),
+        ];
+        let out = truncate_head_for_retry(&msgs, Some(2)).expect("exact drop keeps two groups");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "c");
+        assert_eq!(out[1].content, "d");
+    }
+
+    #[test]
+    fn truncate_head_retry_fallback_fraction_divides_for_seven_groups() {
+        // Kills :113 `/→%`: 7 groups → 7/5 = 1 dropped (7%5 = 2 would drop
+        // two) → result starts at the second message.
+        let msgs: Vec<Message> = (0..7).map(|i| Message::user(format!("m{i}"))).collect();
+        let out = truncate_head_for_retry(&msgs, None).expect("fallback drops one group");
+        assert_eq!(out[0].content, "m1");
+    }
+
+    #[test]
+    fn truncate_head_retry_fallback_clamps_to_one_drop() {
+        // Kills :114 `<→<=`: 3 messages → groups [(0,2),(2,3)] → raw 0 →
+        // must clamp to one drop; `<=` would drop zero and return None.
+        let msgs = vec![
+            Message::user("a".to_string()),
+            Message::assistant("b".to_string()),
+            Message::user("c".to_string()),
+        ];
+        let out = truncate_head_for_retry(&msgs, None).expect("raw 0 clamps to one drop");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, "c");
+    }
+
+    #[test]
+    fn truncate_head_retry_retreats_past_orphaned_tool_head() {
+        // Documents the retreat branch (dead under the current call graph:
+        // keep_from ≥ 1 ⇒ kept head is always a boundary message).
+        let msgs = vec![
+            Message::user("a".to_string()),
+            Message::tool_result("c1", "result".to_string()),
+            Message::user("b".to_string()),
+            Message::assistant("c".to_string()),
+        ];
+        let out = truncate_head_for_retry(&msgs, None).expect("drops one group");
+        assert_eq!(out[0].content, "b");
+    }
+
+    #[test]
+    fn extract_number_after_parses_digits_following_the_prefix() {
+        // Kills :191 `+→-`: the scan window must start after the prefix.
+        assert_eq!(
+            extract_number_after("task resulted in 4096 tokens", "resulted in"),
+            Some(4096)
+        );
+        assert_eq!(extract_number_after("no digits here", "resulted in"), None);
+    }
 }

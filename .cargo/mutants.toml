@@ -1155,4 +1155,28 @@ exclude_re = [
     # batch (positions :36/:158/:171) are pinned, not excluded — see the
     # batch-32 tests in src/workspace/activity.rs.
     "src/workspace/activity\\.rs:80:9: replace <impl ActivityProbe for NoActivityProbe>::active_work -> Vec<ActiveWork> with vec!\\[\\]",
+    # ── Issue #245 compact batch mc1 (主控直落; negctl /tmp/mc1-negctl2.log)
+    # retry.rs group_by_user_boundary / truncate_head_for_retry — six
+    # true-equivalence exclusions, each verified by applying the mutation
+    # and running the full compact::retry suite (GREEN under mutant):
+    #
+    # :45:14 `<→<=` — `start` is only ever assigned from a boundary index i
+    # (loop range 1..len) so start ≤ len-1 < len on every path; the final
+    # `if start < messages.len()` pushes the identical tail group under both
+    # spellings. (The `<` → `>`/`==` siblings are killed by existing
+    # split-on-boundary pins and stay in scope.)
+    "src/compact/retry\\.rs:45:14: replace < with <= in group_by_user_boundary",
+    # :114:20 `<→<=` — the clamp is max(raw, 1): raw<1 ⇒ both spellings
+    # yield 1; raw ≥ 1 ⇒ both yield raw. Identical on the whole domain.
+    "src/compact/retry\\.rs:114:20: replace < with <= in truncate_head_for_retry",
+    # :137:11 / :139:36 / :139:69 / :139:72 — the head-retreat loop is
+    # unreachable dead logic in this call graph: keep_from ≥ 1 always
+    # (drop_count ≥ 1 by the early return; the ≥len clamp lands on len-1),
+    # and groups[k].0 for k ≥ 1 is by construction a User/System boundary
+    # index, so the flattened result head is never Tool/Assistant. The
+    # `==→!=` twin at :139:22 is empirically RED (kept as killed).
+    "src/compact/retry\\.rs:137:11: delete ! in truncate_head_for_retry",
+    "src/compact/retry\\.rs:139:36: replace \\|\\| with \\&\\& in truncate_head_for_retry",
+    "src/compact/retry\\.rs:139:69: replace \\&\\& with \\|\\| in truncate_head_for_retry",
+    "src/compact/retry\\.rs:139:72: delete ! in truncate_head_for_retry",
 ]
