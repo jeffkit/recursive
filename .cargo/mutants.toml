@@ -1236,4 +1236,33 @@ exclude_re = [
     # positive_network_budget_secs_open_a_retry_window_through_the_factory
     # and stay in scope.
     "src/llm/factory\\.rs:46:60: replace > with >= in build_llm_provider",
+    # ── Issue #245 batch 35 (B1 seat, task list /tmp/b1-batch35.txt) ───────
+    # acp/server.rs :564:9 `delete match arm "session/cancel"` in
+    # dispatch_async — dead arm, true equivalence: dispatch_async has exactly
+    # one caller, AcpServer::dispatch_one (:2179), and dispatch_one routes
+    # `session/cancel` itself first (:2095-:2121 — issue #179: the ACP spec
+    # sends cancel as a notification, so it must be handled before the
+    # missing-id early return); both server states and both id forms return
+    # there, so the method name can never reach the match in dispatch_async.
+    # Deleting the arm changes nothing on any input. The live cancel paths
+    # stay pinned where they actually run: pre-init -32002 by
+    # uninitialized_session_methods_report_server_not_initialized, post-init
+    # token firing by the #179 cancel tests. negctl: mutation applied → whole
+    # acp::server suite green (batch 35, B1 seat).
+    "src/acp/server\\.rs:564:9: delete match arm \"session/cancel\" in dispatch_async",
+    # kernel.rs :401:50 `wall_timeout_secs > 0` → `>=` on the `wall_start`
+    # initialiser — true equivalence: the mutant differs only at secs == 0,
+    # where it stores `Some(Instant::now())` instead of `None`, and
+    # `wall_start` is dead data at that value. Its only two readers are
+    # RunCore::check_wall_deadline (src/run_core.rs:975, returns before the
+    # read when `wall_timeout_secs == 0`) and RunCore::complete_with_budget
+    # (:1282-:1293, the `elapsed` it derives is consumed only under
+    # `wall_timeout_secs > 0`). For secs > 0 both spellings store
+    # `Some(now)`, and `Instant::now()` has no observable side effect, so no
+    # test can distinguish the two on any input. The `<` / `==` siblings
+    # disable or invert the budget and are killed by the kernel wall-budget
+    # pins (kernel_wall_budget_fires_when_ctx_leaves_it_zero,
+    # kernel_ctx_budget_overrides_kernel_default). negctl: mutation applied →
+    # whole kernel suite green (batch 35, B1 seat).
+    "src/kernel\\.rs:401:50: replace > with >= in AgentKernel::run",
 ]

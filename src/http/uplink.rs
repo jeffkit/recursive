@@ -155,3 +155,86 @@ pub(super) async fn read_bounded_uplink(
     }
     Ok(Bytes::from(buf))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn with_content_length(len: usize) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_str(&len.to_string()).unwrap(),
+        );
+        headers
+    }
+
+    /// The declared `Content-Length` short-circuits only when it is *above*
+    /// the budget: exactly the budget and anything below must read the body
+    /// (the `>` boundary the Read tool uses), while a declaration above the
+    /// budget fails before a single byte is read — the observed size is the
+    /// declaration itself, not whatever few bytes a lying client then sends.
+    /// Kills the three `len > limit` rewrites (:124:16 `<`, `==`, `>=`).
+    #[tokio::test]
+    async fn content_length_declaration_short_circuits_only_above_the_limit() {
+        let limit = 8;
+        let body = read_bounded_uplink(&with_content_length(8), Body::from("12345678"), limit)
+            .await
+            .expect("a body of exactly the limit is in budget");
+        assert_eq!(&body[..], b"12345678");
+
+        let body = read_bounded_uplink(&with_content_length(3), Body::from("abc"), limit)
+            .await
+            .expect("a body under the limit is in budget");
+        assert_eq!(&body[..], b"abc");
+
+        let err = read_bounded_uplink(&with_content_length(100), Body::from("abc"), limit)
+            .await
+            .expect_err("a declaration above the limit fails before reading");
+        assert_eq!(
+            err,
+            UplinkFailure::Overflow(UplinkOverflow {
+                limit,
+                observed: 100
+            }),
+            "observed must be the declared length, not the 3 bytes actually sent"
+        );
+    }
+
+    /// Without a declaration the overflow is caught while reading, and the
+    /// reported `observed` is the bytes buffered so far *plus* the frame that
+    /// blew the budget — a lower bound of the real body. Kills
+    /// `buf.len() + data.len()` → `*` (:142:49): with the whole body in one
+    /// frame the product is 0; split across frames it collapses to the
+    /// budget itself.
+    #[tokio::test]
+    async fn overflow_observed_size_counts_the_bytes_seen_so_far() {
+        let limit = 8;
+        let err = read_bounded_uplink(&HeaderMap::new(), Body::from("123456789"), limit)
+            .await
+            .expect_err("nine bytes blow an eight-byte budget");
+        assert_eq!(
+            err,
+            UplinkFailure::Overflow(UplinkOverflow { limit, observed: 9 })
+        );
+
+        let frames = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"12345678")),
+            Ok(Bytes::from_static(b"9")),
+        ]);
+        let err = read_bounded_uplink(&HeaderMap::new(), Body::from_stream(frames), limit)
+            .await
+            .expect_err("the ninth byte, arriving in its own frame, blows the budget");
+        assert_eq!(
+            err,
+            UplinkFailure::Overflow(UplinkOverflow { limit, observed: 9 }),
+            "eight buffered bytes plus a one-byte frame is nine, not eight"
+        );
+
+        let body = read_bounded_uplink(&HeaderMap::new(), Body::from("12345678"), limit)
+            .await
+            .expect("exactly the limit, undeclared, is in budget");
+        assert_eq!(&body[..], b"12345678");
+    }
+}

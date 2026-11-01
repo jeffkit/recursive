@@ -1595,4 +1595,152 @@ mod tests {
         );
         assert!(changes.deleted.is_empty());
     }
+
+    /// The walk source already knows *why* a file could not be compared, and
+    /// that reason — not the generic "content unavailable" fallback — is what
+    /// the ledger must surface. An oversized file cannot tell the two apart
+    /// (its size trips the byte budget either way, same wording), so the
+    /// probe is an unreadable file: the current snapshot sees a regular file
+    /// whose read is denied. Kills `fingerprint_reason -> None` (:772:9).
+    ///
+    /// unix-only: the denial is a mode-000 file (`PermissionsExt` does not
+    /// compile elsewhere), and a root process reads such a file anyway, so
+    /// the probe bails out loudly instead of asserting. Unlock on windows =
+    /// a portable "metadata ok, read denied" fixture (ACL / sharing lock).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_degrade_with_the_explicit_read_failure_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("plain");
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = ws.join("secret.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let ledger = ledger(&ws, &tmp.path().join("private"));
+
+        ledger.begin_turn(1);
+        ledger.ensure_baseline().unwrap();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            eprintln!("skipping: this process reads a mode-000 file (root?), nothing to observe");
+            return;
+        }
+        let changes = ledger.finalize_turn(1).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(changes.modified.len(), 1, "{changes:?}");
+        let change = &changes.modified[0];
+        assert!(change.coarse, "{change:?}");
+        assert_eq!(
+            change.coarse_reason.as_deref(),
+            Some("file could not be read"),
+            "the source's own reason must win over the generic fallback: {change:?}"
+        );
+        assert_eq!(change.bytes_before, Some(4));
+        assert_eq!(
+            change.bytes_after,
+            Some(8),
+            "the size still comes from metadata when the body is unreadable"
+        );
+    }
+
+    /// An added file has no "before" and a deleted file has no "after": the
+    /// absent side is `None`, never a phantom `Some(0)` (both diff sources
+    /// hand `build_change` an empty body for the absent side so the unified
+    /// diff has something to compare against). Kills the two `build_change`
+    /// arm deletions (:787:13 `Added => None`, :795:13 `Deleted => None`),
+    /// on the shadow-index and the walk source alike.
+    #[test]
+    fn added_and_deleted_changes_carry_no_size_on_the_absent_side() {
+        fn assert_absent_sides(changes: &TurnChanges) {
+            let added = &changes.added[0];
+            assert_eq!(added.path, "new.txt");
+            assert_eq!(
+                added.bytes_before, None,
+                "an added file has no before-size: {added:?}"
+            );
+            assert_eq!(added.bytes_after, Some(6));
+            let deleted = &changes.deleted[0];
+            assert_eq!(deleted.path, "gone.txt");
+            assert_eq!(deleted.bytes_before, Some(4));
+            assert_eq!(
+                deleted.bytes_after, None,
+                "a deleted file has no after-size: {deleted:?}"
+            );
+        }
+
+        let (_tmp, ws, private) = repo_fixture();
+        std::fs::write(ws.join("gone.txt"), "bye\n").unwrap();
+        let git_ledger = ledger(&ws, &private);
+        git_ledger.begin_turn(1);
+        git_ledger.ensure_baseline().unwrap();
+        std::fs::write(ws.join("new.txt"), "fresh\n").unwrap();
+        std::fs::remove_file(ws.join("gone.txt")).unwrap();
+        let changes = git_ledger.finalize_turn(1).unwrap();
+        assert_eq!(changes.sources, vec!["shadow_index".to_string()]);
+        assert_absent_sides(&changes);
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("plain");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("gone.txt"), "bye\n").unwrap();
+        let walk_ledger = ledger(&ws, &tmp.path().join("private"));
+        walk_ledger.begin_turn(1);
+        walk_ledger.ensure_baseline().unwrap();
+        std::fs::write(ws.join("new.txt"), "fresh\n").unwrap();
+        std::fs::remove_file(ws.join("gone.txt")).unwrap();
+        let changes = walk_ledger.finalize_turn(1).unwrap();
+        assert_eq!(changes.sources, vec!["workspace_walk".to_string()]);
+        assert_absent_sides(&changes);
+    }
+
+    /// The byte budget is exclusive: a file of exactly `max_file_bytes` bytes
+    /// is still captured and compared by content — only the
+    /// `max_file_bytes + 1`st byte degrades it. Both sides sit exactly on the
+    /// budget here, so the ledger must carry a real diff, not the over-budget
+    /// coarse marker. Kills `b > self.budgets.max_file_bytes` → `>=`
+    /// (:807:28) in `build_change`.
+    #[test]
+    fn a_file_exactly_at_the_capture_budget_still_gets_a_real_diff() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("plain");
+        std::fs::create_dir_all(&ws).unwrap();
+        let before = b"0123456789abcde\n";
+        let after = b"0123456789ABCDE\n";
+        assert_eq!(before.len(), 16);
+        assert_eq!(after.len(), 16);
+        std::fs::write(ws.join("edge.txt"), before).unwrap();
+        let budgets = Budgets {
+            max_file_bytes: 16,
+            ..Budgets::default()
+        };
+        let ledger = Deliverables::new(&ws, tmp.path().join("private"), budgets).unwrap();
+
+        ledger.begin_turn(1);
+        ledger.ensure_baseline().unwrap();
+        std::fs::write(ws.join("edge.txt"), after).unwrap();
+        let changes = ledger.finalize_turn(1).unwrap();
+
+        assert_eq!(changes.modified.len(), 1, "{changes:?}");
+        let change = &changes.modified[0];
+        assert!(
+            !change.coarse,
+            "exactly on the budget is still in budget: {change:?}"
+        );
+        assert_eq!(change.coarse_reason, None);
+        assert_eq!(change.bytes_before, Some(16));
+        assert_eq!(change.bytes_after, Some(16));
+        assert!(
+            change.diff.contains("+0123456789ABCDE\n"),
+            "{}",
+            change.diff
+        );
+        assert!(
+            change.diff.contains("-0123456789abcde\n"),
+            "{}",
+            change.diff
+        );
+    }
 }

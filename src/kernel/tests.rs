@@ -260,6 +260,52 @@ async fn kernel_run_prepends_compaction_summary_to_new_messages() {
     );
 }
 
+/// The summary prepend is keyed on *this turn's* compaction count, not on
+/// the mere presence of a summary message: a transcript that already carries
+/// the summary of an earlier turn's compaction, and compacts nothing now,
+/// must yield only the reply — re-emitting the old summary would duplicate
+/// it in the Wrapper's transcript on every later turn. Kills
+/// `inner.intra_turn_compactions > 0` → `>=` (:428:41), which the
+/// non-summary and the real-compaction tests above cannot see.
+#[tokio::test]
+async fn kernel_run_does_not_reprepend_a_summary_from_an_earlier_turn() {
+    use crate::llm::Completion;
+    let provider = Arc::new(MockProvider::new(vec![Completion {
+        content: "reply".to_string(),
+        tool_calls: vec![],
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+        reasoning_content: None,
+    }]));
+    let kernel = AgentKernel::builder()
+        .llm(provider)
+        .max_steps(1)
+        .build()
+        .expect("build");
+
+    let old_summary = Message::user("summary of turns 1-3".to_string()).with_compaction_summary();
+    assert!(old_summary.is_compaction_summary, "fixture is a summary");
+    let ctx = make_minimal_ctx(vec![
+        Message::system("sys".to_string()),
+        old_summary,
+        Message::user("q".to_string()),
+    ]);
+    let outcome = kernel.run(ctx).await.expect("run");
+
+    assert_eq!(
+        outcome.new_messages.len(),
+        1,
+        "a turn without compaction yields only the reply; got {:?}",
+        outcome.new_messages
+    );
+    assert_eq!(outcome.new_messages[0].content, "reply");
+    assert!(
+        !outcome.new_messages[0].is_compaction_summary,
+        "the earlier turn's summary must not be re-emitted: {:?}",
+        outcome.new_messages
+    );
+}
+
 #[test]
 fn kernel_builder_max_transcript_chars_stored_and_chains() {
     let mock = Arc::new(MockProvider::default());

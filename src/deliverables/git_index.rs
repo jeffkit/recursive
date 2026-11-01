@@ -423,4 +423,34 @@ mod tests {
             "an empty workspace must index no files"
         );
     }
+
+    /// `is_empty` is the "nothing indexed" predicate, so it must turn false
+    /// the moment one path is in the snapshot — both for a hand-built value
+    /// and for a real snapshot of a one-file workspace. Kills
+    /// `GitSnapshot::is_empty -> true` (:37:9), which the empty-workspace
+    /// test above cannot see.
+    #[test]
+    fn is_empty_is_false_once_any_path_is_indexed() {
+        let mut one = GitSnapshot::default();
+        assert!(one.is_empty(), "a default snapshot indexes nothing");
+        one.paths.insert("a.txt".into(), "deadbeef".into());
+        assert!(
+            !one.is_empty(),
+            "a snapshot with one path is not empty: {:?}",
+            one.paths
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        init_repo(&ws);
+        std::fs::write(ws.join("a.txt"), "one\n").unwrap();
+        let index = ShadowIndex::open(&ws, tmp.path().join("shadow")).unwrap();
+        let snap = index.snapshot().unwrap();
+        assert_eq!(snap.paths.len(), 1, "{:?}", snap.paths);
+        assert!(
+            !snap.is_empty(),
+            "a snapshot that indexed a.txt must not report empty"
+        );
+    }
 }

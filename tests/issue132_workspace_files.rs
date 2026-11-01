@@ -354,6 +354,67 @@ mod issue132_workspace_files_tests {
         );
     }
 
+    /// The page/window arithmetic at the edges the previous test's ranges
+    /// happen to miss (2..=3 on four lines is the one range where
+    /// `end / start + 1` equals `end - start + 1`):
+    /// - a line page from line 1 is exactly `end - start + 1` lines
+    ///   (`:408:28 - → /` takes one line too many);
+    /// - `offset == size` is a legal, empty window (`:448:15 > → >=` refuses
+    ///   it) and the default length is `size - offset` (`:463:22 - → +`
+    ///   over-reads past EOF into a 500);
+    /// - `offset + length == size` is the last legal window (`:455:23 + → *`
+    ///   refuses 3+3 on six bytes as 3×3).
+    #[tokio::test]
+    async fn line_page_and_byte_window_arithmetic_is_exact_at_the_edges() {
+        let (state, tmp) = workspace_state();
+        let app = build_router(state.clone());
+        let id = create_session(&app).await;
+        write_file(tmp.path(), "five.txt", b"l1\nl2\nl3\nl4\nl5");
+        write_file(tmp.path(), "six.bin", b"abcdef");
+
+        for (query, want_content, want_end) in [
+            ("?path=five.txt&start_line=1&end_line=2", "l1\nl2", 2),
+            ("?path=five.txt&start_line=3&end_line=5", "l3\nl4\nl5", 5),
+        ] {
+            let (status, body) = files_get(&app, &id, query).await;
+            assert_eq!(status, 200, "{query}: {body}");
+            let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(page["content"], want_content, "{query}: {body}");
+            assert_eq!(page["end_line"], want_end, "{query}: {body}");
+            assert_eq!(page["total_lines"], 5, "{query}: {body}");
+        }
+
+        let (status, body) = files_get(&app, &id, "?path=six.bin&mode=bytes&offset=6").await;
+        assert_eq!(status, 200, "offset == size is an empty window: {body}");
+        let window: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(window["length"], 0, "{body}");
+        assert_eq!(window["data"], "", "{body}");
+
+        let (status, body) = files_get(&app, &id, "?path=six.bin&mode=bytes&offset=4").await;
+        assert_eq!(status, 200, "default length runs to EOF: {body}");
+        let window: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(window["length"], 2, "{body}");
+        assert_eq!(
+            window["data"],
+            general_purpose::STANDARD.encode(b"ef"),
+            "{body}"
+        );
+
+        let (status, body) =
+            files_get(&app, &id, "?path=six.bin&mode=bytes&offset=3&length=3").await;
+        assert_eq!(
+            status, 200,
+            "offset + length == size is the last window: {body}"
+        );
+        let window: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(window["length"], 3, "{body}");
+        assert_eq!(
+            window["data"],
+            general_purpose::STANDARD.encode(b"def"),
+            "{body}"
+        );
+    }
+
     // ── headline: stat error mapping and page-limit boundary ────────────
 
     /// A missing path answers 404 with the "no such entry" spelling. The

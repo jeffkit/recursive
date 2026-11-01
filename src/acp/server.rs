@@ -5628,4 +5628,480 @@ done
             "frames after a flush failure must be dropped (peer is gone): {out}"
         );
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // #245 batch 35: initialize type guard, session/new sandbox check,
+    // session/load, process-stdio `run`
+    // ══════════════════════════════════════════════════════════════════
+
+    /// `protocolVersion` must be a *number*: a string spelling of the
+    /// supported version is refused by name, not coerced to 0 and then
+    /// reported as "unsupported version 0". Kills the `!v.is_number()` match
+    /// guard → `false` rewrite (:679:24): with the guard gone the string
+    /// falls through to `as_u64().unwrap_or(0)` and the wrong error wins.
+    #[tokio::test]
+    async fn initialize_rejects_a_non_numeric_protocol_version_by_name() {
+        let mut srv = TestServer::new(mock_llm());
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "1"},
+            }))
+            .await
+            .expect("initialize answers");
+        assert_eq!(resp["error"]["code"], INVALID_PARAMS, "{resp}");
+        let msg = resp["error"]["message"].as_str().expect("error message");
+        assert!(
+            msg.contains("'protocolVersion' must be a number"),
+            "a string version is a type error, not an unsupported version: {msg}"
+        );
+        assert!(
+            matches!(srv.state, ServerState::Uninitialized),
+            "a refused initialize must not flip the server state"
+        );
+
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 2, "method": "initialize",
+                "params": {"protocolVersion": 1},
+            }))
+            .await
+            .expect("initialize answers");
+        assert_eq!(
+            resp["result"]["protocolVersion"],
+            SUPPORTED_PROTOCOL_VERSION.as_u16(),
+            "the same version as a number is accepted: {resp}"
+        );
+    }
+
+    /// AC-2.1, strict mode: the sandbox check is
+    /// `cwd == root || cwd.starts_with(root)`, and
+    /// `RECURSIVE_ACP_SANDBOX_STRICT=1` turns an escaped cwd into an
+    /// INVALID_PARAMS refusal. A tempdir (a strict sub-path of the root)
+    /// opens; the filesystem root `/` is refused by name. Kills `== → !=`
+    /// (:818:30: everything but the root itself counts as inside, the
+    /// outside case is no longer refused), `|| → &&` (:818:38: only the
+    /// root itself counts as inside, the tempdir case is refused) and
+    /// `delete !` (:819:12: both cases flip).
+    ///
+    /// The assertions run in a child process because the strict variables
+    /// live in process env and mutating env in-process races every
+    /// concurrent `session/new` reader (`std::env::set_var` vs `var` is
+    /// POSIX-undefined and torn reads refused other tests' sessions in
+    /// practice); the parent never mutates its own env — it spawns the
+    /// child with the variables already set, the same pattern as
+    /// `run_serves_initialize_on_process_stdio`. The root is the common
+    /// ancestor of `temp_dir()` and `/tmp` — the set of cwds any
+    /// concurrently running `session/new` test uses — so nothing else could
+    /// be refused by it anyway. unix-only fixture (`/` and `/tmp`; windows
+    /// unlock = drive root + `%TEMP%` ancestor).
+    #[cfg(unix)]
+    fn session_new_sandbox_common_root() -> std::path::PathBuf {
+        let mut root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp_dir exists");
+        if let Ok(slash_tmp) = std::path::Path::new("/tmp").canonicalize() {
+            while !slash_tmp.starts_with(&root) {
+                root = root
+                    .parent()
+                    .expect("temp_dir and /tmp share an ancestor")
+                    .to_path_buf();
+            }
+        }
+        root
+    }
+
+    /// Opt-in switch for `session_new_sandbox_strict_child` (see the
+    /// `sandbox_common_root` doc above).
+    const ACP_SANDBOX_STRICT_CHILD: &str = "RECURSIVE_ACP_SANDBOX_STRICT_CHILD";
+
+    /// Child half of `session_new_sandbox_strict_refusal_is_pinned_in_a_child_process`;
+    /// a no-op under the normal suite. Runs with `RECURSIVE_ACP_SANDBOX_ROOT`
+    /// = the common-ancestor root and `RECURSIVE_ACP_SANDBOX_STRICT=1`
+    /// already in its env, set by the parent at spawn time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_sandbox_strict_child() {
+        if std::env::var_os(ACP_SANDBOX_STRICT_CHILD).is_none() {
+            return;
+        }
+        let root = session_new_sandbox_common_root();
+        assert_eq!(
+            std::env::var_os("RECURSIVE_ACP_SANDBOX_ROOT"),
+            Some(root.clone().into_os_string()),
+            "fixture precondition: spawned with the common-ancestor root {root:?}"
+        );
+        assert_eq!(
+            std::env::var_os("RECURSIVE_ACP_SANDBOX_STRICT").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "fixture precondition: spawned with strict mode on"
+        );
+
+        let inside = tempfile::TempDir::new().unwrap();
+        assert!(
+            inside.path().canonicalize().unwrap().starts_with(&root),
+            "fixture precondition: the tempdir must sit under the sandbox root {root:?}"
+        );
+
+        let mut srv = TestServer::new(mock_llm());
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "capabilities": {}},
+            }))
+            .await
+            .expect("initialize responds");
+        assert!(resp.get("result").is_some(), "initialize must succeed");
+
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 2, "method": "session/new",
+                "params": {"cwd": inside.path().to_string_lossy()},
+            }))
+            .await
+            .expect("session/new answers");
+        assert!(
+            resp.get("result").is_some(),
+            "a cwd under the root opens even in strict mode: {resp}"
+        );
+
+        let resp = srv
+            .request(serde_json::json!({
+                "id": 3, "method": "session/new",
+                "params": {"cwd": "/"},
+            }))
+            .await
+            .expect("session/new answers");
+        assert_eq!(
+            resp["error"]["code"], INVALID_PARAMS,
+            "a cwd outside the root is refused in strict mode: {resp}"
+        );
+        let msg = resp["error"]["message"].as_str().expect("error message");
+        assert!(
+            msg.contains("cwd escapes sandbox root"),
+            "the refusal names the escape: {msg}"
+        );
+    }
+
+    /// Parent half of the strict-mode sandbox pin: spawn this test binary on
+    /// `session_new_sandbox_strict_child` with the strict variables injected
+    /// at spawn time (never in this process) and require one green test.
+    /// See `session_new_sandbox_common_root` for the root choice and the
+    /// killed mutants.
+    #[cfg(unix)]
+    #[test]
+    fn session_new_sandbox_strict_refusal_is_pinned_in_a_child_process() {
+        use std::process::{Command, Stdio};
+
+        let root = session_new_sandbox_common_root();
+        assert!(
+            !std::path::Path::new("/").starts_with(&root),
+            "fixture needs a cwd outside the sandbox root; root={root:?}"
+        );
+
+        // `module_path!()` keeps the crate root (`recursive::acp::server::…`);
+        // libtest names tests from the crate root's children.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let child_name = format!("{module}::session_new_sandbox_strict_child");
+        let exe = std::env::current_exe().expect("current test binary");
+        let out = Command::new(exe)
+            .args(["--exact", &child_name, "--nocapture"])
+            .env(ACP_SANDBOX_STRICT_CHILD, "1")
+            .env("RECURSIVE_ACP_SANDBOX_ROOT", &root)
+            .env("RECURSIVE_ACP_SANDBOX_STRICT", "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn child test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed"),
+            "child {child_name} did not run exactly one green test: status={:?}\n\
+             --stdout--\n{stdout}\n--stderr--\n{stderr}",
+            out.status
+        );
+    }
+
+    /// ACP-S1-13: `session/load` without params (or without `sessionId`)
+    /// must answer -32602 naming the field — not go silent. Kills the
+    /// `(None, vec![…])` body replacements of `handle_session_load`
+    /// (`:959:5`, two shapes): the mutated handler answers nothing.
+    #[tokio::test]
+    async fn load_param_errors_name_the_missing_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        for params in [None, Some(serde_json::json!({}))] {
+            let mut req = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"session/load"});
+            if let Some(p) = params.clone() {
+                req["params"] = p;
+            }
+            let (resp, notifs) = AcpServer::dispatch_one(
+                &req,
+                &mut srv.state,
+                &mut srv.sessions,
+                Some(&srv.llm),
+                &srv.sync_table,
+                &srv.control,
+            )
+            .await;
+            let resp = resp.unwrap_or_else(|| panic!("load must answer with params {params:?}"));
+            assert_eq!(resp["error"]["code"], INVALID_PARAMS, "{resp}");
+            assert!(
+                resp["error"]["message"]
+                    .as_str()
+                    .expect("error message")
+                    .contains("sessionId"),
+                "the error must name the missing field: {resp}"
+            );
+            assert!(
+                notifs.is_empty(),
+                "a refused load replays nothing: {notifs:?}"
+            );
+        }
+    }
+
+    /// ACP-S1-13a: an unknown session id must produce -32000 with the
+    /// "Session not found" wording *before* any transcript parsing is
+    /// attempted. Kills `:989:8 delete !` (the existence guard flips: the
+    /// fall-through surfaces a transcript-parse error message instead).
+    #[tokio::test]
+    async fn load_unknown_session_reports_session_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut srv = TestServer::new(mock_llm());
+        srv.initialize_and_open_session(&tmp, false).await;
+
+        let (resp, notifs) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":8,"method":"session/load",
+                "params":{"sessionId":"ghost-1"},
+            }),
+            &mut srv.state,
+            &mut srv.sessions,
+            Some(&srv.llm),
+            &srv.sync_table,
+            &srv.control,
+        )
+        .await;
+        let resp = resp.expect("load of an unknown session must still answer");
+        assert_eq!(
+            resp["error"]["code"], -32000,
+            "unknown session must be SESSION_NOT_FOUND: {resp}"
+        );
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("Session not found"),
+            "the unknown-session error must come from the existence guard: {resp}"
+        );
+        assert!(notifs.is_empty(), "{notifs:?}");
+    }
+
+    /// ACP-S1-01: a persisted session loads into a fresh server. The
+    /// response is the bare `result: null` the contract promises (S1.1), and
+    /// the history is replayed *in order* as `session/update` notifications
+    /// — one chunk per user/assistant message — closed by `session/loaded`
+    /// carrying the message count. Kills the `(Some(Default::default()), …)`
+    /// body replacements of `handle_session_load` (`:959:5`, two shapes): a
+    /// bare `null` (no id, no `result` key) and an empty / one-null replay
+    /// fail the shape asserts. Also pins `:989:8 delete !` from the other
+    /// side: an existing session must not be refused as not found.
+    #[tokio::test]
+    async fn load_round_trip_replays_history_and_answers_null() {
+        use crate::acp::session::{SavedMessage, SessionMetadata};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let persist = tempfile::TempDir::new().unwrap();
+        let sid = "persisted-load-1";
+        let session_dir = persist.path().join(sid);
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        let msgs = [
+            crate::message::Message::user("one"),
+            crate::message::Message::assistant("two"),
+            crate::message::Message::user("three"),
+        ];
+        let transcript_lines: Vec<String> = msgs
+            .iter()
+            .map(|m| {
+                serde_json::to_string(&SavedMessage::from_message(m.clone())).expect("serialize")
+            })
+            .collect();
+        std::fs::write(
+            session_dir.join("transcript.jsonl"),
+            transcript_lines.join("\n") + "\n",
+        )
+        .expect("write transcript");
+        let metadata = SessionMetadata {
+            session_id: sid.to_string(),
+            cwd: workspace.path().to_path_buf(),
+            turn: 4,
+            system_prompt: Some("keeper".into()),
+            mcp_servers: None,
+        };
+        std::fs::write(
+            session_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        let (out, _out_rx) = mpsc::channel::<Value>(256);
+        let control = TurnControl::new(out);
+        let mut state = ServerState::Uninitialized;
+        let mut sessions =
+            AcpSessionManager::new().with_persistence_dir(persist.path().to_path_buf());
+        let sync_table = build_sync_dispatch_table();
+        let llm = mock_llm();
+
+        let (init_resp, _) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"protocolVersion":1},
+            }),
+            &mut state,
+            &mut sessions,
+            Some(&llm),
+            &sync_table,
+            &control,
+        )
+        .await;
+        assert!(init_resp
+            .expect("initialize responds")
+            .get("result")
+            .is_some());
+
+        let (resp, notifs) = AcpServer::dispatch_one(
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":9,"method":"session/load",
+                "params":{"sessionId":sid},
+            }),
+            &mut state,
+            &mut sessions,
+            Some(&llm),
+            &sync_table,
+            &control,
+        )
+        .await;
+        let resp = resp.expect("load of a persisted session must answer");
+        assert_eq!(resp["id"], 9, "the answer carries the request id: {resp}");
+        assert!(resp.get("error").is_none(), "load must succeed: {resp}");
+        assert_eq!(
+            resp.get("result"),
+            Some(&Value::Null),
+            "load answers exactly `result: null` (S1.1): {resp}"
+        );
+
+        let updates: Vec<(String, Option<String>)> = notifs
+            .iter()
+            .map(|n| {
+                assert_eq!(n["method"], "session/update", "{n}");
+                assert_eq!(n["params"]["sessionId"], sid, "{n}");
+                (
+                    n["params"]["update"]["sessionUpdate"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    n["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            updates,
+            vec![
+                ("user_message_chunk".to_string(), Some("one".to_string())),
+                ("agent_message_chunk".to_string(), Some("two".to_string())),
+                ("user_message_chunk".to_string(), Some("three".to_string())),
+                ("session/loaded".to_string(), None),
+            ],
+            "history replays in order and closes with session/loaded: {notifs:?}"
+        );
+        assert_eq!(
+            notifs[3]["params"]["update"]["messageCount"], 3,
+            "{:?}",
+            notifs[3]
+        );
+        assert!(
+            sessions.contains(sid),
+            "the loaded session is live in the manager"
+        );
+    }
+
+    /// Opt-in switch for `acp_server_stdio_child`: `AcpServer::run` binds
+    /// the process's own stdin/stdout, so the child only does work when the
+    /// parent test re-executes this binary with the variable set.
+    const ACP_STDIO_CHILD: &str = "RECURSIVE_ACP_SERVER_STDIO_CHILD";
+
+    /// Child half of `run_serves_initialize_on_process_stdio`; a no-op under
+    /// the normal suite. No LLM: `initialize` is the Sprint-1 surface and
+    /// needs none, and EOF on stdin ends `run` (#183).
+    #[tokio::test]
+    async fn acp_server_stdio_child() {
+        if std::env::var_os(ACP_STDIO_CHILD).is_none() {
+            return;
+        }
+        AcpServer::run(None).await;
+    }
+
+    /// `run` is the production binding of `run_stdio` to process stdio. Its
+    /// only caller is the CLI's `recursive acp`, so no in-process test can
+    /// see it, and the agent-mutants gate tests the mutated package alone —
+    /// a CLI integration pin does not count. As in `src/mcp_server.rs`,
+    /// re-run this test binary on the `*_child` test with capture off, feed
+    /// it one `initialize` on stdin and read the reply back from its stdout.
+    /// Kills `AcpServer::run → ()` (:1862:9): the mutant answers nothing.
+    #[test]
+    fn run_serves_initialize_on_process_stdio() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        // `module_path!()` keeps the crate root (`recursive::acp::server::…`);
+        // libtest names tests from the crate root's children.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let child_name = format!("{module}::acp_server_stdio_child");
+        let exe = std::env::current_exe().expect("current test binary");
+
+        let mut child = Command::new(exe)
+            .args(["--exact", &child_name, "--nocapture"])
+            .env(ACP_STDIO_CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn child test binary");
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\
+                      \"params\":{\"protocolVersion\":1}}\n",
+                )
+                .expect("write request");
+        } // dropping the pipe is the EOF that ends `run`
+        let out = child.wait_with_output().expect("child exit");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed"),
+            "child {child_name} did not run exactly one green test: status={:?}\n\
+             --stdout--\n{stdout}\n--stderr--\n{stderr}",
+            out.status
+        );
+
+        let reply = stdout
+            .lines()
+            .find(|l| l.starts_with('{'))
+            .unwrap_or_else(|| panic!("run must write the initialize reply to stdout:\n{stdout}"));
+        let reply: Value = serde_json::from_str(reply).expect("reply must be JSON");
+        assert_eq!(reply["id"], 1, "{reply}");
+        assert_eq!(
+            reply["result"]["protocolVersion"],
+            SUPPORTED_PROTOCOL_VERSION.as_u16(),
+            "{reply}"
+        );
+    }
 }

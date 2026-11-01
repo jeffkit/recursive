@@ -328,4 +328,58 @@ mod tests {
             "timeout-classified transport failure must be marked retryable, got: {msg}"
         );
     }
+
+    /// Goal 394: `CountLines` holds the session-mutable roots slot, so a
+    /// session fork must yield a clone bound to the fork's fresh slot — a
+    /// root granted to the forked session afterwards is visible to the fork
+    /// and only to it. Kills `fork_box -> None` (:90:9): a tool that refuses
+    /// to fork would leave the forked session without `count_lines` at all.
+    #[tokio::test]
+    async fn fork_box_rewires_count_lines_onto_the_fresh_session_roots_slot() {
+        let workspace = TempDir::new().unwrap();
+        let granted = TempDir::new().unwrap();
+        std::fs::write(granted.path().join("note.txt"), "a\nb\nc\n").unwrap();
+
+        let parent_slot = crate::tools::new_shared_sandbox_roots();
+        let tool = CountLines::new(workspace.path()).with_session_roots(parent_slot);
+        let fresh_slot = crate::tools::new_shared_sandbox_roots();
+        let state = SessionToolState {
+            read_state: None,
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                crate::tools::BackgroundJobManager::new(),
+            )),
+            session_roots: Some(fresh_slot.clone()),
+            deliverables: None,
+        };
+        let forked = tool
+            .fork_box(&state)
+            .expect("CountLines carries session roots, so it must fork onto the fresh slot");
+
+        fresh_slot
+            .write()
+            .unwrap()
+            .push((granted.path().to_path_buf(), AccessTier::ReadOnly));
+        let scope = granted
+            .path()
+            .join("note.txt")
+            .to_string_lossy()
+            .to_string();
+        let out = forked
+            .execute(json!({"path": scope.as_str()}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "3",
+            "the fork must read through the freshly granted root"
+        );
+
+        let err = tool
+            .execute(json!({"path": scope.as_str()}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadToolArgs { .. }),
+            "the parent slot never received the grant, so the parent must still refuse: {err}"
+        );
+    }
 }
