@@ -1071,6 +1071,51 @@ mod tests {
         );
     }
 
+    /// `"auto"` has a single spelling (no legacy alias), so its arm is the
+    /// only way the string reaches `PermissionMode::Auto`; without it the
+    /// string falls through to the `unknown_variant` rejection. Kills the
+    /// `"auto"` arm deletion (:169:21).
+    #[test]
+    fn test_permission_mode_deserialize_auto() {
+        let mode: PermissionMode = serde_json::from_str("\"auto\"").unwrap();
+        assert_eq!(mode, PermissionMode::Auto);
+    }
+
+    /// `"strict"` is the deny-unknown mode and, like `"auto"`, has a single
+    /// spelling. Kills the `"strict"` arm deletion (:170:21).
+    #[test]
+    fn test_permission_mode_deserialize_strict() {
+        let mode: PermissionMode = serde_json::from_str("\"strict\"").unwrap();
+        assert_eq!(mode, PermissionMode::Strict);
+    }
+
+    /// A JSON value that is neither a string nor an object reaches none of
+    /// the visitor's arms, so serde reports `invalid type` and names what was
+    /// expected through `Visitor::expecting` — the only place the accepted
+    /// shape is spelled out for a wrong-typed value (a wrong *string* goes
+    /// through `unknown_variant`, which carries its own list). Kills
+    /// `expecting` → `Ok(Default::default())` (:153:17): with nothing
+    /// written the message ends in "expected " and the operator gets no hint
+    /// of what a permission mode looks like.
+    #[test]
+    fn test_permission_mode_wrong_type_error_names_the_expected_shape() {
+        let err = serde_json::from_str::<PermissionMode>("42")
+            .expect_err("an integer is not a permission mode")
+            .to_string();
+        assert!(
+            err.contains("invalid type: integer `42`"),
+            "the wrong-type path, not unknown_variant, must report: {err}"
+        );
+        assert!(
+            err.contains("expected a permission mode string (\"default\""),
+            "`expecting` must name the accepted string spellings: {err}"
+        );
+        assert!(
+            err.contains("or a Plan object {\"prePlanMode\""),
+            "`expecting` must name the Plan object form: {err}"
+        );
+    }
+
     // ── Backward-compat aliases ───────────────────────────────────────────
 
     #[test]
