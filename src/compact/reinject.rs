@@ -1223,4 +1223,119 @@ mod tests {
         let spec = file_reinjector_spec_from_env(None, Some("00")).unwrap();
         assert_eq!(spec.token_budget, 50_000);
     }
+
+    // ── #245 compact batch mc4b (主控直落) ──
+
+    /// Deterministic fixed-path skill fixture: the tempdir-based helper has
+    /// a random path whose length perturbs the token estimate; these pins
+    /// sit on exact budget edges, so the path must be fixed.
+    fn write_fixed_skill(name: &str, body: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mc4-skill-fixtures-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            format!("---\nname: {name}\ndescription: {name} skill\n---\n\n{body}"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn skill_reinject_no_truncation_marker_at_exact_byte_budget() {
+        // Kills :307:38 `>→>=`: body exactly per_skill_budget*4 bytes is
+        // NOT truncated — no marker.
+        let body = "A".repeat(400); // per_skill_budget 100 tokens = 400 bytes
+        let path = write_fixed_skill("exact", &body);
+        let skill = Skill {
+            name: "exact".to_string(),
+            description: "exact skill".to_string(),
+            path: path.clone(),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: Some(body.clone()),
+        };
+        let r = SkillReinjector {
+            token_budget: 5000,
+            per_skill_budget: 100,
+            skills: vec![skill],
+        };
+        let pre = vec![Message::assistant_with_tool_calls(
+            "Loading skill".to_string(),
+            vec![skill_tool_call("exact")],
+        )];
+        let msgs = r.reinject(&pre);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            !msgs[0].content.contains("skill content truncated"),
+            "exact-byte-budget body must not be marked as truncated"
+        );
+    }
+
+    #[test]
+    fn skill_reinject_budget_walk_is_additive_and_strict() {
+        // Kills :336:44 `+→*` / `+→-` and :338:28 `+=→*`: per-skill tokens
+        // must be chars/4+1 and the walk must be additive. Two same-shaped
+        // skills (fixed path, 400-char bodies) with budget 2T-1 (T = the
+        // per-skill token estimate): original keeps only the first
+        // (T+T = 2T > 2T-1); multiplicative token walk (T-1 per skill:
+        // (T-1)+(T-1) = 2T-2 ≤ 2T-1) or tokens_used pinned at 0 (0*T = 0)
+        // fits both → two messages.
+        let body = "A".repeat(400);
+        let p1 = write_fixed_skill("alpha", &body);
+        let p2 = write_fixed_skill("bravo", &body);
+        let mk = |name: &str, path: &std::path::Path| Skill {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            path: path.to_path_buf(),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: Some(body.clone()),
+        };
+        // Mirror the production token estimate for the budget edge.
+        let hdr = format!("[post-compact skill restore: alpha @ {}]\n", p1.display());
+        let t = (hdr.len() + 400) / 4 + 1;
+        let r = SkillReinjector {
+            token_budget: 2 * t - 1,
+            per_skill_budget: 5000,
+            skills: vec![mk("alpha", &p1), mk("bravo", &p2)],
+        };
+        let pre = vec![
+            Message::assistant_with_tool_calls(
+                "Loading skill".to_string(),
+                vec![skill_tool_call("alpha")],
+            ),
+            Message::assistant_with_tool_calls(
+                "Loading skill".to_string(),
+                vec![skill_tool_call("bravo")],
+            ),
+        ];
+        let msgs = r.reinject(&pre);
+        assert_eq!(msgs.len(), 1, "budget 3T-2 must fit only the first skill");
+    }
+
+    #[test]
+    fn skill_reinjector_zero_budget_falls_back_to_default() {
+        // Kills :388:62 / :390:62 `>→>=`: a zero budget fails the filter →
+        // unwrap_or restores the 25_000 default; `>=` would accept 0.
+        let spec = skill_reinjector_spec_from_env(Some("00"), None).unwrap();
+        assert_eq!(spec.token_budget, 25_000);
+        let spec = skill_reinjector_spec_from_env(None, Some("00")).unwrap();
+        assert_eq!(spec.token_budget, 25_000);
+    }
 }

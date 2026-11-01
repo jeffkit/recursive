@@ -474,4 +474,20 @@ mod tests {
         assert_eq!(rebuilt.boundary, None);
         assert_eq!(rebuilt.seed.len(), 2);
     }
+
+    #[test]
+    fn rebuild_declared_seed_reports_boundary_in_full_file_coordinates() {
+        // Kills rebuild.rs:225:36 `+→-`: the reported boundary must be the
+        // declaration index plus the marker's relative position. With the
+        // declaration at 0 and rows[at=1..] carrying the marked summary at
+        // relative 1, the boundary is 1+1 = 2; subtraction reports 0.
+        let stored = vec![
+            Message::system("declaration row"),
+            Message::user("mid"),
+            summary("folded"),
+            Message::user("tail"),
+        ];
+        let seed = rebuild_declared_seed(&stored, Some(1)).expect("restorable after declaration");
+        assert_eq!(seed.boundary, Some(2));
+    }
 }
