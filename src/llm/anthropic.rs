@@ -2217,6 +2217,22 @@ mod tests {
             "env '0' opts the official endpoint out"
         );
 
+        // A value that is none of 1/true/0/false must fall through to the
+        // endpoint heuristic instead of forcing a verdict. Kills the
+        // `match guard v == "0" || v.eq_ignore_ascii_case("false") with
+        // true` mutant on the second `Ok(v)` arm: with an always-true guard
+        // that arm swallows every unrecognized value and the official
+        // endpoint loses its default-on here.
+        std::env::set_var("RECURSIVE_PROMPT_CACHE", "off");
+        assert!(
+            official.supports_prompt_cache(),
+            "unrecognized env value must fall through to the endpoint heuristic"
+        );
+        assert!(
+            !proxy.supports_prompt_cache(),
+            "unrecognized env value must fall through to the endpoint heuristic"
+        );
+
         assert!(
             AnthropicProvider::new("http://third-party:9999", "sk-noop", "m")
                 .unwrap()

@@ -965,6 +965,20 @@ mod tests {
             "auth_middleware must have an explicit release-build branch that \
              surfaces a misuse warning when INSECURE_OK is set"
         );
+        // And that release branch must fire ONLY when the var is actually
+        // set (`insecure_ok_set && cfg!(not(debug_assertions))`). An `||`
+        // spelling would log "set but ignored" on every unauthenticated
+        // release request even when the operator never set the var — a
+        // lying error line on the default-deny path. This is the one
+        // spelling difference a debug test binary cannot observe at
+        // runtime (both spellings collapse to the same control flow when
+        // `cfg!(not(debug_assertions))` is false), which is why the
+        // structural pin carries it — see the header comment above.
+        assert!(
+            middleware_body.contains("insecure_ok_set && cfg!(not(debug_assertions))"),
+            "the release-build branch must fire only when INSECURE_OK is \
+             actually set"
+        );
     }
 
     // ── Issue #245 batch 30 (B1 seat) — env-resolution / middleware pins ────

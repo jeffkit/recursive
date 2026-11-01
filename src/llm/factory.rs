@@ -173,4 +173,97 @@ mod tests {
             "a compatible proxy must not get the Anthropic beta header"
         );
     }
+
+    /// A loopback server that accepts and immediately drops every
+    /// connection, so each provider attempt is a network-class failure.
+    fn drop_server() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || loop {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        addr
+    }
+
+    /// Issue #203 wiring through the factory: a positive
+    /// `retry_network_budget_secs` must reach the provider as a live
+    /// wall-clock window. With `max_retries = 2` as the count floor, the
+    /// loop may only exit once the window has expired — the window path
+    /// gives up exactly when `elapsed >= budget`, so the `>= 900 ms` bound
+    /// holds by construction, not by timing luck. Kills the `>`→`<` and
+    /// `>`→`==` mutants at the factory's `retry_network_budget_secs > 0`
+    /// guard: either spelling loses the budget for every positive value
+    /// and the loop stops at the count floor (~ms).
+    #[tokio::test]
+    async fn positive_network_budget_secs_open_a_retry_window_through_the_factory() {
+        let addr = drop_server();
+        let config = Config {
+            provider_type: "openai".into(),
+            api_base: format!("http://{addr}"),
+            retry_network_budget_secs: 1,
+            ..base_config()
+        };
+        let retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        };
+        let provider =
+            build_llm_provider(&config, "sk-noop", retry, None, None).expect("openai arm");
+
+        let started = std::time::Instant::now();
+        let result = provider.complete_simple("ping", 0.2).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "every attempt is dropped; must give up");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the configured budget must keep the window open past the count \
+             floor (max_retries=2); elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the window must stop the loop instead of running away; elapsed={elapsed:?}"
+        );
+    }
+
+    /// The "zero means no time cap" half of the same contract (issue #203):
+    /// `retry_network_budget_secs = 0` must NOT open a window — the loop
+    /// stops at the count floor. This seam is doubly guarded (the `> 0`
+    /// guard here AND the zero-budget filter in
+    /// `RetryPolicy::backoff_for_budgeted`), which is why the `>`→`>=`
+    /// mutant at the factory guard is true-equivalent: `secs >= 0` is a
+    /// u64 tautology handing out `Some(secs)` everywhere, and `Some(0)` is
+    /// dropped by the pinned pricing.rs filter exactly like the `None` the
+    /// original produces (see `.cargo/mutants.toml`).
+    #[tokio::test]
+    async fn zero_network_budget_secs_keeps_the_factory_retry_count_only() {
+        let addr = drop_server();
+        let config = Config {
+            provider_type: "openai".into(),
+            api_base: format!("http://{addr}"),
+            retry_network_budget_secs: 0,
+            ..base_config()
+        };
+        let retry = RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        };
+        let provider =
+            build_llm_provider(&config, "sk-noop", retry, None, None).expect("openai arm");
+
+        let started = std::time::Instant::now();
+        let result = provider.complete_simple("ping", 0.2).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "every attempt is dropped; must give up");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "a zero budget must keep the loop count-only (3 attempts, no \
+             window); elapsed={elapsed:?}"
+        );
+    }
 }

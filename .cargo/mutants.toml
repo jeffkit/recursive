@@ -1211,4 +1211,22 @@ exclude_re = [
     # pins). negctl: mutation applied → all 100 handlers tests green
     # (EXIT=0) → byte-exact restore (batch 33, B1 seat).
     "src/http/handlers\\.rs:299:17: replace > with >= in readyz",
+    # ── Issue #245 batch 33 (B2 seat, task list /tmp/b2-batch33.txt) ───────
+    # factory.rs :46:60 `>→>=` on `config.retry_network_budget_secs > 0` —
+    # true equivalence downstream of the guard: `secs >= 0` is a u64
+    # tautology, so the mutant yields `Some(secs)` for every value. For
+    # secs > 0 that is byte-identical to the original `Some(secs)`; for
+    # secs = 0 (where the original yields `None`) the mutant's `Some(0)` is
+    # dropped by the `!b.is_zero()` filter in `RetryPolicy::
+    # backoff_for_budgeted` (src/llm/pricing.rs:142) and both spellings run
+    # count-only — that filter is itself pinned by
+    # retry_policy_none_or_zero_time_budget_is_count_only (pricing.rs). The
+    # whole domain is therefore indistinguishable through every consumer
+    # (both provider arms funnel the budget into backoff_for_budgeted
+    # alone). negctl: mutation applied → both factory budget tests green
+    # (logs in /tmp/b2-b33/logs/, batch 33). The `<`/`==` siblings of the
+    # same guard are killed by
+    # positive_network_budget_secs_open_a_retry_window_through_the_factory
+    # and stay in scope.
+    "src/llm/factory\\.rs:46:60: replace > with >= in build_llm_provider",
 ]
