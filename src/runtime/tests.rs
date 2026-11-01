@@ -4084,3 +4084,793 @@ async fn destroy_environment_reports_a_clean_reclaim_without_a_leak_warning() {
         "no leak WARN may fire when every job was reclaimed, got {lines:?}"
     );
 }
+
+// ── Issue #245 batch 34 (B2 seat): runtime.rs mutation pins ─────────────
+//
+// One test per surviving mutant from the Mutation workflow's runtime.rs
+// shard (task list /tmp/b2-batch34.txt). Each test names the mutant it
+// kills in its leading comment, and was verified red under a hand-applied
+// mutant and green after restore (logs in /tmp/b2-b34/logs/).
+
+/// Kills `replace AgentRuntime::close with ()` (runtime.rs:723): a completed
+/// turn's `close` must dispatch `SessionEnd` exactly once, and a repeated
+/// `close` must not dispatch it again. The Cancelled exemption (close with a
+/// cancelled outcome fires nothing) is pinned separately by
+/// `cancelled_does_not_dispatch_session_end_hook` in tests/integration.rs.
+#[tokio::test]
+async fn close_fires_session_end_once_for_a_completed_turn() {
+    struct CountingHook(std::sync::atomic::AtomicUsize);
+    impl crate::hooks::Hook for CountingHook {
+        fn on_event(&self, event: HookEvent) -> crate::hooks::HookAction {
+            if matches!(event, HookEvent::SessionEnd { .. }) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            crate::hooks::HookAction::Continue
+        }
+    }
+    let counter = Arc::new(CountingHook(std::sync::atomic::AtomicUsize::new(0)));
+    let mut hooks = HookRegistry::new();
+    hooks.register(counter.clone() as Arc<dyn crate::hooks::Hook>);
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![reply("done")])))
+        .hooks(hooks)
+        .build()
+        .unwrap();
+
+    let outcome = rt.run("hi").await.unwrap();
+    assert_eq!(outcome.finish_reason, FinishReason::NoMoreToolCalls);
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        0,
+        "SessionEnd fires on close(), not on run()"
+    );
+
+    rt.close(Some(&outcome)).await;
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        1,
+        "close must dispatch SessionEnd for a completed turn"
+    );
+
+    rt.close(Some(&outcome)).await;
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        1,
+        "a repeated close must not dispatch SessionEnd again"
+    );
+}
+
+/// Kills `replace match guard is_context_window_exceeded(&e) with true` in
+/// `AgentRuntime::run` (runtime.rs:373): emergency compaction + retry is
+/// reserved for a context-window rejection. Any other LLM failure must
+/// propagate as-is — no summary call, no PreCompact/PostCompact, no silent
+/// second attempt.
+#[tokio::test]
+async fn non_context_window_errors_propagate_without_emergency_compaction() {
+    struct CompactionHookRecorder(Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl crate::hooks::Hook for CompactionHookRecorder {
+        fn on_event(&self, event: HookEvent) -> crate::hooks::HookAction {
+            match event {
+                HookEvent::PreCompact { .. } => {
+                    self.0.lock().unwrap().push("PreCompact");
+                }
+                HookEvent::PostCompact { .. } => {
+                    self.0.lock().unwrap().push("PostCompact");
+                }
+                _ => {}
+            }
+            crate::hooks::HookAction::Continue
+        }
+    }
+
+    let unrelated = crate::error::Error::Llm {
+        provider: "test-model".into(),
+        model: None,
+        request_id: None,
+        message: "HTTP 401: unauthorized".into(),
+    };
+    // Spare completions only the (wrong) overflow path would consume: first
+    // the summariser, then the retried turn's reply. A 401 is not
+    // step-retryable, so it reaches `run` on the first attempt.
+    let llm = Arc::new(
+        MockProvider::new(vec![
+            summary_completion(),
+            reply("reply after a retry that must never happen"),
+        ])
+        .with_errors(vec![unrelated]),
+    );
+    let hook_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Arc::new(CompactionHookRecorder(hook_events.clone())));
+    let mut rt = AgentRuntime::builder()
+        .llm(llm.clone())
+        .hooks(hooks)
+        .compactor(crate::Compactor::new(usize::MAX))
+        .build()
+        .unwrap();
+    // Long enough that an emergency compaction WOULD run if attempted.
+    *Arc::make_mut(&mut rt.transcript) = alternating(14);
+
+    let err = rt
+        .run("test: unrelated failure")
+        .await
+        .expect_err("a 401 must propagate, not trigger overflow recovery");
+    assert!(
+        err.to_string().contains("HTTP 401: unauthorized"),
+        "the original error must surface, got: {err}"
+    );
+    assert_eq!(
+        llm.calls().len(),
+        1,
+        "no summary call and no retry may follow a non-overflow error"
+    );
+    assert!(
+        hook_events.lock().unwrap().is_empty(),
+        "no PreCompact/PostCompact for a non-overflow error, got {:?}",
+        *hook_events.lock().unwrap()
+    );
+    assert!(
+        !transcript_contains_summary(&rt).await,
+        "the transcript must not be compacted"
+    );
+    assert_eq!(
+        rt.transcript().len(),
+        15,
+        "14 seeded messages + the staged user prompt, untouched"
+    );
+}
+
+/// Kills `replace match guard !changes.is_empty() with true` in
+/// `finalize_deliverables` (runtime.rs:745): a turn that changed nothing and
+/// presented nothing still finalizes the ledger, but must NOT announce an
+/// empty `ChangeLedger` — consumers treat the event as "the turn changed
+/// files".
+#[tokio::test]
+async fn finalize_deliverables_stays_silent_for_a_turn_without_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let ledger = Arc::new(
+        crate::deliverables::Deliverables::new(
+            ws.clone(),
+            tmp.path().join("ledger"),
+            crate::deliverables::Budgets::default(),
+        )
+        .unwrap(),
+    );
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![reply("just talk")])))
+        .tools(ToolRegistry::local().with_deliverables(Some(ledger.clone())))
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    assert!(
+        rt.deliverables().is_some(),
+        "fixture: the registry's ledger reached the runtime"
+    );
+    while rx.try_recv().is_ok() {}
+
+    rt.run("no tools, no files").await.unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnFinished { .. })),
+        "fixture: the turn completed"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ChangeLedger { .. })),
+        "an empty ledger must not be announced, got {events:?}"
+    );
+    // Non-vacuous: the ledger WAS finalized for this turn, it just had
+    // nothing to say.
+    let last = ledger
+        .last_changes()
+        .expect("finalize_turn ran for the completed turn");
+    assert_eq!(last.turn, 0);
+    assert!(last.is_empty());
+}
+
+/// Kills `replace > with >=` on `pruned > 0` in `maybe_compact_cross_turn`
+/// (runtime.rs:804): a microcompactor that found nothing to prune must leave
+/// no trace — no `Microcompact` event and no rewrite mark on the persisted
+/// prefix (a spurious mark would force every following per-turn persist to
+/// re-read and resync the backend for nothing).
+#[tokio::test]
+async fn cross_turn_microcompact_below_trigger_leaves_no_trace() {
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .microcompactor(crate::compact::Microcompactor::new(2, 1))
+        .compactor(crate::compact::Compactor::new(usize::MAX))
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    // One tool result: at or below the trigger (2), so `prune` returns 0.
+    *Arc::make_mut(&mut rt.transcript) = vec![
+        Message::user("q"),
+        Message::assistant_with_tool_calls(
+            "a",
+            vec![crate::llm::ToolCall {
+                id: "call_0".into(),
+                name: "add".into(),
+                arguments: json!({"a": 1, "b": 1}),
+            }],
+        ),
+        Message::tool_result("call_0", "x".repeat(300)),
+    ];
+    assert!(
+        !rt.transcript_rewritten,
+        "fixture: no rewrite pending before the pass"
+    );
+    while rx.try_recv().is_ok() {}
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Microcompact { .. })),
+        "pruned == 0 must not emit Microcompact, got {events:?}"
+    );
+    assert!(
+        !rt.transcript_rewritten,
+        "pruned == 0 must not mark the transcript as rewritten"
+    );
+    assert_eq!(
+        rt.transcript()[2].content,
+        "x".repeat(300),
+        "the tool result is untouched"
+    );
+}
+
+/// Kills `replace + with -` on `summary_base + offset` in the file-reinject
+/// block of `maybe_compact_cross_turn` (runtime.rs:933): with two re-injected
+/// files the second must land directly after the first, behind the summary —
+/// `summary_base - 1` would push it in front of the summary instead.
+#[tokio::test]
+async fn cross_turn_compaction_keeps_multiple_file_restores_in_order_after_the_summary() {
+    let read_state = Arc::new(std::sync::Mutex::new(crate::tools::ReadFileState::new()));
+    {
+        let mut locked = read_state.lock().unwrap();
+        locked.record(
+            std::path::PathBuf::from("src/older.rs"),
+            false,
+            "pub fn older() {}".into(),
+            1_000,
+        );
+        locked.record(
+            std::path::PathBuf::from("src/newer.rs"),
+            false,
+            "pub fn newer() {}".into(),
+            2_000,
+        );
+    }
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![summary_completion()])))
+        .compactor(crate::Compactor::new(0)) // always compact
+        .file_reinjector(crate::compact::FileReinjector::new(read_state))
+        .build()
+        .unwrap();
+    *Arc::make_mut(&mut rt.transcript) = alternating(14);
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .unwrap();
+
+    let t = rt.transcript();
+    assert!(
+        t[0].is_compaction_summary,
+        "the summary stays at the front; got {:?}",
+        t.iter()
+            .map(|m| &m.content[..m.content.len().min(48)])
+            .collect::<Vec<_>>()
+    );
+    // `ReadFileState::recent_files` is newest-first, so the attachments are
+    // [newer, older] and must occupy indices 1 and 2 in that order.
+    assert!(
+        t[1].content
+            .starts_with("[post-compact file restore: src/newer.rs]"),
+        "got: {}",
+        t[1].content
+    );
+    assert!(
+        t[2].content
+            .starts_with("[post-compact file restore: src/older.rs]"),
+        "got: {}",
+        t[2].content
+    );
+    assert!(
+        !t[3].content.starts_with("[post-compact file restore:"),
+        "exactly two attachments, then the preserved tail"
+    );
+}
+
+/// Kills `replace + with -` on `insert_base + offset` in the skill-reinject
+/// block of `maybe_compact_cross_turn` (runtime.rs:964): with two re-invoked
+/// skills the second attachment must follow the first behind the summary —
+/// `insert_base - 1` would push it in front of the summary instead.
+#[tokio::test]
+async fn cross_turn_compaction_keeps_multiple_skill_restores_in_order_after_the_summary() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, body) in [
+        ("alpha", "Alpha instructions."),
+        ("beta", "Beta instructions."),
+    ] {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} skill\n---\n\n{body}"),
+        )
+        .unwrap();
+    }
+    let skills = crate::skills::discover_skills(&[tmp.path().to_path_buf()]);
+    assert_eq!(skills.len(), 2, "fixture: both skills discovered");
+
+    let skill_call = |id: &str, name: &str| {
+        Message::assistant_with_tool_calls(
+            format!("Loading {name}."),
+            vec![crate::llm::ToolCall {
+                id: id.into(),
+                name: "Skill".into(),
+                arguments: json!({ "name": name }),
+            }],
+        )
+    };
+    let mut msgs = vec![
+        Message::user("start"),
+        skill_call("sk1", "alpha"),
+        Message::tool_result("sk1", "alpha body loaded"),
+        Message::user("next"),
+        skill_call("sk2", "beta"),
+        Message::tool_result("sk2", "beta body loaded"),
+    ];
+    msgs.extend(alternating(8));
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![summary_completion()])))
+        .compactor(crate::Compactor::new(0)) // always compact
+        .skill_reinjector(crate::compact::SkillReinjector::new(skills))
+        .build()
+        .unwrap();
+    *Arc::make_mut(&mut rt.transcript) = msgs;
+
+    rt.maybe_compact_cross_turn(&TokenUsage::default())
+        .await
+        .unwrap();
+
+    let t = rt.transcript();
+    assert!(
+        t[0].is_compaction_summary,
+        "the summary stays at the front; got {:?}",
+        t.iter()
+            .map(|m| &m.content[..m.content.len().min(48)])
+            .collect::<Vec<_>>()
+    );
+    // `SkillReinjector::reinject` emits newest-invoked first: [beta, alpha].
+    assert!(
+        t[1].content
+            .starts_with("[post-compact skill restore: beta @"),
+        "got: {}",
+        t[1].content
+    );
+    assert!(
+        t[2].content
+            .starts_with("[post-compact skill restore: alpha @"),
+        "got: {}",
+        t[2].content
+    );
+    assert!(
+        !t[3].content.starts_with("[post-compact skill restore:"),
+        "exactly two attachments, then the preserved tail"
+    );
+}
+
+/// Kills `replace AgentRuntime::clear_approval_wait_timeout with ()`
+/// (runtime.rs:1589): clearing a previously bounded wait must rebuild the
+/// registered `exit_plan_mode` with wait-forever semantics — a reviewer
+/// decision arriving after the old bound still counts, instead of the tool
+/// having already given up with "timed out". `set_interrupt_token` after the
+/// clear would mask the bug (it re-registers anyway), so no refresh happens
+/// between the clear and the tool call here. Time is paused: the old 1 s
+/// bound expires before the (delayed) decision without real waiting.
+#[tokio::test(start_paused = true)]
+async fn clear_approval_wait_timeout_restores_wait_forever_for_the_registered_plan_tool() {
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+    rt.set_approval_wait_timeout_secs(1);
+    let bounded = rt
+        .kernel
+        .tools()
+        .find_by_name(EXIT_PLAN_MODE_TOOL_NAME)
+        .expect("plan tool present");
+
+    rt.clear_approval_wait_timeout();
+
+    // The REPL reads the env once per turn, so the clear must rebuild the
+    // registered tool — otherwise the old bound survives in the registry.
+    let tool = rt
+        .kernel
+        .tools()
+        .find_by_name(EXIT_PLAN_MODE_TOOL_NAME)
+        .expect("plan tool present");
+    assert!(
+        !Arc::ptr_eq(&bounded, &tool),
+        "clearing must re-register the plan tool"
+    );
+    let wait = tokio::spawn(async move { tool.execute(json!({ "plan": "p" })).await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while rt.plan_approval_gate().pending_plan().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("exit_plan_mode must stage the plan before parking");
+    // Decide only after the old 1 s bound would have expired.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    rt.confirm_plan();
+
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), wait)
+        .await
+        .expect("the wait must end on the reviewer decision")
+        .unwrap()
+        .expect("execute returns Ok (finish is data)");
+    assert!(
+        out.contains("\"approved\":true"),
+        "a decision after the old bound must still be honoured, got: {out}"
+    );
+    assert!(!out.contains("timed out"), "got: {out}");
+}
+
+/// Kills `replace AgentRuntime::confirm_plan with ()` (runtime.rs:1694):
+/// confirming must wake the parked `exit_plan_mode` wait with an approval
+/// and clear the pending plan.
+#[tokio::test]
+async fn confirm_plan_wakes_the_parked_exit_plan_mode_wait_with_an_approval() {
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+    let tool = rt
+        .kernel
+        .tools()
+        .find_by_name(EXIT_PLAN_MODE_TOOL_NAME)
+        .expect("plan tool present");
+    let wait = tokio::spawn(async move { tool.execute(json!({ "plan": "p" })).await });
+    // The tool stages the plan (`begin_approval`) before parking — confirm
+    // only once it is parked, or the staging would wipe the decision.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while rt.plan_approval_gate().pending_plan().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("exit_plan_mode must stage the plan");
+
+    rt.confirm_plan();
+
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("confirm_plan must end the wait")
+        .unwrap()
+        .expect("execute returns Ok (finish is data)");
+    assert!(out.contains("\"approved\":true"), "got: {out}");
+    assert!(
+        rt.plan_approval_gate().pending_plan().is_none(),
+        "an approved plan is no longer pending"
+    );
+}
+
+/// Kills `replace AgentRuntime::approve_plan_mode_request with ()`
+/// (runtime.rs:1817): the approval must reach the registered
+/// `request_plan_mode` tool's wait as `{"approved": true}`.
+#[tokio::test]
+async fn approve_plan_mode_request_answers_the_registered_request_tool() {
+    let rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+    // `wait_for_decision` consumes a decision recorded before the wait
+    // starts, so the runtime can answer first and the tool call resolves.
+    rt.approve_plan_mode_request();
+    let tool = rt
+        .kernel
+        .tools()
+        .find_by_name("request_plan_mode")
+        .expect("request tool present");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.execute(json!({ "reason": "worth planning" })),
+    )
+    .await
+    .expect("an approved request must not park the tool")
+    .expect("execute returns Ok");
+    assert_eq!(out, json!({ "approved": true }).to_string());
+}
+
+/// Kills `replace AgentRuntime::reject_plan_mode_request with ()`
+/// (runtime.rs:1825): the rejection — and its reason — must reach the
+/// registered `request_plan_mode` tool's wait.
+#[tokio::test]
+async fn reject_plan_mode_request_answers_the_registered_request_tool_with_the_reason() {
+    let rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+    rt.reject_plan_mode_request("just do it");
+    let tool = rt
+        .kernel
+        .tools()
+        .find_by_name("request_plan_mode")
+        .expect("request tool present");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.execute(json!({ "reason": "worth planning" })),
+    )
+    .await
+    .expect("a rejected request must not park the tool")
+    .expect("execute returns Ok");
+    assert_eq!(
+        out,
+        json!({ "approved": false, "reason": "just do it" }).to_string()
+    );
+}
+
+/// Kills `replace AgentRuntime::plan_mode_request_gate ->
+/// Arc<PlanModeRequestGate> with Arc::new(Default::default())`
+/// (runtime.rs:1687): the accessor must hand out the SAME gate the
+/// registered `request_plan_mode` tool waits on — the TUI backend answers
+/// through this clone while the runtime is parked inside a spawned task.
+#[tokio::test]
+async fn plan_mode_request_gate_accessor_shares_the_registered_tools_gate() {
+    let rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .with_plan_mode_tools(true)
+        .build()
+        .unwrap();
+    let gate = rt.plan_mode_request_gate();
+    assert!(
+        Arc::ptr_eq(&gate, &rt.plan_mode_request_gate()),
+        "the accessor must return the runtime's own gate"
+    );
+
+    // Decide through the clone; the registered tool must wake.
+    gate.approve();
+    let tool = rt
+        .kernel
+        .tools()
+        .find_by_name("request_plan_mode")
+        .expect("request tool present");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tool.execute(json!({ "reason": "r" })),
+    )
+    .await
+    .expect("a decision on the shared gate must wake the registered tool")
+    .expect("execute returns Ok");
+    assert_eq!(out, json!({ "approved": true }).to_string());
+}
+
+/// Kills `replace AgentRuntime::set_sdk_hook_forwarder with ()`
+/// (runtime.rs:1666): the forwarder installed through the runtime must be
+/// the one the registry's external hook runner consults first — and clearing
+/// must detach it again.
+#[tokio::test]
+async fn set_sdk_hook_forwarder_installs_the_forwarder_on_the_registry_hook_runner() {
+    struct RecordingForwarder(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl crate::hooks::SdkHookForwarder for RecordingForwarder {
+        async fn forward(
+            &self,
+            _input: &crate::hooks::HookInput,
+        ) -> Option<crate::hooks::HookResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(crate::hooks::HookResult {
+                action: crate::hooks::HookAction::Skip,
+                ..Default::default()
+            })
+        }
+    }
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut rt = AgentRuntime::builder()
+        .llm(Arc::new(MockProvider::new(vec![])))
+        .build()
+        .unwrap();
+    let input = crate::hooks::HookInput {
+        event: crate::hooks::external::HookEvent::PreToolCall,
+        tool_name: Some("Bash".into()),
+        args: Some(json!({"command": "ls"})),
+        mode: "ask".into(),
+        content: None,
+        message: None,
+        depth: None,
+        reason: None,
+        error: None,
+    };
+
+    rt.set_sdk_hook_forwarder(Some(Arc::new(RecordingForwarder(calls.clone()))));
+    let res = rt.kernel().tools().hook_runner.dispatch(&input).await;
+    assert!(
+        matches!(res.action, crate::hooks::HookAction::Skip),
+        "the installed forwarder's decision must win, got {:?}",
+        res.action
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the forwarder installed through the runtime must be consulted"
+    );
+
+    rt.set_sdk_hook_forwarder(None);
+    let res = rt.kernel().tools().hook_runner.dispatch(&input).await;
+    assert!(
+        matches!(res.action, crate::hooks::HookAction::Continue),
+        "clearing must detach the forwarder again, got {:?}",
+        res.action
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a cleared forwarder is not consulted"
+    );
+}
+
+/// Kills `replace >= with <` on `turns >= max_turns` in `run_goal_loop`
+/// (runtime.rs:1931): with a judge that never approves, the loop runs
+/// exactly `max_turns` turns, asks the judge after every non-final turn,
+/// and gives up with a single `GoalCleared`. `turns < max_turns` would stop
+/// after the first turn instead.
+#[tokio::test]
+async fn run_goal_loop_exhausts_the_turn_budget_exactly_at_max_turns() {
+    // 3 agent turns interleaved with 2 judge verdicts; the budget check runs
+    // before the judge, so turn 3 (== max_turns) is never judged. Nothing is
+    // left over: a fourth turn would hit "no scripted completions left".
+    let llm = Arc::new(MockProvider::new(vec![
+        reply("turn 1"),
+        reply("NO\nkeep going"),
+        reply("turn 2"),
+        reply("NO\nstill not"),
+        reply("turn 3"),
+    ]));
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    let mut rt = AgentRuntime::builder()
+        .llm(llm.clone())
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    while rx.try_recv().is_ok() {}
+
+    let outcomes = rt
+        .run_goal_loop("start", "impossible", 3)
+        .await
+        .expect("budget exhaustion is not an error");
+
+    let texts: Vec<_> = outcomes
+        .iter()
+        .map(|o| o.final_text.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        texts,
+        ["turn 1", "turn 2", "turn 3"],
+        "one outcome per executed turn, in order"
+    );
+    assert_eq!(
+        llm.calls().len(),
+        5,
+        "3 agent calls + 2 judge calls — the budget turn is not judged"
+    );
+    assert!(
+        rt.current_goal().is_none(),
+        "the goal is cleared once the budget is spent"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    let continuing: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::GoalContinuing { turns, .. } => Some(*turns),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(continuing, [1, 2], "the judge saw turns 1 and 2");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::GoalCleared))
+            .count(),
+        1,
+        "exactly one GoalCleared on budget exhaustion, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::GoalAchieved { .. })),
+        "an unmet goal is never reported achieved, got {events:?}"
+    );
+}
+
+/// Kills `replace AgentRuntime::run_goal_loop -> Result<Vec<RuntimeOutcome>>
+/// with Ok(vec![])` (runtime.rs:1889): the loop must set the goal, run the
+/// turn, consult the judge, and return the turn's outcome — an empty result
+/// would mean no turn ran at all. Also covers the `<` budget-mutant from the
+/// other direction (a first-turn budget trip never reaches the judge).
+#[tokio::test]
+async fn run_goal_loop_returns_the_executed_turn_and_announces_the_goal_lifecycle() {
+    let llm = Arc::new(MockProvider::new(vec![
+        reply("I wrote the greeting."),
+        reply("YES\nGreeting was written."),
+    ]));
+    let (sink, mut rx) = crate::event::ChannelSink::new();
+    let mut rt = AgentRuntime::builder()
+        .llm(llm.clone())
+        .event_sink(Arc::new(sink))
+        .build()
+        .unwrap();
+    while rx.try_recv().is_ok() {}
+
+    let outcomes = rt
+        .run_goal_loop("write a greeting", "a greeting exists", 5)
+        .await
+        .expect("the loop completes on the judge's YES");
+
+    assert_eq!(outcomes.len(), 1, "the achieved turn is returned");
+    assert_eq!(
+        outcomes[0].final_text.as_deref(),
+        Some("I wrote the greeting.")
+    );
+    assert_eq!(llm.calls().len(), 2, "one agent turn + one judge call");
+    assert_eq!(
+        rt.transcript().len(),
+        2,
+        "the turn's prompt and reply landed in the transcript"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        matches!(
+            events.first(),
+            Some(AgentEvent::GoalSet { condition, max_turns: 5 })
+                if condition == "a greeting exists"
+        ),
+        "GoalSet opens the loop, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::GoalAchieved { turns: 1, .. })),
+        "the judge's YES closes the loop with GoalAchieved{{turns:1}}, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::GoalCleared)),
+        "an achieved goal is not cleared as budget-exhausted, got {events:?}"
+    );
+    assert!(rt.current_goal().is_none());
+}

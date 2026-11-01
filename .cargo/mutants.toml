@@ -1265,4 +1265,16 @@ exclude_re = [
     # kernel_ctx_budget_overrides_kernel_default). negctl: mutation applied →
     # whole kernel suite green (batch 35, B1 seat).
     "src/kernel\\.rs:401:50: replace > with >= in AgentKernel::run",
+    # ── Issue #245 batch 34 (B2 seat, task list /tmp/b2-batch34.txt) ───────
+    # runtime.rs :323:9 `builder()` body → `Default::default()` — true
+    # equivalence: `impl Default for AgentRuntimeBuilder` (src/runtime/
+    # builder.rs:105) delegates to `Self::new()`, so the mutant resolves to
+    # the very same constructor call; there is no input on which the two
+    # spellings diverge and no observation point can tell them apart. The
+    # other 15 runtime.rs survivors of this shard are pinned behaviourally
+    # by 14 new tests in src/runtime/tests.rs (logs in /tmp/b2-b34/logs/).
+    # UNLOCK CONDITION: the day `impl Default for AgentRuntimeBuilder`
+    # stops delegating to `new()`, drop this entry — any divergence then
+    # becomes a real behavioural mutant in builder defaults.
+    "src/runtime\\.rs:323:9: replace AgentRuntime::builder \\-> AgentRuntimeBuilder with Default::default\\(\\)",
 ]

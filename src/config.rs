@@ -2879,6 +2879,77 @@ api_key = "sk-from-file"
         );
     }
 
+    // -----------------------------------------------------------------------
+    // context_window_tokens_effective family (issue #245 batch 34 pins)
+    // -----------------------------------------------------------------------
+
+    /// Kills `replace Config::context_window_tokens_effective -> usize with 1`
+    /// (config.rs:346): the effective window is read for the *configured*
+    /// model through the effective catalog, and a global override beats it.
+    #[test]
+    fn context_window_tokens_effective_resolves_the_configured_model_and_honours_the_override() {
+        // Override wins for the configured model.
+        let mut config = valid_config();
+        config.context_window_override = Some(4_321);
+        assert_eq!(
+            config.context_window_tokens_effective(),
+            4_321,
+            "the override must beat the catalog for the configured model"
+        );
+
+        // Without an override it delegates to the configured model's
+        // effective-catalog window (the same source the /model picker shows).
+        let config = valid_config(); // model = "gpt-4o-mini"
+        assert_eq!(
+            config.context_window_tokens_effective(),
+            crate::llm::context_window_tokens_for_model_effective("gpt-4o-mini"),
+            "no override: the configured model's effective window"
+        );
+        assert!(
+            config.context_window_tokens_effective() > 1,
+            "…and it is a real window, not the mutant's 1"
+        );
+    }
+
+    /// Kills `replace Config::context_window_tokens_effective_for -> usize
+    /// with 0` and `… with 1` (config.rs:356 ×2): an arbitrary model name
+    /// resolves through the effective catalog — the override wins for every
+    /// name, and without one the documented 128K fallback answers for an
+    /// unlisted model while a listed model gets its catalog window.
+    #[test]
+    fn context_window_tokens_effective_for_resolves_catalog_and_honours_the_override() {
+        // Override wins for any model name.
+        let config = Config {
+            context_window_override: Some(65_536),
+            ..valid_config()
+        };
+        assert_eq!(
+            config.context_window_tokens_effective_for("any-model-name"),
+            65_536,
+            "the override must beat the catalog for every model name"
+        );
+
+        // Without an override: an unlisted model gets the documented fallback
+        // (the bundled catalog's 128K default), a listed model gets its
+        // catalog window — both far from the mutant's 0 / 1.
+        let config = valid_config();
+        const UNLISTED: &str = "b2-batch34-model-not-in-any-catalog";
+        assert_eq!(
+            config.context_window_tokens_effective_for(UNLISTED),
+            128_000,
+            "the effective catalog falls back to the bundled 128K default for an unlisted model"
+        );
+        assert_eq!(
+            config.context_window_tokens_effective_for("gpt-4o-mini"),
+            crate::llm::context_window_tokens_for_model_effective("gpt-4o-mini"),
+            "a listed model resolves through the effective catalog"
+        );
+        assert!(
+            config.context_window_tokens_effective_for("gpt-4o-mini") > 1,
+            "a real window, not the mutant's 0 or 1"
+        );
+    }
+
     // Consolidated per .dev/AGENTS.md §5: set_var/remove_var are
     // process-global, so we hold env_lock for the whole test body and
     // check both the default (env unset) and the override (env set).
