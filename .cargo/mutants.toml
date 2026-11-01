@@ -1193,4 +1193,22 @@ exclude_re = [
     # domain (the `==`/`>` siblings are killed by existing pins). negctl:
     # mutation applied → compact::reinject suite green (compact mc4a).
     "src/compact/reinject\\.rs:31:15: replace > with >= in truncate_on_char_boundary",
+    # ── Issue #245 batch 33 (handlers.rs family, B1 seat) ───────────────────
+    # readyz :299:17 `failures > 0` → `>=` — true equivalence: `failures` is
+    # u64, so `>= 0` is a tautology and the guard reduces to
+    # `!llm_streak_is_current(...)`. The only divergent input is
+    # failures == 0, where the decay block runs compare_exchange(0, 0): a
+    # no-op absent a concurrent store, and with one it merely re-reads a
+    # concurrently-recorded increment — a strictly fresher readiness count,
+    # i.e. a valid linearisation of the racy read, not a behaviour change.
+    # No deterministic test can interpose between the load (:297) and the
+    # CAS (:303) on a plain AtomicU64. Same unsigned-tautology class as the
+    # #223-b3 plan_approval_timeout_secs and #245-b4 stream_events :302:31
+    # entries. The same-name siblings stay in scope and stay killed:
+    # :299:21 `&&→||` decays a CURRENT streak (readyz threshold pin),
+    # :329:36 / :330:47 are the saturation boundary (saturated_with_waiters
+    # pin), :299:17 `==`/`<`/`delete !` invert the decay trigger (decay
+    # pins). negctl: mutation applied → all 100 handlers tests green
+    # (EXIT=0) → byte-exact restore (batch 33, B1 seat).
+    "src/http/handlers\\.rs:299:17: replace > with >= in readyz",
 ]

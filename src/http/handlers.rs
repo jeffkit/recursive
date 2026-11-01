@@ -7628,4 +7628,604 @@ mod tests {
         // first caller — whoever wins the race — is let through.
         assert!(ensure_agui_thread_access(Some(&bob), ws, "brand-new").is_ok());
     }
+
+    // ── Issue #245 batch 33 (B1 seat): handler mutant pins ────────────────
+
+    /// #245 b33 (handlers.rs:192): `now_stamp_ms` must read the session
+    /// clock — `0` stays reserved for the "never happened" sentinel (issue
+    /// #123) and every readiness stamp must compare against
+    /// `now_session_ms()` readings. A constant stamp cannot sit between two
+    /// live clock reads once the clock has moved past it, hence the 5 ms
+    /// settle before pinning the window.
+    #[test]
+    fn now_stamp_ms_tracks_the_session_clock_and_never_the_sentinel() {
+        crate::http::now_session_ms(); // initialise the process epoch
+        std::thread::sleep(Duration::from_millis(5));
+        let before = crate::http::now_session_ms();
+        let stamp = now_stamp_ms();
+        let after = crate::http::now_session_ms();
+        assert!(
+            stamp >= 1,
+            "0 is the never-happened sentinel, never a stamp"
+        );
+        assert!(
+            stamp >= before,
+            "the stamp must track the session clock, not trail it: {stamp} < {before}"
+        );
+        assert!(
+            stamp <= after,
+            "the stamp must not run ahead of the session clock: {stamp} > {after}"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:222): the `/readyz` storage probe value must be
+    /// non-empty (an empty value cannot be told apart from a lost write on
+    /// the read-back), stable for the life of the process (two concurrent
+    /// probes write identical bytes), and unique to the process (so a stale
+    /// value a previous process left behind fails the read-back instead of
+    /// reading as plausible current data).
+    #[test]
+    fn readyz_probe_value_is_stable_nonempty_and_process_unique() {
+        let value = readyz_probe_value();
+        assert!(
+            !value.is_empty(),
+            "an empty probe value is indistinguishable from a lost write"
+        );
+        assert_eq!(
+            readyz_probe_value(),
+            value,
+            "the value must be stable for the life of the process"
+        );
+        assert!(
+            value.contains(&std::process::id().to_string()),
+            "the value must be process-unique so a previous process's stale \
+             bytes fail the read-back: {value:?}"
+        );
+    }
+
+    /// #245 b33 fixture: an `AppState` whose shared provider is a
+    /// `MockProvider` and whose config carries the given thinking/effort
+    /// defaults, so `provider_for_request`'s shared-vs-rebuilt decision is
+    /// observable through `Arc::ptr_eq` (a rebuild is a fresh provider
+    /// instance; the fallback path hands back the shared one).
+    fn provider_request_state(
+        thinking_budget: Option<u32>,
+        reasoning_effort: Option<&str>,
+    ) -> AppState {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "sk-server-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = preset_test_state(tmp.path());
+        state.config.provider_type = "openai".into();
+        state.config.thinking_budget = thinking_budget;
+        state.config.reasoning_effort = reasoning_effort.map(str::to_string);
+        state.config.api_key = Some("sk-server-key".into());
+        state
+    }
+
+    /// #245 b33 (handlers.rs:538/:543): a thinking budget that DIFFERS from
+    /// the server default must be honoured by rebuilding the provider for
+    /// the request — never silently dropped onto the shared provider. The
+    /// no-override fast path pins the same `&&`'s shared-provider edge.
+    #[test]
+    fn a_differing_thinking_budget_rebuilds_the_provider_per_request() {
+        let state = provider_request_state(None, None);
+        assert!(
+            Arc::ptr_eq(
+                &provider_for_request(&state, &SessionOverrides::default()),
+                &state.provider
+            ),
+            "no overrides → the shared server provider"
+        );
+        let overrides = SessionOverrides {
+            thinking_budget: Some(2048),
+            ..Default::default()
+        };
+        assert!(
+            !Arc::ptr_eq(&provider_for_request(&state, &overrides), &state.provider),
+            "a budget the server default does not already carry must produce a \
+             per-request provider, not fall back to the shared one"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:538): an override EQUAL to the server default
+    /// changes nothing and must keep the shared provider — the equality
+    /// filter's other edge.
+    #[test]
+    fn a_thinking_budget_equal_to_the_server_default_keeps_the_shared_provider() {
+        let state = provider_request_state(Some(1024), None);
+        let overrides = SessionOverrides {
+            thinking_budget: Some(1024),
+            ..Default::default()
+        };
+        assert!(
+            Arc::ptr_eq(&provider_for_request(&state, &overrides), &state.provider),
+            "an override identical to the server default must not rebuild"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:542): the same two edges for the
+    /// reasoning-effort override.
+    #[test]
+    fn a_differing_effort_rebuilds_and_an_equal_effort_keeps_the_shared_provider() {
+        let state = provider_request_state(None, Some("medium"));
+        let overrides = SessionOverrides {
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        assert!(
+            !Arc::ptr_eq(&provider_for_request(&state, &overrides), &state.provider),
+            "an effort the server default does not carry must rebuild the provider"
+        );
+        let same = SessionOverrides {
+            reasoning_effort: Some("medium".into()),
+            ..Default::default()
+        };
+        assert!(
+            Arc::ptr_eq(&provider_for_request(&state, &same), &state.provider),
+            "an effort identical to the server default must not rebuild"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:546): only a NON-empty api_key may rebuild a
+    /// per-request provider — an empty string is no credentials, and the
+    /// fallback to the shared provider must be taken.
+    #[test]
+    fn an_empty_server_api_key_cannot_rebuild_per_request() {
+        let mut state = provider_request_state(None, None);
+        state.config.api_key = Some(String::new());
+        let overrides = SessionOverrides {
+            thinking_budget: Some(2048),
+            ..Default::default()
+        };
+        assert!(
+            Arc::ptr_eq(&provider_for_request(&state, &overrides), &state.provider),
+            "an empty api_key is no credentials: fall back to the shared provider"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:1825/:1827): a fork's persisted metadata blob
+    /// must carry the source preset it inherited (issue #127 — a restart
+    /// must not rewire the fork's tools/context management) and the creating
+    /// identity's (subject, tenant) ownership pair (issue #85). Both land in
+    /// storage exactly the way `create_session` writes one.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn forked_session_persists_the_inherited_preset_and_owner_tenant() {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::remove_var("RECURSIVE_AGENT_PRESET");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(preset_test_state(tmp.path()));
+        let identity = AuthIdentity {
+            subject: "user-1".into(),
+            tenant: Some("acme".into()),
+            admin: false,
+        };
+        let preset =
+            resolve_session_preset(Some("minimal"), &state.config).expect("minimal preset");
+        let runtime = build_session_runtime(
+            &state,
+            crate::tools::build_standard_tools(tmp.path(), &[], 60),
+            Arc::new(state.skills.clone()),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+            &preset,
+            SessionOverrides::default(),
+        )
+        .build()
+        .expect("source runtime build");
+        let source = SessionState {
+            id: "b33-fork-source".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
+            owner: Some("user-1".into()),
+            tenant: Some("acme".into()),
+            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(crate::http::SessionUsage::new("test-model")),
+            event_seq: Arc::new(AtomicU64::new(0)),
+            event_log: Arc::new(crate::http::SessionEventLog::new(
+                crate::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
+        };
+        state
+            .host
+            .sessions()
+            .write()
+            .await
+            .insert("b33-fork-source".to_string(), source);
+
+        let (status, Json(fork)) = fork_session(
+            State(state.clone()),
+            Extension(identity),
+            Path("b33-fork-source".to_string()),
+        )
+        .await
+        .expect("fork must succeed");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let meta = crate::http::cold_load::load_session_meta(&state, &fork.id)
+            .await
+            .expect("the fork must persist its metadata blob like create_session");
+        assert_eq!(
+            meta.preset.as_deref(),
+            Some("minimal"),
+            "the fork inherits the source's preset (#127) — a restart must not \
+             rewire it to the server default"
+        );
+        assert_eq!(
+            meta.owner.as_deref(),
+            Some("user-1"),
+            "the fork is owned by the caller (#85)"
+        );
+        assert_eq!(
+            meta.tenant.as_deref(),
+            Some("acme"),
+            "the fork's ownership key carries the caller's tenant (#85)"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:2071): when the runtime mutex is busy at the
+    /// first `try_lock`, the clear-goal endpoint must actually WAIT for the
+    /// in-flight holder — a lock released inside the retry window ends in a
+    /// 200 "cleared", not the busy 409. (The all-busy 409 edge is pinned by
+    /// `clear_goal_returns_409_when_runtime_busy`.)
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn clear_goal_retry_window_clears_once_the_runtime_frees_up() {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+
+        let sid = "b33-clear-retry";
+        let (state, runtime_arc) = test_app_state_with_session(sid).await;
+
+        // Hold the runtime lock from a spawned task, releasing it a quarter
+        // of the way into the handler's 10×100 ms retry window.
+        let holder = runtime_arc.clone();
+        tokio::spawn(async move {
+            let _held = holder.lock().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        while runtime_arc.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+
+        let resp = session_clear_goal(
+            State(state),
+            Extension(AuthIdentity::local()),
+            Path(sid.to_string()),
+        )
+        .await
+        .expect("the goal must be cleared once the holder releases inside the retry window");
+        assert_eq!(resp.0["status"], "cleared");
+    }
+
+    /// #245 b33 (handlers.rs:2233): the labels a session build is
+    /// partitioned by derive from the owner tenant, exactly like the trace
+    /// path (Goal 431) — an empty set here would fail closed at the first
+    /// operator template needing `{tenant}` instead of partitioning.
+    #[test]
+    fn session_labels_carry_the_owner_tenant() {
+        let labels: Vec<(String, String)> = session_labels(Some("acme")).into_iter().collect();
+        assert_eq!(labels, vec![("tenant".to_string(), "acme".to_string())]);
+        assert!(
+            session_labels(None).into_iter().next().is_none(),
+            "no tenant → no labels (not an error)"
+        );
+    }
+
+    /// #245 b33: a tenant the label rules reject must not fail the session
+    /// build — but the drop is announced (key + rule, never the value),
+    /// matching the `turn_run_meta` degradation twin.
+    #[tracing_test::traced_test]
+    #[test]
+    fn session_labels_announce_a_dropped_tenant_and_proceed_unlabelled() {
+        let labels: Vec<(String, String)> =
+            session_labels(Some("bad\r\nvalue")).into_iter().collect();
+        assert!(
+            labels.is_empty(),
+            "an out-of-bounds tenant degrades to no labels"
+        );
+        assert!(
+            logs_contain("session labels dropped (degradation)"),
+            "the drop must be announced"
+        );
+        assert!(logs_contain("key=tenant"), "the warning names the key");
+        assert!(
+            !logs_contain("bad"),
+            "the warning must never carry the rejected value"
+        );
+    }
+
+    /// #245 b33 fixture: a one-session `AppState` whose runtime answers the
+    /// turn from `script` (bare builder — no compaction), for
+    /// `send_session_message` happy-path pins. Returns the message counter
+    /// so assertions can read what the SSE forwarder tallied.
+    async fn scripted_turn_session(
+        session_id: &str,
+        script: Vec<crate::llm::Completion>,
+    ) -> (
+        Arc<AppState>,
+        Arc<tokio::sync::Mutex<crate::runtime::AgentRuntime>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let provider = Arc::new(crate::llm::MockProvider::new(script));
+        let runtime = AgentRuntimeBuilder::new()
+            .llm(provider.clone())
+            .tools(ToolRegistry::default())
+            .build()
+            .expect("runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        let msg_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let session = SessionState {
+            id: session_id.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
+            owner: None,
+            tenant: None,
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: msg_count.clone(),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(crate::http::SessionUsage::new("test-model")),
+            event_seq: Arc::new(AtomicU64::new(0)),
+            event_log: Arc::new(crate::http::SessionEventLog::new(
+                crate::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
+        };
+        let sessions: HashMap<String, SessionState> = [(session_id.to_string(), session)].into();
+        let host = Arc::new(crate::session_host::SessionHost::new(
+            Duration::from_secs(3600),
+            crate::http::AdmissionGate::new(
+                8,
+                Duration::ZERO,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+        ));
+        host.sessions().write().await.extend(sessions);
+        let state = Arc::new(AppState {
+            tools: vec![],
+            tool_registry: ToolRegistry::default(),
+            config: crate::config::Config::from_env().expect("config"),
+            provider,
+            event_channels: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            metrics: Arc::new(crate::http::Metrics::default()),
+            slash_commands: Arc::new(vec![]),
+            host,
+            rate_limiter: crate::http::RateLimiter::new(10, 1.0),
+            skills: vec![],
+            partitioning: Default::default(),
+            storage: Arc::new(crate::storage::LocalStorageBackend::new(
+                std::env::temp_dir().join(format!("recursive-handlers-b33-{session_id}")),
+            )),
+            agui_active_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_mirror_root: None,
+        });
+        (state, runtime_arc, msg_count)
+    }
+
+    /// #245 b33 (handlers.rs:2506): a turn that COMPLETED (any finish reason
+    /// but `Cancelled`) proves the LLM endpoint answered, so the readiness
+    /// streak resets and the success instant is stamped (issue #123).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_completed_turn_resets_the_llm_readiness_streak() {
+        let _guard = crate::test_util::env_lock();
+        let sid = "b33-streak-reset";
+        let (state, _, _) = scripted_turn_session(
+            sid,
+            vec![crate::llm::Completion {
+                content: "mock reply".into(),
+                ..Default::default()
+            }],
+        )
+        .await;
+
+        // A stale failure streak from before the turn.
+        state
+            .metrics
+            .llm_failures_consecutive
+            .store(2, Ordering::Relaxed);
+        state
+            .metrics
+            .last_llm_failure_ms
+            .store(now_stamp_ms(), Ordering::Relaxed);
+
+        let resp = send_session_message(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Path(sid.to_string()),
+            axum::http::HeaderMap::new(),
+            axum::body::Body::from(r#"{"content":"hello"}"#),
+        )
+        .await;
+        assert!(resp.is_ok(), "the scripted turn must succeed: {resp:?}");
+
+        assert_eq!(
+            state
+                .metrics
+                .llm_failures_consecutive
+                .load(Ordering::Relaxed),
+            0,
+            "a completed turn proves the LLM answered — the readiness streak resets"
+        );
+        assert!(
+            state.metrics.last_llm_success_ms.load(Ordering::Relaxed) >= 1,
+            "the success instant is stamped with the session clock"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:2402): the forwarder counts exactly the
+    /// non-System messages appended during the turn. A cross-turn compaction
+    /// summary is a `Role::System` `MessageAppended` emitted at the tail of
+    /// the same `enqueue` — inside the forwarder's drain window — and must
+    /// stay uncounted, or the per-session counter drifts from
+    /// `SessionInfo.message_count`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_count_excludes_the_compaction_summary_appended_in_the_turn() {
+        let _guard = crate::test_util::env_lock();
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        std::env::set_var("RECURSIVE_COMPACT_THRESHOLD", "800");
+        std::env::set_var("RECURSIVE_MAX_TRANSCRIPT_CHARS", "999999");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = preset_test_state(tmp.path());
+        // Script order: the turn's reply first, then the summariser's
+        // completion (cross-turn compaction runs after the turn, inside the
+        // same `enqueue`).
+        state.provider = Arc::new(crate::llm::MockProvider::new(vec![
+            crate::llm::Completion {
+                content: "mock reply".into(),
+                ..Default::default()
+            },
+            crate::llm::Completion {
+                content: "summary of the compacted half".into(),
+                ..Default::default()
+            },
+        ]));
+        let state = Arc::new(state);
+
+        let preset = resolve_session_preset(None, &state.config).expect("preset");
+        let runtime = build_session_runtime(
+            &state,
+            crate::tools::build_standard_tools(tmp.path(), &[], 60),
+            Arc::new(state.skills.clone()),
+            "sys".to_string(),
+            crate::system_prompt::PromptSegments::default(),
+            16,
+            &preset,
+            SessionOverrides::default(),
+        )
+        .build()
+        .expect("compacting runtime build");
+        let runtime_arc = Arc::new(tokio::sync::Mutex::new(runtime));
+        // Seed over the 800-char threshold and past `keep_recent_n` (8), so
+        // the compactor has an "older" slice to summarise this turn.
+        runtime_arc.lock().await.set_transcript(
+            (0..12)
+                .map(|i| {
+                    let body = "x".repeat(400);
+                    if i % 2 == 0 {
+                        crate::message::Message::user(body)
+                    } else {
+                        crate::message::Message::assistant(body)
+                    }
+                })
+                .collect(),
+        );
+
+        let sid = "b33-compact-count";
+        let msg_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let session = SessionState {
+            id: sid.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            title: None,
+            owner: None,
+            tenant: None,
+            runtime: runtime_arc.clone(),
+            plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+            interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+            non_system_message_count: msg_count.clone(),
+            last_active_ms: Arc::new(AtomicU64::new(0)),
+            usage: Arc::new(crate::http::SessionUsage::new("test-model")),
+            event_seq: Arc::new(AtomicU64::new(0)),
+            event_log: Arc::new(crate::http::SessionEventLog::new(
+                crate::http::SESSION_EVENT_LOG_CAPACITY,
+            )),
+        };
+        state
+            .host
+            .sessions()
+            .write()
+            .await
+            .insert(sid.to_string(), session);
+
+        let resp = send_session_message(
+            State(state.clone()),
+            Extension(AuthIdentity::local()),
+            Path(sid.to_string()),
+            axum::http::HeaderMap::new(),
+            axum::body::Body::from(r#"{"content":"hello"}"#),
+        )
+        .await;
+        assert!(resp.is_ok(), "the seeded turn must succeed: {resp:?}");
+
+        {
+            let rt = runtime_arc.lock().await;
+            assert!(
+                rt.transcript().iter().any(|m| m.is_compaction_summary),
+                "fixture premise: the oversized seed must have triggered a \
+                 cross-turn compaction summary this turn"
+            );
+        }
+        assert_eq!(
+            msg_count.load(Ordering::Relaxed),
+            2,
+            "only the turn's user + assistant messages count — the System-role \
+             compaction summary must stay uncounted"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:3149): a whitespace-only `systemPrompt` is "no
+    /// prompt" — the run must fall back to the process-level prompt, not
+    /// ship blank bytes to the provider as the run's persona.
+    #[tokio::test]
+    async fn agui_whitespace_only_system_prompt_falls_back_to_process_level() {
+        let (base, provider, _ws) = agui_prompt_fixture("PROCESS-LEVEL-FALLBACK-MARKER").await;
+        agui_post(
+            &base,
+            serde_json::json!({
+                "threadId": "prompt-thread-blank",
+                "runId": "r1",
+                "systemPrompt": "   \n\t ",
+                "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        let sys = assert_system_msg(&provider);
+        assert!(
+            sys.contains("PROCESS-LEVEL-FALLBACK-MARKER"),
+            "a whitespace-only systemPrompt must fall back to the process-level \
+             prompt; got: {sys}"
+        );
+    }
+
+    /// #245 b33 (handlers.rs:3479): a session whose runtime mutex is busy is
+    /// SKIPPED by the transcript-size sampler and reported in its own gauge
+    /// — the scrape must neither block on a contended runtime nor silently
+    /// fold the session into the char total.
+    #[tokio::test]
+    async fn metrics_report_a_busy_session_as_a_skipped_transcript_sample() {
+        let sid = "b33-metrics-busy";
+        let (state, runtime_arc) = test_app_state_with_session(sid).await;
+        let held = runtime_arc.lock().await;
+
+        let out = metrics_handler(State(state.clone())).await;
+        assert!(
+            out.contains("recursive_transcript_bytes_skipped 1"),
+            "the contended session must be reported as skipped: {out}"
+        );
+
+        drop(held);
+        let out = metrics_handler(State(state)).await;
+        assert!(
+            out.contains("recursive_transcript_bytes_skipped 0"),
+            "once the runtime is free the session is sampled — nothing skipped: {out}"
+        );
+    }
 }
