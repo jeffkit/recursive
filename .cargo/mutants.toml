@@ -1321,13 +1321,13 @@ exclude_re = [
     # both entries and pin the fallback weight directly.
     "src/llm/search\\.rs:199:27: replace \\+= with -= in resolve",
     "src/llm/search\\.rs:199:27: replace \\+= with \\*= in resolve",
-    # tools/execution/run_code/runner.rs :540:5 — `scratch_volume_free_bytes`
-    # `#[cfg(not(unix))]` twin (:538-:541, body `None`) of the unix statfs
-    # probe at :514-:535. Same cfg-blind class as credentials/store :280:5 and
+    # tools/execution/run_code/runner.rs :562:5 — `scratch_volume_free_bytes`
+    # `#[cfg(not(unix))]` twin (:560-:563, body `None`) of the unix statfs
+    # probe at :536-:557. Same cfg-blind class as credentials/store :280:5 and
     # skills :810:5 above: the ubuntu mutation gate and the macOS seats never
     # compile this body, so both `Some(_)` rewrites build byte-identical to
     # the baseline and report MISSED whatever any unix test asserts. The
-    # unix twin at :519:5 (`None` / `Some(0)` / `Some(1)`) is killed through
+    # unix twin at :541:5 (`None` / `Some(0)` / `Some(1)`) is killed through
     # run_program by low_disk_rejects_before_spawn and the shim run tests.
     # The task list carries only `Some(1)`; `Some(0)` is the same artifact
     # on the same line and is listed with it. Drop both if a Windows
@@ -1335,16 +1335,22 @@ exclude_re = [
     # (line re-anchor 2026-11-02: the #245 runner floor-seam commit added 9
     # `#[cfg(test)]` lines inside the unix fn at :515, shifting this twin
     # :531:5 → :540:5; candidates unchanged.)
-    "src/tools/execution/run_code/runner\\.rs:540:5: replace scratch_volume_free_bytes -> Option<u64> with Some\\(1\\)",
-    "src/tools/execution/run_code/runner\\.rs:540:5: replace scratch_volume_free_bytes -> Option<u64> with Some\\(0\\)",
-    # tools/execution/run_code/runner.rs :616:5 — `address_space_guard_fact`
-    # `#[cfg(not(unix))]` twin (:614-:617, the "rlimit_as=not-probed
-    # (platform)" fact) of the unix implementation at :601. Same cfg-blind
+    # (line re-anchor 2026-11-02 #2: the #245 scratch-collision seam commit
+    # extracted `scratch_dir_name` + `create_unique_dir` out of
+    # `create_scratch_dir` (+22 lines above :536), shifting this twin
+    # :540:5 → :562:5; candidates unchanged.)
+    "src/tools/execution/run_code/runner\\.rs:562:5: replace scratch_volume_free_bytes -> Option<u64> with Some\\(1\\)",
+    "src/tools/execution/run_code/runner\\.rs:562:5: replace scratch_volume_free_bytes -> Option<u64> with Some\\(0\\)",
+    # tools/execution/run_code/runner.rs :638:5 — `address_space_guard_fact`
+    # `#[cfg(not(unix))]` twin (:636-:639, the "rlimit_as=not-probed
+    # (platform)" fact) of the unix implementation at :623. Same cfg-blind
     # class as the entry above: never compiled on the gate platform, so both
-    # body rewrites are byte-identical phantoms. The unix twin at :603:5 is
+    # body rewrites are byte-identical phantoms. The unix twin at :625:5 is
     # killed by resource_guard_fact_matches_the_enforcement_completeness.
     # Drop both if a Windows mutation leg is ever added.
     # (line re-anchor 2026-11-02: same seam commit shift, :607:5 → :616:5.)
-    "src/tools/execution/run_code/runner\\.rs:616:5: replace address_space_guard_fact -> String with \"xyzzy\"\\.into\\(\\)",
-    "src/tools/execution/run_code/runner\\.rs:616:5: replace address_space_guard_fact -> String with String::new\\(\\)",
+    # (line re-anchor 2026-11-02 #2: same scratch-collision seam shift,
+    # :616:5 → :638:5.)
+    "src/tools/execution/run_code/runner\\.rs:638:5: replace address_space_guard_fact -> String with \"xyzzy\"\\.into\\(\\)",
+    "src/tools/execution/run_code/runner\\.rs:638:5: replace address_space_guard_fact -> String with String::new\\(\\)",
 ]

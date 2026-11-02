@@ -478,13 +478,35 @@ async fn probe_permission_model(node: &Path) -> ProbeVerdict {
 fn create_scratch_dir() -> std::io::Result<PathBuf> {
     let base = std::env::temp_dir();
     let pid = std::process::id();
+    create_unique_dir(
+        || {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            base.join(scratch_dir_name(pid, nanos))
+        },
+        |dir| std::fs::create_dir(dir),
+    )
+}
+
+/// The scratch name for one draw: `recursive-run-code-{pid}-{nanos}`.
+fn scratch_dir_name(pid: u32, nanos: u32) -> String {
+    format!("recursive-run-code-{pid}-{nanos}")
+}
+
+/// The retry policy behind `create_scratch_dir`, with both effects injected
+/// so it can be driven without a clock or a disk: `next_candidate` draws a
+/// path, `create` claims it. A claim refused with `AlreadyExists` is a name
+/// collision and gets another draw; any other error surfaces as-is; 64
+/// collisions in a row give up.
+fn create_unique_dir(
+    mut next_candidate: impl FnMut() -> PathBuf,
+    mut create: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     for _ in 0..64 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let dir = base.join(format!("recursive-run-code-{pid}-{nanos}"));
-        match std::fs::create_dir(&dir) {
+        let dir = next_candidate();
+        match create(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -2045,113 +2067,136 @@ return process.cwd();"#
         assert_eq!(out, b"1234567\n");
     }
 
-    /// Opt-in switch for the child half of
-    /// `create_scratch_dir_retries_name_collisions`.
-    const SCRATCH_COLLISION_CHILD: &str = "RECURSIVE_TEST_SCRATCH_COLLISION_CHILD";
-
-    /// Name collisions on `recursive-run-code-{pid}-{nanos}` are retried: a
-    /// draw that lands on a taken name surfaces as `AlreadyExists` inside the
-    /// loop and must end in another attempt, never in that error escaping.
-    /// The draws seed their own trap net — every created dir is KEPT, so a
-    /// later draw collides whenever the clock hands out a subsec-nanos value
-    /// it already handed out in an earlier second. Birthday bound: N names
-    /// spread evenly over T seconds on a clock with S distinct subsec values
-    /// give N²(T−1)/(2TS) expected cross-second repeats; with T ≥ 3 and
-    /// N = 6√S that is ≥ 12, so a collision-free run has probability ≈ e⁻¹².
-    /// S is measured at run time: 1e9 on a nanosecond clock (Linux, ~190k
-    /// names), 1e6 where the clock quantises to 1 µs (macOS, 6k names), 1e7
-    /// at 100 ns (Windows). The previous fixture — 500 names at exact 2 ms
-    /// marks — relied on the macOS quantisation and never hit a trap on
-    /// Linux (#245 batch 36).
-    ///
-    /// Child-process form: the parent re-executes this test with the temp
-    /// root pointed at a throwaway directory, so the kept names never land in
-    /// the shared temp dir and vanish with one `remove_dir_all`.
+    /// The scratch name is the pid plus the subsecond nanos, nothing else:
+    /// the pid keeps two processes off each other's names, the nanos pin
+    /// the draw.
     #[test]
-    fn create_scratch_dir_retries_name_collisions() {
-        if std::env::var_os(SCRATCH_COLLISION_CHILD).is_some() {
-            let base = std::env::temp_dir();
-            let subsec = || {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or(0)
-            };
-            // Clock quantum: 256 consecutive readings that are all multiples
-            // of 1 µs (or 100 ns) cannot happen by chance on a finer clock.
-            let quantum = [1000u32, 100]
-                .into_iter()
-                .find(|q| (0..256).all(|_| subsec() % q == 0))
-                .unwrap_or(1);
-            let space = 1_000_000_000f64 / f64::from(quantum);
-            let target_draws = ((6.0 * space.sqrt()).ceil() as usize).clamp(5_000, 200_000);
-            let min_span = Duration::from_millis(3200);
-            let max_span = Duration::from_secs(10);
-            // Pace the draws over the whole span so the kept names spread
-            // across every second instead of piling into the first one;
-            // sleeps are batched to ≥1 ms because shorter ones oversleep.
-            let pace = min_span / target_draws as u32;
-            let started = Instant::now();
-            let mut draws = 0usize;
-            loop {
-                let elapsed = started.elapsed();
-                if elapsed >= max_span || (elapsed >= min_span && draws >= target_draws) {
-                    break;
-                }
-                if draws >= target_draws {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                let dir = create_scratch_dir().unwrap_or_else(|e| {
-                    panic!("draw {draws}: a name collision must be retried, never surfaced: {e}")
-                });
-                assert!(
-                    dir.starts_with(&base),
-                    "draws stay in the isolated temp root: {dir:?}"
-                );
-                draws += 1;
-                if let Some(ahead) = (pace * draws as u32).checked_sub(started.elapsed()) {
-                    if ahead >= Duration::from_millis(1) {
-                        std::thread::sleep(ahead);
-                    }
-                }
-            }
-            assert!(
-                draws >= target_draws / 2,
-                "clock quantum {quantum} ns wants {target_draws} kept names; the host drew only \
-                 {draws} in {:?}",
-                started.elapsed()
-            );
-            eprintln!(
-                "collision fixture: quantum={quantum} ns, kept {draws} names over {:?}",
-                started.elapsed()
-            );
-            return;
-        }
-
-        let isolated = tempfile::tempdir().unwrap();
-        // `module_path!()` keeps the crate root; libtest names tests from the
-        // crate root's children. `--exact` needs the full path — a bare name
-        // runs zero tests and would fake a green child.
-        let module = module_path!();
-        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-        let child_name = format!("{module}::create_scratch_dir_retries_name_collisions");
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &child_name, "--nocapture"])
-            .env("TMPDIR", isolated.path())
-            .env("TMP", isolated.path())
-            .env("TEMP", isolated.path())
-            .env(SCRATCH_COLLISION_CHILD, "1")
-            .output()
-            .expect("re-exec of the test binary");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success() && stdout.contains("1 passed; 0 failed"),
-            "child {child_name} did not run exactly one green test: status={:?}\n\
-             --stdout--\n{stdout}\n--stderr--\n{stderr}",
-            out.status
+    fn scratch_dir_name_is_pid_dash_nanos() {
+        assert_eq!(
+            scratch_dir_name(4242, 987_654_321),
+            "recursive-run-code-4242-987654321"
         );
+        assert_eq!(scratch_dir_name(1, 0), "recursive-run-code-1-0");
+    }
+
+    /// The real scratch dir is wired through `scratch_dir_name` with THIS
+    /// process's pid and a subsecond nanos value.
+    #[test]
+    fn create_scratch_dir_names_the_dir_after_this_process() {
+        let dir = create_scratch_dir().unwrap();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = format!("recursive-run-code-{}-", std::process::id());
+        let nanos = name
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("scratch dir {name:?} is not named {prefix}<nanos>"));
+        let nanos: u32 = nanos
+            .parse()
+            .unwrap_or_else(|e| panic!("the suffix is the subsecond nanos, got {nanos:?}: {e}"));
+        assert!(
+            nanos < 1_000_000_000,
+            "subsec nanos stay below one second: {nanos}"
+        );
+        cleanup_scratch(&dir);
+    }
+
+    /// Drives `create_unique_dir` against an in-memory disk: candidates are
+    /// `cand-0`, `cand-1`, … in draw order, `create` answers `AlreadyExists`
+    /// for every name in `taken` and `Ok` otherwise. Returns the outcome
+    /// plus every candidate the policy tried, in order.
+    fn drive_unique_dir(taken: &[&str]) -> (std::io::Result<PathBuf>, Vec<PathBuf>) {
+        let taken: std::collections::HashSet<PathBuf> = taken.iter().map(PathBuf::from).collect();
+        let mut tried = Vec::new();
+        let mut draws = 0usize;
+        let result = create_unique_dir(
+            || {
+                let cand = PathBuf::from(format!("cand-{draws}"));
+                draws += 1;
+                cand
+            },
+            |dir| {
+                tried.push(dir.to_path_buf());
+                if taken.contains(dir) {
+                    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        (result, tried)
+    }
+
+    /// The first free name wins without a retry.
+    #[test]
+    fn create_unique_dir_claims_a_free_name_on_the_first_draw() {
+        let (result, tried) = drive_unique_dir(&[]);
+        assert_eq!(result.unwrap(), PathBuf::from("cand-0"));
+        assert_eq!(tried, [PathBuf::from("cand-0")]);
+    }
+
+    /// A name collision (`AlreadyExists`) is retried with a fresh draw and
+    /// never surfaces: two taken names cost exactly two extra draws, and
+    /// the third, free, name is the one returned. (Replaces the #245 batch-36
+    /// clock-sampling child process, which seeded real collisions by pacing
+    /// ~190k `mkdir`s over a 3.2-10 s window and could not keep that pace
+    /// on the shared ubuntu-24.04 disk — the mutation-scan baseline went red
+    /// on "child did not run exactly one green test", run 41389218719.)
+    #[test]
+    fn create_unique_dir_retries_past_name_collisions() {
+        let (result, tried) = drive_unique_dir(&["cand-0", "cand-1"]);
+        assert_eq!(
+            result.unwrap_or_else(|e| panic!("a collision must be retried, never surfaced: {e}")),
+            PathBuf::from("cand-2")
+        );
+        assert_eq!(
+            tried,
+            ["cand-0", "cand-1", "cand-2"].map(PathBuf::from),
+            "one draw per collision plus the winning one, no more"
+        );
+    }
+
+    /// 64 collisions in a row exhaust the policy: exactly 64 draws are made
+    /// — the 65th name is free and must NOT be reached — and the exhaustion
+    /// surfaces as `Other` with the documented message, not as the
+    /// collision error.
+    #[test]
+    fn create_unique_dir_gives_up_after_64_collisions() {
+        let names: Vec<String> = (0..64).map(|i| format!("cand-{i}")).collect();
+        let taken: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (result, tried) = drive_unique_dir(&taken);
+        let err = result.expect_err("64 taken names must exhaust the retries");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            err.to_string(),
+            "could not create a unique scratch directory after 64 attempts"
+        );
+        assert_eq!(tried.len(), 64, "exactly 64 draws: {tried:?}");
+        assert_eq!(tried.last(), Some(&PathBuf::from("cand-63")));
+    }
+
+    /// Only a collision is retried: any other failure from `create` surfaces
+    /// unchanged — same kind, same message — after a single attempt, so a
+    /// permission problem never masquerades as exhaustion (or vice versa).
+    #[test]
+    fn create_unique_dir_surfaces_other_errors_without_retrying() {
+        let mut attempts = 0;
+        let err = create_unique_dir(
+            || PathBuf::from("cand"),
+            |_| {
+                attempts += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sealed",
+                ))
+            },
+        )
+        .expect_err("a non-collision failure must surface");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            err.to_string(),
+            "sealed",
+            "the error passes through unwrapped"
+        );
+        assert_eq!(attempts, 1, "no retry on a non-collision error");
     }
 
     /// A temp root that cannot host the scratch dir surfaces the REAL error
