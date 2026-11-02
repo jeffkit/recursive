@@ -649,4 +649,159 @@ mod tests {
         // filter.
         assert_eq!(resolve("+rea", &s, 5), vec!["ReadFile".to_string()]);
     }
+
+    // ── Issue #245 batch 36: trait entry, select: path, hint filter arm,
+    //    score accumulation and the fallback/description weights ──────────
+
+    /// The trait method is the only entry the registry uses, and it must
+    /// delegate to the scorer with the default cap rather than answer a
+    /// constant. Every test above calls the free `resolve`, so the trait
+    /// body itself was unobserved.
+    #[test]
+    fn trait_resolve_delegates_to_the_keyword_scorer() {
+        let engine = KeywordSearchEngine::new();
+        assert_eq!(
+            ToolSearchEngine::resolve(&engine, "readfile", &specs()),
+            vec!["ReadFile".to_string()],
+            "exact-name fast path through the trait"
+        );
+        let ranked = ToolSearchEngine::resolve(&engine, "slack github", &specs());
+        assert_eq!(
+            ranked,
+            vec![
+                "mcp__github__create_pr".to_string(),
+                "mcp__slack__send_message".to_string()
+            ],
+            "keyword ranking through the trait (equal scores, name order)"
+        );
+        assert!(
+            ToolSearchEngine::resolve(&engine, "", &specs()).is_empty(),
+            "an empty query is empty through the trait too"
+        );
+    }
+
+    /// `select:A,B` answers exactly the named tools, in the requested order,
+    /// silently skipping names that do not exist. The lookup compares the
+    /// candidate's lowercased name for *equality* with each requested name:
+    /// an inequality lookup would answer the first tool that is NOT the one
+    /// asked for.
+    #[test]
+    fn select_prefix_returns_the_named_tools_in_request_order() {
+        assert_eq!(
+            resolve("select:zzz_unknown,readfile", &specs(), 5),
+            vec!["ReadFile".to_string()],
+            "unknown names are skipped, known ones answered"
+        );
+        assert_eq!(
+            resolve("select:webfetch, readfile", &specs(), 5),
+            vec!["WebFetch".to_string(), "ReadFile".to_string()],
+            "request order wins over candidate order; spaces after commas are trimmed"
+        );
+        assert!(
+            resolve("select:nothing_here", &specs(), 5).is_empty(),
+            "no known names → empty"
+        );
+    }
+
+    /// Required-term filter: a term that appears ONLY in the search hint
+    /// (not in any name part, not in the description) still admits the
+    /// candidate, because the hint arm is OR-ed with the others and is
+    /// active whenever the hint is non-empty.
+    #[test]
+    fn required_term_is_satisfied_by_a_hint_only_match() {
+        let s = vec![(
+            spec("Zed", "An editor for code."),
+            Some("open things fast".to_string()),
+        )];
+        assert_eq!(
+            resolve("+open zed", &s, 5),
+            vec!["Zed".to_string()],
+            "the hint arm alone must pass the required filter"
+        );
+    }
+
+    /// Required-term filter, hint arm: a non-empty hint is not enough — the
+    /// term must match the hint at a word boundary. A substring hit inside
+    /// "opener" does not count, so the candidate is filtered out even though
+    /// its name would otherwise score on the optional term.
+    #[test]
+    fn required_term_hint_arm_needs_a_word_boundary_not_just_a_hint() {
+        let s = vec![(
+            spec("Zed", "An editor for code."),
+            Some("opener friendly".to_string()),
+        )];
+        assert!(
+            resolve("+open zed", &s, 5).is_empty(),
+            "a bare substring in the hint must not satisfy a required term"
+        );
+    }
+
+    /// Scoring adds the exact-name-part weight (10) on top of whatever else
+    /// the term earns; it does not multiply the running score. A tool whose
+    /// only signal is an exact name-part match must outrank a tool that
+    /// scores only on its search hint (4).
+    #[test]
+    fn exact_name_part_match_outranks_a_hint_only_match() {
+        let s = vec![
+            (
+                spec("Qux", "Nothing relevant here."),
+                Some("foo friendly".to_string()),
+            ),
+            (spec("FooBar", "Nothing relevant here."), None),
+        ];
+        assert_eq!(
+            resolve("foo", &s, 5),
+            vec!["FooBar".to_string(), "Qux".to_string()],
+            "10 (exact part) must beat 4 (hint); a multiplied 0 would lose to it"
+        );
+    }
+
+    /// Same for the partial-name-part weight (5): it is added, so a partial
+    /// name hit outranks a hint-only hit (4).
+    #[test]
+    fn partial_name_part_match_outranks_a_hint_only_match() {
+        let s = vec![
+            (spec("Qux", "Other things."), Some("rea mode".to_string())),
+            (spec("ReadFile", "Open files from disk."), None),
+        ];
+        assert_eq!(
+            resolve("rea", &s, 5),
+            vec!["ReadFile".to_string(), "Qux".to_string()],
+            "5 (partial part) must beat 4 (hint); a multiplied 0 would lose to it"
+        );
+    }
+
+    /// The full-name fallback (3) is guarded by `score == 0`: it must never
+    /// top up a term that already scored on a name part. Here "foo" scores
+    /// exactly 10 on FooTool's name and nothing else, while Qux earns 12 from
+    /// hint + description on both terms with no name match. An inverted
+    /// guard (`score != 0`) would hand FooTool +3 for the name it already
+    /// matched (13 > 12) and flip the order.
+    #[test]
+    fn full_name_fallback_does_not_top_up_a_term_that_already_scored() {
+        let s = vec![
+            (spec("FooTool", "Does tooling."), None),
+            (
+                spec("Qux", "Foo and bar things."),
+                Some("foo bar stuff".to_string()),
+            ),
+        ];
+        assert_eq!(
+            resolve("foo bar", &s, 5),
+            vec!["Qux".to_string(), "FooTool".to_string()],
+            "12 (hint+desc on two terms) must beat 10 (one exact name part)"
+        );
+    }
+
+    /// A description-only word-boundary match (2) is a positive signal: a
+    /// tool reachable only through its description is still returned.
+    #[test]
+    fn description_only_match_returns_the_tool() {
+        let s = vec![(spec("Qux", "Icy cold drinks here."), None)];
+        assert_eq!(
+            resolve("icy", &s, 5),
+            vec!["Qux".to_string()],
+            "the description weight must be added, not subtracted"
+        );
+    }
 }

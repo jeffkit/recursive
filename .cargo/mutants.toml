@@ -1298,4 +1298,49 @@ exclude_re = [
     # negctl: mutation applied → whole url_guard suite green (batch 36, B1
     # seat).
     "src/tools/policy_domain/url_guard\\.rs:177:17: replace \\|\\| with && in is_private_ip",
+    # ── Issue #245 batch 36 (B2 seat, task list /tmp/b2-batch36.txt) ───────
+    # llm/search.rs :199:27 `score += NAME_FALLBACK` → `-=` — true
+    # equivalence: the statement is dead. Its guard (:198) is
+    # `score == 0 && parsed.full.contains(term)`, and `full` is only ever
+    # `parts.join(" ")` (CamelCase arm) or the MCP name with every `_`
+    # turned into a space, while a query term comes from `split_whitespace`
+    # and so never contains a space. A space-free term that is a substring
+    # of a space-joined string lies inside ONE part, hence
+    # `parts.iter().any(|p| p.contains(term))` is already true and the exact
+    # or partial name arm (:183/:189) has added >= 5 to `score` before the
+    # guard runs — `score == 0` can never hold at :198. No input reaches the
+    # `+=`, so flipping it changes nothing on any input. The guard's own
+    # `==` → `!=` sibling (:198:26) makes the branch REACHABLE and is killed
+    # by full_name_fallback_does_not_top_up_a_term_that_already_scored.
+    # negctl: both spellings applied by hand → whole llm::search suite green
+    # (40/40). The `*=` twin is the same dead statement (it was on the
+    # never-delivered /tmp/b2-batch28.txt list, not on this batch's) and is
+    # listed with it so it cannot resurface as a phantom.
+    # UNLOCK CONDITION: if `full` ever gains characters not derivable from
+    # the parts (or terms may contain spaces), the branch comes alive — drop
+    # both entries and pin the fallback weight directly.
+    "src/llm/search\\.rs:199:27: replace \\+= with -= in resolve",
+    "src/llm/search\\.rs:199:27: replace \\+= with \\*= in resolve",
+    # tools/execution/run_code/runner.rs :531:5 — `scratch_volume_free_bytes`
+    # `#[cfg(not(unix))]` twin (:529-:532, body `None`) of the unix statfs
+    # probe at :514. Same cfg-blind class as credentials/store :280:5 and
+    # skills :810:5 above: the ubuntu mutation gate and the macOS seats never
+    # compile this body, so both `Some(_)` rewrites build byte-identical to
+    # the baseline and report MISSED whatever any unix test asserts. The
+    # unix twin at :516:5 (`None` / `Some(0)` / `Some(1)`) is killed through
+    # run_program by low_disk_rejects_before_spawn and the shim run tests.
+    # The task list carries only `Some(1)`; `Some(0)` is the same artifact
+    # on the same line and is listed with it. Drop both if a Windows
+    # mutation leg is ever added.
+    "src/tools/execution/run_code/runner\\.rs:531:5: replace scratch_volume_free_bytes -> Option<u64> with Some\\(1\\)",
+    "src/tools/execution/run_code/runner\\.rs:531:5: replace scratch_volume_free_bytes -> Option<u64> with Some\\(0\\)",
+    # tools/execution/run_code/runner.rs :607:5 — `address_space_guard_fact`
+    # `#[cfg(not(unix))]` twin (:605-:608, the "rlimit_as=not-probed
+    # (platform)" fact) of the unix implementation at :592. Same cfg-blind
+    # class as the entry above: never compiled on the gate platform, so both
+    # body rewrites are byte-identical phantoms. The unix twin at :594:5 is
+    # killed by resource_guard_fact_matches_the_enforcement_completeness.
+    # Drop both if a Windows mutation leg is ever added.
+    "src/tools/execution/run_code/runner\\.rs:607:5: replace address_space_guard_fact -> String with \"xyzzy\"\\.into\\(\\)",
+    "src/tools/execution/run_code/runner\\.rs:607:5: replace address_space_guard_fact -> String with String::new\\(\\)",
 ]

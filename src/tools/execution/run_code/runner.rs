@@ -1146,6 +1146,16 @@ mod tests {
         );
     }
 
+    /// Goal 416: the scratch-volume floor is the documented 64 MiB. Spelled
+    /// as a plain byte count so the assertion does not share the constant's
+    /// own arithmetic (a `+` or `/` slipped into `64 * 1024 * 1024` yields
+    /// 1 048 640 / 66 560 / 64 / 0 — every one of them a floor a nearly-full
+    /// disk would pass).
+    #[test]
+    fn scratch_free_space_floor_is_the_documented_64_mib() {
+        assert_eq!(MIN_SCRATCH_FREE_BYTES, 67_108_864);
+    }
+
     /// The reader buffers at most `cap` bytes of a line: a newline-free blob
     /// is dropped, not held in memory.
     #[tokio::test]
@@ -1801,6 +1811,98 @@ return process.cwd();"#
         }
     }
 
+    /// Goal 416: the floor is EXCLUSIVE — "below it the run is rejected", so
+    /// a volume with exactly `floor` bytes free STARTS the run. The product
+    /// reports the measured free space in its own refusal, so the test reads
+    /// that number back and re-runs with it as the floor: the pristine
+    /// comparison lets the run through; an inclusive one refuses it, quoting
+    /// the very same number.
+    ///
+    /// Free space is a live quantity (sibling tests write temp files), so the
+    /// probe is direction-aware instead of assuming stillness: a refusal that
+    /// reports LESS free space than the floor is drift and is retried; a
+    /// refusal reporting EXACTLY the floor is the inclusive-comparison
+    /// signature and fails at once; a run that went through is only accepted
+    /// once a follow-up probe confirms the free space had not moved
+    /// meanwhile. The shim's argv log goes to `/dev/null` so the fixture
+    /// itself writes nothing to the volume between the probes (a real file
+    /// costs a copy-on-write block per append on APFS and moved the number
+    /// on every attempt). Sixteen attempts bound the retry.
+    // windows（#224）：scratch_volume_free_bytes 的 cfg(not(unix)) 版本返 None，floor 从不
+    // 参与比较（见 low_disk_rejects_before_spawn 的同款说明）。
+    #[cfg_attr(
+        windows,
+        ignore = "#224: no statfs free-space probe on windows (cfg(not(unix)) returns None), so the floor is never compared"
+    )]
+    #[tokio::test]
+    async fn free_space_floor_admits_a_volume_with_exactly_floor_bytes_free() {
+        fn free_bytes_reported(report: &RunReport) -> u64 {
+            let detail = report.detail.as_deref().unwrap_or_default();
+            let (_, rest) = detail
+                .split_once("insufficient free space: ")
+                .unwrap_or_else(|| panic!("the refusal names the free space: {detail}"));
+            let (free, _) = rest
+                .split_once(" bytes free")
+                .unwrap_or_else(|| panic!("the refusal names the free space: {detail}"));
+            free.parse()
+                .unwrap_or_else(|e| panic!("free bytes {free:?} must parse: {e}"))
+        }
+
+        let tmp = std::env::temp_dir().join(format!("ptc-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let argv_file = PathBuf::from("/dev/null");
+        let node = write_runtime_shim(&tmp, ShimVerdict::Supported, &argv_file).unwrap();
+        let request = |floor: u64| RunProgramRequest {
+            min_free_bytes: Some(floor),
+            ..shim_request(&node, tmp.clone())
+        };
+
+        let mut log = Vec::new();
+        for attempt in 0..16 {
+            let probe = run_program(request(u64::MAX / 2)).await;
+            assert_eq!(
+                probe.failure,
+                Some(protocol::RunCodeFailure::SandboxUnavailable),
+                "an impossible floor always refuses: {probe:?}"
+            );
+            let free = free_bytes_reported(&probe);
+
+            let run = run_program(request(free)).await;
+            match run.failure {
+                None => {
+                    let confirm = run_program(request(u64::MAX / 2)).await;
+                    let after = free_bytes_reported(&confirm);
+                    if after == free {
+                        assert_eq!(run.value.as_deref(), Some("shim-ok"), "{run:?}");
+                        let _ = std::fs::remove_dir_all(&tmp);
+                        return;
+                    }
+                    log.push(format!(
+                        "attempt {attempt}: ran, but free moved {free} -> {after}"
+                    ));
+                }
+                Some(protocol::RunCodeFailure::SandboxUnavailable) => {
+                    let seen = free_bytes_reported(&run);
+                    let detail = run.detail.clone().unwrap_or_default();
+                    assert_ne!(
+                        seen, free,
+                        "exactly `floor` bytes free must start the run (the floor is \
+                         exclusive), yet the run was refused: {detail}"
+                    );
+                    assert!(
+                        seen < free,
+                        "a refusal with more free space than the floor is impossible: {detail}"
+                    );
+                    log.push(format!("attempt {attempt}: free fell {free} -> {seen}"));
+                }
+                other => panic!("unexpected failure {other:?}: {run:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        panic!("free space never held still across 16 attempts: {log:?}");
+    }
+
     /// The scratch dir carries the run's identity and lives under the system
     /// temp volume.
     #[test]
@@ -1898,39 +2000,113 @@ return process.cwd();"#
         assert_eq!(out, b"1234567\n");
     }
 
-    /// Name collisions on `recursive-run-code-{pid}-{nanos}` are retried —
-    /// a hollow trap net (pre-existing names spaced ~2 ms apart across the
-    /// whole subsec-nanos range) makes a first-attempt draw that lands on a
-    /// taken name surface as an `AlreadyExists`, and every such draw must
-    /// end in another attempt, never in the collision error surfacing.
+    /// Opt-in switch for the child half of
+    /// `create_scratch_dir_retries_name_collisions`.
+    const SCRATCH_COLLISION_CHILD: &str = "RECURSIVE_TEST_SCRATCH_COLLISION_CHILD";
+
+    /// Name collisions on `recursive-run-code-{pid}-{nanos}` are retried: a
+    /// draw that lands on a taken name surfaces as `AlreadyExists` inside the
+    /// loop and must end in another attempt, never in that error escaping.
+    /// The draws seed their own trap net — every created dir is KEPT, so a
+    /// later draw collides whenever the clock hands out a subsec-nanos value
+    /// it already handed out in an earlier second. Birthday bound: N names
+    /// spread evenly over T seconds on a clock with S distinct subsec values
+    /// give N²(T−1)/(2TS) expected cross-second repeats; with T ≥ 3 and
+    /// N = 6√S that is ≥ 12, so a collision-free run has probability ≈ e⁻¹².
+    /// S is measured at run time: 1e9 on a nanosecond clock (Linux, ~190k
+    /// names), 1e6 where the clock quantises to 1 µs (macOS, 6k names), 1e7
+    /// at 100 ns (Windows). The previous fixture — 500 names at exact 2 ms
+    /// marks — relied on the macOS quantisation and never hit a trap on
+    /// Linux (#245 batch 36).
+    ///
+    /// Child-process form: the parent re-executes this test with the temp
+    /// root pointed at a throwaway directory, so the kept names never land in
+    /// the shared temp dir and vanish with one `remove_dir_all`.
     #[test]
     fn create_scratch_dir_retries_name_collisions() {
-        let base = std::env::temp_dir();
-        let pid = std::process::id();
-        // 500 traps at 2 ms spacing: the clock quantizes subsec nanos to 1 µs,
-        // so a draw lands on a trap once every ~7k draws (probe: 4 hits per
-        // 30k) — near-certain across ≥30k draws — while the ~100 µs retry
-        // steps always land far from the next trap (green tree escapes every
-        // hit; 64 consecutive trap hits are impossible at 2 ms spacing).
-        let net: Vec<String> = (0..500)
-            .map(|k| format!("recursive-run-code-{pid}-{}", k * 2_000_000))
-            .collect();
-        for name in &net {
-            let _ = std::fs::create_dir(base.join(name));
+        if std::env::var_os(SCRATCH_COLLISION_CHILD).is_some() {
+            let base = std::env::temp_dir();
+            let subsec = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0)
+            };
+            // Clock quantum: 256 consecutive readings that are all multiples
+            // of 1 µs (or 100 ns) cannot happen by chance on a finer clock.
+            let quantum = [1000u32, 100]
+                .into_iter()
+                .find(|q| (0..256).all(|_| subsec() % q == 0))
+                .unwrap_or(1);
+            let space = 1_000_000_000f64 / f64::from(quantum);
+            let target_draws = ((6.0 * space.sqrt()).ceil() as usize).clamp(5_000, 200_000);
+            let min_span = Duration::from_millis(3200);
+            let max_span = Duration::from_secs(10);
+            // Pace the draws over the whole span so the kept names spread
+            // across every second instead of piling into the first one;
+            // sleeps are batched to ≥1 ms because shorter ones oversleep.
+            let pace = min_span / target_draws as u32;
+            let started = Instant::now();
+            let mut draws = 0usize;
+            loop {
+                let elapsed = started.elapsed();
+                if elapsed >= max_span || (elapsed >= min_span && draws >= target_draws) {
+                    break;
+                }
+                if draws >= target_draws {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let dir = create_scratch_dir().unwrap_or_else(|e| {
+                    panic!("draw {draws}: a name collision must be retried, never surfaced: {e}")
+                });
+                assert!(
+                    dir.starts_with(&base),
+                    "draws stay in the isolated temp root: {dir:?}"
+                );
+                draws += 1;
+                if let Some(ahead) = (pace * draws as u32).checked_sub(started.elapsed()) {
+                    if ahead >= Duration::from_millis(1) {
+                        std::thread::sleep(ahead);
+                    }
+                }
+            }
+            assert!(
+                draws >= target_draws / 2,
+                "clock quantum {quantum} ns wants {target_draws} kept names; the host drew only \
+                 {draws} in {:?}",
+                started.elapsed()
+            );
+            eprintln!(
+                "collision fixture: quantum={quantum} ns, kept {draws} names over {:?}",
+                started.elapsed()
+            );
+            return;
         }
-        let started = std::time::Instant::now();
-        let mut draws = 0;
-        // Long enough to make ≥30k draws whatever the pace, so the expected
-        // trap-hit count stays well above 1 even on a loaded host.
-        while draws < 30_000 || started.elapsed() < std::time::Duration::from_millis(2500) {
-            let dir = create_scratch_dir()
-                .unwrap_or_else(|e| panic!("draw {draws}: collision retries must succeed: {e}"));
-            std::fs::remove_dir(&dir).unwrap();
-            draws += 1;
-        }
-        for name in &net {
-            let _ = std::fs::remove_dir(base.join(name));
-        }
+
+        let isolated = tempfile::tempdir().unwrap();
+        // `module_path!()` keeps the crate root; libtest names tests from the
+        // crate root's children. `--exact` needs the full path — a bare name
+        // runs zero tests and would fake a green child.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let child_name = format!("{module}::create_scratch_dir_retries_name_collisions");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &child_name, "--nocapture"])
+            .env("TMPDIR", isolated.path())
+            .env("TMP", isolated.path())
+            .env("TEMP", isolated.path())
+            .env(SCRATCH_COLLISION_CHILD, "1")
+            .output()
+            .expect("re-exec of the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed"),
+            "child {child_name} did not run exactly one green test: status={:?}\n\
+             --stdout--\n{stdout}\n--stderr--\n{stderr}",
+            out.status
+        );
     }
 
     /// A temp root that cannot host the scratch dir surfaces the REAL error
