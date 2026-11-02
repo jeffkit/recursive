@@ -1358,4 +1358,59 @@ mod tests {
         // CGI short-circuit, independent of the variables.
         assert!(configured_proxies("http", true, env(&[("HTTP_PROXY", "http://a")])).is_empty());
     }
+
+    // ── Issue #245 batch 37: nat64 low octets and lenient-parse width ──────
+
+    /// In the `64:ff9b::/96` well-known prefix the embedded v4 address's
+    /// THIRD and FOURTH octets come from `s[7]` (high and low byte).
+    /// `is_private_ip` reads them only for the broadcast case, so that is
+    /// where a slip in the extraction shows: `>> 8` → `<< 8` zeroes the
+    /// third octet (255.255.0.255 is not broadcast), `& 0xff` → `^ 0xff`
+    /// zeroes the fourth (255.255.255.0 is not broadcast), and `& 0xff` →
+    /// `| 0xff` saturates the fourth so 255.255.255.127 reads as broadcast.
+    #[test]
+    fn nat64_embedded_v4_low_octets_decide_the_broadcast_case() {
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert!(
+            nat64_rejects(&v6("64:ff9b::ffff:ffff")),
+            "embedded 255.255.255.255 (broadcast) must be refused"
+        );
+        assert!(
+            !nat64_rejects(&v6("64:ff9b::ffff:ff7f")),
+            "embedded 255.255.255.127 is outside every range is_private_ip refuses"
+        );
+    }
+
+    /// More than four dot-separated parts is rejected up front, even when
+    /// every part parses — `1.2.3.4.0` would otherwise fold to 1.2.3.4 (the
+    /// fifth part is a zero that fits the zero-width last slot). The sibling
+    /// `1.2.3.4.5` case is refused downstream by the width check too, so it
+    /// cannot tell the `parts.len() > 4` arm apart. An empty-part spelling
+    /// is `None` either way because `parse_lenient_part` refuses the empty
+    /// part on its own.
+    #[test]
+    fn parse_lenient_ipv4_rejects_more_than_four_parts_before_parsing() {
+        assert_eq!(parse_lenient_ipv4("1.2.3.4.0"), None);
+        assert_eq!(parse_lenient_ipv4("0.0.0.0.0"), None);
+        assert_eq!(parse_lenient_ipv4("1.2.3.4"), Some(v4(1, 2, 3, 4)));
+        assert_eq!(parse_lenient_ipv4("1..2.3"), None);
+    }
+
+    /// The LAST part spans `8 * remaining_bytes` bits — 24 for two parts,
+    /// 16 for three, 8 for four. Each row sits inside the correct width but
+    /// outside what `8 + remaining_bytes` (9/10/11 bits) or
+    /// `8 / remaining_bytes` (2/4/8 bits) would admit, so a slip in the
+    /// multiplication flips the verdict on at least one row per width.
+    #[test]
+    fn parse_lenient_ipv4_last_part_width_is_eight_bits_per_remaining_byte() {
+        // Two parts: the last part holds 24 bits.
+        assert_eq!(parse_lenient_ipv4("10.5000"), Some(v4(10, 0, 19, 136)));
+        assert_eq!(parse_lenient_ipv4("10.200"), Some(v4(10, 0, 0, 200)));
+        // Three parts: the last part holds 16 bits.
+        assert_eq!(parse_lenient_ipv4("1.2.60000"), Some(v4(1, 2, 234, 96)));
+        assert_eq!(parse_lenient_ipv4("1.2.100"), Some(v4(1, 2, 0, 100)));
+        // Four parts: the last part holds exactly 8 bits — 256 is one too many.
+        assert_eq!(parse_lenient_ipv4("1.2.3.255"), Some(v4(1, 2, 3, 255)));
+        assert_eq!(parse_lenient_ipv4("1.2.3.256"), None);
+    }
 }

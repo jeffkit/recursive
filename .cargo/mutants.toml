@@ -1353,4 +1353,27 @@ exclude_re = [
     # :616:5 → :638:5.)
     "src/tools/execution/run_code/runner\\.rs:638:5: replace address_space_guard_fact -> String with \"xyzzy\"\\.into\\(\\)",
     "src/tools/execution/run_code/runner\\.rs:638:5: replace address_space_guard_fact -> String with String::new\\(\\)",
+    # ── Issue #245 batch 37 (B1 seat, task list /tmp/b1-batch37.txt) ───────
+    # tools/ledger.rs :51:19 — the char-boundary back-off loop guard
+    # `while end > 0 && !text.is_char_boundary(end) { end -= 1; }` → `>=`.
+    # True equivalence on the `usize` domain: `end >= 0` is identically true,
+    # so the mutant reads `while !text.is_char_boundary(end)`. The two
+    # spellings can only differ when `end == 0`, and there `str::is_char_
+    # boundary(0)` is `true` by contract (the start of the string is always a
+    # boundary), so the mutant's remaining term is `false` and the loop stops
+    # on the same iteration as the original — no underflowing `end -= 1`, same
+    # `end`, same slice, on every input (`end` starts at `max_render_bytes`,
+    # strictly below `text.len()` after the early return at :47). rustc
+    # compiles `end >= 0` with only the `unused_comparisons` warning, which is
+    # why it surfaced as MISSED rather than unviable. The reachable siblings
+    # on the same line (`> 0` → `== 0` / `< 0` skip the loop and slice
+    # mid-char; `&&` → `||` walks down to 0) and on :52 (`-= 1` → `+= 1` /
+    # `/= 1`) are killed by
+    # truncate_backs_off_to_a_char_boundary_without_crossing_the_cap.
+    # negctl: mutation applied → tools::ledger suite green 7/7 with the new
+    # pins in place (/tmp/b1-batch37/pins/results.jsonl).
+    # UNLOCK CONDITION: if `end` ever becomes a signed type, or the loop is
+    # rewritten to step before testing the boundary, drop this entry — the
+    # `>=` spelling then gains a real divergence at 0.
+    "src/tools/ledger\\.rs:51:19: replace > with >= in ChangeLedgerTool::truncate",
 ]

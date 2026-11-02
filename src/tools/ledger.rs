@@ -196,4 +196,48 @@ mod tests {
             ToolKind::Read
         );
     }
+
+    // ── Issue #245 batch 37: default cap and the char-boundary back-off ────
+
+    /// The default cap is 64 KiB and leaves small renders alone:
+    /// `ChangeLedgerTool::new` wires `MAX_LEDGER_RENDER_BYTES` in, so a
+    /// 2000-byte render must survive — under a `64 + 1024` slip the default
+    /// cap would be 1088 bytes and this render would be truncated.
+    #[test]
+    fn default_render_cap_is_64_kib_and_leaves_small_renders_alone() {
+        assert_eq!(MAX_LEDGER_RENDER_BYTES, 64 * 1024);
+        let (_dir, _ledger, tool) = fixture();
+        let text = "x".repeat(2000);
+        assert_eq!(tool.truncate(text.clone()), text);
+    }
+
+    /// Truncation backs the cut off to the nearest char boundary at or below
+    /// the cap. The ASCII fixture in `truncation_is_announced` never enters
+    /// the back-off loop, so the loop is pinned here with a 3-byte char
+    /// straddling byte 200: the cut lands on byte 198 and the char is
+    /// dropped whole. Killing shape: skipping the loop (`> 0` → `== 0` or
+    /// `< 0`) slices mid-char and panics; `&&` → `||` walks all the way
+    /// down to 0 and emits an empty prefix; `-= 1` → `+= 1` walks up past
+    /// the cap and keeps the straddling char.
+    #[test]
+    fn truncate_backs_off_to_a_char_boundary_without_crossing_the_cap() {
+        let (_dir, _ledger, tool) = fixture();
+        let tool = tool.with_max_render_bytes(200);
+        let text = format!("{}日tail", "a".repeat(198)); // '日' = bytes 198..201
+        assert_eq!(text.len(), 205);
+        let out = tool.truncate(text);
+        let (prefix, notice) = out
+            .split_once("\n... [ledger output truncated at 200 bytes")
+            .expect("truncation must be announced");
+        assert_eq!(
+            prefix,
+            "a".repeat(198),
+            "cut must land on the boundary just below the cap"
+        );
+        assert!(
+            !out.contains('日'),
+            "the straddling char must be dropped, not kept: {out}"
+        );
+        assert!(notice.contains("full ledger stays in the session event stream"));
+    }
 }
