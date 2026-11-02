@@ -513,6 +513,15 @@ fn cleanup_scratch(dir: &Path) {
 /// (statfs `f_bsize × f_bavail`). `None` when the platform offers no probe.
 #[cfg(unix)]
 fn scratch_volume_free_bytes(path: &Path) -> Option<u64> {
+    // #245 closing blocker (scan 41378955608): tests pin the probe through the
+    // seam below instead of trusting the live disk, whose free space drifts on
+    // shared CI runners. Compiled out of production builds.
+    #[cfg(test)]
+    {
+        if let Some(free) = tests::free_space_test_override() {
+            return Some(free);
+        }
+    }
     use std::os::unix::ffi::OsStrExt as _;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `statfs` writes `count` bytes into the out struct and reads the
@@ -1811,43 +1820,83 @@ return process.cwd();"#
         }
     }
 
+    // ── free-space seam (#245 closing blocker, scan 41378955608) ────────────
+
+    // The free-space value `scratch_volume_free_bytes` reports to *this test
+    // thread*, when a test has pinned it. Thread-local on purpose: tests run
+    // in parallel, and a global pin would leak a fixed reading into sibling
+    // tests' floor checks.
+    thread_local! {
+        static FREE_SPACE_OVERRIDE: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The production hook (see the `#[cfg(test)]` block inside
+    /// `scratch_volume_free_bytes`): the pinned value replaces the statfs
+    /// probe's answer.
+    pub(crate) fn free_space_test_override() -> Option<u64> {
+        FREE_SPACE_OVERRIDE.with(std::cell::Cell::get)
+    }
+
+    /// Pin / clear the free-space reading this thread's runs will observe.
+    pub(crate) fn set_free_space_override(bytes: Option<u64>) {
+        FREE_SPACE_OVERRIDE.with(|cell| cell.set(bytes));
+    }
+
+    /// The seam must be observable through the production fn itself: a pin
+    /// replaces the probe's answer, clearing it restores the live probe.
+    #[test]
+    fn free_space_override_seam_pins_and_clears() {
+        set_free_space_override(None);
+        let live = super::scratch_volume_free_bytes(&std::env::temp_dir());
+        #[cfg(unix)]
+        assert!(
+            live.is_some(),
+            "the statfs probe answers on a real directory: {live:?}"
+        );
+        #[cfg(not(unix))]
+        assert_eq!(live, None, "no probe on this platform: {live:?}");
+
+        const PINNED: u64 = 12_345_678;
+        set_free_space_override(Some(PINNED));
+        assert_eq!(
+            super::scratch_volume_free_bytes(&std::env::temp_dir()),
+            Some(PINNED),
+            "the pinned value is what the floor check observes"
+        );
+
+        set_free_space_override(None);
+        let restored = super::scratch_volume_free_bytes(&std::env::temp_dir());
+        assert_ne!(restored, Some(PINNED), "clearing must unpin: {restored:?}");
+    }
+
     /// Goal 416: the floor is EXCLUSIVE — "below it the run is rejected", so
-    /// a volume with exactly `floor` bytes free STARTS the run. The product
-    /// reports the measured free space in its own refusal, so the test reads
-    /// that number back and re-runs with it as the floor: the pristine
-    /// comparison lets the run through; an inclusive one refuses it, quoting
-    /// the very same number.
+    /// a volume with exactly `floor` bytes free STARTS the run, and a floor
+    /// one byte above the free space refuses while quoting the measured
+    /// number.
     ///
-    /// Free space is a live quantity (sibling tests write temp files), so the
-    /// probe is direction-aware instead of assuming stillness: a refusal that
-    /// reports LESS free space than the floor is drift and is retried; a
-    /// refusal reporting EXACTLY the floor is the inclusive-comparison
-    /// signature and fails at once; a run that went through is only accepted
-    /// once a follow-up probe confirms the free space had not moved
-    /// meanwhile. The shim's argv log goes to `/dev/null` so the fixture
-    /// itself writes nothing to the volume between the probes (a real file
-    /// costs a copy-on-write block per append on APFS and moved the number
-    /// on every attempt). Sixteen attempts bound the retry.
-    // windows（#224）：scratch_volume_free_bytes 的 cfg(not(unix)) 版本返 None，floor 从不
-    // 参与比较（见 low_disk_rejects_before_spawn 的同款说明）。
+    /// The probe is pinned through [`set_free_space_override`] to a fixed F
+    /// instead of reading the live disk. History: the original form probed
+    /// the real volume and retried until free space "held still" across 16
+    /// attempts — on shared CI runners (ubuntu-24.04) sibling processes drain
+    /// free space continuously, every attempt drifted, the test panicked on
+    /// the *unmutated* baseline, and the whole 37-shard mutation scan aborted
+    /// with exit 4 (run 41378955608 — the #245 closing blocker). Three
+    /// deterministic boundary assertions now carry the same semantics:
+    ///   floor == F   → the run starts (exactly-at-floor admits);
+    ///   floor == F+1 → refused, quoting the pinned F as the free space;
+    ///   floor == F−1 → the run starts again.
+    // windows（#224）：scratch_volume_free_bytes 的 cfg(not(unix)) 版本不接 seam
+    //（body 恒 None），floor 从不参与比较（见 low_disk_rejects_before_spawn 的
+    // 同款说明）。
     #[cfg_attr(
         windows,
-        ignore = "#224: no statfs free-space probe on windows (cfg(not(unix)) returns None), so the floor is never compared"
+        ignore = "#224: no statfs free-space probe on windows (cfg(not(unix)) returns None and never consults the seam), so the floor is never compared"
     )]
     #[tokio::test]
     async fn free_space_floor_admits_a_volume_with_exactly_floor_bytes_free() {
-        fn free_bytes_reported(report: &RunReport) -> u64 {
-            let detail = report.detail.as_deref().unwrap_or_default();
-            let (_, rest) = detail
-                .split_once("insufficient free space: ")
-                .unwrap_or_else(|| panic!("the refusal names the free space: {detail}"));
-            let (free, _) = rest
-                .split_once(" bytes free")
-                .unwrap_or_else(|| panic!("the refusal names the free space: {detail}"));
-            free.parse()
-                .unwrap_or_else(|e| panic!("free bytes {free:?} must parse: {e}"))
-        }
-
+        const F: u64 = 1_234_567;
+        set_free_space_override(Some(F));
         let tmp = std::env::temp_dir().join(format!("ptc-floor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1858,49 +1907,45 @@ return process.cwd();"#
             ..shim_request(&node, tmp.clone())
         };
 
-        let mut log = Vec::new();
-        for attempt in 0..16 {
-            let probe = run_program(request(u64::MAX / 2)).await;
-            assert_eq!(
-                probe.failure,
-                Some(protocol::RunCodeFailure::SandboxUnavailable),
-                "an impossible floor always refuses: {probe:?}"
-            );
-            let free = free_bytes_reported(&probe);
+        // Exactly at the floor: the boundary is exclusive, the run starts.
+        let run = run_program(request(F)).await;
+        assert_eq!(
+            run.failure, None,
+            "exactly-floor free must start the run: {run:?}"
+        );
+        assert_eq!(run.value.as_deref(), Some("shim-ok"), "{run:?}");
 
-            let run = run_program(request(free)).await;
-            match run.failure {
-                None => {
-                    let confirm = run_program(request(u64::MAX / 2)).await;
-                    let after = free_bytes_reported(&confirm);
-                    if after == free {
-                        assert_eq!(run.value.as_deref(), Some("shim-ok"), "{run:?}");
-                        let _ = std::fs::remove_dir_all(&tmp);
-                        return;
-                    }
-                    log.push(format!(
-                        "attempt {attempt}: ran, but free moved {free} -> {after}"
-                    ));
-                }
-                Some(protocol::RunCodeFailure::SandboxUnavailable) => {
-                    let seen = free_bytes_reported(&run);
-                    let detail = run.detail.clone().unwrap_or_default();
-                    assert_ne!(
-                        seen, free,
-                        "exactly `floor` bytes free must start the run (the floor is \
-                         exclusive), yet the run was refused: {detail}"
-                    );
-                    assert!(
-                        seen < free,
-                        "a refusal with more free space than the floor is impossible: {detail}"
-                    );
-                    log.push(format!("attempt {attempt}: free fell {free} -> {seen}"));
-                }
-                other => panic!("unexpected failure {other:?}: {run:?}"),
-            }
-        }
+        // One byte above the free space: refused, and the refusal quotes the
+        // pinned measured free space; nothing ran.
+        let refused = run_program(request(F + 1)).await;
+        assert_eq!(
+            refused.failure,
+            Some(protocol::RunCodeFailure::SandboxUnavailable),
+            "free below the floor must refuse: {refused:?}"
+        );
+        let detail = refused.detail.clone().expect("the refusal explains itself");
+        assert!(
+            detail.contains(&format!(
+                "insufficient free space: {F} bytes free on volume of"
+            )),
+            "the refusal reports the pinned free space {F}: {detail}"
+        );
+        assert!(
+            refused.calls == 0 && refused.output.is_empty(),
+            "no runtime work happened on the refused run: {refused:?}"
+        );
+
+        // One byte below the floor: admitted again — only at (and above) the
+        // exact boundary does the volume qualify.
+        let below = run_program(request(F - 1)).await;
+        assert_eq!(
+            below.failure, None,
+            "free above the floor must start the run: {below:?}"
+        );
+        assert_eq!(below.value.as_deref(), Some("shim-ok"), "{below:?}");
+
+        set_free_space_override(None);
         let _ = std::fs::remove_dir_all(&tmp);
-        panic!("free space never held still across 16 attempts: {log:?}");
     }
 
     /// The scratch dir carries the run's identity and lives under the system
