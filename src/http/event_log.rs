@@ -398,6 +398,30 @@ mod tests {
         assert!(!replay.truncated);
     }
 
+    #[test]
+    fn an_untouched_ring_reports_no_eviction_and_no_gap() {
+        // A ring that never received a frame has nothing to replay and
+        // nothing to confess: an unresolved cursor must not be flagged as a
+        // gap (the ring cannot have evicted what never existed), and a pump
+        // joining at position 0 misses nothing.
+        let log = SessionEventLog::new(4);
+
+        let replay = log.replay(Some("not-a-frame-id"));
+        assert!(replay.frames.is_empty());
+        assert!(
+            !replay.truncated,
+            "nothing was ever emitted, so nothing can be missing"
+        );
+        assert_eq!(replay.next_pos, 0);
+
+        let drained = log.drain_from(0);
+        assert!(drained.frames.is_empty());
+        assert!(
+            !drained.truncated,
+            "the write position is 0 — no frame was skipped"
+        );
+    }
+
     // ── Goal 422 W1 (#132): rings rebuilt from storage ──────────────────
 
     #[test]
@@ -503,6 +527,29 @@ mod tests {
         assert!(
             lagged.truncated,
             "the frame at the pump's position was evicted"
+        );
+    }
+
+    #[test]
+    fn a_restored_ring_gaps_the_pre_seed_window_for_a_waiting_pump() {
+        // `restored` seeds the write position at 1 because this ring replaced
+        // a pre-restart one: a pump still waiting at position 0 has genuinely
+        // lost frames — they were never persisted into this ring — while a
+        // pump that joined at the seeded write position has missed nothing.
+        let log = SessionEventLog::restored(4, Some(10));
+
+        let drained = log.drain_from(0);
+        assert!(
+            drained.frames.is_empty(),
+            "nothing was pushed since the restore"
+        );
+        assert!(
+            drained.truncated,
+            "position 0 predates this ring — the wait is a real gap"
+        );
+        assert!(
+            !log.drain_from(1).truncated,
+            "the seeded write position itself has no in-ring predecessor"
         );
     }
 }
