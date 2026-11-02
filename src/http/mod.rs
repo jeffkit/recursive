@@ -3932,6 +3932,351 @@ mod goal_396_persistence_tests {
             "the warning carries the failed count"
         );
     }
+
+    /// #245 batch 36: the removed-count info line is emitted iff
+    /// `removed > 0`, and the plaintext-remains warning iff `failed > 0`. A
+    /// clean sweep that removed three records and failed none must say so
+    /// once — and must NOT raise the erasure warning, which would otherwise
+    /// fire on every tick and train operators to ignore it.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn retention_sweep_reports_removals_and_stays_quiet_when_nothing_failed() {
+        let host = test_host(0);
+        let storage = RecordingStorage::new();
+        storage
+            .purge_result
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        let state = test_state(host, storage.clone(), None).await;
+
+        assert_eq!(
+            purge_expired_transcripts(&state, std::time::Duration::from_secs(86_400)).await,
+            3
+        );
+        assert!(
+            logs_contain("retention: purged expired session records"),
+            "a sweep that removed records must log the fact"
+        );
+        assert!(
+            logs_contain("removed=3"),
+            "the info line carries the removed count"
+        );
+        assert!(
+            !logs_contain("could not be fully erased"),
+            "no failed erasure → no plaintext-remains warning"
+        );
+    }
+
+    /// #245 batch 36: a sweep that found nothing to remove and nothing
+    /// failing is silent on both lines — neither counter is announced at
+    /// zero. The probe line proves the capture is live, so the negative
+    /// assertions cannot pass vacuously.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn retention_sweep_is_silent_when_nothing_was_removed_or_failed() {
+        let host = test_host(0);
+        let storage = RecordingStorage::new();
+        let state = test_state(host, storage.clone(), None).await;
+
+        assert_eq!(
+            purge_expired_transcripts(&state, std::time::Duration::from_secs(86_400)).await,
+            0
+        );
+        tracing::info!("batch36 silent-sweep capture probe");
+        assert!(
+            logs_contain("batch36 silent-sweep capture probe"),
+            "positive control: the test's own line must be captured"
+        );
+        assert!(
+            !logs_contain("retention: purged expired session records"),
+            "zero removals must not be announced"
+        );
+        assert!(
+            !logs_contain("could not be fully erased"),
+            "zero failures must not warn"
+        );
+    }
+
+    /// #245 batch 36: the mirror prices a closing session unless BOTH usage
+    /// counters are zero — a session that consumed prompt tokens but
+    /// produced none (or the reverse) still lands `meta.cost`, and only a
+    /// session with no usage at all leaves it absent. Pins the
+    /// `prompt == 0 && completion == 0` gate operator by operator.
+    #[test]
+    fn mirror_closing_session_prices_cost_unless_both_counters_are_zero() {
+        use crate::llm::TokenUsage;
+
+        let mirrored_cost = |id: &str, prompt: u32, completion: u32| {
+            let root = tempfile::tempdir().unwrap();
+            let session = test_session(id, 0);
+            if prompt > 0 || completion > 0 {
+                session.usage.record(
+                    TokenUsage {
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: prompt + completion,
+                        ..Default::default()
+                    },
+                    0,
+                );
+            }
+            let transcript = vec![Message {
+                role: Role::User,
+                content: "hello".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                is_compaction_summary: false,
+            }];
+            mirror_closing_session(
+                Some(root.path()),
+                std::path::Path::new("/tmp/ws"),
+                "test-model",
+                "openai",
+                &session,
+                &transcript,
+                crate::session::SessionStatus::Completed,
+            );
+            let dir = root
+                .path()
+                .join(crate::session::workspace_slug(std::path::Path::new(
+                    "/tmp/ws",
+                )))
+                .join(id);
+            crate::session::SessionReader::load_meta(&dir)
+                .expect("mirrored meta loads")
+                .cost
+        };
+
+        assert!(
+            mirrored_cost("sess-cost-none", 0, 0).is_none(),
+            "a session with no usage at all must not carry a cost block"
+        );
+        let prompt_only = mirrored_cost("sess-cost-prompt-only", 7, 0)
+            .expect("prompt tokens without completions must still price");
+        assert_eq!(
+            (
+                prompt_only.total_input_tokens,
+                prompt_only.total_output_tokens
+            ),
+            (7, 0)
+        );
+        let completion_only = mirrored_cost("sess-cost-completion-only", 0, 3)
+            .expect("completions without prompt tokens must still price");
+        assert_eq!(
+            (
+                completion_only.total_input_tokens,
+                completion_only.total_output_tokens
+            ),
+            (0, 3)
+        );
+    }
+
+    /// #245 batch 36 (goal-290 housekeeping): an evicted session's SSE
+    /// broadcast channel is pruned with it, while the channel of a session
+    /// the sweep skipped (busy, mid-turn) stays. Pins the
+    /// `!evicted.is_empty()` guard — inverted, the prune would run only on
+    /// sweeps that evicted nothing and the map would grow with every
+    /// eviction.
+    #[tokio::test]
+    async fn evict_prunes_the_event_channel_of_each_evicted_session_only() {
+        let host = test_host(0);
+        let state = test_state(host, RecordingStorage::new(), None).await;
+        state
+            .host
+            .insert("s-gone".into(), test_session("s-gone", 1))
+            .await;
+        state
+            .host
+            .insert("s-busy".into(), test_session("s-busy", 1))
+            .await;
+        {
+            let mut channels = state.event_channels.write().await;
+            channels.insert("s-gone".into(), broadcast::channel(4).0);
+            channels.insert("s-busy".into(), broadcast::channel(4).0);
+        }
+        // Hold the busy session's runtime lock so the sweep skips it in
+        // place (clone the Arc so the sessions read guard drops first).
+        let rt_arc = state
+            .host
+            .sessions()
+            .read()
+            .await
+            .get("s-busy")
+            .unwrap()
+            .runtime
+            .clone();
+        let _guard = rt_arc.lock().await;
+
+        let evicted = evict_idle_sessions(&state).await;
+        assert_eq!(
+            evicted,
+            vec!["s-gone"],
+            "only the idle, non-busy session evicts"
+        );
+        let channels = state.event_channels.read().await;
+        assert!(
+            !channels.contains_key("s-gone"),
+            "the evicted session's SSE channel must be pruned"
+        );
+        assert!(
+            channels.contains_key("s-busy"),
+            "a session the sweep skipped keeps its channel"
+        );
+    }
+
+    /// #245 batch 36: idle time is `now - last_active`. A session touched
+    /// just now, under a TTL of twice its age-since-epoch, is nowhere near
+    /// expiry and must stay. The `-` → `+` slip would compare
+    /// `now + last_active` (≥ that TTL from the first tick) and evict every
+    /// session the moment the reaper runs. The 250 ms floor on the epoch
+    /// age keeps the TTL comfortably larger than the sweep's own latency.
+    #[tokio::test]
+    async fn evict_keeps_a_session_whose_idle_time_is_under_the_ttl() {
+        let age = now_session_ms();
+        if age < 250 {
+            tokio::time::sleep(std::time::Duration::from_millis(250 - age)).await;
+        }
+        let session = test_session("s-fresh", 1);
+        let touched = now_session_ms();
+        session.last_active_ms.store(touched, Ordering::Relaxed);
+        let host = Arc::new(SessionHost::new(
+            std::time::Duration::from_millis(touched.saturating_mul(2)),
+            AdmissionGate::new(
+                8,
+                std::time::Duration::ZERO,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+        ));
+        let state = test_state(host, RecordingStorage::new(), None).await;
+        state.host.insert("s-fresh".into(), session).await;
+
+        let evicted = evict_idle_sessions(&state).await;
+        assert!(
+            evicted.is_empty(),
+            "idle for ~0 ms under a {}ms TTL — must stay, got {evicted:?}",
+            touched * 2
+        );
+        assert!(state.host.contains_key("s-fresh").await);
+    }
+
+    /// #245 batch 36: a session whose last activity sits exactly at the
+    /// session epoch (`last_active_ms == 0` — created in the reaper clock's
+    /// first millisecond) is `now` ms idle and evicts under a zero TTL like
+    /// any other. The `-` → `/` slip would divide by that zero and panic
+    /// the sweep.
+    #[tokio::test]
+    async fn evict_handles_a_session_last_active_at_the_epoch() {
+        let host = test_host(0);
+        let state = test_state(host, RecordingStorage::new(), None).await;
+        let session = test_session("s-epoch", 1);
+        session.last_active_ms.store(0, Ordering::Relaxed);
+        state.host.insert("s-epoch".into(), session).await;
+
+        let evicted = evict_idle_sessions(&state).await;
+        assert_eq!(evicted, vec!["s-epoch"]);
+    }
+}
+
+/// #245 batch 36: pins for the small session-plumbing helpers whose only
+/// observation points are their own return values.
+#[cfg(test)]
+mod session_plumbing_pins {
+    use super::*;
+
+    /// `now_session_ms` is a monotonic millisecond clock: sleeping 20 ms
+    /// must advance it by at least 20 (a constant stand-in reads the same
+    /// value twice and every idle-TTL comparison collapses).
+    #[test]
+    fn now_session_ms_advances_with_the_wall_clock() {
+        let before = now_session_ms();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let after = now_session_ms();
+        assert!(
+            after >= before + 20,
+            "20 ms of sleep must advance the stamp by ≥ 20 ms (before={before}, after={after})"
+        );
+    }
+
+    /// `is_default` is true for the all-`None` value only — each override
+    /// field on its own makes it false — and that is exactly what keeps a
+    /// session that opted into nothing out of its stored metadata
+    /// (`skip_serializing_if`, cold_load.rs) while any override is
+    /// persisted.
+    #[test]
+    fn session_overrides_is_default_only_for_the_all_none_value() {
+        assert!(SessionOverrides::default().is_default());
+        let set = [
+            SessionOverrides {
+                max_budget_usd: Some(1.5),
+                ..Default::default()
+            },
+            SessionOverrides {
+                thinking_budget: Some(1024),
+                ..Default::default()
+            },
+            SessionOverrides {
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+        ];
+        for overrides in &set {
+            assert!(!overrides.is_default(), "{overrides:?} carries an override");
+        }
+
+        #[derive(serde::Serialize)]
+        struct Stored {
+            #[serde(skip_serializing_if = "SessionOverrides::is_default")]
+            overrides: SessionOverrides,
+        }
+        let blank = serde_json::to_value(Stored {
+            overrides: SessionOverrides::default(),
+        })
+        .unwrap();
+        assert!(
+            blank.get("overrides").is_none(),
+            "no overrides → the field is skipped: {blank}"
+        );
+        let opted = serde_json::to_value(Stored {
+            overrides: set[1].clone(),
+        })
+        .unwrap();
+        assert_eq!(opted["overrides"]["thinking_budget"], 1024);
+    }
+
+    /// `has_templates` is true iff at least one URL carries a `{key}`
+    /// placeholder: an all-concrete (or empty) source list keeps the
+    /// process-level catalog semantics, a single templated URL switches the
+    /// deployment to per-session expansion.
+    #[test]
+    fn skill_source_templates_detects_a_placeholder_in_any_url() {
+        assert!(
+            !SkillSourceTemplates::default().has_templates(),
+            "no urls → nothing to expand"
+        );
+        let concrete = SkillSourceTemplates {
+            urls: vec![
+                "https://hub.example/a/index.json".into(),
+                "https://hub.example/b/index.json".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(
+            !concrete.has_templates(),
+            "concrete urls carry no placeholder"
+        );
+        let templated = SkillSourceTemplates {
+            urls: vec![
+                "https://hub.example/a/index.json".into(),
+                "https://hub.example/{tenant}/index.json".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(
+            templated.has_templates(),
+            "one templated url among concrete ones is enough"
+        );
+    }
 }
 
 // =====================================================================

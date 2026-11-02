@@ -1277,4 +1277,25 @@ exclude_re = [
     # stops delegating to `new()`, drop this entry — any divergence then
     # becomes a real behavioural mutant in builder defaults.
     "src/runtime\\.rs:323:9: replace AgentRuntime::builder \\-> AgentRuntimeBuilder with Default::default\\(\\)",
+    # ── Issue #245 batch 36 (B1 seat, task list /tmp/b1-batch36.txt) ───────
+    # url_guard.rs :177:17 — the first `||` of the v6 arm
+    # (`v6.is_loopback() || v6.is_unspecified() || is_multicast || …`) →
+    # `&&`. True equivalence: the only two addresses for which either of
+    # those terms is true are `::1` and `::`, and both are IPv4-compatible
+    # spellings (first 96 bits zero) that std's `Ipv6Addr::to_ipv4` maps to
+    # `0.0.0.1` / `0.0.0.0`, so the `if let Some(v4) = v6.to_ipv4()` guard at
+    # :168 returns them through the v4 arm (`octets[0] == 0` /
+    # `is_unspecified`) before this chain is ever evaluated. At :176-:177
+    # both terms are therefore identically false on every input, and
+    # `false && false` reads the same as `false || false`; the remaining
+    # terms are untouched (`(a && b) || c || d || e` vs `a || b || c || d ||
+    # e`). The premise is pinned by
+    # ipv6_loopback_and_unspecified_are_classified_through_the_v4_arm (the
+    # `to_ipv4` mapping + both classifications) — if that test ever fails,
+    # drop this entry. The sibling :178:17 (`|| is_multicast` → `&&`, which
+    # by precedence becomes `is_unspecified && is_multicast` and drops the
+    # multicast term) is killed by is_private_ip_rejects_ipv6_multicast.
+    # negctl: mutation applied → whole url_guard suite green (batch 36, B1
+    # seat).
+    "src/tools/policy_domain/url_guard\\.rs:177:17: replace \\|\\| with && in is_private_ip",
 ]

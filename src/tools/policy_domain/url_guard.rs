@@ -1067,6 +1067,68 @@ mod tests {
         assert!(!nat64_rejects(&v6("2001:db8::1")));
     }
 
+    /// #245 batch 36: in the `64:ff9b::/96` well-known prefix the embedded
+    /// v4 address's SECOND octet decides for 172.16/12, 192.168/16 and
+    /// 100.64/10 — the sibling test's loopback / 10/8 cases are blind to it,
+    /// so a `& 0xff` → `| 0xff` / `^ 0xff` slip in the octet extraction
+    /// (172.255.x / 172.239.x are public) only shows here.
+    #[test]
+    fn nat64_embedded_v4_second_octet_decides_the_private_ranges() {
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert!(nat64_rejects(&v6("64:ff9b::ac10:1")), "172.16.0.1");
+        assert!(nat64_rejects(&v6("64:ff9b::c0a8:101")), "192.168.1.1");
+        assert!(nat64_rejects(&v6("64:ff9b::6440:1")), "100.64.0.1 (CGNAT)");
+        assert!(
+            !nat64_rejects(&v6("64:ff9b::ac20:1")),
+            "172.32.0.1 is public"
+        );
+        assert!(
+            !nat64_rejects(&v6("64:ff9b::c0a9:101")),
+            "192.169.1.1 is public"
+        );
+        assert!(
+            !nat64_rejects(&v6("64:ff9b::6480:1")),
+            "100.128.0.1 is public"
+        );
+    }
+
+    /// #245 batch 36: IPv6 multicast (`ff00::/8`) is never a unicast
+    /// destination. Pinned on its own because `::1` / `::` never reach the
+    /// v6 arm (see the next test), so `is_multicast()` is the first term of
+    /// that `||` chain which actually decides anything — the one a
+    /// precedence-changing `||` → `&&` slip in front of it drops.
+    #[test]
+    fn is_private_ip_rejects_ipv6_multicast() {
+        assert!(
+            is_private_ip("ff02::1".parse().unwrap()),
+            "link-local all-nodes multicast"
+        );
+        assert!(
+            is_private_ip("ff0e::1".parse().unwrap()),
+            "global-scope multicast"
+        );
+        assert!(
+            !is_private_ip("2606:4700::1111".parse().unwrap()),
+            "plain global unicast next door is untouched"
+        );
+    }
+
+    /// `::1` and `::` are IPv4-compatible spellings (first 96 bits zero):
+    /// std's `to_ipv4` maps them to `0.0.0.1` / `0.0.0.0`, so `is_private_ip`
+    /// classifies both through the v4 arm (`0.0.0.0/8`) and the v6 arm's
+    /// `is_loopback() || is_unspecified()` terms can never be the deciding
+    /// ones. This is the premise of the `.cargo/mutants.toml` entry for
+    /// url_guard.rs:177:17 — if this test ever fails, that exemption must go.
+    #[test]
+    fn ipv6_loopback_and_unspecified_are_classified_through_the_v4_arm() {
+        let loopback: Ipv6Addr = "::1".parse().unwrap();
+        let unspecified: Ipv6Addr = "::".parse().unwrap();
+        assert_eq!(loopback.to_ipv4(), Some(Ipv4Addr::new(0, 0, 0, 1)));
+        assert_eq!(unspecified.to_ipv4(), Some(Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(is_private_ip(IpAddr::V6(loopback)));
+        assert!(is_private_ip(IpAddr::V6(unspecified)));
+    }
+
     /// `boxed_io_error` preserves the message the guard produced.
     #[test]
     fn boxed_io_error_keeps_message() {

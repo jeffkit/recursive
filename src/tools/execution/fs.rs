@@ -1532,4 +1532,251 @@ line3
             "ConnectionReset transport failure must carry the retryable marker, got: {msg}"
         );
     }
+
+    // ── #245 batch 36: ReadFileState bookkeeping, WriteFile fork + staleness gates ──
+
+    /// Re-recording an already-cached path moves it to the newest slot and
+    /// keeps every sibling: `recent_files` must list the re-read file first
+    /// and the other file second — never the re-read file twice. (An
+    /// inverted `retain` would drop every OTHER path from the recency order
+    /// on each re-read.)
+    #[test]
+    fn read_file_state_rerecord_moves_path_to_newest_and_keeps_siblings() {
+        let mut state = ReadFileState::new();
+        let a = PathBuf::from("/ws/a.rs");
+        let b = PathBuf::from("/ws/b.rs");
+        state.record(a.clone(), false, "a1".into(), 1);
+        state.record(b.clone(), false, "b1".into(), 2);
+        state.record(a.clone(), false, "a2".into(), 3);
+
+        let recent: Vec<PathBuf> = state.recent_files(10).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            recent,
+            vec![a.clone(), b.clone()],
+            "re-read file first, sibling kept, nothing duplicated"
+        );
+        assert_eq!(state.get(&a).map(|r| r.content.as_str()), Some("a2"));
+        assert_eq!(state.get(&b).map(|r| r.content.as_str()), Some("b1"));
+    }
+
+    /// The cache holds exactly `READ_FILE_STATE_MAX_ENTRIES` records before
+    /// evicting: the MAX-th record keeps the oldest one, the (MAX+1)-th
+    /// evicts exactly that oldest one and nothing else.
+    #[test]
+    fn read_file_state_evicts_only_once_capacity_is_exceeded() {
+        let path = |i: usize| PathBuf::from(format!("/ws/f{i}.rs"));
+        let mut state = ReadFileState::new();
+        for i in 0..READ_FILE_STATE_MAX_ENTRIES {
+            state.record(path(i), false, String::new(), i as u64);
+        }
+        assert!(
+            state.get(&path(0)).is_some(),
+            "exactly MAX entries must all still be cached"
+        );
+        assert_eq!(
+            state.recent_files(usize::MAX).len(),
+            READ_FILE_STATE_MAX_ENTRIES
+        );
+
+        state.record(path(READ_FILE_STATE_MAX_ENTRIES), false, String::new(), 999);
+        assert!(
+            state.get(&path(0)).is_none(),
+            "the oldest entry goes once the cap is exceeded"
+        );
+        assert!(
+            state.get(&path(1)).is_some(),
+            "only one entry is evicted per overflow"
+        );
+        assert_eq!(
+            state.recent_files(usize::MAX).len(),
+            READ_FILE_STATE_MAX_ENTRIES
+        );
+    }
+
+    /// Goal 394: `WriteFile` holds session state (the read-before-write
+    /// guard slot), so `fork_box` must return a clone rewired to the fork's
+    /// fresh slot — `None` would make `fork_session` keep sharing the
+    /// parent's slot, and a file read inside the fork would still be "not
+    /// read yet" for the fork's own Write.
+    #[tokio::test]
+    async fn write_file_fork_box_rewires_the_read_guard_to_the_fork_slot() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("e.txt");
+        std::fs::write(&path, "orig").unwrap();
+        let parent_slot = Arc::new(Mutex::new(ReadFileState::new()));
+        let fork_slot = Arc::new(Mutex::new(ReadFileState::new()));
+        let parent = WriteFile::new(tmp.path()).with_read_state(parent_slot.clone());
+        let state = SessionToolState {
+            read_state: Some(fork_slot.clone()),
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                crate::tools::run_background::BackgroundJobManager::new(),
+            )),
+            session_roots: None,
+            deliverables: None,
+        };
+        let forked = parent
+            .fork_box(&state)
+            .expect("WriteFile is session-stateful: fork_box must return a rewired clone");
+
+        // Only the fork's slot has read the file…
+        ReadFile::new(tmp.path())
+            .with_read_state(fork_slot.clone())
+            .execute(json!({"path": "e.txt"}))
+            .await
+            .unwrap();
+        // …so the fork's Write may proceed, and its post-write cache update
+        // lands in the fork slot — the parent slot never learns of the file.
+        forked
+            .execute(json!({"path": "e.txt", "contents": "from-fork"}))
+            .await
+            .expect("the fork's Write consults the fork's read slot");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "from-fork");
+        assert!(
+            parent_slot.lock().unwrap().get(&path).is_none(),
+            "the parent slot must stay untouched by the fork"
+        );
+        let err = parent
+            .execute(json!({"path": "e.txt", "contents": "from-parent"}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("has not been read yet"),
+            "the parent's own Write still sees its own (empty) slot: {err}"
+        );
+    }
+
+    /// The pre-read guard is mtime-gated: while the on-disk mtime equals the
+    /// cached read's timestamp the write takes the fast path and no content
+    /// re-validation runs — observable only when the cached bytes differ
+    /// from disk. (`>=` / `==` in either gate would re-read and reject.)
+    #[tokio::test]
+    async fn write_takes_the_fast_path_while_mtime_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("e.txt");
+        std::fs::write(&path, "on-disk").unwrap();
+        let mtime = get_file_mtime(&path);
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        slot.lock()
+            .unwrap()
+            .record(path.clone(), false, "cached-elsewhere".into(), mtime);
+
+        WriteFile::new(tmp.path())
+            .with_read_state(slot)
+            .execute(json!({"path": "e.txt", "contents": "new"}))
+            .await
+            .expect("an unchanged mtime must not trigger a content re-validation");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    /// A file whose mtime moved past the cached read's timestamp AND whose
+    /// bytes differ is rejected by the PRE-READ guard (its own message), not
+    /// left for the call-time re-check — a `<` / `==` gate would let it
+    /// through to the second check and change the error the model sees.
+    #[tokio::test]
+    async fn write_pre_read_guard_rejects_a_file_changed_after_the_cached_read() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("e.txt");
+        std::fs::write(&path, "changed on disk").unwrap();
+        let mtime = get_file_mtime(&path);
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        // A full read cached 10 s before the file's current mtime.
+        slot.lock()
+            .unwrap()
+            .record(path.clone(), false, "as-read".into(), mtime - 10_000);
+
+        let err = WriteFile::new(tmp.path())
+            .with_read_state(slot)
+            .execute(json!({"path": "e.txt", "contents": "new"}))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("has been modified since it was last read"),
+            "the pre-read guard must reject with its own message, got: {msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed on disk");
+    }
+
+    /// Transport whose `create_dir_all` rewrites `victim` on the host disk —
+    /// an external writer racing the Write tool between its pre-read guard
+    /// and its call-time re-check.
+    #[derive(Debug)]
+    struct RacingWriterTransport {
+        inner: crate::tools::transport::LocalTransport,
+        victim: PathBuf,
+    }
+
+    #[async_trait]
+    impl ToolTransport for RacingWriterTransport {
+        async fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.inner.read_file(path).await
+        }
+
+        async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+            self.inner.write_file(path, contents).await
+        }
+
+        async fn list_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>> {
+            self.inner.list_dir(path).await
+        }
+
+        async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            let result = self.inner.create_dir_all(path).await;
+            std::fs::write(&self.victim, "raced in").expect("racing writer");
+            bump_mtime_future(&self.victim);
+            result
+        }
+
+        async fn exec_shell(
+            &self,
+            command: &str,
+            cwd: &Path,
+            env: &[(String, String)],
+            timeout: std::time::Duration,
+            max_output_bytes: usize,
+        ) -> std::io::Result<ExecResult> {
+            self.inner
+                .exec_shell(command, cwd, env, timeout, max_output_bytes)
+                .await
+        }
+    }
+
+    /// The call-time re-check catches a file rewritten AFTER the pre-read
+    /// guard passed (here: during `create_dir_all`) — its mtime is now past
+    /// the cached timestamp and its bytes differ, so the write is refused
+    /// with the re-check's own message and the racing writer's bytes stay
+    /// on disk. A `<` / `==` gate would clobber them.
+    #[tokio::test]
+    async fn write_call_time_recheck_rejects_a_file_rewritten_after_the_guard() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("e.txt");
+        std::fs::write(&path, "orig").unwrap();
+        let slot = Arc::new(Mutex::new(ReadFileState::new()));
+        ReadFile::new(tmp.path())
+            .with_read_state(slot.clone())
+            .execute(json!({"path": "e.txt"}))
+            .await
+            .unwrap();
+        let racing = Arc::new(RacingWriterTransport {
+            inner: crate::tools::transport::LocalTransport,
+            victim: path.clone(),
+        });
+
+        let err = WriteFile::new(tmp.path())
+            .with_read_state(slot)
+            .with_transport(racing as Arc<dyn ToolTransport>)
+            .execute(json!({"path": "e.txt", "contents": "new"}))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("was modified after it was last read"),
+            "the call-time re-check must reject with its own message, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "raced in",
+            "the racing writer's bytes must not be clobbered"
+        );
+    }
 }
