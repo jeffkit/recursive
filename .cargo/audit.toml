@@ -12,6 +12,7 @@ ignore = [
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
     "RUSTSEC-2026-0410",
+    "RUSTSEC-2026-0429",
 ]
 # 0367/0368/0369 = zip 4.6.1 的 ZipArchive::extract 符号链接外逃 / SUID 位保留族。
 # 暴露面：src/tools/install_skill.rs（远程技能 zip 解压，不可信输入；#103 已做路径
@@ -33,3 +34,10 @@ ignore = [
 # 暴露面:zstd 仅经 zip 技能包解压可达(#103 已做路径穿越与完整性校验);
 # seekable frame / 跨流复用上下文均非 zip 解压路径,可达性低。
 # 解禁条件 = zip 发布支持 zstd-safe 8 的版本并升级,或更换压缩后端。
+# 0429 = zip 4.6.1「ZipArchive::extract 在 symlink entry + 大解压比时 abort 进程」
+# (severity 7.5;公告解法=升 zip >=9.0.0,跨大版本且与 0391-0410 的 zstd-safe ^7
+# 钉死链耦合,单升不可行)。暴露面:zip 技能包解压(install_skill,不可信输入;
+# #103 路径穿越与完整性校验在位,但 abort 在 crate 内部)——恶意技能包可致 CLI
+# 进程 abort(可用性影响,用户域内,非提权/非外逃)。解禁条件 = zip >=9.0.0
+# 迁移完成(zstd 链一并)后删除本条。bincode/paste unmaintained 警告为提示级,
+# 非 vulnerability,不触发本门失败。

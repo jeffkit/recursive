@@ -528,11 +528,11 @@ mod tests {
         (value, logs)
     }
 
+    // unix-only（#245 终判 mc 修正）：测试体 `std::os::unix` 导入在 windows
+    // clippy 编译崩（E0433/E0599）——ignore 属性不免编译，须 cfg(unix) 门控；
+    // windows 上该 unlink 失败本就不可复现（chmod no-op），跳过语义由本注释保留。
+    #[cfg(unix)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "forces a non-NotFound unlink failure via unix permission bits (0555 dir); Windows chmod is a no-op so the failure is not reproducible there"
-    )]
     fn unremovable_record_is_restored_with_a_warning() {
         use std::os::unix::fs::PermissionsExt;
         let (workspace, _home, _guard) = workspace_with_sessions();
