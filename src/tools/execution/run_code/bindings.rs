@@ -300,4 +300,16 @@ mod tests {
             BindingTable::from_tool_names(["Read", "Read"]).expect_err("must reject duplicates");
         assert_eq!(err, BindingNameError::Duplicate("Read".to_string()));
     }
+
+    /// `is_empty` must track the table's contents: the empty table is empty
+    /// (and carries no names), a table with one registered tool is not.
+    #[test]
+    fn is_empty_tracks_whether_any_binding_was_registered() {
+        let none = BindingTable::empty();
+        assert!(none.is_empty());
+        assert!(none.names().is_empty());
+        let one = BindingTable::from_tool_names(["Read"]).expect("valid name");
+        assert!(!one.is_empty());
+        assert_eq!(one.names(), &["Read"]);
+    }
 }

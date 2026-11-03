@@ -725,4 +725,47 @@ mod tests {
 
         assert_eq!(new_out, legacy_out);
     }
+
+    /// Goal 394: `GlobTool` holds the session-roots slot, so `fork_box` must
+    /// return a clone rewired to the fork's fresh slot — a root granted only
+    /// in the fork's slot is reachable through the fork, and unreachable
+    /// through the parent.
+    #[tokio::test]
+    async fn glob_fork_box_rewires_the_session_roots_to_the_fork_slot() {
+        let tmp = TempDir::new().unwrap();
+        let granted = TempDir::new().unwrap();
+        create_files(&granted, &["found.rs"]);
+        let fork_slot = crate::tools::new_shared_sandbox_roots();
+        fork_slot
+            .write()
+            .unwrap()
+            .push((granted.path().to_path_buf(), AccessTier::ReadOnly));
+        let parent =
+            GlobTool::new(tmp.path()).with_session_roots(crate::tools::new_shared_sandbox_roots());
+        let state = SessionToolState {
+            read_state: None,
+            bg_manager: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::tools::run_background::BackgroundJobManager::new(),
+            )),
+            session_roots: Some(fork_slot),
+            deliverables: None,
+        };
+        let forked = parent
+            .fork_box(&state)
+            .expect("GlobTool is session-stateful: fork_box must return a rewired clone");
+        let scope = granted.path().to_string_lossy().to_string();
+        let out = forked
+            .execute(json!({"pattern": "**/*.rs", "path": scope}))
+            .await
+            .expect("the fork must see the root granted in its own slot");
+        assert!(out.contains("found.rs"), "got: {out}");
+        let err = parent
+            .execute(json!({"pattern": "**/*.rs", "path": scope}))
+            .await
+            .expect_err("the parent slot never learned of the fork's root");
+        assert!(
+            err.to_string().contains("Glob"),
+            "the parent must reject the out-of-sandbox scope, got: {err}"
+        );
+    }
 }

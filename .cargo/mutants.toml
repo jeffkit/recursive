@@ -1445,4 +1445,104 @@ exclude_re = [
     # the recoverable path or a typed error for the open failure, the two
     # spellings diverge observably — drop this entry and pin.
     "src/session/lifecycle\\.rs:244:23: replace match guard e\\.kind\\(\\) == std::io::ErrorKind::AlreadyExists with true in SessionLock::acquire",
+    # ── Issue #245 batch 38 (B1 seat), logging.rs — true equivalence ──────
+    # StderrOrNull::flush delegates to std::io::stderr().flush() in the
+    # non-quiet arm. std's Stderr is unbuffered (every write is handed to
+    # the OS immediately and the handle owns no intermediate buffer), so
+    # that flush is a no-op that always returns Ok — replacing the whole
+    # body with Ok(()) is observationally identical on every input (the
+    # TUI_QUIET arm already returned Ok(())). The writer wraps stderr
+    # directly, with no BufWriter/LineWriter layer of its own to flush.
+    # The `for .*StderrOrNull` qualification wildcard is load-bearing:
+    # exclude_re matches cargo-mutants' INTERNAL name, which renders the
+    # impl-block type with a module qualification the --list display line
+    # does not show (probe series /tmp/b1-batch38/exclude_probe.txt —
+    # the literal display spelling `<impl io::Write for StderrOrNull>`
+    # never matches, while `.*` before the type does).
+    # negctl: mutation applied → logging suite green with all pins
+    # (/tmp/b1-batch38/negctl/). UNLOCK CONDITION: if the writer ever
+    # gains a buffering layer (or delegates to a buffered handle), the
+    # flush gains a real observable effect — drop this entry and pin it.
+    "src/logging\\.rs:132:9: replace <impl io::Write for .*StderrOrNull>::flush -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # ── Issue #245 batch 40 (B1 seat, task list /tmp/b1-batch40.txt) ───────
+    # tools/{artifacts,checkpoint,client_fs,dispatch,elicitation}.rs +
+    # tools/execution/{edit,glob}.rs + tools/execution/run_code/{bindings,
+    # ledger,protocol}.rs + tools/load_skill.rs — 30 survivors handled:
+    # 23 pinned + the seven true equivalences below (each hand-verified:
+    # mutation applied → whole target module green → byte-exact restore;
+    # logs in /tmp/b1-batch40/negctl/).
+    #
+    # run_code/ledger.rs :28:15 — the char-boundary back-off loop guard
+    # `while end > 0 && !text.is_char_boundary(end) { end -= 1; }` → `>=`.
+    # True equivalence on the usize domain, byte-for-byte the same shape as
+    # the tools/ledger.rs :51:19 entry above (batch 37): `end >= 0` is
+    # identically true, so the mutant reads `while
+    # !text.is_char_boundary(end)`; the spellings can only differ at
+    # `end == 0`, where `str::is_char_boundary(0)` is `true` by contract,
+    # so the loop stops on the same iteration as the original — no
+    # underflowing `end -= 1`, same `end`, same slice, on every input
+    # (`end` starts at `budget`, strictly below `text.len()` after the
+    # early return). The killable siblings on the same line (`> 0` → `==` /
+    # `<` skip the loop and slice mid-char; `&&` → `||` walks to 0) are
+    # killed by truncate_to_budget_keeps_a_utf8_safe_prefix.
+    "src/tools/execution/run_code/ledger\\.rs:28:15: replace > with >= in truncate_to_budget",
+    # bindings.rs :227:9 — `BindingTable::empty` body → `Default::default()`
+    # is the identity: BindingTable derives Default and its only field is a
+    # `Vec<String>`, so the derived impl is `Self { names: Vec::new() }` —
+    # the very expression `empty()` spells out. No input can tell the two
+    # spellings apart (same class as the runtime.rs builder() entry,
+    # batch 34). Guard pin (the empty contract): is_empty_tracks_whether_
+    # any_binding_was_registered. UNLOCK CONDITION: a manual Default impl
+    # or a second non-empty-defaulting field makes the mutant real — drop
+    # this entry then.
+    "src/tools/execution/run_code/bindings\\.rs:227:9: replace BindingTable::empty -> Self with Default::default\\(\\)",
+    # elicitation.rs :39:5 — `new_elicitation_slot` body →
+    # `Default::default()` is the identity: the body is
+    # `Arc::new(RwLock::new(None))` and every Default in that tower is
+    # structural — `Arc<T: Default>: default() = Arc::new(T::default())`,
+    # `RwLock<T: Default>: default() = RwLock::new(T::default())`,
+    # `Option<T>: default() = None`. Both spellings build a fresh
+    # single-strong-count Arc around an empty slot; nothing observable
+    # differs (same class as the bindings.rs entry above). UNLOCK
+    # CONDITION: a custom Default anywhere in the tower.
+    "src/tools/elicitation\\.rs:39:5: replace new_elicitation_slot -> SharedElicitationHandler with Default::default\\(\\)",
+    # dispatch.rs :305:5 — `new_shared_sandbox_roots` body →
+    # `Default::default()` is the identity, the same Default-tower argument
+    # as the elicitation.rs entry above:
+    # `Arc::new(RwLock::new(Vec::new()))` vs
+    # `Arc::new(RwLock::new(Vec::<_>::default()))` — `Vec::default()` IS
+    # `Vec::new()`. Fresh Arc, strong count 1, empty roots, capacity 0 on
+    # both sides. UNLOCK CONDITION: same as above.
+    "src/tools/dispatch\\.rs:305:5: replace new_shared_sandbox_roots -> SharedSandboxRoots with Default::default\\(\\)",
+    # edit.rs :173:37 `<` → `>` and :173:62 `chars[i + 1]` → `chars[i * 1]`
+    # in apply_curly_single's next_letter — both fold next_letter to a
+    # constant false (`i + 1 > chars.len()` is never true for i < len, so
+    # the && short-circuits; `chars[i * 1]` is the apostrophe itself, never
+    # alphabetic), and next_letter == false is behaviorally identical to
+    # the original on every input: when next_letter was true the original
+    # took `prev && next` → RIGHT_SINGLE, and the mutant falls to
+    # is_opening_context, whose matches! set (whitespace, brackets, dashes
+    # — no letters) is false after the alphabetic prev char, so also
+    # RIGHT_SINGLE; when next_letter was false both variants agree
+    # trivially. The panicking siblings on these expressions (`==`/`<=`
+    # index chars[len], `+`→`-` underflows) are killed by the existing
+    # apply_curly_single_* tests; the // cargo-mutants::skip comments on
+    # these lines document the equivalence class but are inert as
+    # comments. UNLOCK CONDITION: if is_opening_context ever admits an
+    # alphabetic char, or the branch structure changes, next_letter=false
+    # stops being equivalent — drop both entries and pin the weight.
+    "src/tools/execution/edit\\.rs:173:37: replace < with > in apply_curly_single",
+    "src/tools/execution/edit\\.rs:173:62: replace \\+ with \\* in apply_curly_single",
+    # load_skill.rs :387:19 — the char-copy boundary walk
+    # `while end < content.len() && !content.is_char_boundary(end)` → `<=`
+    # in substitute_skill_dir: `end` starts at `i + 1 ≤ len` (the caller
+    # loop guards `i < content.len()`) and only ever increments, so the
+    # guards differ only at end == content.len(), and a string's byte
+    # length is always a char boundary — `!is_char_boundary` is false
+    # there, so the mutant exits where the original does. Byte-for-byte
+    # the same shape as the session/index.rs :824:15 entry (batch 28). The
+    # killable siblings on the same line (`<` → `>` skips the back-off and
+    # slices mid-char, `&&` → `||` walks past len and panics, `+=` → `-=`/
+    # `/=`) are pinned by the substitute_skill_dir_* tests in load_skill.rs.
+    "src/tools/load_skill\\.rs:387:19: replace < with <= in substitute_skill_dir",
 ]

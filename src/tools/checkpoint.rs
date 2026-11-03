@@ -724,4 +724,65 @@ mod tests {
             "failed save must keep the accumulated paths"
         );
     }
+
+    /// `build_checkpoint_tools` is the production entry (the `_at` variant
+    /// exists only so tests can bypass the path resolution): it must open the
+    /// shadow repo through `paths::user_shadow_git_dir` — i.e. under
+    /// `RECURSIVE_HOME` — and hand back the read-only tool pair. Env- and
+    /// HOME-dependent, so the assertion runs in a child test process with
+    /// `RECURSIVE_HOME` injected via `Command::env` (no in-process `set_var`).
+    #[test]
+    fn build_checkpoint_tools_opens_the_shadow_repo_under_recursive_home() {
+        if !has_git() {
+            return;
+        }
+        let child_marker = "RECURSIVE_CHECKPOINT_BUILD_CHILD";
+        if std::env::var_os(child_marker).is_some() {
+            let home = std::path::PathBuf::from(
+                std::env::var_os("RECURSIVE_HOME").expect("child gets RECURSIVE_HOME"),
+            );
+            let ws = tempfile::tempdir().expect("workspace tempdir");
+            let (list, diff, repo) = build_checkpoint_tools(ws.path(), "s")
+                .expect("a workspace with git on PATH must get checkpoint tools");
+            assert_eq!(list.spec().name, "checkpoint_list");
+            assert_eq!(diff.spec().name, "checkpoint_diff");
+            let shadow = crate::paths::user_shadow_git_dir(ws.path()).unwrap();
+            assert!(
+                shadow.starts_with(&home),
+                "shadow dir {} must resolve under RECURSIVE_HOME {}",
+                shadow.display(),
+                home.display()
+            );
+            assert!(
+                shadow.is_dir(),
+                "open() must have created {}",
+                shadow.display()
+            );
+            drop(repo);
+            return;
+        }
+        let home = tempfile::tempdir().expect("home tempdir");
+        let exe = std::env::current_exe().expect("test exe path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "tools::checkpoint::tests::build_checkpoint_tools_opens_the_shadow_repo_under_recursive_home",
+                "--test-threads",
+                "1",
+            ])
+            .env(child_marker, "1")
+            .env("RECURSIVE_HOME", home.path())
+            .output()
+            .expect("spawn child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("1 passed"),
+            "child must run exactly this test, got: {stdout}"
+        );
+        assert!(
+            output.status.success(),
+            "child must build the checkpoint tools under RECURSIVE_HOME: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

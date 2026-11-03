@@ -505,4 +505,47 @@ mod tests {
         assert!(rendered.contains("sandbox: scratch=/tmp/run-code-1"));
         assert!(rendered.contains("sandbox: guards=rlimit_as=enforced(768MiB)"));
     }
+
+    /// Each V8 OOM signature is sufficient on its own — the message varies
+    /// by Node version, so a run must never need two of them at once — and
+    /// an unrelated crash is not an OOM.
+    #[test]
+    fn each_heap_oom_signature_is_detected_on_its_own() {
+        for sig in [
+            "JavaScript heap out of memory",
+            "Reached heap limit",
+            "Allocation failed",
+        ] {
+            assert!(
+                is_heap_oom(&format!("FATAL ERROR: {sig}")),
+                "{sig} alone must classify as heap OOM"
+            );
+        }
+        assert!(!is_heap_oom("Segmentation fault"));
+    }
+
+    /// The output block ends with exactly one newline before the value
+    /// header, whether or not the program's output already ended in one.
+    #[test]
+    fn render_ends_the_output_block_with_exactly_one_newline() {
+        for output in ["done\n", "done"] {
+            let report = RunReport {
+                failure: None,
+                exit_code: Some(0),
+                calls: 0,
+                duration_ms: 1,
+                output: output.into(),
+                output_bytes: output.len(),
+                output_truncated: false,
+                value: Some("1".into()),
+                detail: None,
+                sandbox: SandboxFacts::default(),
+            };
+            let rendered = report.render();
+            assert!(
+                rendered.contains("--- output ---\ndone\n--- value ---\n1\n"),
+                "output {output:?} rendered as:\n{rendered}"
+            );
+        }
+    }
 }

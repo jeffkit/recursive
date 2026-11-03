@@ -937,4 +937,51 @@ mod tests {
             "audit must carry the canonical name"
         );
     }
+
+    /// `record_touched` is the runtime's only signal that a turn ran a
+    /// shell: `Bash` must flip `saw_shell` (the pre/post snapshot-diff
+    /// attribution path) and nothing else may — a `Write` records its path
+    /// and leaves the flag off.
+    #[test]
+    fn record_touched_flags_a_shell_only_for_bash() {
+        let slot = Mutex::new(TouchedFiles::new());
+        record_touched(
+            "Write",
+            &serde_json::json!({"path": "notes.md", "contents": "x"}),
+            &slot,
+        );
+        {
+            let t = slot.lock().unwrap();
+            assert!(!t.saw_shell, "a Write is not a shell");
+            assert_eq!(t.paths_sorted(), vec!["notes.md".to_string()]);
+        }
+        record_touched("Bash", &serde_json::json!({"command": "ls"}), &slot);
+        let t = slot.lock().unwrap();
+        assert!(t.saw_shell, "Bash must mark the turn as having run a shell");
+        assert_eq!(
+            t.paths_sorted(),
+            vec!["notes.md".to_string()],
+            "Bash contributes no path of its own"
+        );
+    }
+
+    /// The permission preview is capped at 80 characters: a preview of
+    /// exactly 80 is shown verbatim, the 81st character tips it into the
+    /// 79-char head + `…` form (still 80 wide).
+    #[test]
+    fn args_preview_keeps_exactly_eighty_chars_and_truncates_the_eighty_first() {
+        let exact = serde_json::Value::String("a".repeat(78)); // JSON-quoted → 80 chars
+        let preview = args_preview_for_permission(&exact);
+        assert_eq!(preview, format!("\"{}\"", "a".repeat(78)));
+        assert_eq!(preview.chars().count(), 80);
+
+        let over = serde_json::Value::String("a".repeat(79)); // 81 chars
+        let preview = args_preview_for_permission(&over);
+        assert_eq!(
+            preview,
+            format!("\"{}…", "a".repeat(78)),
+            "the 81st char must be cut and replaced by the ellipsis"
+        );
+        assert_eq!(preview.chars().count(), 80);
+    }
 }

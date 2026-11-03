@@ -200,4 +200,18 @@ mod tests {
         assert!(ledger.is_truncated());
         assert!(ledger.is_empty());
     }
+
+    /// `limit` reports the budget the ledger was built with (the runner
+    /// prints it as the run's output budget fact), and `is_empty` flips as
+    /// soon as the first byte is retained.
+    #[test]
+    fn limit_and_is_empty_report_the_ledger_state() {
+        let mut ledger = OutputLedger::new(64);
+        assert_eq!(ledger.limit(), 64);
+        assert_eq!(OutputLedger::new(0).limit(), 0);
+        assert!(ledger.is_empty());
+        ledger.append("x");
+        assert!(!ledger.is_empty());
+        assert_eq!(ledger.len(), 1);
+    }
 }

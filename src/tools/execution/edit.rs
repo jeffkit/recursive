@@ -2068,4 +2068,109 @@ mod tests {
             "expected the UTF-8 message shape of read_to_string, got: {msg}"
         );
     }
+
+    /// The size guard is `>`: a file whose logical size is exactly
+    /// MAX_EDIT_FILE_SIZE is still within the limit. Sparse `set_len`
+    /// materialises the stat size without allocating, and the bytes come
+    /// from the memory transport, so nothing 1 GiB is ever read or written.
+    #[tokio::test]
+    async fn edit_allows_a_file_exactly_at_the_size_limit() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("edge.txt");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_EDIT_FILE_SIZE).unwrap();
+        drop(f);
+        let mem = Arc::new(MemTransport::default());
+        mem.put(&path, b"hello world\n");
+        let tool = EditTool::new(tmp.path()).with_transport(mem.clone() as Arc<dyn ToolTransport>);
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "edge.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .expect("a file exactly at MAX_EDIT_FILE_SIZE is inside the limit");
+        assert!(
+            result.contains("updated successfully"),
+            "edge-size edit must proceed, got: {result}"
+        );
+        assert_eq!(mem.get(&path).unwrap(), b"goodbye world\n");
+    }
+
+    /// Only a *missing* file is the new-file exemption in the size guard: a
+    /// stat that fails with any other kind must surface. Host-side, a path
+    /// that runs through a regular file (`leaf.txt/child.txt`) stats as
+    /// ENOTDIR; the memory transport would happily serve that virtual path,
+    /// so an over-broad exemption would turn this into a successful edit.
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows maps a path through a regular file to ERROR_PATH_NOT_FOUND = NotFound, which legitimately takes the new-file exemption; lift when a Windows non-NotFound metadata fixture exists"
+    )]
+    async fn edit_size_guard_surfaces_non_not_found_metadata_errors() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("leaf.txt"), "i am a file").unwrap();
+        let virt = tmp.path().join("leaf.txt").join("child.txt");
+        let mem = Arc::new(MemTransport::default());
+        mem.put(&virt, b"hello world\n");
+        let tool = EditTool::new(tmp.path()).with_transport(mem.clone() as Arc<dyn ToolTransport>);
+        let err = tool
+            .execute(serde_json::json!({
+                "file_path": "leaf.txt/child.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .expect_err("ENOTDIR on the host stat is not a missing file");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(&format!("{}: Not a directory", virt.display())),
+            "the stat error must surface verbatim, got: {msg}"
+        );
+        assert_eq!(
+            mem.get(&virt).unwrap(),
+            b"hello world\n",
+            "nothing may be written past a failed stat"
+        );
+    }
+
+    /// The late (post-read) staleness re-check fires only when the disk
+    /// mtime is strictly NEWER than the cached read: a cache stamped at the
+    /// same millisecond — or later than the disk — means nothing happened
+    /// after the read even if the cached text differs, so the edit proceeds.
+    #[tokio::test]
+    async fn edit_late_staleness_recheck_needs_a_strictly_newer_mtime() {
+        for (label, cached_offset) in [
+            ("same-millisecond cache", 0u64),
+            ("cache stamped in the future", 60_000),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("src.txt");
+            std::fs::write(&path, "hello world\n").unwrap();
+            let slot = make_slot();
+            slot.lock().unwrap().record(
+                path.clone(),
+                false,
+                "a different cached text\n".to_string(),
+                get_file_mtime(&path) + cached_offset,
+            );
+            let result = EditTool::new(tmp.path())
+                .with_read_state(slot)
+                .execute(serde_json::json!({
+                    "file_path": "src.txt",
+                    "old_string": "hello",
+                    "new_string": "goodbye"
+                }))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{label}: an mtime that is not strictly newer must not reject the edit: {e}")
+                });
+            assert!(
+                result.contains("updated successfully"),
+                "{label}: got: {result}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "goodbye world\n");
+        }
+    }
 }

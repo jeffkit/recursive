@@ -532,4 +532,43 @@ mod tests {
         let out = tool.execute(json!({})).await.unwrap();
         assert!(out.contains("restored-report"), "got: {out}");
     }
+
+    /// The metadata index is what a restarted process shows for an artifact,
+    /// so its creation stamp must be the wall clock, not a placeholder:
+    /// anything before 2020 means `now_secs()` was never really consulted.
+    #[tokio::test]
+    async fn put_stamps_created_at_from_the_wall_clock() {
+        let (backend, _dir) = backend_with_dir();
+        let store = ArtifactStore::new(backend);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let meta = store.put("body", "n", "w").await.unwrap();
+        assert!(
+            meta.created_at >= before.saturating_sub(1) && meta.created_at <= before + 60,
+            "created_at must be the current unix time (≈{before}), got {}",
+            meta.created_at
+        );
+    }
+
+    /// Bodies are keyed by artifact id under the artifact prefix, so two
+    /// artifacts never share a slot: each id loads its own body back, and the
+    /// raw storage key is `multi/artifacts/<id>` (what another backend or a
+    /// restarted process needs in order to find it).
+    #[tokio::test]
+    async fn each_artifact_body_is_stored_under_its_own_id_key() {
+        let (backend, _dir) = backend_with_dir();
+        let store = ArtifactStore::new(backend.clone());
+        let first = store.put("first body", "a", "w").await.unwrap();
+        let second = store.put("second body", "b", "w").await.unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(store.get(&first.id).await.unwrap(), "first body");
+        assert_eq!(store.get(&second.id).await.unwrap(), "second body");
+        let raw = backend
+            .load_memory(&format!("{ARTIFACT_KEY_PREFIX}{}", first.id))
+            .await
+            .unwrap();
+        assert_eq!(raw.as_deref(), Some("first body"));
+    }
 }

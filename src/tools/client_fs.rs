@@ -533,4 +533,121 @@ mod tests {
         assert!(!state.read_text_file);
         assert!(!state.write_text_file);
     }
+
+    // ── all_roots + fork_box (batch 40 pins) ────────────────────────
+
+    fn fork_state(fresh: Option<SharedSandboxRoots>) -> SessionToolState {
+        SessionToolState {
+            read_state: None,
+            bg_manager: Arc::new(tokio::sync::Mutex::new(
+                crate::tools::run_background::BackgroundJobManager::new(),
+            )),
+            session_roots: fresh,
+            deliverables: None,
+        }
+    }
+
+    /// The containment surface of `ClientReadFile` is its root list:
+    /// primary workspace first (ReadWrite), then the static extra roots,
+    /// then the live session slot — `resolve_within_any` walks them in
+    /// exactly that order.
+    #[test]
+    fn client_read_file_all_roots_lists_workspace_extras_then_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extra = tempfile::TempDir::new().unwrap();
+        let session = tempfile::TempDir::new().unwrap();
+        let slot = crate::tools::new_shared_sandbox_roots();
+        slot.write()
+            .unwrap()
+            .push((session.path().to_path_buf(), AccessTier::ReadWrite));
+        let tool = ClientReadFile::new(tmp.path())
+            .with_extra_roots([(extra.path().to_path_buf(), AccessTier::ReadOnly)])
+            .with_session_roots_opt(Some(slot));
+        assert_eq!(
+            tool.all_roots(),
+            vec![
+                (tmp.path().to_path_buf(), AccessTier::ReadWrite),
+                (extra.path().to_path_buf(), AccessTier::ReadOnly),
+                (session.path().to_path_buf(), AccessTier::ReadWrite),
+            ]
+        );
+    }
+
+    /// Same contract for `ClientWriteFile`.
+    #[test]
+    fn client_write_file_all_roots_lists_workspace_extras_then_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extra = tempfile::TempDir::new().unwrap();
+        let slot = crate::tools::new_shared_sandbox_roots();
+        slot.write()
+            .unwrap()
+            .push((extra.path().to_path_buf(), AccessTier::ReadOnly));
+        let tool = ClientWriteFile::new(tmp.path())
+            .with_extra_roots(Vec::new())
+            .with_session_roots_opt(Some(slot));
+        assert_eq!(
+            tool.all_roots(),
+            vec![
+                (tmp.path().to_path_buf(), AccessTier::ReadWrite),
+                (extra.path().to_path_buf(), AccessTier::ReadOnly),
+            ]
+        );
+    }
+
+    /// Goal 394: both client-fs tools hold a session-roots slot, so
+    /// `fork_box` must return a rewired clone — `None` would make
+    /// `fork_session` keep sharing the parent `Arc`. The clone shares the
+    /// ACP capability state (it answers like the same tool) while carrying
+    /// the fork's spec.
+    #[tokio::test]
+    async fn client_read_file_fork_box_returns_a_live_clone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp = Arc::new(Mutex::new(AcpClientFsState {
+            read_text_file: true,
+            write_text_file: false,
+        }));
+        let tool = ClientReadFile::new(tmp.path())
+            .with_acp_state(acp.clone())
+            .with_session_roots_opt(Some(crate::tools::new_shared_sandbox_roots()));
+        let forked = tool
+            .fork_box(&fork_state(Some(crate::tools::new_shared_sandbox_roots())))
+            .expect("ClientReadFile is session-stateful: fork_box must return a clone");
+        assert_eq!(forked.spec().name, "ClientReadFile");
+        // The clone keeps seeing the shared session capability state.
+        let out = forked
+            .execute(serde_json::json!({"uri": "file:///buffer.txt"}))
+            .await
+            .expect_err("no bridge wired yet — must fall through to the fallback error");
+        let msg = format!("{out}");
+        assert!(
+            msg.contains("fallback"),
+            "the fork must behave like the same ClientReadFile: {msg}"
+        );
+    }
+
+    /// Same fork contract for `ClientWriteFile`.
+    #[tokio::test]
+    async fn client_write_file_fork_box_returns_a_live_clone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp = Arc::new(Mutex::new(AcpClientFsState {
+            read_text_file: false,
+            write_text_file: true,
+        }));
+        let tool = ClientWriteFile::new(tmp.path())
+            .with_acp_state(acp.clone())
+            .with_session_roots_opt(Some(crate::tools::new_shared_sandbox_roots()));
+        let forked = tool
+            .fork_box(&fork_state(Some(crate::tools::new_shared_sandbox_roots())))
+            .expect("ClientWriteFile is session-stateful: fork_box must return a clone");
+        assert_eq!(forked.spec().name, "ClientWriteFile");
+        let inside = tmp.path().join("queued.txt");
+        let out = forked
+            .execute(serde_json::json!({
+                "file_path": inside.to_string_lossy(),
+                "content": "hello"
+            }))
+            .await
+            .expect("a path inside the workspace must be queued for the client");
+        assert!(out.contains("queued"), "got: {out}");
+    }
 }
