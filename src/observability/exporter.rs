@@ -435,4 +435,137 @@ mod tests {
         assert_eq!(otel.timestamp, time);
         assert_eq!(otel.attributes.len(), 1);
     }
+
+    /// The collector sink must actually ingest (issue #245 batch 38):
+    /// `emit -> ()` empties every run's observations while the wire test
+    /// below still passes — `records()` always contains the run's root
+    /// record, so the pin asserts the exact record count for one step.
+    #[tokio::test]
+    async fn collector_sink_ingests_one_event_into_one_record() {
+        let run = ActiveRun::start(
+            &RunMeta::new("sess", "model", "provider"),
+            &test_config("http://127.0.0.1:1/v1/traces"),
+        )
+        .expect("OTLP HTTP exporter must build");
+        run.sink()
+            .emit(AgentEvent::Latency {
+                step: 0,
+                llm_ms: 42,
+            })
+            .await;
+        assert_eq!(
+            run.collector.lock().expect("collector").records().len(),
+            2,
+            "root record + one ingested step, nothing more"
+        );
+    }
+
+    /// `queue` is idempotent by contract (returns `false` when the run
+    /// was already queued) — issue #245 batch 38: a `-> true` replacement
+    /// re-exports on every call and Drop, `-> false` never exports.
+    #[test]
+    fn queue_is_idempotent() {
+        // A real `queue()` leaves spans in the batch processor; on a
+        // current-thread runtime its shutdown waits for a task that can
+        // never be polled again (see `provider_flush`'s doc comment), so
+        // this test needs worker threads like the wire test below.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let run = ActiveRun::start(
+                &RunMeta::new("sess", "model", "provider"),
+                &test_config("http://127.0.0.1:1/v1/traces"),
+            )
+            .expect("OTLP HTTP exporter must build");
+            assert!(run.queue(), "the first queue call must proceed");
+            assert!(!run.queue(), "a second queue call must be a no-op");
+        });
+    }
+
+    /// `sample_draw` is a uniform draw in [0, 1) from subsecond nanos
+    /// (issue #245 batch 38): the `-> 0.0` replacement pins every run to
+    /// the boundary. 100 draws must spread — the pristine tree fails this
+    /// with probability 0.5^100.
+    #[test]
+    fn sample_draw_spans_the_unit_interval() {
+        let max = (0..100).map(|_| sample_draw()).fold(0.0f64, f64::max);
+        assert!(max > 0.5, "100 draws must exceed 0.5, max was {max}");
+    }
+
+    /// A run fed ONLY through its event sink must put its spans on the
+    /// wire by `finish` (issue #245 batch 38). `finish_delivers_…` cannot
+    /// see the queue/export/flush chain — it starts its probe span on the
+    /// tracer directly — so `queue -> true`, `export -> ()`,
+    /// `provider_flush -> ()` and `drain -> ()` all survived it.
+    #[test]
+    fn sink_fed_run_reaches_the_wire_before_finish_returns() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no export arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking client stream");
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).expect("read request");
+            tx.send(()).expect("signal the export was received");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .expect("write response");
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let run = ActiveRun::start(
+                &RunMeta::new("sess", "model", "provider"),
+                &test_config(&format!("http://{addr}/v1/traces")),
+            )
+            .expect("OTLP HTTP exporter must build");
+            run.sink()
+                .emit(AgentEvent::Latency {
+                    step: 0,
+                    llm_ms: 42,
+                })
+                .await;
+            run.finish(None, None).await;
+            // The POST must be on the wire while `run` is STILL ALIVE:
+            // `finish` has to force the processor via drain →
+            // provider_flush. A `drain -> ()` or `provider_flush -> ()`
+            // mutation defers the export to the provider's own
+            // Drop-shutdown, which only fires after this scope ends — and
+            // the batch processor's own 5 s schedule cannot beat the 2 s
+            // recv — so this wait goes red under either mutation. Blocking
+            // the block_on thread here is fine: the multi-thread runtime's
+            // workers drive the export POST on their own threads.
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("sink-fed export must be forced onto the wire by finish itself");
+        });
+        // Simulate the host returning from `main` (runtime shutdown).
+        drop(runtime);
+
+        let request = server.join().expect("server thread");
+        assert!(request.starts_with("POST "), "got: {request}");
+    }
 }

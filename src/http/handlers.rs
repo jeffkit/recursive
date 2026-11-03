@@ -5191,6 +5191,66 @@ mod tests {
         );
     }
 
+    /// The transcript-chars gauge sums the live sessions' transcripts
+    /// (issue #245 batch 38): `transcript_chars += …` mutated to `*=`
+    /// collapses to 0 (and `-=` underflows), so a session that completed
+    /// a turn must show a real, non-zero character count.
+    #[tokio::test]
+    async fn metrics_handler_counts_transcript_chars_of_a_live_session() {
+        use crate::llm::MockProvider;
+
+        std::env::set_var("RECURSIVE_API_KEY", "test-key");
+        std::env::set_var("RECURSIVE_MODEL", "test-model");
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_storage(dir.path());
+        let mut runtime = AgentRuntimeBuilder::new()
+            .llm(
+                Arc::new(MockProvider::new(vec![crate::llm::chat::Completion {
+                    content: "reply body".to_string(),
+                    tool_calls: Vec::new(),
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                    reasoning_content: None,
+                }])) as Arc<dyn crate::ChatProvider>,
+            )
+            .system_prompt("system")
+            .build()
+            .unwrap();
+        runtime.run("hello there").await.expect("one mock turn");
+        state.host.sessions().write().await.insert(
+            "transcript-probe".to_string(),
+            SessionState {
+                id: "transcript-probe".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                title: None,
+                owner: None,
+                tenant: None,
+                runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
+                plan_approval_gate: Arc::new(crate::tools::plan_mode::PlanApprovalGate::new()),
+                interrupt_token: Arc::new(tokio::sync::Mutex::new(None)),
+                non_system_message_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                last_active_ms: Arc::new(AtomicU64::new(0)),
+                usage: Arc::new(crate::http::SessionUsage::new("test-model")),
+                event_seq: Arc::new(AtomicU64::new(0)),
+                event_log: Arc::new(crate::http::SessionEventLog::new(
+                    crate::http::SESSION_EVENT_LOG_CAPACITY,
+                )),
+            },
+        );
+
+        let output = metrics_handler(State(state)).await;
+        let value: u64 = output
+            .lines()
+            .find(|l| l.starts_with("recursive_transcript_bytes_total"))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .expect("transcript_bytes_total gauge present");
+        assert!(
+            value > 0,
+            "a session with a completed turn must show non-zero transcript chars: {output}"
+        );
+    }
+
     /// Issue #123: minimal `AppState` for the readiness / metric-surface
     /// tests, mirroring `metrics_handler_includes_new_fields`.
     fn readyz_state(

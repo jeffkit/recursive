@@ -590,4 +590,42 @@ mod tests {
             vec![(vec!["circuit_breaker".to_string()], 1)]
         );
     }
+
+    /// The compaction counter arms of the sink (issue #245 batch 38): a
+    /// boundary must count once (the arm is not deletable), a zero-prune
+    /// microcompaction must NOT count (the `pruned > 0` guard mutated to
+    /// `==` miscounts the empty case), and a real prune counts.
+    #[tokio::test]
+    async fn sink_counts_boundaries_and_only_nonzero_microcompactions() {
+        let metrics = Arc::new(Metrics::default());
+        let sink = MetricsSink::new(metrics.clone());
+        sink.emit(AgentEvent::CompactionBoundary {
+            turn: 1,
+            compacted_count: 2,
+            summary_uuid: None,
+            cache_hit_tokens: 0,
+            cache_miss_tokens: 0,
+            is_recompaction_in_chain: false,
+            turns_since_previous_compact: 1,
+            previous_compact_turn: None,
+        })
+        .await;
+        sink.emit(AgentEvent::Microcompact { step: 1, pruned: 0 })
+            .await;
+        // Two zero-prunes on purpose: a single zero-prune plus a single
+        // real prune would land on the same `micro=1` total under the
+        // `>` → `==` mutation (only the counting emissions swap).
+        sink.emit(AgentEvent::Microcompact { step: 2, pruned: 0 })
+            .await;
+        sink.emit(AgentEvent::Microcompact { step: 3, pruned: 3 })
+            .await;
+        assert_eq!(
+            metrics.compactions.snapshot(),
+            vec![
+                (vec!["boundary".to_string()], 1),
+                (vec!["micro".to_string()], 1),
+            ],
+            "boundary counts once; the two pruned=0 must not; pruned=3 counts once"
+        );
+    }
 }

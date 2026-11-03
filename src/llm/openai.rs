@@ -3731,4 +3731,23 @@ data: [DONE]
             "each request must carry the credential value current at request time"
         );
     }
+
+    /// The OpenAI wrapper around the terminal give-up WARN (issue #245
+    /// batch 38): a `()` body replacement on this private wrapper
+    /// silences the retry loop's give-up observability while the
+    /// mod-level function itself stays pinned by
+    /// `warn_provider_giving_up_logs_status_and_request_id`.
+    #[test]
+    fn openai_giving_up_wrapper_emits_the_terminal_warn() {
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let _guard = tracing::subscriber::set_default(sub);
+        OpenAiProvider::warn_provider_giving_up("gpt-4o", Some(503), Some("req-openai-9"));
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("giving up (gpt-4o)") && l.contains("status=503")),
+            "the give-up WARN must carry label and status through the wrapper, got {lines:?}"
+        );
+    }
 }

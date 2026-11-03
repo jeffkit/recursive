@@ -2047,4 +2047,31 @@ mod wall_budget_tests {
             crate::agent::FinishReason::NoMoreToolCalls
         );
     }
+
+    /// `is_empty` must report the empty side too (issue #245 batch 38):
+    /// the populated side was already pinned by `shared_memory_keys`,
+    /// which is exactly why the `is_empty -> false` mutant survived it.
+    #[tokio::test]
+    async fn a_fresh_shared_memory_reports_empty() {
+        let mem = SharedMemory::new();
+        assert!(mem.is_empty().await, "a fresh memory is empty");
+        mem.set("k".into(), "v".into(), "a".into()).await;
+        assert!(!mem.is_empty().await);
+    }
+
+    /// `now_timestamp` stamps inter-agent messages with wall-clock
+    /// seconds (issue #245 batch 38): a `-> 0` body replacement ages
+    /// every message to the epoch — observable through the bus inbox.
+    #[tokio::test]
+    async fn task_messages_carry_wallclock_timestamps() {
+        let pool = AgentPool::new(Arc::new(MockProvider::new(vec![])), tests::test_config());
+        pool.send_task("planner", "coder", "go").await;
+        let inbox = pool.bus.inbox("coder").await;
+        assert_eq!(inbox.len(), 1, "fixture: one task message");
+        assert!(
+            inbox[0].timestamp > 0,
+            "a sent task must carry an epoch-second timestamp, got {}",
+            inbox[0].timestamp
+        );
+    }
 }

@@ -1743,4 +1743,65 @@ mod tests {
             change.diff
         );
     }
+
+    /// The maxFiles render budget is a strict `>` (issue #245 batch 38):
+    /// a `>=` mutation coarsens the budget-th file itself and flags
+    /// truncation on a change set that fits; an over-budget set must
+    /// still coarsen exactly the beyond-budget files and set `truncated`
+    /// (which also kills `==`/`<` drift on the same operator).
+    #[test]
+    fn render_budget_coarsens_only_beyond_max_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = Deliverables::new(
+            dir.path().join("ws"),
+            dir.path().join("state"),
+            Budgets {
+                max_files: 2,
+                ..Budgets::default()
+            },
+        )
+        .expect("ledger");
+
+        let change = |path: &str| FileChange {
+            path: path.to_string(),
+            status: ChangeStatus::Added,
+            bytes_before: None,
+            bytes_after: Some(3),
+            diff: "+x\n".to_string(),
+            coarse: false,
+            coarse_reason: None,
+        };
+
+        // Exactly at budget: nothing coarsened, nothing truncated.
+        let mut changes = TurnChanges {
+            added: vec![change("a"), change("b")],
+            ..TurnChanges::default()
+        };
+        d.apply_render_budget(&mut changes);
+        assert!(
+            changes
+                .added
+                .iter()
+                .all(|c| !c.coarse && !c.diff.is_empty()),
+            "every file at or under the budget keeps its diff: {changes:?}"
+        );
+        assert!(!changes.truncated, "a fitting set is not truncated");
+
+        // One beyond budget: the third coarsens, the flag flips.
+        let mut changes = TurnChanges {
+            added: vec![change("a"), change("b"), change("c")],
+            ..TurnChanges::default()
+        };
+        d.apply_render_budget(&mut changes);
+        assert_eq!(changes.added[0].diff, "+x\n");
+        assert!(!changes.added[0].coarse);
+        assert_eq!(changes.added[1].diff, "+x\n");
+        assert!(!changes.added[1].coarse);
+        assert!(changes.added[2].diff.is_empty() && changes.added[2].coarse);
+        assert_eq!(
+            changes.added[2].coarse_reason.as_deref(),
+            Some("beyond the maxFiles=2 render budget")
+        );
+        assert!(changes.truncated, "an over-budget set must be flagged");
+    }
 }

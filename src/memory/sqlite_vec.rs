@@ -696,4 +696,26 @@ mod tests {
         );
         assert_eq!(store.list_all().await.unwrap().len(), 1);
     }
+
+    /// Boundary family for `cosine_similarity` (issue #245 batch 38): the
+    /// length-mismatch and zero-magnitude guards are `||`-joined — a `&&`
+    /// mutation slips a mismatched-length pair through `zip` (silent
+    /// truncation) or a single zero magnitude through as `0/0 = NaN` —
+    /// and the `dot / (mag_a * mag_b)` quotient must not drift into the
+    /// `*`→`/`/`+` or `/`→`*`/`%` variants. All quadrants in one test.
+    #[test]
+    fn cosine_similarity_rejects_mismatched_and_degenerate_vectors() {
+        // Length mismatch must short-circuit to 0, not zip-truncate.
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+        // A single zero magnitude must short-circuit to 0, not divide 0/0.
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[0.0, 0.0]), 0.0);
+        // Unequal magnitudes pin the exact arithmetic: [1,1]·[2,0] = 2,
+        // mag_a = √2, mag_b = 2 → 1/√2. Every operator variant above moves
+        // this value far outside f32 epsilon.
+        let s = cosine_similarity(&[1.0, 1.0], &[2.0, 0.0]);
+        assert!(
+            (s - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5,
+            "cosine must be 1/√2, got {s}"
+        );
+    }
 }

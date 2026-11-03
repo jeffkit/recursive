@@ -822,4 +822,77 @@ mod tests {
         assert_ne!(a, webhook_signature("s2", "body"));
         assert_ne!(a, webhook_signature("s", "body2"));
     }
+
+    /// A non-2xx webhook response must be a delivery error (issue #245
+    /// batch 38): the `status.is_success()` match guard mutated to `true`
+    /// turns any status into success. A loopback 500 pins the refusal.
+    #[test]
+    fn non_success_webhook_status_is_a_delivery_error() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().expect("accept");
+            let _ = read_one_request(&stream);
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+                .expect("write 500");
+        });
+        let notifier = HttpNotifier::new();
+        let target = NotifyTarget::Webhook {
+            url: format!("http://{addr}/hook"),
+            secret: None,
+        };
+        let payload = NotifyPayload {
+            session_id: "s",
+            source: "test",
+            finish_reason: "ok",
+            final_text: None,
+        };
+        let err = dispatch_notify(&notifier, &target, &payload)
+            .expect_err("a 500 must not count as a delivery");
+        handle.join().expect("server thread");
+        match err {
+            NotifyTargetError::Delivery(msg) => {
+                assert!(
+                    msg.contains("500"),
+                    "the error must carry the status, got: {msg}"
+                );
+            }
+            other => panic!("expected a Delivery error, got {other:?}"),
+        }
+    }
+
+    /// `shared_notifier` returns ONE process-wide instance (its doc
+    /// contract: one client, one connection pool) — issue #245 batch 38.
+    /// The `Box::leak(Box::new(default))` replacement mints a fresh leak
+    /// per call; pointer identity is the observable.
+    #[test]
+    fn shared_notifier_is_actually_shared() {
+        let a: &'static HttpNotifier = shared_notifier();
+        let b: &'static HttpNotifier = shared_notifier();
+        assert!(
+            std::ptr::eq(a, b),
+            "repeated calls must return the same notifier instance"
+        );
+    }
+
+    /// `allowed_file_root` resolves under the pinned user data dir
+    /// (issue #245 batch 38): the `Default::default()` replacement
+    /// returns an empty path, against which no file target would ever be
+    /// admitted.
+    #[test]
+    fn allowed_file_root_lands_under_the_user_data_dir() {
+        // PinnedRecursiveHome takes the global env lock itself — do not
+        // take env_lock() here (double-lock = deadlock).
+        let home = tempfile::tempdir().expect("tempdir");
+        let _pin = crate::test_util::PinnedRecursiveHome::new(home.path());
+        let ws = tempfile::tempdir().expect("tempdir");
+        let root = allowed_file_root(ws.path());
+        assert!(
+            root.starts_with(home.path()),
+            "the file root must resolve under the user data dir, got {root:?}"
+        );
+        assert!(!root.as_os_str().is_empty());
+    }
 }

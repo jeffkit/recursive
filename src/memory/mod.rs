@@ -206,4 +206,43 @@ mod tests {
             "removed entry must be gone"
         );
     }
+
+    /// `embedding_from_env` must actually consult the process environment
+    /// (issue #245 batch 38): a `-> None` body replacement silently
+    /// disables vector embeddings. The env read happens in a fresh child
+    /// test process (key injected via `Command::env`) so no process
+    /// global is mutated and parallel tests never observe it.
+    #[test]
+    #[cfg(feature = "vector-memory")]
+    fn embedding_from_env_honours_an_injected_key() {
+        let child_marker = "RECURSIVE_EMBED_FROM_ENV_CHILD";
+        if std::env::var(child_marker).is_ok() {
+            assert!(
+                embedding_from_env().is_some(),
+                "an injected RECURSIVE_EMBEDDING_API_KEY must build an embedding provider"
+            );
+            return;
+        }
+        let exe = std::env::current_exe().expect("test exe path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "memory::tests::embedding_from_env_honours_an_injected_key",
+                "--test-threads",
+                "1",
+            ])
+            .env(child_marker, "1")
+            .env("RECURSIVE_EMBEDDING_API_KEY", "emb-injected-key")
+            .output()
+            .expect("spawn child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("1 passed"),
+            "child must run exactly this test, got: {stdout}"
+        );
+        assert!(
+            output.status.success(),
+            "child must see the provider from the injected env"
+        );
+    }
 }

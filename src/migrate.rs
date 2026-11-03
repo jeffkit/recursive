@@ -285,4 +285,46 @@ mod tests {
         assert_eq!(a, "aaa");
         assert_eq!(b, "bbb");
     }
+
+    /// A rename failure that is NOT EXDEV must surface as the rename
+    /// error (issue #245 batch 38): an `==` → `!=` on the EXDEV guard
+    /// treats every ordinary failure as a cross-device case and reports
+    /// it as a copy-across-mounts failure instead. A read-only migration
+    /// target forces EACCES deterministically; the source must survive
+    /// untouched either way.
+    #[test]
+    #[cfg(unix)] // read-only-dir EACCES fixture is a unix permission shape; no
+                 // portable deny mechanism exists on Windows — drop this gate
+                 // if one lands
+    fn rename_failure_surfaces_as_a_rename_error_not_a_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_home(|| {
+            let ws = tempfile::TempDir::new().unwrap();
+            let dotrec = ws.path().join(".recursive");
+            std::fs::create_dir_all(dotrec.join("sessions")).unwrap();
+            std::fs::write(dotrec.join("sessions/.meta.json"), "{}").unwrap();
+
+            let target = paths::user_workspace_dir(ws.path()).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let err = migrate_workspace(ws.path(), false)
+                .expect_err("a rename into a read-only target must fail");
+
+            // Restore before the tempdir drop so cleanup can recurse.
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let message = match err {
+                Error::Tool { message, .. } => message,
+                other => panic!("expected a Tool error, got {other:?}"),
+            };
+            assert!(
+                message.contains("rename"),
+                "the error must name the rename that failed, got: {message}"
+            );
+            // Nothing was silently copied away from the workspace.
+            assert!(dotrec.join("sessions/.meta.json").exists());
+        });
+    }
 }

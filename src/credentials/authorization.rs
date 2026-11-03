@@ -653,4 +653,13 @@ mod tests {
             "the registry debug view must name its flows: {text}"
         );
     }
+
+    /// The empty side of `is_registered` (issue #245 batch 38): the
+    /// registered side was already pinned by `one_flow_per_key_is_
+    /// enforced`, which is exactly why the `-> true` mutant survived.
+    #[test]
+    fn an_unregistered_key_is_not_registered() {
+        let registry = AuthorizationRegistry::new();
+        assert!(!registry.is_registered(&key("never-registered")));
+    }
 }

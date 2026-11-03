@@ -2134,4 +2134,59 @@ mod tests {
         reconcile_session_run_code(&mut resolved, None, &PresetEnv::default());
         assert!(resolved.tools.run_code, "no field → declaration rules");
     }
+
+    /// `parse_positive` must reject 0 (issue #245 batch 38): the `n > 0`
+    /// filter guard mutated to `>=` (or `==`) silently admits 0 as a
+    /// positive count, and `<` would reject 1. Both edges pinned.
+    #[test]
+    fn parse_positive_rejects_zero_and_keeps_positive() {
+        assert_eq!(parse_positive(Some("0")), None, "0 is not positive");
+        assert_eq!(parse_positive(Some("1")), Some(1));
+        assert_eq!(parse_positive(Some("12")), Some(12));
+        assert_eq!(parse_positive(None), None);
+        assert_eq!(parse_positive(Some("abc")), None);
+    }
+
+    /// The env-override WARN (issue #134) must fire exactly when the env
+    /// state DIFFERS from the session bit (issue #245 batch 38): a `!=`
+    /// → `==` mutation flips the warn into the agree case and silences
+    /// the divergence it exists to expose. Both quadrants pinned on the
+    /// log text via a recording subscriber.
+    #[test]
+    fn env_override_warn_fires_exactly_on_divergence() {
+        let config = config_for("preset-test-model");
+        let env_on = PresetEnv {
+            run_code: Some("1".to_string()),
+            ..PresetEnv::default()
+        };
+
+        // Divergent (session OFF, env ON): the WARN must appear.
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let _guard = tracing::subscriber::set_default(sub);
+        let mut resolved = STANDARD.resolve(&config, &PresetEnv::default());
+        reconcile_session_run_code(&mut resolved, Some(false), &env_on);
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("overrides")),
+            "env-over-session divergence must WARN"
+        );
+        drop(_guard);
+
+        // Agreeing (session ON, env ON): silent — no spurious WARN.
+        let (sub, lines) = crate::test_util::RecordingSubscriber::new();
+        let _guard = tracing::subscriber::set_default(sub);
+        let mut resolved = STANDARD_PTC.resolve(&config, &PresetEnv::default());
+        reconcile_session_run_code(&mut resolved, Some(true), &env_on);
+        assert!(
+            !lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("overrides")),
+            "an agreeing reconcile must stay silent"
+        );
+    }
 }

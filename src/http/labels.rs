@@ -456,4 +456,15 @@ mod tests {
             "a } b"
         );
     }
+
+    /// `is_empty` must distinguish the empty population (issue #245
+    /// batch 38): the `-> true` mutant survives every construction-site
+    /// test because none asserted the empty side.
+    #[test]
+    fn is_empty_reflects_the_population() {
+        let empty = OpaqueLabels::try_from_pairs(Vec::<(&str, &str)>::new())
+            .expect("empty labels are valid");
+        assert!(empty.is_empty());
+        assert!(!labels(&[("t", "v")]).is_empty());
+    }
 }

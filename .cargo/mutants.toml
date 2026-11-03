@@ -1376,4 +1376,23 @@ exclude_re = [
     # rewritten to step before testing the boundary, drop this entry — the
     # `>=` spelling then gains a real divergence at 0.
     "src/tools/ledger\\.rs:51:19: replace > with >= in ChangeLedgerTool::truncate",
+    # ── Issue #245 batch 38 (B1 seat), logging.rs — true equivalence ──────
+    # StderrOrNull::flush delegates to std::io::stderr().flush() in the
+    # non-quiet arm. std's Stderr is unbuffered (every write is handed to
+    # the OS immediately and the handle owns no intermediate buffer), so
+    # that flush is a no-op that always returns Ok — replacing the whole
+    # body with Ok(()) is observationally identical on every input (the
+    # TUI_QUIET arm already returned Ok(())). The writer wraps stderr
+    # directly, with no BufWriter/LineWriter layer of its own to flush.
+    # The `for .*StderrOrNull` qualification wildcard is load-bearing:
+    # exclude_re matches cargo-mutants' INTERNAL name, which renders the
+    # impl-block type with a module qualification the --list display line
+    # does not show (probe series /tmp/b1-batch38/exclude_probe.txt —
+    # the literal display spelling `<impl io::Write for StderrOrNull>`
+    # never matches, while `.*` before the type does).
+    # negctl: mutation applied → logging suite green with all pins
+    # (/tmp/b1-batch38/negctl/). UNLOCK CONDITION: if the writer ever
+    # gains a buffering layer (or delegates to a buffered handle), the
+    # flush gains a real observable effect — drop this entry and pin it.
+    "src/logging\\.rs:132:9: replace <impl io::Write for .*StderrOrNull>::flush -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]

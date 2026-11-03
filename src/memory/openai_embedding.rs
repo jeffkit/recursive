@@ -263,4 +263,93 @@ mod tests {
                 .expect("embed must return once the deadline fires");
         assert!(vector.is_empty(), "a failed embed must yield no vector");
     }
+
+    /// `from_env` must read the real process environment (issue #245
+    /// batch 38): the lookup-parameterised `from_lookup` tests never
+    /// touch `from_env` itself, so a `-> None` body replacement survived.
+    /// The assertion runs in a fresh child test process with the key
+    /// injected via `Command::env` — no process-global mutation.
+    #[test]
+    fn from_env_resolves_the_process_environment() {
+        let child_marker = "RECURSIVE_EMBED_FROM_ENV_CHILD";
+        if std::env::var(child_marker).is_ok() {
+            let e = OpenAiEmbedding::from_env().expect("the injected key must build a provider");
+            assert_eq!(e.api_key, "emb-injected-key");
+            return;
+        }
+        let exe = std::env::current_exe().expect("test exe path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "memory::openai_embedding::tests::from_env_resolves_the_process_environment",
+                "--test-threads",
+                "1",
+            ])
+            .env(child_marker, "1")
+            .env("RECURSIVE_EMBEDDING_API_KEY", "emb-injected-key")
+            .output()
+            .expect("spawn child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            stdout.contains("1 passed"),
+            "child must run exactly this test, got: {stdout}"
+        );
+        assert!(
+            output.status.success(),
+            "child must see the provider from the injected env"
+        );
+    }
+
+    /// A successful `/embeddings` round trip must yield the first data
+    /// vector (issue #245 batch 38): the dead-endpoint test pins only the
+    /// empty-failure side — an `embed -> vec![]` body replacement passes
+    /// it vacuously. A loopback HTTP responder pins the parse side.
+    #[tokio::test]
+    async fn embed_parses_the_first_data_vector_from_a_live_endpoint() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no embed request arrived"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = br#"{"data":[{"embedding":[0.25,-0.5,0.75]}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(body).expect("write body");
+            request.contains("/embeddings")
+        });
+
+        let embedding = OpenAiEmbedding::new(format!("http://{addr}"), "k", DEFAULT_MODEL);
+        let vector = embedding.embed("hello").await;
+        assert_eq!(
+            vector,
+            vec![0.25, -0.5, 0.75],
+            "the first data vector must come back"
+        );
+        assert!(
+            server.join().expect("server thread"),
+            "the POST must go to /embeddings"
+        );
+    }
 }
