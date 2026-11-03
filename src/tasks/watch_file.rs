@@ -252,4 +252,45 @@ mod tests {
         let got = m.poll_watch().expect("b has content from offset 0");
         assert!(got.contains("b-content"));
     }
+
+    #[test]
+    fn watch_file_is_deferred() {
+        // watch_file rides the deferred (name-only) channel — the model loads
+        // its full schema via ToolSearch. Forcing the flag off would eager-
+        // load the schema into every initial prompt.
+        let tmp = TempDir::new().unwrap();
+        assert!(WatchFile::new(tmp.path(), mgr()).is_deferred());
+    }
+
+    #[tokio::test]
+    async fn fork_rebinds_the_watch_target_to_the_session_slot() {
+        // Goal 394: a forked session must watch through ITS OWN bg-manager
+        // slot. `fork_box → None` would leave the fork pointing at the parent
+        // registry's manager, breaking the fork_session contract silently.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("events.log"), "existing\n").unwrap();
+        let parent = mgr();
+        let fork_slot = mgr();
+        let tool = WatchFile::new(tmp.path(), parent.clone());
+        let state = SessionToolState {
+            read_state: None,
+            bg_manager: fork_slot.clone(),
+            session_roots: None,
+            deliverables: None,
+        };
+
+        let forked = tool
+            .fork_box(&state)
+            .expect("watch_file must fork into the session slot");
+        let out = forked.execute(json!({"path": "events.log"})).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["initial_offset"], 9,
+            "the forked tool watches from the same semantics"
+        );
+        assert!(
+            !Arc::ptr_eq(&parent, &fork_slot),
+            "fixture: the fork slot must differ from the parent manager"
+        );
+    }
 }

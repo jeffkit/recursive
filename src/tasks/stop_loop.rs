@@ -120,4 +120,36 @@ mod tests {
         let tool = StopLoop::new("/tmp", mgr());
         assert!(tool.is_deferred());
     }
+
+    #[tokio::test]
+    async fn fork_rebinds_the_stop_target_to_the_session_slot() {
+        // Goal 394: stopping the loop inside a forked session must flip the
+        // fork's own loop control, never the parent's. `fork_box → None`
+        // would strand the fork on the parent registry's manager and the
+        // fork_session contract would silently degrade.
+        let parent = mgr();
+        let fork_slot = mgr();
+        let tool = StopLoop::new("/tmp", parent.clone());
+        let state = SessionToolState {
+            read_state: None,
+            bg_manager: fork_slot.clone(),
+            session_roots: None,
+            deliverables: None,
+        };
+
+        let forked = tool
+            .fork_box(&state)
+            .expect("stop_loop must fork into the session slot");
+        forked.execute(json!({})).await.unwrap();
+        assert_eq!(
+            fork_slot.lock().await.take_loop_control(),
+            Some(LoopControl::Stop),
+            "the fork's slot must receive the stop"
+        );
+        assert_eq!(
+            parent.lock().await.take_loop_control(),
+            None,
+            "the parent's manager must stay untouched"
+        );
+    }
 }

@@ -102,4 +102,37 @@ mod tests {
         }
         assert!(touched.lock().unwrap().is_empty());
     }
+
+    #[test]
+    fn partial_checkpoint_state_is_not_enabled() {
+        // `shadow.is_some() && session_id.is_some()` — a one-sided state must
+        // stay disabled: checkpoint tools need both the shadow repo and the
+        // session id. An `||` here would arm checkpointing with only one of
+        // the two halves.
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut only_shadow = CheckpointState::disabled();
+        only_shadow.shadow = Some(Arc::new(
+            ShadowRepo::open_at(ws.path().to_path_buf(), ws.path().join("shadow"))
+                .expect("open_at bypasses RECURSIVE_HOME and works on a plain tempdir"),
+        ));
+        assert!(
+            !only_shadow.enabled(),
+            "a shadow repo without a session id is not enough"
+        );
+
+        let mut only_session = CheckpointState::disabled();
+        only_session.session_id = Some("sess-b39".into());
+        assert!(
+            !only_session.enabled(),
+            "a session id without a shadow repo is not enough"
+        );
+
+        let mut both = CheckpointState::disabled();
+        both.shadow = only_shadow.shadow.take();
+        both.session_id = Some("sess-b39".into());
+        assert!(
+            both.enabled(),
+            "shadow + session id enables the checkpoint tools"
+        );
+    }
 }

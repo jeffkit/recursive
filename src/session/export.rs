@@ -456,4 +456,43 @@ mod tests {
             "cycle must be reported"
         );
     }
+
+    #[test]
+    fn manifest_kinds_classify_transcript_meta_and_attachments() {
+        // The manifest's `kind` column is the reader's contract for what each
+        // entry holds: dropping the `transcript.jsonl` or `.meta.json` match
+        // arm reclassifies them as attachments, which silently corrupts every
+        // consumer that dispatches on the kind.
+        let env = IsolatedWorkspace::new();
+        let session_id = write_session(env.path(), "kinds", "body");
+        let dir = SessionReader::list_sessions(env.path()).unwrap()[0].clone();
+        std::fs::write(dir.join("cost.json"), "{\"usd\":0}").unwrap();
+
+        let mut out = Vec::new();
+        let export = export_session_tree(env.path(), &session_id, &mut out).unwrap();
+
+        let kind_of = |suffix: &str| {
+            export
+                .entries
+                .iter()
+                .find(|e| e.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("entry {suffix} missing from the export"))
+                .kind
+        };
+        assert_eq!(
+            kind_of(TRANSCRIPT_FILE),
+            ExportKind::Transcript,
+            "transcript.jsonl must be classified Transcript"
+        );
+        assert_eq!(
+            kind_of(".meta.json"),
+            ExportKind::Meta,
+            ".meta.json must be classified Meta"
+        );
+        assert_eq!(
+            kind_of("cost.json"),
+            ExportKind::Attachment,
+            "a non-session file must stay Attachment"
+        );
+    }
 }

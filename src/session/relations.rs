@@ -448,4 +448,64 @@ mod tests {
         let session_id = index.sessions(10).unwrap()[0].session_id.clone();
         assert!(trace_event(&mut index, &session_id, 99).is_err());
     }
+
+    #[test]
+    fn second_marker_folds_forward_from_the_first_window() {
+        use crate::session::serialize::LoadedEntry;
+        // Two markers: the second window must start where the first one
+        // ended (`first_unfolded += replaced`). A `*=` makes the cursor
+        // stick at its previous value (0 * n == 0 for the first window) and
+        // the second marker would claim messages the first already folded.
+        let m = |body: &str| {
+            LoadedEntry::Message(Box::new(crate::session::TranscriptEntry {
+                uuid: String::new(),
+                parent_uuid: None,
+                source_tool_assistant_uuid: None,
+                id: body.into(),
+                parent_id: None,
+                role: "user".into(),
+                content: body.into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+                reasoning_content: None,
+                usage: None,
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                audit: None,
+                step: None,
+                is_compaction_summary: false,
+            }))
+        };
+        let history = vec![
+            m("m0"),
+            m("m1"),
+            m("m2"),
+            LoadedEntry::CompactBoundary {
+                turn: Some(1),
+                removed: 2,
+            },
+            m("m3"),
+            m("m4"),
+            LoadedEntry::CompactBoundary {
+                turn: Some(2),
+                removed: 1,
+            },
+        ];
+        let out = replacements(&history);
+        assert_eq!(
+            out.len(),
+            2,
+            "two non-zero markers → two replacement windows"
+        );
+        assert_eq!(out[0].first_replaced, 0);
+        assert_eq!(out[0].replaced, 2);
+        assert_eq!(out[0].summary_index, 3);
+        // The second marker folds exactly the one message the first window
+        // left unfolded (index 2), starting at the advanced cursor.
+        assert_eq!(
+            out[1].first_replaced, 2,
+            "the cursor must advance past the first window"
+        );
+        assert_eq!(out[1].replaced, 1);
+        assert_eq!(out[1].summary_index, 5);
+    }
 }

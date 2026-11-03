@@ -251,4 +251,40 @@ mod tests {
             "omitting 'block' must default to false (non-blocking)"
         );
     }
+
+    #[tokio::test]
+    async fn block_true_waits_out_a_running_task_until_it_finishes() {
+        // The blocking deadline is `now + timeout_ms`: a task that finishes
+        // well inside the budget must be waited out, not dropped. An inverted
+        // deadline (`now - timeout_ms`) is already expired and the call would
+        // return "(no new output)" while the task is still running.
+        let reg = Arc::new(TaskRegistry::new());
+        let (state, id) = TaskState::new("slow", "alpha", "r");
+        let task = reg.register(state).await;
+        let writer_reg = reg.clone();
+        let writer_task = task.clone();
+        let writer_id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            writer_reg
+                .append_output(&writer_id, "late-line".to_string())
+                .await;
+            writer_task.mark_completed("done".to_string()).await;
+        });
+
+        let tool = TaskOutputTool::new(reg.clone());
+        let out = tool
+            .execute(json!({
+                "task_id": id.to_string(),
+                "block": true,
+                "timeout_ms": 5_000
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("late-line"),
+            "a blocking call must wait for output that arrives inside the \
+             timeout budget, got: {out}"
+        );
+    }
 }

@@ -686,4 +686,24 @@ mod tests {
         let ok = reg.append_output(&ghost_id, "line".into()).await;
         assert!(!ok, "append_output must return false for missing task");
     }
+
+    #[tokio::test]
+    async fn forget_keeps_sibling_entries_in_list_order() {
+        // forget() drops the forgotten id from the insertion order but must
+        // keep its siblings: an inverted retain (`==`) would leave only the
+        // now-removed id in `order`, and task_list would go blind on every
+        // surviving task.
+        let reg = TaskRegistry::new();
+        let (first, a) = TaskState::new("first", "", "");
+        let (second, b) = TaskState::new("second", "", "");
+        let _ = reg.register(first).await;
+        let _ = reg.register(second).await;
+
+        assert!(reg.forget(&a).await);
+        let listed = reg.list().await;
+        assert_eq!(listed.len(), 1, "the surviving task must still be listed");
+        assert_eq!(listed[0].id, b, "…and it is the non-forgotten one");
+        assert!(reg.get(&b).await.is_some());
+        assert!(reg.get(&a).await.is_none());
+    }
 }

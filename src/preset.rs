@@ -2135,6 +2135,66 @@ mod tests {
         assert!(resolved.tools.run_code, "no field → declaration rules");
     }
 
+    /// The creation-time resolver: preset declaration + process env, wrapped
+    /// in `Some` — and `None` exactly when the preset cannot resolve. Every
+    /// arm is pinned because the stampers turn this straight into the
+    /// session's persisted `run_code` bit (issue #134 W2).
+    #[test]
+    fn effective_run_code_resolves_env_over_declaration_and_none_for_unknown() {
+        let _env = crate::test_util::env_lock();
+        let prev_preset = std::env::var_os(PRESET_ENV_VAR);
+        let prev_run_code = std::env::var_os(RUN_CODE_ENV);
+        struct RestoreEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                // SAFETY: env mutations run under the crate env lock (held
+                // for this whole test by `_env`).
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(PRESET_ENV_VAR, v),
+                        None => std::env::remove_var(PRESET_ENV_VAR),
+                    }
+                    match self.1.take() {
+                        Some(v) => std::env::set_var(RUN_CODE_ENV, v),
+                        None => std::env::remove_var(RUN_CODE_ENV),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(prev_preset, prev_run_code);
+        // SAFETY: under the crate env lock (see above).
+        unsafe {
+            std::env::remove_var(PRESET_ENV_VAR);
+            std::env::remove_var(RUN_CODE_ENV);
+        }
+
+        let config = config_for("preset-test-model");
+
+        let plain = effective_run_code(&config).expect("the default preset must resolve");
+        assert!(!plain, "default declaration resolves run_code off");
+
+        unsafe { std::env::set_var(RUN_CODE_ENV, "1") };
+        assert_eq!(
+            effective_run_code(&config),
+            Some(true),
+            "RECURSIVE_RUN_CODE=1 overrides the declaration"
+        );
+
+        unsafe { std::env::set_var(RUN_CODE_ENV, "off") };
+        assert_eq!(
+            effective_run_code(&config),
+            Some(false),
+            "the documented =off escape hatch resolves off"
+        );
+
+        unsafe { std::env::set_var(PRESET_ENV_VAR, "no-such-preset-b39") };
+        assert_eq!(
+            effective_run_code(&config),
+            None,
+            "an unknown preset cannot resolve — callers hard-fail on None"
+        );
+    }
+
     /// `parse_positive` must reject 0 (issue #245 batch 38): the `n > 0`
     /// filter guard mutated to `>=` (or `==`) silently admits 0 as a
     /// positive count, and `<` would reject 1. Both edges pinned.

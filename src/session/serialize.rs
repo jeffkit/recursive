@@ -240,4 +240,32 @@ mod tests {
         let msg = entry_to_message(e);
         assert_eq!(msg.content, "unique-payload-xyz");
     }
+
+    #[test]
+    fn compaction_summary_bit_round_trips_and_is_absent_when_false() {
+        // `is_false` drives `skip_serializing_if` on `is_compaction_summary`:
+        // true rows must carry the field (it IS the persisted g413 boundary —
+        // losing it on disk breaks the canonical rebuild), and false rows must
+        // omit it entirely (pre-g413 transcripts stay byte-compatible).
+        let mut marked = make_entry("user");
+        marked.is_compaction_summary = true;
+        let marked_json = serde_json::to_string(&marked).unwrap();
+        assert!(
+            marked_json.contains("is_compaction_summary"),
+            "a true boundary row serializes the marker: {marked_json}"
+        );
+        let round_tripped: TranscriptEntry = serde_json::from_str(&marked_json).unwrap();
+        assert!(
+            round_tripped.is_compaction_summary,
+            "the boundary bit must survive a write/read cycle"
+        );
+
+        let plain_json = serde_json::to_string(&make_entry("user")).unwrap();
+        assert!(
+            !plain_json.contains("is_compaction_summary"),
+            "a false row must omit the field entirely: {plain_json}"
+        );
+        let plain_round: TranscriptEntry = serde_json::from_str(&plain_json).unwrap();
+        assert!(!plain_round.is_compaction_summary);
+    }
 }

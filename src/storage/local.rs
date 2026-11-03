@@ -1365,4 +1365,125 @@ mod tests {
         );
         assert!(b.load_transcript("untouched").await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn purge_surfaces_non_not_found_sessions_dir_errors() {
+        // The `is_not_found` guard carves out ONLY the missing-sessions-dir
+        // case (nothing to reap). A dir behind an unsearchable parent fails
+        // metadata with PermissionDenied — that must surface as Err, not be
+        // classified as "missing" and reported as an empty reclaim (a
+        // silently swallowed retention failure).
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+
+        let (b, dir) = backend();
+        let sessions = dir.path().join(".recursive").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("old.jsonl"), "expired session data").unwrap();
+
+        // Make `.recursive` unsearchable: stat(sessions) now fails EACCES.
+        let dot_recursive = dir.path().join(".recursive");
+        let mut perm = std::fs::metadata(&dot_recursive).unwrap().permissions();
+        perm.set_mode(0o000);
+        std::fs::set_permissions(&dot_recursive, perm).unwrap();
+
+        struct RestorePerms(std::path::PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                if let Ok(meta) = std::fs::metadata(&self.0) {
+                    let mut p = meta.permissions();
+                    p.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&self.0, p);
+                }
+            }
+        }
+        let _restore = RestorePerms(dot_recursive.clone());
+
+        let cutoff = SystemTime::now() - Duration::from_secs(3600);
+        let err = b
+            .purge_sessions_older_than(cutoff, &HashSet::new())
+            .await
+            .expect_err("an unreadable sessions dir must fail the sweep");
+        assert!(matches!(err, Error::Storage { .. }), "got: {err:?}");
+        assert!(
+            err.to_string().contains("read sessions dir"),
+            "the error must name the dir that could not be read: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_sweep_namespaces_exactly_one_level() {
+        // Writers namespace exactly one level (`trigger-run/<uuid>.jsonl`),
+        // and the descent gate `depth == 0` enforces that. `depth + 1 →
+        // depth * 1` never increments, so the recursion re-arms at every
+        // level and would purge user files in deeper trees.
+        use std::time::{Duration, SystemTime};
+
+        let (b, dir) = backend();
+        let sessions = dir.path().join(".recursive").join("sessions");
+        let deep = sessions.join("trigger-run").join("nested").join("deeper");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("stray.jsonl"), "user data").unwrap();
+
+        // A legitimately-namespaced transcript IS reaped (proves the sweep
+        // ran at all), while the level-3 stray must survive it.
+        std::fs::write(sessions.join("trigger-run").join("real.jsonl"), "{}").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(90 * 86_400);
+        for path in [
+            deep.join("stray.jsonl"),
+            sessions.join("trigger-run").join("real.jsonl"),
+        ] {
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            drop(f);
+        }
+
+        let cutoff = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        let report = b
+            .purge_sessions_older_than(cutoff, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 1, "the namespaced transcript is reaped");
+        assert!(
+            deep.join("stray.jsonl").exists(),
+            "a level-3 transcript is outside the one-level namespace and must not be purged"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn classify_trailing_of_a_zero_length_device_is_absent() {
+        // /dev/null: metadata length is 0 but the fd is seekable, so the two
+        // operands of the `len == 0 || seek failed` guard can disagree. The
+        // length short-circuit must win — an `&&` would fall through to a
+        // failed 1-byte read and misclassify the device as Terminated.
+        // Platform note: the KILL lands on linux (null_lseek always
+        // succeeds → len==0 with a successful seek → the mutant falls
+        // through); macOS lseek fails on char devices so both spellings
+        // agree there. The ubuntu mutation gate is the platform that
+        // matters. A Windows twin would need the NUL device — unblock if a
+        // Windows mutation leg is ever added.
+        assert!(matches!(
+            classify_trailing(Path::new("/dev/null")).await,
+            Trailing::Absent
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn classify_trailing_of_a_directory_is_terminated() {
+        // A directory fd opens, stats non-zero, and seeks fine — but read(2)
+        // fails with EISDIR. The fail-closed contract classifies that as
+        // Terminated (the append itself surfaces any real error); an `&&`
+        // would fall through to the torn-fragment rewrite path.
+        // (unix: read on a dir fd fails EISDIR; unblock Windows via an
+        // ACL-denied file twin if a Windows mutation leg is added.)
+        let tmp = TempDir::new().unwrap();
+        assert!(matches!(
+            classify_trailing(tmp.path()).await,
+            Trailing::Terminated
+        ));
+    }
 }

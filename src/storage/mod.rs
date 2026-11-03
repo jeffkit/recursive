@@ -764,4 +764,32 @@ mod tests {
             }
         );
     }
+
+    #[tokio::test]
+    async fn memory_round_trip_rejects_a_backend_that_returns_stale_bytes() {
+        // The probe exists to catch a backend that accepts a write and then
+        // loses it (/readyz, doctor --probe): the read-back must equal the
+        // written value. A `read == value` guard forced `true` would
+        // green-light any stale read-back and the health check would report
+        // healthy — the write is silently dropped, the key still holds an
+        // older process's bytes.
+        let mut b = ProbeBackend::default();
+        b.stored.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            "probe".to_string(),
+            "stale-from-an-earlier-process".to_string(),
+        );
+        b.drop_writes = true;
+
+        let err = memory_round_trip(&b, "probe", "fresh-value")
+            .await
+            .expect_err("a stale read-back must fail the probe");
+        assert!(
+            matches!(err, crate::error::Error::Storage { .. }),
+            "got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("round-trip mismatch"),
+            "the error must name the mismatch, carrying both values: {err}"
+        );
+    }
 }

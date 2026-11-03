@@ -1376,23 +1376,73 @@ exclude_re = [
     # rewritten to step before testing the boundary, drop this entry — the
     # `>=` spelling then gains a real divergence at 0.
     "src/tools/ledger\\.rs:51:19: replace > with >= in ChangeLedgerTool::truncate",
-    # ── Issue #245 batch 38 (B1 seat), logging.rs — true equivalence ──────
-    # StderrOrNull::flush delegates to std::io::stderr().flush() in the
-    # non-quiet arm. std's Stderr is unbuffered (every write is handed to
-    # the OS immediately and the handle owns no intermediate buffer), so
-    # that flush is a no-op that always returns Ok — replacing the whole
-    # body with Ok(()) is observationally identical on every input (the
-    # TUI_QUIET arm already returned Ok(())). The writer wraps stderr
-    # directly, with no BufWriter/LineWriter layer of its own to flush.
-    # The `for .*StderrOrNull` qualification wildcard is load-bearing:
-    # exclude_re matches cargo-mutants' INTERNAL name, which renders the
-    # impl-block type with a module qualification the --list display line
-    # does not show (probe series /tmp/b1-batch38/exclude_probe.txt —
-    # the literal display spelling `<impl io::Write for StderrOrNull>`
-    # never matches, while `.*` before the type does).
-    # negctl: mutation applied → logging suite green with all pins
-    # (/tmp/b1-batch38/negctl/). UNLOCK CONDITION: if the writer ever
-    # gains a buffering layer (or delegates to a buffered handle), the
-    # flush gains a real observable effect — drop this entry and pin it.
-    "src/logging\\.rs:132:9: replace <impl io::Write for .*StderrOrNull>::flush -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # ── Issue #245 batch 39 (B2 seat, task list /tmp/b2-batch39.txt) ───────
+    # session/mod.rs :431:16 — `workspace_slug` truncate-boundary guard
+    # `if s.len() > 80`. The `>= 80` spelling differs only at exactly 80
+    # bytes, where the branch body calls `truncate_str(&s, 80)` and
+    # truncate_str returns the input untouched when `s.len() <= max_bytes`
+    # (src/lib.rs :187) — so the mutant is the identity at 80 and
+    # unreachable below 80. Same true-equivalence class as the documented
+    # usize skip on rewind_to_char_boundary (src/lib.rs). The reachable
+    # siblings on the same line (`> 80` → `== 80` / `< 80` skip truncation
+    # for over-cap slugs) are killed by the existing workspace_slug
+    # truncation tests.
+    # UNLOCK CONDITION: if truncate_str ever grows an ellipsis, or the cap
+    # constant diverges from the guard constant, `>=` gains a real
+    # divergence at exactly-80 — drop this entry and pin.
+    "src/session/mod\\.rs:431:16: replace > with >= in workspace_slug",
+    # session/serialize.rs :131:9 — deleting the `"user" => Role::User` arm
+    # in entry_to_message makes `"user"` fall to the trailing wildcard
+    # `_ => Role::User`, which maps the same strings to the same variant.
+    # True equivalent by construction (arm and wildcard are identical).
+    # The informative arms ("system"/"assistant"/"tool") are distinct and
+    # covered by the entry_to_message role tests already in place.
+    "src/session/serialize\\.rs:131:9: delete match arm \"user\" in entry_to_message",
+    # storage/mod.rs :159:9 — the trait-default `purge_expired_sessions`
+    # body is already `Ok(ReclaimReport::default())`; the
+    # `Ok(Default::default())` rewrite is byte-identical semantics
+    # (ReclaimReport derives Default). True equivalent. The
+    # LocalStorageBackend override that actually reaps is killed through
+    # the purge_* suite in storage/local.rs.
+    "src/storage/mod\\.rs:159:9: replace StorageBackend::purge_expired_sessions -> Result<ReclaimReport> with Ok\\(Default::default\\(\\)\\)",
+    # tool_set_provider.rs :99:9 — `LocalToolSetProvider::sandbox_mode`
+    # returns `SandboxMode::None`, which is the `#[default]` variant of the
+    # enum, so the `Default::default()` rewrite is value-identical. True
+    # equivalent. (SandboxMode::parse_name / from_env cover the
+    # non-default variants.)
+    "src/tool_set_provider\\.rs:99:9: replace <impl ToolSetProvider for LocalToolSetProvider>::sandbox_mode -> SandboxMode with Default::default\\(\\)",
+    # process.rs :556:5 — `signal_group` `#[cfg(not(unix))]` twin
+    # (body `false`, :555-:557). Same cfg-blind class as the runner.rs
+    # :562:5/:638:5 twins above: the ubuntu mutation gate never compiles
+    # this body, so the `true` rewrite builds byte-identical to the
+    # baseline and reports MISSED whatever any unix test asserts. The unix
+    # twin at :520:5 (`true` / `false` returns) is killed through
+    # kill_group by signal_group_warns_and_skips_unusable_pids and the
+    # killpg mutation guard in the same file. Drop this entry if a Windows
+    # mutation leg is ever added.
+    "src/process\\.rs:556:5: replace signal_group -> bool with true",
+    # session/lifecycle.rs :244:23 — the `AlreadyExists` guard on the
+    # exclusive create in SessionLock::acquire forced `true`. On every
+    # sequentially reachable input the two spellings converge on the same
+    # observable outcome:
+    #   * sentinel file exists → the create fails EEXIST **before any
+    #     permission is consulted** (O_EXCL existence check), so the arm
+    #     matches either way and both spellings run the same sentinel
+    #     read/steal/busy logic below (empirically confirmed: a 0555 dir
+    #     with a live sentinel yields SessionLockBusy on the pristine tree).
+    #   * no sentinel + the create fails for environmental causes (EACCES /
+    #     EROFS / unsearchable dir) → the mutant falls through, but the
+    #     subsequent `read_to_string` and `fs::write` hit the *same* cause
+    #     on the same path, and `Err(e) => return Err(e)` (pristine) and the
+    #     `write` `?` (mutant) surface the same errno and message.
+    #   * the only divergence — a live-parseable sentinel read after a
+    #     non-EEXIST create failure — requires the permission state to
+    #     flip inside acquire's window (create denied, read allowed), a
+    #     TOCTOU race the sequential contract does not cover.
+    # The sibling `guard → false` on the same line is killed by every
+    # acquire test (AlreadyExists would always error and no lock could
+    # ever be taken). UNLOCK CONDITION: if acquire ever gains a WARN on
+    # the recoverable path or a typed error for the open failure, the two
+    # spellings diverge observably — drop this entry and pin.
+    "src/session/lifecycle\\.rs:244:23: replace match guard e\\.kind\\(\\) == std::io::ErrorKind::AlreadyExists with true in SessionLock::acquire",
 ]

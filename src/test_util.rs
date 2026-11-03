@@ -463,3 +463,109 @@ impl tracing::Subscriber for RecordingSubscriber {
 
     fn exit(&self, _span: &tracing::Id) {}
 }
+
+/// Pins for the pin-helpers themselves: every guard above must undo its env
+/// mutation on Drop, or one test's isolation would leak into every test that
+/// runs after it in the same process.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn var(name: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(name)
+    }
+
+    #[test]
+    fn pinned_recursive_home_no_lock_restores_previous_value_on_drop() {
+        let _env = env_lock();
+        let prev = var("RECURSIVE_HOME");
+        let pin = PinnedRecursiveHomeNoLock::new("/tmp/b39-nolock-home", &_env);
+        assert_eq!(
+            var("RECURSIVE_HOME"),
+            Some(std::ffi::OsString::from("/tmp/b39-nolock-home")),
+            "fixture: the pin must take effect immediately"
+        );
+        drop(pin);
+        assert_eq!(
+            var("RECURSIVE_HOME"),
+            prev,
+            "drop must restore the pre-pin value exactly (whole test runs under the env lock)"
+        );
+    }
+
+    #[test]
+    fn pinned_recursive_home_unpins_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let _pin = PinnedRecursiveHome::new(tmp.path());
+            assert_eq!(
+                var("RECURSIVE_HOME").as_deref(),
+                Some(tmp.path().as_os_str()),
+                "while the guard lives, RECURSIVE_HOME points at the pin (env lock held by the guard)"
+            );
+        }
+        assert_ne!(
+            var("RECURSIVE_HOME").as_deref(),
+            Some(tmp.path().as_os_str()),
+            "after the guard drops, RECURSIVE_HOME must not stay pointed at the pin"
+        );
+    }
+
+    #[test]
+    fn pinned_home_unpins_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let _pin = PinnedHome::new(tmp.path());
+            assert_eq!(
+                var("HOME").as_deref(),
+                Some(tmp.path().as_os_str()),
+                "while the guard lives, HOME points at the pin"
+            );
+        }
+        assert_ne!(
+            var("HOME").as_deref(),
+            Some(tmp.path().as_os_str()),
+            "after the guard drops, HOME must not stay pointed at the pin"
+        );
+    }
+
+    #[test]
+    fn pinned_teams_dir_unpins_on_drop() {
+        let pin = PinnedTeamsDir::new();
+        let pinned_path = pin.path().to_path_buf();
+        assert_eq!(
+            var("RECURSIVE_TEAMS_DIR").as_deref(),
+            Some(pinned_path.as_os_str()),
+            "while the guard lives, RECURSIVE_TEAMS_DIR points at the pinned tempdir"
+        );
+        drop(pin);
+        assert_ne!(
+            var("RECURSIVE_TEAMS_DIR").as_deref(),
+            Some(pinned_path.as_os_str()),
+            "after the guard drops, RECURSIVE_TEAMS_DIR must not stay pointed at the pin"
+        );
+    }
+
+    #[test]
+    fn session_env_pins_unpin_on_drop() {
+        let home = TempDir::new().unwrap();
+        let pin = SessionEnvPins::new(home.path());
+        assert_eq!(
+            var("RECURSIVE_HOME").as_deref(),
+            Some(home.path().as_os_str()),
+            "while the pins live, RECURSIVE_HOME points at the bundle's home"
+        );
+        assert_eq!(
+            var("RECURSIVE_SESSIONS_DIR").as_deref(),
+            Some(home.path().join("sessions").as_os_str()),
+            "…and RECURSIVE_SESSIONS_DIR is pinned inside it"
+        );
+        drop(pin);
+        assert_ne!(
+            var("RECURSIVE_HOME").as_deref(),
+            Some(home.path().as_os_str()),
+            "after the bundle drops, RECURSIVE_HOME must not stay pointed at it"
+        );
+    }
+}
