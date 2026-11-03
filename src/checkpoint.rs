@@ -1808,6 +1808,9 @@ mod tests {
         );
     }
 
+    /// Env-var name shared by the unix-gated git shim and its
+    /// tolerated-failure test below; unix-only like both of its users.
+    #[cfg(unix)]
     const SILENT_ADD_GIT_DIR_VAR: &str = "RECURSIVE_CHECKPOINT_TEST_SILENT_ADD_GIT_DIR";
 
     /// A `git` shim, first on PATH for the duration of one test: `add`

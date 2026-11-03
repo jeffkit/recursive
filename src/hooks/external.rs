@@ -2571,6 +2571,8 @@ mod tests {
 
     /// Run `run_hook` for a command hook and return the log lines captured
     /// while it ran. Uses a real `/bin/true` command — cheap, no output.
+    /// unix-only like its only caller (the `#[cfg(unix)]` fail-mode pin).
+    #[cfg(unix)]
     async fn run_hook_capture_log(
         fail_mode: Option<HookFailMode>,
         event: HookEvent,

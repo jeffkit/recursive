@@ -5712,7 +5712,9 @@ done
     }
 
     /// Opt-in switch for `session_new_sandbox_strict_child` (see the
-    /// `sandbox_common_root` doc above).
+    /// `sandbox_common_root` doc above). unix-only: both of its users (the
+    /// child test and the parent spawner) are `#[cfg(unix)]`.
+    #[cfg(unix)]
     const ACP_SANDBOX_STRICT_CHILD: &str = "RECURSIVE_ACP_SANDBOX_STRICT_CHILD";
 
     /// Child half of `session_new_sandbox_strict_refusal_is_pinned_in_a_child_process`;
