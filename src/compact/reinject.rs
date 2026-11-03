@@ -1193,7 +1193,11 @@ mod tests {
             ..FileReinjector::new(state)
         };
         let msgs = r.reinject(&[]);
-        assert_eq!(msgs.len(), 2, "budget 300 admits exactly the first two files (third cumulative 308 > 300)");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "budget 300 admits exactly the first two files (third cumulative 308 > 300)"
+        );
     }
 
     #[test]
