@@ -1173,20 +1173,27 @@ mod tests {
     #[test]
     fn reinject_budget_walk_is_additive_and_strict() {
         // Kills :108 `+→*` / :111:28 `+=→*`: per-file tokens must add one
-        // (400/4+1 = 101) and tokens_used must accumulate additively. With
-        // budget 200 the second file (100 tokens) exceeds 101+100=201 →
-        // exactly one message. Multiplicative variants never exhaust the
-        // budget → two messages.
+        // (400/4+1 = 101) and tokens_used must accumulate additively across
+        // the walk. Three files (101/100/107-token estimates incl. the
+        // two-char name delta), budget 500: original admits all three (101; 201; 308 ≤ 500 → three
+        // messages). Multiplicative accumulation explodes the
+        // running total (10100 after the first file) → later files are
+        // refused → fewer than three messages.
         let big = "A".repeat(400);
         let body2 = "A".repeat(396);
-        let state = make_state_with(vec![("one.rs", &big), ("two.rs", &body2)]);
+        let body3 = "A".repeat(424);
+        let state = make_state_with(vec![
+            ("one.rs", &big),
+            ("two.rs", &body2),
+            ("three.rs", &body3),
+        ]);
         let r = FileReinjector {
-            token_budget: 200,
+            token_budget: 300,
             per_file_budget: 5000,
             ..FileReinjector::new(state)
         };
         let msgs = r.reinject(&[]);
-        assert_eq!(msgs.len(), 1, "budget 200 must fit only the first file");
+        assert_eq!(msgs.len(), 2, "budget 300 admits exactly the first two files (third cumulative 308 > 300)");
     }
 
     #[test]
