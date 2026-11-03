@@ -1856,6 +1856,9 @@ return process.cwd();"#
     /// The production hook (see the `#[cfg(test)]` block inside
     /// `scratch_volume_free_bytes`): the pinned value replaces the statfs
     /// probe's answer.
+    // unix-only（#230 家族）：唯一调用点在 cfg(unix) 的 statfs 探针内
+    // （windows 走 cfg(not(unix)) stub，恒 None、从不接 seam，#224）。
+    #[cfg(unix)]
     pub(crate) fn free_space_test_override() -> Option<u64> {
         FREE_SPACE_OVERRIDE.with(std::cell::Cell::get)
     }

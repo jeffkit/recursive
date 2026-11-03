@@ -495,9 +495,13 @@ mod tests {
 
     /// Append-only shared sink the capture subscriber formats into
     /// (same harness as `checkpoint.rs` / `config_file.rs`).
+    // unix-only（#230 家族）：唯一使用者是下方 cfg(unix) 门控测试，windows
+    // clippy --all-targets 下不门控即 never-used。
+    #[cfg(unix)]
     #[derive(Clone)]
     struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
+    #[cfg(unix)]
     impl std::io::Write for LogCapture {
         fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -514,6 +518,7 @@ mod tests {
     /// Run `f` with a thread-local WARN-level tracing subscriber and return
     /// `(f's result, everything it formatted)` — parallel-safe, no
     /// process-global subscriber, no env mutation.
+    #[cfg(unix)]
     fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
         let sink = buffer.clone();
