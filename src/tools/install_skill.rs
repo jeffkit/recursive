@@ -1412,4 +1412,237 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    // ── Cap arithmetic & boundary pins ───────────────────────────────────
+
+    /// The decompression caps are pure arithmetic consts; pin their documented
+    /// magnitudes (module doc: 8 MiB per entry, 64 MiB per archive) literally.
+    /// An operator flip (`*`→`+`/`/`) silently collapses or shifts the cap
+    /// while still compiling — the zip-bomb guard would enforce the wrong
+    /// number.
+    #[test]
+    fn archive_caps_keep_their_documented_magnitudes() {
+        assert_eq!(MAX_ENTRY_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MAX_TOTAL_UNCOMPRESSED_BYTES, 64 * 1024 * 1024);
+    }
+
+    /// The entry and archive caps are strict `>` bounds: an entry whose
+    /// declared size AND produced bytes sit exactly at the entry cap, and an
+    /// archive whose accumulated total sits exactly at the archive cap, are
+    /// admitted. `==`/`>=` mutants would reject the very archives they claim
+    /// to allow.
+    #[test]
+    fn zip_entry_exactly_at_the_entry_cap_is_admitted() {
+        let big = "x".repeat(1024);
+        let data = make_zip(&[("a/SKILL.md", big.as_str())]);
+        let limits = ArchiveLimits {
+            max_entry: 1024,
+            max_total: 10_000,
+        };
+        let files = InstallSkill::parse_zip_with_limits(&data, limits)
+            .expect("an entry exactly at the cap must be admitted");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 1024);
+        assert_eq!(files[0].content, big);
+    }
+
+    #[test]
+    fn archive_total_exactly_at_the_total_cap_is_admitted() {
+        let data = make_zip(&[
+            ("a/SKILL.md", &"a".repeat(900)),
+            ("a/notes.md", &"b".repeat(900)),
+        ]);
+        // Each entry fits under max_entry; together they add up to exactly
+        // max_total.
+        let limits = ArchiveLimits {
+            max_entry: 1024,
+            max_total: 1800,
+        };
+        let files = InstallSkill::parse_zip_with_limits(&data, limits)
+            .expect("an archive exactly at the total cap must be admitted");
+        assert_eq!(files.len(), 2);
+    }
+
+    // ── Version whitelist / digest pins ──────────────────────────────────
+
+    /// Dashes and underscores are legal version characters (`1-2_beta.3`);
+    /// a poisoned whitelist would strand every such version's CDN fallback.
+    #[test]
+    fn safe_version_admits_dashes_and_underscores() {
+        assert!(InstallSkill::is_safe_version("1-2_beta.3"));
+        assert!(InstallSkill::is_safe_version("0.9.9-rc_1"));
+        assert!(!InstallSkill::is_safe_version("1.0 0"));
+        assert!(!InstallSkill::is_safe_version(""));
+    }
+
+    /// `normalize_sha256` requires exactly 64 hex characters: a short, an
+    /// overlong, or a non-hex digest is None — a short all-hex string must
+    /// not sneak through as a pin.
+    #[test]
+    fn normalize_sha256_requires_exactly_64_hex() {
+        assert_eq!(InstallSkill::normalize_sha256(&"ab".repeat(31)), None);
+        assert_eq!(
+            InstallSkill::normalize_sha256(&"AB".repeat(32)),
+            Some("ab".repeat(32)),
+            "a 64-hex digest is accepted and lowercased"
+        );
+        assert_eq!(InstallSkill::normalize_sha256(&"g".repeat(64)), None);
+        assert_eq!(InstallSkill::normalize_sha256(&"ab".repeat(33)), None);
+    }
+
+    /// Two digest sources that agree resolve without a conflict; disagreeing
+    /// ones are a hard error naming the conflict.
+    #[test]
+    fn resolve_expected_sha256_accepts_agreeing_and_rejects_conflicting_sources() {
+        let _env = EnvVarGuard::set("RECURSIVE_SKILL_SHA256", None);
+        let d1 = "ab".repeat(32);
+        let d2 = "cd".repeat(32);
+        let got = InstallSkill::resolve_expected_sha256("s", Some(&d1), Some(&d1))
+            .expect("agreeing sources must resolve");
+        assert_eq!(got, d1);
+        let err = InstallSkill::resolve_expected_sha256("s", Some(&d1), Some(&d2))
+            .expect_err("conflicting sources must fail closed");
+        assert!(err.to_string().contains("conflicting"), "unexpected: {err}");
+    }
+
+    // ── Network-path pins ────────────────────────────────────────────────
+
+    /// Stub resolver answering every name with a closed loopback port: no
+    /// real DNS, no proxy, no network.
+    struct BlackholeSource;
+
+    impl crate::tools::url_guard::AddrSource for BlackholeSource {
+        fn lookup(&self, _host: &str) -> crate::tools::url_guard::LookupFuture {
+            Box::pin(async move { Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], 1))]) })
+        }
+    }
+
+    /// `search` must surface request failures: against a resolver that maps
+    /// the fixed host to a refused loopback port the call errors naming the
+    /// host — a body replacement returning `Ok(vec![])` would read every
+    /// outage as "no skills found".
+    #[tokio::test]
+    async fn search_surfaces_request_failures() {
+        let resolver =
+            crate::tools::url_guard::GuardedResolver::with_source(Arc::new(BlackholeSource), true);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(2))
+            .no_proxy()
+            .dns_resolver(Arc::new(resolver))
+            .build()
+            .expect("test client builds");
+        let err = match InstallSkill::search(&client, "pdf").await {
+            Ok(items) => panic!(
+                "a refused connection must be an error, got {} items",
+                items.len()
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("api.skillhub.cn"),
+            "error must name the fixed host: {err}"
+        );
+    }
+
+    /// The declared-length and streamed caps are strict `>` bounds on both
+    /// paths: under the cap is admitted, exactly at the cap is admitted
+    /// (declared Content-Length and chunked alike), only strictly over fails.
+    #[tokio::test]
+    async fn fetch_bytes_bounded_admits_declared_and_streamed_bodies_at_the_cap() {
+        let mut under = mockito::Server::new_async().await;
+        let _under_mock = under
+            .mock("GET", "/under")
+            .with_status(200)
+            .with_body(vec![0u8; 512])
+            .create_async()
+            .await;
+        let mut exact = mockito::Server::new_async().await;
+        let _exact_mock = exact
+            .mock("GET", "/exact")
+            .with_status(200)
+            .with_body(vec![0u8; 1024])
+            .create_async()
+            .await;
+        let mut streamed = mockito::Server::new_async().await;
+        let _streamed_mock = streamed
+            .mock("GET", "/stream")
+            .with_status(200)
+            .with_chunked_body(|w| w.write_all(&vec![0u8; 1024]))
+            .create_async()
+            .await;
+
+        let client = InstallSkill::http_client().unwrap();
+        let got =
+            InstallSkill::fetch_bytes_bounded(&client, &format!("{}/under", under.url()), 1024)
+                .await
+                .expect("an under-cap declared body must be admitted");
+        assert_eq!(got.len(), 512);
+        let got =
+            InstallSkill::fetch_bytes_bounded(&client, &format!("{}/exact", exact.url()), 1024)
+                .await
+                .expect("a body exactly at the declared cap must be admitted");
+        assert_eq!(got.len(), 1024);
+        let got =
+            InstallSkill::fetch_bytes_bounded(&client, &format!("{}/stream", streamed.url()), 1024)
+                .await
+                .expect("a chunked body exactly at the cap must be admitted");
+        assert_eq!(got.len(), 1024);
+    }
+
+    /// An `sha256` argument that is empty after trimming is *absent*, not
+    /// malformed: the tool must proceed (toward its next failure) instead of
+    /// rejecting with "sha256 must be 64 hex characters".
+    ///
+    /// Child-process form: the parent re-executes this test with the proxy
+    /// env pinned to a closed loopback port, so `search` fails fast without
+    /// touching the network — and without mutating the shared process env
+    /// that sibling reqwest clients read.
+    #[test]
+    fn empty_sha256_argument_is_ignored_not_rejected() {
+        if std::env::var_os("RECURSIVE_TEST_EMPTY_SHA_CHILD").is_some() {
+            let rt = tokio::runtime::Runtime::new().expect("child runtime");
+            rt.block_on(async {
+                let (tx, rx) = mpsc::unbounded_channel::<SkillInstallEvent>();
+                drop(rx); // any post-argument progress fails fast at the send
+                let tool = InstallSkill::new(Some(tx));
+                let err = tool
+                    .execute(json!({"query": "pdf", "sha256": "   "}))
+                    .await
+                    .expect_err("the install must still fail (search/channel)");
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains("sha256 must be 64 hex characters"),
+                    "an empty-after-trim sha256 argument must be ignored, got: {msg}"
+                );
+            });
+            return;
+        }
+        let child_out = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            .args([
+                "--exact",
+                // `--exact` matches the FULL test path — a bare name
+                // runs zero tests and would fake a green child.
+                "tools::install_skill::tests::empty_sha256_argument_is_ignored_not_rejected",
+                "--nocapture",
+            ])
+            .env("RECURSIVE_TEST_EMPTY_SHA_CHILD", "1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .expect("re-exec of the test binary");
+        let child_stdout = String::from_utf8_lossy(&child_out.stdout);
+        assert!(
+            child_out.status.success(),
+            "child assertion failed: {}",
+            String::from_utf8_lossy(&child_out.stderr)
+        );
+        assert!(
+            child_stdout.contains("1 passed"),
+            "the child must run exactly the re-executed test, got: {child_stdout}"
+        );
+    }
 }

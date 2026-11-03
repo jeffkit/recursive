@@ -943,4 +943,201 @@ mod tests {
         assert_eq!(body, "PINNED-SECRET");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
+
+    // ── Error-excerpt / truncation boundaries ────────────────────────────
+
+    /// HTTP-error excerpts keep the 200-byte truncation contract: a body over
+    /// 200 bytes is cut with a `...` marker, so a hostile error page cannot
+    /// flood the transcript with its tail.
+    #[tokio::test]
+    async fn fetch_error_excerpt_truncates_bodies_over_200_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = format!("{}{}", "A".repeat(200), "B".repeat(50));
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            write!(stream, "{}", response).unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tool = WebFetch::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/err"), DEFAULT_MAX_BYTES),
+        )
+        .await
+        .expect("fetch should not hang");
+        handle.join().ok();
+
+        let err = result.expect_err("HTTP 500 must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("..."),
+            "a >200-byte error body must be truncated with '...': {msg}"
+        );
+        assert!(
+            !msg.contains("BBBB"),
+            "the excerpt must stop at 200 bytes: {msg}"
+        );
+    }
+
+    /// The boundary itself is not truncated: an exactly-200-byte error body
+    /// passes through verbatim (no `...`), pinning `>` against `>=`.
+    #[tokio::test]
+    async fn fetch_error_excerpt_keeps_exactly_200_byte_bodies_verbatim() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = "C".repeat(200);
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            write!(stream, "{}", response).unwrap();
+            stream.flush().unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tool = WebFetch::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/err"), DEFAULT_MAX_BYTES),
+        )
+        .await
+        .expect("fetch should not hang");
+        handle.join().ok();
+
+        let err = result.expect_err("HTTP 500 must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 500"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains("..."),
+            "an exactly-200-byte body must not be truncated: {msg}"
+        );
+    }
+
+    /// Success-path truncation fires only strictly past `max_bytes`: a body
+    /// exactly at the cap is returned byte-for-byte; one byte over gets the
+    /// marker naming both sizes.
+    #[tokio::test]
+    async fn fetch_admits_bodies_exactly_at_max_bytes() {
+        let at_cap = "a".repeat(200);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = {
+            let body = at_cap.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                write!(stream, "{}", response).unwrap();
+                stream.flush().unwrap();
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let tool = WebFetch::new();
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/at-cap"), 200),
+        )
+        .await
+        .expect("fetch should not hang")
+        .expect("a body exactly at max_bytes must be admitted");
+        handle.join().ok();
+        assert_eq!(out, at_cap, "an at-cap body must come back verbatim");
+
+        let over_cap = "b".repeat(201);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = {
+            let body = over_cap.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                write!(stream, "{}", response).unwrap();
+                stream.flush().unwrap();
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.fetch(&format!("http://{addr}/over-cap"), 200),
+        )
+        .await
+        .expect("fetch should not hang")
+        .expect("an over-cap body must still be fetched (truncated)");
+        handle.join().ok();
+        assert!(
+            out.contains("truncated at 200 bytes; total body was 201 bytes"),
+            "the over-cap body must carry the truncation marker: {out}"
+        );
+    }
+
+    // ── html_to_markdown conversion pins ─────────────────────────────────
+
+    /// The script/style skip must consume the closing tag itself: content
+    /// after `</script>` is the page's real text and must be all that stays.
+    #[test]
+    fn html_to_markdown_script_skip_consumes_the_close_tag() {
+        assert_eq!(WebFetch::html_to_markdown("<script>zz</script>ok"), "ok");
+        assert_eq!(WebFetch::html_to_markdown("<style>qq</style>done"), "done");
+    }
+
+    /// A block-level tag immediately followed by its closer emits the newline
+    /// (`<p></p>` ⇒ a blank line in the markdown): each `</x>` lookahead arm
+    /// must fire on its own tag, heading markers included.
+    #[test]
+    fn html_to_markdown_block_close_tags_start_a_new_line() {
+        assert_eq!(WebFetch::html_to_markdown("<p></p>ok"), "\nok");
+        assert_eq!(WebFetch::html_to_markdown("<div></div>ok"), "\nok");
+        assert_eq!(WebFetch::html_to_markdown("<li></li>ok"), "\nok");
+        assert_eq!(WebFetch::html_to_markdown("<h1></h1>ok"), "#\nok");
+        assert_eq!(WebFetch::html_to_markdown("<h2></h2>ok"), "##\nok");
+        assert_eq!(WebFetch::html_to_markdown("<h3></h3>ok"), "###\nok");
+    }
+
+    /// Whitespace directly after a block-close newline is absorbed: it must
+    /// not re-open the just-closed line, and a whitespace-only tail after the
+    /// newline must not leave a dangling blank line at end of input.
+    #[test]
+    fn html_to_markdown_whitespace_after_block_close_is_absorbed() {
+        assert_eq!(WebFetch::html_to_markdown("a<p></p>  "), "a");
+        assert_eq!(WebFetch::html_to_markdown("a<p></p>  b"), "a\nb");
+    }
+
+    /// A link left unterminated at end of input closes through the
+    /// trailing-link block; with no link text nothing is rendered — an
+    /// empty-text link must not degrade into `[](href)`.
+    #[test]
+    fn html_to_markdown_unterminated_empty_link_renders_nothing() {
+        assert_eq!(WebFetch::html_to_markdown("<a href=\"u\">"), "");
+    }
 }
