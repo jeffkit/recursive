@@ -1826,4 +1826,129 @@ mod tests {
         ];
         assert!(!is_likely_spam_results(&results));
     }
+
+    // ── Issue #245 batch 38-b2 (B2 seat, recheck#4 survivors) ──────────────────
+
+    /// `root_domain` label boundaries: 3+ label hosts collapse to the last
+    /// two labels; 1-2 label hosts pass through verbatim; empty labels (from
+    /// `a..b` or a trailing dot) are filtered out and must not count toward
+    /// the join threshold. Deleting the `!s.is_empty()` filter makes
+    /// `a..b` a 3-"label" host (→ `.b`); flipping `labels.len() <= 2` to `>`
+    /// makes a 3-label host pass through un-collapsed.
+    #[test]
+    fn root_domain_label_boundaries() {
+        assert_eq!(
+            root_domain("https://api.example.com/v1?q=1"),
+            Some("example.com".to_string()),
+            "3-label host must collapse to its last two labels"
+        );
+        assert_eq!(
+            root_domain("https://example.com/x"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            root_domain("https://localhost/x"),
+            Some("localhost".to_string())
+        );
+        assert_eq!(
+            root_domain("https://a..b/x"),
+            Some("a..b".to_string()),
+            "an empty label must be filtered, not counted toward the join"
+        );
+        assert_eq!(
+            root_domain("https://example.com./x"),
+            Some("example.com.".to_string()),
+            "a trailing dot must not turn the host into a 3-label join"
+        );
+        assert_eq!(
+            root_domain("http://EXAMPLE.COM:8080/x"),
+            Some("example.com".to_string()),
+            "host must be lowercased and stripped of its port"
+        );
+    }
+
+    /// Every named-entity match arm of `decode_html_entities` must decode
+    /// to its character: deleting any single arm leaves the entity text
+    /// verbatim instead.
+    #[test]
+    fn decodes_every_named_entity_arm() {
+        assert_eq!(decode_html_entities("a&lt;b"), "a<b");
+        assert_eq!(decode_html_entities("x&gt;y"), "x>y");
+        assert_eq!(decode_html_entities("s&quot;t&quot;"), "s\"t\"");
+        assert_eq!(decode_html_entities("it&apos;s"), "it's");
+        assert_eq!(decode_html_entities("a&nbsp;b"), "a b");
+        assert_eq!(decode_html_entities("a&mdash;b"), "a\u{2014}b");
+        assert_eq!(decode_html_entities("a&ndash;b"), "a\u{2013}b");
+        assert_eq!(decode_html_entities("wait&hellip;"), "wait\u{2026}");
+        assert_eq!(decode_html_entities("a&amp;b"), "a&b");
+        assert_eq!(
+            decode_html_entities("x&nope;y"),
+            "x&nope;y",
+            "an unknown entity name passes through verbatim"
+        );
+    }
+
+    /// `percent_decode` boundary handling: escapes at the start, past the
+    /// midpoint, and truncated at the end of the input.
+    ///
+    /// - `i + 2` → `i * 2`: a `%` at i=3 in a 6-byte input has `3*2 == len`,
+    ///   so the mutant skips the decode (`abc%E9` stays literal).
+    /// - `i + 2` → `i - 2`: a `%` at i=0 underflows usize (panic in tests).
+    /// - guard → `true`: a trailing bare `%` slices past the end of the input.
+    /// - `<` → `<=`: one hex digit then end-of-input (`i + 2 == len`) must NOT
+    ///   decode; the mutant slices one byte past the end.
+    #[test]
+    fn percent_decode_start_mid_and_truncated_escapes() {
+        assert_eq!(percent_decode("%2B"), "+");
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
+        // %E9 is a lone (invalid-UTF-8) byte once decoded, so lossy
+        // conversion renders the replacement character — the observable
+        // difference from leaving the escape literal.
+        assert_eq!(
+            percent_decode("abc%E9"),
+            "abc\u{FFFD}",
+            "a %-escape past the input midpoint must still decode"
+        );
+        assert_eq!(
+            percent_decode("100%"),
+            "100%",
+            "a trailing bare % with no hex pair must pass through"
+        );
+        assert_eq!(
+            percent_decode("ab%4"),
+            "ab%4",
+            "one hex digit then end-of-input is not an escape"
+        );
+    }
+
+    /// An empty Jina key override must be dropped by the `!k.is_empty()`
+    /// filter, never sent as a blank `Authorization: Bearer` credential.
+    /// The mock only matches requests that carry NO Authorization header;
+    /// under the mutant the blank header is sent, the mock does not match,
+    /// and the request fails instead of succeeding.
+    #[tokio::test]
+    async fn jina_fallback_sends_no_authorization_header_for_an_empty_key() {
+        use mockito::Server;
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_header("Authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "text/markdown")
+            .with_body("# ok")
+            .create_async()
+            .await;
+
+        let tool = WebSearch::with_test_base(server.url()).with_search_config(
+            None,
+            None,
+            Some(String::new()),
+        );
+        let out = tool
+            .search_jina_fallback("anything")
+            .await
+            .expect("an empty jina key must not be sent as a credential");
+        assert!(out.contains("ok"), "{out}");
+    }
 }

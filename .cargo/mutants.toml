@@ -1545,4 +1545,37 @@ exclude_re = [
     # slices mid-char, `&&` → `||` walks past len and panics, `+=` → `-=`/
     # `/=`) are pinned by the substitute_skill_dir_* tests in load_skill.rs.
     "src/tools/load_skill\\.rs:387:19: replace < with <= in substitute_skill_dir",
+    # ── Issue #245 batch 38-b2 round 2 (B2 seat, recheck#4 survivors:
+    # web_search 14 + registry 7 + http_call 3; run 41594949032 shards) ────
+    # registry.rs :170:5 — `empty_permission_hook` body →
+    # `Default::default()` is value-identical: SharedPermissionHook is
+    # `Arc<RwLock<Option<Arc<dyn PermissionHook>>>>` and every one of those
+    # types implements Default with exactly the constructed value
+    # (`Arc::new(RwLock::new(None))` — fresh Arc, no hook). The slot's only
+    # consumer is the read/write lock discipline in set/clear/
+    # `permission_hook()`/`isolate_permission_hook`; nothing in the crate
+    # observes Arc identity of the permission-hook slot (the two Arc::ptr_eq
+    # sites in tests target the read-file-state slot). True equivalent by
+    # construction; negctl green-direction evidence /tmp/b2-batch38-r2/
+    # negctl/results.jsonl R1 (full lib suite green under the mutant).
+    # UNLOCK CONDITION: if any code path starts comparing permission-hook
+    # slot Arcs (ptr_eq / as_ptr), identity becomes observable — drop this
+    # entry and pin.
+    "src/tools/registry\\.rs:170:5: replace empty_permission_hook -> SharedPermissionHook with Default::default\\(\\)",
+    # http_call.rs :573:26 — `placeholders` advance `rest = &rest[end + 1..]`
+    # → `end - 1`: the mutant's window only re-includes the consumed name's
+    # last char (always [a-zA-Z0-9_]) and the closing `}` — neither can be
+    # `{` — so the next `find('{')` lands on the same brace, every later
+    # name extraction is position-relative to that brace and identical, and
+    # both variants exit/Err identically (Err messages embed `template`,
+    # not `rest`). Proven by exhaustive enumeration of all 21,844 templates
+    # up to length 7 over {a,b,{,}} (all structural brace/name patterns and
+    # both error paths): zero output divergences — /tmp/b2-batch38-r2/
+    # ph-equivalence.py. negctl: mutant applied → consecutive_placeholders
+    # test passes (results.jsonl H1), consistent with unobservability.
+    # UNLOCK CONDITION: if the scanner ever treats a `}` inside the
+    # just-consumed window as meaningful (e.g. `{{`-escape support or a
+    # `{a}}` collapsing rule), the stale window gains observable effect —
+    # drop this entry and pin.
+    "src/tools/http_call\\.rs:573:26: replace \\+ with \\- in placeholders",
 ]

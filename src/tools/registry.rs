@@ -3227,4 +3227,102 @@ mod tests {
             "load_skill must be registered when the skills slice is non-empty"
         );
     }
+
+    // ── Issue #245 batch 38-b2 (B2 seat, recheck#4 survivors) ──────────────────
+
+    /// `remove_tools` must drop exactly the named tools: replaced with a
+    /// no-op body nothing is removed; deleting the `!` in the tools retain
+    /// inverts it (everything except the targets is dropped); deleting the
+    /// `!` in the origins retain wipes the survivor's origin stamp — a
+    /// silent downgrade to `Builtin` that this assert makes loud.
+    #[test]
+    fn remove_tools_drops_targets_with_aliases_and_origins_but_spares_siblings() {
+        struct McpLikeTool {
+            name: &'static str,
+            server: &'static str,
+        }
+        #[async_trait]
+        impl Tool for McpLikeTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.to_string(),
+                    description: "mcp proxied test tool".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+            fn mcp_server_name(&self) -> Option<&str> {
+                Some(self.server)
+            }
+            async fn execute(&self, _args: Value) -> crate::error::Result<String> {
+                Ok("ok".into())
+            }
+        }
+
+        let mut reg = make_registry()
+            .register_with_aliases(
+                Arc::new(McpLikeTool {
+                    name: "mcp__gh__keep",
+                    server: "gh",
+                }),
+                &["keep_alias"],
+            )
+            .register_with_aliases(Arc::new(ReadOnlyTool { name: "Doomed" }), &["doomed_alias"]);
+        reg.remove_tools(&["Doomed"]);
+
+        assert!(
+            reg.find_by_name("Doomed").is_none(),
+            "the named tool must be removed"
+        );
+        assert!(
+            reg.find_by_name("mcp__gh__keep").is_some(),
+            "a sibling outside the drop set must survive"
+        );
+        assert!(
+            reg.find_by_name("doomed_alias").is_none(),
+            "an alias pointing at a removed tool must be dropped"
+        );
+        assert!(
+            reg.find_by_name("keep_alias").is_some(),
+            "an alias pointing at a surviving tool must be kept"
+        );
+        assert_eq!(
+            reg.identity_for("keep_alias").map(|i| i.origin),
+            Some(ToolOrigin::Mcp {
+                server: "gh".to_string()
+            }),
+            "the survivor's origin stamp must survive remove_tools"
+        );
+    }
+
+    /// The elicitation slot contract (mcp feature): absent by default,
+    /// attached verbatim by `with_elicitation_slot` (which must return the
+    /// same registry, tools intact), and returned by `elicitation_slot` as
+    /// the SAME Arc — never a fresh default slot.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn elicitation_slot_round_trips_and_is_absent_by_default() {
+        use crate::tools::elicitation::new_elicitation_slot;
+
+        let fresh = make_registry();
+        assert!(
+            fresh.elicitation_slot().is_none(),
+            "a fresh registry must have no elicitation slot"
+        );
+
+        let slot = new_elicitation_slot();
+        let reg = make_registry()
+            .register(Arc::new(ReadOnlyTool { name: "Marker" }))
+            .with_elicitation_slot(slot.clone());
+        assert!(
+            reg.find_by_name("Marker").is_some(),
+            "with_elicitation_slot must return the same registry, tools intact"
+        );
+        let got = reg
+            .elicitation_slot()
+            .expect("the attached slot must be retrievable");
+        assert!(
+            Arc::ptr_eq(&got, &slot),
+            "elicitation_slot must return the attached slot Arc, not a fresh default"
+        );
+    }
 }

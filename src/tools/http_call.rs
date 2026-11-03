@@ -2623,4 +2623,97 @@ mod tests {
             captured.headers
         );
     }
+
+    // ── Issue #245 batch 38-b2 (B2 seat, recheck#4 survivors) ──────────────────
+
+    /// Consecutive `{a}{b}` placeholders must each be extracted: advancing
+    /// the scan window with `end - 1` instead of `end + 1` re-reads the
+    /// consumed name's last char, so the next iteration sees the leftover
+    /// `}` and either errors on an empty name or slices out of range.
+    #[test]
+    fn consecutive_placeholders_are_all_extracted() {
+        let got = placeholders("/o/{order_id}/{comment_id}").expect("valid template");
+        assert_eq!(got, vec!["order_id", "comment_id"]);
+        let adjacent = placeholders("{a}{b}").expect("adjacent placeholders are valid");
+        assert_eq!(adjacent, vec!["a", "b"]);
+        let single = placeholders("{solo}").expect("single placeholder");
+        assert_eq!(single, vec!["solo"]);
+    }
+
+    /// `resolve_auth`'s env fallback must filter out EMPTY values (no
+    /// auth resolver installed): a blank env value must never become a
+    /// blank `Authorization: Bearer` credential. The test never mutates
+    /// process env outside `env_lock` discipline and uses a probe name no
+    /// other test reads.
+    #[test]
+    fn resolve_auth_drops_empty_env_values() {
+        let _guard = crate::test_util::env_lock();
+        let tool = HttpCall::new(loopback_registry(json!({})));
+        const PROBE: &str = "RECURSIVE_HTTP_RESOLVE_AUTH_PROBE";
+        // SAFETY: process-global env; the caller holds env_lock, so no
+        // other test observes or mutates the variable concurrently.
+        unsafe {
+            std::env::set_var(PROBE, "secret-value");
+        }
+        assert_eq!(
+            tool.resolve_auth(PROBE).as_deref(),
+            Some("secret-value"),
+            "a non-empty env value must reach the auth resolver"
+        );
+        // SAFETY: same lock discipline as above.
+        unsafe {
+            std::env::set_var(PROBE, "");
+        }
+        assert!(
+            tool.resolve_auth(PROBE).is_none(),
+            "an empty env value must be filtered out, not sent as a blank credential"
+        );
+        // SAFETY: same lock discipline as above.
+        unsafe {
+            std::env::remove_var(PROBE);
+        }
+        assert!(
+            tool.resolve_auth(PROBE).is_none(),
+            "an unset env value resolves to nothing"
+        );
+    }
+
+    /// Chunks summing to exactly `max_bytes` are NOT truncation: the
+    /// overflow guard is strictly `>` (`buf.len() + chunk.len() > cap`) and
+    /// an exact fill exits via the `buf.len() >= max_bytes` break with
+    /// `truncated == false`. `>=` in the guard flags this exact-fill body.
+    #[tokio::test]
+    async fn chunked_body_exactly_at_the_cap_is_not_truncated() {
+        let (addr, handle) = spawn_chunked_mock(&["q".repeat(60), "z".repeat(40)]);
+        let reg = EndpointRegistry::from_json(
+            &json!({ "endpoints": { "get_order": {
+                "method": "GET",
+                "base_url": format!("http://{addr}"),
+                "path": "/api/orders/{order_id}",
+                "max_response_bytes": 100,
+                "allow_private": true
+            }}})
+            .to_string(),
+        )
+        .expect("registry");
+        let tool = HttpCall::new(reg);
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({"endpoint": "get_order", "params": {"order_id": "A"}})),
+        )
+        .await
+        .expect("no hang")
+        .expect("ok");
+        handle.join().expect("join");
+        assert!(out.contains("HTTP 200"), "{out}");
+        assert!(
+            !out.contains("truncated"),
+            "exactly 100 bytes == the cap is not truncation: {out}"
+        );
+        assert_eq!(
+            out.matches('z').count(),
+            40,
+            "the exact-fill chunk must be read in full: {out}"
+        );
+    }
 }
