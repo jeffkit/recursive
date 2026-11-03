@@ -271,11 +271,33 @@ fn should_sample(ratio: f64, draw: f64) -> bool {
 
 /// A cheap uniform draw in `[0, 1)` derived from the wall clock.
 fn sample_draw() -> f64 {
+    #[cfg(test)]
+    if let Some(nanos) = SEEDED_SAMPLE_NANOS.with(|seed| seed.get()) {
+        return nanos_to_unit_interval(nanos);
+    }
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
+    nanos_to_unit_interval(nanos)
+}
+
+/// The sampler's mapping core: subsecond nanos to a draw in `[0, 1)`. Pure so
+/// the division is pinned deterministically — the wall-clock path behind
+/// `sample_draw` cannot be asserted against on hosts with a coarse clock tick
+/// (issue #245: the batch-38 100-draw statistical assertion false-reds there).
+fn nanos_to_unit_interval(nanos: u32) -> f64 {
     f64::from(nanos) / 1_000_000_000.0
+}
+
+// Test seam for `sample_draw`: when seeded, the draw comes from here instead
+// of the wall clock, so the `-> 0.0` body replacement stays killable at any
+// host clock granularity. Never compiled outside tests. (Plain comments, not
+// `///`: rustdoc does not document macro invocations, so `-D warnings` flags
+// doc comments here.)
+#[cfg(test)]
+thread_local! {
+    static SEEDED_SAMPLE_NANOS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -484,14 +506,33 @@ mod tests {
         });
     }
 
-    /// `sample_draw` is a uniform draw in [0, 1) from subsecond nanos
-    /// (issue #245 batch 38): the `-> 0.0` replacement pins every run to
-    /// the boundary. 100 draws must spread — the pristine tree fails this
-    /// with probability 0.5^100.
+    /// `nanos_to_unit_interval` mapping pins (issue #245). The batch-38
+    /// `sample_draw_spans_the_unit_interval` statistical assertion (max of
+    /// 100 wall-clock draws > 0.5) was deleted instead: on runners whose
+    /// clock tick is coarse (e.g. 4 ms), 100 tight-loop draws land in one
+    /// tick and every draw sits near 0.0 — the deterministic CI red behind
+    /// main b99fb13d, third clock-quantum casualty (after the create_
+    /// scratch_dir collision family). These pins kill the same mutation
+    /// family (fn-body constantification, `/` -> `*`/`%`) deterministically.
     #[test]
-    fn sample_draw_spans_the_unit_interval() {
-        let max = (0..100).map(|_| sample_draw()).fold(0.0f64, f64::max);
-        assert!(max > 0.5, "100 draws must exceed 0.5, max was {max}");
+    fn nanos_to_unit_interval_maps_deterministically() {
+        assert_eq!(nanos_to_unit_interval(0), 0.0);
+        assert_eq!(nanos_to_unit_interval(500_000_000), 0.5);
+        assert!(nanos_to_unit_interval(999_999_999) < 1.0);
+        // Out of the caller's domain (subsec_nanos is always < 1e9): the
+        // mapping is pure division, no clamp — u32::MAX overshoots past 1.0.
+        assert!(nanos_to_unit_interval(u32::MAX) > 1.0);
+    }
+
+    /// Seamed wiring pin: a seeded draw must route through
+    /// `nanos_to_unit_interval` (seed 0.5 s -> draw 0.5). Kills the
+    /// `sample_draw -> 0.0` body replacement — the mutant the deleted
+    /// statistical test was the only killer of — at any clock granularity.
+    #[test]
+    fn sample_draw_routes_seeded_nanos_through_the_mapping() {
+        SEEDED_SAMPLE_NANOS.with(|seed| seed.set(Some(500_000_000)));
+        assert_eq!(sample_draw(), 0.5);
+        SEEDED_SAMPLE_NANOS.with(|seed| seed.set(None));
     }
 
     /// A run fed ONLY through its event sink must put its spans on the
