@@ -194,6 +194,7 @@ mod tests {
     /// Fake Docker API on a unique unix socket: create → 201 with an `Id`,
     /// everything else → 204. Returns the `unix://` URL for DOCKER_HOST, the
     /// socket path (best-effort removed by the caller) and the request log.
+    #[cfg(unix)]
     fn spawn_fake_docker_api() -> (
         String,
         std::path::PathBuf,
@@ -259,6 +260,7 @@ mod tests {
     /// with Ok(Default::default())` (:87): the real body creates the
     /// container via the fake API (create recorded) and returns the standard
     /// tool set; the mutant returns an empty registry without dialling.
+    #[cfg(unix)]
     #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
     #[tokio::test]
     async fn container_provider_build_registry_result_builds_the_standard_tool_set() {
@@ -296,6 +298,7 @@ mod tests {
     /// Kill `replace <impl ToolSetProvider for ContainerToolSetProvider>::build_registry
     /// -> ToolRegistry with Default::default()` (:116): same contract via the
     /// sync wrapper (block_in_place needs the multi-thread runtime).
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn container_provider_build_registry_builds_the_standard_tool_set() {
         let _lock = crate::test_util::env_lock();
