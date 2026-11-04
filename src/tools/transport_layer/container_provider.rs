@@ -176,4 +176,153 @@ mod tests {
         assert!(msg.contains("no daemon"));
         assert!(msg.contains("refusing to fall back"));
     }
+
+    // ── Issue #245 batch 43 (B1 seat): registry-body pins ─────────────────
+    //
+    // These drive the real bollard client (DOCKER_HOST redirected under the
+    // crate env lock) against a fake Docker API on a unique unix-domain
+    // socket — a socket, because bollard 0.18's connect_with_unix_defaults
+    // only honours a `unix://` DOCKER_HOST (an http:// value is filtered out
+    // and falls back to /var/run/docker.sock). POST /containers/create
+    // answers 201 {"Id": …}, everything else 204. The toolchain probe's exec
+    // round-trips therefore fail and are swallowed (`probe_toolchain` →
+    // empty vec), while create+start succeed — enough for the registry
+    // build. The whole file compiles only under `cloud-runtime`; these
+    // tests (and the mutants they kill) are invisible to the default
+    // `cargo test --workspace` gate.
+
+    /// Fake Docker API on a unique unix socket: create → 201 with an `Id`,
+    /// everything else → 204. Returns the `unix://` URL for DOCKER_HOST, the
+    /// socket path (best-effort removed by the caller) and the request log.
+    fn spawn_fake_docker_api() -> (
+        String,
+        std::path::PathBuf,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        let sock_path = std::env::temp_dir().join(format!(
+            "recursive-itest-docker-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind fake docker socket");
+        let addr = format!("unix://{}", sock_path.display());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { continue };
+                let reqs = reqs.clone();
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 8192];
+                    let mut read = 0;
+                    loop {
+                        let n = sock.read(&mut buf[read..]).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let first = text.lines().next().unwrap_or("").to_string();
+                    let is_create = first.contains("POST /containers/create");
+                    reqs.lock().unwrap_or_else(|e| e.into_inner()).push(first);
+                    let (status, body): (&str, &[u8]) = if is_create {
+                        (
+                            "201 Created",
+                            br#"{"Id":"recursive-itest-fake","Warnings":[]}"#,
+                        )
+                    } else {
+                        ("204 No Content", b"")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(body);
+                });
+            }
+        });
+        (addr, sock_path, requests)
+    }
+
+    /// Kill `replace ContainerToolSetProvider::build_registry_result -> …
+    /// with Ok(Default::default())` (:87): the real body creates the
+    /// container via the fake API (create recorded) and returns the standard
+    /// tool set; the mutant returns an empty registry without dialling.
+    #[allow(clippy::await_holding_lock)] // std env lock is fine: only same-crate tests contend
+    #[tokio::test]
+    async fn container_provider_build_registry_result_builds_the_standard_tool_set() {
+        let _lock = crate::test_util::env_lock();
+        let (addr, sock_path, log) = spawn_fake_docker_api();
+        let saved = std::env::var_os("DOCKER_HOST");
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var("DOCKER_HOST", &addr) };
+        let p = ContainerToolSetProvider::new(PathBuf::from("/tmp"), 30, vec![]);
+        let reg = p
+            .build_registry_result()
+            .await
+            .expect("container tier builds against the fake Docker API");
+        // SAFETY: restore before releasing the env lock.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("DOCKER_HOST", v),
+                None => std::env::remove_var("DOCKER_HOST"),
+            }
+        }
+        let _ = std::fs::remove_file(&sock_path);
+        assert!(
+            reg.find_by_name("Bash").is_some(),
+            "build_registry_result must wire the standard tool set (Bash missing)"
+        );
+        assert!(
+            log.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|r| r.contains("POST /containers/create")),
+            "the real body must create the container"
+        );
+    }
+
+    /// Kill `replace <impl ToolSetProvider for ContainerToolSetProvider>::build_registry
+    /// -> ToolRegistry with Default::default()` (:116): same contract via the
+    /// sync wrapper (block_in_place needs the multi-thread runtime).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn container_provider_build_registry_builds_the_standard_tool_set() {
+        let _lock = crate::test_util::env_lock();
+        let (addr, sock_path, log) = spawn_fake_docker_api();
+        let saved = std::env::var_os("DOCKER_HOST");
+        // SAFETY: process-global env mutation, serialised by `env_lock`.
+        unsafe { std::env::set_var("DOCKER_HOST", &addr) };
+        let p = ContainerToolSetProvider::new(PathBuf::from("/tmp"), 30, vec![]);
+        let reg = p.build_registry();
+        // SAFETY: restore before releasing the env lock.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("DOCKER_HOST", v),
+                None => std::env::remove_var("DOCKER_HOST"),
+            }
+        }
+        let _ = std::fs::remove_file(&sock_path);
+        assert!(
+            reg.find_by_name("Bash").is_some(),
+            "build_registry must wire the standard tool set (Bash missing)"
+        );
+        assert!(
+            log.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|r| r.contains("POST /containers/create")),
+            "the real body must create the container"
+        );
+    }
 }

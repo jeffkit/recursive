@@ -1782,6 +1782,42 @@ return process.cwd();"#
         );
     }
 
+    /// A pure timeout (no abort token) must still fire the Goal 412 kill
+    /// block: the hung runtime is killed at once and the report lands within
+    /// a second. Kills `replace || with && in run_program` (:974) — the
+    /// mutant additionally requires `aborted`, skips kill_group +
+    /// start_kill, and burns both 5s REAP_GRACE waits (child reap, then
+    /// stderr close held open by the surviving runtime) before returning,
+    /// blowing the duration bound below.
+    #[tokio::test]
+    async fn timeout_alone_kills_the_runtime_promptly() {
+        if !node_available() {
+            eprintln!("skipping: no `node` runtime found on PATH");
+            return;
+        }
+        let report = run_program(RunProgramRequest {
+            source: "await new Promise(() => {});".to_string(),
+            bindings: BindingTable::empty(),
+            invoker: Arc::new(NullInvoker),
+            limits: RunCodeLimits {
+                timeout: Duration::from_millis(300),
+                ..RunCodeLimits::default()
+            },
+            node_bin: None,
+            abort: None,
+            read_root: None,
+            min_free_bytes: None,
+        })
+        .await;
+        assert_eq!(report.failure, Some(protocol::RunCodeFailure::Timeout));
+        assert!(
+            report.duration_ms < 4000,
+            "a timed-out run must be killed promptly, took {}ms \
+             (a && mutant burns ≥10s of REAP_GRACE waits first)",
+            report.duration_ms
+        );
+    }
+
     /// Headline (#134 W1): a scratch volume below the free-space floor is
     /// rejected BEFORE spawn — `sandbox-unavailable` with the volume path and
     /// the measured free space, and no runtime process is ever started.

@@ -464,6 +464,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_tool_is_deferred() {
+        // kills `replace <impl Tool for CheckpointSave>::is_deferred -> bool with false`
+        if !has_git() {
+            return;
+        }
+        let w = ws();
+        let repo = Arc::new(Mutex::new(
+            ShadowRepo::open_at(w.path(), w.shadow_dir()).unwrap(),
+        ));
+        let log_path = w.path().join("checkpoints.jsonl");
+        let writer = Arc::new(Mutex::new(CheckpointLogWriter::open(&log_path).unwrap()));
+        let tool = build_checkpoint_save_tool(
+            repo,
+            "s".into(),
+            None,
+            writer,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            log_path,
+        );
+        assert!(
+            tool.is_deferred(),
+            "checkpoint_save must be a deferred tool"
+        );
+    }
+
+    #[tokio::test]
     async fn list_tool_empty_session_returns_sentinel() {
         // kills `if infos.is_empty()` branch-swap mutations
         if !has_git() {

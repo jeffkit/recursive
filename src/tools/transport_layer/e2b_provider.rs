@@ -993,6 +993,29 @@ mod tests {
         assert_eq!(p.sandbox_mode(), SandboxMode::MicroVm);
     }
 
+    /// Kills `replace <impl ToolSetProvider for E2bToolSetProvider>::build_registry
+    /// -> ToolRegistry with Default::default()` (:940): the real body creates the
+    /// sandbox against the mock (POST /sandboxes recorded) and wires the standard
+    /// tool set; the mutant returns an empty registry without dialling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn e2b_provider_build_registry_builds_the_standard_tool_set() {
+        let (base, log) = spawn_e2b_mock(transport_route);
+        let p = E2bToolSetProvider::new(config_at(&base, 3600), PathBuf::from("/tmp"), 30, vec![]);
+        let reg = p.build_registry();
+        assert!(
+            reg.find_by_name("Bash").is_some(),
+            "build_registry must wire the standard tool set (Bash missing)"
+        );
+        assert!(
+            requests(&log).iter().any(|r| r.target == "/sandboxes"),
+            "build_registry must create the sandbox itself (mock saw: {:?})",
+            requests(&log)
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn e2b_config_from_env_defaults_and_overrides() {
         // Save + clear, set explicitly, restore — self-contained despite

@@ -133,6 +133,35 @@ exclude_globs = [
     # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
     # the existing pins above take over.
     "src/tools/transport_layer/docker_provider.rs",
+    # ── Issue #245 batch 43 (B1 seat, task list /tmp/b1-batch43.txt) ───────
+    # container_provider.rs is the SIXTH whole-file cfg-blind case, same
+    # class as the five entries above: transport_layer/mod.rs declares it
+    # `#[cfg(feature = "cloud-runtime")]` and that feature is NOT in
+    # agent-mutants.sh FEATURES, so under the gate the module is never
+    # compiled and each of its mutants builds byte-identical to the
+    # baseline — the 4 "MISSED" rows of this batch's task list (:75
+    # create_transport / :87 build_registry_result / :116 build_registry /
+    # :158 sandbox_mode) are that artifact. All 4 are dispositioned where
+    # the file DOES compile (`--all-features`, hand-verified locally, logs
+    # in /tmp/b1-batch43/negctl/):
+    # - `build_registry_result → Ok(Default::default())` and
+    #   `build_registry → Default::default()` are pinned by the two
+    #   container_provider_build_registry* tests, which drive the real
+    #   bollard client (DOCKER_HOST pointed at a unique unix socket under
+    #   env_lock — bollard 0.18 only honours a unix:// DOCKER_HOST) against
+    #   a fake Docker API answering create=201 {"Id": …} / everything else
+    #   204 and assert the Bash tool is present in the built registry
+    #   (the mutants return an empty registry without ever dialling);
+    # - `sandbox_mode → Default::default()` is already pinned by the
+    #   pre-existing container_provider_sandbox_mode_is_container;
+    # - `create_transport → Ok(Default::default())` is unviable when the
+    #   file compiles (E0277: ContainerTransport implements no Default —
+    #   same unviable-when-compiled class as the s3.rs / docker_sandbox.rs /
+    #   redis.rs rows above).
+    # UNLOCK CONDITION: identical to the entries above — the day
+    # `cloud-runtime` joins agent-mutants.sh FEATURES, drop this glob and
+    # the file's own pins take over.
+    "src/tools/transport_layer/container_provider.rs",
 ]
 
 # Regexes match the mutant *name* string cargo-mutants prints.

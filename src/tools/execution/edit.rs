@@ -324,9 +324,9 @@ fn try_match(haystack: &str, needle: &str) -> Option<String> {
 
     // 4. Quote normalization + trailing whitespace strip combined
     let qn_tws = strip_trailing_whitespace(&qn_needle);
-    // &&→|| guard mutations are equivalent (deduplication-only: step 4 finds the same
-    // result as an earlier step when the guard is bypassed). Behaviorally tested by
-    // try_match_combined_quote_and_trailing_ws; mutations skipped via end-of-line tag.
+    // Neither &&→|| mutation of this guard is equivalent: with a straight-quote needle
+    // that has trailing whitespace under a haystack holding the curly-quote window, the
+    // original skips this block and returns None while either mutant returns Some.
     if qn_tws != needle && qn_tws != qn_needle && qn_tws != tws {
         // cargo-mutants::skip
         let qn_tws_haystack = strip_trailing_whitespace(&qn_haystack);
@@ -1161,6 +1161,19 @@ mod tests {
             None,
             "desanitized form not in haystack must return None"
         );
+    }
+
+    // ── try_match step 4 guard negatives (kills 330:25 / 330:48 &&→||) ───
+
+    /// A needle whose only "change" is trailing whitespace (straight quotes,
+    /// guard truth table T,T,F) under a haystack that holds the curly-quote
+    /// form of the window: step 3's verbatim search misses, the original
+    /// skips step 4 (third conjunct false) and step 5 desanitizes nothing →
+    /// None. Either `&&→||` mutation enters step 4, matches the normalised
+    /// window and returns the curly slice instead — killing both mutants.
+    #[test]
+    fn try_match_step4_guard_mutations_return_none_for_curly_haystack() {
+        assert_eq!(try_match("a\u{201C}b", "a\"b "), None);
     }
 
     // ── Tool (end-to-end) ─────────────────────────────────────────────────

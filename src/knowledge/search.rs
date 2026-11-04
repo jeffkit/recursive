@@ -358,6 +358,15 @@ mod tests {
         assert!(out.contains("edge.log:1: match-at-cap"), "output: {out}");
     }
 
+    /// The cap's literal is itself the contract ("1 MiB covers virtually all
+    /// source files"): the boundary tests above reference the constant, so
+    /// they cannot see the constant drift. Pin the value against the
+    /// `replace * with +` / `replace * with /` mutations of the literal.
+    #[test]
+    fn grep_size_cap_literal_is_one_mib() {
+        assert_eq!(MAX_GREP_FILE_BYTES, 1024 * 1024);
+    }
+
     /// The line cap is "longer than": a line of exactly `DEFAULT_MAX_LINE_LEN`
     /// bytes comes through verbatim, one byte more is cut to the cap and
     /// marked with the ellipsis.

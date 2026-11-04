@@ -1266,6 +1266,22 @@ mod tests {
         }
     }
 
+    /// A name whose ONLY sensitive marker is `CREDENTIAL` must still scrub:
+    /// kills `replace || with && in is_sensitive_env_var` (the CREDENTIAL
+    /// arm) — `&&` demands an earlier marker too and would hand e.g.
+    /// GOOGLE_APPLICATION_CREDENTIALS straight to the child shell.
+    #[test]
+    fn is_sensitive_env_var_credential_marker_alone_is_sensitive() {
+        assert!(super::is_sensitive_env_var("AWS_CREDENTIAL_FILE"));
+        assert!(super::is_sensitive_env_var(
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        ));
+        // The neighbouring arms keep their quadrants under the same predicate.
+        assert!(super::is_sensitive_env_var("SSH_AUTH_SOCK"));
+        assert!(!super::is_sensitive_env_var("GIT_AUTHOR_NAME"));
+        assert!(!super::is_sensitive_env_var("CARGO_TEST_BENIGN_VAR"));
+    }
+
     #[tokio::test]
     async fn local_transport_exec_shell_timeout() {
         let t = LocalTransport;
