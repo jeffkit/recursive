@@ -1657,4 +1657,44 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.unwrap(), "# API Spec\n\nInline.");
     }
+
+    /// Multi-byte body through the tail-copy path: the char-boundary scan
+    /// must advance past each multi-byte char and terminate. Run on a worker
+    /// thread so a non-progress loop surfaces as a red timeout here instead
+    /// of wedging the whole test binary (the leaked spinner dies with the
+    /// process when the harness main thread returns).
+    #[test]
+    fn substitute_skill_dir_renders_multibyte_body_and_terminates() {
+        let skill = Skill {
+            name: "mb-skill".to_string(),
+            description: "multi-byte body".to_string(),
+            path: PathBuf::from("/tmp/mb-skill/SKILL.md"),
+            mode: SkillMode::Manual,
+            triggers: vec![],
+            hint: String::new(),
+            depends_on: vec![],
+            refs: vec![],
+            params: vec![],
+            scripts: vec![],
+            sections: vec![],
+            globs: None,
+            body: None,
+        };
+        let content = "中文 ${SKILL_DIR}/脚本.md \\${SKILL_DIR} 字面 尾";
+        let expected = "中文 /tmp/mb-skill/脚本.md ${SKILL_DIR} 字面 尾";
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = substitute_skill_dir(content, &skill);
+            let _ = tx.send(out);
+        });
+        let out = std::sync::mpsc::Receiver::recv_timeout(&rx, std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "substitute_skill_dir did not hand back a result on multi-byte input \
+                     (non-progress loop, or the worker panicked)"
+                )
+            });
+        assert_eq!(out, expected);
+    }
 }

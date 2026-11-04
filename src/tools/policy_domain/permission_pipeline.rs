@@ -1054,6 +1054,129 @@ mod tests {
             "StrReplace to a path outside write_allow must be denied"
         );
     }
+
+    // ── Batch 44: the interactive flag must survive alias resolution ─────
+
+    use std::sync::Arc;
+
+    /// A plain (non-readonly-allowlisted) tool the tests can register under
+    /// an alias. Kept local so the pipeline tests never depend on the
+    /// tool-mod test fixtures.
+    struct ProbeTool;
+
+    #[async_trait]
+    impl crate::tools::Tool for ProbeTool {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::llm::ToolSpec {
+                name: "probe".into(),
+                description: "probe".into(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            }
+        }
+        async fn execute(&self, _args: Value) -> Result<String> {
+            Ok("probe-ok".into())
+        }
+    }
+
+    fn headless_registry(interactive_rules: &[&str]) -> ToolRegistry {
+        use crate::permissions::{LayeredPermissionsConfig, PermissionLayer, RuleSource};
+        let config = LayeredPermissionsConfig {
+            mode: PermissionMode::Default,
+            layers: vec![PermissionLayer {
+                source: RuleSource::User,
+                interactive: interactive_rules.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }],
+        };
+        ToolRegistry::local()
+            .with_permissions(config)
+            .with_headless(true)
+            .register_with_aliases(Arc::new(ProbeTool), &["probe-alias"])
+    }
+
+    /// The `interactive` rule names the ALIAS; the canonical name carries no
+    /// rule. Headless + no hook runner must deny — the interactive flag is
+    /// computed as `any_interactive(canonical) || (canonical != raw &&
+    /// any_interactive(raw))`, so the alias hit has to survive the alias
+    /// check even though the canonical miss fails the first clause.
+    #[tokio::test]
+    async fn check_alias_interactive_rule_denies_headless_despite_quiet_canonical() {
+        let registry = headless_registry(&["probe-alias"]);
+        let pipeline = PermissionPipeline::new(&registry);
+        let outcome = pipeline.check("probe-alias", serde_json::json!({})).await;
+        match outcome {
+            CheckOutcome::Deny { error, .. } => assert!(
+                matches!(
+                    error,
+                    Error::PermissionDenied {
+                        reason: DecisionReason::Hook { .. },
+                        ..
+                    }
+                ),
+                "the alias-named interactive rule must gate headless dispatch, got: {error:?}"
+            ),
+            CheckOutcome::Allow { .. } => {
+                panic!("an interactive rule on the alias must deny in headless mode with no hook runner")
+            }
+        }
+    }
+
+    /// Control for the clause shape: when NEITHER the canonical name nor the
+    /// alias carries an interactive rule, the flag must stay false even
+    /// though `canonical != raw` holds — an alias alone must not flip the
+    /// tool into the headless approval path.
+    #[tokio::test]
+    async fn check_aliased_plain_tool_without_interactive_rule_stays_allowed() {
+        let registry = headless_registry(&["unrelated-tool"]);
+        let pipeline = PermissionPipeline::new(&registry);
+        match pipeline.check("probe-alias", serde_json::json!({})).await {
+            CheckOutcome::Allow { .. } => {}
+            CheckOutcome::Deny { error, .. } => {
+                panic!(
+                    "an alias with no interactive rule must not enter the headless approval path: {error:?}"
+                )
+            }
+        }
+    }
+
+    /// A hook that emits `permissionDecision: "deny"` TOGETHER WITH
+    /// `action: "continue"` must still deny: the explicit decision is the
+    /// approval authority and wins over a continue action. (A deny WITHOUT
+    /// an action resolves to `Error` upstream and denies through the
+    /// fallback arm either way — only the deny+continue pair separates the
+    /// explicit-decision arm from the continue arm.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_hook_deny_decision_beats_continue_action() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_path = tmp.path().join("deny-continue.sh");
+        std::fs::write(
+            &hook_path,
+            "#!/bin/sh\nread -r _\necho '{\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"hook vetoed\",\"action\":\"continue\"}'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
+        let hook_runner = crate::hooks::ExternalHookRunner::discover(&[tmp.path().to_path_buf()]);
+
+        let registry = headless_registry(&["probe"]).with_hook_runner(hook_runner);
+        let pipeline = PermissionPipeline::new(&registry);
+        let outcome = pipeline.check("probe", serde_json::json!({})).await;
+        match outcome {
+            CheckOutcome::Deny { error, .. } => match error {
+                Error::PermissionDenied {
+                    reason: DecisionReason::Hook { name },
+                    ..
+                } => assert_eq!(name, "hook vetoed", "the hook's own reason must surface"),
+                other => panic!("expected hook-sourced denial, got: {other:?}"),
+            },
+            CheckOutcome::Allow { .. } => {
+                panic!("an explicit hook deny must deny even when the hook action says continue")
+            }
+        }
+    }
 }
 
 // =====================================================================

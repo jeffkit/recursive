@@ -1324,4 +1324,132 @@ mod tests {
         assert_eq!(report.applied, 0);
         assert_eq!(report.already_applied, 1);
     }
+
+    // ── Batch 44: recovery accounting, marker IO edges, resolve & ordering ──
+
+    /// Every journal entry that recover applies must be counted in
+    /// `report.cleared` — the marker is only removed after its effect is
+    /// durable, so cleared is the audit trail of "how many crashes did we
+    /// replay". (The existing distinct-markers test only pins `applied`.)
+    #[test]
+    fn recover_report_counts_cleared_markers() {
+        let (_home, _pin, reg) = registry();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        for (dir, name) in [(dir_a.path(), "clear-a"), (dir_b.path(), "clear-b")] {
+            reg.write_marker(&PendingMutation::Create {
+                record: crashed_create_record(dir, name),
+            })
+            .unwrap();
+        }
+
+        let report = reg.recover().unwrap();
+        assert_eq!(report.applied, 2);
+        assert_eq!(
+            report.cleared, 2,
+            "each applied marker must land in the cleared count"
+        );
+        assert!(
+            reg.read_markers().unwrap().is_empty(),
+            "replayed markers must be gone after recover"
+        );
+    }
+
+    /// A missing `pending/` directory is the fresh-install shape: no markers
+    /// to replay, not an error. (`at()` creates the dir, so the test removes
+    /// it to reach the read_dir NotFound arm.)
+    #[test]
+    fn read_markers_missing_pending_dir_is_ok_empty() {
+        let (_home, _pin, reg) = registry();
+        std::fs::remove_dir(reg.pending_dir()).unwrap();
+        assert!(
+            reg.read_markers().unwrap().is_empty(),
+            "a missing pending dir means zero markers, not a failure"
+        );
+    }
+
+    /// Any read_dir failure other than NotFound must fail loud — collapsing
+    /// every error into "no markers" would silently skip crash recovery.
+    #[cfg(unix)]
+    #[test]
+    fn read_markers_unreadable_pending_dir_fails_loud() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_home, _pin, reg) = registry();
+        std::fs::set_permissions(reg.pending_dir(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::read_dir(reg.pending_dir()).is_ok() {
+            std::fs::set_permissions(reg.pending_dir(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            eprintln!("skipping: this process reads a mode-000 dir (root?), nothing to observe");
+            return;
+        }
+        let err = reg.read_markers().unwrap_err();
+        std::fs::set_permissions(reg.pending_dir(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a real read_dir failure must surface as Io, got: {err:?}"
+        );
+    }
+
+    /// resolve() answers all three key shapes with the same canonical id:
+    /// the id itself, a path that canonicalizes to it, and the display name.
+    #[test]
+    fn resolve_by_id_canonical_path_and_name_all_hit() {
+        let ws = tempfile::tempdir().unwrap();
+        let id = std::fs::canonicalize(ws.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let index = RegistryIndex {
+            version: REGISTRY_SCHEMA_VERSION,
+            workspaces: vec![WorkspaceRecord {
+                id: id.clone(),
+                display: ws.path().to_string_lossy().into_owned(),
+                name: "proj".into(),
+                created_at: crate::session::chrono_lite_now(),
+                archived: false,
+                sessions: Vec::new(),
+            }],
+        };
+
+        assert_eq!(resolve(&index, &id).unwrap(), id, "the id is its own key");
+        assert_eq!(
+            resolve(&index, ws.path().to_str().unwrap()).unwrap(),
+            id,
+            "a path canonicalizing to the id must resolve"
+        );
+        assert_eq!(
+            resolve(&index, "proj").unwrap(),
+            id,
+            "the display name must resolve to the canonical id"
+        );
+    }
+
+    /// A missing path maps to the workspace-flavored NotFound (with the path
+    /// in the message), not the raw io error — callers branch on the variant.
+    #[test]
+    fn realpath_maps_missing_path_to_workspace_not_found() {
+        let missing = "/nonexistent-registry-realpath-target/dir";
+        match realpath(Path::new(missing)).unwrap_err() {
+            Error::NotFound(msg) => {
+                assert!(msg.contains(missing), "message must name the path: {msg}");
+            }
+            other => panic!("expected NotFound for a missing path, got: {other:?}"),
+        }
+    }
+
+    /// The saved index is kept deterministic (name-first): insertion order
+    /// must not leak into `list()`.
+    #[test]
+    fn create_keeps_index_name_sorted() {
+        let (_home, _pin, reg) = registry();
+        let ws_beta = tempfile::tempdir().unwrap();
+        let ws_alpha = tempfile::tempdir().unwrap();
+        reg.create(ws_beta.path(), Some("beta".into())).unwrap();
+        reg.create(ws_alpha.path(), Some("alpha".into())).unwrap();
+
+        let names: Vec<String> = reg.list().unwrap().into_iter().map(|w| w.name).collect();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
 }
