@@ -226,4 +226,84 @@ mod tests {
         assert!(config_from(getter(&[("LANGFUSE_PUBLIC_KEY", "")])).is_none());
         assert!(config_from(getter(&[("RECURSIVE_OTEL_TRACES_URL", "")])).is_none());
     }
+
+    // The process-env entry point is the seam the exporter actually calls;
+    // the pure `config_from` pins never touch std::env, which is why the
+    // `-> None` body mutant survived batch after batch. Serialize env
+    // mutation like the other env-reading modules (reinject.rs ENV_GUARD
+    // idiom): one process-global lock, vars scrubbed then restored.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remove every key `config_from` reads, apply `vars`, run `f`, restore.
+    fn with_clean_env(vars: &[(&str, &str)], f: impl FnOnce()) {
+        const KEYS: [&str; 10] = [
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "LANGFUSE_OTEL_ENDPOINT",
+            "RECURSIVE_OTEL_TRACES_URL",
+            "LANGFUSE_HOST",
+            "LANGFUSE_SERVICE_NAME",
+            "RECURSIVE_OTEL_SERVICE_NAME",
+            "LANGFUSE_SAMPLE_RATIO",
+            "RECURSIVE_OTEL_SAMPLE_RATIO",
+            "LANGFUSE_REDACT",
+        ];
+        let prev: Vec<(String, Option<String>)> = KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        for k in KEYS {
+            std::env::remove_var(k);
+        }
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        f();
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(&k, &v),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+
+    #[test]
+    fn langfuse_config_from_env_enables_on_the_key_pair() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let _g = env_guard();
+        with_clean_env(
+            &[
+                ("LANGFUSE_PUBLIC_KEY", "pk-test"),
+                ("LANGFUSE_SECRET_KEY", "sk-test"),
+            ],
+            || {
+                let cfg = langfuse_config_from_env()
+                    .expect("a Langfuse key pair must enable the exporter");
+                assert_eq!(
+                    cfg.endpoint,
+                    "https://cloud.langfuse.com/api/public/otel/v1/traces"
+                );
+                assert_eq!(cfg.headers.len(), 1, "key pair → exactly the auth header");
+                assert_eq!(cfg.headers[0].0, "Authorization");
+                assert_eq!(
+                    cfg.headers[0].1,
+                    format!("Basic {}", STANDARD.encode("pk-test:sk-test"))
+                );
+                assert_eq!(cfg.service_name, "recursive");
+                assert_eq!(cfg.sample_ratio, 1.0);
+                assert!(cfg.redact, "redaction defaults on");
+            },
+        );
+        // The same entry point with a scrubbed env stays disabled.
+        with_clean_env(&[], || {
+            assert!(
+                langfuse_config_from_env().is_none(),
+                "no Langfuse/OTLP env → disabled"
+            );
+        });
+    }
 }

@@ -619,6 +619,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reinject_token_estimate_keeps_its_ceiling_unit() {
+        // The estimate is chars/4 + 1; the +1 is the conservative unit that
+        // makes a file landing exactly on the budget still estimate to
+        // budget + 1 and get skipped. 400 ASCII bytes at budget 100 estimate
+        // to 101 > 100 → skipped; a chars/4 * 1 spelling would estimate 100
+        // and admit it.
+        let content = "A".repeat(400);
+        let state = make_state_with(vec![("edge.rs", &content)]);
+        let r = FileReinjector {
+            token_budget: 100,
+            per_file_budget: 5000,
+            ..FileReinjector::new(state)
+        };
+        let msgs = r.reinject(&[]);
+        assert!(
+            msgs.is_empty(),
+            "a file whose estimate is budget+1 must be skipped"
+        );
+
+        // Same file with budget 101 is admitted: the exclusion above sits on
+        // the budget boundary, not on the content.
+        let state = make_state_with(vec![("edge.rs", &content)]);
+        let r = FileReinjector {
+            token_budget: 101,
+            per_file_budget: 5000,
+            ..FileReinjector::new(state)
+        };
+        let msgs = r.reinject(&[]);
+        assert_eq!(msgs.len(), 1, "an estimate of exactly the budget fits");
+    }
+
     // ── reinject_truncates_oversized_file ─────────────────────────────────
 
     #[test]

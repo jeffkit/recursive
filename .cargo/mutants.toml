@@ -1184,6 +1184,24 @@ exclude_re = [
     # batch (positions :36/:158/:171) are pinned, not excluded — see the
     # batch-32 tests in src/workspace/activity.rs.
     "src/workspace/activity\\.rs:80:9: replace <impl ActivityProbe for NoActivityProbe>::active_work -> Vec<ActiveWork> with vec!\\[\\]",
+    # activity.rs :84:9 — the stop twin of the :80:9 entry above, same
+    # identity: the body IS `Vec::new()` and `vec![]` expands to exactly
+    # that, and the trait contract says stop returns the subset actually
+    # stopped, which for a probe with no runtime to ask is always nothing —
+    # every caller observes the same empty Vec, so no test can distinguish
+    # the spellings (there is nothing to distinguish). Batch 32 pinned the
+    # killable siblings (:36/:158/:171) but left this twin out; issue #245
+    # 终判复核 batch 45 (清单 /tmp/b2-batch45.txt) surfaced it as MISSED.
+    # Verified: mutation applied → workspace::activity module green →
+    # restored (negctl /tmp/b2-b45/).
+    # The `vec![Default::default()]` twin at :84:9 stays in scope:
+    # ActiveWork implements no Default (E0277 unviable-when-compiled), and
+    # a future Default would let stop claim work it never stopped — killed
+    # by the batch-32 archive admission tests.
+    # UNLOCK CONDITION: if NoActivityProbe::stop ever grows real logic (a
+    # registry of stoppable handles), the line anchor shifts and the
+    # spelling stops being identity — drop this entry and pin.
+    "src/workspace/activity\\.rs:84:9: replace <impl ActivityProbe for NoActivityProbe>::stop -> Vec<ActiveWork> with vec!\\[\\]",
     # ── Issue #245 compact batch mc1 (主控直落; negctl /tmp/mc1-negctl2.log)
     # retry.rs group_by_user_boundary / truncate_head_for_retry — six
     # true-equivalence exclusions, each verified by applying the mutation

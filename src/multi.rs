@@ -2060,17 +2060,29 @@ mod wall_budget_tests {
     }
 
     /// `now_timestamp` stamps inter-agent messages with wall-clock
-    /// seconds (issue #245 batch 38): a `-> 0` body replacement ages
-    /// every message to the epoch — observable through the bus inbox.
+    /// seconds (issue #245 batch 38): a constant body replacement ages
+    /// every message to the epoch — observable through the bus inbox
+    /// against a wall-clock window taken around the send. The bare
+    /// `> 0` this test grew up with already caught `-> 0`; the surviving
+    /// `-> 1` sibling (batch 45) needs the window, since 1 > 0 holds.
     #[tokio::test]
     async fn task_messages_carry_wallclock_timestamps() {
+        let stamp = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        };
+        let before = stamp();
         let pool = AgentPool::new(Arc::new(MockProvider::new(vec![])), tests::test_config());
         pool.send_task("planner", "coder", "go").await;
+        let after = stamp();
         let inbox = pool.bus.inbox("coder").await;
         assert_eq!(inbox.len(), 1, "fixture: one task message");
         assert!(
-            inbox[0].timestamp > 0,
-            "a sent task must carry an epoch-second timestamp, got {}",
+            (before..=after).contains(&inbox[0].timestamp),
+            "a sent task must carry the wall-clock second it was sent \
+             (window {before}..={after}), got {}",
             inbox[0].timestamp
         );
     }
