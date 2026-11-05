@@ -263,6 +263,19 @@ impl InstallSkill {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     }
 
+    /// The search result matching the TUI-selected slug — this lookup
+    /// doubles as the allow-list check (the choice must be one of the
+    /// results we actually showed).
+    fn selected_item<'a>(items: &'a [SearchItem], slug: &str) -> Option<&'a SearchItem> {
+        items.iter().find(|item| item.slug == slug)
+    }
+
+    /// The confirm-modal answer, as the note it yields: `Some` means the
+    /// TUI declined and the install must not run, `None` means proceed.
+    fn cancel_note(confirmed: bool) -> Option<String> {
+        (!confirmed).then_some("Installation cancelled.".to_string())
+    }
+
     /// Primary download URL (`/download?slug=…`), built through the URL API
     /// so the slug is percent-encoded rather than string-spliced.
     fn download_url(slug: &str) -> Result<String> {
@@ -813,7 +826,7 @@ impl Tool for InstallSkill {
         // of the results we actually showed (that lookup also yields the
         // version used by the CDN fallback).
         Self::validate_slug(&slug)?;
-        let selected = items.iter().find(|item| item.slug == slug).ok_or_else(|| {
+        let selected = Self::selected_item(&items, &slug).ok_or_else(|| {
             Self::tool_error(format!(
                 "TUI selected a skill slug that was not in the search results: '{slug}'"
             ))
@@ -848,8 +861,8 @@ impl Tool for InstallSkill {
             Self::tool_error("TUI did not reply to install confirmation (channel dropped)")
         })?;
 
-        if !confirmed {
-            return Ok("Installation cancelled.".to_string());
+        if let Some(msg) = Self::cancel_note(confirmed) {
+            return Ok(msg);
         }
 
         // ── Install ───────────────────────────────────────────────────────────
@@ -1643,6 +1656,74 @@ mod tests {
         assert!(
             child_stdout.contains("1 passed"),
             "the child must run exactly the re-executed test, got: {child_stdout}"
+        );
+    }
+
+    // ── Issue #245 batch 45: selection allow-list & confirm gate ──────────
+
+    /// `selected_item` is the allow-list: the TUI's choice must resolve to
+    /// the result with the exact slug. An inverted comparison would hand
+    /// back the first *different* result (its `version`/`sha256` then feed
+    /// the CDN fallback and the digest check), and a body replacement to
+    /// `None` would strand every valid selection behind the
+    /// not-in-search-results error.
+    #[test]
+    fn selected_item_matches_the_exact_slug_only() {
+        let items = vec![
+            SearchItem {
+                slug: "alpha".into(),
+                name: "Alpha".into(),
+                description: String::new(),
+                downloads: 1,
+                stars: 0,
+                version: "1.0.0".into(),
+                sha256: None,
+            },
+            SearchItem {
+                slug: "beta".into(),
+                name: "Beta".into(),
+                description: String::new(),
+                downloads: 2,
+                stars: 0,
+                version: "2.0.0".into(),
+                sha256: None,
+            },
+        ];
+        assert_eq!(
+            InstallSkill::selected_item(&items, "beta")
+                .expect("beta is on the list")
+                .slug,
+            "beta",
+            "the exact slug must win even when an earlier sibling differs"
+        );
+        assert_eq!(
+            InstallSkill::selected_item(&items, "alpha")
+                .expect("alpha is on the list")
+                .slug,
+            "alpha",
+            "the first result must not skip itself"
+        );
+        assert!(
+            InstallSkill::selected_item(&items, "gamma").is_none(),
+            "a slug nobody showed must not resolve"
+        );
+    }
+
+    /// The confirm gate: `true` proceeds (no note), `false` cancels with
+    /// the standard note. Both directions are pinned because the gate is
+    /// fail-closed by design — inverting or constant-folding it either
+    /// installs unconfirmed archives or makes confirming impossible.
+    #[test]
+    fn cancel_note_is_some_exactly_when_declined() {
+        assert_eq!(
+            InstallSkill::cancel_note(true),
+            None,
+            "a confirmed install must proceed, not cancel"
+        );
+        assert_eq!(
+            InstallSkill::cancel_note(false).as_deref(),
+            Some("Installation cancelled."),
+            "a declined install must produce the cancel note"
         );
     }
 }

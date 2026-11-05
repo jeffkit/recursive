@@ -312,6 +312,37 @@ mod tests {
         assert_eq!(out.len(), AUDIT_ERR_MAX_BYTES);
     }
 
+    #[test]
+    fn truncate_multibyte_straddle_backs_up_to_boundary_and_terminates() {
+        // The cap lands inside a 3-byte CJK char (bytes 510..=512 of the
+        // string): the boundary walk must back `end` up to byte 510, the
+        // char's leading byte (a boundary; its continuation bytes are not).
+        // Stepping FORWARD would clip after the partial character (the `+=`
+        // twin lands on byte 513, a 513-byte clip), and stepping IN PLACE
+        // never terminates (the `/=` twin is identity — `end /= 1` — so the
+        // walk spins forever). The call runs on a worker thread with a
+        // recv_timeout so a stalled walk turns this test red instead of
+        // wedging the whole suite.
+        let s = format!("{}中x", "a".repeat(510));
+        assert_eq!(s.len(), AUDIT_ERR_MAX_BYTES + 2);
+        assert!(
+            !s.is_char_boundary(AUDIT_ERR_MAX_BYTES),
+            "precondition: the cap must straddle the multibyte char"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(truncate_for_audit(&s)));
+        let (out, truncated) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("boundary walk must terminate (a stalled walk wedges here)");
+        assert!(truncated, "an over-cap string must be flagged as truncated");
+        assert_eq!(
+            out.len(),
+            510,
+            "must clip back to the truncated char's leading byte"
+        );
+        assert_eq!(out, "a".repeat(510));
+    }
+
     // --- blake3_canonical_json ---
 
     #[test]

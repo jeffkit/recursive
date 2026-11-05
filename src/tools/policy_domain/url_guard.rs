@@ -1413,4 +1413,87 @@ mod tests {
         assert_eq!(parse_lenient_ipv4("1.2.3.255"), Some(v4(1, 2, 3, 255)));
         assert_eq!(parse_lenient_ipv4("1.2.3.256"), None);
     }
+
+    // ── Issue #245 batch 45: non-final 255 octet and the env opt-out ──────
+
+    /// A NON-final part of exactly 255 must parse: the `n > 0xFF` gate is
+    /// strict. The malformed table only exercises 256, which every
+    /// comparison twin (`==`/`<`) also rejects — only 255 distinguishes
+    /// them from the strict `>`.
+    #[test]
+    fn parse_lenient_ipv4_admits_255_in_every_nonfinal_part() {
+        assert_eq!(parse_lenient_ipv4("255.0.0.1"), Some(v4(255, 0, 0, 1)));
+        assert_eq!(parse_lenient_ipv4("10.255.0.2"), Some(v4(10, 255, 0, 2)));
+        assert_eq!(parse_lenient_ipv4("255.255.1.3"), Some(v4(255, 255, 1, 3)));
+    }
+
+    /// Test-only guard for process env: holds the global env lock so
+    /// sibling tests never observe the mutation, restores the previous
+    /// value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let lock = crate::test_util::env_lock();
+            let prev = std::env::var_os(key);
+            // SAFETY: the env lock is held for this guard's lifetime.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self {
+                key,
+                prev,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding the env lock (dropped last).
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// `from_env` must actually read [`ALLOW_PRIVATE_DNS_ENV`]: a body
+    /// replaced with a constant (`true` or `false`) would open the SSRF
+    /// guard for every operator who opted out — or close it for every
+    /// proxy deployment that legitimately needs the opt-out — regardless
+    /// of the environment.
+    #[test]
+    fn from_env_honors_the_private_dns_opt_out() {
+        {
+            let _g = EnvGuard::set(ALLOW_PRIVATE_DNS_ENV, Some("1"));
+            assert!(
+                GuardedResolver::from_env().allow_private,
+                "opt-out set ⇒ the guard must be open"
+            );
+        }
+        {
+            let _g = EnvGuard::set(ALLOW_PRIVATE_DNS_ENV, Some("0"));
+            assert!(
+                !GuardedResolver::from_env().allow_private,
+                "'0' is not an opt-out ⇒ the guard stays closed"
+            );
+        }
+        {
+            let _g = EnvGuard::set(ALLOW_PRIVATE_DNS_ENV, None);
+            assert!(
+                !GuardedResolver::from_env().allow_private,
+                "unset ⇒ the guard stays closed"
+            );
+        }
+    }
 }
