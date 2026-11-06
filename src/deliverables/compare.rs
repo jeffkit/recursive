@@ -477,4 +477,66 @@ mod tests {
         let out = unified_diff("f.txt", "a\nb\n", "a\nX\n", usize::MAX, NO_DEADLINE);
         assert!(out.text.contains("@@ -1,2 +1,2 @@"), "{}", out.text);
     }
+
+    #[test]
+    fn cells_budget_boundary_exactly_at_max_is_still_line_compared() {
+        // (999 + 1) * (999 + 1) == MAX_DIFF_TABLE_CELLS exactly. The guard is
+        // `cells > MAX`, so a table of exactly MAX cells is still inside the
+        // budget and must be line-compared, not degraded to a whole-file
+        // replacement. Only budget-path facts are asserted here so the test
+        // stays indifferent to the LCS arithmetic pinned by the golden test.
+        let old: String = (0..999).map(|i| format!("l{i}\n")).collect();
+        let new: String = (0..999)
+            .map(|i| {
+                if i == 500 {
+                    "changed\n".to_string()
+                } else {
+                    format!("l{i}\n")
+                }
+            })
+            .collect();
+        let n = lines(&old).len();
+        let m = lines(&new).len();
+        assert_eq!((n + 1) * (m + 1), MAX_DIFF_TABLE_CELLS);
+        let out = unified_diff("big.txt", &old, &new, 3, NO_DEADLINE);
+        assert!(!out.is_coarse(), "{:?}", out.coarse);
+        assert!(
+            out.text.starts_with("--- a/big.txt\n+++ b/big.txt\n@@ -"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("whole-file replacement"), "{}", out.text);
+    }
+
+    #[test]
+    fn golden_hunks_pin_lcs_table_fill_and_walker_arithmetic() {
+        // Repeated lines put LCS values of 1 and 2 in neighbouring cells, so
+        // any off-by-one row/column read in the table fill, a wrong row
+        // stride, or a wrong walker comparison lands on a different cell and
+        // changes the emitted hunk. Full-text goldens, three hunk shapes; the
+        // third one also catches a walker that reads row 0 instead of row i
+        // (that inflates the "insert" side and flips the Del/Ins decision).
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a\na\nb\na\n",
+                "c\na\na\n",
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n-a\n+c\n a\n-b\n a\n",
+            ),
+            (
+                "a\nb\na\na\n",
+                "c\na\na\n",
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n-a\n-b\n+c\n a\n a\n",
+            ),
+            (
+                "a\nb\nc\nb\n",
+                "b\na\na\nb\n",
+                "--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,4 @@\n-a\n b\n-c\n+a\n+a\n b\n",
+            ),
+        ];
+        for (old, new, expected) in cases {
+            let out = unified_diff("f.txt", old, new, 3, NO_DEADLINE);
+            assert!(!out.is_coarse(), "{:?}", out.coarse);
+            assert_eq!(out.text, *expected, "old={old:?} new={new:?}");
+        }
+    }
 }
