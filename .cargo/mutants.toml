@@ -1625,4 +1625,36 @@ exclude_re = [
     # `{a}}` collapsing rule), the stale window gains observable effect —
     # drop this entry and pin.
     "src/tools/http_call\\.rs:573:26: replace \\+ with \\- in placeholders",
+    # ── Issue #245 batch 46 (B1 seat, /tmp/b1-batch46.txt 14 条; 11 pinned
+    # by cells_budget_boundary_* and golden_hunks_* in compare.rs; the two
+    # entries below are the seat-recorded true equivalences adjudicated by
+    # the controller 11-07; the third family member — :165 elapsed() >
+    # deadline → >= — was NOT exempted: the controller extracted it into
+    # the pure `deadline_hit` same day, so the boundary is a pinned unit
+    # fact instead of an exemption) ─────────────────────────────────────
+    # truncate_at_char_boundary :69:15 — `end > 0` → `>=`: end is usize, so
+    # `>= 0` is vacuously true; the body additionally requires
+    # `!s.is_char_boundary(end)` and is_char_boundary(0) is true per the
+    # std contract (byte 0 is always a boundary), so end==0 never enters
+    # the loop body and the `end -= 1` underflow is unreachable. Byte-exact
+    # same result for every input. The killable siblings (`>` → `==` skips
+    # the back-off mid-char, `<` underflows immediately) stay in scope.
+    # Controller-verified against source 11-07 (line 69 read independently).
+    # UNLOCK CONDITION: if the loop is ever rewritten decrement-first
+    # (end -= 1 before the boundary test), end==0 becomes reachable — drop
+    # this entry and pin.
+    "src/deliverables/compare\\.rs:69:15: replace > with >= in truncate_at_char_boundary",
+    # unified_diff walker :201:72 — B-read `table[i * stride + (j + 1)]` →
+    # `table[i * stride + (j * 1)]`: the else-if runs only when
+    # old[i] != new[j], and the fill at the mismatch arm stores
+    # t[i][j] = max(t[i+1][j], t[i][j+1]) = max(A, B). The mutated compare
+    # A >= t[i][j] ≡ A >= max(A, B) ≡ A >= B (A >= A is vacuous) — the Del/
+    # Ins decision is identical for every input. Seat evidence: verbatim
+    # Python mirror of the algorithm searched 28,560 candidate inputs
+    # ({a,b,c} × len ≤ 4 × ctx ∈ {1,3}) — zero kill vectors, matching the
+    # hand proof (/tmp/b46-b1/sim.py). Controller-verified algebra 11-07.
+    # UNLOCK CONDITION: if the mismatch merge rule ever stops being
+    # max(A, B) (e.g. tie-breaking by direction), the identity breaks —
+    # drop this entry and pin the walker.
+    "src/deliverables/compare\\.rs:201:72: replace \\+ with \\* in unified_diff",
 ]

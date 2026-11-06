@@ -72,6 +72,15 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
+/// Deadline verdict for the row-fill loop, extracted as a pure function so
+/// the boundary is directly pinnable: `elapsed == deadline` is NOT a hit.
+/// Inline at the call site this `>` was untestable (nanosecond-exact
+/// equality at a loop-top check is not deterministically observable
+/// without a clock seam); as a pure function the boundary is a unit fact.
+fn deadline_hit(elapsed: Duration, deadline: Duration) -> bool {
+    elapsed > deadline
+}
+
 fn file_header(path: &str) -> String {
     format!("--- a/{path}\n+++ b/{path}\n")
 }
@@ -162,7 +171,7 @@ pub fn unified_diff(
     // `table[i * stride + j]` = LCS length of old[i..] and new[j..].
     let mut table = vec![0u32; cells];
     for i in (0..n).rev() {
-        if started.elapsed() > deadline {
+        if deadline_hit(started.elapsed(), deadline) {
             return whole_file(
                 path,
                 &old_lines,
@@ -476,6 +485,19 @@ mod tests {
     fn huge_context_lines_do_not_overflow() {
         let out = unified_diff("f.txt", "a\nb\n", "a\nX\n", usize::MAX, NO_DEADLINE);
         assert!(out.text.contains("@@ -1,2 +1,2 @@"), "{}", out.text);
+    }
+
+    #[test]
+    fn deadline_hit_equal_elapsed_is_not_a_hit_and_overrun_is() {
+        // The batch-46 :165 `>` mutant family (→ >= / == / < / <=) moved into
+        // the pure `deadline_hit`; the boundary is now a direct unit fact:
+        // elapsed exactly equal to deadline is still inside budget, while
+        // any overrun (and nothing else) is a hit. Kills all four sibling
+        // mutations in one stroke.
+        let d = Duration::from_millis(100);
+        assert!(!deadline_hit(d, d));
+        assert!(deadline_hit(d + Duration::from_nanos(1), d));
+        assert!(!deadline_hit(d - Duration::from_nanos(1), d));
     }
 
     #[test]
