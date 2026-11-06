@@ -539,6 +539,57 @@ mod tests {
     #[tokio::test]
     // Same rationale as `list_audit_filters_and_scopes_to_the_caller`.
     #[allow(clippy::await_holding_lock)]
+    async fn list_audit_without_verify_reports_a_broken_log_as_an_error() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        crate::audit_log::set_log_path(&path).expect("bind");
+        crate::audit_log::emit(
+            AuditActor::new("alice", Some("acme".into())),
+            None,
+            AuditAction::AuthFailure {
+                reason: "bad key".into(),
+            },
+        );
+        let mut text = std::fs::read_to_string(&path).expect("read");
+        text.push_str("{ truncated\n");
+        std::fs::write(&path, text).expect("write");
+
+        // The empty-list-with-verdict answer is reserved for callers that
+        // asked for chain verification; without `?verify=true` a broken log
+        // must surface as the internal error, never as a silent empty list.
+        let result = list_audit(
+            Query(AuditQueryParams {
+                verify: false,
+                ..Default::default()
+            }),
+            Extension(admin()),
+        )
+        .await;
+
+        match result {
+            Ok(body) => {
+                panic!("a broken audit log must be an error without a verify request, got {body:?}")
+            }
+            Err(e) => {
+                assert_eq!(
+                    e.status,
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the broken log is a server-side failure"
+                );
+                assert!(
+                    e.message.contains("audit log read failed"),
+                    "unexpected message: {}",
+                    e.message
+                );
+            }
+        }
+        crate::audit_log::clear();
+    }
+
+    #[tokio::test]
+    // Same rationale as `list_audit_filters_and_scopes_to_the_caller`.
+    #[allow(clippy::await_holding_lock)]
     async fn export_audit_returns_ndjson_scoped_to_the_caller() {
         let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
