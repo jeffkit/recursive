@@ -914,6 +914,22 @@ mod tests {
         assert_eq!(parsed["reason"], "not needed");
     }
 
+    #[test]
+    fn request_plan_mode_tool_is_deferred_and_not_readonly() {
+        // kills `replace <impl Tool for RequestPlanModeTool>::is_deferred -> bool with false`
+        // kills `replace <impl Tool for RequestPlanModeTool>::is_readonly -> bool with true`
+        let gate = Arc::new(PlanModeRequestGate::new());
+        let tool = RequestPlanModeTool::new(gate, Arc::new(NullSink));
+        assert!(
+            tool.is_deferred(),
+            "RequestPlanModeTool must be deferred (it blocks on a human decision)"
+        );
+        assert!(
+            !tool.is_readonly(),
+            "RequestPlanModeTool must NOT be readonly (same external-interaction family as exit_plan_mode)"
+        );
+    }
+
     // -- PlanApprovalGate::pending_plan -------------------------------------
 
     #[test]

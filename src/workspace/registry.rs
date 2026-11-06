@@ -1426,6 +1426,54 @@ mod tests {
         );
     }
 
+    /// A path key that is *not* byte-equal to any id but canonicalizes to one
+    /// must resolve via the canonicalize branch to that workspace — never to a
+    /// sibling. The trailing-slash spelling keeps the key byte-different from
+    /// the id on every platform: on Linux `/tmp` has no symlink layer, so
+    /// `tempdir.path()` alone is byte-equal to the id and the exact-id branch
+    /// would answer first, leaving the canonicalize branch untested (that is
+    /// how the `== → !=` mutant survived CI while macOS killed it).
+    #[test]
+    fn resolve_path_spelling_canonicalizing_to_a_hits_that_workspace_not_sibling() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let canonical_id = |d: &tempfile::TempDir| {
+            std::fs::canonicalize(d.path())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let (id_a, id_b) = (canonical_id(&dir_a), canonical_id(&dir_b));
+        let record = |id: String, dir: &tempfile::TempDir, name: &str| WorkspaceRecord {
+            id,
+            display: dir.path().to_string_lossy().into_owned(),
+            name: name.into(),
+            created_at: crate::session::chrono_lite_now(),
+            archived: false,
+            sessions: Vec::new(),
+        };
+        let index = RegistryIndex {
+            version: REGISTRY_SCHEMA_VERSION,
+            workspaces: vec![
+                record(id_a.clone(), &dir_a, "alpha"),
+                record(id_b.clone(), &dir_b, "beta"),
+            ],
+        };
+
+        // Kills `replace == with != in resolve`: with `!=` the find skips the
+        // matching record and returns the first *non-matching* sibling.
+        assert_eq!(
+            resolve(&index, &format!("{id_a}/")).unwrap(),
+            id_a,
+            "a spelling that canonicalizes to A must resolve to A, not its sibling"
+        );
+        assert_eq!(
+            resolve(&index, &format!("{id_b}/")).unwrap(),
+            id_b,
+            "the sibling's spelling must resolve to B in turn, not to A's id"
+        );
+    }
+
     /// A missing path maps to the workspace-flavored NotFound (with the path
     /// in the message), not the raw io error — callers branch on the variant.
     #[test]
