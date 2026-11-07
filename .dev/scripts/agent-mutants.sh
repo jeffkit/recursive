@@ -53,6 +53,15 @@ FEATURES="test-utils,anthropic,http,mcp,web_fetch,web_search,skill-hub,acp,coord
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 if [[ "$JOBS" -gt 8 ]]; then JOBS=8; fi
 
+# cargo-mutants --exclude-re patterns arriving via CI matrix dispatch cannot
+# travel as raw text: the workflow expands $SHARD_FILES unquoted (word split +
+# glob), so regex metacharacters ([ ( * $) get eaten or rewritten before this
+# script ever sees them. The safe channel is base64: the matrix carries
+# `--exclude-re-b64 <b64>` pairs (metachar-free tokens), and we decode here —
+# inside a quoted assignment — then append to the cargo invocation as a quoted
+# array, never touching the unquoted positional expansion. (#245 终验三轮)
+EXCL_RE=()
+
 if ! command -v cargo-mutants >/dev/null 2>&1; then
   echo "error: cargo-mutants not installed. Run: cargo install cargo-mutants" >&2
   exit 2
@@ -69,6 +78,10 @@ while [[ $# -gt 0 ]]; do
     --jobs=*)
       JOBS="${1#--jobs=}"
       shift
+      ;;
+    --exclude-re-b64)
+      EXCL_RE+=(--exclude-re "$(printf '%s' "${2:?--exclude-re-b64 requires a value}" | base64 -d)")
+      shift 2
       ;;
     *)
       ARGS+=("$1")
@@ -170,7 +183,9 @@ run_mutants() {
   # blanket pass would false-green those missed mutants, so check the report text.
   local rc=0 out
   out=$(mktemp)
-  cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+  # ${EXCL_RE[@]+…}: safe empty-array expansion under bash 3.2 + set -u.
+  cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" \
+    ${EXCL_RE[@]+"${EXCL_RE[@]}"} "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
   if [[ "$rc" -eq 3 ]]; then
     if grep -q "MISSED" "$out"; then
       echo "note: cargo-mutants exited 3 but the report contains MISSED mutants — treating as FAILURE" >&2
