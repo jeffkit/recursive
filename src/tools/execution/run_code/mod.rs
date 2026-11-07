@@ -783,7 +783,14 @@ return await Slow();
             return;
         }
         let tool = RunCode::new(registry_with(Arc::new(Double))).with_limits(RunCodeLimits {
-            timeout: Duration::from_millis(400),
+            // 2000ms: the budget only has to stay authoritative (status=timeout,
+            // bounded joins) — it must also be long enough for a cold `node`
+            // start under a 4-way parallel mutation-build load. At 400ms a
+            // loaded runner can kill node before it prints the deny line
+            // (empty output → false red; CI run 42384713115 job 128439562925),
+            // so the budget here is generous and the 15s ceiling below still
+            // pins the pipe-holder bound.
+            timeout: Duration::from_millis(2000),
             ..RunCodeLimits::default()
         });
         let code = r#"
