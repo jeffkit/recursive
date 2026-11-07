@@ -2351,6 +2351,111 @@ mod tests {
         );
     }
 
+    /// Cancelling an interrupt whose tool call has NO persisted result
+    /// anywhere must INJECT the sentinel — and the injection must be
+    /// durable on disk (issue #57), not just spliced into the in-memory
+    /// seed. The rewrite half of that persistence gate (a tool row already
+    /// on disk) is covered by
+    /// [`prepare_run_resume_must_cover_all_open_interrupts`]; here the
+    /// transcript carries no tool row for the call, so the only way the
+    /// sentinel reaches the persisted transcript is the inject arm of
+    /// `apply_resume_tool_results`.
+    #[test]
+    fn prepare_run_resume_injected_cancel_sentinel_lands_on_disk() {
+        let ws_tmp = IsolatedWorkspace::new();
+        let ws = ws_tmp.path();
+        let dir = agui_session_dir(ws, "t-inject").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // The inject arm of apply_resume_tool_results appends through the
+        // SessionWriter, which needs the native session meta on disk.
+        drop(
+            crate::agui_session::open_thread_writer(
+                ws,
+                "t-inject",
+                "goal",
+                "deepseek-chat",
+                "deepseek",
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        write_interrupts(
+            &dir,
+            &[OpenInterrupt {
+                interrupt_id: "i1".into(),
+                tool_call_id: "tc-9".into(),
+                reason: "tool_call".into(),
+                message: None,
+                created_at: "now".into(),
+            }],
+        );
+        // `tc-9` is a dangling intermediate call: the seed-rebuild splice
+        // only answers the LAST assistant row carrying tool_calls, and the
+        // later round (`tc-10`) takes that slot — so no tool result exists
+        // for `tc-9` on disk or in the spliced seed. The seed rebuild still
+        // answers `tc-10` with a skip marker in memory only; nothing of it
+        // reaches the persisted transcript.
+        let lines = [
+            serde_json::to_string(&user("run the checks")).unwrap(),
+            serde_json::to_string(&crate::message::Message::assistant_with_tool_calls(
+                "running it",
+                vec![crate::llm::ToolCall {
+                    id: "tc-9".into(),
+                    name: "Bash".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                }],
+            ))
+            .unwrap(),
+            serde_json::to_string(&crate::message::Message::assistant_with_tool_calls(
+                "one more round",
+                vec![crate::llm::ToolCall {
+                    id: "tc-10".into(),
+                    name: "Bash".into(),
+                    arguments: serde_json::json!({"command": "cargo fmt"}),
+                }],
+            ))
+            .unwrap(),
+        ];
+        std::fs::write(dir.join("transcript.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let resume = vec![agui_protocol::Resume {
+            interrupt_id: "i1".into(),
+            status: agui_protocol::ResumeStatus::Cancelled,
+            payload: None,
+        }];
+        let prepared = prepare_run(AguiRunInput {
+            workspace: ws,
+            input: &run_input("t-inject", Some(resume)),
+        })
+        .expect("resume prepares");
+        let seed = prepared.seed_transcript.expect("seed");
+        let inj = seed
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("tc-9"))
+            .expect("cancelled sentinel injected into the seed");
+        assert_eq!(inj.content, "[interrupt cancelled by user]");
+
+        // The same injection must land on disk — runs append, so a later
+        // resume of this thread re-seeds whatever is persisted here.
+        let disk = std::fs::read_to_string(dir.join("transcript.jsonl")).unwrap();
+        let entry = disk
+            .lines()
+            .find_map(|l| {
+                serde_json::from_str::<crate::session::TranscriptEntry>(l)
+                    .ok()
+                    .filter(|e| e.tool_call_id.as_deref() == Some("tc-9"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "cancelled sentinel must be appended to the persisted transcript, got: {disk}"
+                )
+            });
+        assert_eq!(entry.tool_call_id.as_deref(), Some("tc-9"));
+        assert_eq!(entry.content, "[interrupt cancelled by user]");
+    }
+
     /// A compacted AG-UI thread whose last run was interrupted on `tc-1`:
     /// `[prompt, turn 1, answer 1, <boundary>, SUMMARY, turn 2, answer 2,
     /// assistant(tc-1), tool(tc-1 denied)]`, with the interrupt left open.
@@ -3147,6 +3252,24 @@ mod tests {
         assert_eq!(custom.value["hookEvent"], "PostToolUse");
         assert_eq!(custom.value["hookName"], "lint");
         assert_eq!(custom.value["lastLine"], "3 warnings");
+
+        let events = conv.convert(&AgentEvent::HookFinished {
+            hook_event: "Stop".into(),
+            hook_name: "lint".into(),
+            outcome: "success".into(),
+            duration_ms: 42,
+        });
+        let [ev] = &events[..] else {
+            panic!("HookFinished must forward exactly one event, got {events:?}")
+        };
+        let ag::Event::Custom(custom) = ev else {
+            panic!("HookFinished must forward as Custom, got {ev:?}")
+        };
+        assert_eq!(custom.name, "agui-tui/hook_finished");
+        assert_eq!(custom.value["hookEvent"], "Stop");
+        assert_eq!(custom.value["hookName"], "lint");
+        assert_eq!(custom.value["outcome"], "success");
+        assert_eq!(custom.value["durationMs"], 42);
 
         let events = conv.convert(&AgentEvent::HookSystemMessage {
             text: "hook says hi".into(),
