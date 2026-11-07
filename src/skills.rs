@@ -2646,6 +2646,77 @@ mod tests {
         assert_eq!(params[0].default, Some("fallback".to_string()));
     }
 
+    #[test]
+    fn parse_skill_meta_globs_blank_line_still_terminates_and_parses() {
+        // A blank line inside the `globs:` list must advance the scan index by
+        // exactly one. `*=` stalls on the blank line forever and `-=` bounces
+        // between the blank line and its neighbour; both spins are unbounded,
+        // so the parse runs on a worker thread behind a bounded recv_timeout:
+        // pristine completes instantly, either mutant trips the deadline and
+        // the assertion panics instead of hanging the whole harness.
+        let content =
+            "---\nname: x\ndescription: d\nmode: globs\nglobs:\n\n  - \"*.rs\"\n---\nbody";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_content = content.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(parse_skill_meta(&worker_content, &fake_dir()));
+        });
+        let (name, _desc, mode, _triggers, _hint, _depends_on, _params, globs) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("parse_skill_meta must terminate on a blank line inside the globs list");
+        assert_eq!(name, "x");
+        assert_eq!(mode, SkillMode::Globs, "explicit mode: globs must survive");
+        assert_eq!(
+            globs,
+            vec!["*.rs".to_string()],
+            "pattern after the blank line must still be captured"
+        );
+    }
+
+    #[test]
+    fn parse_skill_meta_params_first_key_no_index_underflow() {
+        // `params:` as the very first frontmatter key with the opening
+        // delimiter glued to it ("---params:"): strip_prefix("---") leaves no
+        // leading newline, so the block-advance at the `params:` arm runs with
+        // scan index 0 and `-=` underflows usize there (debug: "attempt to
+        // subtract with overflow" panic; release: wraps to usize::MAX and
+        // silently skips the whole block). Either way this pin must stay green
+        // on the pristine parser.
+        let content = "---params:\n  - name: region\n    description: AWS region\n    default: us-east-1\n---\nbody";
+        let (name, desc, _mode, _triggers, _hint, _depends_on, params, _globs) =
+            parse_skill_meta(content, &fake_dir());
+        assert_eq!(name, "my-skill", "no name key means dir-name fallback");
+        assert_eq!(desc, "body", "description falls back to first body line");
+        assert_eq!(params.len(), 1, "params block must be parsed");
+        assert_eq!(params[0].name, "region");
+        assert_eq!(params[0].description, "AWS region");
+        assert_eq!(params[0].default, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_skill_meta_param_sub_block_stops_at_unindented_line() {
+        // The per-param sub-block scan must stop at a column-0 line (indent
+        // guard: !starts_with(' ') && !starts_with('\t')). Deleting the second
+        // `!` makes the break condition unsatisfiable, so a top-level
+        // `description:` following the params block leaks into the param's
+        // description instead of ending the sub-block.
+        let content = "---\nname: x\nparams:\n  - name: region\n    default: us\ndescription: leaked\n---\nbody";
+        let (name, desc, _mode, _triggers, _hint, _depends_on, params, _globs) =
+            parse_skill_meta(content, &fake_dir());
+        assert_eq!(name, "x");
+        assert_eq!(
+            desc, "body",
+            "post-params top-level keys are ignored; description falls back to body"
+        );
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].name, "region");
+        assert_eq!(
+            params[0].description, "",
+            "unindented line must terminate the param sub-block, not leak into it"
+        );
+        assert_eq!(params[0].default, Some("us".to_string()));
+    }
+
     // ── discover_refs unit tests ─────────────────────────────────────────────
 
     #[test]
