@@ -2852,7 +2852,13 @@ data: [DONE]
                 initial_backoff: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(2),
             })
-            .with_retry_network_budget(Some(Duration::from_millis(80)));
+            .with_retry_network_budget(Some(Duration::from_millis(800)));
+        // 800ms (was 80): the pin's semantics are "the time window outlives the
+        // count floor", which needs enough slow-attempt iterations to fit. On
+        // an idle or loaded machine a single attempt can take ~100ms+, so at
+        // 80ms only 2 attempts fit and `recs.len() > 2` false-reds (local
+        // repro 2026-11-08, batch-48 experiment). The runaway bound below
+        // still pins that the budget stops the loop.
 
         let started = std::time::Instant::now();
         let result = provider
