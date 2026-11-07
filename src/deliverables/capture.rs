@@ -413,4 +413,28 @@ mod tests {
         assert!(!Fingerprint::Unreadable { bytes: 9 }
             .same_content(&Fingerprint::Unreadable { bytes: 8 }));
     }
+
+    #[test]
+    fn oversized_pairs_compare_by_the_documented_size_rule() {
+        // The Oversized/Oversized arm is the documented contract: size is
+        // the only signal captured for over-budget files, so equal sizes
+        // count as "same content" (an in-place same-size edit is invisible
+        // by design). Losing the arm would fall through to `_ => false`
+        // and reclassify every unchanged oversized file as changed.
+        let a = Fingerprint::Oversized { bytes: 4096 };
+        assert!(a.same_content(&Fingerprint::Oversized { bytes: 4096 }));
+        assert!(!a.same_content(&Fingerprint::Oversized { bytes: 4097 }));
+    }
+
+    #[test]
+    fn contains_is_false_for_absent_addresses() {
+        let tmp = TempDir::new().unwrap();
+        let store = CaptureStore::open(tmp.path()).unwrap();
+        let sha = store.put(b"payload").unwrap();
+        assert!(store.contains(&sha), "the just-stored blob is contained");
+        // Nothing else was ever written: a well-formed 40-hex address and
+        // a short one must both read as absent.
+        assert!(!store.contains("0000000000000000000000000000000000000000"));
+        assert!(!store.contains("deadbeef"));
+    }
 }

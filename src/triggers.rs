@@ -835,6 +835,23 @@ mod tests {
     }
 
     #[test]
+    fn next_after_horizon_is_exclusive() {
+        // A Feb-29 schedule whose next window lands exactly ON the scan
+        // horizon must stay unfired: the bound is exclusive. Starting one
+        // minute before 2100-02-26 puts the first candidate exactly
+        // HORIZON_DAYS (1464) before 2104-02-29 00:00Z, and 2100 is a
+        // non-leap century year, so no Feb 29 sits strictly inside the
+        // window — the correct answer is None. An inclusive bound would
+        // fire the horizon instant itself.
+        let feb29_2104 = parse_rfc3339_utc("2104-02-29T00:00:00Z").expect("fixture");
+        let from = feb29_2104 - HORIZON_DAYS * 86_400 - 60;
+        assert_eq!(next_after("0 0 29 2 *", from), None);
+        // One minute of scan progress moves the horizon past the window
+        // and the same schedule IS found (guards a false-green None).
+        assert_eq!(next_after("0 0 29 2 *", from + 60), Some(feb29_2104));
+    }
+
+    #[test]
     fn next_after_invalid_expr_is_none_not_panic() {
         assert_eq!(next_after("not a cron", monday_0900()), None);
     }
