@@ -2555,6 +2555,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_skill_meta_body_after_frontmatter_feeds_description_fallback() {
+        // Frontmatter WITHOUT `description:` + a body after the closing `---`:
+        // the fallback description must come from the body's first non-empty
+        // line, taken strictly *after* the closing delimiter (end + 3), never
+        // from bytes straddling it.
+        let content = "---\nname: abc\n---\nBody line.\n\nMore.";
+        let (name, desc, _mode, _triggers, _hint, _depends_on, _params, _globs) =
+            parse_skill_meta(content, &fake_dir());
+        assert_eq!(name, "abc", "frontmatter name must win");
+        assert_eq!(
+            desc, "Body line.",
+            "fallback description must be the first body line after the closing ---"
+        );
+
+        // Closing delimiter flush against the opening one: `end` is 0, so the
+        // body slice start must not underflow and the fallback description is
+        // simply empty.
+        let content = "------";
+        let (name, desc, ..) = parse_skill_meta(content, &fake_dir());
+        assert_eq!(
+            name, "my-skill",
+            "no name in frontmatter → dir-name fallback"
+        );
+        assert_eq!(desc, "", "empty body → empty fallback description");
+    }
+
+    #[test]
     fn parse_skill_meta_mode_always() {
         let content = "---\nname: x\ndescription: d\nmode: always\n---\nbody";
         let (_n, _d, mode, ..) = parse_skill_meta(content, &fake_dir());
