@@ -1657,4 +1657,64 @@ exclude_re = [
     # max(A, B) (e.g. tie-breaking by direction), the identity breaks —
     # drop this entry and pin the walker.
     "src/deliverables/compare\\.rs:201:72: replace \\+ with \\* in unified_diff",
+    # ── Issue #245 batch 48 (B1 capture/triggers + B2 skills; the seven
+    # entries below are the equivalence claims adjudicated by the controller
+    # 11-08 — every one independently re-derived from source before landing;
+    # the other seven MISSED of the harvest are pinned by
+    # oversized_pairs_compare_by_the_documented_size_rule,
+    # contains_is_false_for_absent_addresses,
+    # next_after_horizon_is_exclusive (B1) and
+    # parse_skill_meta_globs_blank_line_still_terminates_and_parses,
+    # parse_skill_meta_params_first_key_no_index_underflow,
+    # parse_skill_meta_param_sub_block_stops_at_unindented_line (B2)) ──
+    # capture.rs sha1_hex :67:36 — `|` → `^` in the SHA-1 Ch round
+    # `(b & c) | ((!b) & d)`: this IS the textbook xor form of the same
+    # function — for every (b,c,d) bit triple, b ? c : d equals
+    # (b&c) ^ ((!b)&d) (b=1: c^0=c; b=0: 0^d=d). Word-wide equality follows
+    # from bitwise independence. Seat evidence: 100k random-word fuzz with a
+    # precedence-check compile (/tmp/b1-batch48/sha1_search.py,
+    # precedence_check.rs). The killable `&`-siblings on the same
+    # expressions stay in scope (pinned by the published SHA-1 vectors).
+    # UNLOCK CONDITION: if the round constants/functions are ever rewritten
+    # away from the standard SHA-1 Ch/Maj forms, re-derive before keeping.
+    "src/deliverables/capture\\.rs:67:36: replace \\| with \\^ in sha1_hex",
+    # capture.rs sha1_hex :69:37 — `|` → `^` in the Maj round, first pipe:
+    # `(b&c) ^ (b&d) | (c&d)` (precedence: ^ binds tighter) — full 8-case
+    # bitwise enumeration equals Maj(b,c,d): the xor term selects exactly the
+    # b=1-and-exactly-one-of-c,d cases where the third AND is 0, and the
+    # trailing (c&d) covers the remaining two-set cases. Controller verified
+    # all 8 triples 11-08. UNLOCK CONDITION: same as above.
+    "src/deliverables/capture\\.rs:69:37: replace \\| with \\^ in sha1_hex",
+    # capture.rs sha1_hex :69:47 — second pipe of the same Maj round:
+    # `(b&c) | ((b&d) ^ (c&d))` — mirror-image partition (xor covers
+    # c=1-and-exactly-one-of-b,d), same 8-case enumeration. UNLOCK CONDITION:
+    # same as above.
+    "src/deliverables/capture\\.rs:69:47: replace \\| with \\^ in sha1_hex",
+    # skills.rs :939:23 — `i += 1` → `i *= 1` after the `params:` header:
+    # leaving i on the "params:" line itself is absorbed because the line
+    # falls into the comment-body `else if !trimmed.is_empty() &&
+    # !trimmed.starts_with('-')` arm (see the :965 entries — that arm's body
+    # is a bare comment) and the loop advances via its trailing `i += 1`,
+    # reproducing the pristine trajectory with one extra iteration. Edge
+    # forms (params: as first glued key, params: as last line) traced by
+    # hand and by planted-run 22/22 green (/tmp/b2-batch48/eqctl-939-mul.log).
+    # The killable `+= → -=` sibling at the same coordinate underflows usize
+    # at i=0 and is pinned by
+    # parse_skill_meta_params_first_key_no_index_underflow.
+    # UNLOCK CONDITION: if the comment-only arm ever gains a statement, or
+    # the loop's trailing advance moves, the absorption breaks — drop this
+    # entry and pin.
+    "src/skills\\.rs:939:23: replace \\+ with \\* in parse_skill_meta",
+    # skills.rs :965:43 / :63 / :66 — the guard `!trimmed.is_empty() &&
+    # !trimmed.starts_with('-')` guards a body that is a bare comment ("//
+    # Unknown indented line — skip"): every outcome falls through to the
+    # same trailing `i += 1`, so the condition is semantically dead and ALL
+    # mutations of it (! delete ×2, && → ||) are true equivalences.
+    # Controller verified the branch body is comment-only at the tip 11-08.
+    # UNLOCK CONDITION: if the arm ever gains a statement (e.g. a trace or
+    # metric for unknown indented lines), the condition becomes live — drop
+    # all three entries and pin the guard.
+    "src/skills\\.rs:965:43: delete ! in parse_skill_meta",
+    "src/skills\\.rs:965:63: replace && with \\|\\| in parse_skill_meta",
+    "src/skills\\.rs:965:66: delete ! in parse_skill_meta",
 ]
