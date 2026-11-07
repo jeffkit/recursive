@@ -54,6 +54,10 @@ on:
         description: 'recursive-agent 分片模式：JSON matrix（{"shard": [["src/a.rs", …], …]}）。设置后跳过 full/regression，按文件清单并行跑 agent 分片（每个 ≤~850 变异体，330min 内可完成；--all 全量在 4 核 runner 实证两度超 330min，见 run 40598348438 / 40927380347）'
         type: string
         default: ""
+      shard_jobs:
+        description: '分片腿内 cargo-mutants 并发拷贝数（--jobs）。默认 4；重变异体片（慢测试族：anthropic 流式/web_search/triggers 等）在 16GB runner 上 4 并发曾两轮整体楔死（基线后零结果直至 runner 回收 143，见 run 42209001992 / 42310894599 的 hooks|llm/mock|credentials|auto_classifier|checkpoint_log|skills 各腿）——救援重派用 2。'
+        type: string
+        default: "4"
   schedule:
     - cron: "37 18 1,15 * *"
 
@@ -462,6 +466,7 @@ jobs:
       - name: Run agent mutation shard
         env:
           SHARD_FILES: ${{ join(matrix.shard, ' ') }}
+          SHARD_JOBS: ${{ inputs.shard_jobs }}
         run: |
           echo "shard: $(echo $SHARD_FILES | wc -w) files"
-          bash .dev/scripts/agent-mutants.sh --jobs 4 $SHARD_FILES
+          bash .dev/scripts/agent-mutants.sh --jobs "${SHARD_JOBS:-4}" $SHARD_FILES
