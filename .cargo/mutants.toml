@@ -1740,7 +1740,7 @@ exclude_re = [
     # stops being trivially true at cursor == hunk-start (condition or body
     # edit), or the outer advance moves relative to `let mut last`, the
     # absorption breaks — drop this entry and pin.
-    "src/deliverables/compare\\.rs:233:16: replace \\+= with \\* in unified_diff",
+    "src/deliverables/compare\\.rs:233:16: replace \\+= with \\*= in unified_diff",
     # skills.rs :963:39 — param-entry backup `i -= 1` → `/= 1` (identity):
     # deleting the backup. The backup exists so the OUTER loop re-processes
     # the entry line; in every terminating form the re-processed line lands
@@ -1757,5 +1757,5 @@ exclude_re = [
     # the pristine consecutive-entry hang is a latent production bug worth a
     # follow-up fix; when that fix lands the backup becomes live — drop this
     # entry and pin.
-    "src/skills\\.rs:963:39: replace \\- with \\/ in parse_skill_meta",
+    "src/skills\\.rs:963:39: replace \\-= with \\/= in parse_skill_meta",
 ]
