@@ -1704,7 +1704,7 @@ exclude_re = [
     # UNLOCK CONDITION: if the comment-only arm ever gains a statement, or
     # the loop's trailing advance moves, the absorption breaks — drop this
     # entry and pin.
-    "src/skills\\.rs:939:23: replace \\+ with \\* in parse_skill_meta",
+    "src/skills\\.rs:939:23: replace \\+= with \\*= in parse_skill_meta",
     # skills.rs :965:43 / :63 / :66 — the guard `!trimmed.is_empty() &&
     # !trimmed.starts_with('-')` guards a body that is a bare comment ("//
     # Unknown indented line — skip"): every outcome falls through to the
