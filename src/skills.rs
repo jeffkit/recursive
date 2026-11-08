@@ -1344,6 +1344,40 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
+    /// Append-only shared sink the capture subscriber formats into
+    /// (same harness as `tasks/wakeup_store.rs`).
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture buffer")
+                .extend_from_slice(chunk);
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local WARN-level tracing subscriber and return
+    /// `(f's result, everything it formatted)` — parallel-safe, no
+    /// process-global subscriber, no env mutation.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || LogCapture(sink.clone()))
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let out = buffer.lock().expect("log capture buffer").clone();
+        let logs = String::from_utf8(out).expect("tracing output is utf-8");
+        (value, logs)
+    }
+
     // --- Goal #76: SkillSource trait + StaticSkillSource ---
 
     #[test]
@@ -2509,6 +2543,50 @@ mod tests {
         // Zero → falls back to default (a budget must be positive)
         std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "0");
         assert_eq!(default_skill_index_budget(), 8000);
+
+        // Restore (or clear if it was unset originally)
+        if let Some(v) = original {
+            std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", v);
+        } else {
+            std::env::remove_var("RECURSIVE_SKILL_INDEX_BUDGET");
+        }
+    }
+
+    /// Regression (issue #220 warn-once): the `!` on `BUDGET_WARNED.swap`
+    /// makes the guard warn on the FIRST unusable read and then stay quiet;
+    /// deleting the `!` inverts that (silent first read, warn on every
+    /// subsequent one). The flag is a process-global with no reset seam and
+    /// parallel test order is nondeterministic, so "exactly one" is not a
+    /// stable assertion here — the order-stable invariant is: a burst of
+    /// bad-value reads adds AT MOST one warn (pristine: 0 or 1 depending on
+    /// prior state; mutant: one per read, ≥ 2 across the burst).
+    #[test]
+    fn budget_warn_fires_at_most_once_for_repeated_bad_reads() {
+        let _env_lock = crate::test_util::env_lock();
+        let original = std::env::var("RECURSIVE_SKILL_INDEX_BUDGET").ok();
+
+        // Baseline: unset → default, and no budget warning at all.
+        std::env::remove_var("RECURSIVE_SKILL_INDEX_BUDGET");
+        let (value, logs) = capture_logs(default_skill_index_budget);
+        assert_eq!(value, 8000);
+        assert!(
+            !logs.contains("unusable byte budget"),
+            "unset read must not warn: {logs}"
+        );
+
+        // Three bad-value reads: the once-guard must cap them at one warn.
+        std::env::set_var("RECURSIVE_SKILL_INDEX_BUDGET", "not-a-number");
+        let budget_warns = |logs: &str| logs.matches("unusable byte budget").count();
+        let (v1, l1) = capture_logs(default_skill_index_budget);
+        let (v2, l2) = capture_logs(default_skill_index_budget);
+        let (v3, l3) = capture_logs(default_skill_index_budget);
+        // Value semantics unaffected either way — the pin is on the warn face.
+        assert_eq!((v1, v2, v3), (8000, 8000, 8000));
+        let warns = budget_warns(&l1) + budget_warns(&l2) + budget_warns(&l3);
+        assert!(
+            warns <= 1,
+            "warn-once violated: 3 bad reads produced {warns} warns\n{l1}\n{l2}\n{l3}"
+        );
 
         // Restore (or clear if it was unset originally)
         if let Some(v) = original {
