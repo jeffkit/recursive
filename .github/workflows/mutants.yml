@@ -471,15 +471,27 @@ jobs:
       # 42404673315: 12-15 legs per round dying with zero mutant results).
       # sccache shares dep artifacts across slots via GHA cache, collapsing
       # the cold phase to one shared pass. (#245 终验 wedge 修复)
-      - name: Install sccache
+      # best-effort: the GHA cache backend has outages (504s) — when the
+      # action fails the leg must still run, just without the shared dep cache
+      # (that degrades back to the wedge-prone cold phase, but legs complete).
+      - name: Install sccache (best-effort)
         uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
 
       - name: Run agent mutation shard
         env:
           SHARD_FILES: ${{ join(matrix.shard, ' ') }}
           SHARD_JOBS: ${{ inputs.shard_jobs }}
-          RUSTC_WRAPPER: sccache
           SCCACHE_GHA_ENABLED: "true"
         run: |
           echo "shard: $(echo $SHARD_FILES | wc -w) files"
+          # wrap rustc only when sccache actually installed (action may have
+          # failed on a cache-service outage — RUSTC_WRAPPER=undefined kills
+          # every rustc invocation)
+          if command -v sccache >/dev/null 2>&1; then
+            export RUSTC_WRAPPER=sccache
+            echo "sccache: enabled"
+          else
+            echo "sccache: unavailable, running unwrapped"
+          fi
           bash .dev/scripts/agent-mutants.sh --jobs "${SHARD_JOBS:-4}" $SHARD_FILES
