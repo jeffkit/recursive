@@ -463,10 +463,23 @@ jobs:
       - name: Install cargo-mutants
         run: command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
 
+      # sccache: copy mode gives every worker slot its own workspace copy with
+      # a COLD target — the full dependency tree (~600 crates) rebuilds per
+      # slot, 25-50min × slots on the 4-core runner, before the first mutant
+      # even compiles. On the heavy-test files that cold phase alone ate the
+      # 330min wall (the "143 wedge", runs 42209001992 / 42310894599 /
+      # 42404673315: 12-15 legs per round dying with zero mutant results).
+      # sccache shares dep artifacts across slots via GHA cache, collapsing
+      # the cold phase to one shared pass. (#245 终验 wedge 修复)
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Run agent mutation shard
         env:
           SHARD_FILES: ${{ join(matrix.shard, ' ') }}
           SHARD_JOBS: ${{ inputs.shard_jobs }}
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
         run: |
           echo "shard: $(echo $SHARD_FILES | wc -w) files"
           bash .dev/scripts/agent-mutants.sh --jobs "${SHARD_JOBS:-4}" $SHARD_FILES
