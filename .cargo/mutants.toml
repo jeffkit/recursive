@@ -1717,4 +1717,45 @@ exclude_re = [
     "src/skills\\.rs:965:43: delete ! in parse_skill_meta",
     "src/skills\\.rs:965:63: replace && with \\|\\| in parse_skill_meta",
     "src/skills\\.rs:965:66: delete ! in parse_skill_meta",
+    # ── Issue #245 batch 49 (B1 compare + B2 skills; the two entries below
+    # are the equivalence claims adjudicated by the controller 11-08; the
+    # other three MISSED of the r11 harvest are pinned by
+    # budget_warn_fires_at_most_once_for_repeated_bad_reads (B2) and the
+    # batch-46 golden/budget pins' coverage) ──
+    # compare.rs unified_diff :233:16 — outer hunk-loop advance `cursor += 1`
+    # → `*=` (frozen): absorbed by the inner walk loop's own trailing
+    # `cursor += 1` (:241). At the frozen cursor the inner first check is
+    # `cp[cursor] <= last + 2*ctx + 1` with last == cp[cursor] — always true
+    # (saturating keeps RHS >= the value) — and the body re-assigns `last` to
+    # the value it already holds: a stateless no-op landing the loop in
+    # exactly the pristine post-advance state. One extra no-op iteration per
+    # hunk; the render block reads only first/last/window. Controller
+    # independently re-derived from source incl. the last-hunk-alone and
+    # empty-list edges. Evidence: trajectory identity + exhaustive Python
+    # mirror 63,714 cases 0 mismatches (/tmp/b1-batch49/sim-out.log) +
+    # real-code implant with the FULL recursive-agent suite green, 4710
+    # passed (/tmp/b1-batch49/implant-test.log). The killable `+= → -=`
+    # sibling at the same coordinate underflows usize at cursor=0 and is
+    # already caught. UNLOCK CONDITION: if the inner walk's first check ever
+    # stops being trivially true at cursor == hunk-start (condition or body
+    # edit), or the outer advance moves relative to `let mut last`, the
+    # absorption breaks — drop this entry and pin.
+    "src/deliverables/compare\\.rs:233:16: replace \\+= with \\* in unified_diff",
+    # skills.rs :963:39 — param-entry backup `i -= 1` → `/= 1` (identity):
+    # deleting the backup. The backup exists so the OUTER loop re-processes
+    # the entry line; in every terminating form the re-processed line lands
+    # in the comment-only skip arm (see the :965 entries) and the trailing
+    # advance absorbs it — bit-identical trajectory. The ONLY behavioral
+    # divergence is the consecutive-indented-entries form, where the PRISTINE
+    # backup loops forever (re-pushing the same param) and the mutant
+    # terminates: a divergence where the original is the hung side, i.e. no
+    # suite-exercised output difference (exhaustive sim: 37,449 sequences,
+    # divergences classified solely {DEADLOOP, OK}, zero
+    # both-terminate-differently — /tmp/b2-batch49/sim_params.py; implant
+    # all-green /tmp/b2-batch49/negctl-div.log). Controller verified the
+    # absorption structure at the tip 11-08. NOTE: this entry documents that
+    # the pristine consecutive-entry hang is a latent production bug worth a
+    # follow-up fix; when that fix lands the backup becomes live — drop this
+    # entry and pin.
+    "src/skills\\.rs:963:39: replace \\- with \\/ in parse_skill_meta",
 ]
