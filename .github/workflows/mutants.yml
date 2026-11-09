@@ -383,7 +383,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # GHA cache service 504 outage (2026-11-08~09) fails this step and the
+      # whole leg — cache is an optimization, never worth a leg (#245 终验).
       - name: Cache cargo registry & target
+        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: |
