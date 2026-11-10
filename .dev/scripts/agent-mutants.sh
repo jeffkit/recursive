@@ -184,8 +184,17 @@ run_mutants() {
   local rc=0 out
   out=$(mktemp)
   # ${EXCL_RE[@]+…}: safe empty-array expansion under bash 3.2 + set -u.
-  cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" \
-    ${EXCL_RE[@]+"${EXCL_RE[@]}"} "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+  # MUTANTS_TEST_ARGS (optional env): test-filter args appended after `--`
+  # so each mutant only runs its module's tests (#245 终验: full suite per
+  # mutant is the wall-clock killer on slow hosts; two-phase full-suite
+  # verification covers filtering false-MISSED).
+  if [[ -n "${MUTANTS_TEST_ARGS:-}" ]]; then
+    cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" \
+      ${EXCL_RE[@]+"${EXCL_RE[@]}"} "$@" -- "$MUTANTS_TEST_ARGS" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+  else
+    cargo mutants -p "$CRATE" --features "$FEATURES" "${mode_args[@]}" \
+      ${EXCL_RE[@]+"${EXCL_RE[@]}"} "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+  fi
   if [[ "$rc" -eq 3 ]]; then
     if grep -q "MISSED" "$out"; then
       echo "note: cargo-mutants exited 3 but the report contains MISSED mutants — treating as FAILURE" >&2
